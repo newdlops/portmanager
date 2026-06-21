@@ -1,0 +1,9 @@
+.vscode/**
+.codeidx/**
+node_modules/**
+src/**
+test/**
+*.map
+tsconfig.json
+AGENTS.md
+SPEC.MD

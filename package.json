@@ -1,0 +1,235 @@
+{
+  "name": "portmanager",
+  "displayName": "Port Manager",
+  "description": "Route managed development processes to available ports and manage them from a VS Code sidebar.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "private": true,
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:portManager.processes",
+    "onCommand:portManager.startManagedProcess",
+    "onCommand:portManager.addExistingProcess",
+    "onCommand:portManager.refresh",
+    "onCommand:portManager.stopProcess",
+    "onCommand:portManager.restartProcess",
+    "onCommand:portManager.stopAllProcesses",
+    "onCommand:portManager.copyRoutedUrl",
+    "onCommand:portManager.openRoutedUrl",
+    "onCommand:portManager.removeProcess",
+    "onCommand:portManager.openSettings"
+  ],
+  "main": "./out/extension/activate.js",
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node --test out/test/unit/*.test.js",
+    "package": "npm run compile"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "portManager",
+          "title": "Port Manager",
+          "icon": "media/port-manager.svg"
+        }
+      ]
+    },
+    "views": {
+      "portManager": [
+        {
+          "id": "portManager.processes",
+          "name": "Processes"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "portManager.startManagedProcess",
+        "title": "Port Manager: Start Managed Process",
+        "category": "Port Manager"
+      },
+      {
+        "command": "portManager.addExistingProcess",
+        "title": "Port Manager: Add Existing Process",
+        "category": "Port Manager"
+      },
+      {
+        "command": "portManager.refresh",
+        "title": "Port Manager: Refresh",
+        "category": "Port Manager",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "portManager.stopProcess",
+        "title": "Port Manager: Stop Process",
+        "category": "Port Manager",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "portManager.restartProcess",
+        "title": "Port Manager: Restart Process",
+        "category": "Port Manager",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "portManager.stopAllProcesses",
+        "title": "Port Manager: Stop All Processes",
+        "category": "Port Manager",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "portManager.copyRoutedUrl",
+        "title": "Port Manager: Copy Routed URL",
+        "category": "Port Manager",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "portManager.openRoutedUrl",
+        "title": "Port Manager: Open Routed URL",
+        "category": "Port Manager",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "portManager.removeProcess",
+        "title": "Port Manager: Remove Process",
+        "category": "Port Manager",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "portManager.openSettings",
+        "title": "Port Manager: Open Settings",
+        "category": "Port Manager",
+        "icon": "$(settings-gear)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "portManager.startManagedProcess",
+          "when": "view == portManager.processes",
+          "group": "navigation@1"
+        },
+        {
+          "command": "portManager.addExistingProcess",
+          "when": "view == portManager.processes",
+          "group": "navigation@2"
+        },
+        {
+          "command": "portManager.refresh",
+          "when": "view == portManager.processes",
+          "group": "navigation@3"
+        },
+        {
+          "command": "portManager.stopAllProcesses",
+          "when": "view == portManager.processes",
+          "group": "navigation@4"
+        },
+        {
+          "command": "portManager.openSettings",
+          "when": "view == portManager.processes",
+          "group": "navigation@5"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "portManager.openRoutedUrl",
+          "when": "view == portManager.processes && viewItem == managedProcess",
+          "group": "inline@1"
+        },
+        {
+          "command": "portManager.copyRoutedUrl",
+          "when": "view == portManager.processes && viewItem == managedProcess",
+          "group": "inline@2"
+        },
+        {
+          "command": "portManager.stopProcess",
+          "when": "view == portManager.processes && viewItem == managedProcess",
+          "group": "managed@1"
+        },
+        {
+          "command": "portManager.restartProcess",
+          "when": "view == portManager.processes && viewItem == managedProcess",
+          "group": "managed@2"
+        },
+        {
+          "command": "portManager.removeProcess",
+          "when": "view == portManager.processes && viewItem == managedProcess",
+          "group": "managed@3"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Port Manager",
+      "properties": {
+        "portManager.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable managed process port routing."
+        },
+        "portManager.defaultHost": {
+          "type": "string",
+          "default": "localhost",
+          "description": "Host used when building routed URLs."
+        },
+        "portManager.scanRange": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 200,
+          "description": "Number of nearby ports to scan when the requested port is busy."
+        },
+        "portManager.scanDirection": {
+          "type": "string",
+          "default": "up",
+          "enum": [
+            "up",
+            "down",
+            "both"
+          ],
+          "description": "Direction used when scanning for an available nearby port."
+        },
+        "portManager.preferredPorts": {
+          "type": "array",
+          "default": [
+            3000,
+            3001,
+            5173,
+            8000,
+            8080
+          ],
+          "items": {
+            "type": "number"
+          },
+          "description": "Common ports offered by the start command prompt."
+        },
+        "portManager.autoOpenBrowser": {
+          "type": "boolean",
+          "default": false,
+          "description": "Open the routed URL after a managed process starts."
+        },
+        "portManager.showConflictNotification": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show an information notification when a busy requested port is routed."
+        },
+        "portManager.processKillSignal": {
+          "type": "string",
+          "default": "SIGTERM",
+          "description": "Signal used to stop managed processes on POSIX platforms."
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.95.0",
+    "typescript": "^5.7.2"
+  }
+}
