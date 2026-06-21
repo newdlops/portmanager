@@ -14,7 +14,7 @@ Port Manager의 기본 구현 방향은 레거시 포트 재할당 UI에서 Logi
 
 ## Phase 0: 레거시 UI 숨김
 
-상태: 진행 중
+상태: 완료
 
 - 사이드바에서 daemon/routes/managed process/listener 중심 화면을 숨긴다.
 - Command Palette와 view toolbar에서 레거시 시작/중지/라우팅 명령을 숨긴다.
@@ -23,7 +23,7 @@ Port Manager의 기본 구현 방향은 레거시 포트 재할당 UI에서 Logi
 
 ## Phase 1: 도메인 모델
 
-상태: 예정
+상태: 초기 구현 완료
 
 - `LogicalNetwork` 모델 추가
   - id, name, status, runtime adapter, createdAt, metadata
@@ -31,15 +31,16 @@ Port Manager의 기본 구현 방향은 레거시 포트 재할당 UI에서 Logi
   - networkId, rootPid, processGroupId, shell, tty, attachedAt, status
 - `HostPortExposure` 모델 추가
   - hostAddress, hostPort, targetAddress, targetPort, protocol, networkId
-- repository와 event contract 추가
-- 설정 스키마에 기본 runtime adapter와 exposure 기본 host 추가
+- `LogicalNetworkRegistry`와 event contract 추가
+- VS Code global state persistence 추가
+- 설정 스키마에 기본 runtime adapter와 exposure 기본 host 추가는 예정
 
 ## Phase 2: 터미널 탐색
 
-상태: 예정
+상태: 초기 구현 완료
 
-- OS 전체 process tree scanner 추가
-- 터미널 후보 식별 규칙 구현
+- OS 전체 process table 기반 terminal candidate scanner 추가
+- 터미널 후보 식별 규칙 초기 구현
   - macOS: Terminal, iTerm2, shell, tty, process group
   - Linux: terminal emulator, shell, tty, process group
   - Windows: Windows Terminal, conhost, PowerShell, cmd, WSL process tree
@@ -48,7 +49,7 @@ Port Manager의 기본 구현 방향은 레거시 포트 재할당 UI에서 Logi
 
 ## Phase 3: Network Runtime Adapter
 
-상태: 예정
+상태: 일부 구현
 
 - `NetworkRuntimeAdapter` 인터페이스 정의
   - create network
@@ -66,20 +67,23 @@ Port Manager의 기본 구현 방향은 레거시 포트 재할당 UI에서 Logi
   - supportsHostExposure
   - requiresPrivilegedHelper
   - requiresContainerRuntime
+- 현재 구현된 adapter
+  - `Local TCP Proxy`: host exposure 지원, same internal ports 미지원, terminal attach 미지원
 
 ## Phase 4: Host Port Exposure
 
-상태: 예정
+상태: 초기 구현 완료
 
 - host exposure 생성/삭제/검증 서비스 구현
 - `localhost:3004 -> A network:3004` 같은 명시적 매핑 저장
-- exposure 생성 전에 host port 점유 여부를 검사
+- exposure 생성 전에 실제 TCP bind로 host port 점유 여부 검사
 - 충돌 시 실행 이후가 아니라 exposure 설정 단계에서 실패 처리
 - exposure 상태를 sidebar에 표시
+- extension reload 시 active exposure 재개
 
 ## Phase 5: Sidebar UX
 
-상태: 예정
+상태: 초기 구현 완료
 
 - Logical Networks 섹션
   - 네트워크 생성, 삭제, 상태 확인

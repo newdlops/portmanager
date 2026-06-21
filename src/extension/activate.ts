@@ -2,8 +2,7 @@ import * as vscode from "vscode";
 import { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import { LocalAgentClient } from "./local-agent-client";
 import { PortManagerCommandController } from "./commands";
-import { TerminalConflictMonitor } from "./terminal-conflict-monitor";
-import { configureTerminalHookEnvironment } from "./terminal-hook-environment";
+import { PortManagerNetworkService } from "./network-service";
 
 /**
  * VS Code activation entry point for Port Manager.
@@ -14,29 +13,26 @@ import { configureTerminalHookEnvironment } from "./terminal-hook-environment";
  */
 export function activate(context: vscode.ExtensionContext): void {
   const processService = new LocalAgentClient(context);
-  const treeProvider = new PortManagerTreeProvider(processService);
+  const networkService = new PortManagerNetworkService(context);
+  const treeProvider = new PortManagerTreeProvider(networkService);
   const commandController = new PortManagerCommandController({
     processService,
+    networkService,
     treeProvider,
-  });
-  const terminalConflictMonitor = new TerminalConflictMonitor({
-    processService,
   });
 
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider("portManager.processes", treeProvider),
+    networkService,
     processService,
     treeProvider,
     commandController,
-    terminalConflictMonitor,
-    configureTerminalHookEnvironment(context),
   );
 
   commandController.register(context);
-  terminalConflictMonitor.start(context);
-  void processService.start().catch((error) => {
+  void networkService.start().catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
-    void vscode.window.showErrorMessage(`Port Manager agent failed to start: ${message}`);
+    void vscode.window.showErrorMessage(`Port Manager network service failed to start: ${message}`);
   });
 }
 

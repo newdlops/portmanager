@@ -64,6 +64,8 @@ Logical Network를 실제 시스템에서 구현하는 어댑터다. VS Code 확
 - OS native adapter: Linux network namespace, macOS pf/utun/launch wrapper, Windows WFP/Hyper-V/WSL 기반 구현
 - Proxy adapter: 완전 격리는 아니지만 host exposure와 일부 outbound/inbound 라우팅을 제공하는 fallback
 
+현재 초기 구현은 `Local TCP Proxy` adapter를 제공한다. 이 adapter는 host port exposure를 실제 TCP listener/proxy로 수행하지만, 같은 내부 포트 재사용과 기존 터미널 attach는 지원하지 않는다. UI는 이 capability를 그대로 표시해야 하며, 지원하지 않는 attach 요청은 성공처럼 저장하지 않고 실패로 처리한다.
+
 #### Terminal Discovery
 
 VS Code 통합 터미널만이 아니라 macOS Terminal/iTerm2, Linux terminal emulator, Windows Terminal, PowerShell, cmd, WSL 터미널의 shell/process tree를 조회하고, 사용자가 연결할 터미널 프로세스를 선택할 수 있게 하는 기능이다.

@@ -28,6 +28,8 @@ export type TerminalAttachmentStatus = "attached" | "detached" | "error";
 
 export type NetworkRuntimeKind = "container" | "linuxNamespace" | "nativeHelper" | "proxy";
 
+export type HostPortExposureStatus = "opening" | "active" | "stopped" | "error";
+
 /**
  * A user-facing network scope where duplicated app-internal ports remain
  * meaningful. Runtime adapters decide whether this is backed by a container,
@@ -132,6 +134,36 @@ export interface HostPortExposure {
   readonly targetPort: number;
   /** Transport protocol for the exposure. */
   readonly protocol: NetworkPortProtocol;
+  /** Current host listener/proxy lifecycle state. */
+  readonly status: HostPortExposureStatus;
+  /** ISO timestamp when this exposure was requested. */
+  readonly createdAt: string;
+  /** Last bind/proxy failure, if any. */
+  readonly errorMessage?: string;
+}
+
+export interface NetworkSnapshot {
+  /** Logical networks known to the current VS Code window. */
+  readonly networks: readonly LogicalNetwork[];
+  /** Latest best-effort terminal candidates from VS Code and the OS. */
+  readonly terminalCandidates: readonly TerminalCandidate[];
+  /** Terminal-to-network attachment records. */
+  readonly attachments: readonly TerminalAttachment[];
+  /** Host port bindings owned by Port Manager. */
+  readonly exposures: readonly HostPortExposure[];
+  /** Runtime adapters available on this platform/build. */
+  readonly runtimes: readonly NetworkRuntimeDescriptor[];
+  /** ISO timestamp for this snapshot. */
+  readonly updatedAt: string;
+}
+
+export interface TerminalCandidateProvider {
+  /**
+   * Lists terminal-like shell processes visible to the current user.
+   * Implementations belong to platform or extension layers because discovery
+   * reads OS process tables or VS Code terminal APIs.
+   */
+  list(): Promise<readonly TerminalCandidate[]>;
 }
 
 export interface PortManagerSettings {

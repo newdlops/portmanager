@@ -37,6 +37,14 @@
   "activationEvents": [
     "onStartupFinished",
     "onView:portManager.processes",
+    "onCommand:portManager.createLogicalNetwork",
+    "onCommand:portManager.removeLogicalNetwork",
+    "onCommand:portManager.refreshTerminals",
+    "onCommand:portManager.attachTerminalToNetwork",
+    "onCommand:portManager.addHostPortExposure",
+    "onCommand:portManager.removeHostPortExposure",
+    "onCommand:portManager.copyHostPortExposureUrl",
+    "onCommand:portManager.openHostPortExposureUrl",
     "onCommand:portManager.startDaemon",
     "onCommand:portManager.stopDaemon",
     "onCommand:portManager.showDaemonStatus",
@@ -86,6 +94,54 @@
       ]
     },
     "commands": [
+      {
+        "command": "portManager.createLogicalNetwork",
+        "title": "Port Manager: Create Logical Network",
+        "category": "Port Manager",
+        "icon": "$(vm)"
+      },
+      {
+        "command": "portManager.removeLogicalNetwork",
+        "title": "Port Manager: Remove Logical Network",
+        "category": "Port Manager",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "portManager.refreshTerminals",
+        "title": "Port Manager: Refresh Terminals",
+        "category": "Port Manager",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "portManager.attachTerminalToNetwork",
+        "title": "Port Manager: Attach Terminal to Network",
+        "category": "Port Manager",
+        "icon": "$(debug-console)"
+      },
+      {
+        "command": "portManager.addHostPortExposure",
+        "title": "Port Manager: Add Host Port Exposure",
+        "category": "Port Manager",
+        "icon": "$(ports-view-icon)"
+      },
+      {
+        "command": "portManager.removeHostPortExposure",
+        "title": "Port Manager: Remove Host Port Exposure",
+        "category": "Port Manager",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "portManager.copyHostPortExposureUrl",
+        "title": "Port Manager: Copy Host Exposure URL",
+        "category": "Port Manager",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "portManager.openHostPortExposureUrl",
+        "title": "Port Manager: Open Host Exposure URL",
+        "category": "Port Manager",
+        "icon": "$(link-external)"
+      },
       {
         "command": "portManager.startDaemon",
         "title": "Port Manager: Start Daemon",
@@ -178,14 +234,29 @@
     "menus": {
       "view/title": [
         {
-          "command": "portManager.refresh",
+          "command": "portManager.createLogicalNetwork",
           "when": "view == portManager.processes",
           "group": "navigation@1"
         },
         {
-          "command": "portManager.openSettings",
+          "command": "portManager.addHostPortExposure",
           "when": "view == portManager.processes",
           "group": "navigation@2"
+        },
+        {
+          "command": "portManager.refreshTerminals",
+          "when": "view == portManager.processes",
+          "group": "navigation@3"
+        },
+        {
+          "command": "portManager.refresh",
+          "when": "view == portManager.processes",
+          "group": "navigation@4"
+        },
+        {
+          "command": "portManager.openSettings",
+          "when": "view == portManager.processes",
+          "group": "navigation@5"
         }
       ],
       "commandPalette": [
@@ -243,6 +314,51 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "portManager.createLogicalNetwork",
+          "when": "view == portManager.processes && viewItem == section.networks",
+          "group": "network@1"
+        },
+        {
+          "command": "portManager.addHostPortExposure",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "network@2"
+        },
+        {
+          "command": "portManager.removeLogicalNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "network@3"
+        },
+        {
+          "command": "portManager.refreshTerminals",
+          "when": "view == portManager.processes && viewItem == section.terminals",
+          "group": "terminal@1"
+        },
+        {
+          "command": "portManager.attachTerminalToNetwork",
+          "when": "view == portManager.processes && viewItem == terminalCandidate",
+          "group": "terminal@2"
+        },
+        {
+          "command": "portManager.addHostPortExposure",
+          "when": "view == portManager.processes && viewItem == section.exposures",
+          "group": "exposure@1"
+        },
+        {
+          "command": "portManager.openHostPortExposureUrl",
+          "when": "view == portManager.processes && viewItem == hostExposureActive",
+          "group": "inline@1"
+        },
+        {
+          "command": "portManager.copyHostPortExposureUrl",
+          "when": "view == portManager.processes && (viewItem == hostExposureActive || viewItem == hostExposure)",
+          "group": "inline@2"
+        },
+        {
+          "command": "portManager.removeHostPortExposure",
+          "when": "view == portManager.processes && (viewItem == hostExposureActive || viewItem == hostExposure)",
+          "group": "exposure@3"
+        },
         {
           "command": "portManager.stopDaemon",
           "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",

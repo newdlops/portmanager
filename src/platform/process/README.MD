@@ -10,11 +10,13 @@
 - 실제 포트를 환경 변수와 템플릿에 주입
 - PID와 종료 이벤트 추적
 - 설정된 종료 신호 전달
+- OS process table에서 터미널 후보 탐색
 
 ## 주요 진입점
 
 - `node-process-launcher.ts`
 - `node-runtime.ts`
+- `node-terminal-candidate-provider.ts`
 
 ## 외부 의존성
 

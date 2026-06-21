@@ -9,18 +9,28 @@ A network: frontend 3004, backend 8004, exposed as localhost:3004
 B network: frontend 3004, backend 8004, exposed as localhost:3005
 ```
 
-The previous managed-process routing, native hook, and rerun-on-failure implementation remains in the repository as deprecated compatibility code. It is hidden from the default sidebar and command surfaces while the logical network model is specified and implemented.
+The previous managed-process routing, native hook, and rerun-on-failure implementation remains in the repository as deprecated compatibility code. It is hidden from the default sidebar and command surfaces while the logical network model is implemented.
 
 ## Target Capabilities
 
-- Discover terminal processes across VS Code and external OS terminals.
-- Let the user attach a selected terminal process group to a logical network.
-- Let child processes launched from that terminal inherit the selected network context.
-- Allow multiple networks to reuse the same internal ports.
-- Configure explicit host port exposure, such as `localhost:3005 -> B network:3004`.
-- Detect host exposure conflicts before exposing a port.
+- Discover terminal processes across VS Code and external OS terminals. Initial implementation is best-effort.
+- Let the user attach a selected terminal process group to a logical network. This requires a runtime adapter that supports terminal attach.
+- Let child processes launched from that terminal inherit the selected network context. This is not supported by the current local proxy adapter.
+- Allow multiple networks to reuse the same internal ports when the selected runtime provides isolation.
+- Configure explicit host port exposure, such as `localhost:3005 -> B network:3004`. Initial implementation provides a real local TCP proxy.
+- Detect host exposure conflicts before exposing a port by actually binding the host listener.
 - Keep fixed protocol ports such as SSH, MySQL, and PostgreSQL meaningful inside each logical network.
 - Implement real network behavior through runtime adapters such as container runtimes, OS-native network namespaces, privileged helpers, or proxy fallbacks.
+
+## Implemented Logical Network Mode
+
+- Create and remove logical network records.
+- Persist logical networks, terminal attachments, and host exposures in VS Code global state.
+- Discover VS Code integrated terminals and OS shell processes in one Terminal Sessions view.
+- Expose a host TCP port to a target address and port through `Local TCP Proxy`.
+- Close proxy listeners when exposures or networks are removed.
+- Reopen persisted active exposures when the extension starts.
+- Show runtime capabilities so unsupported same-port isolation and terminal attach are explicit.
 
 ## Current Compatibility Code
 
@@ -52,9 +62,11 @@ These commands and views are no longer the primary product surface. They remain 
 2. Run `npm run compile`.
 3. Press `F5` in VS Code and choose `Run Port Manager Extension`.
 4. In the Extension Development Host, open the Port Manager activity bar view.
-5. Review the Logical Networks, Terminal Sessions, and Host Port Exposures sections.
+5. Use `Port Manager: Create Logical Network`.
+6. Use `Port Manager: Add Host Port Exposure` to bind a host port to a target address and port.
+7. Use `Port Manager: Refresh Terminals` to update detected terminal candidates.
 
-The logical network runtime is under design. See `SPEC.MD` and `IMPLEMENTATION_PLAN.MD` for the current architecture plan and platform constraints.
+The current runtime is `Local TCP Proxy`. It provides real host port exposure, but it does not isolate network namespaces or attach existing terminals. Same internal ports across A/B apps require a future container, namespace, native-helper, or VM-backed runtime adapter.
 
 ## Legacy Routing
 

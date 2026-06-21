@@ -7,15 +7,26 @@ import { getDefaultRouteTablePath } from "../agent/route-table";
 import { readPortManagerSettings, openPortManagerSettings } from "../config/vscode-settings";
 import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
 import type { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
-import { getProcessFromCommandArgument } from "../ui/sidebar/port-manager-tree";
+import {
+  getHostPortExposureFromCommandArgument,
+  getLogicalNetworkFromCommandArgument,
+  getProcessFromCommandArgument,
+  getTerminalCandidateFromCommandArgument,
+} from "../ui/sidebar/port-manager-tree";
+import type { PortManagerNetworkService } from "./network-service";
 import type { PortManagerProcessService } from "./process-service";
 import { prepareAsdfShimLauncherDirectory } from "./terminal-hook-environment";
 import type {
   DisposableLike,
+  HostPortExposure,
+  LogicalNetwork,
   ManagedProcess,
   ManagedProcessStartInput,
+  NetworkRuntimeDescriptor,
+  NetworkRuntimeKind,
   PortInjectionMode,
   PortManagerSettings,
+  TerminalCandidate,
 } from "../shared/types";
 
 /**
@@ -29,6 +40,8 @@ import type {
 export interface PortManagerCommandDependencies {
   /** Agent-backed service shared by commands and the sidebar. */
   readonly processService: PortManagerProcessService;
+  /** Logical network service shared by commands and the sidebar. */
+  readonly networkService: PortManagerNetworkService;
   /** Sidebar provider refreshed after command-driven changes. */
   readonly treeProvider: PortManagerTreeProvider;
 }
@@ -49,6 +62,26 @@ export class PortManagerCommandController implements DisposableLike {
    * error notifications instead of unhandled promise rejections.
    */
   register(context: vscode.ExtensionContext): void {
+    this.registerCommand(context, "portManager.createLogicalNetwork", () => this.createLogicalNetwork());
+    this.registerCommand(context, "portManager.removeLogicalNetwork", (argument) =>
+      this.removeLogicalNetwork(argument),
+    );
+    this.registerCommand(context, "portManager.refreshTerminals", () => this.refreshTerminals());
+    this.registerCommand(context, "portManager.attachTerminalToNetwork", (argument) =>
+      this.attachTerminalToNetwork(argument),
+    );
+    this.registerCommand(context, "portManager.addHostPortExposure", (argument) =>
+      this.addHostPortExposure(argument),
+    );
+    this.registerCommand(context, "portManager.removeHostPortExposure", (argument) =>
+      this.removeHostPortExposure(argument),
+    );
+    this.registerCommand(context, "portManager.copyHostPortExposureUrl", (argument) =>
+      this.copyHostPortExposureUrl(argument),
+    );
+    this.registerCommand(context, "portManager.openHostPortExposureUrl", (argument) =>
+      this.openHostPortExposureUrl(argument),
+    );
     this.registerCommand(context, "portManager.startDaemon", () => this.startDaemon());
     this.registerCommand(context, "portManager.stopDaemon", () => this.stopDaemon());
     this.registerCommand(context, "portManager.showDaemonStatus", () => this.showDaemonStatus());
@@ -64,6 +97,159 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.installShellHook", () => this.installShellHook(context));
     this.registerCommand(context, "portManager.installExternalCli", () => this.installExternalCli(context));
     this.registerCommand(context, "portManager.openSettings", () => openPortManagerSettings());
+  }
+
+  /** Creates a logical network row backed by the selected runtime adapter. */
+  private async createLogicalNetwork(): Promise<void> {
+    const name = await vscode.window.showInputBox({
+      title: "Create Logical Network",
+      prompt: "Network name",
+      placeHolder: "A app",
+      ignoreFocusOut: true,
+      validateInput: (value) => (value.trim().length === 0 ? "Network name is required." : undefined),
+    });
+
+    if (!name) {
+      return;
+    }
+
+    const runtimeKind = await promptForRuntimeKind(this.dependencies.networkService.getSnapshot().runtimes);
+    if (runtimeKind === undefined) {
+      return;
+    }
+
+    this.dependencies.networkService.createNetwork(name.trim(), runtimeKind);
+    this.dependencies.treeProvider.refresh();
+  }
+
+  /** Removes a logical network after closing its host exposures. */
+  private async removeLogicalNetwork(argument: unknown): Promise<void> {
+    const network = await this.resolveNetworkArgument(argument, "Remove Logical Network");
+    if (network === undefined) {
+      return;
+    }
+
+    const selection = await vscode.window.showWarningMessage(
+      `Remove logical network "${network.name}" and its host exposures?`,
+      { modal: true },
+      "Remove Network",
+    );
+
+    if (selection !== "Remove Network") {
+      return;
+    }
+
+    await this.dependencies.networkService.removeNetwork(network.id);
+    this.dependencies.treeProvider.refresh();
+  }
+
+  /** Refreshes OS and VS Code terminal candidates. */
+  private async refreshTerminals(): Promise<void> {
+    const candidates = await this.dependencies.networkService.refreshTerminals();
+    this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage(`Discovered ${candidates.length} terminal candidates.`);
+  }
+
+  /** Attaches a selected terminal to a selected network when the runtime supports it. */
+  private async attachTerminalToNetwork(argument: unknown): Promise<void> {
+    const terminal = await this.resolveTerminalArgument(argument, "Attach Terminal to Network");
+    if (terminal === undefined) {
+      return;
+    }
+
+    const network = await this.resolveNetworkArgument(undefined, "Attach Terminal to Network");
+    if (network === undefined) {
+      return;
+    }
+
+    this.dependencies.networkService.attachTerminal(network.id, terminal.pid);
+    this.dependencies.treeProvider.refresh();
+  }
+
+  /** Opens a host TCP listener/proxy for a network target port. */
+  private async addHostPortExposure(argument: unknown): Promise<void> {
+    const settings = readPortManagerSettings();
+    const network = await this.resolveNetworkArgument(argument, "Add Host Port Exposure");
+    if (network === undefined) {
+      return;
+    }
+
+    const hostAddress = await vscode.window.showInputBox({
+      title: "Add Host Port Exposure",
+      prompt: "Host address",
+      value: settings.defaultHost,
+      ignoreFocusOut: true,
+      validateInput: (value) => (value.trim().length === 0 ? "Host address is required." : undefined),
+    });
+
+    if (!hostAddress) {
+      return;
+    }
+
+    const hostPort = await promptForPort("Host port", settings.preferredPorts[0] ?? 3000);
+    if (hostPort === undefined) {
+      return;
+    }
+
+    const targetAddress = await vscode.window.showInputBox({
+      title: "Add Host Port Exposure",
+      prompt: "Target address inside the runtime network",
+      value: "127.0.0.1",
+      ignoreFocusOut: true,
+      validateInput: (value) => (value.trim().length === 0 ? "Target address is required." : undefined),
+    });
+
+    if (!targetAddress) {
+      return;
+    }
+
+    const targetPort = await promptForPort("Target port", hostPort);
+    if (targetPort === undefined) {
+      return;
+    }
+
+    const exposure = await this.dependencies.networkService.createExposure({
+      networkId: network.id,
+      hostAddress: hostAddress.trim(),
+      hostPort,
+      targetAddress: targetAddress.trim(),
+      targetPort,
+    });
+    this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage(`Exposed ${formatExposureUrl(exposure)}.`);
+  }
+
+  /** Removes one host exposure and closes its local listener. */
+  private async removeHostPortExposure(argument: unknown): Promise<void> {
+    const exposure = await this.resolveExposureArgument(argument, "Remove Host Port Exposure");
+    if (exposure === undefined) {
+      return;
+    }
+
+    await this.dependencies.networkService.removeExposure(exposure.id);
+    this.dependencies.treeProvider.refresh();
+  }
+
+  /** Copies the URL for one active host exposure. */
+  private async copyHostPortExposureUrl(argument: unknown): Promise<void> {
+    const exposure = await this.resolveExposureArgument(argument, "Copy Host Exposure URL");
+    if (exposure === undefined) {
+      return;
+    }
+
+    const url = formatExposureUrl(exposure);
+    await vscode.env.clipboard.writeText(url);
+    await vscode.window.showInformationMessage(`Copied ${url}`);
+  }
+
+  /** Opens the URL for one active host exposure. */
+  private async openHostPortExposureUrl(argument: unknown): Promise<void> {
+    const exposure = await this.resolveExposureArgument(argument, "Open Host Exposure URL");
+    if (exposure === undefined) {
+      return;
+    }
+
+    await openUrl(formatExposureUrl(exposure));
   }
 
   /** Releases command subscriptions during extension deactivation. */
@@ -232,7 +418,7 @@ export class PortManagerCommandController implements DisposableLike {
 
   /** Forces the tree provider to request the latest registry snapshot. */
   private async refresh(): Promise<void> {
-    await this.dependencies.processService.refresh();
+    await this.dependencies.networkService.refreshTerminals();
     this.dependencies.treeProvider.refresh();
   }
 
@@ -442,6 +628,85 @@ export class PortManagerCommandController implements DisposableLike {
     return selected?.process;
   }
 
+  /** Resolves a logical network from tree context or Quick Pick. */
+  private async resolveNetworkArgument(argument: unknown, title: string): Promise<LogicalNetwork | undefined> {
+    const network = getLogicalNetworkFromCommandArgument(argument);
+
+    if (network !== undefined) {
+      return this.dependencies.networkService.getSnapshot().networks.find((item) => item.id === network.id);
+    }
+
+    const networks = this.dependencies.networkService.getSnapshot().networks;
+    if (networks.length === 0) {
+      await vscode.window.showInformationMessage("No logical networks exist.");
+      return undefined;
+    }
+
+    const selected = await vscode.window.showQuickPick(
+      networks.map((item) => ({
+        label: item.name,
+        description: `${item.runtimeKind} ${item.status}`,
+        network: item,
+      })),
+      { title, placeHolder: "Select a logical network" },
+    );
+
+    return selected?.network;
+  }
+
+  /** Resolves a terminal candidate from tree context or Quick Pick. */
+  private async resolveTerminalArgument(argument: unknown, title: string): Promise<TerminalCandidate | undefined> {
+    const terminal = getTerminalCandidateFromCommandArgument(argument);
+
+    if (terminal !== undefined) {
+      return terminal;
+    }
+
+    const candidates = this.dependencies.networkService.getSnapshot().terminalCandidates;
+    if (candidates.length === 0) {
+      await vscode.window.showInformationMessage("No terminal candidates discovered.");
+      return undefined;
+    }
+
+    const selected = await vscode.window.showQuickPick(
+      candidates.map((item) => ({
+        label: item.name,
+        description: `pid ${item.pid}${item.vscodeTerminal ? ", VS Code" : ""}`,
+        detail: item.command,
+        terminal: item,
+      })),
+      { title, placeHolder: "Select a terminal process" },
+    );
+
+    return selected?.terminal;
+  }
+
+  /** Resolves a host exposure from tree context or Quick Pick. */
+  private async resolveExposureArgument(argument: unknown, title: string): Promise<HostPortExposure | undefined> {
+    const exposure = getHostPortExposureFromCommandArgument(argument);
+
+    if (exposure !== undefined) {
+      return this.dependencies.networkService.getExposure(exposure.id);
+    }
+
+    const exposures = this.dependencies.networkService.getSnapshot().exposures;
+    if (exposures.length === 0) {
+      await vscode.window.showInformationMessage("No host port exposures exist.");
+      return undefined;
+    }
+
+    const selected = await vscode.window.showQuickPick(
+      exposures.map((item) => ({
+        label: formatExposureUrl(item),
+        description: `${item.targetAddress}:${item.targetPort} ${item.status}`,
+        exposure: item,
+      })),
+      { title, placeHolder: "Select a host exposure" },
+    );
+
+    return selected?.exposure;
+  }
+
   /** Registers one command and wraps thrown errors in a user-visible message. */
   private registerCommand(
     context: vscode.ExtensionContext,
@@ -532,6 +797,39 @@ async function promptForInjectionMode(): Promise<PortInjectionMode | undefined> 
   return selected?.mode;
 }
 
+/** Lets users choose a runtime adapter when more than one is available. */
+async function promptForRuntimeKind(
+  runtimes: readonly NetworkRuntimeDescriptor[],
+): Promise<NetworkRuntimeKind | undefined> {
+  if (runtimes.length === 0) {
+    await vscode.window.showErrorMessage("No network runtime adapters are available.");
+    return undefined;
+  }
+
+  if (runtimes.length === 1) {
+    return runtimes[0].kind;
+  }
+
+  const selected = await vscode.window.showQuickPick(
+    runtimes.map((runtime) => ({
+      label: runtime.name,
+      description: runtime.kind,
+      detail: [
+        runtime.capabilities.supportsSameInternalPorts ? "same internal ports" : "no same-port isolation",
+        runtime.capabilities.supportsTerminalAttach ? "terminal attach" : "no terminal attach",
+        runtime.capabilities.supportsHostExposure ? "host exposure" : "no host exposure",
+      ].join(", "),
+      runtime,
+    })),
+    {
+      title: "Network Runtime",
+      placeHolder: "Select a runtime adapter",
+    },
+  );
+
+  return selected?.runtime.kind;
+}
+
 /** Uses workspace folder name as the default process label when possible. */
 function deriveProcessName(command: string, cwd: string): string {
   const folderName = path.basename(cwd);
@@ -551,6 +849,15 @@ function getDefaultWorkspaceFolder(): string | undefined {
 /** Opens an HTTP URL through VS Code's external URI bridge. */
 async function openUrl(url: string): Promise<void> {
   await vscode.env.openExternal(vscode.Uri.parse(url));
+}
+
+/** Builds the URL users open from a host exposure row. */
+function formatExposureUrl(exposure: HostPortExposure): string {
+  const host =
+    exposure.hostAddress === "0.0.0.0" || exposure.hostAddress === "::" ? "localhost" : exposure.hostAddress;
+  const formattedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+
+  return `http://${formattedHost}:${exposure.hostPort}`;
 }
 
 /** Validates the user-facing TCP port range. */

@@ -10,12 +10,14 @@ Port Manager의 순수 도메인 로직을 담당한다.
 - 해시 기반 논리 라우팅과 nearest 포트 탐색 정책 적용
 - 관리 중인 프로세스 상태 저장과 전이
 - 프로세스 실행 요청 모델 정의
+- Logical Network, Terminal Attachment, Host Port Exposure 상태 저장
 
 ## 주요 진입점
 
 - `port-routing.ts`
 - `process-registry.ts`
 - `terminal-conflict-parser.ts`
+- `networks/logical-network-registry.ts`
 
 ## 외부 의존성
 
