@@ -6,6 +6,8 @@
 node_modules/**
 src/**
 test/**
+native/**
+scripts/**
 out/test/**
 dist/**
 *.vsix

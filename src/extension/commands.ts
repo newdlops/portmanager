@@ -1,5 +1,9 @@
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { getAgentSocketPath } from "../agent/agent-socket";
+import { getDefaultRouteTablePath } from "../agent/route-table";
 import { readPortManagerSettings, openPortManagerSettings } from "../config/vscode-settings";
 import type { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import { getProcessFromCommandArgument } from "../ui/sidebar/port-manager-tree";
@@ -43,6 +47,7 @@ export class PortManagerCommandController implements DisposableLike {
    */
   register(context: vscode.ExtensionContext): void {
     this.registerCommand(context, "portManager.startDaemon", () => this.startDaemon());
+    this.registerCommand(context, "portManager.stopDaemon", () => this.stopDaemon());
     this.registerCommand(context, "portManager.showDaemonStatus", () => this.showDaemonStatus());
     this.registerCommand(context, "portManager.startManagedProcess", () => this.startManagedProcess());
     this.registerCommand(context, "portManager.addExistingProcess", () => this.addExistingProcess());
@@ -53,6 +58,8 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.copyRoutedUrl", (argument) => this.copyRoutedUrl(argument));
     this.registerCommand(context, "portManager.openRoutedUrl", (argument) => this.openRoutedUrl(argument));
     this.registerCommand(context, "portManager.removeProcess", (argument) => this.removeProcess(argument));
+    this.registerCommand(context, "portManager.installShellHook", () => this.installShellHook(context));
+    this.registerCommand(context, "portManager.installExternalCli", () => this.installExternalCli(context));
     this.registerCommand(context, "portManager.openSettings", () => openPortManagerSettings());
   }
 
@@ -72,6 +79,23 @@ export class PortManagerCommandController implements DisposableLike {
     await vscode.window.showInformationMessage(
       `Port Manager daemon ${daemon.status}: pid ${daemon.pid}, ${daemon.listenerCount} listeners, ${daemon.routeCount} routes`,
     );
+  }
+
+  /** Stops the shared daemon without terminating processes it previously tracked. */
+  private async stopDaemon(): Promise<void> {
+    const selection = await vscode.window.showWarningMessage(
+      "Stop the Port Manager daemon? Running application processes may keep running, but routing and monitoring stop until the daemon starts again.",
+      { modal: true },
+      "Stop Daemon",
+    );
+
+    if (selection !== "Stop Daemon") {
+      return;
+    }
+
+    await this.dependencies.processService.stopDaemon();
+    this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage("Port Manager daemon stopped.");
   }
 
   /** Shows the latest daemon status known from the shared agent snapshot. */
@@ -292,6 +316,72 @@ export class PortManagerCommandController implements DisposableLike {
     await this.dependencies.processService.removeProcess(process.id);
   }
 
+  /** Installs a small shell shim so OS terminals can call the daemon wrapper. */
+  private async installExternalCli(context: vscode.ExtensionContext): Promise<void> {
+    const cliPath = context.asAbsolutePath(path.join("out", "src", "cli", "portmanager-cli.js"));
+    const installDirectory = getExternalCliInstallDirectory();
+    const shimPath = getExternalCliShimPath(installDirectory);
+    const shimContent = buildExternalCliShim(cliPath);
+
+    await fs.mkdir(installDirectory, { recursive: true });
+    await fs.writeFile(shimPath, shimContent, "utf8");
+
+    if (process.platform !== "win32") {
+      await fs.chmod(shimPath, 0o755);
+    }
+
+    const pathHint = buildPathHint(installDirectory);
+    const selection = await vscode.window.showInformationMessage(
+      `Installed Port Manager CLI shim: ${shimPath}`,
+      pathHint === undefined ? "Copy Command" : "Copy PATH Setup",
+    );
+
+    if (selection === "Copy Command") {
+      await vscode.env.clipboard.writeText(`"${shimPath}"`);
+    }
+
+    if (selection === "Copy PATH Setup" && pathHint !== undefined) {
+      await vscode.env.clipboard.writeText(pathHint);
+    }
+  }
+
+  /** Installs the native socket hook into the user's shell startup file. */
+  private async installShellHook(context: vscode.ExtensionContext): Promise<void> {
+    const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
+    const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
+    const hookDirectory = path.join(os.homedir(), ".portmanager");
+    const hookScriptPath = path.join(hookDirectory, "portmanager-hook.sh");
+    const shellProfilePath = getShellProfilePath();
+    const sourceLine = `. "${hookScriptPath}"`;
+
+    await fs.mkdir(hookDirectory, { recursive: true });
+    await fs.writeFile(
+      hookScriptPath,
+      buildShellHookScript({
+        hookLibraryPath,
+        agentMainPath,
+        nodeExecutablePath: process.execPath,
+        socketPath: getAgentSocketPath(),
+        routeTablePath: getDefaultRouteTablePath(),
+      }),
+      "utf8",
+    );
+
+    if (shellProfilePath !== undefined) {
+      await appendLineOnce(shellProfilePath, sourceLine);
+    }
+
+    const message =
+      shellProfilePath === undefined
+        ? `Installed Port Manager shell hook: ${hookScriptPath}`
+        : `Installed Port Manager shell hook and updated ${shellProfilePath}`;
+    const selection = await vscode.window.showInformationMessage(message, "Copy Source Line");
+
+    if (selection === "Copy Source Line") {
+      await vscode.env.clipboard.writeText(sourceLine);
+    }
+  }
+
   /**
    * Starts a process from an explicit profile through the agent, which owns
    * routing and restart metadata.
@@ -343,6 +433,7 @@ export class PortManagerCommandController implements DisposableLike {
 
     return selected?.process;
   }
+
   /** Registers one command and wraps thrown errors in a user-visible message. */
   private registerCommand(
     context: vscode.ExtensionContext,
@@ -457,6 +548,152 @@ async function openUrl(url: string): Promise<void> {
 /** Validates the user-facing TCP port range. */
 function isValidPort(port: number): boolean {
   return Number.isInteger(port) && port >= 1 && port <= 65_535;
+}
+
+/** Returns the platform-specific directory used for the external CLI shim. */
+function getExternalCliInstallDirectory(): string {
+  if (process.platform === "win32") {
+    return path.join(os.homedir(), "bin");
+  }
+
+  return path.join(os.homedir(), ".local", "bin");
+}
+
+/** Returns the executable shim path installed by the command palette action. */
+function getExternalCliShimPath(installDirectory: string): string {
+  return path.join(installDirectory, process.platform === "win32" ? "portmanager.cmd" : "portmanager");
+}
+
+/** Builds a tiny shell wrapper that points at this extension's compiled CLI. */
+function buildExternalCliShim(cliPath: string): string {
+  if (process.platform === "win32") {
+    return `@echo off\r\n"${process.execPath}" "${cliPath}" %*\r\n`;
+  }
+
+  return `#!/bin/sh\nexec "${process.execPath}" "${cliPath}" "$@"\n`;
+}
+
+/** Builds a shell command users can paste if the shim directory is not on PATH. */
+function buildPathHint(installDirectory: string): string | undefined {
+  const pathEntries = (process.env.PATH ?? "").split(path.delimiter);
+  if (pathEntries.includes(installDirectory)) {
+    return undefined;
+  }
+
+  if (process.platform === "win32") {
+    return `setx PATH "%PATH%;${installDirectory}"`;
+  }
+
+  return `export PATH="${installDirectory}:$PATH"`;
+}
+
+/** Returns the packaged native hook library for the current OS. */
+function getHookLibraryRelativePath(): string {
+  if (process.platform === "darwin") {
+    return path.join("media", "native", "libportmanager_hook.dylib");
+  }
+
+  if (process.platform === "linux") {
+    return path.join("media", "native", "libportmanager_hook.so");
+  }
+
+  throw new Error("Native shell hook is currently supported on macOS and Linux.");
+}
+
+/** Chooses the user's current shell startup file when it is a POSIX shell. */
+function getShellProfilePath(): string | undefined {
+  const shellName = path.basename(process.env.SHELL ?? "");
+
+  if (shellName === "zsh") {
+    return path.join(os.homedir(), ".zshrc");
+  }
+
+  if (shellName === "bash") {
+    return path.join(os.homedir(), ".bashrc");
+  }
+
+  if (shellName === "sh") {
+    return path.join(os.homedir(), ".profile");
+  }
+
+  return undefined;
+}
+
+interface ShellHookScriptOptions {
+  /** Native hook library packaged with this extension. */
+  readonly hookLibraryPath: string;
+  /** Agent entrypoint used when no daemon socket exists yet. */
+  readonly agentMainPath: string;
+  /** Node-compatible executable used by VS Code to run extension JS. */
+  readonly nodeExecutablePath: string;
+  /** Singleton agent socket path shared with VS Code windows. */
+  readonly socketPath: string;
+  /** Dynamic route-table JSON file written by the daemon. */
+  readonly routeTablePath: string;
+}
+
+/** Builds the POSIX shell snippet that injects the native socket hook. */
+function buildShellHookScript(options: ShellHookScriptOptions): string {
+  const escapedHookLibraryPath = shellDoubleQuote(options.hookLibraryPath);
+  const escapedAgentMainPath = shellDoubleQuote(options.agentMainPath);
+  const escapedNodeExecutablePath = shellDoubleQuote(options.nodeExecutablePath);
+  const escapedSocketPath = shellDoubleQuote(options.socketPath);
+  const escapedRouteTablePath = shellDoubleQuote(options.routeTablePath);
+
+  return `# Port Manager shell hook
+# This file is generated by the VS Code Port Manager extension.
+export PORT_MANAGER_HOOK=1
+export PORT_MANAGER_AGENT_SOCKET="${escapedSocketPath}"
+export PORT_MANAGER_ROUTES_FILE="${escapedRouteTablePath}"
+export PORT_MANAGER_AGENT_MAIN="${escapedAgentMainPath}"
+
+if [ -z "$\{PORT_MANAGER_HOOK_DAEMON_STARTED:-}" ]; then
+  export PORT_MANAGER_HOOK_DAEMON_STARTED=1
+  if [ ! -S "$PORT_MANAGER_AGENT_SOCKET" ]; then
+    nohup "${escapedNodeExecutablePath}" "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" >/tmp/newdlops-portmanager-agent.log 2>&1 &
+  fi
+fi
+
+if [ -f "${escapedHookLibraryPath}" ]; then
+  case "$(uname -s)" in
+    Darwin)
+      case ":\${DYLD_INSERT_LIBRARIES:-}:" in
+        *:"${escapedHookLibraryPath}":*) ;;
+        *) export DYLD_INSERT_LIBRARIES="${escapedHookLibraryPath}\${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}" ;;
+      esac
+      ;;
+    Linux)
+      case ":\${LD_PRELOAD:-}:" in
+        *:"${escapedHookLibraryPath}":*) ;;
+        *) export LD_PRELOAD="${escapedHookLibraryPath}\${LD_PRELOAD:+:$LD_PRELOAD}" ;;
+      esac
+      ;;
+  esac
+fi
+`;
+}
+
+/** Appends one line to a shell profile if it is not already present. */
+async function appendLineOnce(filePath: string, line: string): Promise<void> {
+  let existingContent = "";
+
+  try {
+    existingContent = await fs.readFile(filePath, "utf8");
+  } catch {
+    // Missing shell profiles are created on first install.
+  }
+
+  if (existingContent.split(/\r?\n/).includes(line)) {
+    return;
+  }
+
+  const prefix = existingContent.length > 0 && !existingContent.endsWith("\n") ? "\n" : "";
+  await fs.writeFile(filePath, `${existingContent}${prefix}${line}\n`, "utf8");
+}
+
+/** Escapes a string for safe use inside POSIX double quotes. */
+function shellDoubleQuote(value: string): string {
+  return value.replace(/(["\\$`])/g, "\\$1");
 }
 
 /** Shows concise but specific command errors. */

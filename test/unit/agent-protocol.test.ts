@@ -48,6 +48,36 @@ test("buffers partial NDJSON chunks until a complete frame is available", () => 
   assert.deepEqual(decodedMessages[1], { id: 2, method: "refreshSnapshot" });
 });
 
+test("recognizes external route allocation request methods", () => {
+  const allocateMessage = {
+    id: "request-allocate",
+    method: "allocateRoute",
+    payload: {
+      cwd: "/workspace/app",
+      requestedPort: 8000,
+      host: "localhost",
+      scanRange: 20,
+      scanDirection: "up",
+      routingMode: "hashed",
+    },
+  } as const;
+  const releaseMessage = {
+    id: "request-release",
+    method: "releaseRouteAllocation",
+    payload: {
+      allocationId: "allocation:test",
+    },
+  } as const;
+  const shutdownMessage = {
+    id: "request-shutdown",
+    method: "shutdownDaemon",
+  } as const;
+
+  assert.equal(isAgentRequestMessage(allocateMessage), true);
+  assert.equal(isAgentRequestMessage(releaseMessage), true);
+  assert.equal(isAgentRequestMessage(shutdownMessage), true);
+});
+
 test("snapshot merge keeps managed route context and adds external listeners", () => {
   const managedProcess = createManagedProcess({
     id: "managed-1",
@@ -106,6 +136,37 @@ test("snapshot merge keeps managed route context and adds external listeners", (
       processName: "web",
       status: "running",
       source: "managed",
+    },
+  ]);
+});
+
+test("snapshot merge includes pending external route allocations", () => {
+  const snapshot = buildAgentSnapshot({
+    agentPid: 777,
+    registryProcesses: [],
+    pendingRoutes: [
+      {
+        logicalPort: 8000,
+        actualPort: 58000,
+        host: "localhost",
+        processName: "external-cli",
+        status: "starting",
+        source: "allocated",
+      },
+    ],
+    listeners: [],
+    updatedAt: fixedUpdatedAt,
+  });
+
+  assert.equal(snapshot.daemon.routeCount, 1);
+  assert.deepEqual(snapshot.routes, [
+    {
+      logicalPort: 8000,
+      actualPort: 58000,
+      host: "localhost",
+      processName: "external-cli",
+      status: "starting",
+      source: "allocated",
     },
   ]);
 });

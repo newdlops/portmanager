@@ -116,8 +116,6 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
 
 /** Collapsible root row used as a VS Code tree accordion section. */
 class TreeSectionItem extends vscode.TreeItem {
-  readonly contextValue = "section";
-
   constructor(
     readonly kind: TreeSectionKind,
     label: string,
@@ -126,6 +124,7 @@ class TreeSectionItem extends vscode.TreeItem {
   ) {
     super(label, vscode.TreeItemCollapsibleState.Expanded);
     this.id = `section:${kind}`;
+    this.contextValue = `section.${kind}`;
     this.description = description;
     this.iconPath = new vscode.ThemeIcon(icon);
   }

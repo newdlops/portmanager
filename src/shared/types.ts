@@ -16,7 +16,7 @@ export type PortInjectionMode = "env" | "template" | "argument";
 
 export type ProcessKillSignal = NodeJS.Signals | "SIGKILL" | "SIGTERM";
 
-export type ProcessSource = "managed" | "registered" | "detected";
+export type ProcessSource = "managed" | "registered" | "detected" | "allocated";
 
 export type PortProtocol = "tcp";
 
@@ -51,6 +51,8 @@ export interface PortManagerSettings {
   readonly monitorAllListeningPorts: boolean;
   /** Whether terminal output should be scanned for bind/listen failures. */
   readonly detectTerminalListenFailures: boolean;
+  /** Whether explicit terminal port commands should be offered daemon routing at start. */
+  readonly routeTerminalCommandsOnStart: boolean;
   /** Signal used when stopping managed child processes. */
   readonly processKillSignal: ProcessKillSignal;
 }
@@ -193,6 +195,48 @@ export interface LogicalPortRoute {
   readonly source: ProcessSource;
 }
 
+export interface AgentAllocateRouteRequest {
+  /** Optional display name for a process that will use this allocation. */
+  readonly name?: string;
+  /** Optional shell command shown in diagnostics and future UI surfaces. */
+  readonly command?: string;
+  /** Working directory used as the default hashed route scope. */
+  readonly cwd: string;
+  /** Requested logical port. */
+  readonly requestedPort: number;
+  /** Host used for scanning and URL generation. */
+  readonly host: string;
+  /** Number of nearby candidate ports checked after the requested port is busy. */
+  readonly scanRange: number;
+  /** Candidate generation policy used by the agent. */
+  readonly scanDirection: ScanDirection;
+  /** Routing policy used by the agent. */
+  readonly routingMode?: PortRoutingMode;
+  /** First TCP port in the hashed actual-port range. */
+  readonly virtualPortRangeStart?: number;
+  /** Last TCP port in the hashed actual-port range. */
+  readonly virtualPortRangeEnd?: number;
+}
+
+export interface PortRouteAllocation {
+  /** Short-lived id used to release or replace the pending route. */
+  readonly allocationId: string;
+  /** Requested logical port. */
+  readonly requestedPort: number;
+  /** Actual TCP port assigned by the daemon. */
+  readonly actualPort: number;
+  /** Host associated with the route. */
+  readonly host: string;
+  /** True when the assigned actual port differs from the logical port. */
+  readonly routed: boolean;
+  /** Current logical routes plus this pending allocation. */
+  readonly logicalRoutes: readonly LogicalPortRoute[];
+  /** Path to the daemon-maintained dynamic route table. */
+  readonly logicalRoutesFile: string;
+  /** Expiration timestamp for the pending route if the client never registers. */
+  readonly expiresAt: string;
+}
+
 export type AgentDaemonState = "starting" | "running" | "disconnected" | "error";
 
 export interface AgentDaemonStatus {
@@ -274,6 +318,8 @@ export interface RegisteredProcessInput {
   readonly actualPort: number;
   /** Host used to build the user-facing URL. */
   readonly host: string;
+  /** Optional pending route allocation that this running process consumes. */
+  readonly allocationId?: string;
 }
 
 export interface ManagedProcessStartInput {

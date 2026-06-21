@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildReroutableCommand,
   detectTerminalListenFailure,
+  detectTerminalPortIntent,
 } from "../../src/core/terminal-conflict-parser";
 
 /**
@@ -29,6 +30,34 @@ test("detects generic EADDRINUSE output with host and port", () => {
 
   assert.equal(failure?.host, "0.0.0.0");
   assert.equal(failure?.port, 3000);
+});
+
+test("detects explicit terminal port flags before bind failure", () => {
+  const intent = detectTerminalPortIntent("vite --host 0.0.0.0 --port 3000");
+
+  assert.equal(intent?.port, 3000);
+  assert.equal(intent?.source, "flag");
+});
+
+test("detects PORT environment assignments before bind failure", () => {
+  const intent = detectTerminalPortIntent("PORT=8000 npm run dev");
+
+  assert.equal(intent?.port, 8000);
+  assert.equal(intent?.source, "env");
+});
+
+test("detects Django runserver host and port before bind failure", () => {
+  const intent = detectTerminalPortIntent("python manage.py runserver 127.0.0.1:8004");
+
+  assert.equal(intent?.host, "127.0.0.1");
+  assert.equal(intent?.port, 8004);
+  assert.equal(intent?.source, "runserver");
+});
+
+test("does not treat unrelated command numbers as port intent", () => {
+  const intent = detectTerminalPortIntent("npm install vite@5.2.0");
+
+  assert.equal(intent, undefined);
 });
 
 test("rewrites commands that already contain the requested port into template mode", () => {

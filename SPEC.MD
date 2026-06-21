@@ -111,7 +111,12 @@ Port Manager agent가 관리하는 `논리 포트 -> 실제 포트` 관계이다
 - 확장은 OS 사용자 단위의 단일 local agent와 통신하고, 여러 VS Code 창은 동일한 agent snapshot을 공유해야 한다.
 - agent는 전체 listening TCP 포트를 감시하고, 관리형 프로세스의 논리 요청 포트와 실제 라우팅 포트 매핑을 함께 제공해야 한다.
 - agent는 실행 중인 관리형 프로세스의 논리 라우팅 테이블을 snapshot과 프로세스 환경 변수로 제공해야 한다.
+- daemon 시작/상태 확인/종료 기능은 Command Palette뿐 아니라 사이드 패널 UI에서도 접근 가능해야 한다.
+- VS Code 터미널 명령이 `--port`, `-p`, `PORT=`, `host:port`, `runserver host:port`처럼 명시적 포트를 포함하면 확장은 bind 실패를 기다리지 않고 daemon 경유 재실행을 제안해야 한다.
 - 확장은 VS Code shell integration이 제공하는 터미널 출력에서 listen/bind 실패 메시지를 감지하고 라우팅 재실행을 제안해야 한다.
+- 외부 OS 터미널에서 실행되는 프로세스는 shell hook을 통해 `bind/connect/getsockname`이 가로채져 daemon의 논리 라우팅 테이블과 동기화되어야 한다.
+- 확장은 외부 터미널 hook을 쉽게 사용할 수 있도록 `Port Manager: Install Shell Hook` 명령으로 OS별 native hook 주입 스크립트를 설치할 수 있어야 한다.
+- daemon은 native hook을 위해 short-lived route allocation을 제공하고, `bind()` 성공 후 hook이 해당 프로세스를 등록할 수 있어야 한다.
 - 플랫폼별 조회 방식을 지원해야 한다.
   - macOS/Linux: `lsof`, `netstat`, `ss` 중 사용 가능한 명령
   - Windows: `netstat`, PowerShell, `Get-NetTCPConnection`
@@ -413,7 +418,10 @@ VS Code Command Palette에 다음 명령을 등록한다.
 - agent snapshot과 실행 프로세스 환경 변수에 논리 라우팅 테이블이 제공된다.
 - 사이드 패널이 Daemon, Routing Table, Managed Processes, OS Listening Ports 아코디언으로 구분된다.
 - Daemon 섹션에서 PID, 상태, listener 수, route 수, route table 파일 경로를 확인할 수 있다.
+- 사이드 패널 UI에서 daemon을 종료하면 daemon snapshot이 disconnected 상태로 전환된다.
 - 외부 프로세스가 종료되면 OS Listening Ports 섹션에서 해당 listener가 자동으로 사라진다.
+- 터미널에서 명시적 포트를 포함한 서버 명령을 실행하면 daemon이 논리 포트를 실제 포트로 배정하는 재실행 경로가 bind 실패 전부터 제공된다.
+- 외부 OS 터미널에서 기존 명령을 그대로 실행해도 hook이 `bind(8000)`을 실제 포트로 바꾸고 daemon의 라우팅 테이블과 사이드 패널에 표시한다.
 - 같은 요청 포트를 가진 여러 관리형 프로세스가 각각 다른 실제 포트로 실행될 수 있다.
 - 사이드 패널 행 클릭은 브라우저를 열지 않고 선택만 수행한다.
 - 사용자가 사이드 패널에서 프로세스를 종료하고 재시작할 수 있다.

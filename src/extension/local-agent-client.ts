@@ -1,9 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
-import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { getAgentSocketPath, removeStaleSocketFile } from "../agent/agent-socket";
 import { readPortManagerSettings } from "../config/vscode-settings";
 import { SimpleEventEmitter } from "../shared/events";
 import type {
@@ -28,6 +28,7 @@ import type { PortManagerProcessService } from "./process-service";
 type AgentMethod =
   | "listSnapshot"
   | "refreshSnapshot"
+  | "shutdownDaemon"
   | "startManagedProcess"
   | "registerExistingProcess"
   | "stopProcess"
@@ -111,6 +112,37 @@ export class LocalAgentClient implements PortManagerProcessService {
   async start(): Promise<void> {
     await this.ensureConnected();
     await this.refresh();
+  }
+
+  /** Stops the singleton local agent and resets the extension-side snapshot. */
+  async stopDaemon(): Promise<void> {
+    const daemonPid = this.snapshot.daemon.pid;
+
+    if (this.socket !== undefined && !this.socket.destroyed) {
+      try {
+        await this.request<boolean>("shutdownDaemon");
+      } catch {
+        if (daemonPid > 0 && daemonPid !== process.pid) {
+          try {
+            process.kill(daemonPid, "SIGTERM");
+          } catch {
+            // The daemon may already have exited or belong to another stale snapshot.
+          }
+        }
+      }
+    } else if (daemonPid > 0 && daemonPid !== process.pid) {
+      try {
+        process.kill(daemonPid, "SIGTERM");
+      } catch {
+        // Treat missing daemon processes as already stopped.
+      }
+    }
+
+    this.socket?.destroy();
+    this.socket = undefined;
+    this.childProcess = undefined;
+    this.snapshot = createEmptySnapshot();
+    this.changeEvents.emit();
   }
 
   /** Returns the latest complete agent snapshot for status and tree sections. */
@@ -430,39 +462,6 @@ export class LocalAgentClient implements PortManagerProcessService {
       pending.reject(error);
       this.pendingRequests.delete(id);
     }
-  }
-}
-
-/**
- * Builds a per-user singleton socket path. POSIX uses a Unix domain socket in
- * the temp directory; Windows uses a named pipe.
- */
-export function getAgentSocketPath(): string {
-  if (process.platform === "win32") {
-    return "\\\\.\\pipe\\newdlops-portmanager-agent";
-  }
-
-  const userId = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;
-  return path.join(os.tmpdir(), `newdlops-portmanager-agent-${userId}.sock`);
-}
-
-/**
- * Removes a stale Unix-domain socket after connection has already failed.
- * Active agents are not touched because a healthy socket would have accepted
- * the initial connection before this cleanup path runs.
- */
-function removeStaleSocketFile(socketPath: string): void {
-  if (process.platform === "win32") {
-    return;
-  }
-
-  try {
-    if (fs.existsSync(socketPath)) {
-      fs.unlinkSync(socketPath);
-    }
-  } catch {
-    // A concurrent VS Code window may have removed or recreated the socket.
-    // The subsequent connect retry decides whether startup actually worked.
   }
 }
 

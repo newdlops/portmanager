@@ -1,8 +1,10 @@
 import type {
+  AgentAllocateRouteRequest,
   AgentSnapshot,
   AgentStartManagedProcessRequest,
   ManagedProcess,
   ProcessKillSignal,
+  PortRouteAllocation,
   PortRoutingMode,
   RegisteredProcessInput,
   ScanDirection,
@@ -19,6 +21,9 @@ import type {
 
 export type AgentRequestMethod =
   | "listSnapshot"
+  | "allocateRoute"
+  | "releaseRouteAllocation"
+  | "shutdownDaemon"
   | "startManagedProcess"
   | "registerExistingProcess"
   | "stopProcess"
@@ -105,8 +110,16 @@ export interface RemoveProcessPayload {
   readonly id: string;
 }
 
+export interface ReleaseRouteAllocationPayload {
+  /** Pending allocation id returned by allocateRoute. */
+  readonly allocationId: string;
+}
+
 export type AgentRequestPayloadByMethod = {
   readonly listSnapshot: undefined;
+  readonly allocateRoute: AgentAllocateRouteRequest;
+  readonly releaseRouteAllocation: ReleaseRouteAllocationPayload;
+  readonly shutdownDaemon: undefined;
   readonly startManagedProcess: AgentStartManagedProcessRequest;
   readonly registerExistingProcess: RegisteredProcessInput;
   readonly stopProcess: StopProcessPayload;
@@ -117,6 +130,9 @@ export type AgentRequestPayloadByMethod = {
 
 export type AgentResponsePayloadByMethod = {
   readonly listSnapshot: AgentSnapshot;
+  readonly allocateRoute: PortRouteAllocation;
+  readonly releaseRouteAllocation: boolean;
+  readonly shutdownDaemon: boolean;
   readonly startManagedProcess: ManagedProcess;
   readonly registerExistingProcess: ManagedProcess;
   readonly stopProcess: ManagedProcess | undefined;
@@ -225,6 +241,9 @@ export function createErrorResponse(
 function isAgentRequestMethod(value: unknown): value is AgentRequestMethod {
   return (
     value === "listSnapshot" ||
+    value === "allocateRoute" ||
+    value === "releaseRouteAllocation" ||
+    value === "shutdownDaemon" ||
     value === "startManagedProcess" ||
     value === "registerExistingProcess" ||
     value === "stopProcess" ||

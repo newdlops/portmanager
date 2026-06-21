@@ -1,11 +1,13 @@
+import { randomUUID } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { ManagedProcessRegistry } from "../core/process-registry";
 import { PortRoutingService } from "../core/port-routing";
 import { SimpleEventEmitter } from "../shared/events";
+import { getDefaultRouteTablePath } from "./route-table";
 import type {
+  AgentAllocateRouteRequest,
   AgentSnapshot,
   AgentStartManagedProcessRequest,
   DisposableLike,
@@ -17,6 +19,7 @@ import type {
   ProcessKillSignal,
   ProcessLauncher,
   PortAvailabilityProvider,
+  PortRouteAllocation,
   RegisteredProcessInput,
 } from "../shared/types";
 import {
@@ -28,6 +31,7 @@ import {
   type AgentRequestMessage,
   type RemoveProcessPayload,
   type RestartProcessPayload,
+  type ReleaseRouteAllocationPayload,
   type StopProcessPayload,
 } from "./protocol";
 
@@ -42,6 +46,7 @@ import {
 const DEFAULT_KILL_SIGNAL: ProcessKillSignal = "SIGTERM";
 const DETECTED_PROCESS_ID_PREFIX = "detected:";
 const DEFAULT_LISTENER_SCAN_INTERVAL_MS = 3_000;
+const ROUTE_ALLOCATION_TTL_MS = 30_000;
 
 export interface PortManagerAgentOptions {
   /** Shared registry for managed and manually registered process rows. */
@@ -75,6 +80,8 @@ export interface BuildAgentSnapshotOptions {
   readonly agentPid: number;
   /** Registry rows for managed and manually registered processes. */
   readonly registryProcesses: readonly ManagedProcess[];
+  /** Short-lived routes allocated for external CLI launches before register. */
+  readonly pendingRoutes?: readonly LogicalPortRoute[];
   /** Raw listener rows returned by the platform provider. */
   readonly listeners: readonly ListeningPort[];
   /** Snapshot timestamp shared by generated rows. */
@@ -96,6 +103,15 @@ interface AgentClientConnection {
   readonly socket: Socket;
   /** Per-client decoder because frames can be split differently per socket. */
   readonly buffer: NdjsonMessageBuffer;
+}
+
+interface PendingRouteAllocation {
+  /** Opaque id returned to the client that requested the allocation. */
+  readonly id: string;
+  /** Route row visible until the launched process registers or TTL expires. */
+  readonly route: LogicalPortRoute;
+  /** Millisecond deadline after which the pending route is discarded. */
+  readonly expiresAtMs: number;
 }
 
 /**
@@ -121,6 +137,9 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Detected listener rows hidden from process view after removeProcess. */
   private readonly suppressedDetectedProcessIds = new Set<string>();
+
+  /** Short-lived route reservations created for external terminal wrappers. */
+  private readonly pendingRouteAllocations = new Map<string, PendingRouteAllocation>();
 
   /** Active socket clients that should receive snapshot broadcasts. */
   private readonly clients = new Set<AgentClientConnection>();
@@ -179,8 +198,28 @@ export class PortManagerAgent implements DisposableLike {
       });
     this.processLauncher = options.processLauncher;
     this.listeningPortProvider = options.listeningPortProvider;
+    const portAvailabilityProvider = options.portAvailabilityProvider;
     this.routingService =
-      options.routingService ?? new PortRoutingService(requirePortAvailabilityProvider(options));
+      options.routingService ??
+      new PortRoutingService({
+        check: async (port, host) => {
+          if (this.isActualPortReserved(port)) {
+            return {
+              port,
+              available: false,
+              owner: {
+                name: "Port Manager pending route allocation",
+              },
+            };
+          }
+
+          if (portAvailabilityProvider === undefined) {
+            throw new Error("PortManagerAgent requires a portAvailabilityProvider or routingService.");
+          }
+
+          return portAvailabilityProvider.check(port, host);
+        },
+      });
     this.agentPid = options.agentPid ?? process.pid;
     this.now = options.now ?? (() => new Date());
     this.startedAt = this.now().toISOString();
@@ -251,6 +290,75 @@ export class PortManagerAgent implements DisposableLike {
   }
 
   /**
+   * Allocates an actual port for an external wrapper before it launches.
+   * The pending route is short-lived so abandoned CLI attempts do not leave
+   * stale logical mappings in the shared route table.
+   */
+  async allocateRoute(input: AgentAllocateRouteRequest): Promise<PortRouteAllocation> {
+    this.cleanupExpiredRouteAllocations();
+
+    const decision = await this.routingService.route({
+      requestedPort: input.requestedPort,
+      host: input.host,
+      scanRange: input.scanRange,
+      scanDirection: input.scanDirection,
+      routingMode: input.routingMode,
+      routeScope: input.cwd,
+      virtualPortRangeStart: input.virtualPortRangeStart,
+      virtualPortRangeEnd: input.virtualPortRangeEnd,
+    });
+    const allocationId = `allocation:${randomUUID()}`;
+    const expiresAtMs = this.now().getTime() + ROUTE_ALLOCATION_TTL_MS;
+    const route = buildAllocatedLogicalRoute(input, decision.actualPort);
+
+    this.pendingRouteAllocations.set(allocationId, {
+      id: allocationId,
+      route,
+      expiresAtMs,
+    });
+
+    const logicalRoutes = this.buildCurrentLogicalRoutes();
+    this.writeRouteTable(logicalRoutes);
+    this.queueSnapshotBroadcast();
+
+    return {
+      allocationId,
+      requestedPort: input.requestedPort,
+      actualPort: decision.actualPort,
+      host: input.host,
+      routed: decision.routed,
+      logicalRoutes,
+      logicalRoutesFile: this.routeTablePath,
+      expiresAt: new Date(expiresAtMs).toISOString(),
+    };
+  }
+
+  /** Releases a pending route allocation that did not become a process row. */
+  releaseRouteAllocation(allocationId: string): boolean {
+    const released = this.pendingRouteAllocations.delete(allocationId);
+
+    if (released) {
+      this.writeRouteTable(this.buildCurrentLogicalRoutes());
+      this.queueSnapshotBroadcast();
+    }
+
+    return released;
+  }
+
+  /**
+   * Schedules daemon shutdown after the response frame has a chance to flush.
+   * Running child processes are intentionally not killed here; the daemon is a
+   * routing/control plane and Stop Process remains the explicit lifecycle tool.
+   */
+  shutdownDaemon(): boolean {
+    setTimeout(() => {
+      this.dispose();
+    }, 25);
+
+    return true;
+  }
+
+  /**
    * Starts a managed process after routing its requested port.
    * The launch profile is kept outside the public process model because it is
    * execution policy, not user-facing process state.
@@ -276,7 +384,7 @@ export class PortManagerAgent implements DisposableLike {
       host: input.host,
       actualPort: decision.actualPort,
       injectionMode: input.injectionMode,
-      logicalRoutes: buildLogicalRoutes(this.registry.list(), pendingRoute),
+      logicalRoutes: buildLogicalRoutes(this.registry.list(), [pendingRoute]),
       logicalRoutesFile: this.routeTablePath,
     });
 
@@ -301,6 +409,10 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Registers an already-running external process in the shared registry. */
   async registerExistingProcess(input: RegisteredProcessInput): Promise<ManagedProcess> {
+    if (input.allocationId !== undefined) {
+      this.pendingRouteAllocations.delete(input.allocationId);
+    }
+
     return this.registry.register(input, {
       source: "registered",
     });
@@ -380,7 +492,7 @@ export class PortManagerAgent implements DisposableLike {
       injectionMode: nextProfile.injectionMode,
       logicalRoutes: buildLogicalRoutes(
         this.registry.list().filter((candidate) => candidate.id !== id),
-        pendingRoute,
+        [pendingRoute],
       ),
       logicalRoutesFile: this.routeTablePath,
     });
@@ -519,6 +631,14 @@ export class PortManagerAgent implements DisposableLike {
     switch (request.method) {
       case "listSnapshot":
         return this.listSnapshot();
+      case "allocateRoute":
+        return this.allocateRoute(request.payload as AgentAllocateRouteRequest);
+      case "releaseRouteAllocation": {
+        const payload = request.payload as ReleaseRouteAllocationPayload;
+        return this.releaseRouteAllocation(payload.allocationId);
+      }
+      case "shutdownDaemon":
+        return this.shutdownDaemon();
       case "startManagedProcess":
         return this.startManagedProcess(request.payload as AgentStartManagedProcessRequest);
       case "registerExistingProcess":
@@ -628,10 +748,13 @@ export class PortManagerAgent implements DisposableLike {
    * unit-testable without a real child process or OS command.
    */
   private async buildSnapshot(): Promise<AgentSnapshot> {
+    this.cleanupExpiredRouteAllocations();
+
     const listeners = await this.listeningPortProvider.list();
     const snapshot = buildAgentSnapshot({
       agentPid: this.agentPid,
       registryProcesses: this.registry.list(),
+      pendingRoutes: this.listPendingRoutes(),
       listeners,
       updatedAt: this.now().toISOString(),
       daemonStartedAt: this.startedAt,
@@ -643,6 +766,36 @@ export class PortManagerAgent implements DisposableLike {
 
     this.writeRouteTable(snapshot.routes);
     return snapshot;
+  }
+
+  /** Builds active routes from registry rows and short-lived allocations. */
+  private buildCurrentLogicalRoutes(): readonly LogicalPortRoute[] {
+    this.cleanupExpiredRouteAllocations();
+    return buildLogicalRoutes(this.registry.list(), this.listPendingRoutes());
+  }
+
+  /** Lists pending route rows in a stable order for snapshots and env payloads. */
+  private listPendingRoutes(): readonly LogicalPortRoute[] {
+    return [...this.pendingRouteAllocations.values()]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((allocation) => ({ ...allocation.route }));
+  }
+
+  /** True when a short-lived route allocation already owns this actual port. */
+  private isActualPortReserved(port: number): boolean {
+    this.cleanupExpiredRouteAllocations();
+    return [...this.pendingRouteAllocations.values()].some((allocation) => allocation.route.actualPort === port);
+  }
+
+  /** Removes abandoned route allocations after their TTL. */
+  private cleanupExpiredRouteAllocations(): void {
+    const nowMs = this.now().getTime();
+
+    for (const [id, allocation] of this.pendingRouteAllocations) {
+      if (allocation.expiresAtMs <= nowMs) {
+        this.pendingRouteAllocations.delete(id);
+      }
+    }
   }
 
   /** Writes the latest dynamic route table for already-running children. */
@@ -705,7 +858,7 @@ export function buildAgentSnapshot(options: BuildAgentSnapshotOptions): AgentSna
     )
     .filter((process) => !options.suppressedDetectedProcessIds?.has(process.id));
 
-  const routes = buildLogicalRoutes(options.registryProcesses);
+  const routes = buildLogicalRoutes(options.registryProcesses, options.pendingRoutes ?? []);
   const daemon = buildDaemonStatus({
     agentPid: options.agentPid,
     updatedAt: options.updatedAt,
@@ -753,7 +906,7 @@ function buildDaemonStatus(options: {
  */
 function buildLogicalRoutes(
   processes: readonly ManagedProcess[],
-  pendingRoute?: LogicalPortRoute,
+  pendingRoutes: readonly LogicalPortRoute[] = [],
 ): readonly LogicalPortRoute[] {
   const routes = processes
     .filter((process) => process.status === "running" && process.source !== "detected")
@@ -767,7 +920,7 @@ function buildLogicalRoutes(
       source: process.source ?? "managed",
     }));
 
-  return pendingRoute === undefined ? routes : [...routes, pendingRoute];
+  return [...routes, ...pendingRoutes.map((route) => ({ ...route }))];
 }
 
 /** Creates the route row for a process before the registry has assigned an id. */
@@ -779,6 +932,18 @@ function buildPendingLogicalRoute(input: AgentStartManagedProcessRequest, actual
     processName: input.name,
     status: "running",
     source: "managed",
+  };
+}
+
+/** Creates a route row for an external CLI process before it is spawned. */
+function buildAllocatedLogicalRoute(input: AgentAllocateRouteRequest, actualPort: number): LogicalPortRoute {
+  return {
+    logicalPort: input.requestedPort,
+    actualPort,
+    host: input.host,
+    processName: input.name ?? input.command,
+    status: "starting",
+    source: "allocated",
   };
 }
 
@@ -883,21 +1048,6 @@ function normalizeListenerHost(localAddress: string, defaultHost: string): strin
   }
 
   return trimmedAddress;
-}
-
-/** Ensures the router can be built when a prebuilt routing service is omitted. */
-function requirePortAvailabilityProvider(options: PortManagerAgentOptions): PortAvailabilityProvider {
-  if (options.portAvailabilityProvider === undefined) {
-    throw new Error("PortManagerAgent requires a portAvailabilityProvider or routingService.");
-  }
-
-  return options.portAvailabilityProvider;
-}
-
-/** Builds the per-user route table file path shared by one local agent. */
-function getDefaultRouteTablePath(): string {
-  const userId = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;
-  return path.join(os.tmpdir(), `newdlops-portmanager-routes-${userId}.json`);
 }
 
 /** Keeps daemon listener polling responsive without creating a tight loop. */

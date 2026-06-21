@@ -26,6 +26,17 @@ export interface ReroutableCommand {
   readonly injectionMode: PortInjectionMode;
 }
 
+export interface TerminalPortIntent {
+  /** Host explicitly present in the terminal command when available. */
+  readonly host?: string;
+  /** Logical TCP port the command appears to request. */
+  readonly port: number;
+  /** Pattern class that revealed the port intent. */
+  readonly source: "flag" | "env" | "address" | "runserver";
+  /** Sanitized command text used for the detection decision. */
+  readonly rawText: string;
+}
+
 const ANSI_ESCAPE_PATTERN = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
 
 /**
@@ -57,6 +68,45 @@ export function detectTerminalListenFailure(output: string): TerminalListenFailu
 
   if (portOnlyMatch) {
     return buildListenFailure(portOnlyMatch[1], sanitizedOutput, "address already in use");
+  }
+
+  return undefined;
+}
+
+/**
+ * Detects a terminal command's explicit port request before bind failure.
+ * Only clear server-port forms are accepted so unrelated numbers such as
+ * package versions, issue ids, or migration names do not trigger rerouting.
+ */
+export function detectTerminalPortIntent(command: string): TerminalPortIntent | undefined {
+  const sanitizedCommand = stripTerminalControlSequences(command).trim();
+
+  if (sanitizedCommand.length === 0) {
+    return undefined;
+  }
+
+  const envPortMatch = sanitizedCommand.match(/(?:^|\s)PORT=(\d{1,5})(?=\s|$)/);
+  if (envPortMatch) {
+    return buildPortIntent(envPortMatch[1], sanitizedCommand, "env");
+  }
+
+  const flagPortMatch = sanitizedCommand.match(/(?:^|\s)(?:--port|-p)(?:=|\s+)(\d{1,5})(?=\s|$)/);
+  if (flagPortMatch) {
+    return buildPortIntent(flagPortMatch[1], sanitizedCommand, "flag");
+  }
+
+  const runserverMatch = sanitizedCommand.match(
+    /(?:^|\s)runserver\s+(?:(localhost|127\.0\.0\.1|0\.0\.0\.0|\*|\[?::1\]?):)?(\d{1,5})(?=\s|$)/,
+  );
+  if (runserverMatch) {
+    return buildPortIntent(runserverMatch[2], sanitizedCommand, "runserver", runserverMatch[1]);
+  }
+
+  const addressMatch = sanitizedCommand.match(
+    /(?:^|\s)(localhost|127\.0\.0\.1|0\.0\.0\.0|\*|\[?::1\]?):(\d{1,5})(?=\s|$)/,
+  );
+  if (addressMatch) {
+    return buildPortIntent(addressMatch[2], sanitizedCommand, "address", addressMatch[1]);
   }
 
   return undefined;
@@ -108,6 +158,27 @@ function buildListenFailure(
     port,
     reason,
     rawText: rawText.trim(),
+  };
+}
+
+/** Builds a validated preflight port-intent result from a regex capture. */
+function buildPortIntent(
+  portText: string | undefined,
+  rawText: string,
+  source: TerminalPortIntent["source"],
+  host?: string,
+): TerminalPortIntent | undefined {
+  const port = Number.parseInt(portText ?? "", 10);
+
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    return undefined;
+  }
+
+  return {
+    host,
+    port,
+    source,
+    rawText,
   };
 }
 

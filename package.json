@@ -37,6 +37,7 @@
     "onStartupFinished",
     "onView:portManager.processes",
     "onCommand:portManager.startDaemon",
+    "onCommand:portManager.stopDaemon",
     "onCommand:portManager.showDaemonStatus",
     "onCommand:portManager.startManagedProcess",
     "onCommand:portManager.addExistingProcess",
@@ -47,12 +48,18 @@
     "onCommand:portManager.copyRoutedUrl",
     "onCommand:portManager.openRoutedUrl",
     "onCommand:portManager.removeProcess",
+    "onCommand:portManager.installShellHook",
+    "onCommand:portManager.installExternalCli",
     "onCommand:portManager.openSettings"
   ],
   "main": "./out/src/extension/activate.js",
+  "bin": {
+    "portmanager": "./out/src/cli/portmanager-cli.js"
+  },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run compile && npm run build:hook",
     "compile": "tsc -p ./",
+    "build:hook": "sh scripts/build-native-hook.sh",
     "watch": "tsc -watch -p ./",
     "test": "npm run compile && node --test out/test/unit/*.test.js",
     "package": "vsce package",
@@ -83,6 +90,12 @@
         "title": "Port Manager: Start Daemon",
         "category": "Port Manager",
         "icon": "$(server-process)"
+      },
+      {
+        "command": "portManager.stopDaemon",
+        "title": "Port Manager: Stop Daemon",
+        "category": "Port Manager",
+        "icon": "$(debug-disconnect)"
       },
       {
         "command": "portManager.showDaemonStatus",
@@ -143,6 +156,18 @@
         "icon": "$(trash)"
       },
       {
+        "command": "portManager.installExternalCli",
+        "title": "Port Manager: Install External CLI",
+        "category": "Port Manager",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "portManager.installShellHook",
+        "title": "Port Manager: Install Shell Hook",
+        "category": "Port Manager",
+        "icon": "$(plug)"
+      },
+      {
         "command": "portManager.openSettings",
         "title": "Port Manager: Open Settings",
         "category": "Port Manager",
@@ -157,37 +182,62 @@
           "group": "navigation@1"
         },
         {
-          "command": "portManager.showDaemonStatus",
+          "command": "portManager.stopDaemon",
           "when": "view == portManager.processes",
           "group": "navigation@2"
         },
         {
-          "command": "portManager.startManagedProcess",
+          "command": "portManager.showDaemonStatus",
           "when": "view == portManager.processes",
           "group": "navigation@3"
         },
         {
-          "command": "portManager.addExistingProcess",
+          "command": "portManager.startManagedProcess",
           "when": "view == portManager.processes",
           "group": "navigation@4"
         },
         {
-          "command": "portManager.refresh",
+          "command": "portManager.addExistingProcess",
           "when": "view == portManager.processes",
           "group": "navigation@5"
         },
         {
-          "command": "portManager.stopAllProcesses",
+          "command": "portManager.refresh",
           "when": "view == portManager.processes",
           "group": "navigation@6"
         },
         {
-          "command": "portManager.openSettings",
+          "command": "portManager.stopAllProcesses",
           "when": "view == portManager.processes",
           "group": "navigation@7"
+        },
+        {
+          "command": "portManager.openSettings",
+          "when": "view == portManager.processes",
+          "group": "navigation@8"
+        },
+        {
+          "command": "portManager.installExternalCli",
+          "when": "view == portManager.processes",
+          "group": "navigation@9"
+        },
+        {
+          "command": "portManager.installShellHook",
+          "when": "view == portManager.processes",
+          "group": "navigation@10"
         }
       ],
       "view/item/context": [
+        {
+          "command": "portManager.stopDaemon",
+          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
+          "group": "daemon@1"
+        },
+        {
+          "command": "portManager.showDaemonStatus",
+          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
+          "group": "daemon@2"
+        },
         {
           "command": "portManager.openRoutedUrl",
           "when": "view == portManager.processes && (viewItem == managedProcessRunning || viewItem == detectedProcess)",
@@ -318,6 +368,11 @@
           "type": "boolean",
           "default": true,
           "description": "Detect terminal bind/listen failures and offer to rerun the command through Port Manager routing."
+        },
+        "portManager.routeTerminalCommandsOnStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a VS Code terminal command explicitly requests a port, offer to stop it and rerun it through the Port Manager daemon before waiting for bind failure."
         },
         "portManager.processKillSignal": {
           "type": "string",

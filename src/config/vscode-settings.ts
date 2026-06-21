@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { DEFAULT_PORT_MANAGER_SETTINGS } from "../shared/default-settings";
 import type { PortManagerSettings, PortRoutingMode, ProcessKillSignal, ScanDirection } from "../shared/types";
 
 /**
@@ -8,24 +9,7 @@ import type { PortManagerSettings, PortRoutingMode, ProcessKillSignal, ScanDirec
  * are reflected without requiring extension reload.
  */
 
-const DEFAULT_SETTINGS: PortManagerSettings = {
-  enabled: true,
-  defaultHost: "localhost",
-  scanRange: 20,
-  scanDirection: "up",
-  routingMode: "hashed",
-  virtualPortRangeStart: 53_000,
-  virtualPortRangeEnd: 59_999,
-  preferredPorts: [3000, 3001, 5173, 8000, 8080],
-  autoOpenBrowser: false,
-  showConflictNotification: true,
-  watchPreferredPorts: true,
-  watchIntervalMs: 3000,
-  notifyOnDetectedConflict: true,
-  monitorAllListeningPorts: true,
-  detectTerminalListenFailures: true,
-  processKillSignal: "SIGTERM",
-};
+const DEFAULT_SETTINGS: PortManagerSettings = DEFAULT_PORT_MANAGER_SETTINGS;
 
 const VALID_SCAN_DIRECTIONS = new Set<ScanDirection>(["up", "down", "both"]);
 const VALID_ROUTING_MODES = new Set<PortRoutingMode>(["nearest", "hashed"]);
@@ -75,6 +59,10 @@ export function readPortManagerSettings(): PortManagerSettings {
     detectTerminalListenFailures: config.get<boolean>(
       "detectTerminalListenFailures",
       DEFAULT_SETTINGS.detectTerminalListenFailures,
+    ),
+    routeTerminalCommandsOnStart: config.get<boolean>(
+      "routeTerminalCommandsOnStart",
+      DEFAULT_SETTINGS.routeTerminalCommandsOnStart,
     ),
     processKillSignal: normalizeKillSignal(
       config.get<ProcessKillSignal>("processKillSignal", DEFAULT_SETTINGS.processKillSignal),

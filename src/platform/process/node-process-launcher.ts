@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { SimpleEventEmitter } from "../../shared/events";
+import { buildInjectedCommand, buildPortManagerEnvironment } from "./port-injection";
 import type {
   DisposableLike,
   ProcessKillSignal,
@@ -40,14 +41,13 @@ export class NodeProcessLauncher implements ProcessLauncher {
 
     // PORT remains the common development-server convention; the route env
     // values let duplicate app instances resolve logical ports explicitly.
-    const environment: NodeJS.ProcessEnv = {
-      ...process.env,
-      PORT: String(request.actualPort),
-      PORT_MANAGER_ACTUAL_PORT: String(request.actualPort),
-      PORT_MANAGER_LOGICAL_PORT: String(request.requestedPort),
-      PORT_MANAGER_ROUTES: JSON.stringify(request.logicalRoutes ?? []),
-      PORT_MANAGER_ROUTES_FILE: request.logicalRoutesFile ?? "",
-    };
+    const environment = buildPortManagerEnvironment({
+      baseEnv: process.env,
+      requestedPort: request.requestedPort,
+      actualPort: request.actualPort,
+      logicalRoutes: request.logicalRoutes,
+      logicalRoutesFile: request.logicalRoutesFile,
+    });
 
     const child = spawn(command, {
       cwd: request.cwd,
@@ -130,23 +130,4 @@ export class NodeProcessLauncher implements ProcessLauncher {
       this.exitEvents.emit({ pid, exitCode, signal });
     });
   }
-}
-
-/**
- * Applies the selected port injection strategy to the shell command.
- * Template mode rewrites every `${port}` placeholder, argument mode appends a
- * conventional `--port` flag, and env mode leaves command text unchanged.
- */
-function buildInjectedCommand(request: ProcessLaunchRequest): string {
-  const port = String(request.actualPort);
-
-  if (request.injectionMode === "template") {
-    return request.command.replaceAll("${port}", port);
-  }
-
-  if (request.injectionMode === "argument") {
-    return `${request.command.trimEnd()} --port ${port}`;
-  }
-
-  return request.command;
 }

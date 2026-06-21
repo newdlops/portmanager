@@ -1,17 +1,26 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { buildReroutableCommand, detectTerminalListenFailure } from "../core/terminal-conflict-parser";
+import {
+  buildReroutableCommand,
+  detectTerminalListenFailure,
+  detectTerminalPortIntent,
+} from "../core/terminal-conflict-parser";
 import { readPortManagerSettings } from "../config/vscode-settings";
-import type { DisposableLike, ManagedProcessStartInput } from "../shared/types";
+import type {
+  DisposableLike,
+  ManagedProcess,
+  ManagedProcessStartInput,
+  PortManagerSettings,
+} from "../shared/types";
 import type { PortManagerProcessService } from "./process-service";
 
 /**
  * Watches VS Code shell integration output for listen failures.
  *
- * This monitor does not intercept a process before it fails. Instead, it reads
- * terminal output as soon as a command starts, detects bind errors such as
- * Daphne's Errno 48 message, and offers to rerun the same command through the
- * Port Manager agent with port routing enabled.
+ * The monitor gives terminal commands an active daemon-managed path when their
+ * command line exposes a requested port. If that preflight route is missed, it
+ * still scans output for bind errors such as Daphne's Errno 48 message and
+ * offers the same daemon-managed rerun after failure.
  */
 
 export interface TerminalConflictMonitorOptions {
@@ -25,6 +34,9 @@ export class TerminalConflictMonitor implements DisposableLike {
 
   /** Executions already handled, preventing repeated prompts for one failure. */
   private readonly handledExecutions = new WeakSet<vscode.TerminalShellExecution>();
+
+  /** Executions that already received a start-time routing prompt. */
+  private readonly promptedExecutions = new WeakSet<vscode.TerminalShellExecution>();
 
   constructor(private readonly options: TerminalConflictMonitorOptions) {}
 
@@ -51,6 +63,14 @@ export class TerminalConflictMonitor implements DisposableLike {
    */
   private async watchExecution(event: vscode.TerminalShellExecutionStartEvent): Promise<void> {
     const settings = readPortManagerSettings();
+    if (!settings.detectTerminalListenFailures && !settings.routeTerminalCommandsOnStart) {
+      return;
+    }
+
+    if (settings.routeTerminalCommandsOnStart && (await this.offerPreflightRerun(event, settings))) {
+      return;
+    }
+
     if (!settings.detectTerminalListenFailures) {
       return;
     }
@@ -83,6 +103,53 @@ export class TerminalConflictMonitor implements DisposableLike {
     }
   }
 
+  /** Offers a daemon-managed rerun as soon as a terminal command exposes a port. */
+  private async offerPreflightRerun(
+    event: vscode.TerminalShellExecutionStartEvent,
+    settings: PortManagerSettings,
+  ): Promise<boolean> {
+    const commandLine = event.execution.commandLine.value.trim();
+    const intent = detectTerminalPortIntent(commandLine);
+
+    if (intent === undefined || this.promptedExecutions.has(event.execution)) {
+      return false;
+    }
+
+    await this.options.processService.refresh();
+
+    const owner = findPortOwner(this.options.processService.list(), intent.port);
+    const shouldOfferRouting = settings.routingMode === "hashed" || owner !== undefined;
+
+    if (!shouldOfferRouting) {
+      return false;
+    }
+
+    this.promptedExecutions.add(event.execution);
+
+    const reason = owner
+      ? `Port ${intent.port} is occupied by ${owner.name}`
+      : `Port ${intent.port} is a logical port in hashed routing mode`;
+    const selection = await vscode.window.showWarningMessage(
+      `${reason}. Stop this terminal command and rerun it through the daemon?`,
+      "Rerun Routed",
+      "Show Ports",
+    );
+
+    if (selection === "Show Ports") {
+      await this.options.processService.refresh();
+      await vscode.commands.executeCommand("workbench.view.extension.portManager");
+      return false;
+    }
+
+    if (selection !== "Rerun Routed") {
+      return false;
+    }
+
+    event.terminal.sendText("\x03", false);
+    await this.startRoutedReplacement(event, intent.port, intent.host ?? settings.defaultHost);
+    return true;
+  }
+
   /** Offers a user-confirmed rerun through the agent-managed launch path. */
   private async offerRerun(
     event: vscode.TerminalShellExecutionStartEvent,
@@ -113,6 +180,17 @@ export class TerminalConflictMonitor implements DisposableLike {
       return;
     }
 
+    await this.startRoutedReplacement(event, requestedPort, detectedHost);
+  }
+
+  /** Starts the terminal command through the daemon after it assigns the route. */
+  private async startRoutedReplacement(
+    event: vscode.TerminalShellExecutionStartEvent,
+    requestedPort: number,
+    detectedHost: string | undefined,
+  ): Promise<void> {
+    const settings = readPortManagerSettings();
+    const commandLine = event.execution.commandLine.value.trim();
     const reroutableCommand = buildReroutableCommand(commandLine, requestedPort);
     const cwd = event.execution.cwd?.fsPath ?? getDefaultWorkspaceFolder() ?? process.cwd();
     const host = normalizeHost(detectedHost ?? settings.defaultHost, settings.defaultHost);
@@ -133,6 +211,11 @@ export class TerminalConflictMonitor implements DisposableLike {
       );
     }
   }
+}
+
+/** Finds the current visible owner for a TCP port in the latest agent snapshot. */
+function findPortOwner(processes: readonly ManagedProcess[], port: number): ManagedProcess | undefined {
+  return processes.find((process) => process.actualPort === port && process.status === "running");
 }
 
 /** Uses workspace folder name as a stable default process label. */

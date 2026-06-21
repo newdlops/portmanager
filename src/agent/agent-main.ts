@@ -29,6 +29,7 @@ async function main(args: readonly string[]): Promise<void> {
       processLauncher: new NodeProcessLauncher(),
       portAvailabilityProvider: new NodePortScanner(),
       listeningPortProvider: new NodeListeningPortProvider(),
+      routeTablePath: process.env.PORT_MANAGER_ROUTES_FILE,
     });
 
     agent.onServerError((error) => {
