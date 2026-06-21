@@ -41,6 +41,8 @@ export interface PortManagerSettings {
   readonly notifyOnDetectedConflict: boolean;
   /** Whether the local agent should report every listening TCP port. */
   readonly monitorAllListeningPorts: boolean;
+  /** Whether terminal output should be scanned for bind/listen failures. */
+  readonly detectTerminalListenFailures: boolean;
   /** Signal used when stopping managed child processes. */
   readonly processKillSignal: ProcessKillSignal;
 }

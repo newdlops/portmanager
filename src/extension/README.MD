@@ -10,11 +10,13 @@ VS Code 확장의 활성화 지점과 명령 등록을 담당한다.
 - Port Manager 서비스 조립
 - Command Palette 명령 등록
 - Sidebar TreeDataProvider 등록
+- VS Code 터미널 listen 실패 감지와 라우팅 재실행 제안
 
 ## 주요 진입점
 
 - `activate.ts`
 - `commands.ts`
+- `terminal-conflict-monitor.ts`
 
 ## 외부 의존성
 

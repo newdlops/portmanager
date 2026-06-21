@@ -13,6 +13,7 @@ The MVP uses one local Port Manager agent per OS user. VS Code windows connect t
 - Track requested and actual ports in the sidebar.
 - Watch all local listening TCP ports through the shared local agent.
 - Show which process owns each visible port when the OS exposes PID/name data.
+- Detect VS Code terminal listen failures and offer to rerun the failed command through Port Manager routing.
 - Stop, restart, remove, open, and copy managed process URLs.
 - Register an already running process for sidebar management.
 
@@ -27,6 +28,8 @@ The MVP uses one local Port Manager agent per OS user. VS Code windows connect t
 
 If the requested port is busy, the extension routes to the nearest available port according to `portManager.scanDirection` and `portManager.scanRange`.
 
+If a command is run directly in a VS Code terminal and fails with a bind error such as `Address already in use`, Port Manager can detect the terminal output and offer `Rerun Routed`. That rerun starts the command through the shared agent so the requested port is mapped to a nearby available port.
+
 ## Local Agent
 
 Port Manager starts after VS Code startup and connects to a single local agent.
@@ -40,7 +43,7 @@ The sidebar shows:
 - externally detected listening ports
 - best-effort PID, process name, command, and URL information
 
-Important limitation: the agent does not transparently intercept every arbitrary process' failed `bind()` request. Automatic rerouting works for processes launched through `Port Manager: Start Managed Process`. External processes are detected after they occupy a listening port.
+Important limitation: the agent does not transparently intercept every arbitrary process' failed `bind()` request before it happens. Automatic pre-launch rerouting works for processes launched through `Port Manager: Start Managed Process`. For direct terminal commands, Port Manager detects supported listen-failure output after the command fails and can rerun the same command through the managed launch path.
 
 ## Settings
 
@@ -55,6 +58,7 @@ Important limitation: the agent does not transparently intercept every arbitrary
 - `portManager.watchPreferredPorts`: watch preferred ports for external listeners.
 - `portManager.watchIntervalMs`: polling interval for preferred port watching.
 - `portManager.notifyOnDetectedConflict`: show a notification when a preferred port becomes occupied externally.
+- `portManager.detectTerminalListenFailures`: detect VS Code terminal bind/listen failures and offer a routed rerun.
 - `portManager.processKillSignal`: signal used to stop managed processes.
 
 ## Commands

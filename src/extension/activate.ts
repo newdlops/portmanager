@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import { LocalAgentClient } from "./local-agent-client";
 import { PortManagerCommandController } from "./commands";
+import { TerminalConflictMonitor } from "./terminal-conflict-monitor";
 
 /**
  * VS Code activation entry point for Port Manager.
@@ -17,15 +18,20 @@ export function activate(context: vscode.ExtensionContext): void {
     processService,
     treeProvider,
   });
+  const terminalConflictMonitor = new TerminalConflictMonitor({
+    processService,
+  });
 
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider("portManager.processes", treeProvider),
     processService,
     treeProvider,
     commandController,
+    terminalConflictMonitor,
   );
 
   commandController.register(context);
+  terminalConflictMonitor.start(context);
   void processService.start().catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     void vscode.window.showErrorMessage(`Port Manager agent failed to start: ${message}`);

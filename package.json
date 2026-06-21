@@ -267,6 +267,11 @@
           "default": true,
           "description": "Show all listening TCP ports reported by the local agent, not only preferred ports."
         },
+        "portManager.detectTerminalListenFailures": {
+          "type": "boolean",
+          "default": true,
+          "description": "Detect terminal bind/listen failures and offer to rerun the command through Port Manager routing."
+        },
         "portManager.processKillSignal": {
           "type": "string",
           "default": "SIGTERM",

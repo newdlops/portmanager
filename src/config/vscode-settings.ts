@@ -20,6 +20,7 @@ const DEFAULT_SETTINGS: PortManagerSettings = {
   watchIntervalMs: 3000,
   notifyOnDetectedConflict: true,
   monitorAllListeningPorts: true,
+  detectTerminalListenFailures: true,
   processKillSignal: "SIGTERM",
 };
 
@@ -59,6 +60,10 @@ export function readPortManagerSettings(): PortManagerSettings {
     monitorAllListeningPorts: config.get<boolean>(
       "monitorAllListeningPorts",
       DEFAULT_SETTINGS.monitorAllListeningPorts,
+    ),
+    detectTerminalListenFailures: config.get<boolean>(
+      "detectTerminalListenFailures",
+      DEFAULT_SETTINGS.detectTerminalListenFailures,
     ),
     processKillSignal: normalizeKillSignal(
       config.get<ProcessKillSignal>("processKillSignal", DEFAULT_SETTINGS.processKillSignal),
