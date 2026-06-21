@@ -2,6 +2,7 @@ import type {
   PortAvailability,
   PortAvailabilityProvider,
   PortRoutingDecision,
+  PortRoutingMode,
   PortRoutingRequest,
   ScanDirection,
 } from "../shared/types";
@@ -17,6 +18,9 @@ import type {
 
 const MIN_TCP_PORT = 1;
 const MAX_TCP_PORT = 65_535;
+const DEFAULT_ROUTING_MODE: PortRoutingMode = "nearest";
+const DEFAULT_VIRTUAL_PORT_RANGE_START = 53_000;
+const DEFAULT_VIRTUAL_PORT_RANGE_END = 59_999;
 
 /**
  * Error raised when the routing policy cannot produce a usable actual port.
@@ -54,6 +58,11 @@ export class PortRoutingService {
       request.requestedPort,
       request.host,
     );
+    const routingMode = request.routingMode ?? DEFAULT_ROUTING_MODE;
+
+    if (routingMode === "hashed") {
+      return this.routeHashed(request, requestedPortStatus);
+    }
 
     if (requestedPortStatus.available) {
       return {
@@ -62,6 +71,7 @@ export class PortRoutingService {
         routed: false,
         requestedPortStatus,
         checkedCandidates: [],
+        routingMode,
       };
     }
 
@@ -82,6 +92,7 @@ export class PortRoutingService {
           routed: true,
           requestedPortStatus,
           checkedCandidates,
+          routingMode,
         };
       }
     }
@@ -89,6 +100,45 @@ export class PortRoutingService {
     throw new PortRoutingError(
       `No available port found near requested port ${request.requestedPort} ` +
         `using direction "${request.scanDirection}" and scan range ${request.scanRange}.`,
+    );
+  }
+
+  /**
+   * Routes a logical port into the configured virtual range even when the
+   * requested port is free, keeping logical ports unoccupied by managed apps.
+   */
+  private async routeHashed(
+    request: PortRoutingRequest,
+    requestedPortStatus: PortAvailability,
+  ): Promise<PortRoutingDecision> {
+    const checkedCandidates: PortAvailability[] = [];
+
+    for (const candidatePort of buildHashedPortCandidates({
+      requestedPort: request.requestedPort,
+      routeScope: request.routeScope ?? request.host,
+      scanRange: request.scanRange,
+      virtualPortRangeStart: request.virtualPortRangeStart ?? DEFAULT_VIRTUAL_PORT_RANGE_START,
+      virtualPortRangeEnd: request.virtualPortRangeEnd ?? DEFAULT_VIRTUAL_PORT_RANGE_END,
+    })) {
+      const candidateStatus = await this.availabilityProvider.check(candidatePort, request.host);
+      checkedCandidates.push(candidateStatus);
+
+      if (candidateStatus.available) {
+        return {
+          requestedPort: request.requestedPort,
+          actualPort: candidateStatus.port,
+          routed: candidateStatus.port !== request.requestedPort,
+          requestedPortStatus,
+          checkedCandidates,
+          routingMode: "hashed",
+        };
+      }
+    }
+
+    throw new PortRoutingError(
+      `No available hashed port found for logical port ${request.requestedPort} ` +
+        `in virtual range ${request.virtualPortRangeStart ?? DEFAULT_VIRTUAL_PORT_RANGE_START}-` +
+        `${request.virtualPortRangeEnd ?? DEFAULT_VIRTUAL_PORT_RANGE_END}.`,
     );
   }
 
@@ -105,6 +155,13 @@ export class PortRoutingService {
 
     if (!Number.isInteger(request.scanRange) || request.scanRange < 0) {
       throw new PortRoutingError(`Scan range must be a non-negative integer; received ${request.scanRange}.`);
+    }
+
+    if ((request.routingMode ?? DEFAULT_ROUTING_MODE) === "hashed") {
+      validateVirtualPortRange(
+        request.virtualPortRangeStart ?? DEFAULT_VIRTUAL_PORT_RANGE_START,
+        request.virtualPortRangeEnd ?? DEFAULT_VIRTUAL_PORT_RANGE_END,
+      );
     }
   }
 }
@@ -135,6 +192,44 @@ export function buildCandidatePorts(
   return candidates;
 }
 
+export interface HashedPortCandidateRequest {
+  /** Logical port used as part of the deterministic hash input. */
+  readonly requestedPort: number;
+  /** Namespace that keeps duplicate projects from hashing to the same slot. */
+  readonly routeScope: string;
+  /** Maximum number of linear-probe candidates after the hashed slot. */
+  readonly scanRange: number;
+  /** First TCP port in the virtual actual-port range. */
+  readonly virtualPortRangeStart: number;
+  /** Last TCP port in the virtual actual-port range. */
+  readonly virtualPortRangeEnd: number;
+}
+
+/**
+ * Builds deterministic actual-port candidates inside a virtual range.
+ * The first slot is a stable hash of route scope and logical port; subsequent
+ * candidates linearly probe the range to resolve collisions without falling
+ * back to the logical port itself.
+ */
+export function buildHashedPortCandidates(request: HashedPortCandidateRequest): readonly number[] {
+  validateVirtualPortRange(request.virtualPortRangeStart, request.virtualPortRangeEnd);
+
+  if (!Number.isInteger(request.scanRange) || request.scanRange < 0) {
+    throw new PortRoutingError(`Scan range must be a non-negative integer; received ${request.scanRange}.`);
+  }
+
+  const rangeSize = request.virtualPortRangeEnd - request.virtualPortRangeStart + 1;
+  const maxCandidates = Math.min(rangeSize, request.scanRange + 1);
+  const startOffset = hashText(`${request.routeScope}:${request.requestedPort}`) % rangeSize;
+  const candidates: number[] = [];
+
+  for (let offset = 0; offset < maxCandidates; offset += 1) {
+    candidates.push(request.virtualPortRangeStart + ((startOffset + offset) % rangeSize));
+  }
+
+  return candidates;
+}
+
 /**
  * Keeps candidate generation from passing invalid TCP ports into lower-level
  * scanners. This is especially relevant for downward scans near port 1.
@@ -151,4 +246,23 @@ function pushIfValidPort(candidates: number[], port: number): void {
  */
 function isValidPort(port: number): boolean {
   return Number.isInteger(port) && port >= MIN_TCP_PORT && port <= MAX_TCP_PORT;
+}
+
+/** Validates the dedicated actual-port pool used by hashed routing. */
+function validateVirtualPortRange(start: number, end: number): void {
+  if (!isValidPort(start) || !isValidPort(end) || start > end) {
+    throw new PortRoutingError(`Invalid virtual port range ${start}-${end}.`);
+  }
+}
+
+/** Small FNV-1a hash for stable cross-platform route-slot selection. */
+function hashText(value: string): number {
+  let hash = 0x811c9dc5;
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+
+  return hash;
 }

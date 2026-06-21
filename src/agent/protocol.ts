@@ -3,6 +3,7 @@ import type {
   AgentStartManagedProcessRequest,
   ManagedProcess,
   ProcessKillSignal,
+  PortRoutingMode,
   RegisteredProcessInput,
   ScanDirection,
 } from "../shared/types";
@@ -89,6 +90,12 @@ export interface RestartProcessPayload {
   readonly scanRange?: number;
   /** Optional current scan direction override from VS Code settings. */
   readonly scanDirection?: ScanDirection;
+  /** Optional current routing mode override from VS Code settings. */
+  readonly routingMode?: PortRoutingMode;
+  /** Optional first TCP port in the hashed actual-port range. */
+  readonly virtualPortRangeStart?: number;
+  /** Optional last TCP port in the hashed actual-port range. */
+  readonly virtualPortRangeEnd?: number;
   /** Optional signal used to stop the previous child before relaunching. */
   readonly signal?: ProcessKillSignal;
 }

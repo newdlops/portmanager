@@ -112,7 +112,7 @@ test("emits update events with previous process state", () => {
   assert.equal(events[1]?.process.status, "starting");
 });
 
-test("marks processes as stopped without changing their port mapping", () => {
+test("marks processes as stopped without keeping a live routed URL", () => {
   const registry = new ManagedProcessRegistry({
     now: () => new Date(fixedStoppedAt),
   });
@@ -124,6 +124,7 @@ test("marks processes as stopped without changing their port mapping", () => {
   assert.equal(stopped.stoppedAt, fixedStoppedAt);
   assert.equal(stopped.requestedPort, 3000);
   assert.equal(stopped.actualPort, 3001);
+  assert.equal(stopped.url, undefined);
 });
 
 test("removes processes and emits the post-removal snapshot", () => {

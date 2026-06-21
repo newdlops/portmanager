@@ -164,6 +164,7 @@ export class ManagedProcessRegistry {
       ...previousProcess,
       status: "stopped",
       stoppedAt,
+      url: undefined,
     };
 
     this.processesById.set(id, nextProcess);

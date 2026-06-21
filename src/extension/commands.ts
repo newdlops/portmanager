@@ -233,7 +233,8 @@ export class PortManagerCommandController implements DisposableLike {
   /** Copies the selected process URL to the system clipboard. */
   private async copyRoutedUrl(argument: unknown): Promise<void> {
     const process = await this.resolveProcessArgument(argument, "Copy Routed URL");
-    if (process?.url === undefined) {
+    if (!isReachableProcess(process)) {
+      await vscode.window.showInformationMessage("This process is not running, so there is no routed URL to copy.");
       return;
     }
 
@@ -244,7 +245,8 @@ export class PortManagerCommandController implements DisposableLike {
   /** Opens the selected process URL in the user's default browser. */
   private async openRoutedUrl(argument: unknown): Promise<void> {
     const process = await this.resolveProcessArgument(argument, "Open Routed URL");
-    if (process?.url === undefined) {
+    if (!isReachableProcess(process)) {
+      await vscode.window.showInformationMessage("This process is not running, so there is no routed URL to open.");
       return;
     }
 
@@ -409,6 +411,11 @@ async function promptForInjectionMode(): Promise<PortInjectionMode | undefined> 
 function deriveProcessName(command: string, cwd: string): string {
   const folderName = path.basename(cwd);
   return folderName.length > 0 ? folderName : command;
+}
+
+/** A routed URL is only actionable while the target process is currently running. */
+function isReachableProcess(process: ManagedProcess | undefined): process is ManagedProcess & { url: string } {
+  return process !== undefined && process.status === "running" && typeof process.url === "string";
 }
 
 /** Returns the first workspace folder path because MVP commands are workspace-scoped. */

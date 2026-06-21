@@ -79,15 +79,10 @@ export class ManagedProcessTreeItem extends vscode.TreeItem {
     super(process.name, vscode.TreeItemCollapsibleState.None);
 
     this.id = process.id;
-    this.contextValue = process.source === "detected" ? "detectedProcess" : "managedProcess";
+    this.contextValue = buildContextValue(process);
     this.description = buildDescription(process);
     this.tooltip = buildTooltip(process);
     this.iconPath = new vscode.ThemeIcon(iconForStatus(process.status), colorForStatus(process.status));
-    this.command = {
-      command: "portManager.openRoutedUrl",
-      title: "Open Routed URL",
-      arguments: [this],
-    };
   }
 }
 
@@ -120,6 +115,10 @@ export function getProcessFromCommandArgument(argument: unknown): ManagedProcess
 
 /** Builds compact `requested -> actual` mapping text for the sidebar row. */
 function buildDescription(process: ManagedProcess): string {
+  if (process.status !== "running") {
+    return process.status;
+  }
+
   const routeText =
     process.requestedPort === process.actualPort
       ? String(process.actualPort)
@@ -143,7 +142,7 @@ function buildTooltip(process: ManagedProcess): vscode.MarkdownString {
   tooltip.appendMarkdown(`- Source: \`${process.source ?? "managed"}\`\n`);
   tooltip.appendMarkdown(`- Requested Port: \`${process.requestedPort}\`\n`);
   tooltip.appendMarkdown(`- Actual Port: \`${process.actualPort}\`\n`);
-  tooltip.appendMarkdown(`- URL: \`${process.url ?? "n/a"}\`\n`);
+  tooltip.appendMarkdown(`- URL: \`${process.status === "running" ? process.url ?? "n/a" : "n/a"}\`\n`);
   tooltip.appendMarkdown(`- CWD: \`${escapeMarkdown(process.cwd)}\`\n`);
   tooltip.appendMarkdown(`- Command: \`${escapeMarkdown(process.command)}\`\n`);
 
@@ -152,6 +151,24 @@ function buildTooltip(process: ManagedProcess): vscode.MarkdownString {
   }
 
   return tooltip;
+}
+
+/** Assigns context menu groups by source and lifecycle state. */
+function buildContextValue(process: ManagedProcess): string {
+  if (process.source === "detected") {
+    return "detectedProcess";
+  }
+
+  switch (process.status) {
+    case "running":
+      return "managedProcessRunning";
+    case "starting":
+      return "managedProcessStarting";
+    case "stopped":
+      return "managedProcessStopped";
+    case "error":
+      return "managedProcessError";
+  }
 }
 
 /** Maps lifecycle status to a familiar VS Code product icon. */

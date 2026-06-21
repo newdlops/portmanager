@@ -159,6 +159,9 @@ export class LocalAgentClient implements PortManagerProcessService {
       ...input,
       scanRange: settings.scanRange,
       scanDirection: settings.scanDirection,
+      routingMode: settings.routingMode,
+      virtualPortRangeStart: settings.virtualPortRangeStart,
+      virtualPortRangeEnd: settings.virtualPortRangeEnd,
     });
     await this.refresh();
 
@@ -191,6 +194,9 @@ export class LocalAgentClient implements PortManagerProcessService {
       signal: settings.processKillSignal,
       scanRange: settings.scanRange,
       scanDirection: settings.scanDirection,
+      routingMode: settings.routingMode,
+      virtualPortRangeStart: settings.virtualPortRangeStart,
+      virtualPortRangeEnd: settings.virtualPortRangeEnd,
     });
     await this.refresh();
 
@@ -460,6 +466,7 @@ function createEmptySnapshot(): AgentSnapshot {
     agentPid: 0,
     processes: [],
     listeners: [],
+    routes: [],
     updatedAt: new Date(0).toISOString(),
   };
 }

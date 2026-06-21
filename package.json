@@ -166,27 +166,27 @@
       "view/item/context": [
         {
           "command": "portManager.openRoutedUrl",
-          "when": "view == portManager.processes && (viewItem == managedProcess || viewItem == detectedProcess)",
+          "when": "view == portManager.processes && (viewItem == managedProcessRunning || viewItem == detectedProcess)",
           "group": "inline@1"
         },
         {
           "command": "portManager.copyRoutedUrl",
-          "when": "view == portManager.processes && (viewItem == managedProcess || viewItem == detectedProcess)",
+          "when": "view == portManager.processes && (viewItem == managedProcessRunning || viewItem == detectedProcess)",
           "group": "inline@2"
         },
         {
           "command": "portManager.stopProcess",
-          "when": "view == portManager.processes && viewItem == managedProcess",
+          "when": "view == portManager.processes && (viewItem == managedProcessRunning || viewItem == managedProcessStarting)",
           "group": "managed@1"
         },
         {
           "command": "portManager.restartProcess",
-          "when": "view == portManager.processes && viewItem == managedProcess",
+          "when": "view == portManager.processes && (viewItem == managedProcessRunning || viewItem == managedProcessStopped || viewItem == managedProcessError)",
           "group": "managed@2"
         },
         {
           "command": "portManager.removeProcess",
-          "when": "view == portManager.processes && (viewItem == managedProcess || viewItem == detectedProcess)",
+          "when": "view == portManager.processes && (viewItem == managedProcessRunning || viewItem == managedProcessStarting || viewItem == managedProcessStopped || viewItem == managedProcessError || viewItem == detectedProcess)",
           "group": "managed@3"
         }
       ]
@@ -220,6 +220,29 @@
             "both"
           ],
           "description": "Direction used when scanning for an available nearby port."
+        },
+        "portManager.routingMode": {
+          "type": "string",
+          "default": "hashed",
+          "enum": [
+            "nearest",
+            "hashed"
+          ],
+          "description": "Routing policy. Hashed keeps logical ports unoccupied and assigns actual ports from the virtual range."
+        },
+        "portManager.virtualPortRangeStart": {
+          "type": "number",
+          "default": 53000,
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "First actual TCP port used by hashed logical routing."
+        },
+        "portManager.virtualPortRangeEnd": {
+          "type": "number",
+          "default": 59999,
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Last actual TCP port used by hashed logical routing."
         },
         "portManager.preferredPorts": {
           "type": "array",

@@ -93,6 +93,17 @@ test("snapshot merge keeps managed route context and adds external listeners", (
   assert.equal(snapshot.processes[1]?.url, "http://localhost:5173");
   assert.equal(snapshot.listeners[0]?.source, "managed");
   assert.equal(snapshot.listeners[1]?.source, "external");
+  assert.deepEqual(snapshot.routes, [
+    {
+      logicalPort: 3000,
+      actualPort: 3001,
+      host: "localhost",
+      processId: "managed-1",
+      processName: "web",
+      status: "running",
+      source: "managed",
+    },
+  ]);
 });
 
 test("snapshot merge can suppress detected listener rows", () => {
@@ -112,6 +123,7 @@ test("snapshot merge can suppress detected listener rows", () => {
 
   assert.deepEqual(snapshot.processes, []);
   assert.equal(snapshot.listeners.length, 1);
+  assert.deepEqual(snapshot.routes, []);
 });
 
 function createManagedProcess(overrides: Partial<ManagedProcess> = {}): ManagedProcess {

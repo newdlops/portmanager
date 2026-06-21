@@ -10,6 +10,8 @@ export type ProcessStatus = "starting" | "running" | "stopped" | "error";
 
 export type ScanDirection = "up" | "down" | "both";
 
+export type PortRoutingMode = "nearest" | "hashed";
+
 export type PortInjectionMode = "env" | "template" | "argument";
 
 export type ProcessKillSignal = NodeJS.Signals | "SIGKILL" | "SIGTERM";
@@ -27,6 +29,12 @@ export interface PortManagerSettings {
   readonly scanRange: number;
   /** Direction used to build the candidate port sequence. */
   readonly scanDirection: ScanDirection;
+  /** Routing policy used to choose the actual bind port. */
+  readonly routingMode: PortRoutingMode;
+  /** First TCP port in the deterministic hashed actual-port range. */
+  readonly virtualPortRangeStart: number;
+  /** Last TCP port in the deterministic hashed actual-port range. */
+  readonly virtualPortRangeEnd: number;
   /** Common starting ports shown to the user by command prompts. */
   readonly preferredPorts: readonly number[];
   /** Whether a newly launched routed URL should be opened automatically. */
@@ -143,6 +151,14 @@ export interface PortRoutingRequest {
   readonly scanRange: number;
   /** Candidate generation policy for nearby ports. */
   readonly scanDirection: ScanDirection;
+  /** Whether actual ports are chosen near the request or from a hashed virtual range. */
+  readonly routingMode?: PortRoutingMode;
+  /** Stable namespace used by hashed routing to isolate duplicate projects. */
+  readonly routeScope?: string;
+  /** First TCP port in the hashed actual-port range. */
+  readonly virtualPortRangeStart?: number;
+  /** Last TCP port in the hashed actual-port range. */
+  readonly virtualPortRangeEnd?: number;
 }
 
 export interface PortRoutingDecision {
@@ -156,6 +172,25 @@ export interface PortRoutingDecision {
   readonly requestedPortStatus: PortAvailability;
   /** Candidate ports checked after a conflict, in the order they were tested. */
   readonly checkedCandidates: readonly PortAvailability[];
+  /** Routing policy that produced the decision. */
+  readonly routingMode?: PortRoutingMode;
+}
+
+export interface LogicalPortRoute {
+  /** Logical port the application code or user-facing workflow refers to. */
+  readonly logicalPort: number;
+  /** Actual OS listening port assigned by Port Manager. */
+  readonly actualPort: number;
+  /** Host used for URLs and availability checks. */
+  readonly host: string;
+  /** Process row that owns this mapping when known. */
+  readonly processId?: string;
+  /** Human-readable process name for route table displays and env payloads. */
+  readonly processName?: string;
+  /** Current lifecycle state of the owning process. */
+  readonly status: ProcessStatus;
+  /** Origin of the route row. */
+  readonly source: ProcessSource;
 }
 
 export interface ProcessLaunchRequest {
@@ -173,6 +208,10 @@ export interface ProcessLaunchRequest {
   readonly actualPort: number;
   /** How the actual port should be communicated to the process. */
   readonly injectionMode: PortInjectionMode;
+  /** Current logical routing table made available to the launched process. */
+  readonly logicalRoutes?: readonly LogicalPortRoute[];
+  /** Path to the dynamic JSON route table maintained by the local agent. */
+  readonly logicalRoutesFile?: string;
 }
 
 export interface ProcessLaunchResult {
@@ -234,6 +273,12 @@ export interface AgentStartManagedProcessRequest extends ManagedProcessStartInpu
   readonly scanRange: number;
   /** Candidate generation policy used by the agent. */
   readonly scanDirection: ScanDirection;
+  /** Routing policy used by the agent. */
+  readonly routingMode?: PortRoutingMode;
+  /** First TCP port in the hashed actual-port range. */
+  readonly virtualPortRangeStart?: number;
+  /** Last TCP port in the hashed actual-port range. */
+  readonly virtualPortRangeEnd?: number;
 }
 
 export interface AgentSnapshot {
@@ -243,6 +288,8 @@ export interface AgentSnapshot {
   readonly processes: readonly ManagedProcess[];
   /** Raw listening TCP ports observed by the agent. */
   readonly listeners: readonly ListeningPort[];
+  /** Active logical-port to actual-port mappings known to the agent. */
+  readonly routes: readonly LogicalPortRoute[];
   /** ISO timestamp for this snapshot. */
   readonly updatedAt: string;
 }

@@ -1,4 +1,5 @@
 .vscode/**
+.lh/**
 .codeidx/**
 .zoek-rs/**
 .gitignore

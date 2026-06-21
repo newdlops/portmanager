@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import type { PortManagerSettings, ProcessKillSignal, ScanDirection } from "../shared/types";
+import type { PortManagerSettings, PortRoutingMode, ProcessKillSignal, ScanDirection } from "../shared/types";
 
 /**
  * Reads and normalizes VS Code configuration for the Port Manager domain.
@@ -13,6 +13,9 @@ const DEFAULT_SETTINGS: PortManagerSettings = {
   defaultHost: "localhost",
   scanRange: 20,
   scanDirection: "up",
+  routingMode: "hashed",
+  virtualPortRangeStart: 53_000,
+  virtualPortRangeEnd: 59_999,
   preferredPorts: [3000, 3001, 5173, 8000, 8080],
   autoOpenBrowser: false,
   showConflictNotification: true,
@@ -25,6 +28,7 @@ const DEFAULT_SETTINGS: PortManagerSettings = {
 };
 
 const VALID_SCAN_DIRECTIONS = new Set<ScanDirection>(["up", "down", "both"]);
+const VALID_ROUTING_MODES = new Set<PortRoutingMode>(["nearest", "hashed"]);
 
 /**
  * Builds a complete settings object from VS Code configuration values.
@@ -33,6 +37,10 @@ const VALID_SCAN_DIRECTIONS = new Set<ScanDirection>(["up", "down", "both"]);
  */
 export function readPortManagerSettings(): PortManagerSettings {
   const config = vscode.workspace.getConfiguration("portManager");
+  const virtualPortRange = normalizeVirtualPortRange(
+    config.get<number>("virtualPortRangeStart", DEFAULT_SETTINGS.virtualPortRangeStart),
+    config.get<number>("virtualPortRangeEnd", DEFAULT_SETTINGS.virtualPortRangeEnd),
+  );
 
   return {
     enabled: config.get<boolean>("enabled", DEFAULT_SETTINGS.enabled),
@@ -41,6 +49,9 @@ export function readPortManagerSettings(): PortManagerSettings {
     scanDirection: normalizeScanDirection(
       config.get<ScanDirection>("scanDirection", DEFAULT_SETTINGS.scanDirection),
     ),
+    routingMode: normalizeRoutingMode(config.get<PortRoutingMode>("routingMode", DEFAULT_SETTINGS.routingMode)),
+    virtualPortRangeStart: virtualPortRange.start,
+    virtualPortRangeEnd: virtualPortRange.end,
     preferredPorts: normalizePreferredPorts(
       config.get<readonly number[]>("preferredPorts", DEFAULT_SETTINGS.preferredPorts),
     ),
@@ -112,6 +123,35 @@ function normalizeWatchIntervalMs(watchIntervalMs: number): number {
 /** Converts unknown scan direction strings to the documented default policy. */
 function normalizeScanDirection(scanDirection: ScanDirection): ScanDirection {
   return VALID_SCAN_DIRECTIONS.has(scanDirection) ? scanDirection : DEFAULT_SETTINGS.scanDirection;
+}
+
+/** Converts unknown routing modes to the hashed logical-port policy. */
+function normalizeRoutingMode(routingMode: PortRoutingMode): PortRoutingMode {
+  return VALID_ROUTING_MODES.has(routingMode) ? routingMode : DEFAULT_SETTINGS.routingMode;
+}
+
+/** Keeps the hashed actual-port pool inside a valid TCP range. */
+function normalizeVirtualPortRange(start: number, end: number): { readonly start: number; readonly end: number } {
+  const normalizedStart = Math.trunc(start);
+  const normalizedEnd = Math.trunc(end);
+
+  if (
+    !Number.isFinite(start) ||
+    !Number.isFinite(end) ||
+    normalizedStart < 1 ||
+    normalizedEnd > 65_535 ||
+    normalizedStart > normalizedEnd
+  ) {
+    return {
+      start: DEFAULT_SETTINGS.virtualPortRangeStart,
+      end: DEFAULT_SETTINGS.virtualPortRangeEnd,
+    };
+  }
+
+  return {
+    start: normalizedStart,
+    end: normalizedEnd,
+  };
 }
 
 /**

@@ -38,11 +38,15 @@ export class NodeProcessLauncher implements ProcessLauncher {
   async launch(request: ProcessLaunchRequest): Promise<ProcessLaunchResult> {
     const command = buildInjectedCommand(request);
 
-    // PORT is the common convention for Node development servers; it is set for
-    // every mode so template and argument launches still receive a fallback.
+    // PORT remains the common development-server convention; the route env
+    // values let duplicate app instances resolve logical ports explicitly.
     const environment: NodeJS.ProcessEnv = {
       ...process.env,
       PORT: String(request.actualPort),
+      PORT_MANAGER_ACTUAL_PORT: String(request.actualPort),
+      PORT_MANAGER_LOGICAL_PORT: String(request.requestedPort),
+      PORT_MANAGER_ROUTES: JSON.stringify(request.logicalRoutes ?? []),
+      PORT_MANAGER_ROUTES_FILE: request.logicalRoutesFile ?? "",
     };
 
     const child = spawn(command, {

@@ -1,4 +1,7 @@
 import { createServer, type Server, type Socket } from "node:net";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { ManagedProcessRegistry } from "../core/process-registry";
 import { PortRoutingService } from "../core/port-routing";
 import { SimpleEventEmitter } from "../shared/events";
@@ -6,6 +9,7 @@ import type {
   AgentSnapshot,
   AgentStartManagedProcessRequest,
   DisposableLike,
+  LogicalPortRoute,
   ListeningPort,
   ListeningPortProvider,
   ManagedProcess,
@@ -58,6 +62,8 @@ export interface PortManagerAgentOptions {
   readonly defaultHost?: string;
   /** Fallback cwd for detected listeners that have no process working dir. */
   readonly defaultCwd?: string;
+  /** JSON route table path shared with launched child processes. */
+  readonly routeTablePath?: string;
 }
 
 export interface BuildAgentSnapshotOptions {
@@ -132,6 +138,9 @@ export class PortManagerAgent implements DisposableLike {
   /** Fallback cwd for detected rows. */
   private readonly defaultCwd: string;
 
+  /** JSON file path that stores the latest logical routing table. */
+  private readonly routeTablePath: string;
+
   /** Node net server once listen() has been called. */
   private server: Server | undefined;
 
@@ -151,6 +160,7 @@ export class PortManagerAgent implements DisposableLike {
     this.defaultKillSignal = options.defaultKillSignal ?? DEFAULT_KILL_SIGNAL;
     this.defaultHost = options.defaultHost ?? "localhost";
     this.defaultCwd = options.defaultCwd ?? process.cwd();
+    this.routeTablePath = options.routeTablePath ?? getDefaultRouteTablePath();
 
     this.subscriptions.push(
       this.registry.onDidChange(() => {
@@ -221,7 +231,12 @@ export class PortManagerAgent implements DisposableLike {
       host: input.host,
       scanRange: input.scanRange,
       scanDirection: input.scanDirection,
+      routingMode: input.routingMode,
+      routeScope: input.cwd,
+      virtualPortRangeStart: input.virtualPortRangeStart,
+      virtualPortRangeEnd: input.virtualPortRangeEnd,
     });
+    const pendingRoute = buildPendingLogicalRoute(input, decision.actualPort);
 
     const launchResult = await this.processLauncher.launch({
       name: input.name,
@@ -231,6 +246,8 @@ export class PortManagerAgent implements DisposableLike {
       host: input.host,
       actualPort: decision.actualPort,
       injectionMode: input.injectionMode,
+      logicalRoutes: buildLogicalRoutes(this.registry.list(), pendingRoute),
+      logicalRoutesFile: this.routeTablePath,
     });
 
     const process = this.registry.register(
@@ -306,6 +323,9 @@ export class PortManagerAgent implements DisposableLike {
       ...profile,
       scanRange: options.scanRange ?? profile.scanRange,
       scanDirection: options.scanDirection ?? profile.scanDirection,
+      routingMode: options.routingMode ?? profile.routingMode,
+      virtualPortRangeStart: options.virtualPortRangeStart ?? profile.virtualPortRangeStart,
+      virtualPortRangeEnd: options.virtualPortRangeEnd ?? profile.virtualPortRangeEnd,
     };
 
     const decision = await this.routingService.route({
@@ -313,7 +333,12 @@ export class PortManagerAgent implements DisposableLike {
       host: nextProfile.host,
       scanRange: nextProfile.scanRange,
       scanDirection: nextProfile.scanDirection,
+      routingMode: nextProfile.routingMode,
+      routeScope: nextProfile.cwd,
+      virtualPortRangeStart: nextProfile.virtualPortRangeStart,
+      virtualPortRangeEnd: nextProfile.virtualPortRangeEnd,
     });
+    const pendingRoute = buildPendingLogicalRoute(nextProfile, decision.actualPort);
 
     const launchResult = await this.processLauncher.launch({
       name: nextProfile.name,
@@ -323,6 +348,11 @@ export class PortManagerAgent implements DisposableLike {
       host: nextProfile.host,
       actualPort: decision.actualPort,
       injectionMode: nextProfile.injectionMode,
+      logicalRoutes: buildLogicalRoutes(
+        this.registry.list().filter((candidate) => candidate.id !== id),
+        pendingRoute,
+      ),
+      logicalRoutesFile: this.routeTablePath,
     });
 
     this.launchProfilesByProcessId.set(id, nextProfile);
@@ -524,8 +554,7 @@ export class PortManagerAgent implements DisposableLike {
    */
   private async buildSnapshot(): Promise<AgentSnapshot> {
     const listeners = await this.listeningPortProvider.list();
-
-    return buildAgentSnapshot({
+    const snapshot = buildAgentSnapshot({
       agentPid: this.agentPid,
       registryProcesses: this.registry.list(),
       listeners,
@@ -534,6 +563,24 @@ export class PortManagerAgent implements DisposableLike {
       defaultHost: this.defaultHost,
       defaultCwd: this.defaultCwd,
     });
+
+    this.writeRouteTable(snapshot.routes);
+    return snapshot;
+  }
+
+  /** Writes the latest dynamic route table for already-running children. */
+  private writeRouteTable(routes: readonly LogicalPortRoute[]): void {
+    try {
+      fs.mkdirSync(path.dirname(this.routeTablePath), { recursive: true });
+      fs.writeFileSync(
+        this.routeTablePath,
+        `${JSON.stringify({ updatedAt: this.now().toISOString(), routes }, null, 2)}\n`,
+        "utf8",
+      );
+    } catch {
+      // Route table file updates are a convenience channel. Snapshot delivery
+      // and managed process lifecycle should continue if the write fails.
+    }
   }
 
   /**
@@ -579,7 +626,44 @@ export function buildAgentSnapshot(options: BuildAgentSnapshotOptions): AgentSna
     agentPid: options.agentPid,
     processes: [...options.registryProcesses.map((process) => ({ ...process })), ...detectedProcesses],
     listeners: normalizedListeners,
+    routes: buildLogicalRoutes(options.registryProcesses),
     updatedAt: options.updatedAt,
+  };
+}
+
+/**
+ * Builds the logical routing table from active managed and registered rows.
+ * Stopped rows are excluded because their previous actual port is no longer a
+ * live target for process-to-process communication.
+ */
+function buildLogicalRoutes(
+  processes: readonly ManagedProcess[],
+  pendingRoute?: LogicalPortRoute,
+): readonly LogicalPortRoute[] {
+  const routes = processes
+    .filter((process) => process.status === "running" && process.source !== "detected")
+    .map((process) => ({
+      logicalPort: process.requestedPort,
+      actualPort: process.actualPort,
+      host: routeHostFromUrl(process.url),
+      processId: process.id,
+      processName: process.name,
+      status: process.status,
+      source: process.source ?? "managed",
+    }));
+
+  return pendingRoute === undefined ? routes : [...routes, pendingRoute];
+}
+
+/** Creates the route row for a process before the registry has assigned an id. */
+function buildPendingLogicalRoute(input: AgentStartManagedProcessRequest, actualPort: number): LogicalPortRoute {
+  return {
+    logicalPort: input.requestedPort,
+    actualPort,
+    host: input.host,
+    processName: input.name,
+    status: "running",
+    source: "managed",
   };
 }
 
@@ -652,6 +736,19 @@ function buildUrl(host: string, actualPort: number): string {
   return `http://${normalizedHost}:${actualPort}`;
 }
 
+/** Extracts a route host from a stored URL without making URL parsing fatal. */
+function routeHostFromUrl(url: string | undefined): string {
+  if (url === undefined) {
+    return "localhost";
+  }
+
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "localhost";
+  }
+}
+
 /**
  * Converts wildcard bind addresses into a URL users can open in a browser.
  * OS tools often report 0.0.0.0 or :: for "all interfaces", but localhost is
@@ -680,4 +777,10 @@ function requirePortAvailabilityProvider(options: PortManagerAgentOptions): Port
   }
 
   return options.portAvailabilityProvider;
+}
+
+/** Builds the per-user route table file path shared by one local agent. */
+function getDefaultRouteTablePath(): string {
+  const userId = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;
+  return path.join(os.tmpdir(), `newdlops-portmanager-routes-${userId}.json`);
 }

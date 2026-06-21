@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { PortRoutingError, PortRoutingService, buildCandidatePorts } from "../../src/core/port-routing";
+import {
+  PortRoutingError,
+  PortRoutingService,
+  buildCandidatePorts,
+  buildHashedPortCandidates,
+} from "../../src/core/port-routing";
 import type { PortAvailability, PortAvailabilityProvider } from "../../src/shared/types";
 
 /**
@@ -54,6 +59,61 @@ test("uses the requested port when it is available", async () => {
   assert.equal(decision.routed, false);
   assert.deepEqual(decision.checkedCandidates, []);
   assert.deepEqual(provider.checkedPorts, [3000]);
+});
+
+test("hashed routing keeps the logical requested port unoccupied", async () => {
+  const provider = new FakePortAvailabilityProvider([]);
+  const service = new PortRoutingService(provider);
+  const [expectedActualPort] = buildHashedPortCandidates({
+    requestedPort: 8000,
+    routeScope: "/workspace/app",
+    scanRange: 20,
+    virtualPortRangeStart: 53_000,
+    virtualPortRangeEnd: 59_999,
+  });
+
+  const decision = await service.route({
+    requestedPort: 8000,
+    host: "localhost",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    routeScope: "/workspace/app",
+    virtualPortRangeStart: 53_000,
+    virtualPortRangeEnd: 59_999,
+  });
+
+  assert.equal(decision.requestedPort, 8000);
+  assert.equal(decision.actualPort, expectedActualPort);
+  assert.notEqual(decision.actualPort, 8000);
+  assert.equal(decision.routed, true);
+  assert.deepEqual(provider.checkedPorts, [8000, expectedActualPort]);
+});
+
+test("hashed routing linearly probes the virtual range after a collision", async () => {
+  const firstCandidates = buildHashedPortCandidates({
+    requestedPort: 3000,
+    routeScope: "/workspace/app",
+    scanRange: 3,
+    virtualPortRangeStart: 53_000,
+    virtualPortRangeEnd: 59_999,
+  });
+  const provider = new FakePortAvailabilityProvider([firstCandidates[0]]);
+  const service = new PortRoutingService(provider);
+
+  const decision = await service.route({
+    requestedPort: 3000,
+    host: "localhost",
+    scanRange: 3,
+    scanDirection: "up",
+    routingMode: "hashed",
+    routeScope: "/workspace/app",
+    virtualPortRangeStart: 53_000,
+    virtualPortRangeEnd: 59_999,
+  });
+
+  assert.equal(decision.actualPort, firstCandidates[1]);
+  assert.deepEqual(provider.checkedPorts, [3000, firstCandidates[0], firstCandidates[1]]);
 });
 
 test("scans upward candidates until a free port is found", async () => {
