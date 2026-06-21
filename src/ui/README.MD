@@ -7,7 +7,8 @@ Port Manager의 VS Code 사용자 인터페이스를 담당한다.
 ## 책임
 
 - 사이드바 Tree View 구성
-- 관리 중인 프로세스 표시
+- Logical Network, Terminal Session, Host Port Exposure 중심의 기본 화면 표시
+- 레거시 관리형 프로세스 UI를 기본 화면에서 숨김
 - Tree item context value와 command 연결
 
 ## 주요 진입점
@@ -23,3 +24,4 @@ Port Manager의 VS Code 사용자 인터페이스를 담당한다.
 ## 주의사항
 
 UI는 플랫폼 명령을 직접 실행하지 않고 등록된 command로 동작을 위임한다.
+레거시 daemon/routes/processes/listeners 렌더링 코드는 호환성을 위해 남아 있을 수 있지만, 기본 루트 트리에서는 노출하지 않는다.

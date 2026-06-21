@@ -1,7 +1,7 @@
 {
   "name": "portmanager",
   "displayName": "Port Manager",
-  "description": "Route managed development processes to available ports and manage them from a VS Code sidebar.",
+  "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
   "version": "0.0.1",
   "publisher": "newdlops",
   "license": "MIT",
@@ -12,6 +12,7 @@
     "ports",
     "port-manager",
     "development-server",
+    "network",
     "routing",
     "vscode-extension"
   ],
@@ -80,7 +81,7 @@
       "portManager": [
         {
           "id": "portManager.processes",
-          "name": "Processes"
+          "name": "Networks"
         }
       ]
     },
@@ -177,24 +178,68 @@
     "menus": {
       "view/title": [
         {
-          "command": "portManager.startDaemon",
+          "command": "portManager.refresh",
           "when": "view == portManager.processes",
           "group": "navigation@1"
         },
         {
-          "command": "portManager.stopDaemon",
+          "command": "portManager.openSettings",
           "when": "view == portManager.processes",
           "group": "navigation@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "portManager.startDaemon",
+          "when": "false"
+        },
+        {
+          "command": "portManager.stopDaemon",
+          "when": "false"
         },
         {
           "command": "portManager.showDaemonStatus",
-          "when": "view == portManager.processes",
-          "group": "navigation@3"
+          "when": "false"
         },
         {
-          "command": "portManager.refresh",
-          "when": "view == portManager.processes",
-          "group": "navigation@4"
+          "command": "portManager.startManagedProcess",
+          "when": "false"
+        },
+        {
+          "command": "portManager.addExistingProcess",
+          "when": "false"
+        },
+        {
+          "command": "portManager.stopProcess",
+          "when": "false"
+        },
+        {
+          "command": "portManager.restartProcess",
+          "when": "false"
+        },
+        {
+          "command": "portManager.stopAllProcesses",
+          "when": "false"
+        },
+        {
+          "command": "portManager.copyRoutedUrl",
+          "when": "false"
+        },
+        {
+          "command": "portManager.openRoutedUrl",
+          "when": "false"
+        },
+        {
+          "command": "portManager.removeProcess",
+          "when": "false"
+        },
+        {
+          "command": "portManager.installShellHook",
+          "when": "false"
+        },
+        {
+          "command": "portManager.installExternalCli",
+          "when": "false"
         }
       ],
       "view/item/context": [

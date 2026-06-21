@@ -1,5 +1,109 @@
 # Port Manager Extension Specification
 
+## 0. 제품 방향 전환: Logical Network Mode
+
+Port Manager의 기본 제품 방향은 기존의 `요청 포트 -> 실제 포트` 재할당 방식에서, 터미널 프로세스 그룹을 논리 네트워크에 붙이고 호스트 머신에는 사용자가 선택한 포트만 노출하는 방식으로 전환한다.
+
+기존 라우팅, managed process, native hook, listen-failure rerun 기능은 레거시 구현으로 유지한다. 이 기능들은 마이그레이션과 호환성 검토를 위해 코드에는 남기되, 기본 UI와 Command Palette에서는 새 논리 네트워크 모델을 방해하지 않도록 숨긴다.
+
+### 0.1 문제 재정의
+
+포트 충돌이 발생한 뒤에 프로세스를 다시 라우팅하는 방식은 충분하지 않다. `bind()` 충돌이 이미 발생하면 대부분의 개발 서버는 에러로 종료되어 있고, 그 시점의 재실행 제안은 실패를 예방하지 못한다.
+
+새 목표는 각 앱 또는 터미널 프로세스 그룹을 별도의 논리 네트워크에 넣어, 내부에서는 같은 포트 번호를 그대로 쓰고, 호스트에서 접근할 포트만 Port Manager가 명시적으로 노출하도록 하는 것이다.
+
+예시:
+
+```txt
+A network
+  frontend: 127.0.0.1:3004
+  backend:  127.0.0.1:8004
+  host exposure: localhost:3004 -> A network:3004
+
+B network
+  frontend: 127.0.0.1:3004
+  backend:  127.0.0.1:8004
+  host exposure: localhost:3005 -> B network:3004
+```
+
+이 구조에서는 A 프론트엔드가 `localhost:8004` 또는 설정된 backend URL로 접근할 때 A network 내부의 백엔드를 찾고, B 프론트엔드도 같은 `8004`를 사용하더라도 B network 내부의 백엔드를 찾는다. 사용자는 호스트 브라우저에서 A를 `localhost:3004`, B를 `localhost:3005`로 접근한다.
+
+### 0.2 핵심 개념
+
+#### Logical Network
+
+하나의 앱, 워크스페이스, 클러스터, 또는 터미널 프로세스 그룹이 공유하는 독립 네트워크 컨텍스트다. 같은 Logical Network 안에서는 포트 `3004`, `8004` 같은 내부 포트가 그대로 유지된다.
+
+#### Terminal Attachment
+
+사용자가 선택한 터미널 프로세스 또는 shell process group을 Logical Network에 연결하는 행위다. 연결된 터미널에서 실행되는 하위 프로세스는 같은 네트워크 컨텍스트를 상속해야 한다.
+
+#### Host Port Exposure
+
+호스트 머신의 주소와 포트를 Logical Network 내부 주소와 포트로 연결하는 명시적 매핑이다.
+
+```ts
+type HostPortExposure = {
+  id: string;
+  networkId: string;
+  hostAddress: string;
+  hostPort: number;
+  targetAddress: string;
+  targetPort: number;
+  protocol: "tcp" | "udp";
+};
+```
+
+#### Network Runtime Adapter
+
+Logical Network를 실제 시스템에서 구현하는 어댑터다. VS Code 확장만으로 모든 플랫폼에서 임의 프로세스의 network namespace를 만들 수는 없으므로, 런타임 구현은 인터페이스 뒤에 둔다.
+
+우선 검토 대상:
+
+- Container runtime adapter: Docker, Podman, Colima, nerdctl 같은 컨테이너/VM 기반 격리
+- OS native adapter: Linux network namespace, macOS pf/utun/launch wrapper, Windows WFP/Hyper-V/WSL 기반 구현
+- Proxy adapter: 완전 격리는 아니지만 host exposure와 일부 outbound/inbound 라우팅을 제공하는 fallback
+
+#### Terminal Discovery
+
+VS Code 통합 터미널만이 아니라 macOS Terminal/iTerm2, Linux terminal emulator, Windows Terminal, PowerShell, cmd, WSL 터미널의 shell/process tree를 조회하고, 사용자가 연결할 터미널 프로세스를 선택할 수 있게 하는 기능이다.
+
+### 0.3 기능 요구사항
+
+- 확장은 OS 전체 터미널 후보를 best-effort로 탐색해야 한다.
+  - macOS/Linux: shell process, tty, process group, parent-child tree, terminal app process를 조합해 표시한다.
+  - Windows: Windows Terminal, conhost, PowerShell, cmd, WSL 관련 process tree를 조합해 표시한다.
+  - 권한 제한으로 전체 정보를 얻지 못하면 식별 가능한 범위만 표시하고 제한 사유를 남긴다.
+- 사용자는 새 Logical Network를 만들고 이름을 지정할 수 있어야 한다.
+- 사용자는 탐색된 터미널 프로세스를 선택해 Logical Network에 attach할 수 있어야 한다.
+- attach 이후 해당 터미널에서 실행되는 개발 서버는 같은 Logical Network 안에서 동작해야 한다.
+- 같은 내부 포트 조합을 사용하는 여러 앱이 서로 다른 Logical Network에서 동시에 실행될 수 있어야 한다.
+- 사용자는 호스트 노출 포트를 직접 설정해야 한다.
+  - 예: `localhost:3004 -> A network:3004`
+  - 예: `localhost:3005 -> B network:3004`
+- 노출 포트가 충돌하면 실행 뒤가 아니라 exposure 생성 단계에서 실패해야 한다.
+- MySQL, PostgreSQL, SSH처럼 포트 번호가 프로토콜 계약인 서버도 Logical Network 내부에서는 원래 포트를 그대로 쓸 수 있어야 한다.
+- 기존 레거시 라우팅 UI는 기본 사이드바와 Command Palette에서 숨긴다.
+- 기존 레거시 코드와 설정은 제거하지 않고 deprecated 상태로 유지한다.
+
+### 0.4 중요한 제약
+
+두 개의 일반 호스트 프로세스가 같은 네트워크 namespace 없이 동시에 `127.0.0.1:3004`에 bind하는 것은 OS TCP/IP 모델상 불가능하다. 따라서 A/B 앱이 각각 내부 `3004/8004`를 그대로 쓰려면 다음 중 하나가 필요하다.
+
+- 프로세스를 실제 별도 network namespace 또는 VM/container 안에서 실행한다.
+- 프로세스의 socket API를 안정적으로 후킹해 per-network bind/connect 의미를 제공한다.
+- 모든 서버와 클라이언트 트래픽을 제어 가능한 proxy/runtime을 통해 강제한다.
+
+macOS와 Windows는 Linux network namespace와 같은 per-process 네트워크 격리를 기본 사용자 권한으로 제공하지 않으므로, 동일한 UX를 제공하려면 런타임별 adapter가 필요하다. 이 제약 때문에 새 구현은 `NetworkRuntimeAdapter` 인터페이스를 먼저 만들고, 실제 격리 구현은 adapter별 능력과 제한을 명시적으로 표시한다.
+
+### 0.5 레거시 기능 상태
+
+아래 1장 이후의 `logical port routing`, `managed process`, `native hook`, `rerun routed` 스펙은 현재 구현된 레거시 기능을 설명한다. 새 제품 방향에서는 이 기능들을 기본 사용자 흐름에서 숨기고, 향후 다음 중 하나로 정리한다.
+
+- Logical Network runtime adapter 내부 구현으로 흡수
+- 호환성 모드로 유지하되 설정에서만 접근
+- 새 아키텍처가 안정화된 뒤 제거
+
 ## 1. 개요
 
 Port Manager는 VS Code 확장으로, 개발 중 실행되는 응용프로그램의 요청 포트를 논리 포트로 관리하고 실제 OS bind 포트는 별도의 사용 가능 포트로 라우팅하며, 라우팅된 프로세스를 사이드 패널 GUI에서 관리하는 도구이다.

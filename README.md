@@ -1,10 +1,28 @@
 # Port Manager
 
-Port Manager is a VS Code extension that starts managed development processes on available ports and shows the routed process list in a sidebar.
+Port Manager is shifting from post-conflict port rerouting to logical development networks. The target workflow is to attach a terminal process group to a named network, keep app-internal ports unchanged, and explicitly expose selected network ports on the host machine.
 
-The MVP uses one local Port Manager agent per OS user. VS Code windows connect to that agent, which scans local listening TCP ports, owns managed process launches, maps logical requested ports to actual bind ports, injects route data through environment variables, and publishes a shared snapshot to every Port Manager sidebar.
+Example:
 
-## MVP Capabilities
+```txt
+A network: frontend 3004, backend 8004, exposed as localhost:3004
+B network: frontend 3004, backend 8004, exposed as localhost:3005
+```
+
+The previous managed-process routing, native hook, and rerun-on-failure implementation remains in the repository as deprecated compatibility code. It is hidden from the default sidebar and command surfaces while the logical network model is specified and implemented.
+
+## Target Capabilities
+
+- Discover terminal processes across VS Code and external OS terminals.
+- Let the user attach a selected terminal process group to a logical network.
+- Let child processes launched from that terminal inherit the selected network context.
+- Allow multiple networks to reuse the same internal ports.
+- Configure explicit host port exposure, such as `localhost:3005 -> B network:3004`.
+- Detect host exposure conflicts before exposing a port.
+- Keep fixed protocol ports such as SSH, MySQL, and PostgreSQL meaningful inside each logical network.
+- Implement real network behavior through runtime adapters such as container runtimes, OS-native network namespaces, privileged helpers, or proxy fallbacks.
+
+## Current Compatibility Code
 
 - Start a managed process from the command palette or sidebar.
 - Detect whether the requested port is busy.
@@ -26,14 +44,19 @@ The MVP uses one local Port Manager agent per OS user. VS Code windows connect t
 - Treat routed URLs as live only while the process is running.
 - Register an already running process for sidebar management.
 
+These commands and views are no longer the primary product surface. They remain available internally for migration and testing until the logical network runtime adapters replace them.
+
 ## Usage
 
 1. Run `npm install`.
 2. Run `npm run compile`.
 3. Press `F5` in VS Code and choose `Run Port Manager Extension`.
 4. In the Extension Development Host, open the Port Manager activity bar view.
-5. Run `Port Manager: Start Managed Process`.
-6. Enter a command such as `npm run dev`, the requested port, working directory, and injection mode.
+5. Review the Logical Networks, Terminal Sessions, and Host Port Exposures sections.
+
+The logical network runtime is under design. See `SPEC.MD` and `IMPLEMENTATION_PLAN.MD` for the current architecture plan and platform constraints.
+
+## Legacy Routing
 
 By default, Port Manager uses hashed logical routing: a requested port such as `8000` remains the logical port, while the launched process binds to a deterministic actual port in `portManager.virtualPortRangeStart` through `portManager.virtualPortRangeEnd`. Set `portManager.routingMode` to `nearest` to use the older nearby-port behavior.
 
@@ -65,7 +88,7 @@ The sidebar shows:
 
 Stopped processes stay visible for restart or removal, but their routed URL is cleared and the sidebar no longer presents their old port mapping as an active route.
 
-Important limitation: the agent does not transparently intercept every arbitrary process' failed `bind()` request before it happens. Automatic pre-launch rerouting works for processes launched through `Port Manager: Start Managed Process`. For direct terminal commands, Port Manager detects supported listen-failure output after the command fails and can rerun the same command through the managed launch path. The logical route table is exposed to launched processes, but transparent rewriting of arbitrary in-process HTTP calls still requires a proxy, SDK, or runtime injection layer.
+Important limitation: the agent does not transparently create isolated per-process networks. Automatic pre-launch rerouting works only for supported managed or hooked process paths. Running two ordinary host processes that both bind `127.0.0.1:3004` still requires true network isolation, runtime injection, or a proxy/runtime adapter.
 
 ## Settings
 

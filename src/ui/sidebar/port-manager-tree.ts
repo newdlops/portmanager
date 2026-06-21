@@ -26,11 +26,12 @@ export interface ManagedProcessTreeSource {
   onDidChange(listener: () => void): DisposableLike;
 }
 
-type TreeSectionKind = "actions" | "daemon" | "routes" | "processes" | "listeners";
+type TreeSectionKind = "networks" | "terminals" | "exposures" | "runtime";
 
 type PortManagerTreeItem =
   | TreeSectionItem
   | ActionTreeItem
+  | PlannedFeatureTreeItem
   | DaemonStatusTreeItem
   | RouteTreeItem
   | ManagedProcessTreeItem
@@ -70,18 +71,17 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
 
   /**
    * Converts the daemon snapshot into grouped tree rows. VS Code tree groups
-   * act as accordions for daemon status, routes, managed rows, and OS listeners.
+   * now act as accordions for the logical network model. Legacy daemon,
+   * route, managed-process, and listener rows remain implemented below for
+   * compatibility, but they are intentionally not surfaced from the root.
    */
   getChildren(element?: PortManagerTreeItem): PortManagerTreeItem[] {
-    const snapshot = this.source.getSnapshot();
-
     if (element === undefined) {
       return [
-        new TreeSectionItem("actions", "Actions", "daemon and setup commands", "tools"),
-        new TreeSectionItem("daemon", "Daemon", formatDaemonSummary(snapshot.daemon), "server-process"),
-        new TreeSectionItem("routes", "Routing Table", `${snapshot.routes.length} active`, "references"),
-        new TreeSectionItem("processes", "Managed Processes", `${countManagedProcesses(snapshot)} rows`, "vm-running"),
-        new TreeSectionItem("listeners", "OS Listening Ports", `${snapshot.listeners.length} listeners`, "radio-tower"),
+        new TreeSectionItem("networks", "Logical Networks", "network scoped app ports", "vm"),
+        new TreeSectionItem("terminals", "Terminal Sessions", "attach process groups", "terminal"),
+        new TreeSectionItem("exposures", "Host Port Exposures", "host to network ports", "ports-view-icon"),
+        new TreeSectionItem("runtime", "Runtime Adapter", "container, native, or proxy", "circuit-board"),
       ];
     }
 
@@ -90,24 +90,26 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
     }
 
     switch (element.kind) {
-      case "actions":
-        return buildActionChildren();
-      case "daemon":
-        return buildDaemonChildren(snapshot.daemon);
-      case "routes":
-        return snapshot.routes.length > 0
-          ? snapshot.routes.map((route) => new RouteTreeItem(route))
-          : [new EmptyTreeItem("No active logical routes", "Start a managed process")];
-      case "processes": {
-        const processes = snapshot.processes.filter((process) => process.source !== "detected");
-        return processes.length > 0
-          ? processes.map((process) => new ManagedProcessTreeItem(process))
-          : [new EmptyTreeItem("No managed processes", "Start one from the toolbar")];
-      }
-      case "listeners":
-        return snapshot.listeners.length > 0
-          ? snapshot.listeners.map((listener) => new ListenerTreeItem(listener))
-          : [new EmptyTreeItem("No OS listeners", "Refresh after starting a server")];
+      case "networks":
+        return [
+          new PlannedFeatureTreeItem("A app network", "internal 3004/8004, expose 3004", "vm-active"),
+          new PlannedFeatureTreeItem("B app network", "internal 3004/8004, expose 3005", "vm-outline"),
+        ];
+      case "terminals":
+        return [
+          new PlannedFeatureTreeItem("Discover OS terminals", "VS Code and external shells", "search"),
+          new PlannedFeatureTreeItem("Attach selected terminal", "children inherit network context", "debug-console"),
+        ];
+      case "exposures":
+        return [
+          new PlannedFeatureTreeItem("localhost:3004", "A network -> 3004", "link-external"),
+          new PlannedFeatureTreeItem("localhost:3005", "B network -> 3004", "link-external"),
+        ];
+      case "runtime":
+        return [
+          new PlannedFeatureTreeItem("NetworkRuntimeAdapter", "required for same internal ports", "circuit-board"),
+          new PlannedFeatureTreeItem("Adapter candidates", "container, OS native, proxy", "extensions"),
+        ];
     }
   }
 
@@ -144,6 +146,17 @@ class TreeSectionItem extends vscode.TreeItem {
     super(label, vscode.TreeItemCollapsibleState.Expanded);
     this.id = `section:${kind}`;
     this.contextValue = `section.${kind}`;
+    this.description = description;
+    this.iconPath = new vscode.ThemeIcon(icon);
+  }
+}
+
+/** Planned logical-network row shown while the new runtime model is built. */
+class PlannedFeatureTreeItem extends vscode.TreeItem {
+  readonly contextValue = "plannedNetworkFeature";
+
+  constructor(label: string, description: string, icon: string) {
+    super(label, vscode.TreeItemCollapsibleState.None);
     this.description = description;
     this.iconPath = new vscode.ThemeIcon(icon);
   }

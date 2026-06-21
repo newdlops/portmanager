@@ -20,6 +20,120 @@ export type ProcessSource = "managed" | "registered" | "hooked" | "detected" | "
 
 export type PortProtocol = "tcp";
 
+export type NetworkPortProtocol = "tcp" | "udp";
+
+export type LogicalNetworkStatus = "creating" | "running" | "stopped" | "error";
+
+export type TerminalAttachmentStatus = "attached" | "detached" | "error";
+
+export type NetworkRuntimeKind = "container" | "linuxNamespace" | "nativeHelper" | "proxy";
+
+/**
+ * A user-facing network scope where duplicated app-internal ports remain
+ * meaningful. Runtime adapters decide whether this is backed by a container,
+ * OS namespace, helper process, or proxy layer.
+ */
+export interface LogicalNetwork {
+  /** Stable id used by terminal attachments and host exposure mappings. */
+  readonly id: string;
+  /** Human-readable name such as "A app" or "B app". */
+  readonly name: string;
+  /** Current lifecycle state reported by the selected runtime adapter. */
+  readonly status: LogicalNetworkStatus;
+  /** Runtime adapter kind responsible for enforcing the network behavior. */
+  readonly runtimeKind: NetworkRuntimeKind;
+  /** ISO timestamp from network creation. */
+  readonly createdAt: string;
+  /** Last runtime error or capability warning, if any. */
+  readonly errorMessage?: string;
+}
+
+/**
+ * Capability metadata keeps the UI honest about what an adapter can really do
+ * on the current platform before a user expects same-port isolation to work.
+ */
+export interface NetworkRuntimeCapabilities {
+  /** True when different networks can reuse the same internal listening ports. */
+  readonly supportsSameInternalPorts: boolean;
+  /** True when an existing terminal or shell process group can be attached. */
+  readonly supportsTerminalAttach: boolean;
+  /** True when host ports can be exposed to network-internal ports. */
+  readonly supportsHostExposure: boolean;
+  /** True when privileged setup is required for this adapter. */
+  readonly requiresPrivilegedHelper: boolean;
+  /** True when Docker, Podman, Colima, or a similar runtime must be installed. */
+  readonly requiresContainerRuntime: boolean;
+}
+
+export interface NetworkRuntimeDescriptor {
+  /** Stable adapter id used in settings and stored network rows. */
+  readonly id: string;
+  /** Display name shown in runtime selection UI. */
+  readonly name: string;
+  /** Adapter implementation family. */
+  readonly kind: NetworkRuntimeKind;
+  /** Platform-specific behavior exposed to planning and UI layers. */
+  readonly capabilities: NetworkRuntimeCapabilities;
+}
+
+/**
+ * A terminal candidate discovered from VS Code or the OS process table.
+ * Discovery is best-effort because terminals, shells, and permissions differ
+ * significantly across platforms.
+ */
+export interface TerminalCandidate {
+  /** PID of the shell or root terminal process that can be selected. */
+  readonly pid: number;
+  /** Parent process id when known from the platform scanner. */
+  readonly parentPid?: number;
+  /** Process group id used on POSIX platforms when available. */
+  readonly processGroupId?: number;
+  /** Terminal device path or Windows console/session identifier when known. */
+  readonly terminalId?: string;
+  /** Shell or terminal display name. */
+  readonly name: string;
+  /** Full command line when the platform exposes it. */
+  readonly command?: string;
+  /** Working directory when known. */
+  readonly cwd?: string;
+  /** True when this candidate came from VS Code's integrated terminal API. */
+  readonly vscodeTerminal: boolean;
+}
+
+export interface TerminalAttachment {
+  /** Stable attachment row id. */
+  readonly id: string;
+  /** Logical network that descendant processes should join. */
+  readonly networkId: string;
+  /** Selected terminal candidate root PID. */
+  readonly rootPid: number;
+  /** Process group used to apply runtime context where supported. */
+  readonly processGroupId?: number;
+  /** Current attachment lifecycle state. */
+  readonly status: TerminalAttachmentStatus;
+  /** ISO timestamp when the attachment was requested. */
+  readonly attachedAt: string;
+  /** Last attach failure or runtime warning, if any. */
+  readonly errorMessage?: string;
+}
+
+export interface HostPortExposure {
+  /** Stable exposure row id. */
+  readonly id: string;
+  /** Network that owns the target address and port. */
+  readonly networkId: string;
+  /** Host interface exposed to the user's browser or local clients. */
+  readonly hostAddress: string;
+  /** Host port chosen by the user. */
+  readonly hostPort: number;
+  /** Address inside the logical network. */
+  readonly targetAddress: string;
+  /** Port inside the logical network, for example 3004. */
+  readonly targetPort: number;
+  /** Transport protocol for the exposure. */
+  readonly protocol: NetworkPortProtocol;
+}
+
 export interface PortManagerSettings {
   /** Master switch used by command handlers before launching managed processes. */
   readonly enabled: boolean;

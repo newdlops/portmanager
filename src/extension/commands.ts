@@ -9,6 +9,7 @@ import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
 import type { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import { getProcessFromCommandArgument } from "../ui/sidebar/port-manager-tree";
 import type { PortManagerProcessService } from "./process-service";
+import { prepareAsdfShimLauncherDirectory } from "./terminal-hook-environment";
 import type {
   DisposableLike,
   ManagedProcess,
@@ -351,6 +352,7 @@ export class PortManagerCommandController implements DisposableLike {
   private async installShellHook(context: vscode.ExtensionContext): Promise<void> {
     const settings = readPortManagerSettings();
     const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
+    const asdfShimLauncherPath = context.asAbsolutePath(getAsdfShimLauncherRelativePath());
     const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
     const hookDirectory = path.join(os.homedir(), ".portmanager");
     const hookScriptPath = path.join(hookDirectory, "portmanager-hook.sh");
@@ -358,6 +360,7 @@ export class PortManagerCommandController implements DisposableLike {
     const sourceLine = `. "${hookScriptPath}"`;
 
     await fs.mkdir(hookDirectory, { recursive: true });
+    const asdfShimDirectory = prepareAsdfShimLauncherDirectory(hookDirectory, asdfShimLauncherPath);
     await fs.writeFile(
       hookScriptPath,
       buildShellHookScript({
@@ -367,6 +370,7 @@ export class PortManagerCommandController implements DisposableLike {
         socketPath: getAgentSocketPath(),
         routeTablePath: getDefaultRouteTablePath(),
         settings,
+        asdfShimDirectory,
       }),
       "utf8",
     );
@@ -608,6 +612,11 @@ function getHookLibraryRelativePath(): string {
   throw new Error("Native shell hook is currently supported on macOS and Linux.");
 }
 
+/** Returns the packaged asdf shim launcher for macOS shell hook installs. */
+function getAsdfShimLauncherRelativePath(): string {
+  return path.join("media", "native", "portmanager_asdf_shim");
+}
+
 /**
  * Chooses startup files for the current POSIX shell. Updating both login and
  * interactive profiles makes new OS terminals inherit the native hook env.
@@ -648,6 +657,8 @@ interface ShellHookScriptOptions {
   readonly routeTablePath: string;
   /** Routing settings mirrored into native hook environment variables. */
   readonly settings: PortManagerSettings;
+  /** Optional PATH directory that bypasses macOS asdf shell-script shims. */
+  readonly asdfShimDirectory?: string;
 }
 
 /** Builds the POSIX shell snippet that injects the native socket hook. */
@@ -657,6 +668,8 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
   const escapedNodeExecutablePath = shellDoubleQuote(options.nodeExecutablePath);
   const escapedSocketPath = shellDoubleQuote(options.socketPath);
   const escapedRouteTablePath = shellDoubleQuote(options.routeTablePath);
+  const escapedAsdfShimDirectory =
+    options.asdfShimDirectory !== undefined ? shellDoubleQuote(options.asdfShimDirectory) : undefined;
   const nodeRuntimePrefix = `${ELECTRON_RUN_AS_NODE}=1`;
 
   return `# Port Manager shell hook
@@ -670,6 +683,7 @@ export PORT_MANAGER_ROUTING_MODE="${options.settings.routingMode}"
 export PORT_MANAGER_VIRTUAL_PORT_START="${options.settings.virtualPortRangeStart}"
 export PORT_MANAGER_VIRTUAL_PORT_END="${options.settings.virtualPortRangeEnd}"
 export PORT_MANAGER_FIXED_PROTOCOL_PORTS="${options.settings.fixedProtocolPorts.join(",")}"
+${escapedAsdfShimDirectory !== undefined ? `export PATH="${escapedAsdfShimDirectory}:$PATH"` : ""}
 
 if [ -z "$\{PORT_MANAGER_HOOK_DAEMON_STARTED:-}" ]; then
   export PORT_MANAGER_HOOK_DAEMON_STARTED=1

@@ -1,86 +1,111 @@
-# Port Manager MVP Implementation Plan
+# Port Manager Logical Network Implementation Plan
 
-## MVP 범위
+## 방향
 
-`SPEC.MD`의 Phase 1부터 Phase 4까지 중, 관리형 프로세스 경로를 우선 구현한다.
+Port Manager의 기본 구현 방향은 레거시 포트 재할당 UI에서 Logical Network UI로 전환한다. 기존 daemon, route table, managed process, native hook 코드는 삭제하지 않고 deprecated 상태로 유지한다. 새 화면과 명령은 터미널 프로세스 선택, Logical Network 생성, host port exposure 설정을 중심으로 설계한다.
 
-이번 MVP에서 구현하는 동작:
+## 핵심 판단
 
-- 사용자가 VS Code 명령 또는 사이드바에서 관리형 프로세스를 시작한다.
-- OS 사용자 단위의 단일 local agent가 전체 listening TCP 포트를 감시한다.
-- 여러 VS Code 창은 같은 agent에 연결해 동일한 포트 snapshot을 본다.
-- agent가 요청 포트의 사용 가능 여부를 확인한다.
-- 요청 포트가 사용 중이면 설정된 탐색 정책으로 인접 가용 포트를 찾는다.
-- 실제 포트를 프로세스에 주입한다.
-- 프로세스의 요청 포트와 실제 포트 매핑을 사이드바에 표시한다.
-- 사용자가 사이드바에서 URL 열기, URL 복사, 종료, 재시작, 제거를 수행한다.
-- 외부 프로세스가 점유한 listening port와 PID/프로세스명 정보를 사이드바에 표시한다.
+- 충돌 이후 rerun prompt는 개발 서버가 이미 종료된 뒤라 예방 기능이 아니다.
+- 여러 앱이 같은 내부 포트를 동시에 쓰려면 실제 네트워크 격리 또는 그에 준하는 런타임이 필요하다.
+- VS Code 확장 단독으로 macOS/Windows/Linux 전체에서 동일한 per-process network namespace를 제공할 수는 없다.
+- 따라서 도메인은 `LogicalNetwork`, `TerminalAttachment`, `HostPortExposure`로 먼저 모델링하고, 실제 구현은 `NetworkRuntimeAdapter` 뒤에 둔다.
+- 레거시 라우팅 기능은 새 모델의 fallback 또는 adapter 내부 구현으로 흡수할 수 있을 때까지 숨김 상태로 둔다.
 
-이번 MVP에서 제외하는 동작:
+## Phase 0: 레거시 UI 숨김
 
-- 임의 외부 프로세스의 소켓 바인딩을 OS 수준에서 투명하게 후킹하는 기능
-- 이미 실패한 외부 프로세스의 `bind()` 요청을 런타임 밖에서 자동 복구하는 기능
-- Docker, Kubernetes, WSL, Remote SSH 자동 포트 매핑
-- VS Code task/debug configuration 자동 패치
-- webview 기반 고급 GUI
+상태: 진행 중
 
-## 구현 단계
+- 사이드바에서 daemon/routes/managed process/listener 중심 화면을 숨긴다.
+- Command Palette와 view toolbar에서 레거시 시작/중지/라우팅 명령을 숨긴다.
+- 레거시 코드 경로는 유지해 기존 테스트와 빌드를 깨지 않는다.
+- README와 SPEC에 레거시 상태와 새 방향을 명시한다.
 
-### 1. 확장 스캐폴드
+## Phase 1: 도메인 모델
 
-상태: 완료
+상태: 예정
 
-- `package.json` contribution 작성
-- Activity Bar와 Processes view 등록
-- Command Palette 명령 등록
-- TypeScript 빌드 구성
-- F5 실행용 VS Code launch configuration 추가
+- `LogicalNetwork` 모델 추가
+  - id, name, status, runtime adapter, createdAt, metadata
+- `TerminalAttachment` 모델 추가
+  - networkId, rootPid, processGroupId, shell, tty, attachedAt, status
+- `HostPortExposure` 모델 추가
+  - hostAddress, hostPort, targetAddress, targetPort, protocol, networkId
+- repository와 event contract 추가
+- 설정 스키마에 기본 runtime adapter와 exposure 기본 host 추가
 
-### 2. Core 도메인
+## Phase 2: 터미널 탐색
 
-상태: 완료
+상태: 예정
 
-- `PortRoutingService` 구현
-- `scanDirection` 기반 후보 포트 생성
-- 요청 포트 보존, 실제 포트 분리
-- `ManagedProcessRegistry` 구현
-- registry change event 제공
-- core unit test 추가
+- OS 전체 process tree scanner 추가
+- 터미널 후보 식별 규칙 구현
+  - macOS: Terminal, iTerm2, shell, tty, process group
+  - Linux: terminal emulator, shell, tty, process group
+  - Windows: Windows Terminal, conhost, PowerShell, cmd, WSL process tree
+- VS Code 통합 터미널과 외부 터미널을 같은 `TerminalCandidate` 모델로 표시
+- 권한 제한과 불완전한 식별 결과를 UI에 표시
 
-### 3. Platform 어댑터
+## Phase 3: Network Runtime Adapter
 
-상태: 완료
+상태: 예정
 
-- Node TCP bind 기반 포트 가용성 확인
-- macOS/Linux `lsof`, Windows PowerShell 기반 best-effort owner lookup
-- child process launcher 구현
-- `PORT`, `${port}`, `--port` 주입 방식 지원
-- process exit event 제공
-- scanner unit test 추가
+- `NetworkRuntimeAdapter` 인터페이스 정의
+  - create network
+  - attach terminal/process group
+  - apply environment/wrapper
+  - create/remove host exposure
+  - inspect runtime health
+- 첫 adapter 후보 구현 순서
+  - Docker/Podman/Colima 계열 adapter
+  - Linux network namespace adapter
+  - macOS/Windows proxy 또는 VM 기반 adapter
+- adapter별 capability를 UI에 노출
+  - supportsSameInternalPorts
+  - supportsTerminalAttach
+  - supportsHostExposure
+  - requiresPrivilegedHelper
+  - requiresContainerRuntime
 
-### 4. UI와 명령 통합
+## Phase 4: Host Port Exposure
 
-상태: 완료
+상태: 예정
 
-- Sidebar TreeDataProvider 구현
-- 프로세스 상태, PID, 포트 매핑, URL 표시
-- Start, Add Existing, Stop, Restart, Stop All, Remove 명령 연결
-- URL 열기와 복사 명령 연결
-- Settings 열기 명령 연결
+- host exposure 생성/삭제/검증 서비스 구현
+- `localhost:3004 -> A network:3004` 같은 명시적 매핑 저장
+- exposure 생성 전에 host port 점유 여부를 검사
+- 충돌 시 실행 이후가 아니라 exposure 설정 단계에서 실패 처리
+- exposure 상태를 sidebar에 표시
 
-### 5. 검증
+## Phase 5: Sidebar UX
 
-상태: 완료
+상태: 예정
 
-- `npm run compile` 통과
-- `npm test` 통과
-- 총 14개 unit test 통과
+- Logical Networks 섹션
+  - 네트워크 생성, 삭제, 상태 확인
+- Terminal Sessions 섹션
+  - 감지된 터미널 표시
+  - 선택한 터미널을 네트워크에 attach
+- Host Port Exposures 섹션
+  - host port와 내부 target port 매핑 표시
+  - 노출 추가, 제거, 복사, 브라우저 열기
+- 레거시 라우팅은 사이드바 섹션으로 표시하지 않는다.
 
-## 후속 구현 후보
+## Phase 6: 검증 시나리오
 
-- managed process stdout/stderr output channel 연결
-- 재시작 시 기존 프로세스 종료 완료 대기
-- framework별 기본 실행 프로필 제공
-- task/debug configuration 연동
-- workspace state 기반 최근 프로세스 프로필 저장
-- 통합 테스트에서 Extension Development Host 명령 검증
+상태: 예정
+
+- A network에서 frontend `3004`, backend `8004` 실행
+- B network에서 같은 frontend `3004`, backend `8004` 실행
+- host `localhost:3004`는 A frontend로 연결
+- host `localhost:3005`는 B frontend로 연결
+- A frontend의 backend 호출은 A network 내부 `8004`로 연결
+- B frontend의 backend 호출은 B network 내부 `8004`로 연결
+- host exposure 충돌은 exposure 생성 단계에서 차단
+
+## 남은 위험
+
+- 외부 터미널을 이미 실행 중인 상태에서 강제로 다른 network namespace에 이동시키는 것은 OS별로 불가능하거나 제한적일 수 있다.
+- macOS와 Windows에서 진짜 per-process 네트워크 격리는 privileged helper, VM, container runtime, 또는 proxy 강제가 필요할 가능성이 높다.
+- shell script shim, version manager, login shell, terminal app별 process tree가 다르므로 terminal attach는 best-effort로 시작해야 한다.
+- 프론트엔드 코드가 빌드 타임에 backend URL을 고정하면 네트워크 격리만으로 해결되지 않고 앱 설정도 함께 다뤄야 한다.

@@ -5,7 +5,8 @@ set -eu
 # The VSIX includes the resulting library when a supported compiler exists.
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-SOURCE_FILE="$ROOT_DIR/native/hook/portmanager_hook.c"
+HOOK_SOURCE_FILE="$ROOT_DIR/native/hook/portmanager_hook.c"
+ASDF_SHIM_SOURCE_FILE="$ROOT_DIR/native/asdf-shim/portmanager_asdf_shim.c"
 OUTPUT_DIR="$ROOT_DIR/media/native"
 
 mkdir -p "$OUTPUT_DIR"
@@ -17,10 +18,11 @@ fi
 
 case "$(uname -s)" in
   Darwin)
-    cc -Wall -Wextra -O2 -dynamiclib "$SOURCE_FILE" -o "$OUTPUT_DIR/libportmanager_hook.dylib"
+    cc -Wall -Wextra -O2 -dynamiclib "$HOOK_SOURCE_FILE" -o "$OUTPUT_DIR/libportmanager_hook.dylib"
+    cc -Wall -Wextra -O2 "$ASDF_SHIM_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_asdf_shim"
     ;;
   Linux)
-    cc -Wall -Wextra -O2 -fPIC -shared "$SOURCE_FILE" -ldl -o "$OUTPUT_DIR/libportmanager_hook.so"
+    cc -Wall -Wextra -O2 -fPIC -shared "$HOOK_SOURCE_FILE" -ldl -o "$OUTPUT_DIR/libportmanager_hook.so"
     ;;
   *)
     echo "Unsupported native hook platform; skipping"
