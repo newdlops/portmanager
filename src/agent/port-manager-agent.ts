@@ -41,6 +41,7 @@ import {
 
 const DEFAULT_KILL_SIGNAL: ProcessKillSignal = "SIGTERM";
 const DETECTED_PROCESS_ID_PREFIX = "detected:";
+const DEFAULT_LISTENER_SCAN_INTERVAL_MS = 3_000;
 
 export interface PortManagerAgentOptions {
   /** Shared registry for managed and manually registered process rows. */
@@ -65,6 +66,8 @@ export interface PortManagerAgentOptions {
   readonly defaultCwd?: string;
   /** JSON route table path shared with launched child processes. */
   readonly routeTablePath?: string;
+  /** Interval for daemon-side OS listener polling. */
+  readonly listenerScanIntervalMs?: number;
 }
 
 export interface BuildAgentSnapshotOptions {
@@ -149,6 +152,21 @@ export class PortManagerAgent implements DisposableLike {
   /** JSON file path that stores the latest logical routing table. */
   private readonly routeTablePath: string;
 
+  /** Interval for rescanning the OS listening table while clients are attached. */
+  private readonly listenerScanIntervalMs: number;
+
+  /** Timer that keeps OS Listening Ports fresh without manual refresh. */
+  private listenerScanTimer: NodeJS.Timeout | undefined;
+
+  /** Prevents overlapping lsof/netstat scans when an interval tick is slow. */
+  private listenerScanInFlight = false;
+
+  /** Last broadcast signature, used to skip unchanged polling updates. */
+  private lastSnapshotSignature = "";
+
+  /** Last route table content signature, used to avoid timer-driven file churn. */
+  private lastRouteTableSignature = "";
+
   /** Node net server once listen() has been called. */
   private server: Server | undefined;
 
@@ -170,6 +188,7 @@ export class PortManagerAgent implements DisposableLike {
     this.defaultHost = options.defaultHost ?? "localhost";
     this.defaultCwd = options.defaultCwd ?? process.cwd();
     this.routeTablePath = options.routeTablePath ?? getDefaultRouteTablePath();
+    this.listenerScanIntervalMs = normalizeListenerScanInterval(options.listenerScanIntervalMs);
 
     this.subscriptions.push(
       this.registry.onDidChange(() => {
@@ -217,6 +236,8 @@ export class PortManagerAgent implements DisposableLike {
       server.once("listening", onListening);
       server.listen(socketPath);
     });
+
+    this.startListenerPolling();
   }
 
   /** Allows agent-main to exit if the underlying socket server fails. */
@@ -405,6 +426,7 @@ export class PortManagerAgent implements DisposableLike {
   /** Forces a rescan and broadcasts the resulting state to all clients. */
   async refreshSnapshot(): Promise<AgentSnapshot> {
     const snapshot = await this.buildSnapshot();
+    this.lastSnapshotSignature = buildSnapshotSignature(snapshot);
     this.broadcastSnapshot(snapshot);
     return snapshot;
   }
@@ -419,6 +441,11 @@ export class PortManagerAgent implements DisposableLike {
     if (this.server !== undefined) {
       this.server.close();
       this.server = undefined;
+    }
+
+    if (this.listenerScanTimer !== undefined) {
+      clearInterval(this.listenerScanTimer);
+      this.listenerScanTimer = undefined;
     }
 
     while (this.subscriptions.length > 0) {
@@ -524,6 +551,7 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Broadcasts a snapshot event to every currently connected client. */
   private broadcastSnapshot(snapshot: AgentSnapshot): void {
+    this.lastSnapshotSignature = buildSnapshotSignature(snapshot);
     const message = encodeAgentMessage({
       type: "snapshot",
       payload: snapshot,
@@ -556,6 +584,44 @@ export class PortManagerAgent implements DisposableLike {
       });
   }
 
+  /** Starts the daemon-side OS listener polling loop. */
+  private startListenerPolling(): void {
+    if (this.listenerScanTimer !== undefined) {
+      return;
+    }
+
+    this.listenerScanTimer = setInterval(() => {
+      void this.pollListeningPorts();
+    }, this.listenerScanIntervalMs);
+    this.listenerScanTimer.unref();
+  }
+
+  /**
+   * Periodically rescans OS listeners and broadcasts only real table changes.
+   * This is what removes stale OS Listening Ports after an external process
+   * exits without any Port Manager command being invoked.
+   */
+  private async pollListeningPorts(): Promise<void> {
+    if (this.clients.size === 0 || this.listenerScanInFlight) {
+      return;
+    }
+
+    this.listenerScanInFlight = true;
+
+    try {
+      const snapshot = await this.buildSnapshot();
+      const nextSignature = buildSnapshotSignature(snapshot);
+
+      if (nextSignature !== this.lastSnapshotSignature) {
+        this.broadcastSnapshot(snapshot);
+      }
+    } catch (error) {
+      this.serverErrors.emit(error instanceof Error ? error : new Error(String(error)));
+    } finally {
+      this.listenerScanInFlight = false;
+    }
+  }
+
   /**
    * Builds a snapshot from the registry and a fresh listening-port scan.
    * The merge function is exported separately so the de-duplication policy is
@@ -581,6 +647,11 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Writes the latest dynamic route table for already-running children. */
   private writeRouteTable(routes: readonly LogicalPortRoute[]): void {
+    const routeTableSignature = buildRouteTableSignature(routes);
+    if (routeTableSignature === this.lastRouteTableSignature && fs.existsSync(this.routeTablePath)) {
+      return;
+    }
+
     try {
       fs.mkdirSync(path.dirname(this.routeTablePath), { recursive: true });
       fs.writeFileSync(
@@ -588,6 +659,7 @@ export class PortManagerAgent implements DisposableLike {
         `${JSON.stringify({ updatedAt: this.now().toISOString(), routes }, null, 2)}\n`,
         "utf8",
       );
+      this.lastRouteTableSignature = routeTableSignature;
     } catch {
       // Route table file updates are a convenience channel. Snapshot delivery
       // and managed process lifecycle should continue if the write fails.
@@ -826,4 +898,73 @@ function requirePortAvailabilityProvider(options: PortManagerAgentOptions): Port
 function getDefaultRouteTablePath(): string {
   const userId = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;
   return path.join(os.tmpdir(), `newdlops-portmanager-routes-${userId}.json`);
+}
+
+/** Keeps daemon listener polling responsive without creating a tight loop. */
+function normalizeListenerScanInterval(intervalMs: number | undefined): number {
+  if (intervalMs === undefined || !Number.isFinite(intervalMs)) {
+    return DEFAULT_LISTENER_SCAN_INTERVAL_MS;
+  }
+
+  return Math.max(1_000, Math.trunc(intervalMs));
+}
+
+/**
+ * Builds a stable signature for real snapshot contents.
+ * Volatile timestamps are excluded so the polling loop refreshes only when
+ * listeners, routes, or process lifecycle rows actually change.
+ */
+function buildSnapshotSignature(snapshot: AgentSnapshot): string {
+  const listenerRows = snapshot.listeners
+    .map((listener) => [
+      listener.id,
+      listener.localAddress,
+      listener.port,
+      listener.pid ?? "",
+      listener.processName ?? "",
+      listener.command ?? "",
+      listener.source,
+    ])
+    .sort(compareSignatureRows);
+  const processRows = snapshot.processes
+    .map((process) => [
+      process.id,
+      process.pid,
+      process.requestedPort,
+      process.actualPort,
+      process.status,
+      process.source ?? "",
+    ])
+    .sort(compareSignatureRows);
+  return JSON.stringify({
+    listeners: listenerRows,
+    processes: processRows,
+    routes: buildRouteSignatureRows(snapshot.routes),
+  });
+}
+
+/** Builds a content-only route table signature for write de-duplication. */
+function buildRouteTableSignature(routes: readonly LogicalPortRoute[]): string {
+  return JSON.stringify(buildRouteSignatureRows(routes));
+}
+
+/** Normalizes route rows so snapshot and route-file signatures stay aligned. */
+function buildRouteSignatureRows(routes: readonly LogicalPortRoute[]): readonly (readonly unknown[])[] {
+  const routeRows = routes
+    .map((route) => [
+      route.logicalPort,
+      route.actualPort,
+      route.host,
+      route.processId ?? "",
+      route.status,
+      route.source,
+    ])
+    .sort(compareSignatureRows);
+
+  return routeRows;
+}
+
+/** Sorts signature rows by their serialized value for stable comparisons. */
+function compareSignatureRows(left: readonly unknown[], right: readonly unknown[]): number {
+  return JSON.stringify(left).localeCompare(JSON.stringify(right));
 }

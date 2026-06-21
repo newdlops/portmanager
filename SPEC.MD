@@ -106,7 +106,7 @@ Port Manager agent가 관리하는 `논리 포트 -> 실제 포트` 관계이다
 
 - 확장은 지정된 포트가 이미 사용 중인지 확인할 수 있어야 한다.
 - 포트 점유 프로세스의 PID, 프로세스명, 명령어를 가능한 범위에서 조회해야 한다.
-- daemon은 OS 전체 listening TCP 포트를 감시하고 사이드 패널에 표시해야 한다.
+- daemon은 OS 전체 listening TCP 포트를 주기적으로 감시하고 사이드 패널에 자동 반영해야 한다.
 - 확장은 선호 포트 목록을 백그라운드에서 감시하고, 외부 프로세스가 점유한 포트를 사이드 패널에 표시해야 한다.
 - 확장은 OS 사용자 단위의 단일 local agent와 통신하고, 여러 VS Code 창은 동일한 agent snapshot을 공유해야 한다.
 - agent는 전체 listening TCP 포트를 감시하고, 관리형 프로세스의 논리 요청 포트와 실제 라우팅 포트 매핑을 함께 제공해야 한다.
@@ -413,6 +413,7 @@ VS Code Command Palette에 다음 명령을 등록한다.
 - agent snapshot과 실행 프로세스 환경 변수에 논리 라우팅 테이블이 제공된다.
 - 사이드 패널이 Daemon, Routing Table, Managed Processes, OS Listening Ports 아코디언으로 구분된다.
 - Daemon 섹션에서 PID, 상태, listener 수, route 수, route table 파일 경로를 확인할 수 있다.
+- 외부 프로세스가 종료되면 OS Listening Ports 섹션에서 해당 listener가 자동으로 사라진다.
 - 같은 요청 포트를 가진 여러 관리형 프로세스가 각각 다른 실제 포트로 실행될 수 있다.
 - 사이드 패널 행 클릭은 브라우저를 열지 않고 선택만 수행한다.
 - 사용자가 사이드 패널에서 프로세스를 종료하고 재시작할 수 있다.

@@ -14,7 +14,7 @@ The MVP uses one local Port Manager agent per OS user. VS Code windows connect t
 - Inject `PORT_MANAGER_LOGICAL_PORT`, `PORT_MANAGER_ACTUAL_PORT`, `PORT_MANAGER_ROUTES`, and `PORT_MANAGER_ROUTES_FILE`.
 - Track requested and actual ports in the sidebar.
 - Show daemon status, routing table, managed processes, and OS listeners as separate sidebar accordion sections.
-- Watch all local listening TCP ports through the shared local agent.
+- Watch all local listening TCP ports through the shared local agent and update the sidebar automatically.
 - Show which process owns each visible port when the OS exposes PID/name data.
 - Detect VS Code terminal listen failures and offer to rerun the failed command through Port Manager routing.
 - Stop, restart, remove, open, and copy managed process URLs.
@@ -39,7 +39,7 @@ If a command is run directly in a VS Code terminal and fails with a bind error s
 
 Port Manager starts after VS Code startup and connects to a single local agent.
 
-The agent listens on a per-user local socket or named pipe. If no agent is running, the first VS Code window starts one. Additional VS Code windows connect to the same agent and receive the same port snapshot.
+The agent listens on a per-user local socket or named pipe. If no agent is running, the first VS Code window starts one. Additional VS Code windows connect to the same agent and receive the same port snapshot. While a VS Code client is attached, the daemon rescans the OS listening table periodically so stopped external processes disappear without a manual refresh.
 
 The sidebar shows:
 
