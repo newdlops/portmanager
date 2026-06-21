@@ -287,9 +287,26 @@ function buildDescription(process: ManagedProcess): string {
       ? String(process.actualPort)
       : `${process.requestedPort} -> ${process.actualPort}`;
 
-  const sourceText = process.source === "detected" ? "external" : process.status;
+  const sourceText = sourceLabel(process);
 
   return `${routeText} ${sourceText}`;
+}
+
+/** Labels process origin without changing the managed-section behavior. */
+function sourceLabel(process: ManagedProcess): string {
+  switch (process.source) {
+    case "detected":
+      return "external";
+    case "hooked":
+      return "hooked";
+    case "registered":
+      return "registered";
+    case "allocated":
+      return "allocated";
+    case "managed":
+    case undefined:
+      return process.status;
+  }
 }
 
 /**

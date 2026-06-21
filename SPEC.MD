@@ -89,16 +89,16 @@ Port Manager agent가 관리하는 `논리 포트 -> 실제 포트` 관계이다
 
 수동 등록된 외부 프로세스는 포트 충돌 전에 라우팅할 수 없으므로, 상태 조회와 종료 같은 관리 기능을 우선 제공한다.
 
-### 5.4 터미널 listen 실패 복구
+### 5.4 터미널 bind 전 논리 할당
 
-1. 사용자가 VS Code 터미널에서 직접 개발 서버를 실행한다.
-2. 서버가 이미 점유된 포트에 bind를 시도하고 `Address already in use`, `EADDRINUSE`, Daphne의 `Couldn't listen on 127.0.0.1:8004` 같은 오류를 출력한다.
-3. Port Manager가 VS Code shell integration 출력 스트림에서 실패 포트와 호스트를 감지한다.
-4. 확장은 사이드 패널 포트 snapshot을 갱신하고, 해당 포트 점유 프로세스 정보를 가능한 범위에서 표시한다.
-5. 사용자가 `Rerun Routed`를 선택하면 같은 명령을 Port Manager agent 관리형 실행 경로로 다시 실행한다.
-6. 재실행된 프로세스는 요청 포트와 실제 포트 매핑을 생성하고, 사이드 패널에 표시된다.
+1. daemon이 실행된 뒤 사용자가 VS Code 새 터미널 또는 shell hook이 설치된 외부 터미널에서 개발 프로세스를 실행한다.
+2. 프로세스가 고정 프로토콜 제외 목록에 없는 포트로 `bind()`를 호출한다.
+3. native hook이 OS bind 호출 전에 daemon에 short-lived route allocation을 요청한다.
+4. daemon은 논리 요청 포트와 실제 가용 포트를 결정하고 라우팅 테이블에 pending route를 기록한다.
+5. native hook은 실제 포트로 bind를 수행하고, 성공하면 해당 프로세스를 hooked row로 등록한다.
+6. 사이드 패널에는 요청 포트와 실제 포트 매핑이 표시된다.
 
-이 경로는 첫 번째 bind 실패를 사전에 막는 기능이 아니라 실패를 감지한 뒤 라우팅된 재실행으로 복구하는 기능이다.
+이미 열려 있어 hook 환경을 상속받지 못한 터미널이나 native hook을 사용할 수 없는 플랫폼에서는 기존 listen 실패 감지와 `Rerun Routed` 재실행 제안을 fallback으로 제공한다. 이 fallback은 첫 번째 bind 실패를 사전에 막는 기능이 아니다.
 
 ## 6. 기능 요구사항
 
@@ -112,11 +112,13 @@ Port Manager agent가 관리하는 `논리 포트 -> 실제 포트` 관계이다
 - agent는 전체 listening TCP 포트를 감시하고, 관리형 프로세스의 논리 요청 포트와 실제 라우팅 포트 매핑을 함께 제공해야 한다.
 - agent는 실행 중인 관리형 프로세스의 논리 라우팅 테이블을 snapshot과 프로세스 환경 변수로 제공해야 한다.
 - daemon 시작/상태 확인/종료 기능은 Command Palette뿐 아니라 사이드 패널 UI에서도 접근 가능해야 한다.
-- VS Code 터미널 명령이 `--port`, `-p`, `PORT=`, `host:port`, `runserver host:port`처럼 명시적 포트를 포함하면 확장은 bind 실패를 기다리지 않고 daemon 경유 재실행을 제안해야 한다.
-- 확장은 VS Code shell integration이 제공하는 터미널 출력에서 listen/bind 실패 메시지를 감지하고 라우팅 재실행을 제안해야 한다.
+- VS Code 통합 터미널에서 새로 실행되는 프로세스는 native hook 환경을 상속받아, 고정 프로토콜 포트가 아닌 `bind()` 요청을 OS 호출 전에 daemon 논리 라우팅으로 할당받아야 한다.
 - 외부 OS 터미널에서 실행되는 프로세스는 shell hook을 통해 `bind/connect/getsockname`이 가로채져 daemon의 논리 라우팅 테이블과 동기화되어야 한다.
+- native hook이 적용되지 않은 VS Code 터미널 명령이 `--port`, `-p`, `PORT=`, `host:port`, `runserver host:port`처럼 명시적 포트를 포함하면 확장은 daemon 경유 재실행을 제안할 수 있어야 한다.
+- 확장은 VS Code shell integration이 제공하는 터미널 출력에서 listen/bind 실패 메시지를 감지하고 라우팅 재실행을 fallback으로 제안해야 한다.
 - 확장은 외부 터미널 hook을 쉽게 사용할 수 있도록 `Port Manager: Install Shell Hook` 명령으로 OS별 native hook 주입 스크립트를 설치할 수 있어야 한다.
 - daemon은 native hook을 위해 short-lived route allocation을 제공하고, `bind()` 성공 후 hook이 해당 프로세스를 등록할 수 있어야 한다.
+- native hook은 SSH, MySQL, PostgreSQL처럼 포트 번호 자체가 프로토콜 계약인 고정 포트는 기본적으로 재매핑하지 않아야 하며, 제외 목록은 설정으로 변경할 수 있어야 한다.
 - 플랫폼별 조회 방식을 지원해야 한다.
   - macOS/Linux: `lsof`, `netstat`, `ss` 중 사용 가능한 명령
   - Windows: `netstat`, PowerShell, `Get-NetTCPConnection`
@@ -262,6 +264,7 @@ OS Listening Ports:
   "portManager.virtualPortRangeStart": 53000,
   "portManager.virtualPortRangeEnd": 59999,
   "portManager.preferredPorts": [3000, 3001, 5173, 8000, 8080],
+  "portManager.fixedProtocolPorts": [22, 25, 53, 80, 110, 143, 389, 443, 465, 587, 993, 995, 1433, 1521, 3306, 33060, 5432, 5672, 6379, 9200, 9300, 11211, 27017],
   "portManager.autoOpenBrowser": false,
   "portManager.showConflictNotification": true,
   "portManager.watchPreferredPorts": true,

@@ -3,6 +3,7 @@ import { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import { LocalAgentClient } from "./local-agent-client";
 import { PortManagerCommandController } from "./commands";
 import { TerminalConflictMonitor } from "./terminal-conflict-monitor";
+import { configureTerminalHookEnvironment } from "./terminal-hook-environment";
 
 /**
  * VS Code activation entry point for Port Manager.
@@ -28,6 +29,7 @@ export function activate(context: vscode.ExtensionContext): void {
     treeProvider,
     commandController,
     terminalConflictMonitor,
+    configureTerminalHookEnvironment(context),
   );
 
   commandController.register(context);

@@ -5,6 +5,7 @@ import * as vscode from "vscode";
 import { getAgentSocketPath } from "../agent/agent-socket";
 import { getDefaultRouteTablePath } from "../agent/route-table";
 import { readPortManagerSettings, openPortManagerSettings } from "../config/vscode-settings";
+import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
 import type { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import { getProcessFromCommandArgument } from "../ui/sidebar/port-manager-tree";
 import type { PortManagerProcessService } from "./process-service";
@@ -13,6 +14,7 @@ import type {
   ManagedProcess,
   ManagedProcessStartInput,
   PortInjectionMode,
+  PortManagerSettings,
 } from "../shared/types";
 
 /**
@@ -321,7 +323,7 @@ export class PortManagerCommandController implements DisposableLike {
     const cliPath = context.asAbsolutePath(path.join("out", "src", "cli", "portmanager-cli.js"));
     const installDirectory = getExternalCliInstallDirectory();
     const shimPath = getExternalCliShimPath(installDirectory);
-    const shimContent = buildExternalCliShim(cliPath);
+    const shimContent = buildExternalCliShim(cliPath, process.execPath);
 
     await fs.mkdir(installDirectory, { recursive: true });
     await fs.writeFile(shimPath, shimContent, "utf8");
@@ -347,11 +349,12 @@ export class PortManagerCommandController implements DisposableLike {
 
   /** Installs the native socket hook into the user's shell startup file. */
   private async installShellHook(context: vscode.ExtensionContext): Promise<void> {
+    const settings = readPortManagerSettings();
     const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
     const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
     const hookDirectory = path.join(os.homedir(), ".portmanager");
     const hookScriptPath = path.join(hookDirectory, "portmanager-hook.sh");
-    const shellProfilePath = getShellProfilePath();
+    const shellProfilePaths = getShellProfilePaths();
     const sourceLine = `. "${hookScriptPath}"`;
 
     await fs.mkdir(hookDirectory, { recursive: true });
@@ -363,18 +366,19 @@ export class PortManagerCommandController implements DisposableLike {
         nodeExecutablePath: process.execPath,
         socketPath: getAgentSocketPath(),
         routeTablePath: getDefaultRouteTablePath(),
+        settings,
       }),
       "utf8",
     );
 
-    if (shellProfilePath !== undefined) {
+    for (const shellProfilePath of shellProfilePaths) {
       await appendLineOnce(shellProfilePath, sourceLine);
     }
 
     const message =
-      shellProfilePath === undefined
+      shellProfilePaths.length === 0
         ? `Installed Port Manager shell hook: ${hookScriptPath}`
-        : `Installed Port Manager shell hook and updated ${shellProfilePath}`;
+        : `Installed Port Manager shell hook and updated ${shellProfilePaths.join(", ")}`;
     const selection = await vscode.window.showInformationMessage(message, "Copy Source Line");
 
     if (selection === "Copy Source Line") {
@@ -564,13 +568,17 @@ function getExternalCliShimPath(installDirectory: string): string {
   return path.join(installDirectory, process.platform === "win32" ? "portmanager.cmd" : "portmanager");
 }
 
-/** Builds a tiny shell wrapper that points at this extension's compiled CLI. */
-function buildExternalCliShim(cliPath: string): string {
+/**
+ * Builds a tiny shell wrapper that runs the compiled CLI in Node mode.
+ * `process.execPath` may point at VS Code's Electron binary, so the shim must
+ * force Node behavior instead of letting Electron open another editor window.
+ */
+function buildExternalCliShim(cliPath: string, nodeExecutablePath: string): string {
   if (process.platform === "win32") {
-    return `@echo off\r\n"${process.execPath}" "${cliPath}" %*\r\n`;
+    return `@echo off\r\nset "${ELECTRON_RUN_AS_NODE}=1"\r\n"${nodeExecutablePath}" "${cliPath}" %*\r\n`;
   }
 
-  return `#!/bin/sh\nexec "${process.execPath}" "${cliPath}" "$@"\n`;
+  return `#!/bin/sh\n${ELECTRON_RUN_AS_NODE}=1 exec "${shellDoubleQuote(nodeExecutablePath)}" "${shellDoubleQuote(cliPath)}" "$@"\n`;
 }
 
 /** Builds a shell command users can paste if the shim directory is not on PATH. */
@@ -600,23 +608,31 @@ function getHookLibraryRelativePath(): string {
   throw new Error("Native shell hook is currently supported on macOS and Linux.");
 }
 
-/** Chooses the user's current shell startup file when it is a POSIX shell. */
-function getShellProfilePath(): string | undefined {
+/**
+ * Chooses startup files for the current POSIX shell. Updating both login and
+ * interactive profiles makes new OS terminals inherit the native hook env.
+ */
+function getShellProfilePaths(): readonly string[] {
   const shellName = path.basename(process.env.SHELL ?? "");
 
   if (shellName === "zsh") {
-    return path.join(os.homedir(), ".zshrc");
+    return uniquePaths([path.join(os.homedir(), ".zprofile"), path.join(os.homedir(), ".zshrc")]);
   }
 
   if (shellName === "bash") {
-    return path.join(os.homedir(), ".bashrc");
+    return uniquePaths([path.join(os.homedir(), ".bash_profile"), path.join(os.homedir(), ".bashrc")]);
   }
 
   if (shellName === "sh") {
-    return path.join(os.homedir(), ".profile");
+    return [path.join(os.homedir(), ".profile")];
   }
 
-  return undefined;
+  return [];
+}
+
+/** Removes duplicate profile paths while preserving the intended source order. */
+function uniquePaths(paths: readonly string[]): readonly string[] {
+  return [...new Set(paths)];
 }
 
 interface ShellHookScriptOptions {
@@ -624,12 +640,14 @@ interface ShellHookScriptOptions {
   readonly hookLibraryPath: string;
   /** Agent entrypoint used when no daemon socket exists yet. */
   readonly agentMainPath: string;
-  /** Node-compatible executable used by VS Code to run extension JS. */
+  /** Node or Electron executable used to run compiled extension JS in Node mode. */
   readonly nodeExecutablePath: string;
   /** Singleton agent socket path shared with VS Code windows. */
   readonly socketPath: string;
   /** Dynamic route-table JSON file written by the daemon. */
   readonly routeTablePath: string;
+  /** Routing settings mirrored into native hook environment variables. */
+  readonly settings: PortManagerSettings;
 }
 
 /** Builds the POSIX shell snippet that injects the native socket hook. */
@@ -639,6 +657,7 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
   const escapedNodeExecutablePath = shellDoubleQuote(options.nodeExecutablePath);
   const escapedSocketPath = shellDoubleQuote(options.socketPath);
   const escapedRouteTablePath = shellDoubleQuote(options.routeTablePath);
+  const nodeRuntimePrefix = `${ELECTRON_RUN_AS_NODE}=1`;
 
   return `# Port Manager shell hook
 # This file is generated by the VS Code Port Manager extension.
@@ -646,12 +665,17 @@ export PORT_MANAGER_HOOK=1
 export PORT_MANAGER_AGENT_SOCKET="${escapedSocketPath}"
 export PORT_MANAGER_ROUTES_FILE="${escapedRouteTablePath}"
 export PORT_MANAGER_AGENT_MAIN="${escapedAgentMainPath}"
+export PORT_MANAGER_SCAN_RANGE="${options.settings.scanRange}"
+export PORT_MANAGER_ROUTING_MODE="${options.settings.routingMode}"
+export PORT_MANAGER_VIRTUAL_PORT_START="${options.settings.virtualPortRangeStart}"
+export PORT_MANAGER_VIRTUAL_PORT_END="${options.settings.virtualPortRangeEnd}"
+export PORT_MANAGER_FIXED_PROTOCOL_PORTS="${options.settings.fixedProtocolPorts.join(",")}"
 
 if [ -z "$\{PORT_MANAGER_HOOK_DAEMON_STARTED:-}" ]; then
   export PORT_MANAGER_HOOK_DAEMON_STARTED=1
-  "${escapedNodeExecutablePath}" -e 'const net=require("node:net");const fs=require("node:fs");const socketPath=process.argv[1];const socket=net.createConnection(socketPath);const timer=setTimeout(()=>{socket.destroy();try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);},500);socket.once("connect",()=>{clearTimeout(timer);socket.end();process.exit(0);});socket.once("error",()=>{clearTimeout(timer);try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);});' "$PORT_MANAGER_AGENT_SOCKET" >/dev/null 2>&1
+  ${nodeRuntimePrefix} "${escapedNodeExecutablePath}" -e 'const net=require("node:net");const fs=require("node:fs");const socketPath=process.argv[1];const socket=net.createConnection(socketPath);const timer=setTimeout(()=>{socket.destroy();try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);},500);socket.once("connect",()=>{clearTimeout(timer);socket.end();process.exit(0);});socket.once("error",()=>{clearTimeout(timer);try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);});' "$PORT_MANAGER_AGENT_SOCKET" >/dev/null 2>&1
   if [ $? -ne 0 ]; then
-    nohup "${escapedNodeExecutablePath}" "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" >/tmp/newdlops-portmanager-agent.log 2>&1 &
+    ${nodeRuntimePrefix} nohup "${escapedNodeExecutablePath}" "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" >/tmp/newdlops-portmanager-agent.log 2>&1 &
   fi
 fi
 

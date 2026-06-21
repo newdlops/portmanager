@@ -18,6 +18,7 @@ The MVP uses one local Port Manager agent per OS user. VS Code windows connect t
 - Watch all local listening TCP ports through the shared local agent and update the sidebar automatically.
 - Show which process owns each visible port when the OS exposes PID/name data.
 - Offer daemon-managed routing as soon as a VS Code terminal command explicitly requests a port.
+- Inject the native hook into new VS Code terminals so non-fixed protocol bind ports are allocated before bind.
 - Install a native shell hook for OS terminals outside VS Code.
 - Detect VS Code terminal listen failures and offer to rerun the failed command through Port Manager routing.
 - Stop, restart, remove, open, and copy managed process URLs.
@@ -36,7 +37,7 @@ The MVP uses one local Port Manager agent per OS user. VS Code windows connect t
 
 By default, Port Manager uses hashed logical routing: a requested port such as `8000` remains the logical port, while the launched process binds to a deterministic actual port in `portManager.virtualPortRangeStart` through `portManager.virtualPortRangeEnd`. Set `portManager.routingMode` to `nearest` to use the older nearby-port behavior.
 
-If a command is run directly in a VS Code terminal and explicitly includes a port such as `--port 3000`, `PORT=8000`, or `runserver 127.0.0.1:8000`, Port Manager offers `Rerun Routed` immediately. That stops the direct terminal command and starts it through the shared agent so the daemon assigns the actual bind port before the application starts. If a command hides its port and later fails with a bind error such as `Address already in use`, Port Manager can still detect the terminal output and offer the same routed rerun.
+For new VS Code terminals, Port Manager injects the native socket hook while the daemon is running. When a terminal-launched process calls `bind()` on a port that is not in `portManager.fixedProtocolPorts`, the hook asks the daemon for an actual port before the OS bind happens, then registers the logical route. The explicit `Rerun Routed` prompt and listen-failure monitor remain fallback paths for terminals that were already open or are not running with the hook environment.
 
 For terminals outside VS Code, run `Port Manager: Install Shell Hook` once from the Command Palette, then open a new shell. The hook is sourced from your shell profile and injects the native socket hook into descendant development processes.
 
@@ -45,7 +46,7 @@ daphne -b 127.0.0.1 -p 8000 myapp.asgi:application
 npm run dev
 ```
 
-When a hooked process calls `bind(8000)`, the hook asks the same per-user daemon to allocate an actual port, rewrites the bind call, and registers the logical route. When another hooked local process calls `connect(...:8000)`, the hook reads the daemon route table and redirects the connection to the actual port.
+When a hooked process calls `bind(8000)`, the hook asks the same per-user daemon to allocate an actual port, rewrites the bind call, and registers the logical route. Fixed protocol ports such as SSH, MySQL, and PostgreSQL are preserved by default because the port number itself is part of the protocol contract. When another hooked local process calls `connect(...:8000)`, the hook reads the daemon route table and redirects the connection to the actual port.
 
 ## Local Agent
 
@@ -76,6 +77,7 @@ Important limitation: the agent does not transparently intercept every arbitrary
 - `portManager.virtualPortRangeStart`: first actual port used by hashed routing.
 - `portManager.virtualPortRangeEnd`: last actual port used by hashed routing.
 - `portManager.preferredPorts`: ports watched in the background and suggested by prompts.
+- `portManager.fixedProtocolPorts`: ports the native hook leaves untouched; set to `[]` to make every bind port eligible for logical routing.
 - `portManager.autoOpenBrowser`: open routed URLs after managed process launch.
 - `portManager.showConflictNotification`: show a notification when a managed process is routed.
 - `portManager.monitorAllListeningPorts`: show all listening TCP ports reported by the agent.

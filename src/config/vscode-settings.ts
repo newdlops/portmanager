@@ -39,6 +39,11 @@ export function readPortManagerSettings(): PortManagerSettings {
     preferredPorts: normalizePreferredPorts(
       config.get<readonly number[]>("preferredPorts", DEFAULT_SETTINGS.preferredPorts),
     ),
+    fixedProtocolPorts: normalizePortList(
+      config.get<readonly number[]>("fixedProtocolPorts", DEFAULT_SETTINGS.fixedProtocolPorts),
+      DEFAULT_SETTINGS.fixedProtocolPorts,
+      { allowEmpty: true },
+    ),
     autoOpenBrowser: config.get<boolean>("autoOpenBrowser", DEFAULT_SETTINGS.autoOpenBrowser),
     showConflictNotification: config.get<boolean>(
       "showConflictNotification",
@@ -144,13 +149,25 @@ function normalizeVirtualPortRange(start: number, end: number): { readonly start
 
 /**
  * Removes invalid port entries and duplicates while keeping user ordering.
- * The resulting list is used only for prompt hints, so an empty list is safe.
+ * Empty prompt lists fall back to defaults so command prompts stay useful.
  */
 function normalizePreferredPorts(preferredPorts: readonly number[]): readonly number[] {
+  return normalizePortList(preferredPorts, DEFAULT_SETTINGS.preferredPorts, { allowEmpty: false });
+}
+
+/**
+ * Removes invalid port entries and duplicates while keeping user ordering.
+ * Used for both prompt suggestions and fixed-protocol exclusions.
+ */
+function normalizePortList(
+  ports: readonly number[],
+  fallbackPorts: readonly number[],
+  options: { readonly allowEmpty: boolean },
+): readonly number[] {
   const seenPorts = new Set<number>();
   const normalizedPorts: number[] = [];
 
-  for (const port of preferredPorts) {
+  for (const port of ports) {
     const normalizedPort = Math.trunc(port);
     if (!isValidPort(normalizedPort) || seenPorts.has(normalizedPort)) {
       continue;
@@ -160,7 +177,11 @@ function normalizePreferredPorts(preferredPorts: readonly number[]): readonly nu
     normalizedPorts.push(normalizedPort);
   }
 
-  return normalizedPorts.length > 0 ? normalizedPorts : DEFAULT_SETTINGS.preferredPorts;
+  if (normalizedPorts.length > 0 || options.allowEmpty) {
+    return normalizedPorts;
+  }
+
+  return fallbackPorts;
 }
 
 /**

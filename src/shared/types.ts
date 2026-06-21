@@ -16,7 +16,7 @@ export type PortInjectionMode = "env" | "template" | "argument";
 
 export type ProcessKillSignal = NodeJS.Signals | "SIGKILL" | "SIGTERM";
 
-export type ProcessSource = "managed" | "registered" | "detected" | "allocated";
+export type ProcessSource = "managed" | "registered" | "hooked" | "detected" | "allocated";
 
 export type PortProtocol = "tcp";
 
@@ -37,6 +37,8 @@ export interface PortManagerSettings {
   readonly virtualPortRangeEnd: number;
   /** Common starting ports shown to the user by command prompts. */
   readonly preferredPorts: readonly number[];
+  /** Ports whose protocol identity should not be auto-remapped by terminal hooks. */
+  readonly fixedProtocolPorts: readonly number[];
   /** Whether a newly launched routed URL should be opened automatically. */
   readonly autoOpenBrowser: boolean;
   /** Whether conflict routing should show an informational notification. */
@@ -320,6 +322,8 @@ export interface RegisteredProcessInput {
   readonly host: string;
   /** Optional pending route allocation that this running process consumes. */
   readonly allocationId?: string;
+  /** Registration origin; native socket hook rows are managed by listener state. */
+  readonly source?: "registered" | "hooked";
 }
 
 export interface ManagedProcessStartInput {

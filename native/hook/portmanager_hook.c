@@ -36,6 +36,7 @@
 #define PM_DEFAULT_SCAN_RANGE 20
 #define PM_DEFAULT_VIRTUAL_START 53000
 #define PM_DEFAULT_VIRTUAL_END 59999
+#define PM_DEFAULT_FIXED_PROTOCOL_PORTS "22,25,53,80,110,143,389,443,465,587,993,995,1433,1521,3306,33060,5432,5672,6379,9200,9300,11211,27017"
 
 typedef int (*pm_bind_fn)(int, const struct sockaddr *, socklen_t);
 typedef int (*pm_connect_fn)(int, const struct sockaddr *, socklen_t);
@@ -73,6 +74,29 @@ static int pm_hook_enabled(void) {
   return enabled == NULL || strcmp(enabled, "0") != 0;
 }
 
+static int pm_debug_enabled(void) {
+  const char *debug = getenv("PORT_MANAGER_HOOK_DEBUG");
+  return debug != NULL && strcmp(debug, "1") == 0;
+}
+
+static void pm_debug(const char *format, ...) {
+  va_list args;
+
+  if (!pm_debug_enabled()) {
+    return;
+  }
+
+  fprintf(stderr, "[portmanager-hook pid=%ld] ", (long)getpid());
+  va_start(args, format);
+  vfprintf(stderr, format, args);
+  va_end(args);
+  fprintf(stderr, "\n");
+}
+
+__attribute__((constructor)) static void pm_hook_loaded(void) {
+  pm_debug("loaded");
+}
+
 static void *pm_resolve_symbol(const char *name) {
   void *symbol = dlsym(RTLD_NEXT, name);
   return symbol;
@@ -107,6 +131,47 @@ static int pm_parse_int_env(const char *name, int fallback) {
   }
 
   return (int)parsed;
+}
+
+static int pm_port_list_contains(const char *ports, int target_port) {
+  const char *cursor = ports;
+
+  while (cursor != NULL && *cursor != '\0') {
+    char *end = NULL;
+    long parsed;
+
+    while (*cursor != '\0' && !isdigit((unsigned char)*cursor)) {
+      cursor++;
+    }
+
+    if (*cursor == '\0') {
+      break;
+    }
+
+    parsed = strtol(cursor, &end, 10);
+    if (end == cursor) {
+      break;
+    }
+
+    if (parsed == target_port) {
+      return 1;
+    }
+
+    cursor = end;
+  }
+
+  return 0;
+}
+
+static int pm_is_fixed_protocol_port(int port) {
+  const char *configured_ports = getenv("PORT_MANAGER_FIXED_PROTOCOL_PORTS");
+  const char *ports = configured_ports != NULL ? configured_ports : PM_DEFAULT_FIXED_PROTOCOL_PORTS;
+
+  if (ports == NULL || ports[0] == '\0') {
+    return 0;
+  }
+
+  return pm_port_list_contains(ports, port);
 }
 
 static const char *pm_routing_mode(void) {
@@ -324,8 +389,10 @@ static int pm_agent_roundtrip(const char *request, char *response, size_t respon
 
   pm_hook_depth++;
   if (pm_real_connect(fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0) {
+    int saved_errno = errno;
     pm_hook_depth--;
     close(fd);
+    pm_debug("agent connect failed socket=%s error=%s", socket_path, strerror(saved_errno));
     return -1;
   }
   pm_hook_depth--;
@@ -333,6 +400,7 @@ static int pm_agent_roundtrip(const char *request, char *response, size_t respon
   while (request_len > 0) {
     written = write(fd, request, request_len);
     if (written <= 0) {
+      pm_debug("agent write failed socket=%s", socket_path);
       close(fd);
       return -1;
     }
@@ -356,6 +424,9 @@ static int pm_agent_roundtrip(const char *request, char *response, size_t respon
 
   close(fd);
   response[total] = '\0';
+  if (total == 0) {
+    pm_debug("agent returned empty response socket=%s", socket_path);
+  }
   return total > 0 ? 0 : -1;
 }
 
@@ -439,6 +510,7 @@ static int pm_allocate_route(int logical_port, const char *host, int *actual_por
   pm_json_escape(cwd, cwd_json, sizeof(cwd_json));
   pm_json_escape(command, command_json, sizeof(command_json));
   pm_json_escape(host, host_json, sizeof(host_json));
+  response[0] = '\0';
 
   snprintf(
     request,
@@ -456,7 +528,9 @@ static int pm_allocate_route(int logical_port, const char *host, int *actual_por
     pm_parse_int_env("PORT_MANAGER_VIRTUAL_PORT_START", PM_DEFAULT_VIRTUAL_START),
     pm_parse_int_env("PORT_MANAGER_VIRTUAL_PORT_END", PM_DEFAULT_VIRTUAL_END));
 
+  pm_debug("allocating route logical=%d host=%s mode=%s", logical_port, host, pm_routing_mode());
   if (pm_agent_roundtrip(request, response, sizeof(response)) != 0 || !pm_response_ok(response)) {
+    pm_debug("allocateRoute failed logical=%d response=%.240s", logical_port, response);
     return -1;
   }
 
@@ -464,15 +538,17 @@ static int pm_allocate_route(int logical_port, const char *host, int *actual_por
   if (pm_json_string(response, "allocationId", allocation_id, allocation_size) != 0) {
     allocation_id[0] = '\0';
   }
+  pm_debug("allocated route logical=%d actual=%d allocation=%s", logical_port, *actual_port, allocation_id);
 
   return 0;
 }
 
-static void pm_send_simple_payload(const char *method, const char *payload) {
+static int pm_send_simple_payload(const char *method, const char *payload) {
   char request[PM_MAX_REQUEST];
   char response[PM_MAX_RESPONSE];
   unsigned long sequence = pm_request_sequence++;
 
+  response[0] = '\0';
   snprintf(
     request,
     sizeof(request),
@@ -481,7 +557,13 @@ static void pm_send_simple_payload(const char *method, const char *payload) {
     sequence,
     method,
     payload);
-  (void)pm_agent_roundtrip(request, response, sizeof(response));
+  if (pm_agent_roundtrip(request, response, sizeof(response)) != 0 || !pm_response_ok(response)) {
+    pm_debug("%s failed response=%.240s", method, response);
+    return -1;
+  }
+
+  pm_debug("%s succeeded", method);
+  return 0;
 }
 
 static void pm_register_process(int logical_port, int actual_port, const char *host, const char *allocation_id) {
@@ -503,7 +585,7 @@ static void pm_register_process(int logical_port, int actual_port, const char *h
   snprintf(
     payload,
     sizeof(payload),
-    "{\"pid\":%ld,\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"actualPort\":%d,\"host\":\"%s\",\"allocationId\":\"%s\"}",
+    "{\"pid\":%ld,\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"actualPort\":%d,\"host\":\"%s\",\"allocationId\":\"%s\",\"source\":\"hooked\"}",
     (long)getpid(),
     command_json,
     command_json,
@@ -512,7 +594,8 @@ static void pm_register_process(int logical_port, int actual_port, const char *h
     actual_port,
     host_json,
     allocation_json);
-  pm_send_simple_payload("registerExistingProcess", payload);
+  pm_debug("registering hooked process logical=%d actual=%d host=%s allocation=%s", logical_port, actual_port, host, allocation_id);
+  (void)pm_send_simple_payload("registerExistingProcess", payload);
 }
 
 static void pm_release_allocation(const char *allocation_id) {
@@ -525,7 +608,7 @@ static void pm_release_allocation(const char *allocation_id) {
 
   pm_json_escape(allocation_id, allocation_json, sizeof(allocation_json));
   snprintf(payload, sizeof(payload), "{\"allocationId\":\"%s\"}", allocation_json);
-  pm_send_simple_payload("releaseRouteAllocation", payload);
+  (void)pm_send_simple_payload("releaseRouteAllocation", payload);
 }
 
 static void pm_remember_route(int logical_port, int actual_port, const char *host, const char *allocation_id) {
@@ -663,6 +746,11 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
 
   logical_port = pm_sockaddr_port(addr);
   if (logical_port <= 0) {
+    return pm_real_bind(sockfd, addr, addrlen);
+  }
+
+  if (pm_is_fixed_protocol_port(logical_port)) {
+    pm_debug("preserving fixed protocol bind port=%d", logical_port);
     return pm_real_bind(sockfd, addr, addrlen);
   }
 

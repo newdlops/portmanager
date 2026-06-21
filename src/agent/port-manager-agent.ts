@@ -425,7 +425,7 @@ export class PortManagerAgent implements DisposableLike {
     }
 
     const process = this.registry.register(input, {
-      source: "registered",
+      source: input.source === "hooked" ? "hooked" : "registered",
     });
     this.writeRouteTable(this.buildCurrentLogicalRoutes());
 
@@ -768,7 +768,7 @@ export class PortManagerAgent implements DisposableLike {
    * exits without any Port Manager command being invoked.
    */
   private async pollListeningPorts(): Promise<void> {
-    if (this.clients.size === 0 || this.listenerScanInFlight) {
+    if (this.listenerScanInFlight) {
       return;
     }
 
@@ -778,8 +778,10 @@ export class PortManagerAgent implements DisposableLike {
       const snapshot = await this.buildSnapshot();
       const nextSignature = buildSnapshotSignature(snapshot);
 
-      if (nextSignature !== this.lastSnapshotSignature) {
+      if (this.clients.size > 0 && nextSignature !== this.lastSnapshotSignature) {
         this.broadcastSnapshot(snapshot);
+      } else {
+        this.lastSnapshotSignature = nextSignature;
       }
     } catch (error) {
       this.serverErrors.emit(error instanceof Error ? error : new Error(String(error)));
@@ -820,7 +822,7 @@ export class PortManagerAgent implements DisposableLike {
     const activeListenerKeys = new Set(listeners.map((listener) => buildListenerKey(listener.pid, listener.port)));
 
     for (const process of this.registry.list()) {
-      if (process.status !== "running" || process.source !== "registered") {
+      if (process.status !== "running" || !isListenerOwnedExternalProcess(process)) {
         continue;
       }
 
@@ -895,6 +897,14 @@ export class PortManagerAgent implements DisposableLike {
 
     this.registry.stop(process.id, this.now().toISOString());
   }
+}
+
+/**
+ * Hook/manual registrations are owned by OS listener state because the agent
+ * did not spawn them and cannot rely on child-process exit events.
+ */
+function isListenerOwnedExternalProcess(process: ManagedProcess): boolean {
+  return process.source === "registered" || process.source === "hooked";
 }
 
 /**

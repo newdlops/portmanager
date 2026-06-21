@@ -12,6 +12,7 @@ import type {
   ManagedProcessStartInput,
   PortManagerSettings,
 } from "../shared/types";
+import { shouldInjectTerminalHook } from "./terminal-hook-environment";
 import type { PortManagerProcessService } from "./process-service";
 
 /**
@@ -67,7 +68,11 @@ export class TerminalConflictMonitor implements DisposableLike {
       return;
     }
 
-    if (settings.routeTerminalCommandsOnStart && (await this.offerPreflightRerun(event, settings))) {
+    if (
+      settings.routeTerminalCommandsOnStart &&
+      !shouldInjectTerminalHook(settings) &&
+      (await this.offerPreflightRerun(event, settings))
+    ) {
       return;
     }
 

@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { getAgentSocketPath, removeStaleSocketFile } from "../agent/agent-socket";
 import { readPortManagerSettings } from "../config/vscode-settings";
+import { buildNodeRuntimeEnvironment } from "../platform/process/node-runtime";
 import { SimpleEventEmitter } from "../shared/events";
 import type {
   AgentDaemonStatus,
@@ -347,6 +348,7 @@ export class LocalAgentClient implements PortManagerProcessService {
 
     this.childProcess = spawn(process.execPath, [agentMainPath, "--socket", socketPath], {
       detached: true,
+      env: buildNodeRuntimeEnvironment(),
       stdio: "ignore",
       windowsHide: true,
     });

@@ -302,6 +302,38 @@
           },
           "description": "Common ports offered by the start command prompt."
         },
+        "portManager.fixedProtocolPorts": {
+          "type": "array",
+          "default": [
+            22,
+            25,
+            53,
+            80,
+            110,
+            143,
+            389,
+            443,
+            465,
+            587,
+            993,
+            995,
+            1433,
+            1521,
+            3306,
+            33060,
+            5432,
+            5672,
+            6379,
+            9200,
+            9300,
+            11211,
+            27017
+          ],
+          "items": {
+            "type": "number"
+          },
+          "description": "TCP ports that the native terminal hook leaves untouched because the port number itself identifies a fixed protocol such as SSH, MySQL, or PostgreSQL."
+        },
         "portManager.autoOpenBrowser": {
           "type": "boolean",
           "default": false,

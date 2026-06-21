@@ -11,6 +11,7 @@ import {
 } from "../agent/protocol";
 import { buildReroutableCommand } from "../core/terminal-conflict-parser";
 import { buildInjectedCommand, buildPortManagerEnvironment } from "../platform/process/port-injection";
+import { buildNodeRuntimeEnvironment } from "../platform/process/node-runtime";
 import { DEFAULT_PORT_MANAGER_SETTINGS } from "../shared/default-settings";
 import type {
   AgentAllocateRouteRequest,
@@ -293,6 +294,7 @@ class AgentCliClient {
 
     const child = spawn(process.execPath, [this.agentMainPath, "--socket", socketPath], {
       detached: true,
+      env: buildNodeRuntimeEnvironment(),
       stdio: "ignore",
       windowsHide: true,
     });
