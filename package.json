@@ -3,8 +3,30 @@
   "displayName": "Port Manager",
   "description": "Route managed development processes to available ports and manage them from a VS Code sidebar.",
   "version": "0.0.1",
-  "publisher": "local",
-  "private": true,
+  "publisher": "newdlops",
+  "license": "MIT",
+  "preview": true,
+  "qna": false,
+  "keywords": [
+    "port",
+    "ports",
+    "port-manager",
+    "development-server",
+    "routing",
+    "vscode-extension"
+  ],
+  "galleryBanner": {
+    "color": "#1E1E1E",
+    "theme": "dark"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/newdlops/portmanager.git"
+  },
+  "bugs": {
+    "url": "https://github.com/newdlops/portmanager/issues"
+  },
+  "homepage": "https://github.com/newdlops/portmanager#readme",
   "engines": {
     "vscode": "^1.95.0"
   },
@@ -24,12 +46,15 @@
     "onCommand:portManager.removeProcess",
     "onCommand:portManager.openSettings"
   ],
-  "main": "./out/extension/activate.js",
+  "main": "./out/src/extension/activate.js",
   "scripts": {
+    "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "test": "npm run compile && node --test out/test/unit/*.test.js",
-    "package": "npm run compile"
+    "package": "vsce package",
+    "publish": "vsce publish",
+    "publish:precheck": "npm test && npm run package"
   },
   "contributes": {
     "viewsContainers": {
@@ -230,6 +255,7 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/vscode": "^1.95.0",
+    "@vscode/vsce": "^3.9.2",
     "typescript": "^5.7.2"
   }
 }
