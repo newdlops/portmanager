@@ -102,6 +102,32 @@ export interface TerminalCandidate {
   readonly vscodeTerminal: boolean;
 }
 
+/**
+ * User-facing terminal window/session grouped from one or more shell process
+ * candidates. The UI selects windows first, while runtime adapters can still
+ * use the root PID or process group underneath.
+ */
+export interface TerminalWindow {
+  /** Stable id derived from VS Code terminal identity, tty, or process group. */
+  readonly id: string;
+  /** Short user-facing label for the terminal window or session. */
+  readonly title: string;
+  /** Whether this window was discovered through VS Code or the OS table. */
+  readonly source: "vscode" | "os";
+  /** Terminal device path or console/session id when available. */
+  readonly terminalId?: string;
+  /** Root shell PID selected for runtime attach attempts. */
+  readonly rootPid: number;
+  /** Process group id used on POSIX platforms when available. */
+  readonly processGroupId?: number;
+  /** Candidate shell/process PIDs grouped under this window. */
+  readonly candidatePids: readonly number[];
+  /** Number of terminal candidate processes grouped into this window. */
+  readonly candidateCount: number;
+  /** Representative command for diagnostics and tooltips. */
+  readonly command?: string;
+}
+
 export interface TerminalAttachment {
   /** Stable attachment row id. */
   readonly id: string;
@@ -147,6 +173,8 @@ export interface NetworkSnapshot {
   readonly networks: readonly LogicalNetwork[];
   /** Latest best-effort terminal candidates from VS Code and the OS. */
   readonly terminalCandidates: readonly TerminalCandidate[];
+  /** User-facing terminal windows grouped from terminal candidates. */
+  readonly terminalWindows: readonly TerminalWindow[];
   /** Terminal-to-network attachment records. */
   readonly attachments: readonly TerminalAttachment[];
   /** Host port bindings owned by Port Manager. */

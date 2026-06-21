@@ -13,6 +13,7 @@ import type {
   TerminalAttachment,
   TerminalCandidate,
   TerminalCandidateProvider,
+  TerminalWindow,
 } from "../shared/types";
 
 const NETWORK_STATE_KEY = "portManager.logicalNetworkState.v1";
@@ -98,8 +99,8 @@ export class PortManagerNetworkService implements DisposableLike {
     return this.registry.removeNetwork(networkId);
   }
 
-  /** Refreshes VS Code and external OS terminal candidates. */
-  async refreshTerminals(): Promise<readonly TerminalCandidate[]> {
+  /** Refreshes VS Code and external OS terminal windows. */
+  async refreshTerminals(): Promise<readonly TerminalWindow[]> {
     const [vscodeCandidates, osCandidates] = await Promise.all([
       listVscodeTerminalCandidates(),
       this.terminalCandidateProvider.list().catch(() => []),
@@ -107,7 +108,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const candidates = [...vscodeCandidates, ...osCandidates];
     this.registry.setTerminalCandidates(candidates);
 
-    return candidates;
+    return this.registry.getSnapshot().terminalWindows;
   }
 
   /**
@@ -138,6 +139,19 @@ export class PortManagerNetworkService implements DisposableLike {
       status: "attached",
       attachedAt: new Date().toISOString(),
     });
+  }
+
+  /** Attaches a user-facing terminal window by resolving it to its root process. */
+  attachTerminalWindow(networkId: string, terminalWindowId: string): TerminalAttachment {
+    const terminalWindow = this.registry
+      .getSnapshot()
+      .terminalWindows.find((window) => window.id === terminalWindowId);
+
+    if (terminalWindow === undefined) {
+      throw new Error(`Unknown terminal window: ${terminalWindowId}`);
+    }
+
+    return this.attachTerminal(networkId, terminalWindow.rootPid);
   }
 
   /** Creates and opens a host TCP exposure through the concrete proxy runtime. */

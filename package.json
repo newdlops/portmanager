@@ -108,13 +108,13 @@
       },
       {
         "command": "portManager.refreshTerminals",
-        "title": "Port Manager: Refresh Terminals",
+        "title": "Port Manager: Refresh Terminal Windows",
         "category": "Port Manager",
         "icon": "$(refresh)"
       },
       {
         "command": "portManager.attachTerminalToNetwork",
-        "title": "Port Manager: Attach Terminal to Network",
+        "title": "Port Manager: Attach Terminal Window to Network",
         "category": "Port Manager",
         "icon": "$(debug-console)"
       },
@@ -336,7 +336,7 @@
         },
         {
           "command": "portManager.attachTerminalToNetwork",
-          "when": "view == portManager.processes && viewItem == terminalCandidate",
+          "when": "view == portManager.processes && viewItem == terminalWindow",
           "group": "terminal@2"
         },
         {

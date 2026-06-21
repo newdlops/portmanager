@@ -40,11 +40,11 @@ Port Manager의 기본 구현 방향은 레거시 포트 재할당 UI에서 Logi
 상태: 초기 구현 완료
 
 - OS 전체 process table 기반 terminal candidate scanner 추가
-- 터미널 후보 식별 규칙 초기 구현
+- 터미널 후보를 사용자-facing `TerminalWindow`로 그룹화
   - macOS: Terminal, iTerm2, shell, tty, process group
   - Linux: terminal emulator, shell, tty, process group
   - Windows: Windows Terminal, conhost, PowerShell, cmd, WSL process tree
-- VS Code 통합 터미널과 외부 터미널을 같은 `TerminalCandidate` 모델로 표시
+- VS Code 통합 터미널과 외부 터미널을 같은 `TerminalWindow` 모델로 표시
 - 권한 제한과 불완전한 식별 결과를 UI에 표시
 
 ## Phase 3: Network Runtime Adapter
@@ -87,12 +87,13 @@ Port Manager의 기본 구현 방향은 레거시 포트 재할당 UI에서 Logi
 
 - Logical Networks 섹션
   - 네트워크 생성, 삭제, 상태 확인
-- Terminal Sessions 섹션
-  - 감지된 터미널 표시
-  - 선택한 터미널을 네트워크에 attach
+- Terminal Windows 섹션
+  - 감지된 터미널 창/세션 표시
+  - 선택한 터미널 창을 네트워크에 attach
 - Host Port Exposures 섹션
   - host port와 내부 target port 매핑 표시
   - 노출 추가, 제거, 복사, 브라우저 열기
+- 각 섹션에 command row를 제공해 Command Palette 없이 주요 명령을 실행
 - 레거시 라우팅은 사이드바 섹션으로 표시하지 않는다.
 
 ## Phase 6: 검증 시나리오

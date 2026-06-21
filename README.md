@@ -1,6 +1,6 @@
 # Port Manager
 
-Port Manager is shifting from post-conflict port rerouting to logical development networks. The target workflow is to attach a terminal process group to a named network, keep app-internal ports unchanged, and explicitly expose selected network ports on the host machine.
+Port Manager is shifting from post-conflict port rerouting to logical development networks. The target workflow is to attach a terminal window/session to a named network, keep app-internal ports unchanged, and explicitly expose selected network ports on the host machine.
 
 Example:
 
@@ -13,8 +13,8 @@ The previous managed-process routing, native hook, and rerun-on-failure implemen
 
 ## Target Capabilities
 
-- Discover terminal processes across VS Code and external OS terminals. Initial implementation is best-effort.
-- Let the user attach a selected terminal process group to a logical network. This requires a runtime adapter that supports terminal attach.
+- Discover terminal windows across VS Code and external OS terminals. Initial implementation groups noisy shell processes by VS Code terminal instance, tty, or process group.
+- Let the user attach a selected terminal window to a logical network. This requires a runtime adapter that supports terminal attach.
 - Let child processes launched from that terminal inherit the selected network context. This is not supported by the current local proxy adapter.
 - Allow multiple networks to reuse the same internal ports when the selected runtime provides isolation.
 - Configure explicit host port exposure, such as `localhost:3005 -> B network:3004`. Initial implementation provides a real local TCP proxy.
@@ -26,7 +26,8 @@ The previous managed-process routing, native hook, and rerun-on-failure implemen
 
 - Create and remove logical network records.
 - Persist logical networks, terminal attachments, and host exposures in VS Code global state.
-- Discover VS Code integrated terminals and OS shell processes in one Terminal Sessions view.
+- Discover VS Code integrated terminals and OS shell processes as grouped Terminal Windows.
+- Start every primary network command from sidebar action rows, not only Command Palette.
 - Expose a host TCP port to a target address and port through `Local TCP Proxy`.
 - Close proxy listeners when exposures or networks are removed.
 - Reopen persisted active exposures when the extension starts.
@@ -62,9 +63,9 @@ These commands and views are no longer the primary product surface. They remain 
 2. Run `npm run compile`.
 3. Press `F5` in VS Code and choose `Run Port Manager Extension`.
 4. In the Extension Development Host, open the Port Manager activity bar view.
-5. Use `Port Manager: Create Logical Network`.
-6. Use `Port Manager: Add Host Port Exposure` to bind a host port to a target address and port.
-7. Use `Port Manager: Refresh Terminals` to update detected terminal candidates.
+5. Use the `Create Logical Network` row in the Logical Networks section.
+6. Use the `Add Host Port Exposure` row in the Host Port Exposures section.
+7. Use `Refresh Terminal Windows` in the Terminal Windows section.
 
 The current runtime is `Local TCP Proxy`. It provides real host port exposure, but it does not isolate network namespaces or attach existing terminals. Same internal ports across A/B apps require a future container, namespace, native-helper, or VM-backed runtime adapter.
 

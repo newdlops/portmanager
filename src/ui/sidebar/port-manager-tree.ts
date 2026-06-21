@@ -13,6 +13,7 @@ import type {
   ProcessStatus,
   TerminalAttachment,
   TerminalCandidate,
+  TerminalWindow,
 } from "../../shared/types";
 
 /**
@@ -46,6 +47,7 @@ type PortManagerTreeItem =
   | ActionTreeItem
   | PlannedFeatureTreeItem
   | LogicalNetworkTreeItem
+  | TerminalWindowTreeItem
   | TerminalCandidateTreeItem
   | TerminalAttachmentTreeItem
   | HostPortExposureTreeItem
@@ -99,10 +101,17 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
     if (element === undefined) {
       return [
         new TreeSectionItem("networks", "Logical Networks", `${snapshot.networks.length} networks`, "vm"),
-        new TreeSectionItem("terminals", "Terminal Sessions", `${snapshot.terminalCandidates.length} candidates`, "terminal"),
+        new TreeSectionItem("terminals", "Terminal Windows", `${snapshot.terminalWindows.length} windows`, "terminal"),
         new TreeSectionItem("exposures", "Host Port Exposures", `${snapshot.exposures.length} bindings`, "ports-view-icon"),
         new TreeSectionItem("runtime", "Runtime Adapter", `${snapshot.runtimes.length} available`, "circuit-board"),
       ];
+    }
+
+    if (element instanceof TerminalWindowTreeItem) {
+      const candidateSet = new Set(element.window.candidatePids);
+      return snapshot.terminalCandidates
+        .filter((candidate) => candidateSet.has(candidate.pid))
+        .map((candidate) => new TerminalCandidateTreeItem(candidate));
     }
 
     if (!(element instanceof TreeSectionItem)) {
@@ -111,19 +120,36 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
 
     switch (element.kind) {
       case "networks":
-        return snapshot.networks.length > 0
-          ? snapshot.networks.map((network) => new LogicalNetworkTreeItem(network, snapshot.attachments))
-          : [new EmptyTreeItem("No logical networks", "Create a network from the toolbar")];
+        return [
+          new ActionTreeItem("Create Logical Network", "portManager.createLogicalNetwork", "add"),
+          new ActionTreeItem("Remove Logical Network", "portManager.removeLogicalNetwork", "trash"),
+          ...(snapshot.networks.length > 0
+            ? snapshot.networks.map((network) => new LogicalNetworkTreeItem(network, snapshot.attachments))
+            : [new EmptyTreeItem("No logical networks", "Create one here")]),
+        ];
       case "terminals":
-        return snapshot.terminalCandidates.length > 0
-          ? snapshot.terminalCandidates.map((candidate) => new TerminalCandidateTreeItem(candidate))
-          : [new EmptyTreeItem("No terminals discovered", "Refresh after opening a shell")];
+        return [
+          new ActionTreeItem("Refresh Terminal Windows", "portManager.refreshTerminals", "refresh"),
+          new ActionTreeItem("Attach Window to Network", "portManager.attachTerminalToNetwork", "debug-console"),
+          ...(snapshot.terminalWindows.length > 0
+            ? snapshot.terminalWindows.map((window) => new TerminalWindowTreeItem(window))
+            : [new EmptyTreeItem("No terminal windows discovered", "Open a shell and refresh")]),
+        ];
       case "exposures":
-        return snapshot.exposures.length > 0
-          ? snapshot.exposures.map((exposure) => new HostPortExposureTreeItem(exposure, snapshot.networks))
-          : [new EmptyTreeItem("No host exposures", "Expose a network port from the toolbar")];
+        return [
+          new ActionTreeItem("Add Host Port Exposure", "portManager.addHostPortExposure", "add"),
+          new ActionTreeItem("Open Host Exposure URL", "portManager.openHostPortExposureUrl", "link-external"),
+          new ActionTreeItem("Copy Host Exposure URL", "portManager.copyHostPortExposureUrl", "copy"),
+          new ActionTreeItem("Remove Host Port Exposure", "portManager.removeHostPortExposure", "trash"),
+          ...(snapshot.exposures.length > 0
+            ? snapshot.exposures.map((exposure) => new HostPortExposureTreeItem(exposure, snapshot.networks))
+            : [new EmptyTreeItem("No host exposures", "Expose a network port here")]),
+        ];
       case "runtime":
-        return snapshot.runtimes.map((runtime) => new RuntimeAdapterTreeItem(runtime));
+        return [
+          new ActionTreeItem("Open Settings", "portManager.openSettings", "settings-gear"),
+          ...snapshot.runtimes.map((runtime) => new RuntimeAdapterTreeItem(runtime)),
+        ];
     }
   }
 
@@ -197,6 +223,19 @@ export class LogicalNetworkTreeItem extends vscode.TreeItem {
 }
 
 /** Terminal candidate row discovered from VS Code or the OS process table. */
+export class TerminalWindowTreeItem extends vscode.TreeItem {
+  readonly contextValue = "terminalWindow";
+
+  constructor(readonly window: TerminalWindow) {
+    super(window.title, vscode.TreeItemCollapsibleState.Collapsed);
+    this.id = window.id;
+    this.description = `${window.candidateCount} processes, root ${window.rootPid}`;
+    this.tooltip = buildTerminalWindowTooltip(window);
+    this.iconPath = new vscode.ThemeIcon(window.source === "vscode" ? "terminal" : "window");
+  }
+}
+
+/** Process-level detail row nested under a terminal window. */
 export class TerminalCandidateTreeItem extends vscode.TreeItem {
   readonly contextValue = "terminalCandidate";
 
@@ -396,13 +435,13 @@ export function getLogicalNetworkFromCommandArgument(argument: unknown): Logical
   return undefined;
 }
 
-/** Extracts a terminal candidate from a tree command argument. */
-export function getTerminalCandidateFromCommandArgument(argument: unknown): TerminalCandidate | undefined {
-  if (argument instanceof TerminalCandidateTreeItem) {
-    return argument.candidate;
+/** Extracts a terminal window from a tree command argument. */
+export function getTerminalWindowFromCommandArgument(argument: unknown): TerminalWindow | undefined {
+  if (argument instanceof TerminalWindowTreeItem) {
+    return argument.window;
   }
 
-  if (isTerminalCandidate(argument)) {
+  if (isTerminalWindow(argument)) {
     return argument;
   }
 
@@ -436,6 +475,21 @@ function buildNetworkTooltip(network: LogicalNetwork, attachmentCount: number): 
   if (network.errorMessage) {
     tooltip.appendMarkdown(`\nError: \`${escapeMarkdown(network.errorMessage)}\``);
   }
+
+  return tooltip;
+}
+
+/** Builds tooltip details for one grouped terminal window. */
+function buildTerminalWindowTooltip(window: TerminalWindow): vscode.MarkdownString {
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.isTrusted = false;
+  tooltip.appendMarkdown(`**${escapeMarkdown(window.title)}**\n\n`);
+  tooltip.appendMarkdown(`- Source: \`${window.source}\`\n`);
+  tooltip.appendMarkdown(`- Terminal: \`${escapeMarkdown(window.terminalId ?? "n/a")}\`\n`);
+  tooltip.appendMarkdown(`- Root PID: \`${window.rootPid}\`\n`);
+  tooltip.appendMarkdown(`- Process Group: \`${window.processGroupId ?? "n/a"}\`\n`);
+  tooltip.appendMarkdown(`- Candidate Processes: \`${window.candidateCount}\`\n`);
+  tooltip.appendMarkdown(`- Command: \`${escapeMarkdown(window.command ?? "n/a")}\`\n`);
 
   return tooltip;
 }
@@ -678,6 +732,20 @@ function isTerminalCandidate(value: unknown): value is TerminalCandidate {
     typeof candidate.pid === "number" &&
     typeof candidate.name === "string" &&
     typeof candidate.vscodeTerminal === "boolean"
+  );
+}
+
+function isTerminalWindow(value: unknown): value is TerminalWindow {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const candidate = value as Partial<TerminalWindow>;
+  return (
+    typeof candidate.id === "string" &&
+    typeof candidate.title === "string" &&
+    typeof candidate.rootPid === "number" &&
+    typeof candidate.candidateCount === "number"
   );
 }
 

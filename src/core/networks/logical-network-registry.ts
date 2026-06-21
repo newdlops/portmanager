@@ -7,6 +7,7 @@ import type {
   NetworkSnapshot,
   TerminalAttachment,
   TerminalCandidate,
+  TerminalWindow,
 } from "../../shared/types";
 
 /**
@@ -28,6 +29,9 @@ export class LogicalNetworkRegistry implements DisposableLike {
 
   /** Latest transient terminal discovery results. */
   private terminalCandidates: readonly TerminalCandidate[] = [];
+
+  /** User-facing terminal windows grouped from transient process candidates. */
+  private terminalWindows: readonly TerminalWindow[] = [];
 
   /** Runtime descriptors available to the current extension session. */
   private runtimes: readonly NetworkRuntimeDescriptor[];
@@ -61,6 +65,7 @@ export class LogicalNetworkRegistry implements DisposableLike {
     return {
       networks: [...this.networks.values()],
       terminalCandidates: this.terminalCandidates,
+      terminalWindows: this.terminalWindows,
       attachments: [...this.attachments.values()],
       exposures: [...this.exposures.values()],
       runtimes: this.runtimes,
@@ -86,6 +91,7 @@ export class LogicalNetworkRegistry implements DisposableLike {
   /** Replaces the transient terminal discovery list. */
   setTerminalCandidates(candidates: readonly TerminalCandidate[]): void {
     this.terminalCandidates = dedupeTerminalCandidates(candidates);
+    this.terminalWindows = groupTerminalWindows(this.terminalCandidates);
     this.emitChange();
   }
 
@@ -236,4 +242,90 @@ function dedupeTerminalCandidates(candidates: readonly TerminalCandidate[]): rea
   }
 
   return deduped;
+}
+
+/** Groups noisy process-level shell candidates into user-facing terminal windows. */
+function groupTerminalWindows(candidates: readonly TerminalCandidate[]): readonly TerminalWindow[] {
+  const groups = new Map<string, TerminalCandidate[]>();
+
+  for (const candidate of candidates) {
+    const key = terminalWindowGroupKey(candidate);
+    const existing = groups.get(key);
+
+    if (existing === undefined) {
+      groups.set(key, [candidate]);
+      continue;
+    }
+
+    existing.push(candidate);
+  }
+
+  return [...groups.entries()].map(([id, group]) => {
+    const root = selectTerminalRoot(group);
+    const source = group.some((candidate) => candidate.vscodeTerminal) ? "vscode" : "os";
+    const terminalId = root.terminalId ?? group.find((candidate) => candidate.terminalId)?.terminalId;
+
+    return {
+      id,
+      title: buildTerminalWindowTitle(source, root, terminalId),
+      source,
+      terminalId,
+      rootPid: root.pid,
+      processGroupId: root.processGroupId,
+      candidatePids: group.map((candidate) => candidate.pid),
+      candidateCount: group.length,
+      command: root.command,
+    };
+  });
+}
+
+/** Chooses the grouping key that best represents a terminal window on each platform. */
+function terminalWindowGroupKey(candidate: TerminalCandidate): string {
+  if (candidate.vscodeTerminal) {
+    return `vscode:${candidate.pid}`;
+  }
+
+  if (candidate.terminalId !== undefined) {
+    return `tty:${candidate.terminalId}`;
+  }
+
+  if (candidate.processGroupId !== undefined) {
+    return `pgid:${candidate.processGroupId}`;
+  }
+
+  return `pid:${candidate.pid}`;
+}
+
+/**
+ * Finds the root shell for a terminal window. POSIX shells often use the
+ * process-group leader as the actionable root; otherwise the oldest PID is the
+ * least surprising representative for UI and attach attempts.
+ */
+function selectTerminalRoot(group: readonly TerminalCandidate[]): TerminalCandidate {
+  const processGroupLeader = group.find(
+    (candidate) => candidate.processGroupId !== undefined && candidate.pid === candidate.processGroupId,
+  );
+
+  if (processGroupLeader !== undefined) {
+    return processGroupLeader;
+  }
+
+  return [...group].sort((left, right) => left.pid - right.pid)[0];
+}
+
+/** Builds a concise label that helps users distinguish terminal windows. */
+function buildTerminalWindowTitle(
+  source: TerminalWindow["source"],
+  root: TerminalCandidate,
+  terminalId: string | undefined,
+): string {
+  if (source === "vscode") {
+    return `VS Code: ${root.name}`;
+  }
+
+  if (terminalId !== undefined) {
+    return `Terminal ${terminalId}`;
+  }
+
+  return `Terminal PID ${root.pid}`;
 }

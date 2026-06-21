@@ -73,11 +73,55 @@ test("stores networks, terminal candidates, and exposures in snapshots", () => {
     [101],
   );
   assert.deepEqual(
+    snapshot.terminalWindows.map((window) => window.rootPid),
+    [101],
+  );
+  assert.deepEqual(
     snapshot.exposures.map((exposure) => exposure.id),
     ["exposure-1"],
   );
   assert.equal(snapshot.runtimes[0]?.id, "proxy");
   assert.equal(eventCount, 3);
+});
+
+test("groups noisy terminal process candidates into terminal windows", () => {
+  const registry = new LogicalNetworkRegistry([runtime]);
+  registry.setTerminalCandidates([
+    {
+      pid: 100,
+      parentPid: 1,
+      processGroupId: 100,
+      terminalId: "ttys001",
+      name: "zsh",
+      command: "/bin/zsh -il",
+      vscodeTerminal: false,
+    },
+    {
+      pid: 101,
+      parentPid: 100,
+      processGroupId: 100,
+      terminalId: "ttys001",
+      name: "bash",
+      command: "/bin/bash ./run-server",
+      vscodeTerminal: false,
+    },
+    {
+      pid: 200,
+      name: "Extension Host",
+      command: "Extension Host",
+      vscodeTerminal: true,
+    },
+  ]);
+
+  const windows = registry.getSnapshot().terminalWindows;
+
+  assert.equal(windows.length, 2);
+  assert.equal(windows[0]?.id, "tty:ttys001");
+  assert.equal(windows[0]?.rootPid, 100);
+  assert.equal(windows[0]?.candidateCount, 2);
+  assert.deepEqual(windows[0]?.candidatePids, [100, 101]);
+  assert.equal(windows[1]?.id, "vscode:200");
+  assert.equal(windows[1]?.title, "VS Code: Extension Host");
 });
 
 test("rejects duplicate host exposures for the same address and port", () => {

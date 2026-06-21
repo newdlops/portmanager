@@ -11,7 +11,7 @@ import {
   getHostPortExposureFromCommandArgument,
   getLogicalNetworkFromCommandArgument,
   getProcessFromCommandArgument,
-  getTerminalCandidateFromCommandArgument,
+  getTerminalWindowFromCommandArgument,
 } from "../ui/sidebar/port-manager-tree";
 import type { PortManagerNetworkService } from "./network-service";
 import type { PortManagerProcessService } from "./process-service";
@@ -26,7 +26,7 @@ import type {
   NetworkRuntimeKind,
   PortInjectionMode,
   PortManagerSettings,
-  TerminalCandidate,
+  TerminalWindow,
 } from "../shared/types";
 
 /**
@@ -143,26 +143,26 @@ export class PortManagerCommandController implements DisposableLike {
     this.dependencies.treeProvider.refresh();
   }
 
-  /** Refreshes OS and VS Code terminal candidates. */
+  /** Refreshes OS and VS Code terminal windows. */
   private async refreshTerminals(): Promise<void> {
-    const candidates = await this.dependencies.networkService.refreshTerminals();
+    const windows = await this.dependencies.networkService.refreshTerminals();
     this.dependencies.treeProvider.refresh();
-    await vscode.window.showInformationMessage(`Discovered ${candidates.length} terminal candidates.`);
+    await vscode.window.showInformationMessage(`Discovered ${windows.length} terminal windows.`);
   }
 
-  /** Attaches a selected terminal to a selected network when the runtime supports it. */
+  /** Attaches a selected terminal window to a selected network when the runtime supports it. */
   private async attachTerminalToNetwork(argument: unknown): Promise<void> {
-    const terminal = await this.resolveTerminalArgument(argument, "Attach Terminal to Network");
-    if (terminal === undefined) {
+    const terminalWindow = await this.resolveTerminalWindowArgument(argument, "Attach Terminal Window to Network");
+    if (terminalWindow === undefined) {
       return;
     }
 
-    const network = await this.resolveNetworkArgument(undefined, "Attach Terminal to Network");
+    const network = await this.resolveNetworkArgument(undefined, "Attach Terminal Window to Network");
     if (network === undefined) {
       return;
     }
 
-    this.dependencies.networkService.attachTerminal(network.id, terminal.pid);
+    this.dependencies.networkService.attachTerminalWindow(network.id, terminalWindow.id);
     this.dependencies.treeProvider.refresh();
   }
 
@@ -654,31 +654,31 @@ export class PortManagerCommandController implements DisposableLike {
     return selected?.network;
   }
 
-  /** Resolves a terminal candidate from tree context or Quick Pick. */
-  private async resolveTerminalArgument(argument: unknown, title: string): Promise<TerminalCandidate | undefined> {
-    const terminal = getTerminalCandidateFromCommandArgument(argument);
+  /** Resolves a terminal window from tree context or Quick Pick. */
+  private async resolveTerminalWindowArgument(argument: unknown, title: string): Promise<TerminalWindow | undefined> {
+    const terminalWindow = getTerminalWindowFromCommandArgument(argument);
 
-    if (terminal !== undefined) {
-      return terminal;
+    if (terminalWindow !== undefined) {
+      return terminalWindow;
     }
 
-    const candidates = this.dependencies.networkService.getSnapshot().terminalCandidates;
-    if (candidates.length === 0) {
-      await vscode.window.showInformationMessage("No terminal candidates discovered.");
+    const windows = this.dependencies.networkService.getSnapshot().terminalWindows;
+    if (windows.length === 0) {
+      await vscode.window.showInformationMessage("No terminal windows discovered.");
       return undefined;
     }
 
     const selected = await vscode.window.showQuickPick(
-      candidates.map((item) => ({
-        label: item.name,
-        description: `pid ${item.pid}${item.vscodeTerminal ? ", VS Code" : ""}`,
+      windows.map((item) => ({
+        label: item.title,
+        description: `${item.source}, ${item.candidateCount} processes, root ${item.rootPid}`,
         detail: item.command,
-        terminal: item,
+        terminalWindow: item,
       })),
-      { title, placeHolder: "Select a terminal process" },
+      { title, placeHolder: "Select a terminal window" },
     );
 
-    return selected?.terminal;
+    return selected?.terminalWindow;
   }
 
   /** Resolves a host exposure from tree context or Quick Pick. */
