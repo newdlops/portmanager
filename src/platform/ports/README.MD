@@ -8,11 +8,13 @@
 
 - Node.js TCP server를 사용한 포트 가용성 검사
 - 플랫폼별 명령으로 점유 프로세스 후보 조회
+- 단일 로컬 agent가 사용할 전체 listening TCP 포트 목록 조회
 - 포트 조회 실패를 도메인에서 다룰 수 있는 결과로 변환
 
 ## 주요 진입점
 
 - `node-port-scanner.ts`
+- `node-listening-port-provider.ts`
 
 ## 외부 의존성
 

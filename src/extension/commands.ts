@@ -1,56 +1,40 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { ManagedProcessRegistry } from "../core/process-registry";
-import { PortRoutingError, PortRoutingService } from "../core/port-routing";
 import { readPortManagerSettings, openPortManagerSettings } from "../config/vscode-settings";
 import type { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import { getProcessFromCommandArgument } from "../ui/sidebar/port-manager-tree";
+import type { PortManagerProcessService } from "./process-service";
 import type {
   DisposableLike,
   ManagedProcess,
   ManagedProcessStartInput,
   PortInjectionMode,
-  ProcessLauncher,
 } from "../shared/types";
 
 /**
  * Registers Port Manager commands and coordinates the MVP flow.
  *
  * This controller is intentionally an orchestration boundary: it reads VS Code
- * input, asks core services for routing decisions, delegates process mechanics
- * to the platform launcher, and updates the registry for the UI.
+ * input and delegates routing, process mechanics, and shared state to the
+ * local agent process service.
  */
 
 export interface PortManagerCommandDependencies {
-  /** Domain registry backing the sidebar process list. */
-  readonly registry: ManagedProcessRegistry;
-  /** Domain routing policy that resolves requested ports to actual ports. */
-  readonly routingService: PortRoutingService;
-  /** Platform launcher that starts and stops child processes. */
-  readonly launcher: ProcessLauncher;
+  /** Agent-backed service shared by commands and the sidebar. */
+  readonly processService: PortManagerProcessService;
   /** Sidebar provider refreshed after command-driven changes. */
   readonly treeProvider: PortManagerTreeProvider;
 }
 
 /**
- * Command controller keeps restart profiles that are not part of the public
- * ManagedProcess record. This avoids changing the product data model while
- * still allowing a process to restart with its original injection strategy.
+ * Command controller keeps VS Code prompt flow separate from the agent-backed
+ * process service so the same agent can serve multiple VS Code windows.
  */
 export class PortManagerCommandController implements DisposableLike {
-  /** Disposables returned by VS Code command registration and launcher events. */
+  /** Disposables returned by VS Code command registration. */
   private readonly disposables: DisposableLike[] = [];
 
-  /** Launch profiles keyed by registry id so restart can preserve user choices. */
-  private readonly launchProfilesByProcessId = new Map<string, ManagedProcessStartInput>();
-
-  constructor(private readonly dependencies: PortManagerCommandDependencies) {
-    this.disposables.push(
-      this.dependencies.launcher.onExit((pid) => {
-        this.markExitedProcessStopped(pid);
-      }),
-    );
-  }
+  constructor(private readonly dependencies: PortManagerCommandDependencies) {}
 
   /**
    * Registers every command contribution declared in package.json.
@@ -70,7 +54,7 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.openSettings", () => openPortManagerSettings());
   }
 
-  /** Releases command and launcher subscriptions during extension deactivation. */
+  /** Releases command subscriptions during extension deactivation. */
   dispose(): void {
     while (this.disposables.length > 0) {
       this.disposables.pop()?.dispose();
@@ -180,7 +164,7 @@ export class PortManagerCommandController implements DisposableLike {
     }
 
     const cwd = getDefaultWorkspaceFolder() ?? process.cwd();
-    this.dependencies.registry.register({
+    await this.dependencies.processService.registerExistingProcess({
       pid,
       name,
       command: name,
@@ -194,14 +178,15 @@ export class PortManagerCommandController implements DisposableLike {
   }
 
   /** Forces the tree provider to request the latest registry snapshot. */
-  private refresh(): void {
+  private async refresh(): Promise<void> {
+    await this.dependencies.processService.refresh();
     this.dependencies.treeProvider.refresh();
   }
 
   /**
-   * Stops a selected process. The platform launcher only owns child processes
-   * it started; registry state is still marked stopped so external registrations
-   * can be cleared from the active list by the user.
+   * Stops a selected process through the shared agent. External detected rows
+   * may not map to an agent-owned child process, so the service decides whether
+   * stop is actionable.
    */
   private async stopProcess(argument: unknown): Promise<void> {
     const process = await this.resolveProcessArgument(argument, "Stop Process");
@@ -210,14 +195,13 @@ export class PortManagerCommandController implements DisposableLike {
     }
 
     const settings = readPortManagerSettings();
-    await this.dependencies.launcher.stop(process.pid, settings.processKillSignal);
-    this.dependencies.registry.stop(process.id);
+    await this.dependencies.processService.stopProcess(process.id, settings);
   }
 
   /**
-   * Restarts a managed process using its saved launch profile when available.
-   * Registered external processes fall back to their current command and env
-   * injection, which is enough for the MVP but may not match all external apps.
+   * Restarts a managed process using the launch profile stored by the agent.
+   * Detected external rows generally cannot restart because the agent did not
+   * launch them.
    */
   private async restartProcess(argument: unknown): Promise<void> {
     const process = await this.resolveProcessArgument(argument, "Restart Process");
@@ -226,35 +210,10 @@ export class PortManagerCommandController implements DisposableLike {
     }
 
     const settings = readPortManagerSettings();
-    await this.dependencies.launcher.stop(process.pid, settings.processKillSignal);
+    const restarted = await this.dependencies.processService.restartProcess(process.id, settings);
 
-    const fallbackProfile: ManagedProcessStartInput = {
-      name: process.name,
-      command: process.command,
-      cwd: process.cwd,
-      requestedPort: process.requestedPort,
-      host: settings.defaultHost,
-      injectionMode: "env",
-    };
-
-    const profile = this.launchProfilesByProcessId.get(process.id) ?? fallbackProfile;
-    const restarted = await this.launchProfile(profile);
-
-    this.dependencies.registry.update(process.id, {
-      pid: restarted.pid,
-      command: restarted.command,
-      actualPort: restarted.actualPort,
-      status: "running",
-      startedAt: new Date().toISOString(),
-      stoppedAt: undefined,
-      url: buildUrl(profile.host, restarted.actualPort),
-      errorMessage: undefined,
-    });
-
-    this.launchProfilesByProcessId.set(process.id, profile);
-
-    if (settings.autoOpenBrowser) {
-      await openUrl(buildUrl(profile.host, restarted.actualPort));
+    if (settings.autoOpenBrowser && restarted?.url) {
+      await openUrl(restarted.url);
     }
   }
 
@@ -262,13 +221,12 @@ export class PortManagerCommandController implements DisposableLike {
   private async stopAllProcesses(): Promise<void> {
     const settings = readPortManagerSettings();
 
-    for (const process of this.dependencies.registry.list()) {
+    for (const process of this.dependencies.processService.list()) {
       if (process.status === "stopped") {
         continue;
       }
 
-      await this.dependencies.launcher.stop(process.pid, settings.processKillSignal);
-      this.dependencies.registry.stop(process.id);
+      await this.dependencies.processService.stopProcess(process.id, settings);
     }
   }
 
@@ -294,8 +252,8 @@ export class PortManagerCommandController implements DisposableLike {
   }
 
   /**
-   * Removes a process from the registry. The command does not stop the process;
-   * users can choose Stop first when they want lifecycle control.
+   * Removes a process row from the shared agent state. The command does not
+   * stop external processes; users can choose Stop first for managed children.
    */
   private async removeProcess(argument: unknown): Promise<void> {
     const process = await this.resolveProcessArgument(argument, "Remove Process");
@@ -303,32 +261,21 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
-    this.launchProfilesByProcessId.delete(process.id);
-    this.dependencies.registry.remove(process.id);
+    await this.dependencies.processService.removeProcess(process.id);
   }
 
   /**
-   * Starts a process from an explicit profile, records it in the registry, and
-   * stores the profile for restart.
+   * Starts a process from an explicit profile through the agent, which owns
+   * routing and restart metadata.
    */
   private async startFromProfile(profile: ManagedProcessStartInput): Promise<ManagedProcess> {
     const settings = readPortManagerSettings();
-    const launch = await this.launchProfile(profile);
-    const process = this.dependencies.registry.register({
-      pid: launch.pid,
-      name: profile.name,
-      command: launch.command,
-      cwd: profile.cwd,
-      requestedPort: profile.requestedPort,
-      actualPort: launch.actualPort,
-      host: profile.host,
-    });
+    const process = await this.dependencies.processService.startManagedProcess(profile, settings);
+    const routed = process.requestedPort !== process.actualPort;
 
-    this.launchProfilesByProcessId.set(process.id, profile);
-
-    if (launch.routed && settings.showConflictNotification) {
+    if (routed && settings.showConflictNotification) {
       await vscode.window.showInformationMessage(
-        `Port ${profile.requestedPort} is busy. Routed app to ${launch.actualPort}.`,
+        `Port ${profile.requestedPort} is busy. Routed app to ${process.actualPort}.`,
       );
     }
 
@@ -340,43 +287,6 @@ export class PortManagerCommandController implements DisposableLike {
   }
 
   /**
-   * Routes the requested port and delegates child-process creation to the
-   * platform launcher. The returned command may include template expansion or
-   * appended arguments depending on injection mode.
-   */
-  private async launchProfile(profile: ManagedProcessStartInput): Promise<{
-    readonly pid: number;
-    readonly command: string;
-    readonly actualPort: number;
-    readonly routed: boolean;
-  }> {
-    const settings = readPortManagerSettings();
-    const decision = await this.dependencies.routingService.route({
-      requestedPort: profile.requestedPort,
-      host: profile.host,
-      scanRange: settings.scanRange,
-      scanDirection: settings.scanDirection,
-    });
-
-    const launch = await this.dependencies.launcher.launch({
-      name: profile.name,
-      command: profile.command,
-      cwd: profile.cwd,
-      requestedPort: profile.requestedPort,
-      host: profile.host,
-      actualPort: decision.actualPort,
-      injectionMode: profile.injectionMode,
-    });
-
-    return {
-      pid: launch.pid,
-      command: launch.command,
-      actualPort: decision.actualPort,
-      routed: decision.routed,
-    };
-  }
-
-  /**
    * Resolves a command argument from the tree, or asks the user to choose a
    * process when the command was launched from the palette.
    */
@@ -384,10 +294,10 @@ export class PortManagerCommandController implements DisposableLike {
     const process = getProcessFromCommandArgument(argument);
 
     if (process !== undefined) {
-      return this.dependencies.registry.get(process.id);
+      return this.dependencies.processService.get(process.id);
     }
 
-    const processes = this.dependencies.registry.list();
+    const processes = this.dependencies.processService.list();
     if (processes.length === 0) {
       await vscode.window.showInformationMessage("No managed processes are registered.");
       return undefined;
@@ -405,22 +315,6 @@ export class PortManagerCommandController implements DisposableLike {
 
     return selected?.process;
   }
-
-  /**
-   * Marks the matching registry entry stopped when the child process exits on
-   * its own. PID matching is sufficient because the launcher only emits events
-   * for processes it started.
-   */
-  private markExitedProcessStopped(pid: number): void {
-    const process = this.dependencies.registry.list().find((candidate) => candidate.pid === pid);
-
-    if (process === undefined || process.status === "stopped") {
-      return;
-    }
-
-    this.dependencies.registry.stop(process.id);
-  }
-
   /** Registers one command and wraps thrown errors in a user-visible message. */
   private registerCommand(
     context: vscode.ExtensionContext,
@@ -522,11 +416,6 @@ function getDefaultWorkspaceFolder(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }
 
-/** Builds the HTTP URL used by MVP development servers. */
-function buildUrl(host: string, port: number): string {
-  return `http://${host}:${port}`;
-}
-
 /** Opens an HTTP URL through VS Code's external URI bridge. */
 async function openUrl(url: string): Promise<void> {
   await vscode.env.openExternal(vscode.Uri.parse(url));
@@ -539,11 +428,6 @@ function isValidPort(port: number): boolean {
 
 /** Shows concise but specific command errors. */
 async function showCommandError(error: unknown): Promise<void> {
-  if (error instanceof PortRoutingError) {
-    await vscode.window.showErrorMessage(error.message);
-    return;
-  }
-
   if (error instanceof Error) {
     await vscode.window.showErrorMessage(error.message);
     return;

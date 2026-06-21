@@ -34,6 +34,7 @@
     "Other"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onView:portManager.processes",
     "onCommand:portManager.startManagedProcess",
     "onCommand:portManager.addExistingProcess",
@@ -165,12 +166,12 @@
       "view/item/context": [
         {
           "command": "portManager.openRoutedUrl",
-          "when": "view == portManager.processes && viewItem == managedProcess",
+          "when": "view == portManager.processes && (viewItem == managedProcess || viewItem == detectedProcess)",
           "group": "inline@1"
         },
         {
           "command": "portManager.copyRoutedUrl",
-          "when": "view == portManager.processes && viewItem == managedProcess",
+          "when": "view == portManager.processes && (viewItem == managedProcess || viewItem == detectedProcess)",
           "group": "inline@2"
         },
         {
@@ -185,7 +186,7 @@
         },
         {
           "command": "portManager.removeProcess",
-          "when": "view == portManager.processes && viewItem == managedProcess",
+          "when": "view == portManager.processes && (viewItem == managedProcess || viewItem == detectedProcess)",
           "group": "managed@3"
         }
       ]
@@ -243,6 +244,28 @@
           "type": "boolean",
           "default": true,
           "description": "Show an information notification when a busy requested port is routed."
+        },
+        "portManager.watchPreferredPorts": {
+          "type": "boolean",
+          "default": true,
+          "description": "Watch preferred ports in the background and show externally occupied ports in the Port Manager sidebar."
+        },
+        "portManager.watchIntervalMs": {
+          "type": "number",
+          "default": 3000,
+          "minimum": 1000,
+          "maximum": 60000,
+          "description": "Polling interval for watching preferred ports."
+        },
+        "portManager.notifyOnDetectedConflict": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a notification when a preferred port becomes occupied by an external process."
+        },
+        "portManager.monitorAllListeningPorts": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show all listening TCP ports reported by the local agent, not only preferred ports."
         },
         "portManager.processKillSignal": {
           "type": "string",

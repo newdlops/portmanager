@@ -2,6 +2,7 @@ import { SimpleEventEmitter } from "../shared/events";
 import type {
   DisposableLike,
   ManagedProcess,
+  ProcessSource,
   ProcessStatus,
   RegisteredProcessInput,
 } from "../shared/types";
@@ -50,6 +51,8 @@ export interface RegisteredProcessOptions {
   readonly url?: string;
   /** Initial error message when registering a known failed process. */
   readonly errorMessage?: string;
+  /** Registry source for UI and command behavior. */
+  readonly source?: ProcessSource;
 }
 
 export type ManagedProcessUpdate = Partial<Omit<ManagedProcess, "id" | "requestedPort">>;
@@ -124,6 +127,7 @@ export class ManagedProcessRegistry {
       stoppedAt: options.stoppedAt,
       url: options.url ?? buildUrl(input.host || this.defaultHost, input.actualPort),
       errorMessage: options.errorMessage,
+      source: options.source ?? "registered",
     };
 
     return this.add(process);

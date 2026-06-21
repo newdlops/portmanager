@@ -75,12 +75,11 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
  * visible for quick scanning.
  */
 export class ManagedProcessTreeItem extends vscode.TreeItem {
-  readonly contextValue = "managedProcess";
-
   constructor(readonly process: ManagedProcess) {
     super(process.name, vscode.TreeItemCollapsibleState.None);
 
     this.id = process.id;
+    this.contextValue = process.source === "detected" ? "detectedProcess" : "managedProcess";
     this.description = buildDescription(process);
     this.tooltip = buildTooltip(process);
     this.iconPath = new vscode.ThemeIcon(iconForStatus(process.status), colorForStatus(process.status));
@@ -126,7 +125,9 @@ function buildDescription(process: ManagedProcess): string {
       ? String(process.actualPort)
       : `${process.requestedPort} -> ${process.actualPort}`;
 
-  return `${routeText} ${process.status}`;
+  const sourceText = process.source === "detected" ? "external" : process.status;
+
+  return `${routeText} ${sourceText}`;
 }
 
 /**
@@ -139,6 +140,7 @@ function buildTooltip(process: ManagedProcess): vscode.MarkdownString {
   tooltip.appendMarkdown(`**${escapeMarkdown(process.name)}**\n\n`);
   tooltip.appendMarkdown(`- PID: \`${process.pid}\`\n`);
   tooltip.appendMarkdown(`- Status: \`${process.status}\`\n`);
+  tooltip.appendMarkdown(`- Source: \`${process.source ?? "managed"}\`\n`);
   tooltip.appendMarkdown(`- Requested Port: \`${process.requestedPort}\`\n`);
   tooltip.appendMarkdown(`- Actual Port: \`${process.actualPort}\`\n`);
   tooltip.appendMarkdown(`- URL: \`${process.url ?? "n/a"}\`\n`);

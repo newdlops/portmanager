@@ -1,0 +1,472 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import * as fs from "node:fs";
+import * as net from "node:net";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as vscode from "vscode";
+import { readPortManagerSettings } from "../config/vscode-settings";
+import { SimpleEventEmitter } from "../shared/events";
+import type {
+  AgentSnapshot,
+  DisposableLike,
+  ManagedProcess,
+  ManagedProcessStartInput,
+  PortManagerSettings,
+  RegisteredProcessInput,
+} from "../shared/types";
+import type { PortManagerProcessService } from "./process-service";
+
+/**
+ * VS Code extension client for the single local Port Manager agent.
+ *
+ * The client owns IPC mechanics only: locating the socket, starting the agent
+ * when no process is listening, request/response correlation, and maintaining
+ * the latest snapshot for the tree view.
+ */
+
+type AgentMethod =
+  | "listSnapshot"
+  | "refreshSnapshot"
+  | "startManagedProcess"
+  | "registerExistingProcess"
+  | "stopProcess"
+  | "restartProcess"
+  | "removeProcess";
+
+interface AgentRequest {
+  /** Correlates one line-delimited request with its response. */
+  readonly id: string;
+  /** Command understood by the agent server. */
+  readonly method: AgentMethod;
+  /** Method-specific payload. */
+  readonly payload?: unknown;
+}
+
+interface AgentResponse<T = unknown> {
+  /** Identifies agent responses on the shared event/response stream. */
+  readonly type: "response";
+  /** Request id being answered. */
+  readonly id: string;
+  /** True when the method completed successfully. */
+  readonly ok: boolean;
+  /** Method result returned by the agent. */
+  readonly payload?: T;
+  /** Error message returned by the agent. */
+  readonly error?: string;
+}
+
+interface AgentEvent {
+  /** Event name. The MVP only streams snapshots. */
+  readonly type: "snapshot";
+  /** Latest shared agent state. */
+  readonly payload: AgentSnapshot;
+}
+
+interface PendingRequest {
+  /** Resolves when the response with the matching id arrives. */
+  readonly resolve: (value: unknown) => void;
+  /** Rejects on agent error, socket close, or timeout. */
+  readonly reject: (error: Error) => void;
+  /** Timeout guard so command promises do not hang forever. */
+  readonly timer: NodeJS.Timeout;
+}
+
+/**
+ * Agent-backed process service used by commands and the sidebar provider.
+ * Multiple VS Code windows can create clients; they all connect to the same
+ * OS-user socket and receive the same snapshots.
+ */
+export class LocalAgentClient implements PortManagerProcessService {
+  /** Last snapshot received from the agent; tree reads are served from here. */
+  private snapshot: AgentSnapshot = createEmptySnapshot();
+
+  /** Active socket connected to the local agent. */
+  private socket: net.Socket | undefined;
+
+  /** Agent child process started by this VS Code window, if any. */
+  private childProcess: ChildProcess | undefined;
+
+  /** Request promises waiting for an agent response. */
+  private readonly pendingRequests = new Map<string, PendingRequest>();
+
+  /** Event channel for sidebar refreshes after snapshot changes. */
+  private readonly changeEvents = new SimpleEventEmitter<void>();
+
+  /** Buffered partial line data from the socket. */
+  private incomingBuffer = "";
+
+  /** Monotonic suffix used for request ids sent on this client connection. */
+  private nextRequestId = 1;
+
+  /** In-flight connect promise shared by concurrent commands. */
+  private connecting: Promise<void> | undefined;
+
+  /** Disposed clients should not reconnect after socket close. */
+  private disposed = false;
+
+  constructor(private readonly context: vscode.ExtensionContext) {}
+
+  /** Connects to the agent and loads the initial snapshot. */
+  async start(): Promise<void> {
+    await this.ensureConnected();
+    await this.refresh();
+  }
+
+  /** Returns the current process rows in agent snapshot order. */
+  list(): readonly ManagedProcess[] {
+    const settings = readPortManagerSettings();
+    if (settings.monitorAllListeningPorts) {
+      return this.snapshot.processes;
+    }
+
+    const preferredPorts = new Set(settings.preferredPorts);
+    return this.snapshot.processes.filter((process) => {
+      if (process.source !== "detected") {
+        return true;
+      }
+
+      return preferredPorts.has(process.actualPort);
+    });
+  }
+
+  /** Returns the unfiltered process rows for command resolution. */
+  private listAll(): readonly ManagedProcess[] {
+    return this.snapshot.processes;
+  }
+
+  /** Returns a process row by id from the latest snapshot. */
+  get(id: string): ManagedProcess | undefined {
+    return this.listAll().find((process) => process.id === id);
+  }
+
+  /** Subscribes to snapshot changes. */
+  onDidChange(listener: () => void): DisposableLike {
+    return this.changeEvents.subscribe(listener);
+  }
+
+  /** Requests a fresh OS port scan from the agent. */
+  async refresh(): Promise<void> {
+    const snapshot = await this.request<AgentSnapshot>("refreshSnapshot");
+    this.applySnapshot(snapshot);
+  }
+
+  /** Starts a managed process through the agent's centralized routing service. */
+  async startManagedProcess(
+    input: ManagedProcessStartInput,
+    settings: PortManagerSettings,
+  ): Promise<ManagedProcess> {
+    const process = await this.request<ManagedProcess>("startManagedProcess", {
+      ...input,
+      scanRange: settings.scanRange,
+      scanDirection: settings.scanDirection,
+    });
+    await this.refresh();
+
+    return process;
+  }
+
+  /** Registers an existing external process with the agent. */
+  async registerExistingProcess(input: RegisteredProcessInput): Promise<ManagedProcess> {
+    const process = await this.request<ManagedProcess>("registerExistingProcess", input);
+    await this.refresh();
+
+    return process;
+  }
+
+  /** Stops a process through the agent when it owns the child PID. */
+  async stopProcess(id: string, settings: PortManagerSettings): Promise<ManagedProcess | undefined> {
+    const process = await this.request<ManagedProcess | undefined>("stopProcess", {
+      id,
+      signal: settings.processKillSignal,
+    });
+    await this.refresh();
+
+    return process;
+  }
+
+  /** Restarts a process through its agent-side launch profile. */
+  async restartProcess(id: string, settings: PortManagerSettings): Promise<ManagedProcess | undefined> {
+    const process = await this.request<ManagedProcess | undefined>("restartProcess", {
+      id,
+      signal: settings.processKillSignal,
+      scanRange: settings.scanRange,
+      scanDirection: settings.scanDirection,
+    });
+    await this.refresh();
+
+    return process;
+  }
+
+  /** Removes a process row from the shared agent state. */
+  async removeProcess(id: string): Promise<ManagedProcess | undefined> {
+    const process = await this.request<ManagedProcess | undefined>("removeProcess", { id });
+    await this.refresh();
+
+    return process;
+  }
+
+  /** Closes the socket and rejects pending requests. */
+  dispose(): void {
+    this.disposed = true;
+    this.changeEvents.clear();
+    this.rejectAllPending(new Error("Port Manager agent client disposed."));
+    this.socket?.destroy();
+    this.socket = undefined;
+  }
+
+  /**
+   * Ensures a socket is connected. If no agent is listening, this client starts
+   * one and retries the connection for a short window.
+   */
+  private async ensureConnected(): Promise<void> {
+    if (this.socket && !this.socket.destroyed) {
+      return;
+    }
+
+    if (this.connecting) {
+      return this.connecting;
+    }
+
+    this.connecting = this.connectWithAgentStartup().finally(() => {
+      this.connecting = undefined;
+    });
+
+    return this.connecting;
+  }
+
+  /** Tries an existing socket first, then starts the agent and retries. */
+  private async connectWithAgentStartup(): Promise<void> {
+    try {
+      this.socket = await this.openSocket();
+      this.attachSocketHandlers(this.socket);
+      return;
+    } catch {
+      this.startAgentProcess();
+    }
+
+    const deadline = Date.now() + 5000;
+    let lastError: unknown;
+
+    while (Date.now() < deadline) {
+      await delay(150);
+
+      try {
+        this.socket = await this.openSocket();
+        this.attachSocketHandlers(this.socket);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error("Failed to connect to Port Manager agent.");
+  }
+
+  /** Opens the OS-specific local socket used by the singleton agent. */
+  private async openSocket(): Promise<net.Socket> {
+    const socketPath = getAgentSocketPath();
+
+    return new Promise<net.Socket>((resolve, reject) => {
+      const socket = net.createConnection(socketPath);
+      const timer = setTimeout(() => {
+        socket.destroy();
+        reject(new Error(`Timed out connecting to Port Manager agent at ${socketPath}.`));
+      }, 1000);
+
+      socket.once("connect", () => {
+        clearTimeout(timer);
+        resolve(socket);
+      });
+
+      socket.once("error", (error) => {
+        clearTimeout(timer);
+        socket.destroy();
+        reject(error);
+      });
+    });
+  }
+
+  /**
+   * Starts the local agent as a detached Node process. When another VS Code
+   * window starts it first, this process may exit after failing to bind; the
+   * client still retries the shared socket.
+   */
+  private startAgentProcess(): void {
+    const agentMainPath = this.context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
+
+    if (!fs.existsSync(agentMainPath)) {
+      throw new Error(`Port Manager agent entrypoint is missing: ${agentMainPath}`);
+    }
+
+    const socketPath = getAgentSocketPath();
+    removeStaleSocketFile(socketPath);
+
+    this.childProcess = spawn(process.execPath, [agentMainPath, "--socket", socketPath], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    this.childProcess.unref();
+  }
+
+  /** Wires line-delimited JSON handling for one socket connection. */
+  private attachSocketHandlers(socket: net.Socket): void {
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => this.handleData(String(chunk)));
+    socket.on("close", () => {
+      if (this.socket === socket) {
+        this.socket = undefined;
+      }
+
+      this.rejectAllPending(new Error("Port Manager agent connection closed."));
+    });
+    socket.on("error", (error) => {
+      this.rejectAllPending(error instanceof Error ? error : new Error(String(error)));
+    });
+  }
+
+  /** Accumulates socket data until complete newline-delimited messages arrive. */
+  private handleData(chunk: string): void {
+    this.incomingBuffer += chunk;
+
+    for (;;) {
+      const newlineIndex = this.incomingBuffer.indexOf("\n");
+      if (newlineIndex === -1) {
+        return;
+      }
+
+      const line = this.incomingBuffer.slice(0, newlineIndex).trim();
+      this.incomingBuffer = this.incomingBuffer.slice(newlineIndex + 1);
+
+      if (line.length > 0) {
+        this.handleMessage(line);
+      }
+    }
+  }
+
+  /** Dispatches one agent response or event. Malformed messages are ignored. */
+  private handleMessage(line: string): void {
+    const message = JSON.parse(line) as Partial<AgentResponse> & Partial<AgentEvent>;
+
+    if (message.type === "response" && typeof message.id === "string") {
+      this.handleResponse(message as AgentResponse);
+      return;
+    }
+
+    if (message.type === "snapshot" && message.payload) {
+      this.applySnapshot(message.payload);
+    }
+  }
+
+  /** Resolves or rejects the request waiting for the response id. */
+  private handleResponse(response: AgentResponse): void {
+    const pending = this.pendingRequests.get(response.id);
+
+    if (!pending) {
+      return;
+    }
+
+    clearTimeout(pending.timer);
+    this.pendingRequests.delete(response.id);
+
+    if (!response.ok) {
+      pending.reject(new Error(response.error ?? "Port Manager agent request failed."));
+      return;
+    }
+
+    pending.resolve(response.payload);
+  }
+
+  /** Sends one request and waits for the correlated response. */
+  private async request<T>(method: AgentMethod, params?: unknown): Promise<T> {
+    await this.ensureConnected();
+
+    const socket = this.socket;
+    if (!socket || socket.destroyed) {
+      throw new Error("Port Manager agent is not connected.");
+    }
+
+    const id = `extension-${process.pid}-${this.nextRequestId++}`;
+    const request: AgentRequest = { id, method, payload: params };
+
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(id);
+        reject(new Error(`Port Manager agent request timed out: ${method}`));
+      }, 10_000);
+
+      this.pendingRequests.set(id, {
+        resolve: (value) => resolve(value as T),
+        reject,
+        timer,
+      });
+
+      socket.write(`${JSON.stringify(request)}\n`);
+    });
+  }
+
+  /** Stores a new snapshot and notifies tree subscribers. */
+  private applySnapshot(snapshot: AgentSnapshot): void {
+    this.snapshot = snapshot;
+    this.changeEvents.emit();
+  }
+
+  /** Rejects every pending command when the socket becomes unusable. */
+  private rejectAllPending(error: Error): void {
+    for (const [id, pending] of this.pendingRequests) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+      this.pendingRequests.delete(id);
+    }
+  }
+}
+
+/**
+ * Builds a per-user singleton socket path. POSIX uses a Unix domain socket in
+ * the temp directory; Windows uses a named pipe.
+ */
+export function getAgentSocketPath(): string {
+  if (process.platform === "win32") {
+    return "\\\\.\\pipe\\newdlops-portmanager-agent";
+  }
+
+  const userId = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;
+  return path.join(os.tmpdir(), `newdlops-portmanager-agent-${userId}.sock`);
+}
+
+/**
+ * Removes a stale Unix-domain socket after connection has already failed.
+ * Active agents are not touched because a healthy socket would have accepted
+ * the initial connection before this cleanup path runs.
+ */
+function removeStaleSocketFile(socketPath: string): void {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  try {
+    if (fs.existsSync(socketPath)) {
+      fs.unlinkSync(socketPath);
+    }
+  } catch {
+    // A concurrent VS Code window may have removed or recreated the socket.
+    // The subsequent connect retry decides whether startup actually worked.
+  }
+}
+
+/** Creates the pre-connection snapshot shown before the agent responds. */
+function createEmptySnapshot(): AgentSnapshot {
+  return {
+    agentPid: 0,
+    processes: [],
+    listeners: [],
+    updatedAt: new Date(0).toISOString(),
+  };
+}
+
+/** Small retry delay helper for agent startup polling. */
+async function delay(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}

@@ -14,6 +14,10 @@ export type PortInjectionMode = "env" | "template" | "argument";
 
 export type ProcessKillSignal = NodeJS.Signals | "SIGKILL" | "SIGTERM";
 
+export type ProcessSource = "managed" | "registered" | "detected";
+
+export type PortProtocol = "tcp";
+
 export interface PortManagerSettings {
   /** Master switch used by command handlers before launching managed processes. */
   readonly enabled: boolean;
@@ -29,6 +33,14 @@ export interface PortManagerSettings {
   readonly autoOpenBrowser: boolean;
   /** Whether conflict routing should show an informational notification. */
   readonly showConflictNotification: boolean;
+  /** Whether the extension should watch preferred ports even for external processes. */
+  readonly watchPreferredPorts: boolean;
+  /** Polling interval used by the preferred-port watcher. */
+  readonly watchIntervalMs: number;
+  /** Whether newly detected busy preferred ports should show a notification. */
+  readonly notifyOnDetectedConflict: boolean;
+  /** Whether the local agent should report every listening TCP port. */
+  readonly monitorAllListeningPorts: boolean;
   /** Signal used when stopping managed child processes. */
   readonly processKillSignal: ProcessKillSignal;
 }
@@ -58,6 +70,8 @@ export interface ManagedProcess {
   readonly url?: string;
   /** Last error associated with this process, if any. */
   readonly errorMessage?: string;
+  /** Origin of the registry entry, used to separate launched and detected processes. */
+  readonly source?: ProcessSource;
 }
 
 export interface ProcessSnapshot {
@@ -67,6 +81,35 @@ export interface ProcessSnapshot {
   readonly name?: string;
   /** Full command line when the platform can provide it. */
   readonly command?: string;
+}
+
+export interface ListeningPort {
+  /** Stable row id derived from protocol, address, port, and owning process. */
+  readonly id: string;
+  /** Network protocol monitored by the agent. */
+  readonly protocol: PortProtocol;
+  /** Local bind address reported by the operating system. */
+  readonly localAddress: string;
+  /** Local listening TCP port. */
+  readonly port: number;
+  /** PID that owns the listener when the OS exposes it. */
+  readonly pid?: number;
+  /** Process name that owns the listener when available. */
+  readonly processName?: string;
+  /** Full command or executable path when available. */
+  readonly command?: string;
+  /** Whether this listener belongs to an agent-launched process. */
+  readonly source: "external" | "managed";
+  /** ISO timestamp from the scan that produced this row. */
+  readonly updatedAt: string;
+}
+
+export interface ListeningPortProvider {
+  /**
+   * Lists every local TCP listener the current user can inspect.
+   * Implementations live in the platform layer because they execute OS tools.
+   */
+  list(): Promise<readonly ListeningPort[]>;
 }
 
 export interface PortAvailability {
@@ -182,6 +225,24 @@ export interface ManagedProcessStartInput {
   readonly host: string;
   /** Port injection strategy selected by command handlers. */
   readonly injectionMode: PortInjectionMode;
+}
+
+export interface AgentStartManagedProcessRequest extends ManagedProcessStartInput {
+  /** Number of nearby candidate ports checked after the requested port is busy. */
+  readonly scanRange: number;
+  /** Candidate generation policy used by the agent. */
+  readonly scanDirection: ScanDirection;
+}
+
+export interface AgentSnapshot {
+  /** PID of the single local agent process serving this snapshot. */
+  readonly agentPid: number;
+  /** Combined view rows for managed, registered, and externally detected ports. */
+  readonly processes: readonly ManagedProcess[];
+  /** Raw listening TCP ports observed by the agent. */
+  readonly listeners: readonly ListeningPort[];
+  /** ISO timestamp for this snapshot. */
+  readonly updatedAt: string;
 }
 
 export interface DisposableLike {

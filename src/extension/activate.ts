@@ -1,9 +1,6 @@
 import * as vscode from "vscode";
-import { ManagedProcessRegistry } from "../core/process-registry";
-import { PortRoutingService } from "../core/port-routing";
-import { NodePortScanner } from "../platform/ports/node-port-scanner";
-import { NodeProcessLauncher } from "../platform/process/node-process-launcher";
 import { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
+import { LocalAgentClient } from "./local-agent-client";
 import { PortManagerCommandController } from "./commands";
 
 /**
@@ -14,25 +11,25 @@ import { PortManagerCommandController } from "./commands";
  * handlers orchestrate user workflows.
  */
 export function activate(context: vscode.ExtensionContext): void {
-  const portScanner = new NodePortScanner();
-  const routingService = new PortRoutingService(portScanner);
-  const processLauncher = new NodeProcessLauncher();
-  const registry = new ManagedProcessRegistry();
-  const treeProvider = new PortManagerTreeProvider(registry);
+  const processService = new LocalAgentClient(context);
+  const treeProvider = new PortManagerTreeProvider(processService);
   const commandController = new PortManagerCommandController({
-    registry,
-    routingService,
-    launcher: processLauncher,
+    processService,
     treeProvider,
   });
 
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider("portManager.processes", treeProvider),
+    processService,
     treeProvider,
     commandController,
   );
 
   commandController.register(context);
+  void processService.start().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    void vscode.window.showErrorMessage(`Port Manager agent failed to start: ${message}`);
+  });
 }
 
 /**

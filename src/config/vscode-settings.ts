@@ -16,6 +16,10 @@ const DEFAULT_SETTINGS: PortManagerSettings = {
   preferredPorts: [3000, 3001, 5173, 8000, 8080],
   autoOpenBrowser: false,
   showConflictNotification: true,
+  watchPreferredPorts: true,
+  watchIntervalMs: 3000,
+  notifyOnDetectedConflict: true,
+  monitorAllListeningPorts: true,
   processKillSignal: "SIGTERM",
 };
 
@@ -44,6 +48,18 @@ export function readPortManagerSettings(): PortManagerSettings {
       "showConflictNotification",
       DEFAULT_SETTINGS.showConflictNotification,
     ),
+    watchPreferredPorts: config.get<boolean>("watchPreferredPorts", DEFAULT_SETTINGS.watchPreferredPorts),
+    watchIntervalMs: normalizeWatchIntervalMs(
+      config.get<number>("watchIntervalMs", DEFAULT_SETTINGS.watchIntervalMs),
+    ),
+    notifyOnDetectedConflict: config.get<boolean>(
+      "notifyOnDetectedConflict",
+      DEFAULT_SETTINGS.notifyOnDetectedConflict,
+    ),
+    monitorAllListeningPorts: config.get<boolean>(
+      "monitorAllListeningPorts",
+      DEFAULT_SETTINGS.monitorAllListeningPorts,
+    ),
     processKillSignal: normalizeKillSignal(
       config.get<ProcessKillSignal>("processKillSignal", DEFAULT_SETTINGS.processKillSignal),
     ),
@@ -52,7 +68,7 @@ export function readPortManagerSettings(): PortManagerSettings {
 
 /** Opens the Settings UI already filtered to this extension's namespace. */
 export async function openPortManagerSettings(): Promise<void> {
-  await vscode.commands.executeCommand("workbench.action.openSettings", "@ext:local.portmanager portManager");
+  await vscode.commands.executeCommand("workbench.action.openSettings", "@ext:newdlops.portmanager portManager");
 }
 
 /**
@@ -74,6 +90,18 @@ function normalizeScanRange(scanRange: number): number {
   }
 
   return Math.max(1, Math.min(200, Math.trunc(scanRange)));
+}
+
+/**
+ * Keeps background polling responsive without letting a bad setting create a
+ * tight loop in the extension host.
+ */
+function normalizeWatchIntervalMs(watchIntervalMs: number): number {
+  if (!Number.isFinite(watchIntervalMs)) {
+    return DEFAULT_SETTINGS.watchIntervalMs;
+  }
+
+  return Math.max(1000, Math.min(60_000, Math.trunc(watchIntervalMs)));
 }
 
 /** Converts unknown scan direction strings to the documented default policy. */
