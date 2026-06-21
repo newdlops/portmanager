@@ -1,5 +1,6 @@
 import type {
   DisposableLike,
+  AgentSnapshot,
   ManagedProcess,
   ManagedProcessStartInput,
   PortManagerSettings,
@@ -14,6 +15,10 @@ import type {
  * to the single local agent shared across VS Code windows.
  */
 export interface PortManagerProcessService {
+  /** Connects to the local daemon, starting it when no socket is available. */
+  start(): Promise<void>;
+  /** Returns the latest complete daemon snapshot known to the extension. */
+  getSnapshot(): AgentSnapshot;
   /** Returns the latest agent snapshot rows in sidebar display order. */
   list(): readonly ManagedProcess[];
   /** Returns one process row by id from the latest snapshot. */

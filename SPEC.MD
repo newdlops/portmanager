@@ -67,10 +67,12 @@ Port Manager agent가 관리하는 `논리 포트 -> 실제 포트` 관계이다
 ### 5.2 GUI 관리
 
 1. 사용자가 VS Code Activity Bar에서 Port Manager 뷰를 연다.
-2. 현재 관리 중인 프로세스 목록을 확인한다.
-3. 각 항목에서 프로세스 이름, PID, 요청 포트, 실제 포트, 상태, 시작 시간을 확인한다.
-4. 목록 행 클릭은 항목 선택만 수행하며 브라우저를 열지 않는다.
-5. 사용자는 다음 동작을 명시적으로 수행할 수 있다.
+2. 사이드 패널은 `Daemon`, `Routing Table`, `Managed Processes`, `OS Listening Ports` 아코디언 섹션으로 나뉜다.
+3. 사용자는 daemon PID, 상태, 전체 listener 수, route 수, route table 파일 경로를 확인한다.
+4. 사용자는 라우팅 테이블에서 논리 포트와 실제 포트의 관계를 확인한다.
+5. 관리형 프로세스 항목에서 프로세스 이름, PID, 요청 포트, 실제 포트, 상태, 시작 시간을 확인한다.
+6. 목록 행 클릭은 항목 선택만 수행하며 브라우저를 열지 않는다.
+7. 사용자는 다음 동작을 명시적으로 수행할 수 있다.
    - 브라우저에서 열기
    - 실제 포트 URL 복사
    - 프로세스 종료
@@ -104,6 +106,7 @@ Port Manager agent가 관리하는 `논리 포트 -> 실제 포트` 관계이다
 
 - 확장은 지정된 포트가 이미 사용 중인지 확인할 수 있어야 한다.
 - 포트 점유 프로세스의 PID, 프로세스명, 명령어를 가능한 범위에서 조회해야 한다.
+- daemon은 OS 전체 listening TCP 포트를 감시하고 사이드 패널에 표시해야 한다.
 - 확장은 선호 포트 목록을 백그라운드에서 감시하고, 외부 프로세스가 점유한 포트를 사이드 패널에 표시해야 한다.
 - 확장은 OS 사용자 단위의 단일 local agent와 통신하고, 여러 VS Code 창은 동일한 agent snapshot을 공유해야 한다.
 - agent는 전체 listening TCP 포트를 감시하고, 관리형 프로세스의 논리 요청 포트와 실제 라우팅 포트 매핑을 함께 제공해야 한다.
@@ -182,7 +185,25 @@ type ManagedProcess = {
 
 VS Code Activity Bar에 `Port Manager` 뷰를 제공한다.
 
-뷰는 다음 정보를 표시한다.
+뷰는 다음 아코디언 섹션을 제공한다.
+
+Daemon:
+
+- 상태
+- PID
+- 전체 listener 수
+- active route 수
+- route table 파일 경로
+- 마지막 갱신 시각
+
+Routing Table:
+
+- 논리 포트
+- 실제 포트
+- host
+- owning process
+
+Managed Processes:
 
 - 프로세스 이름
 - 상태
@@ -191,6 +212,14 @@ VS Code Activity Bar에 `Port Manager` 뷰를 제공한다.
 - 실제 포트
 - URL
 - 실행 시간
+
+OS Listening Ports:
+
+- local address
+- port
+- PID
+- process name
+- command
 
 프로세스별 액션:
 
@@ -243,6 +272,8 @@ VS Code Activity Bar에 `Port Manager` 뷰를 제공한다.
 
 VS Code Command Palette에 다음 명령을 등록한다.
 
+- `Port Manager: Start Daemon`
+- `Port Manager: Daemon Status`
 - `Port Manager: Start Managed Process`
 - `Port Manager: Add Existing Process`
 - `Port Manager: Refresh`
@@ -272,7 +303,7 @@ VS Code Command Palette에 다음 명령을 등록한다.
 
 - 포트 사용 여부 확인
 - 점유 프로세스 조회
-- 사용 가능한 인접 포트 탐색
+- 해시 기반 가상 포트와 nearest 인접 포트 탐색
 
 ### 8.3 Process Launcher
 
@@ -280,8 +311,8 @@ VS Code Command Palette에 다음 명령을 등록한다.
 
 - 사용자의 실행 명령 파싱
 - 요청 포트 확인
-- 충돌 시 실제 포트 할당
-- 환경 변수 또는 CLI 인자로 실제 포트 전달
+- 라우팅 정책에 따른 실제 포트 할당
+- 환경 변수 또는 CLI 인자로 실제 포트와 route table 전달
 - child process lifecycle 관리
 
 ### 8.4 Process Registry
@@ -297,6 +328,7 @@ VS Code Command Palette에 다음 명령을 등록한다.
 책임:
 
 - 현재 레지스트리 상태 렌더링
+- daemon 상태, 라우팅 테이블, 관리형 프로세스, OS listener를 아코디언 섹션으로 렌더링
 - 사용자 액션을 VS Code command로 전달
 - 수동 새로고침과 자동 상태 반영
 
@@ -306,12 +338,12 @@ VS Code Command Palette에 다음 명령을 등록한다.
 
 1. 사용자가 `Start Managed Process` 명령을 실행한다.
 2. 확장이 실행 명령, 작업 디렉터리, 요청 포트를 입력받는다.
-3. Port Scanner가 요청 포트 점유 여부를 확인한다.
-4. 점유 중이면 인접 포트를 탐색한다.
-5. Process Launcher가 실제 포트로 프로세스를 실행한다.
-6. Process Registry가 매핑을 저장한다.
-7. Sidebar View가 목록을 갱신한다.
-8. 사용자가 실제 URL로 접근한다.
+3. Port Router가 라우팅 모드에 따라 실제 포트를 선택한다.
+4. Process Launcher가 실제 포트와 route table 환경 변수를 주입해 프로세스를 실행한다.
+5. Process Registry가 논리 포트와 실제 포트 매핑을 저장한다.
+6. Agent가 전체 OS listening port snapshot과 active route table을 갱신한다.
+7. Sidebar View가 Daemon, Routing Table, Managed Processes, OS Listening Ports 섹션을 갱신한다.
+8. 사용자가 실행 중인 실제 URL로 접근한다.
 
 ### 9.2 프로세스 종료
 
@@ -347,7 +379,7 @@ VS Code Command Palette에 다음 명령을 등록한다.
 
 ### Phase 4: GUI 관리
 
-- 프로세스 목록 표시
+- Daemon, Routing Table, Managed Processes, OS Listening Ports 아코디언 표시
 - Stop, Restart, Copy URL, Open Browser 구현
 - 상태 자동 갱신
 - 오류 상태 표시
@@ -355,6 +387,7 @@ VS Code Command Palette에 다음 명령을 등록한다.
 
 ### Phase 5: 고급 라우팅
 
+- OS 전체 투명 라우팅을 위한 프록시/SDK/런타임 주입/네이티브 오버레이 계층 설계
 - task/debug configuration 통합
 - 프로젝트별 실행 프로필 저장
 - 프록시 또는 네이티브 어댑터 가능성 검토
@@ -365,6 +398,8 @@ VS Code Command Palette에 다음 명령을 등록한다.
 - VS Code 확장만으로 임의의 외부 프로세스가 호출하는 `bind(3000)`을 운영체제 수준에서 투명하게 바꾸는 것은 불가능하거나 플랫폼별 네이티브 구현이 필요하다.
 - MVP는 확장이 실행을 관리하는 프로세스에 대해 포트를 사전에 조정하는 방식으로 구현한다.
 - MVP의 논리 라우팅 테이블은 프로세스 환경 변수와 agent snapshot으로 제공한다. 임의 코드의 `http://localhost:3000` 호출을 자동으로 `http://localhost:53000`으로 바꾸려면 프록시, SDK, 또는 런타임 주입이 필요하다.
+- daemon은 OS 전체 listening port를 감시하고 표시하지만, 이미 외부 터미널에서 성공적으로 bind한 임의 프로세스를 사후에 다른 포트로 이동시킬 수는 없다.
+- 컨테이너의 가상 오버레이 네트워크 같은 투명 라우팅은 네이티브 드라이버, per-process 런타임 주입, 또는 모든 traffic이 통과하는 local proxy 계층이 필요하다.
 - VS Code 터미널에서 직접 실행된 프로세스는 첫 bind 실패 이후 터미널 출력 기반으로 감지하고, 사용자 확인 후 관리형 재실행으로 복구한다.
 - 이미 실행된 외부 프로세스는 포트를 변경할 수 없으므로 감지와 관리 기능만 제공한다.
 - 일부 포트 조회 명령은 권한 제한으로 인해 PID 또는 프로세스명을 얻지 못할 수 있다.
@@ -376,6 +411,8 @@ VS Code Command Palette에 다음 명령을 등록한다.
 - nearest 모드에서 `3000` 포트가 점유된 상태로 관리형 프로세스를 실행하면 자동으로 `3001` 또는 사용 가능한 인접 포트로 실행된다.
 - 사이드 패널에 `요청 포트 -> 실제 포트` 매핑이 표시된다.
 - agent snapshot과 실행 프로세스 환경 변수에 논리 라우팅 테이블이 제공된다.
+- 사이드 패널이 Daemon, Routing Table, Managed Processes, OS Listening Ports 아코디언으로 구분된다.
+- Daemon 섹션에서 PID, 상태, listener 수, route 수, route table 파일 경로를 확인할 수 있다.
 - 같은 요청 포트를 가진 여러 관리형 프로세스가 각각 다른 실제 포트로 실행될 수 있다.
 - 사이드 패널 행 클릭은 브라우저를 열지 않고 선택만 수행한다.
 - 사용자가 사이드 패널에서 프로세스를 종료하고 재시작할 수 있다.

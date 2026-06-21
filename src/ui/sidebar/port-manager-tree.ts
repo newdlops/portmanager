@@ -1,5 +1,13 @@
 import * as vscode from "vscode";
-import type { DisposableLike, ManagedProcess, ProcessStatus } from "../../shared/types";
+import type {
+  AgentDaemonStatus,
+  AgentSnapshot,
+  DisposableLike,
+  ListeningPort,
+  LogicalPortRoute,
+  ManagedProcess,
+  ProcessStatus,
+} from "../../shared/types";
 
 /**
  * Sidebar adapter for the managed process registry.
@@ -10,13 +18,23 @@ import type { DisposableLike, ManagedProcess, ProcessStatus } from "../../shared
  */
 
 export interface ManagedProcessTreeSource {
+  /** Returns the latest complete daemon snapshot. */
+  getSnapshot(): AgentSnapshot;
   /** Returns the latest registry snapshot in display order. */
   list(): readonly ManagedProcess[];
   /** Notifies the tree when registry contents or process statuses change. */
   onDidChange(listener: () => void): DisposableLike;
 }
 
-type PortManagerTreeItem = ManagedProcessTreeItem | EmptyTreeItem;
+type TreeSectionKind = "daemon" | "routes" | "processes" | "listeners";
+
+type PortManagerTreeItem =
+  | TreeSectionItem
+  | DaemonStatusTreeItem
+  | RouteTreeItem
+  | ManagedProcessTreeItem
+  | ListenerTreeItem
+  | EmptyTreeItem;
 
 /**
  * Renders managed processes as VS Code tree items and refreshes on registry
@@ -50,22 +68,89 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
   }
 
   /**
-   * Converts the registry snapshot into tree rows. A dedicated empty item keeps
-   * the view informative before the first process is started.
+   * Converts the daemon snapshot into grouped tree rows. VS Code tree groups
+   * act as accordions for daemon status, routes, managed rows, and OS listeners.
    */
-  getChildren(): PortManagerTreeItem[] {
-    const processes = this.source.list();
-    if (processes.length === 0) {
-      return [new EmptyTreeItem()];
+  getChildren(element?: PortManagerTreeItem): PortManagerTreeItem[] {
+    const snapshot = this.source.getSnapshot();
+
+    if (element === undefined) {
+      return [
+        new TreeSectionItem("daemon", "Daemon", formatDaemonSummary(snapshot.daemon), "server-process"),
+        new TreeSectionItem("routes", "Routing Table", `${snapshot.routes.length} active`, "references"),
+        new TreeSectionItem("processes", "Managed Processes", `${countManagedProcesses(snapshot)} rows`, "vm-running"),
+        new TreeSectionItem("listeners", "OS Listening Ports", `${snapshot.listeners.length} listeners`, "radio-tower"),
+      ];
     }
 
-    return processes.map((process) => new ManagedProcessTreeItem(process));
+    if (!(element instanceof TreeSectionItem)) {
+      return [];
+    }
+
+    switch (element.kind) {
+      case "daemon":
+        return buildDaemonChildren(snapshot.daemon);
+      case "routes":
+        return snapshot.routes.length > 0
+          ? snapshot.routes.map((route) => new RouteTreeItem(route))
+          : [new EmptyTreeItem("No active logical routes", "Start a managed process")];
+      case "processes": {
+        const processes = snapshot.processes.filter((process) => process.source !== "detected");
+        return processes.length > 0
+          ? processes.map((process) => new ManagedProcessTreeItem(process))
+          : [new EmptyTreeItem("No managed processes", "Start one from the toolbar")];
+      }
+      case "listeners":
+        return snapshot.listeners.length > 0
+          ? snapshot.listeners.map((listener) => new ListenerTreeItem(listener))
+          : [new EmptyTreeItem("No OS listeners", "Refresh after starting a server")];
+    }
   }
 
   /** Releases VS Code and registry event resources during deactivation. */
   dispose(): void {
     this.sourceSubscription.dispose();
     this.onDidChangeTreeDataEmitter.dispose();
+  }
+}
+
+/** Collapsible root row used as a VS Code tree accordion section. */
+class TreeSectionItem extends vscode.TreeItem {
+  readonly contextValue = "section";
+
+  constructor(
+    readonly kind: TreeSectionKind,
+    label: string,
+    description: string,
+    icon: string,
+  ) {
+    super(label, vscode.TreeItemCollapsibleState.Expanded);
+    this.id = `section:${kind}`;
+    this.description = description;
+    this.iconPath = new vscode.ThemeIcon(icon);
+  }
+}
+
+/** Static daemon detail row. */
+class DaemonStatusTreeItem extends vscode.TreeItem {
+  readonly contextValue = "daemonStatus";
+
+  constructor(label: string, description: string, icon: string = "info") {
+    super(label, vscode.TreeItemCollapsibleState.None);
+    this.description = description;
+    this.iconPath = new vscode.ThemeIcon(icon);
+  }
+}
+
+/** One logical routing table row. */
+class RouteTreeItem extends vscode.TreeItem {
+  readonly contextValue = "route";
+
+  constructor(readonly route: LogicalPortRoute) {
+    super(`${route.logicalPort} -> ${route.actualPort}`, vscode.TreeItemCollapsibleState.None);
+    this.description = route.processName ?? route.source;
+    this.tooltip = buildRouteTooltip(route);
+    this.iconPath = new vscode.ThemeIcon("symbol-interface", new vscode.ThemeColor("charts.purple"));
   }
 }
 
@@ -86,15 +171,59 @@ export class ManagedProcessTreeItem extends vscode.TreeItem {
   }
 }
 
+/** One raw OS listening-port row reported by the daemon. */
+class ListenerTreeItem extends vscode.TreeItem {
+  readonly contextValue = "listener";
+
+  constructor(readonly listener: ListeningPort) {
+    const owner = listener.processName ?? (listener.pid === undefined ? "unknown" : `pid ${listener.pid}`);
+    super(`${listener.localAddress}:${listener.port}`, vscode.TreeItemCollapsibleState.None);
+    this.description = owner;
+    this.tooltip = buildListenerTooltip(listener);
+    this.iconPath = new vscode.ThemeIcon(
+      listener.source === "managed" ? "plug" : "radio-tower",
+      listener.source === "managed" ? new vscode.ThemeColor("testing.iconPassed") : undefined,
+    );
+  }
+}
+
 /** Placeholder row shown when no processes are registered. */
 class EmptyTreeItem extends vscode.TreeItem {
   readonly contextValue = "empty";
 
-  constructor() {
-    super("No managed processes", vscode.TreeItemCollapsibleState.None);
-    this.description = "Start one from the toolbar";
+  constructor(label: string, description: string) {
+    super(label, vscode.TreeItemCollapsibleState.None);
+    this.description = description;
     this.iconPath = new vscode.ThemeIcon("debug-start");
   }
+}
+
+/** Builds child rows for the daemon accordion section. */
+function buildDaemonChildren(daemon: AgentDaemonStatus): PortManagerTreeItem[] {
+  const children: PortManagerTreeItem[] = [
+    new DaemonStatusTreeItem("Status", daemon.status, daemon.status === "running" ? "pass" : "warning"),
+    new DaemonStatusTreeItem("PID", daemon.pid > 0 ? String(daemon.pid) : "n/a", "server-process"),
+    new DaemonStatusTreeItem("Listeners", String(daemon.listenerCount), "radio-tower"),
+    new DaemonStatusTreeItem("Routes", String(daemon.routeCount), "references"),
+    new DaemonStatusTreeItem("Route Table File", daemon.routeTablePath ?? "n/a", "json"),
+    new DaemonStatusTreeItem("Updated", daemon.updatedAt, "clock"),
+  ];
+
+  if (daemon.errorMessage) {
+    children.push(new DaemonStatusTreeItem("Warning", daemon.errorMessage, "warning"));
+  }
+
+  return children;
+}
+
+/** One-line daemon summary for the root section. */
+function formatDaemonSummary(daemon: AgentDaemonStatus): string {
+  return daemon.pid > 0 ? `${daemon.status} pid ${daemon.pid}` : daemon.status;
+}
+
+/** Counts non-detected process rows for the managed process section label. */
+function countManagedProcesses(snapshot: AgentSnapshot): number {
+  return snapshot.processes.filter((process) => process.source !== "detected").length;
 }
 
 /**
@@ -149,6 +278,45 @@ function buildTooltip(process: ManagedProcess): vscode.MarkdownString {
   if (process.errorMessage) {
     tooltip.appendMarkdown(`\nError: \`${escapeMarkdown(process.errorMessage)}\``);
   }
+
+  return tooltip;
+}
+
+/** Builds tooltip details for one logical route row. */
+function buildRouteTooltip(route: LogicalPortRoute): vscode.MarkdownString {
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.isTrusted = false;
+  tooltip.appendMarkdown(`**Logical Route**\n\n`);
+  tooltip.appendMarkdown(`- Logical Port: \`${route.logicalPort}\`\n`);
+  tooltip.appendMarkdown(`- Actual Port: \`${route.actualPort}\`\n`);
+  tooltip.appendMarkdown(`- Host: \`${escapeMarkdown(route.host)}\`\n`);
+  tooltip.appendMarkdown(`- Status: \`${route.status}\`\n`);
+  tooltip.appendMarkdown(`- Source: \`${route.source}\`\n`);
+
+  if (route.processName) {
+    tooltip.appendMarkdown(`- Process: \`${escapeMarkdown(route.processName)}\`\n`);
+  }
+
+  if (route.processId) {
+    tooltip.appendMarkdown(`- Process ID: \`${escapeMarkdown(route.processId)}\`\n`);
+  }
+
+  return tooltip;
+}
+
+/** Builds tooltip details for one raw OS listener row. */
+function buildListenerTooltip(listener: ListeningPort): vscode.MarkdownString {
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.isTrusted = false;
+  tooltip.appendMarkdown(`**OS Listener**\n\n`);
+  tooltip.appendMarkdown(`- Address: \`${escapeMarkdown(listener.localAddress)}\`\n`);
+  tooltip.appendMarkdown(`- Port: \`${listener.port}\`\n`);
+  tooltip.appendMarkdown(`- Protocol: \`${listener.protocol}\`\n`);
+  tooltip.appendMarkdown(`- Source: \`${listener.source}\`\n`);
+  tooltip.appendMarkdown(`- PID: \`${listener.pid ?? "n/a"}\`\n`);
+  tooltip.appendMarkdown(`- Process: \`${escapeMarkdown(listener.processName ?? "n/a")}\`\n`);
+  tooltip.appendMarkdown(`- Command: \`${escapeMarkdown(listener.command ?? "n/a")}\`\n`);
+  tooltip.appendMarkdown(`- Updated: \`${listener.updatedAt}\`\n`);
 
   return tooltip;
 }

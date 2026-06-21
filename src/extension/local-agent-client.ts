@@ -7,6 +7,7 @@ import * as vscode from "vscode";
 import { readPortManagerSettings } from "../config/vscode-settings";
 import { SimpleEventEmitter } from "../shared/events";
 import type {
+  AgentDaemonStatus,
   AgentSnapshot,
   DisposableLike,
   ManagedProcess,
@@ -110,6 +111,11 @@ export class LocalAgentClient implements PortManagerProcessService {
   async start(): Promise<void> {
     await this.ensureConnected();
     await this.refresh();
+  }
+
+  /** Returns the latest complete agent snapshot for status and tree sections. */
+  getSnapshot(): AgentSnapshot {
+    return this.snapshot;
   }
 
   /** Returns the current process rows in agent snapshot order. */
@@ -413,7 +419,7 @@ export class LocalAgentClient implements PortManagerProcessService {
 
   /** Stores a new snapshot and notifies tree subscribers. */
   private applySnapshot(snapshot: AgentSnapshot): void {
-    this.snapshot = snapshot;
+    this.snapshot = normalizeAgentSnapshot(snapshot);
     this.changeEvents.emit();
   }
 
@@ -462,13 +468,61 @@ function removeStaleSocketFile(socketPath: string): void {
 
 /** Creates the pre-connection snapshot shown before the agent responds. */
 function createEmptySnapshot(): AgentSnapshot {
+  const updatedAt = new Date(0).toISOString();
+
   return {
     agentPid: 0,
+    daemon: createDaemonStatus({
+      status: "disconnected",
+      pid: 0,
+      updatedAt,
+      listenerCount: 0,
+      routeCount: 0,
+      monitoringAllListeners: false,
+    }),
     processes: [],
     listeners: [],
     routes: [],
-    updatedAt: new Date(0).toISOString(),
+    updatedAt,
   };
+}
+
+/**
+ * Accepts snapshots from current and older daemon versions.
+ * Older daemons do not include daemon/routes metadata, so the extension derives
+ * safe defaults instead of letting the tree or status command read undefined.
+ */
+function normalizeAgentSnapshot(snapshot: AgentSnapshot): AgentSnapshot {
+  const runtimeSnapshot = snapshot as Partial<AgentSnapshot>;
+  const updatedAt = runtimeSnapshot.updatedAt ?? new Date().toISOString();
+  const processes = runtimeSnapshot.processes ?? [];
+  const listeners = runtimeSnapshot.listeners ?? [];
+  const routes = runtimeSnapshot.routes ?? [];
+  const agentPid = runtimeSnapshot.agentPid ?? 0;
+
+  return {
+    agentPid,
+    daemon:
+      runtimeSnapshot.daemon ??
+      createDaemonStatus({
+        status: agentPid > 0 ? "running" : "disconnected",
+        pid: agentPid,
+        updatedAt,
+        listenerCount: listeners.length,
+        routeCount: routes.length,
+        monitoringAllListeners: listeners.length > 0,
+        errorMessage: runtimeSnapshot.daemon === undefined ? "Connected daemon does not expose status metadata." : undefined,
+      }),
+    processes,
+    listeners,
+    routes,
+    updatedAt,
+  };
+}
+
+/** Builds daemon status objects with all required UI-safe defaults. */
+function createDaemonStatus(status: AgentDaemonStatus): AgentDaemonStatus {
+  return status;
 }
 
 /** Small retry delay helper for agent startup polling. */

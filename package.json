@@ -36,6 +36,8 @@
   "activationEvents": [
     "onStartupFinished",
     "onView:portManager.processes",
+    "onCommand:portManager.startDaemon",
+    "onCommand:portManager.showDaemonStatus",
     "onCommand:portManager.startManagedProcess",
     "onCommand:portManager.addExistingProcess",
     "onCommand:portManager.refresh",
@@ -76,6 +78,18 @@
       ]
     },
     "commands": [
+      {
+        "command": "portManager.startDaemon",
+        "title": "Port Manager: Start Daemon",
+        "category": "Port Manager",
+        "icon": "$(server-process)"
+      },
+      {
+        "command": "portManager.showDaemonStatus",
+        "title": "Port Manager: Daemon Status",
+        "category": "Port Manager",
+        "icon": "$(pulse)"
+      },
       {
         "command": "portManager.startManagedProcess",
         "title": "Port Manager: Start Managed Process",
@@ -138,29 +152,39 @@
     "menus": {
       "view/title": [
         {
-          "command": "portManager.startManagedProcess",
+          "command": "portManager.startDaemon",
           "when": "view == portManager.processes",
           "group": "navigation@1"
         },
         {
-          "command": "portManager.addExistingProcess",
+          "command": "portManager.showDaemonStatus",
           "when": "view == portManager.processes",
           "group": "navigation@2"
         },
         {
-          "command": "portManager.refresh",
+          "command": "portManager.startManagedProcess",
           "when": "view == portManager.processes",
           "group": "navigation@3"
         },
         {
-          "command": "portManager.stopAllProcesses",
+          "command": "portManager.addExistingProcess",
           "when": "view == portManager.processes",
           "group": "navigation@4"
         },
         {
-          "command": "portManager.openSettings",
+          "command": "portManager.refresh",
           "when": "view == portManager.processes",
           "group": "navigation@5"
+        },
+        {
+          "command": "portManager.stopAllProcesses",
+          "when": "view == portManager.processes",
+          "group": "navigation@6"
+        },
+        {
+          "command": "portManager.openSettings",
+          "when": "view == portManager.processes",
+          "group": "navigation@7"
         }
       ],
       "view/item/context": [

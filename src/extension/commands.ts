@@ -42,6 +42,8 @@ export class PortManagerCommandController implements DisposableLike {
    * error notifications instead of unhandled promise rejections.
    */
   register(context: vscode.ExtensionContext): void {
+    this.registerCommand(context, "portManager.startDaemon", () => this.startDaemon());
+    this.registerCommand(context, "portManager.showDaemonStatus", () => this.showDaemonStatus());
     this.registerCommand(context, "portManager.startManagedProcess", () => this.startManagedProcess());
     this.registerCommand(context, "portManager.addExistingProcess", () => this.addExistingProcess());
     this.registerCommand(context, "portManager.refresh", () => this.refresh());
@@ -59,6 +61,30 @@ export class PortManagerCommandController implements DisposableLike {
     while (this.disposables.length > 0) {
       this.disposables.pop()?.dispose();
     }
+  }
+
+  /** Starts or reconnects to the singleton local daemon and refreshes the view. */
+  private async startDaemon(): Promise<void> {
+    await this.dependencies.processService.start();
+    this.dependencies.treeProvider.refresh();
+
+    const daemon = this.dependencies.processService.getSnapshot().daemon;
+    await vscode.window.showInformationMessage(
+      `Port Manager daemon ${daemon.status}: pid ${daemon.pid}, ${daemon.listenerCount} listeners, ${daemon.routeCount} routes`,
+    );
+  }
+
+  /** Shows the latest daemon status known from the shared agent snapshot. */
+  private async showDaemonStatus(): Promise<void> {
+    await this.dependencies.processService.refresh();
+    const daemon = this.dependencies.processService.getSnapshot().daemon;
+    const routeTablePath = daemon.routeTablePath ? `\nRoute table: ${daemon.routeTablePath}` : "";
+    const errorMessage = daemon.errorMessage ? `\nWarning: ${daemon.errorMessage}` : "";
+
+    await vscode.window.showInformationMessage(
+      `Daemon ${daemon.status}. PID: ${daemon.pid || "n/a"}. Listeners: ${daemon.listenerCount}. Routes: ${daemon.routeCount}.${routeTablePath}${errorMessage}`,
+      { modal: true },
+    );
   }
 
   /**

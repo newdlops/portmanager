@@ -9,6 +9,7 @@ import type {
   AgentSnapshot,
   AgentStartManagedProcessRequest,
   DisposableLike,
+  AgentDaemonStatus,
   LogicalPortRoute,
   ListeningPort,
   ListeningPortProvider,
@@ -75,6 +76,10 @@ export interface BuildAgentSnapshotOptions {
   readonly listeners: readonly ListeningPort[];
   /** Snapshot timestamp shared by generated rows. */
   readonly updatedAt: string;
+  /** Daemon startup timestamp exposed in sidebar/status UI. */
+  readonly daemonStartedAt?: string;
+  /** Dynamic JSON route table path shared with launched processes. */
+  readonly routeTablePath?: string;
   /** Detected listener row ids hidden by removeProcess. */
   readonly suppressedDetectedProcessIds?: ReadonlySet<string>;
   /** Host used when a listener address is not user-friendly for HTTP URLs. */
@@ -129,6 +134,9 @@ export class PortManagerAgent implements DisposableLike {
   /** Clock source used for lifecycle and snapshot timestamps. */
   private readonly now: () => Date;
 
+  /** Timestamp captured when the daemon object is created. */
+  private readonly startedAt: string;
+
   /** Default signal for stop/restart requests with no settings payload. */
   private readonly defaultKillSignal: ProcessKillSignal;
 
@@ -157,6 +165,7 @@ export class PortManagerAgent implements DisposableLike {
       options.routingService ?? new PortRoutingService(requirePortAvailabilityProvider(options));
     this.agentPid = options.agentPid ?? process.pid;
     this.now = options.now ?? (() => new Date());
+    this.startedAt = this.now().toISOString();
     this.defaultKillSignal = options.defaultKillSignal ?? DEFAULT_KILL_SIGNAL;
     this.defaultHost = options.defaultHost ?? "localhost";
     this.defaultCwd = options.defaultCwd ?? process.cwd();
@@ -559,6 +568,8 @@ export class PortManagerAgent implements DisposableLike {
       registryProcesses: this.registry.list(),
       listeners,
       updatedAt: this.now().toISOString(),
+      daemonStartedAt: this.startedAt,
+      routeTablePath: this.routeTablePath,
       suppressedDetectedProcessIds: this.suppressedDetectedProcessIds,
       defaultHost: this.defaultHost,
       defaultCwd: this.defaultCwd,
@@ -622,12 +633,44 @@ export function buildAgentSnapshot(options: BuildAgentSnapshotOptions): AgentSna
     )
     .filter((process) => !options.suppressedDetectedProcessIds?.has(process.id));
 
+  const routes = buildLogicalRoutes(options.registryProcesses);
+  const daemon = buildDaemonStatus({
+    agentPid: options.agentPid,
+    updatedAt: options.updatedAt,
+    startedAt: options.daemonStartedAt,
+    routeTablePath: options.routeTablePath,
+    listenerCount: normalizedListeners.length,
+    routeCount: routes.length,
+  });
+
   return {
     agentPid: options.agentPid,
+    daemon,
     processes: [...options.registryProcesses.map((process) => ({ ...process })), ...detectedProcesses],
     listeners: normalizedListeners,
-    routes: buildLogicalRoutes(options.registryProcesses),
+    routes,
     updatedAt: options.updatedAt,
+  };
+}
+
+/** Creates daemon metadata for status commands and sidebar display. */
+function buildDaemonStatus(options: {
+  readonly agentPid: number;
+  readonly updatedAt: string;
+  readonly startedAt?: string;
+  readonly routeTablePath?: string;
+  readonly listenerCount: number;
+  readonly routeCount: number;
+}): AgentDaemonStatus {
+  return {
+    status: "running",
+    pid: options.agentPid,
+    startedAt: options.startedAt,
+    updatedAt: options.updatedAt,
+    routeTablePath: options.routeTablePath,
+    listenerCount: options.listenerCount,
+    routeCount: options.routeCount,
+    monitoringAllListeners: true,
   };
 }
 

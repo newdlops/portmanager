@@ -193,6 +193,29 @@ export interface LogicalPortRoute {
   readonly source: ProcessSource;
 }
 
+export type AgentDaemonState = "starting" | "running" | "disconnected" | "error";
+
+export interface AgentDaemonStatus {
+  /** Current extension-side view of the local daemon lifecycle. */
+  readonly status: AgentDaemonState;
+  /** PID of the single local agent process when connected. */
+  readonly pid: number;
+  /** ISO timestamp from daemon startup when known. */
+  readonly startedAt?: string;
+  /** ISO timestamp when the snapshot/status was produced. */
+  readonly updatedAt: string;
+  /** Dynamic route table JSON file path shared with managed processes. */
+  readonly routeTablePath?: string;
+  /** Number of raw OS listeners in the latest daemon scan. */
+  readonly listenerCount: number;
+  /** Number of active logical route rows in the latest daemon snapshot. */
+  readonly routeCount: number;
+  /** Whether the daemon is scanning the OS listening table, not only managed rows. */
+  readonly monitoringAllListeners: boolean;
+  /** Last daemon or connection error if known. */
+  readonly errorMessage?: string;
+}
+
 export interface ProcessLaunchRequest {
   /** Human-readable name shown in the sidebar; defaults to command when omitted. */
   readonly name?: string;
@@ -284,6 +307,8 @@ export interface AgentStartManagedProcessRequest extends ManagedProcessStartInpu
 export interface AgentSnapshot {
   /** PID of the single local agent process serving this snapshot. */
   readonly agentPid: number;
+  /** Daemon lifecycle and monitoring metadata for UI/status surfaces. */
+  readonly daemon: AgentDaemonStatus;
   /** Combined view rows for managed, registered, and externally detected ports. */
   readonly processes: readonly ManagedProcess[];
   /** Raw listening TCP ports observed by the agent. */

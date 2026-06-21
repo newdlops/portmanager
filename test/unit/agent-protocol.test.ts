@@ -84,6 +84,10 @@ test("snapshot merge keeps managed route context and adds external listeners", (
 
   assert.equal(snapshot.agentPid, 777);
   assert.equal(snapshot.updatedAt, fixedUpdatedAt);
+  assert.equal(snapshot.daemon.status, "running");
+  assert.equal(snapshot.daemon.pid, 777);
+  assert.equal(snapshot.daemon.listenerCount, 2);
+  assert.equal(snapshot.daemon.routeCount, 1);
   assert.equal(snapshot.processes.length, 2);
   assert.equal(snapshot.processes[0]?.id, "managed-1");
   assert.equal(snapshot.processes[0]?.requestedPort, 3000);
