@@ -26,10 +26,11 @@ export interface ManagedProcessTreeSource {
   onDidChange(listener: () => void): DisposableLike;
 }
 
-type TreeSectionKind = "daemon" | "routes" | "processes" | "listeners";
+type TreeSectionKind = "actions" | "daemon" | "routes" | "processes" | "listeners";
 
 type PortManagerTreeItem =
   | TreeSectionItem
+  | ActionTreeItem
   | DaemonStatusTreeItem
   | RouteTreeItem
   | ManagedProcessTreeItem
@@ -76,6 +77,7 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
 
     if (element === undefined) {
       return [
+        new TreeSectionItem("actions", "Actions", "daemon and setup commands", "tools"),
         new TreeSectionItem("daemon", "Daemon", formatDaemonSummary(snapshot.daemon), "server-process"),
         new TreeSectionItem("routes", "Routing Table", `${snapshot.routes.length} active`, "references"),
         new TreeSectionItem("processes", "Managed Processes", `${countManagedProcesses(snapshot)} rows`, "vm-running"),
@@ -88,6 +90,8 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
     }
 
     switch (element.kind) {
+      case "actions":
+        return buildActionChildren();
       case "daemon":
         return buildDaemonChildren(snapshot.daemon);
       case "routes":
@@ -114,6 +118,21 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
   }
 }
 
+/** One clickable command row in the Actions accordion. */
+class ActionTreeItem extends vscode.TreeItem {
+  readonly contextValue = "action";
+
+  constructor(label: string, command: string, icon: string, description?: string) {
+    super(label, vscode.TreeItemCollapsibleState.None);
+    this.description = description;
+    this.iconPath = new vscode.ThemeIcon(icon);
+    this.command = {
+      command,
+      title: label,
+    };
+  }
+}
+
 /** Collapsible root row used as a VS Code tree accordion section. */
 class TreeSectionItem extends vscode.TreeItem {
   constructor(
@@ -128,6 +147,22 @@ class TreeSectionItem extends vscode.TreeItem {
     this.description = description;
     this.iconPath = new vscode.ThemeIcon(icon);
   }
+}
+
+/** Builds multirow sidebar command access so the header toolbar stays compact. */
+function buildActionChildren(): PortManagerTreeItem[] {
+  return [
+    new ActionTreeItem("Start Daemon", "portManager.startDaemon", "server-process"),
+    new ActionTreeItem("Stop Daemon", "portManager.stopDaemon", "debug-disconnect"),
+    new ActionTreeItem("Daemon Status", "portManager.showDaemonStatus", "pulse"),
+    new ActionTreeItem("Start Managed Process", "portManager.startManagedProcess", "run"),
+    new ActionTreeItem("Add Existing Process", "portManager.addExistingProcess", "add"),
+    new ActionTreeItem("Refresh", "portManager.refresh", "refresh"),
+    new ActionTreeItem("Install Shell Hook", "portManager.installShellHook", "plug"),
+    new ActionTreeItem("Install External CLI", "portManager.installExternalCli", "terminal"),
+    new ActionTreeItem("Stop All Processes", "portManager.stopAllProcesses", "debug-stop"),
+    new ActionTreeItem("Open Settings", "portManager.openSettings", "settings-gear"),
+  ];
 }
 
 /** Static daemon detail row. */

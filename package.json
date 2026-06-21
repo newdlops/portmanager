@@ -192,39 +192,9 @@
           "group": "navigation@3"
         },
         {
-          "command": "portManager.startManagedProcess",
-          "when": "view == portManager.processes",
-          "group": "navigation@4"
-        },
-        {
-          "command": "portManager.addExistingProcess",
-          "when": "view == portManager.processes",
-          "group": "navigation@5"
-        },
-        {
           "command": "portManager.refresh",
           "when": "view == portManager.processes",
-          "group": "navigation@6"
-        },
-        {
-          "command": "portManager.stopAllProcesses",
-          "when": "view == portManager.processes",
-          "group": "navigation@7"
-        },
-        {
-          "command": "portManager.openSettings",
-          "when": "view == portManager.processes",
-          "group": "navigation@8"
-        },
-        {
-          "command": "portManager.installExternalCli",
-          "when": "view == portManager.processes",
-          "group": "navigation@9"
-        },
-        {
-          "command": "portManager.installShellHook",
-          "when": "view == portManager.processes",
-          "group": "navigation@10"
+          "group": "navigation@4"
         }
       ],
       "view/item/context": [

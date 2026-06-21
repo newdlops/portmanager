@@ -649,7 +649,8 @@ export PORT_MANAGER_AGENT_MAIN="${escapedAgentMainPath}"
 
 if [ -z "$\{PORT_MANAGER_HOOK_DAEMON_STARTED:-}" ]; then
   export PORT_MANAGER_HOOK_DAEMON_STARTED=1
-  if [ ! -S "$PORT_MANAGER_AGENT_SOCKET" ]; then
+  "${escapedNodeExecutablePath}" -e 'const net=require("node:net");const fs=require("node:fs");const socketPath=process.argv[1];const socket=net.createConnection(socketPath);const timer=setTimeout(()=>{socket.destroy();try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);},500);socket.once("connect",()=>{clearTimeout(timer);socket.end();process.exit(0);});socket.once("error",()=>{clearTimeout(timer);try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);});' "$PORT_MANAGER_AGENT_SOCKET" >/dev/null 2>&1
+  if [ $? -ne 0 ]; then
     nohup "${escapedNodeExecutablePath}" "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" >/tmp/newdlops-portmanager-agent.log 2>&1 &
   fi
 fi

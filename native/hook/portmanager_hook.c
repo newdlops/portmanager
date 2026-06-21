@@ -681,6 +681,19 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
   pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
 
   result = pm_real_bind(sockfd, (struct sockaddr *)&rewritten, addrlen);
+  if (result != 0 && errno == EADDRINUSE && actual_port != logical_port) {
+    pm_release_allocation(allocation_id);
+    allocation_id[0] = '\0';
+
+    pm_hook_depth++;
+    if (pm_allocate_route(logical_port, host, &actual_port, allocation_id, sizeof(allocation_id)) == 0) {
+      memcpy(&rewritten, addr, addrlen);
+      pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
+      result = pm_real_bind(sockfd, (struct sockaddr *)&rewritten, addrlen);
+    }
+    pm_hook_depth--;
+  }
+
   if (result == 0) {
     char logical_text[16];
     char actual_text[16];
