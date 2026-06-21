@@ -1,6 +1,7 @@
 import { SimpleEventEmitter } from "../../shared/events";
 import type {
   DisposableLike,
+  HostAccessBinding,
   HostPortExposure,
   LogicalNetwork,
   NetworkRuntimeDescriptor,
@@ -26,6 +27,9 @@ export class LogicalNetworkRegistry implements DisposableLike {
 
   /** Host listener/proxy rows keyed by exposure id. */
   private readonly exposures = new Map<string, HostPortExposure>();
+
+  /** Network-to-host binding rows keyed by binding id. */
+  private readonly hostAccessBindings = new Map<string, HostAccessBinding>();
 
   /** Latest transient terminal discovery results. */
   private terminalCandidates: readonly TerminalCandidate[] = [];
@@ -53,6 +57,10 @@ export class LogicalNetworkRegistry implements DisposableLike {
     for (const exposure of initialState?.exposures ?? []) {
       this.exposures.set(exposure.id, exposure);
     }
+
+    for (const binding of initialState?.hostAccessBindings ?? []) {
+      this.hostAccessBindings.set(binding.id, binding);
+    }
   }
 
   /** Subscribes to any registry mutation. */
@@ -68,6 +76,7 @@ export class LogicalNetworkRegistry implements DisposableLike {
       terminalWindows: this.terminalWindows,
       attachments: [...this.attachments.values()],
       exposures: [...this.exposures.values()],
+      hostAccessBindings: [...this.hostAccessBindings.values()],
       runtimes: this.runtimes,
       updatedAt: new Date().toISOString(),
     };
@@ -79,6 +88,7 @@ export class LogicalNetworkRegistry implements DisposableLike {
       networks: [...this.networks.values()],
       attachments: [...this.attachments.values()],
       exposures: [...this.exposures.values()],
+      hostAccessBindings: [...this.hostAccessBindings.values()],
     };
   }
 
@@ -124,6 +134,12 @@ export class LogicalNetworkRegistry implements DisposableLike {
     for (const [exposureId, exposure] of this.exposures) {
       if (exposure.networkId === networkId) {
         this.exposures.delete(exposureId);
+      }
+    }
+
+    for (const [bindingId, binding] of this.hostAccessBindings) {
+      if (binding.networkId === networkId) {
+        this.hostAccessBindings.delete(bindingId);
       }
     }
 
@@ -207,6 +223,41 @@ export class LogicalNetworkRegistry implements DisposableLike {
     return exposure;
   }
 
+  /** Stores a network-to-host access binding after validating its network scope. */
+  addHostAccessBinding(binding: HostAccessBinding): HostAccessBinding {
+    if (!this.networks.has(binding.networkId)) {
+      throw new Error(`Unknown logical network: ${binding.networkId}`);
+    }
+
+    const conflictingBinding = [...this.hostAccessBindings.values()].find(
+      (item) =>
+        item.id !== binding.id &&
+        item.networkId === binding.networkId &&
+        item.protocol === binding.protocol &&
+        item.logicalPort === binding.logicalPort,
+    );
+
+    if (conflictingBinding !== undefined) {
+      throw new Error(`Host access binding already exists for logical port ${binding.logicalPort}.`);
+    }
+
+    this.hostAccessBindings.set(binding.id, binding);
+    this.emitChange();
+    return binding;
+  }
+
+  /** Removes one network-to-host access binding. */
+  removeHostAccessBinding(bindingId: string): HostAccessBinding | undefined {
+    const binding = this.hostAccessBindings.get(bindingId);
+    if (binding === undefined) {
+      return undefined;
+    }
+
+    this.hostAccessBindings.delete(bindingId);
+    this.emitChange();
+    return binding;
+  }
+
   /** Releases registry listeners. */
   dispose(): void {
     this.changeEvents.clear();
@@ -224,6 +275,8 @@ export interface LogicalNetworkRegistryState {
   readonly attachments: readonly TerminalAttachment[];
   /** Persisted host exposure rows. */
   readonly exposures: readonly HostPortExposure[];
+  /** Persisted network-to-host access rows. */
+  readonly hostAccessBindings?: readonly HostAccessBinding[];
 }
 
 /** Keeps one row per visible terminal root while preserving discovery order. */

@@ -206,6 +206,17 @@ static void pm_default_route_table_path(char *buffer, size_t size) {
   snprintf(buffer, size, "/tmp/newdlops-portmanager-routes-%ld.json", (long)getuid());
 }
 
+static void pm_default_host_access_path(char *buffer, size_t size) {
+  const char *configured = getenv("PORT_MANAGER_HOST_ACCESS_FILE");
+
+  if (configured != NULL && configured[0] != '\0') {
+    snprintf(buffer, size, "%s", configured);
+    return;
+  }
+
+  snprintf(buffer, size, "/tmp/newdlops-portmanager-host-access-%ld.json", (long)getuid());
+}
+
 static int pm_is_supported_sockaddr(const struct sockaddr *addr, socklen_t addrlen) {
   if (addr == NULL) {
     return 0;
@@ -245,6 +256,35 @@ static void pm_set_sockaddr_port(struct sockaddr *addr, int port) {
   if (addr->sa_family == AF_INET6) {
     struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
     in6->sin6_port = htons((uint16_t)port);
+  }
+}
+
+static void pm_set_sockaddr_host(struct sockaddr *addr, const char *host) {
+  if (host == NULL || host[0] == '\0') {
+    return;
+  }
+
+  if (addr->sa_family == AF_INET) {
+    struct sockaddr_in *in = (struct sockaddr_in *)addr;
+
+    if (strcmp(host, "localhost") == 0 || strcmp(host, "::1") == 0) {
+      inet_pton(AF_INET, "127.0.0.1", &in->sin_addr);
+      return;
+    }
+
+    (void)inet_pton(AF_INET, host, &in->sin_addr);
+    return;
+  }
+
+  if (addr->sa_family == AF_INET6) {
+    struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
+
+    if (strcmp(host, "localhost") == 0 || strcmp(host, "127.0.0.1") == 0) {
+      inet_pton(AF_INET6, "::1", &in6->sin6_addr);
+      return;
+    }
+
+    (void)inet_pton(AF_INET6, host, &in6->sin6_addr);
   }
 }
 
@@ -521,6 +561,73 @@ static int pm_route_matches_network(const char *route_json) {
   }
 
   return strcmp(route_network, network_id) == 0;
+}
+
+static int pm_host_access_lookup(int logical_port, char *target_host, size_t target_host_size) {
+  char path[PM_MAX_PATH];
+  char *buffer;
+  int fd;
+  struct stat stat_buffer;
+  ssize_t read_count;
+  char needle[64];
+  char *cursor;
+
+  pm_default_host_access_path(path, sizeof(path));
+  fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    return 0;
+  }
+
+  if (fstat(fd, &stat_buffer) != 0 || stat_buffer.st_size <= 0 || stat_buffer.st_size > 1024 * 1024) {
+    close(fd);
+    return 0;
+  }
+
+  buffer = (char *)malloc((size_t)stat_buffer.st_size + 1);
+  if (buffer == NULL) {
+    close(fd);
+    return 0;
+  }
+
+  read_count = read(fd, buffer, (size_t)stat_buffer.st_size);
+  close(fd);
+  if (read_count <= 0) {
+    free(buffer);
+    return 0;
+  }
+
+  buffer[read_count] = '\0';
+  snprintf(needle, sizeof(needle), "\"logicalPort\": %d", logical_port);
+  cursor = buffer;
+
+  while ((cursor = strstr(cursor, needle)) != NULL) {
+    char *object_start = cursor;
+    char *object_end = strchr(cursor, '}');
+    int host_port;
+
+    while (object_start > buffer && *object_start != '{') {
+      object_start--;
+    }
+
+    if (object_end == NULL) {
+      break;
+    }
+
+    *object_end = '\0';
+    host_port = pm_json_int(object_start, "hostPort", 0);
+    if (host_port > 0 && pm_route_matches_network(object_start)) {
+      if (pm_json_string(object_start, "hostAddress", target_host, target_host_size) != 0) {
+        snprintf(target_host, target_host_size, "127.0.0.1");
+      }
+      free(buffer);
+      return host_port;
+    }
+
+    cursor = object_end + 1;
+  }
+
+  free(buffer);
+  return 0;
 }
 
 static int pm_response_ok(const char *response) {
@@ -839,6 +946,7 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
 
 static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   struct sockaddr_storage rewritten;
+  char target_host[128];
   int logical_port;
   int actual_port;
 
@@ -853,6 +961,15 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
   }
 
   logical_port = pm_sockaddr_port(addr);
+  target_host[0] = '\0';
+  actual_port = pm_host_access_lookup(logical_port, target_host, sizeof(target_host));
+  if (actual_port > 0) {
+    memcpy(&rewritten, addr, addrlen);
+    pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
+    pm_set_sockaddr_host((struct sockaddr *)&rewritten, target_host);
+    return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
+  }
+
   actual_port = pm_memory_actual_for_logical(logical_port);
   if (actual_port == 0) {
     actual_port = pm_route_table_lookup(logical_port, 0);

@@ -64,7 +64,11 @@ Logical Network를 실제 시스템에서 구현하는 어댑터다. VS Code 확
 - OS native adapter: Linux network namespace, macOS pf/utun/launch wrapper, Windows WFP/Hyper-V/WSL 기반 구현
 - Proxy adapter: 완전 격리는 아니지만 host exposure와 일부 outbound/inbound 라우팅을 제공하는 fallback
 
-현재 초기 구현은 `Local TCP Proxy` adapter를 제공한다. 이 adapter는 host port exposure를 실제 TCP listener/proxy로 수행하고 터미널 창 attach 의도를 logical association으로 저장하지만, 같은 내부 포트 재사용과 실제 터미널 네트워크 격리는 지원하지 않는다. UI는 이 capability를 그대로 표시해야 하며, logical attach와 isolated attach를 구분해서 보여줘야 한다.
+Logical Network runtime은 컨테이너 또는 network namespace처럼 터미널 프로세스의 socket namespace를 실제로 분리해야 한다. 논리 네트워크에 속한 프로세스가 `127.0.0.1:3004`에 bind하더라도 그 포트는 호스트 namespace의 `3004`를 차지하면 안 된다. 호스트에서 접근 가능한 포트는 사용자가 만든 Host Port Exposure만 점유한다.
+
+`Local TCP Proxy`는 Host Port Exposure를 구현하는 보조 adapter로만 사용할 수 있다. 이 adapter는 host port listener/proxy를 열 수 있지만, 터미널 창을 컨테이너 수준으로 격리하지 못하고 같은 내부 포트 재사용도 보장하지 못한다. 따라서 `Local TCP Proxy`를 Logical Network runtime으로 선택하거나 terminal attach 성공으로 표시해서는 안 된다. 격리 가능한 runtime이 없으면 Logical Network 생성 또는 attach 단계에서 명확히 실패해야 한다.
+
+초기 격리 runtime은 Docker/Podman container adapter다. Logical Network 생성 시 전용 bridge network와 long-running development container를 만들고, terminal attach는 선택한 터미널에서 `docker exec` 또는 `podman exec`로 container shell에 진입시키는 방식으로 동작한다. 이 shell 안에서 시작한 개발 서버만 Logical Network 내부 포트로 간주한다.
 
 #### Terminal Discovery
 
@@ -78,7 +82,7 @@ VS Code 통합 터미널만이 아니라 macOS Terminal/iTerm2, Linux terminal e
   - 권한 제한으로 전체 정보를 얻지 못하면 식별 가능한 범위만 표시하고 제한 사유를 남긴다.
 - 사용자는 새 Logical Network를 만들고 이름을 지정할 수 있어야 한다.
 - 사용자는 탐색된 터미널 창/세션을 선택해 Logical Network에 attach할 수 있어야 한다.
-- attach 이후 해당 터미널에서 실행되는 개발 서버는 같은 Logical Network 안에서 동작해야 한다.
+- attach 이후 해당 터미널에서 실행되는 개발 서버는 같은 Logical Network 안에서 동작해야 하며, 명시적인 Host Port Exposure가 없는 한 호스트 머신의 동일 포트를 점유하지 않아야 한다.
 - 같은 내부 포트 조합을 사용하는 여러 앱이 서로 다른 Logical Network에서 동시에 실행될 수 있어야 한다.
 - 사용자는 호스트 노출 포트를 직접 설정해야 한다.
   - 예: `localhost:3004 -> A network:3004`

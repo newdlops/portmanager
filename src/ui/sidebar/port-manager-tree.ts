@@ -3,6 +3,7 @@ import type {
   AgentDaemonStatus,
   AgentSnapshot,
   DisposableLike,
+  HostAccessBinding,
   HostPortExposure,
   LogicalNetwork,
   ListeningPort,
@@ -51,6 +52,7 @@ type PortManagerTreeItem =
   | TerminalCandidateTreeItem
   | TerminalAttachmentTreeItem
   | HostPortExposureTreeItem
+  | HostAccessBindingTreeItem
   | RuntimeAdapterTreeItem
   | DaemonStatusTreeItem
   | RouteTreeItem
@@ -109,9 +111,24 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
 
     if (element instanceof LogicalNetworkTreeItem) {
       const attachments = snapshot.attachments.filter((attachment) => attachment.networkId === element.network.id);
-      return attachments.length > 0
-        ? attachments.map((attachment) => new TerminalAttachmentTreeItem(attachment))
-        : [new EmptyTreeItem("No terminal windows attached", "Attach a window from Terminal Windows")];
+      const exposures = snapshot.exposures.filter((exposure) => exposure.networkId === element.network.id);
+      const hostAccessBindings = snapshot.hostAccessBindings.filter((binding) => binding.networkId === element.network.id);
+      return [
+        new ActionTreeItem("Add Host Binding", "portManager.addHostPortExposure", "add", "Expose network port", element.network),
+        new ActionTreeItem(
+          "Add Host Access",
+          "portManager.addHostAccessBinding",
+          "arrow-swap",
+          "Reach host port from network",
+          element.network,
+        ),
+        ...exposures.map((exposure) => new HostPortExposureTreeItem(exposure, [element.network])),
+        ...hostAccessBindings.map((binding) => new HostAccessBindingTreeItem(binding)),
+        ...attachments.map((attachment) => new TerminalAttachmentTreeItem(attachment)),
+        ...(attachments.length === 0 && exposures.length === 0 && hostAccessBindings.length === 0
+          ? [new EmptyTreeItem("No bindings or terminal windows", "Attach a window or add a host binding")]
+          : []),
+      ];
     }
 
     if (element instanceof TerminalWindowTreeItem) {
@@ -131,7 +148,14 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
           new ActionTreeItem("Create Logical Network", "portManager.createLogicalNetwork", "add"),
           new ActionTreeItem("Remove Logical Network", "portManager.removeLogicalNetwork", "trash"),
           ...(snapshot.networks.length > 0
-            ? snapshot.networks.map((network) => new LogicalNetworkTreeItem(network, snapshot.attachments))
+            ? snapshot.networks.map((network) =>
+                new LogicalNetworkTreeItem(
+                  network,
+                  snapshot.attachments,
+                  snapshot.exposures,
+                  snapshot.hostAccessBindings,
+                ),
+              )
             : [new EmptyTreeItem("No logical networks", "Create one here")]),
         ];
       case "terminals":
@@ -155,6 +179,15 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
       case "runtime":
         return [
           new ActionTreeItem("Open Settings", "portManager.openSettings", "settings-gear"),
+          ...(snapshot.runtimes.some(isContainerLevelRuntime)
+            ? []
+            : [
+                new PlannedFeatureTreeItem(
+                  "No container isolation runtime",
+                  "Local proxy cannot isolate terminal ports",
+                  "warning",
+                ),
+              ]),
           ...snapshot.runtimes.map((runtime) => new RuntimeAdapterTreeItem(runtime)),
         ];
     }
@@ -171,13 +204,14 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
 class ActionTreeItem extends vscode.TreeItem {
   readonly contextValue = "action";
 
-  constructor(label: string, command: string, icon: string, description?: string) {
+  constructor(label: string, command: string, icon: string, description?: string, argument?: unknown) {
     super(label, vscode.TreeItemCollapsibleState.None);
     this.description = description;
     this.iconPath = new vscode.ThemeIcon(icon);
     this.command = {
       command,
       title: label,
+      arguments: argument === undefined ? [] : [argument],
     };
   }
 }
@@ -216,15 +250,21 @@ export class LogicalNetworkTreeItem extends vscode.TreeItem {
   constructor(
     readonly network: LogicalNetwork,
     attachments: readonly TerminalAttachment[],
+    exposures: readonly HostPortExposure[] = [],
+    hostAccessBindings: readonly HostAccessBinding[] = [],
   ) {
     const attachmentCount = attachments.filter((attachment) => attachment.networkId === network.id).length;
+    const exposureCount = exposures.filter((exposure) => exposure.networkId === network.id).length;
+    const hostAccessCount = hostAccessBindings.filter((binding) => binding.networkId === network.id).length;
     super(
       network.name,
-      attachmentCount > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
+      attachmentCount > 0 || exposureCount > 0 || hostAccessCount > 0
+        ? vscode.TreeItemCollapsibleState.Collapsed
+        : vscode.TreeItemCollapsibleState.None,
     );
     this.id = network.id;
-    this.description = `${network.runtimeKind} ${network.status}${attachmentCount > 0 ? `, ${attachmentCount} terminals` : ""}`;
-    this.tooltip = buildNetworkTooltip(network, attachmentCount);
+    this.description = buildNetworkDescription(network, attachmentCount, exposureCount, hostAccessCount);
+    this.tooltip = buildNetworkTooltip(network, attachmentCount, exposureCount, hostAccessCount);
     this.iconPath = new vscode.ThemeIcon(
       network.status === "running" ? "vm-active" : "vm-outline",
       network.status === "error" ? new vscode.ThemeColor("testing.iconFailed") : undefined,
@@ -286,11 +326,27 @@ export class HostPortExposureTreeItem extends vscode.TreeItem {
     const network = networks.find((item) => item.id === exposure.networkId);
     this.id = exposure.id;
     this.contextValue = exposure.status === "active" ? "hostExposureActive" : "hostExposure";
-    this.description = `${network?.name ?? exposure.networkId} -> ${exposure.targetAddress}:${exposure.targetPort}`;
+    this.description = `${network?.name ?? exposure.networkId} -> logical ${exposure.targetPort}`;
     this.tooltip = buildExposureTooltip(exposure, network);
     this.iconPath = new vscode.ThemeIcon(
       exposure.status === "active" ? "link-external" : "warning",
       exposure.status === "error" ? new vscode.ThemeColor("testing.iconFailed") : undefined,
+    );
+  }
+}
+
+/** Network-to-host binding row used by attached terminal processes. */
+export class HostAccessBindingTreeItem extends vscode.TreeItem {
+  readonly contextValue = "hostAccessBinding";
+
+  constructor(readonly binding: HostAccessBinding) {
+    super(`network:${binding.logicalPort}`, vscode.TreeItemCollapsibleState.None);
+    this.id = binding.id;
+    this.description = `host ${binding.hostAddress}:${binding.hostPort}`;
+    this.tooltip = buildHostAccessBindingTooltip(binding);
+    this.iconPath = new vscode.ThemeIcon(
+      binding.status === "active" ? "arrow-swap" : "warning",
+      binding.status === "error" ? new vscode.ThemeColor("testing.iconFailed") : undefined,
     );
   }
 }
@@ -475,8 +531,52 @@ export function getHostPortExposureFromCommandArgument(argument: unknown): HostP
   return undefined;
 }
 
+/** Extracts a network-to-host binding from a tree command argument. */
+export function getHostAccessBindingFromCommandArgument(argument: unknown): HostAccessBinding | undefined {
+  if (argument instanceof HostAccessBindingTreeItem) {
+    return argument.binding;
+  }
+
+  if (isHostAccessBinding(argument)) {
+    return argument;
+  }
+
+  return undefined;
+}
+
+function isHostAccessBinding(argument: unknown): argument is HostAccessBinding {
+  return (
+    typeof argument === "object" &&
+    argument !== null &&
+    "id" in argument &&
+    "networkId" in argument &&
+    "logicalPort" in argument &&
+    "hostPort" in argument
+  );
+}
+
+function buildNetworkDescription(
+  network: LogicalNetwork,
+  attachmentCount: number,
+  exposureCount: number,
+  hostAccessCount: number,
+): string {
+  const details = [
+    attachmentCount > 0 ? `${attachmentCount} terminals` : undefined,
+    exposureCount > 0 ? `${exposureCount} bindings` : undefined,
+    hostAccessCount > 0 ? `${hostAccessCount} host access` : undefined,
+  ].filter((item): item is string => item !== undefined);
+
+  return `${network.runtimeKind} ${network.status}${details.length > 0 ? `, ${details.join(", ")}` : ""}`;
+}
+
 /** Builds tooltip details for one logical network. */
-function buildNetworkTooltip(network: LogicalNetwork, attachmentCount: number): vscode.MarkdownString {
+function buildNetworkTooltip(
+  network: LogicalNetwork,
+  attachmentCount: number,
+  exposureCount: number,
+  hostAccessCount: number,
+): vscode.MarkdownString {
   const tooltip = new vscode.MarkdownString(undefined, true);
   tooltip.isTrusted = false;
   tooltip.appendMarkdown(`**${escapeMarkdown(network.name)}**\n\n`);
@@ -484,6 +584,8 @@ function buildNetworkTooltip(network: LogicalNetwork, attachmentCount: number): 
   tooltip.appendMarkdown(`- Runtime: \`${network.runtimeKind}\`\n`);
   tooltip.appendMarkdown(`- Status: \`${network.status}\`\n`);
   tooltip.appendMarkdown(`- Attachments: \`${attachmentCount}\`\n`);
+  tooltip.appendMarkdown(`- Host Bindings: \`${exposureCount}\`\n`);
+  tooltip.appendMarkdown(`- Host Access: \`${hostAccessCount}\`\n`);
   tooltip.appendMarkdown(`- Created: \`${network.createdAt}\`\n`);
 
   if (network.errorMessage) {
@@ -551,13 +653,31 @@ function buildExposureTooltip(
   tooltip.isTrusted = false;
   tooltip.appendMarkdown(`**Host Exposure**\n\n`);
   tooltip.appendMarkdown(`- Host: \`${escapeMarkdown(exposure.hostAddress)}:${exposure.hostPort}\`\n`);
-  tooltip.appendMarkdown(`- Target: \`${escapeMarkdown(exposure.targetAddress)}:${exposure.targetPort}\`\n`);
+  tooltip.appendMarkdown(`- Network Target: \`${escapeMarkdown(exposure.targetAddress)}:${exposure.targetPort}\`\n`);
   tooltip.appendMarkdown(`- Network: \`${escapeMarkdown(network?.name ?? exposure.networkId)}\`\n`);
   tooltip.appendMarkdown(`- Protocol: \`${exposure.protocol}\`\n`);
   tooltip.appendMarkdown(`- Status: \`${exposure.status}\`\n`);
 
   if (exposure.errorMessage) {
     tooltip.appendMarkdown(`\nError: \`${escapeMarkdown(exposure.errorMessage)}\``);
+  }
+
+  return tooltip;
+}
+
+/** Builds tooltip details for one network-to-host access binding. */
+function buildHostAccessBindingTooltip(binding: HostAccessBinding): vscode.MarkdownString {
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.isTrusted = false;
+  tooltip.appendMarkdown(`**Host Access**\n\n`);
+  tooltip.appendMarkdown(`- Network Logical Port: \`${binding.logicalPort}\`\n`);
+  tooltip.appendMarkdown(`- Host Target: \`${escapeMarkdown(binding.hostAddress)}:${binding.hostPort}\`\n`);
+  tooltip.appendMarkdown(`- Network ID: \`${escapeMarkdown(binding.networkId)}\`\n`);
+  tooltip.appendMarkdown(`- Protocol: \`${binding.protocol}\`\n`);
+  tooltip.appendMarkdown(`- Status: \`${binding.status}\`\n`);
+
+  if (binding.errorMessage) {
+    tooltip.appendMarkdown(`\nError: \`${escapeMarkdown(binding.errorMessage)}\``);
   }
 
   return tooltip;
@@ -575,7 +695,18 @@ function buildRuntimeTooltip(runtime: NetworkRuntimeDescriptor): vscode.Markdown
   tooltip.appendMarkdown(`- Privileged Helper: \`${runtime.capabilities.requiresPrivilegedHelper}\`\n`);
   tooltip.appendMarkdown(`- Container Runtime: \`${runtime.capabilities.requiresContainerRuntime}\`\n`);
 
+  if (!isContainerLevelRuntime(runtime)) {
+    tooltip.appendMarkdown(
+      "\nWarning: this runtime cannot attach terminals as container-level logical networks.",
+    );
+  }
+
   return tooltip;
+}
+
+/** True only for runtimes that can keep internal ports off the host namespace. */
+function isContainerLevelRuntime(runtime: NetworkRuntimeDescriptor): boolean {
+  return runtime.capabilities.supportsSameInternalPorts && runtime.capabilities.supportsTerminalAttach;
 }
 
 /** Builds compact `requested -> actual` mapping text for the sidebar row. */

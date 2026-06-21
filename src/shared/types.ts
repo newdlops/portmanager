@@ -32,6 +32,10 @@ export type NetworkRuntimeKind = "container" | "linuxNamespace" | "nativeHelper"
 
 export type HostPortExposureStatus = "opening" | "active" | "stopped" | "error";
 
+export type HostAccessBindingStatus = "active" | "error";
+
+export type ContainerRuntimePreference = "auto" | "docker" | "podman";
+
 /**
  * A user-facing network scope where duplicated app-internal ports remain
  * meaningful. Runtime adapters decide whether this is backed by a container,
@@ -57,9 +61,9 @@ export interface LogicalNetwork {
  * on the current platform before a user expects same-port isolation to work.
  */
 export interface NetworkRuntimeCapabilities {
-  /** True when different networks can reuse the same internal listening ports. */
+  /** True when different networks can reuse internal ports without occupying host ports. */
   readonly supportsSameInternalPorts: boolean;
-  /** True when an existing terminal or shell process group can be attached. */
+  /** True when a terminal can run inside the runtime's isolated socket namespace. */
   readonly supportsTerminalAttach: boolean;
   /** True when host ports can be exposed to network-internal ports. */
   readonly supportsHostExposure: boolean;
@@ -145,7 +149,7 @@ export interface TerminalAttachment {
   readonly terminalWindowId?: string;
   /** Title shown to the user when the terminal window was attached. */
   readonly terminalTitle?: string;
-  /** Whether the runtime actually isolated traffic or only recorded association. */
+  /** Whether traffic is isolated. "logical" is retained only for legacy persisted rows. */
   readonly mode?: TerminalAttachmentMode;
   /** Current attachment lifecycle state. */
   readonly status: TerminalAttachmentStatus;
@@ -178,6 +182,27 @@ export interface HostPortExposure {
   readonly errorMessage?: string;
 }
 
+export interface HostAccessBinding {
+  /** Stable binding row id. */
+  readonly id: string;
+  /** Network whose attached terminal processes can use this host access rule. */
+  readonly networkId: string;
+  /** Network-local logical port that apps call, for example localhost:15432. */
+  readonly logicalPort: number;
+  /** Host-machine address the logical port should connect to. */
+  readonly hostAddress: string;
+  /** Host-machine TCP port reached from inside the logical network. */
+  readonly hostPort: number;
+  /** Transport protocol for the binding. */
+  readonly protocol: NetworkPortProtocol;
+  /** Current binding lifecycle state. */
+  readonly status: HostAccessBindingStatus;
+  /** ISO timestamp when this binding was requested. */
+  readonly createdAt: string;
+  /** Last binding error, if any. */
+  readonly errorMessage?: string;
+}
+
 export interface NetworkSnapshot {
   /** Logical networks known to the current VS Code window. */
   readonly networks: readonly LogicalNetwork[];
@@ -189,6 +214,8 @@ export interface NetworkSnapshot {
   readonly attachments: readonly TerminalAttachment[];
   /** Host port bindings owned by Port Manager. */
   readonly exposures: readonly HostPortExposure[];
+  /** Network-to-host port bindings visible from attached terminals. */
+  readonly hostAccessBindings: readonly HostAccessBinding[];
   /** Runtime adapters available on this platform/build. */
   readonly runtimes: readonly NetworkRuntimeDescriptor[];
   /** ISO timestamp for this snapshot. */
@@ -241,6 +268,17 @@ export interface PortManagerSettings {
   readonly routeTerminalCommandsOnStart: boolean;
   /** Signal used when stopping managed child processes. */
   readonly processKillSignal: ProcessKillSignal;
+}
+
+export interface ContainerRuntimeSettings {
+  /** Preferred local container CLI. "auto" probes Docker first, then Podman. */
+  readonly containerRuntime: ContainerRuntimePreference;
+  /** Image used for long-lived per-network development containers. */
+  readonly containerImage: string;
+  /** Workspace path mounted inside the container. */
+  readonly containerWorkspacePath: string;
+  /** Interactive shell launched when a terminal enters the container. */
+  readonly containerShell: string;
 }
 
 export interface ManagedProcess {

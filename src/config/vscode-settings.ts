@@ -1,6 +1,13 @@
 import * as vscode from "vscode";
 import { DEFAULT_PORT_MANAGER_SETTINGS } from "../shared/default-settings";
-import type { PortManagerSettings, PortRoutingMode, ProcessKillSignal, ScanDirection } from "../shared/types";
+import type {
+  ContainerRuntimePreference,
+  ContainerRuntimeSettings,
+  PortManagerSettings,
+  PortRoutingMode,
+  ProcessKillSignal,
+  ScanDirection,
+} from "../shared/types";
 
 /**
  * Reads and normalizes VS Code configuration for the Port Manager domain.
@@ -10,9 +17,16 @@ import type { PortManagerSettings, PortRoutingMode, ProcessKillSignal, ScanDirec
  */
 
 const DEFAULT_SETTINGS: PortManagerSettings = DEFAULT_PORT_MANAGER_SETTINGS;
+const DEFAULT_CONTAINER_RUNTIME_SETTINGS: ContainerRuntimeSettings = {
+  containerRuntime: "auto",
+  containerImage: "node:22-bookworm",
+  containerWorkspacePath: "/workspace",
+  containerShell: "/bin/sh",
+};
 
 const VALID_SCAN_DIRECTIONS = new Set<ScanDirection>(["up", "down", "both"]);
 const VALID_ROUTING_MODES = new Set<PortRoutingMode>(["nearest", "hashed"]);
+const VALID_CONTAINER_RUNTIMES = new Set<ContainerRuntimePreference>(["auto", "docker", "podman"]);
 
 /**
  * Builds a complete settings object from VS Code configuration values.
@@ -75,6 +89,35 @@ export function readPortManagerSettings(): PortManagerSettings {
   };
 }
 
+/** Reads container runtime settings used by the logical network adapter. */
+export function readContainerRuntimeSettings(): ContainerRuntimeSettings {
+  const config = vscode.workspace.getConfiguration("portManager");
+
+  return {
+    containerRuntime: normalizeContainerRuntime(
+      config.get<ContainerRuntimePreference>(
+        "containerRuntime",
+        DEFAULT_CONTAINER_RUNTIME_SETTINGS.containerRuntime,
+      ),
+    ),
+    containerImage: normalizeNonEmptyString(
+      config.get<string>("containerImage", DEFAULT_CONTAINER_RUNTIME_SETTINGS.containerImage),
+      DEFAULT_CONTAINER_RUNTIME_SETTINGS.containerImage,
+    ),
+    containerWorkspacePath: normalizeAbsolutePath(
+      config.get<string>(
+        "containerWorkspacePath",
+        DEFAULT_CONTAINER_RUNTIME_SETTINGS.containerWorkspacePath,
+      ),
+      DEFAULT_CONTAINER_RUNTIME_SETTINGS.containerWorkspacePath,
+    ),
+    containerShell: normalizeAbsolutePath(
+      config.get<string>("containerShell", DEFAULT_CONTAINER_RUNTIME_SETTINGS.containerShell),
+      DEFAULT_CONTAINER_RUNTIME_SETTINGS.containerShell,
+    ),
+  };
+}
+
 /** Opens the Settings UI already filtered to this extension's namespace. */
 export async function openPortManagerSettings(): Promise<void> {
   await vscode.commands.executeCommand("workbench.action.openSettings", "@ext:newdlops.portmanager portManager");
@@ -121,6 +164,23 @@ function normalizeScanDirection(scanDirection: ScanDirection): ScanDirection {
 /** Converts unknown routing modes to the hashed logical-port policy. */
 function normalizeRoutingMode(routingMode: PortRoutingMode): PortRoutingMode {
   return VALID_ROUTING_MODES.has(routingMode) ? routingMode : DEFAULT_SETTINGS.routingMode;
+}
+
+/** Converts unknown container runtime settings to auto detection. */
+function normalizeContainerRuntime(runtime: ContainerRuntimePreference): ContainerRuntimePreference {
+  return VALID_CONTAINER_RUNTIMES.has(runtime) ? runtime : DEFAULT_CONTAINER_RUNTIME_SETTINGS.containerRuntime;
+}
+
+/** Keeps required string settings populated. */
+function normalizeNonEmptyString(value: string, fallback: string): string {
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : fallback;
+}
+
+/** Keeps container paths absolute because Docker workdir and shell require it. */
+function normalizeAbsolutePath(value: string, fallback: string): string {
+  const trimmed = value.trim();
+  return trimmed.startsWith("/") ? trimmed : fallback;
 }
 
 /** Keeps the hashed actual-port pool inside a valid TCP range. */

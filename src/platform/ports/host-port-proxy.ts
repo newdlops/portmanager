@@ -1,6 +1,22 @@
 import * as net from "node:net";
 import type { HostPortExposure } from "../../shared/types";
 
+export interface HostPortProxyTarget {
+  /** Address the local proxy should connect to after resolving network scope. */
+  readonly host: string;
+  /** Actual TCP port the target process is listening on. */
+  readonly port: number;
+}
+
+export interface HostPortProxyTargetResolver {
+  /**
+   * Resolves a persisted host binding to its current connection target.
+   * Runtime adapters can map a network-local logical port to a live actual port
+   * without leaking that policy into this socket-forwarding class.
+   */
+  resolve(exposure: HostPortExposure): HostPortProxyTarget | Promise<HostPortProxyTarget>;
+}
+
 /**
  * Owns local host listeners used by proxy-capable runtime adapters.
  *
@@ -14,6 +30,8 @@ export class HostPortProxyManager {
 
   /** Active inbound sockets keyed by host exposure id for prompt teardown. */
   private readonly sockets = new Map<string, Set<net.Socket>>();
+
+  constructor(private readonly targetResolver: HostPortProxyTargetResolver = STATIC_TARGET_RESOLVER) {}
 
   /**
    * Opens a host listener and forwards each connection to the exposure target.
@@ -33,15 +51,7 @@ export class HostPortProxyManager {
       sockets.add(incoming);
       incoming.once("close", () => sockets.delete(incoming));
 
-      const outgoing = net.createConnection({
-        host: exposure.targetAddress,
-        port: exposure.targetPort,
-      });
-
-      incoming.on("error", () => outgoing.destroy());
-      outgoing.on("error", () => incoming.destroy());
-      incoming.pipe(outgoing);
-      outgoing.pipe(incoming);
+      void this.forwardConnection(exposure, incoming, sockets);
     });
 
     await listen(server, exposure.hostPort, exposure.hostAddress);
@@ -77,7 +87,47 @@ export class HostPortProxyManager {
 
     await Promise.all(servers.map(([, server]) => closeServer(server)));
   }
+
+  /** Resolves the current target and wires one inbound socket to it. */
+  private async forwardConnection(
+    exposure: HostPortExposure,
+    incoming: net.Socket,
+    sockets: Set<net.Socket>,
+  ): Promise<void> {
+    let target: HostPortProxyTarget;
+
+    try {
+      target = await this.targetResolver.resolve(exposure);
+    } catch {
+      incoming.destroy();
+      return;
+    }
+
+    if (incoming.destroyed) {
+      return;
+    }
+
+    const outgoing = net.createConnection({
+      host: target.host,
+      port: target.port,
+    });
+    sockets.add(outgoing);
+    outgoing.once("close", () => sockets.delete(outgoing));
+    incoming.once("close", () => outgoing.destroy());
+
+    incoming.on("error", () => outgoing.destroy());
+    outgoing.on("error", () => incoming.destroy());
+    incoming.pipe(outgoing);
+    outgoing.pipe(incoming);
+  }
 }
+
+const STATIC_TARGET_RESOLVER: HostPortProxyTargetResolver = {
+  resolve: (exposure) => ({
+    host: exposure.targetAddress,
+    port: exposure.targetPort,
+  }),
+};
 
 /** Converts Node's callback-based listen path into a precise promise. */
 function listen(server: net.Server, port: number, host: string): Promise<void> {

@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { getAgentSocketPath } from "../agent/agent-socket";
-import { getDefaultRouteTablePath } from "../agent/route-table";
+import { getDefaultHostAccessBindingsPath, getDefaultRouteTablePath } from "../agent/route-table";
 import { readPortManagerSettings } from "../config/vscode-settings";
 import type { DisposableLike, PortManagerSettings } from "../shared/types";
 
@@ -62,6 +62,7 @@ function applyTerminalHookEnvironment(context: vscode.ExtensionContext): void {
   collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath(), TERMINAL_MUTATOR_OPTIONS);
   applyRoutingSettings(collection, settings);
   collection.prepend(preloadVariable, `${hookLibraryPath}${path.delimiter}`, TERMINAL_MUTATOR_OPTIONS);
   applyAsdfShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath);

@@ -1,17 +1,25 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import * as vscode from "vscode";
 import { getAgentSocketPath } from "../agent/agent-socket";
-import { getDefaultRouteTablePath } from "../agent/route-table";
+import { getDefaultHostAccessBindingsPath, getDefaultRouteTablePath } from "../agent/route-table";
+import { readContainerRuntimeSettings } from "../config/vscode-settings";
 import { LogicalNetworkRegistry, type LogicalNetworkRegistryState } from "../core/networks/logical-network-registry";
-import { HostPortProxyManager } from "../platform/ports/host-port-proxy";
+import {
+  ContainerNetworkRuntimeAdapter,
+  type ContainerRuntimeTarget,
+} from "../platform/network/container-runtime";
+import { HostPortProxyManager, type HostPortProxyTarget } from "../platform/ports/host-port-proxy";
 import { NodeTerminalCandidateProvider } from "../platform/process/node-terminal-candidate-provider";
 import type {
   DisposableLike,
+  HostAccessBinding,
   HostPortExposure,
   LogicalNetwork,
+  LogicalPortRoute,
   NetworkRuntimeDescriptor,
   NetworkRuntimeKind,
   NetworkSnapshot,
@@ -27,6 +35,7 @@ import {
   prepareAsdfShimLauncherDirectory,
   shouldInjectTerminalHook,
 } from "./terminal-hook-environment";
+import type { PortManagerProcessService } from "./process-service";
 
 const NETWORK_STATE_KEY = "portManager.logicalNetworkState.v1";
 const execFileAsync = promisify(execFile);
@@ -49,14 +58,28 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Local TCP proxy runtime used for concrete host exposure support. */
   private readonly proxyManager: HostPortProxyManager;
 
+  /** Container runtime adapter that provides actual same-port isolation. */
+  private readonly containerRuntime: ContainerNetworkRuntimeAdapter;
+
   /** VS Code event subscriptions owned by this service. */
   private readonly disposables: DisposableLike[] = [];
 
-  constructor(private readonly context: vscode.ExtensionContext) {
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly processService?: PortManagerProcessService,
+  ) {
     this.terminalCandidateProvider = new NodeTerminalCandidateProvider();
-    this.proxyManager = new HostPortProxyManager();
-    this.registry = new LogicalNetworkRegistry(DEFAULT_RUNTIMES, this.loadState());
-    this.disposables.push(this.registry.onDidChange(() => this.saveState()));
+    this.containerRuntime = new ContainerNetworkRuntimeAdapter();
+    this.proxyManager = new HostPortProxyManager({
+      resolve: (exposure) => this.resolveHostExposureTarget(exposure),
+    });
+    this.registry = new LogicalNetworkRegistry(BASE_RUNTIMES, this.loadState());
+    this.disposables.push(
+      this.registry.onDidChange(() => {
+        this.saveState();
+        void this.writeHostAccessBindingsFile();
+      }),
+    );
   }
 
   /** Loads terminal candidates and reopens persisted host exposures. */
@@ -68,9 +91,16 @@ export class PortManagerNetworkService implements DisposableLike {
       vscode.window.onDidCloseTerminal(() => {
         void this.refreshTerminals();
       }),
+      vscode.workspace.onDidChangeConfiguration((event) => {
+        if (event.affectsConfiguration("portManager.containerRuntime")) {
+          void this.refreshRuntimeDescriptors();
+        }
+      }),
     );
 
+    await this.refreshRuntimeDescriptors();
     await this.reopenPersistedExposures();
+    await this.writeHostAccessBindingsFile();
     await this.refreshTerminals();
   }
 
@@ -85,28 +115,37 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /** Creates a network row for the selected runtime adapter. */
-  createNetwork(name: string, runtimeKind: NetworkRuntimeKind = "proxy"): LogicalNetwork {
-    const runtime = DEFAULT_RUNTIMES.find((item) => item.kind === runtimeKind);
-    if (runtime === undefined) {
-      throw new Error(`Unknown network runtime: ${runtimeKind}`);
-    }
+  async createNetwork(name: string, runtimeKind: NetworkRuntimeKind = "container"): Promise<LogicalNetwork> {
+    const runtime = requireRuntime(this.registry.getSnapshot().runtimes, runtimeKind);
+    requireContainerLevelRuntime(runtime);
 
-    return this.registry.addNetwork({
+    const network: LogicalNetwork = {
       id: createId("network"),
       name,
       status: "running",
       runtimeKind: runtime.kind,
       createdAt: new Date().toISOString(),
-    });
+    };
+
+    if (runtime.kind === "container") {
+      await this.containerRuntime.createNetwork(network, readContainerRuntimeSettings(), getDefaultWorkspaceFolder());
+    }
+
+    return this.registry.addNetwork(network);
   }
 
   /** Removes a network and closes any host exposures that belonged to it. */
   async removeNetwork(networkId: string): Promise<LogicalNetwork | undefined> {
     const snapshot = this.registry.getSnapshot();
+    const network = snapshot.networks.find((item) => item.id === networkId);
     const exposures = snapshot.exposures.filter((exposure) => exposure.networkId === networkId);
 
     for (const exposure of exposures) {
       await this.proxyManager.close(exposure.id);
+    }
+
+    if (network?.runtimeKind === "container") {
+      await this.containerRuntime.removeNetwork(networkId).catch(() => undefined);
     }
 
     return this.registry.removeNetwork(networkId);
@@ -125,43 +164,36 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * Attaches a terminal candidate to a network. Runtimes without terminal
-   * isolation support still record a logical association so the UI can bind
-   * user intent before a stronger adapter is installed.
+   * Attaches a terminal candidate to a network only after the selected runtime
+   * can provide container-level same-port isolation. Recording logical-only
+   * associations would let host bind conflicts leak into the product model.
    */
   attachTerminal(networkId: string, terminalPid: number): TerminalAttachment {
-    const network = requireNetwork(this.registry.getNetwork(networkId), networkId);
-    const runtime = requireRuntime(network.runtimeKind);
-    const candidate = this.registry.getSnapshot().terminalCandidates.find((item) => item.pid === terminalPid);
-    if (candidate === undefined) {
-      throw new Error(`Unknown terminal process: ${terminalPid}`);
-    }
-
-    return this.registry.addAttachment({
-      id: createId("attachment"),
-      networkId,
-      rootPid: candidate.pid,
-      processGroupId: candidate.processGroupId,
-      terminalTitle: candidate.windowTitle ?? candidate.name,
-      mode: runtime.capabilities.supportsTerminalAttach ? "isolated" : "logical",
-      status: "attached",
-      errorMessage: runtime.capabilities.supportsTerminalAttach
-        ? undefined
-        : `${runtime.name} records this terminal but does not isolate its network traffic yet.`,
-      attachedAt: new Date().toISOString(),
-    });
+    requireNetwork(this.registry.getNetwork(networkId), networkId);
+    void terminalPid;
+    throw new Error("Container logical networks attach terminal windows by opening a container shell.");
   }
 
   /** Attaches a user-facing terminal window by resolving it to its root process. */
-  attachTerminalWindow(networkId: string, terminalWindowId: string): TerminalAttachment {
+  async attachTerminalWindow(networkId: string, terminalWindowId: string): Promise<TerminalAttachment> {
     const network = requireNetwork(this.registry.getNetwork(networkId), networkId);
-    const runtime = requireRuntime(network.runtimeKind);
+    const runtime = requireRuntime(this.registry.getSnapshot().runtimes, network.runtimeKind);
+    requireContainerLevelRuntime(runtime);
     const terminalWindow = this.registry
       .getSnapshot()
       .terminalWindows.find((window) => window.id === terminalWindowId);
 
     if (terminalWindow === undefined) {
       throw new Error(`Unknown terminal window: ${terminalWindowId}`);
+    }
+
+    if (runtime.kind === "container") {
+      await this.containerRuntime.createNetwork(network, readContainerRuntimeSettings(), getDefaultWorkspaceFolder());
+      const attachCommand = this.containerRuntime.buildAttachCommand(network.id, readContainerRuntimeSettings());
+      const sent = await sendCommandToTerminalWindow(terminalWindow, attachCommand);
+      if (!sent) {
+        throw new Error(`Could not send container attach command to "${terminalWindow.title}".`);
+      }
     }
 
     return this.registry.addAttachment({
@@ -171,11 +203,8 @@ export class PortManagerNetworkService implements DisposableLike {
       processGroupId: terminalWindow.processGroupId,
       terminalWindowId: terminalWindow.id,
       terminalTitle: terminalWindow.title,
-      mode: runtime.capabilities.supportsTerminalAttach ? "isolated" : "logical",
+      mode: "isolated",
       status: "attached",
-      errorMessage: runtime.capabilities.supportsTerminalAttach
-        ? undefined
-        : `${runtime.name} records this terminal window but does not isolate its network traffic yet.`,
       attachedAt: new Date().toISOString(),
     });
   }
@@ -229,7 +258,7 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Creates and opens a host TCP exposure through the concrete proxy runtime. */
   async createExposure(input: HostPortExposureInput): Promise<HostPortExposure> {
     const network = requireNetwork(this.registry.getNetwork(input.networkId), input.networkId);
-    const runtime = requireRuntime(network.runtimeKind);
+    const runtime = requireRuntime(this.registry.getSnapshot().runtimes, network.runtimeKind);
 
     if (!runtime.capabilities.supportsHostExposure) {
       throw new Error(`${runtime.name} does not support host port exposure.`);
@@ -270,6 +299,33 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Returns one exposure row from the latest snapshot. */
   getExposure(exposureId: string): HostPortExposure | undefined {
     return this.registry.getSnapshot().exposures.find((exposure) => exposure.id === exposureId);
+  }
+
+  /** Creates a network-local logical port that forwards to a host-machine port. */
+  createHostAccessBinding(input: HostAccessBindingInput): HostAccessBinding {
+    requireNetwork(this.registry.getNetwork(input.networkId), input.networkId);
+    ensureNoHostAccessConflict(this.registry.getSnapshot().hostAccessBindings, input);
+
+    return this.registry.addHostAccessBinding({
+      id: createId("host-access"),
+      networkId: input.networkId,
+      logicalPort: input.logicalPort,
+      hostAddress: input.hostAddress,
+      hostPort: input.hostPort,
+      protocol: "tcp",
+      status: "active",
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  /** Removes one network-to-host access binding. */
+  removeHostAccessBinding(bindingId: string): HostAccessBinding | undefined {
+    return this.registry.removeHostAccessBinding(bindingId);
+  }
+
+  /** Returns one network-to-host access binding from the latest snapshot. */
+  getHostAccessBinding(bindingId: string): HostAccessBinding | undefined {
+    return this.registry.getSnapshot().hostAccessBindings.find((binding) => binding.id === bindingId);
   }
 
   /** Releases listeners and event subscriptions. */
@@ -314,6 +370,75 @@ export class PortManagerNetworkService implements DisposableLike {
     }
   }
 
+  /**
+   * Resolves a network-owned host binding to the live process port. The binding
+   * stores the network-local logical port, while the daemon snapshot carries the
+   * current actual port assigned by the native hook.
+   */
+  private async resolveHostExposureTarget(exposure: HostPortExposure): Promise<HostPortProxyTarget> {
+    const network = this.registry.getNetwork(exposure.networkId);
+    if (network?.runtimeKind === "container") {
+      return toHostPortProxyTarget(await this.containerRuntime.resolveExposureTarget(exposure));
+    }
+
+    const route = await this.findNetworkRoute(exposure.networkId, exposure.targetPort);
+
+    if (route !== undefined) {
+      return {
+        host: route.host,
+        port: route.actualPort,
+      };
+    }
+
+    return {
+      host: exposure.targetAddress,
+      port: exposure.targetPort,
+    };
+  }
+
+  /** Rebuilds runtime descriptors from currently installed container tools. */
+  private async refreshRuntimeDescriptors(): Promise<void> {
+    const containerDescriptor = await this.containerRuntime
+      .detect(readContainerRuntimeSettings())
+      .catch(() => undefined);
+    this.registry.setRuntimes(
+      containerDescriptor === undefined ? BASE_RUNTIMES : [containerDescriptor, ...BASE_RUNTIMES],
+    );
+  }
+
+  /** Looks up the latest route for one network-local logical target port. */
+  private async findNetworkRoute(networkId: string, logicalPort: number): Promise<LogicalPortRoute | undefined> {
+    const currentRoute = findMatchingRoute(this.processService?.getSnapshot().routes ?? [], networkId, logicalPort);
+    if (currentRoute !== undefined || this.processService === undefined) {
+      return currentRoute;
+    }
+
+    await this.processService.refresh().catch(() => undefined);
+    return findMatchingRoute(this.processService.getSnapshot().routes, networkId, logicalPort);
+  }
+
+  /** Writes network-to-host bindings for native connect hooks in attached terminals. */
+  private async writeHostAccessBindingsFile(): Promise<void> {
+    const bindings = this.registry
+      .getSnapshot()
+      .hostAccessBindings.filter((binding) => binding.status === "active" && binding.protocol === "tcp");
+    const filePath = getDefaultHostAccessBindingsPath();
+
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(
+      filePath,
+      JSON.stringify(
+        {
+          updatedAt: new Date().toISOString(),
+          bindings,
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+  }
+
   /** Builds the shell commands that make later child processes join one logical network scope. */
   private buildTerminalRoutingScript(networkId: string, settings: PortManagerSettings): string {
     const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
@@ -328,6 +453,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_NETWORK_ID", networkId),
       shellExport("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath()),
       shellExport("PORT_MANAGER_ROUTES_FILE", getDefaultRouteTablePath()),
+      shellExport("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath()),
       shellExport("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange)),
       shellExport("PORT_MANAGER_ROUTING_MODE", settings.routingMode),
       shellExport("PORT_MANAGER_VIRTUAL_PORT_START", String(settings.virtualPortRangeStart)),
@@ -355,6 +481,17 @@ export interface TerminalRoutingInjectionResult {
   readonly injected: boolean;
   /** User-facing explanation when automatic injection is unavailable. */
   readonly reason?: string;
+}
+
+export interface HostAccessBindingInput {
+  /** Existing logical network id. */
+  readonly networkId: string;
+  /** Network-local logical TCP port that attached apps call. */
+  readonly logicalPort: number;
+  /** Host-machine address reached by the binding. */
+  readonly hostAddress: string;
+  /** Host-machine TCP port reached by the binding. */
+  readonly hostPort: number;
 }
 
 export interface HostPortExposureInput {
@@ -407,13 +544,32 @@ function requireNetwork(network: LogicalNetwork | undefined, networkId: string):
   return network;
 }
 
-function requireRuntime(runtimeKind: NetworkRuntimeKind): NetworkRuntimeDescriptor {
-  const runtime = DEFAULT_RUNTIMES.find((item) => item.kind === runtimeKind);
+function requireRuntime(
+  runtimes: readonly NetworkRuntimeDescriptor[],
+  runtimeKind: NetworkRuntimeKind,
+): NetworkRuntimeDescriptor {
+  const runtime = runtimes.find((item) => item.kind === runtimeKind);
   if (runtime === undefined) {
     throw new Error(`No runtime adapter registered for ${runtimeKind}.`);
   }
 
   return runtime;
+}
+
+/**
+ * Logical networks must behave like container/network-namespace boundaries.
+ * Host-only proxy runtimes can expose ports, but they cannot make two terminal
+ * processes reuse the same internal port without occupying host TCP ports.
+ */
+function requireContainerLevelRuntime(runtime: NetworkRuntimeDescriptor): void {
+  if (runtime.capabilities.supportsSameInternalPorts && runtime.capabilities.supportsTerminalAttach) {
+    return;
+  }
+
+  throw new Error(
+    `${runtime.name} cannot create container-level logical networks. ` +
+      "Install or select a runtime that isolates terminal processes before attaching terminals.",
+  );
 }
 
 /** Prevents duplicate exposure rows before the platform bind call. */
@@ -433,6 +589,23 @@ function ensureNoExposureConflict(
   }
 }
 
+/** Prevents ambiguous network-local ports before writing hook binding state. */
+function ensureNoHostAccessConflict(
+  bindings: readonly HostAccessBinding[],
+  input: HostAccessBindingInput,
+): void {
+  const conflictingBinding = bindings.find(
+    (binding) =>
+      binding.networkId === input.networkId &&
+      binding.protocol === "tcp" &&
+      binding.logicalPort === input.logicalPort,
+  );
+
+  if (conflictingBinding !== undefined) {
+    throw new Error(`Host access binding already exists for logical port ${input.logicalPort}.`);
+  }
+}
+
 function createId(prefix: string): string {
   return `${prefix}-${randomUUID()}`;
 }
@@ -441,10 +614,54 @@ function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** Sends a routing script into an integrated terminal without relying on OS window automation. */
+/** Chooses a route scoped to the selected logical network and target port. */
+function findMatchingRoute(
+  routes: readonly LogicalPortRoute[],
+  networkId: string,
+  logicalPort: number,
+): LogicalPortRoute | undefined {
+  return routes.find(
+    (route) =>
+      route.networkId === networkId &&
+      route.logicalPort === logicalPort &&
+      (route.status === "running" || route.status === "starting"),
+  );
+}
+
+/** Converts the container adapter target into the socket proxy contract. */
+function toHostPortProxyTarget(target: ContainerRuntimeTarget): HostPortProxyTarget {
+  return {
+    host: target.host,
+    port: target.port,
+  };
+}
+
+/** Returns the workspace mounted into container logical networks. */
+function getDefaultWorkspaceFolder(): string | undefined {
+  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+}
+
+/** Sends a command into a terminal window using the best available platform route. */
+async function sendCommandToTerminalWindow(terminalWindow: TerminalWindow, command: string): Promise<boolean> {
+  if (terminalWindow.source === "vscode" && (await sendCommandToVscodeTerminal(terminalWindow, command))) {
+    return true;
+  }
+
+  return sendCommandToExternalTerminalWindow(terminalWindow, command);
+}
+
+/** Sends a command into an integrated terminal without relying on OS window automation. */
 async function sendRoutingScriptToVscodeTerminal(
   terminalWindow: TerminalWindow,
   script: string,
+): Promise<boolean> {
+  return sendCommandToVscodeTerminal(terminalWindow, script);
+}
+
+/** Sends a command into an integrated terminal without relying on OS window automation. */
+async function sendCommandToVscodeTerminal(
+  terminalWindow: TerminalWindow,
+  command: string,
 ): Promise<boolean> {
   for (const terminal of vscode.window.terminals) {
     let processId: number | undefined;
@@ -459,7 +676,7 @@ async function sendRoutingScriptToVscodeTerminal(
       continue;
     }
 
-    terminal.sendText(script, true);
+    terminal.sendText(command, true);
     return true;
   }
 
@@ -471,12 +688,20 @@ async function sendRoutingScriptToExternalTerminalWindow(
   terminalWindow: TerminalWindow,
   script: string,
 ): Promise<boolean> {
+  return sendCommandToExternalTerminalWindow(terminalWindow, script);
+}
+
+/** Sends a command into Terminal.app or iTerm2 sessions selected by tty. */
+async function sendCommandToExternalTerminalWindow(
+  terminalWindow: TerminalWindow,
+  command: string,
+): Promise<boolean> {
   if (process.platform !== "darwin" || terminalWindow.terminalId === undefined) {
     return false;
   }
 
   const tty = normalizeTerminalTty(terminalWindow.terminalId);
-  return (await runTerminalAppleScript(tty, script)) || (await runITermAppleScript(tty, script));
+  return (await runTerminalAppleScript(tty, command)) || (await runITermAppleScript(tty, command));
 }
 
 /** Terminal.app exposes tty on each tab, which lets us target a window without matching titles. */
@@ -554,10 +779,10 @@ function appleScriptString(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-const DEFAULT_RUNTIMES: readonly NetworkRuntimeDescriptor[] = [
+const BASE_RUNTIMES: readonly NetworkRuntimeDescriptor[] = [
   {
     id: "local-proxy",
-    name: "Local TCP Proxy",
+    name: "Local TCP Proxy (host exposure only)",
     kind: "proxy",
     capabilities: {
       supportsSameInternalPorts: false,

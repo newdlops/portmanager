@@ -43,6 +43,34 @@ test("rejects a host exposure when the host port is already occupied", async () 
   await closeServer(occupied);
 });
 
+test("resolves host exposure targets when each inbound connection starts", async () => {
+  const target = net.createServer((socket) => {
+    socket.once("data", (chunk) => {
+      socket.end(`dynamic:${chunk.toString("utf8")}`);
+    });
+  });
+
+  await listen(target, 0, "127.0.0.1");
+  const targetPort = getServerPort(target);
+  const hostPort = await getAvailablePort();
+  const proxy = new HostPortProxyManager({
+    resolve: (exposure) => ({
+      host: exposure.targetAddress,
+      port: targetPort,
+    }),
+  });
+  const exposure = createExposure({ hostPort, targetPort: 3004 });
+
+  await proxy.open(exposure);
+
+  const response = await sendTcpMessage(exposure.hostPort, "127.0.0.1", "hello");
+
+  assert.equal(response, "dynamic:hello");
+
+  await proxy.dispose();
+  await closeServer(target);
+});
+
 function createExposure(overrides: Partial<HostPortExposure> = {}): HostPortExposure {
   return {
     id: `exposure-${Math.random()}`,

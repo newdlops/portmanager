@@ -3,12 +3,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { getAgentSocketPath } from "../agent/agent-socket";
-import { getDefaultRouteTablePath } from "../agent/route-table";
+import { getDefaultHostAccessBindingsPath, getDefaultRouteTablePath } from "../agent/route-table";
 import { readPortManagerSettings, openPortManagerSettings } from "../config/vscode-settings";
 import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
 import type { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import {
   getHostPortExposureFromCommandArgument,
+  getHostAccessBindingFromCommandArgument,
   getLogicalNetworkFromCommandArgument,
   getProcessFromCommandArgument,
   getTerminalWindowFromCommandArgument,
@@ -18,6 +19,7 @@ import type { PortManagerProcessService } from "./process-service";
 import { prepareAsdfShimLauncherDirectory } from "./terminal-hook-environment";
 import type {
   DisposableLike,
+  HostAccessBinding,
   HostPortExposure,
   LogicalNetwork,
   ManagedProcess,
@@ -73,6 +75,12 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.addHostPortExposure", (argument) =>
       this.addHostPortExposure(argument),
     );
+    this.registerCommand(context, "portManager.addHostAccessBinding", (argument) =>
+      this.addHostAccessBinding(argument),
+    );
+    this.registerCommand(context, "portManager.removeHostAccessBinding", (argument) =>
+      this.removeHostAccessBinding(argument),
+    );
     this.registerCommand(context, "portManager.removeHostPortExposure", (argument) =>
       this.removeHostPortExposure(argument),
     );
@@ -101,6 +109,11 @@ export class PortManagerCommandController implements DisposableLike {
 
   /** Creates a logical network row backed by the selected runtime adapter. */
   private async createLogicalNetwork(): Promise<void> {
+    const runtimeKind = await promptForRuntimeKind(this.dependencies.networkService.getSnapshot().runtimes);
+    if (runtimeKind === undefined) {
+      return;
+    }
+
     const name = await vscode.window.showInputBox({
       title: "Create Logical Network",
       prompt: "Network name",
@@ -113,12 +126,7 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
-    const runtimeKind = await promptForRuntimeKind(this.dependencies.networkService.getSnapshot().runtimes);
-    if (runtimeKind === undefined) {
-      return;
-    }
-
-    this.dependencies.networkService.createNetwork(name.trim(), runtimeKind);
+    await this.dependencies.networkService.createNetwork(name.trim(), runtimeKind);
     this.dependencies.treeProvider.refresh();
   }
 
@@ -152,7 +160,6 @@ export class PortManagerCommandController implements DisposableLike {
 
   /** Attaches a selected terminal window to a selected network when the runtime supports it. */
   private async attachTerminalToNetwork(argument: unknown): Promise<void> {
-    const settings = readPortManagerSettings();
     const terminalWindow = await this.resolveTerminalWindowArgument(argument, "Attach Terminal Window to Network");
     if (terminalWindow === undefined) {
       return;
@@ -163,26 +170,11 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
-    if (settings.enabled) {
-      await this.dependencies.processService.start();
-    }
-    const attachment = this.dependencies.networkService.attachTerminalWindow(network.id, terminalWindow.id);
-    const injection = await this.dependencies.networkService.injectRoutingIntoTerminalWindow(
-      terminalWindow.id,
-      network.id,
-      settings,
-    );
+    const attachment = await this.dependencies.networkService.attachTerminalWindow(network.id, terminalWindow.id);
     this.dependencies.treeProvider.refresh();
 
-    if (!injection.injected) {
-      await vscode.window.showWarningMessage(
-        `Attached "${terminalWindow.title}" to "${network.name}", but automatic routing injection failed: ${injection.reason}`,
-      );
-      return;
-    }
-
     await vscode.window.showInformationMessage(
-      `Attached "${terminalWindow.title}" to "${network.name}" (${attachment.mode ?? "isolated"} mode). Restart servers in that terminal.`,
+      `Attached "${terminalWindow.title}" to "${network.name}" (${attachment.mode ?? "isolated"} mode).`,
     );
   }
 
@@ -213,8 +205,8 @@ export class PortManagerCommandController implements DisposableLike {
 
     const targetAddress = await vscode.window.showInputBox({
       title: "Add Host Port Exposure",
-      prompt: "Target address inside the runtime network",
-      value: "127.0.0.1",
+      prompt: "Target address inside the selected logical network",
+      value: network.runtimeKind === "container" ? "0.0.0.0" : "127.0.0.1",
       ignoreFocusOut: true,
       validateInput: (value) => (value.trim().length === 0 ? "Target address is required." : undefined),
     });
@@ -223,9 +215,13 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
-    const targetPort = await promptForPort("Target port", hostPort);
+    const targetPort = await promptForPort("Target logical port inside network", settings.preferredPorts[0] ?? hostPort);
     if (targetPort === undefined) {
       return;
+    }
+
+    if (settings.enabled) {
+      await this.dependencies.processService.start();
     }
 
     const exposure = await this.dependencies.networkService.createExposure({
@@ -239,6 +235,47 @@ export class PortManagerCommandController implements DisposableLike {
     await vscode.window.showInformationMessage(`Exposed ${formatExposureUrl(exposure)}.`);
   }
 
+  /** Creates a network-to-host binding visible from attached terminal processes. */
+  private async addHostAccessBinding(argument: unknown): Promise<void> {
+    const network = await this.resolveNetworkArgument(argument, "Add Host Access Binding");
+    if (network === undefined) {
+      return;
+    }
+
+    const logicalPort = await promptForPort("Network logical port", 15_432);
+    if (logicalPort === undefined) {
+      return;
+    }
+
+    const hostAddress = await vscode.window.showInputBox({
+      title: "Add Host Access Binding",
+      prompt: "Host machine address",
+      value: "127.0.0.1",
+      ignoreFocusOut: true,
+      validateInput: (value) => (value.trim().length === 0 ? "Host address is required." : undefined),
+    });
+
+    if (!hostAddress) {
+      return;
+    }
+
+    const hostPort = await promptForPort("Host machine port", logicalPort);
+    if (hostPort === undefined) {
+      return;
+    }
+
+    const binding = this.dependencies.networkService.createHostAccessBinding({
+      networkId: network.id,
+      logicalPort,
+      hostAddress: hostAddress.trim(),
+      hostPort,
+    });
+    this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage(
+      `Bound "${network.name}" logical port ${binding.logicalPort} to host ${binding.hostAddress}:${binding.hostPort}.`,
+    );
+  }
+
   /** Removes one host exposure and closes its local listener. */
   private async removeHostPortExposure(argument: unknown): Promise<void> {
     const exposure = await this.resolveExposureArgument(argument, "Remove Host Port Exposure");
@@ -247,6 +284,17 @@ export class PortManagerCommandController implements DisposableLike {
     }
 
     await this.dependencies.networkService.removeExposure(exposure.id);
+    this.dependencies.treeProvider.refresh();
+  }
+
+  /** Removes one network-to-host binding. */
+  private async removeHostAccessBinding(argument: unknown): Promise<void> {
+    const binding = await this.resolveHostAccessBindingArgument(argument, "Remove Host Access Binding");
+    if (binding === undefined) {
+      return;
+    }
+
+    this.dependencies.networkService.removeHostAccessBinding(binding.id);
     this.dependencies.treeProvider.refresh();
   }
 
@@ -575,6 +623,7 @@ export class PortManagerCommandController implements DisposableLike {
         nodeExecutablePath: process.execPath,
         socketPath: getAgentSocketPath(),
         routeTablePath: getDefaultRouteTablePath(),
+        hostAccessFilePath: getDefaultHostAccessBindingsPath(),
         settings,
         asdfShimDirectory,
       }),
@@ -727,6 +776,35 @@ export class PortManagerCommandController implements DisposableLike {
     return selected?.exposure;
   }
 
+  /** Resolves a network-to-host binding from tree context or Quick Pick. */
+  private async resolveHostAccessBindingArgument(
+    argument: unknown,
+    title: string,
+  ): Promise<HostAccessBinding | undefined> {
+    const binding = getHostAccessBindingFromCommandArgument(argument);
+
+    if (binding !== undefined) {
+      return this.dependencies.networkService.getHostAccessBinding(binding.id);
+    }
+
+    const bindings = this.dependencies.networkService.getSnapshot().hostAccessBindings;
+    if (bindings.length === 0) {
+      await vscode.window.showInformationMessage("No host access bindings exist.");
+      return undefined;
+    }
+
+    const selected = await vscode.window.showQuickPick(
+      bindings.map((item) => ({
+        label: `${item.logicalPort} -> ${item.hostAddress}:${item.hostPort}`,
+        description: item.status,
+        binding: item,
+      })),
+      { title, placeHolder: "Select a host access binding" },
+    );
+
+    return selected?.binding;
+  }
+
   /** Registers one command and wraps thrown errors in a user-visible message. */
   private registerCommand(
     context: vscode.ExtensionContext,
@@ -821,17 +899,21 @@ async function promptForInjectionMode(): Promise<PortInjectionMode | undefined> 
 async function promptForRuntimeKind(
   runtimes: readonly NetworkRuntimeDescriptor[],
 ): Promise<NetworkRuntimeKind | undefined> {
-  if (runtimes.length === 0) {
-    await vscode.window.showErrorMessage("No network runtime adapters are available.");
+  const containerLevelRuntimes = runtimes.filter(isContainerLevelRuntime);
+
+  if (containerLevelRuntimes.length === 0) {
+    await vscode.window.showErrorMessage(
+      "No container-level network runtime is available. Logical networks require isolated terminal processes; Local TCP Proxy is only for host exposure.",
+    );
     return undefined;
   }
 
-  if (runtimes.length === 1) {
-    return runtimes[0].kind;
+  if (containerLevelRuntimes.length === 1) {
+    return containerLevelRuntimes[0].kind;
   }
 
   const selected = await vscode.window.showQuickPick(
-    runtimes.map((runtime) => ({
+    containerLevelRuntimes.map((runtime) => ({
       label: runtime.name,
       description: runtime.kind,
       detail: [
@@ -848,6 +930,11 @@ async function promptForRuntimeKind(
   );
 
   return selected?.runtime.kind;
+}
+
+/** Logical network creation is limited to runtimes that can isolate terminal sockets. */
+function isContainerLevelRuntime(runtime: NetworkRuntimeDescriptor): boolean {
+  return runtime.capabilities.supportsSameInternalPorts && runtime.capabilities.supportsTerminalAttach;
 }
 
 /** Uses workspace folder name as the default process label when possible. */
@@ -982,6 +1069,8 @@ interface ShellHookScriptOptions {
   readonly socketPath: string;
   /** Dynamic route-table JSON file written by the daemon. */
   readonly routeTablePath: string;
+  /** Network-to-host binding JSON file written by the extension. */
+  readonly hostAccessFilePath: string;
   /** Routing settings mirrored into native hook environment variables. */
   readonly settings: PortManagerSettings;
   /** Optional PATH directory that bypasses macOS asdf shell-script shims. */
@@ -995,6 +1084,7 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
   const escapedNodeExecutablePath = shellDoubleQuote(options.nodeExecutablePath);
   const escapedSocketPath = shellDoubleQuote(options.socketPath);
   const escapedRouteTablePath = shellDoubleQuote(options.routeTablePath);
+  const escapedHostAccessFilePath = shellDoubleQuote(options.hostAccessFilePath);
   const escapedAsdfShimDirectory =
     options.asdfShimDirectory !== undefined ? shellDoubleQuote(options.asdfShimDirectory) : undefined;
   const nodeRuntimePrefix = `${ELECTRON_RUN_AS_NODE}=1`;
@@ -1004,6 +1094,7 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
 export PORT_MANAGER_HOOK=1
 export PORT_MANAGER_AGENT_SOCKET="${escapedSocketPath}"
 export PORT_MANAGER_ROUTES_FILE="${escapedRouteTablePath}"
+export PORT_MANAGER_HOST_ACCESS_FILE="${escapedHostAccessFilePath}"
 export PORT_MANAGER_AGENT_MAIN="${escapedAgentMainPath}"
 export PORT_MANAGER_SCAN_RANGE="${options.settings.scanRange}"
 export PORT_MANAGER_ROUTING_MODE="${options.settings.routingMode}"

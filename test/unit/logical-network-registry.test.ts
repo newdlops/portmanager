@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { LogicalNetworkRegistry } from "../../src/core/networks/logical-network-registry";
-import type { HostPortExposure, LogicalNetwork, NetworkRuntimeDescriptor } from "../../src/shared/types";
+import type {
+  HostAccessBinding,
+  HostPortExposure,
+  LogicalNetwork,
+  NetworkRuntimeDescriptor,
+} from "../../src/shared/types";
 
 const runtime: NetworkRuntimeDescriptor = {
   id: "proxy",
@@ -43,6 +48,20 @@ function createExposure(overrides: Partial<HostPortExposure> = {}): HostPortExpo
   };
 }
 
+function createHostAccessBinding(overrides: Partial<HostAccessBinding> = {}): HostAccessBinding {
+  return {
+    id: "host-access-1",
+    networkId: "network-1",
+    logicalPort: 15432,
+    hostAddress: "127.0.0.1",
+    hostPort: 5432,
+    protocol: "tcp",
+    status: "active",
+    createdAt: "2026-06-22T00:03:00.000Z",
+    ...overrides,
+  };
+}
+
 test("stores networks, terminal candidates, and exposures in snapshots", () => {
   const registry = new LogicalNetworkRegistry([runtime]);
   let eventCount = 0;
@@ -61,6 +80,7 @@ test("stores networks, terminal candidates, and exposures in snapshots", () => {
     },
   ]);
   registry.addExposure(createExposure());
+  registry.addHostAccessBinding(createHostAccessBinding());
 
   const snapshot = registry.getSnapshot();
 
@@ -80,8 +100,12 @@ test("stores networks, terminal candidates, and exposures in snapshots", () => {
     snapshot.exposures.map((exposure) => exposure.id),
     ["exposure-1"],
   );
+  assert.deepEqual(
+    snapshot.hostAccessBindings.map((binding) => binding.id),
+    ["host-access-1"],
+  );
   assert.equal(snapshot.runtimes[0]?.id, "proxy");
-  assert.equal(eventCount, 3);
+  assert.equal(eventCount, 4);
 });
 
 test("groups noisy terminal process candidates into terminal windows", () => {
@@ -138,6 +162,17 @@ test("rejects duplicate host exposures for the same address and port", () => {
   );
 });
 
+test("rejects duplicate host access bindings in the same network", () => {
+  const registry = new LogicalNetworkRegistry([runtime]);
+  registry.addNetwork(createNetwork());
+  registry.addHostAccessBinding(createHostAccessBinding());
+
+  assert.throws(
+    () => registry.addHostAccessBinding(createHostAccessBinding({ id: "host-access-2" })),
+    /Host access binding already exists/,
+  );
+});
+
 test("removing a network removes dependent attachments and exposures", () => {
   const registry = new LogicalNetworkRegistry([runtime]);
   registry.addNetwork(createNetwork());
@@ -155,6 +190,7 @@ test("removing a network removes dependent attachments and exposures", () => {
   });
   const attachment = registry.getSnapshot().attachments[0];
   registry.addExposure(createExposure());
+  registry.addHostAccessBinding(createHostAccessBinding());
 
   const removed = registry.removeNetwork("network-1");
   const snapshot = registry.getSnapshot();
@@ -166,6 +202,7 @@ test("removing a network removes dependent attachments and exposures", () => {
   assert.deepEqual(snapshot.networks, []);
   assert.deepEqual(snapshot.attachments, []);
   assert.deepEqual(snapshot.exposures, []);
+  assert.deepEqual(snapshot.hostAccessBindings, []);
 });
 
 test("persisted state excludes transient terminal candidates", () => {

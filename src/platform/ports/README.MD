@@ -27,3 +27,4 @@
 ## 주의사항
 
 명령 실행 실패는 확장 전체 실패가 아니라 세부 정보 누락으로 처리한다.
+`host-port-proxy.ts`는 Host Port Exposure를 위한 listener/proxy만 담당한다. 이 proxy는 컨테이너 수준의 Logical Network 격리를 제공하지 않으며, 터미널 프로세스가 호스트 포트 namespace를 점유하지 않게 만드는 책임을 갖지 않는다.

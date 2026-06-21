@@ -14,3 +14,9 @@ export function getDefaultRouteTablePath(): string {
   const userId = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;
   return path.join(os.tmpdir(), `newdlops-portmanager-routes-${userId}.json`);
 }
+
+/** Builds the per-user network-to-host binding file path shared with native hooks. */
+export function getDefaultHostAccessBindingsPath(): string {
+  const userId = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;
+  return path.join(os.tmpdir(), `newdlops-portmanager-host-access-${userId}.json`);
+}

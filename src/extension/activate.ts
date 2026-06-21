@@ -13,7 +13,7 @@ import { PortManagerNetworkService } from "./network-service";
  */
 export function activate(context: vscode.ExtensionContext): void {
   const processService = new LocalAgentClient(context);
-  const networkService = new PortManagerNetworkService(context);
+  const networkService = new PortManagerNetworkService(context, processService);
   const treeProvider = new PortManagerTreeProvider(networkService);
   const commandController = new PortManagerCommandController({
     processService,
