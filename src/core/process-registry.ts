@@ -120,6 +120,7 @@ export class ManagedProcessRegistry {
       name: input.name,
       command: input.command,
       cwd: input.cwd,
+      ...(input.networkId ? { networkId: input.networkId } : {}),
       requestedPort: input.requestedPort,
       actualPort: input.actualPort,
       status: options.status ?? "running",

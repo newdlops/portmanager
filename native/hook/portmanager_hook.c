@@ -491,6 +491,38 @@ static int pm_json_string(const char *json, const char *key, char *buffer, size_
   return used > 0 ? 0 : -1;
 }
 
+static void pm_network_scope_payload(char *buffer, size_t size) {
+  const char *network_id = getenv("PORT_MANAGER_NETWORK_ID");
+  char network_json[PM_MAX_TEXT * 2];
+
+  if (size == 0) {
+    return;
+  }
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    buffer[0] = '\0';
+    return;
+  }
+
+  pm_json_escape(network_id, network_json, sizeof(network_json));
+  snprintf(buffer, size, ",\"networkId\":\"%s\"", network_json);
+}
+
+static int pm_route_matches_network(const char *route_json) {
+  const char *network_id = getenv("PORT_MANAGER_NETWORK_ID");
+  char route_network[PM_MAX_TEXT];
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    return pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0;
+  }
+
+  if (pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0) {
+    return 0;
+  }
+
+  return strcmp(route_network, network_id) == 0;
+}
+
 static int pm_response_ok(const char *response) {
   return strstr(response, "\"ok\":true") != NULL || strstr(response, "\"ok\": true") != NULL;
 }
@@ -501,6 +533,7 @@ static int pm_allocate_route(int logical_port, const char *host, int *actual_por
   char cwd_json[PM_MAX_TEXT * 2];
   char command_json[PM_MAX_TEXT * 2];
   char host_json[256];
+  char network_payload[PM_MAX_TEXT * 3];
   char request[PM_MAX_REQUEST];
   char response[PM_MAX_RESPONSE];
   unsigned long sequence = pm_request_sequence++;
@@ -510,12 +543,13 @@ static int pm_allocate_route(int logical_port, const char *host, int *actual_por
   pm_json_escape(cwd, cwd_json, sizeof(cwd_json));
   pm_json_escape(command, command_json, sizeof(command_json));
   pm_json_escape(host, host_json, sizeof(host_json));
+  pm_network_scope_payload(network_payload, sizeof(network_payload));
   response[0] = '\0';
 
   snprintf(
     request,
     sizeof(request),
-    "{\"id\":\"hook-%ld-%lu\",\"method\":\"allocateRoute\",\"payload\":{\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"host\":\"%s\",\"scanRange\":%d,\"scanDirection\":\"up\",\"routingMode\":\"%s\",\"virtualPortRangeStart\":%d,\"virtualPortRangeEnd\":%d}}\n",
+    "{\"id\":\"hook-%ld-%lu\",\"method\":\"allocateRoute\",\"payload\":{\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"host\":\"%s\"%s,\"scanRange\":%d,\"scanDirection\":\"up\",\"routingMode\":\"%s\",\"virtualPortRangeStart\":%d,\"virtualPortRangeEnd\":%d}}\n",
     (long)getpid(),
     sequence,
     command_json,
@@ -523,6 +557,7 @@ static int pm_allocate_route(int logical_port, const char *host, int *actual_por
     cwd_json,
     logical_port,
     host_json,
+    network_payload,
     pm_parse_int_env("PORT_MANAGER_SCAN_RANGE", PM_DEFAULT_SCAN_RANGE),
     pm_routing_mode(),
     pm_parse_int_env("PORT_MANAGER_VIRTUAL_PORT_START", PM_DEFAULT_VIRTUAL_START),
@@ -573,6 +608,7 @@ static void pm_register_process(int logical_port, int actual_port, const char *h
   char command_json[PM_MAX_TEXT * 2];
   char host_json[256];
   char allocation_json[PM_MAX_TEXT * 2];
+  char network_payload[PM_MAX_TEXT * 3];
   char payload[PM_MAX_REQUEST];
 
   pm_cwd(cwd, sizeof(cwd));
@@ -581,11 +617,12 @@ static void pm_register_process(int logical_port, int actual_port, const char *h
   pm_json_escape(command, command_json, sizeof(command_json));
   pm_json_escape(host, host_json, sizeof(host_json));
   pm_json_escape(allocation_id, allocation_json, sizeof(allocation_json));
+  pm_network_scope_payload(network_payload, sizeof(network_payload));
 
   snprintf(
     payload,
     sizeof(payload),
-    "{\"pid\":%ld,\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"actualPort\":%d,\"host\":\"%s\",\"allocationId\":\"%s\",\"source\":\"hooked\"}",
+    "{\"pid\":%ld,\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"actualPort\":%d,\"host\":\"%s\"%s,\"allocationId\":\"%s\",\"source\":\"hooked\"}",
     (long)getpid(),
     command_json,
     command_json,
@@ -593,6 +630,7 @@ static void pm_register_process(int logical_port, int actual_port, const char *h
     logical_port,
     actual_port,
     host_json,
+    network_payload,
     allocation_json);
   pm_debug("registering hooked process logical=%d actual=%d host=%s allocation=%s", logical_port, actual_port, host, allocation_id);
   (void)pm_send_simple_payload("registerExistingProcess", payload);
@@ -709,12 +747,12 @@ static int pm_route_table_lookup(int source_port, int source_is_actual) {
     *object_end = '\0';
     logical = pm_json_int(object_start, "logicalPort", 0);
     actual = pm_json_int(object_start, "actualPort", 0);
-    if (source_is_actual && actual == source_port) {
+    if (source_is_actual && actual == source_port && pm_route_matches_network(object_start)) {
       free(buffer);
       return logical;
     }
 
-    if (!source_is_actual && logical == source_port) {
+    if (!source_is_actual && logical == source_port && pm_route_matches_network(object_start)) {
       free(buffer);
       return actual;
     }

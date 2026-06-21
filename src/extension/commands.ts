@@ -152,6 +152,7 @@ export class PortManagerCommandController implements DisposableLike {
 
   /** Attaches a selected terminal window to a selected network when the runtime supports it. */
   private async attachTerminalToNetwork(argument: unknown): Promise<void> {
+    const settings = readPortManagerSettings();
     const terminalWindow = await this.resolveTerminalWindowArgument(argument, "Attach Terminal Window to Network");
     if (terminalWindow === undefined) {
       return;
@@ -162,10 +163,26 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
+    if (settings.enabled) {
+      await this.dependencies.processService.start();
+    }
     const attachment = this.dependencies.networkService.attachTerminalWindow(network.id, terminalWindow.id);
+    const injection = await this.dependencies.networkService.injectRoutingIntoTerminalWindow(
+      terminalWindow.id,
+      network.id,
+      settings,
+    );
     this.dependencies.treeProvider.refresh();
+
+    if (!injection.injected) {
+      await vscode.window.showWarningMessage(
+        `Attached "${terminalWindow.title}" to "${network.name}", but automatic routing injection failed: ${injection.reason}`,
+      );
+      return;
+    }
+
     await vscode.window.showInformationMessage(
-      `Attached "${terminalWindow.title}" to "${network.name}" (${attachment.mode ?? "isolated"} mode).`,
+      `Attached "${terminalWindow.title}" to "${network.name}" (${attachment.mode ?? "isolated"} mode). Restart servers in that terminal.`,
     );
   }
 

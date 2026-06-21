@@ -301,13 +301,14 @@ export class PortManagerAgent implements DisposableLike {
     return this.runExclusiveRouteOperation(async () => {
       this.cleanupExpiredRouteAllocations();
 
+      const networkRouteScope = normalizeNetworkId(input.networkId);
       const decision = await this.routingService.route({
         requestedPort: input.requestedPort,
         host: input.host,
         scanRange: input.scanRange,
         scanDirection: input.scanDirection,
         routingMode: input.routingMode,
-        routeScope: input.cwd,
+        routeScope: networkRouteScope ?? input.cwd,
         virtualPortRangeStart: input.virtualPortRangeStart,
         virtualPortRangeEnd: input.virtualPortRangeEnd,
       });
@@ -986,6 +987,7 @@ function buildLogicalRoutes(
       logicalPort: process.requestedPort,
       actualPort: process.actualPort,
       host: routeHostFromUrl(process.url),
+      ...(process.networkId ? { networkId: process.networkId } : {}),
       processId: process.id,
       processName: process.name,
       status: process.status,
@@ -1013,10 +1015,25 @@ function buildAllocatedLogicalRoute(input: AgentAllocateRouteRequest, actualPort
     logicalPort: input.requestedPort,
     actualPort,
     host: input.host,
+    ...logicalNetworkRouteScope(input.networkId),
     processName: input.name ?? input.command,
     status: "starting",
     source: "allocated",
   };
+}
+
+/** Normalizes absent or blank terminal network scope to the unscoped route path. */
+function normalizeNetworkId(networkId: string | undefined): string | undefined {
+  const normalized = networkId?.trim();
+  return normalized && normalized.length > 0 ? normalized : undefined;
+}
+
+/** Adds network scope to a route only when the hook actually provided one. */
+function logicalNetworkRouteScope(
+  networkId: string | undefined,
+): Pick<LogicalPortRoute, "networkId"> | Record<string, never> {
+  const normalized = normalizeNetworkId(networkId);
+  return normalized === undefined ? {} : { networkId: normalized };
 }
 
 /**
@@ -1154,6 +1171,7 @@ function buildSnapshotSignature(snapshot: AgentSnapshot): string {
       process.pid,
       process.requestedPort,
       process.actualPort,
+      process.networkId ?? "",
       process.status,
       process.source ?? "",
     ])
@@ -1177,6 +1195,7 @@ function buildRouteSignatureRows(routes: readonly LogicalPortRoute[]): readonly 
       route.logicalPort,
       route.actualPort,
       route.host,
+      route.networkId ?? "",
       route.processId ?? "",
       route.status,
       route.source,

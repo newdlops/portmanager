@@ -44,6 +44,7 @@ test("registers native hook processes as hooked managed rows", async (context) =
     requestedPort: 8000,
     actualPort: 58000,
     host: "localhost",
+    networkId: "network-a",
     source: "hooked",
   });
 
@@ -58,6 +59,7 @@ test("registers native hook processes as hooked managed rows", async (context) =
       logicalPort: 8000,
       actualPort: 58000,
       host: "localhost",
+      networkId: "network-a",
       processId: process.id,
       processName: "node",
       status: "running",

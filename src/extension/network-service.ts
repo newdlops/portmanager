@@ -1,5 +1,10 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import * as path from "node:path";
+import { promisify } from "node:util";
 import * as vscode from "vscode";
+import { getAgentSocketPath } from "../agent/agent-socket";
+import { getDefaultRouteTablePath } from "../agent/route-table";
 import { LogicalNetworkRegistry, type LogicalNetworkRegistryState } from "../core/networks/logical-network-registry";
 import { HostPortProxyManager } from "../platform/ports/host-port-proxy";
 import { NodeTerminalCandidateProvider } from "../platform/process/node-terminal-candidate-provider";
@@ -10,13 +15,21 @@ import type {
   NetworkRuntimeDescriptor,
   NetworkRuntimeKind,
   NetworkSnapshot,
+  PortManagerSettings,
   TerminalAttachment,
   TerminalCandidate,
   TerminalCandidateProvider,
   TerminalWindow,
 } from "../shared/types";
+import {
+  getAsdfShimLauncherRelativePath,
+  getHookLibraryRelativePath,
+  prepareAsdfShimLauncherDirectory,
+  shouldInjectTerminalHook,
+} from "./terminal-hook-environment";
 
 const NETWORK_STATE_KEY = "portManager.logicalNetworkState.v1";
+const execFileAsync = promisify(execFile);
 
 /**
  * Extension-side application service for the Logical Network mode.
@@ -167,6 +180,52 @@ export class PortManagerNetworkService implements DisposableLike {
     });
   }
 
+  /**
+   * Injects routing variables into the selected terminal window's current shell.
+   * The command affects only processes launched after the attach action, which
+   * matches the pre-bind constraint of the native socket hook.
+   */
+  async injectRoutingIntoTerminalWindow(
+    terminalWindowId: string,
+    networkId: string,
+    settings: PortManagerSettings,
+  ): Promise<TerminalRoutingInjectionResult> {
+    requireNetwork(this.registry.getNetwork(networkId), networkId);
+
+    const terminalWindow = this.registry
+      .getSnapshot()
+      .terminalWindows.find((window) => window.id === terminalWindowId);
+
+    if (terminalWindow === undefined) {
+      throw new Error(`Unknown terminal window: ${terminalWindowId}`);
+    }
+
+    if (!settings.enabled) {
+      return { injected: false, reason: "Port Manager is disabled in settings." };
+    }
+
+    if (!shouldInjectTerminalHook(settings)) {
+      return {
+        injected: false,
+        reason: `Native terminal routing is not supported on ${process.platform}.`,
+      };
+    }
+
+    const script = this.buildTerminalRoutingScript(networkId, settings);
+    if (terminalWindow.source === "vscode" && (await sendRoutingScriptToVscodeTerminal(terminalWindow, script))) {
+      return { injected: true };
+    }
+
+    if (await sendRoutingScriptToExternalTerminalWindow(terminalWindow, script)) {
+      return { injected: true };
+    }
+
+    return {
+      injected: false,
+      reason: `Could not find a controllable terminal session for "${terminalWindow.title}".`,
+    };
+  }
+
   /** Creates and opens a host TCP exposure through the concrete proxy runtime. */
   async createExposure(input: HostPortExposureInput): Promise<HostPortExposure> {
     const network = requireNetwork(this.registry.getNetwork(input.networkId), input.networkId);
@@ -254,6 +313,48 @@ export class PortManagerNetworkService implements DisposableLike {
       }
     }
   }
+
+  /** Builds the shell commands that make later child processes join one logical network scope. */
+  private buildTerminalRoutingScript(networkId: string, settings: PortManagerSettings): string {
+    const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
+    const asdfShimLauncherPath = this.context.asAbsolutePath(getAsdfShimLauncherRelativePath());
+    const asdfShimDirectory = prepareAsdfShimLauncherDirectory(
+      this.context.globalStorageUri.fsPath,
+      asdfShimLauncherPath,
+    );
+    const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
+    const commands = [
+      shellExport("PORT_MANAGER_HOOK", "1"),
+      shellExport("PORT_MANAGER_NETWORK_ID", networkId),
+      shellExport("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath()),
+      shellExport("PORT_MANAGER_ROUTES_FILE", getDefaultRouteTablePath()),
+      shellExport("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange)),
+      shellExport("PORT_MANAGER_ROUTING_MODE", settings.routingMode),
+      shellExport("PORT_MANAGER_VIRTUAL_PORT_START", String(settings.virtualPortRangeStart)),
+      shellExport("PORT_MANAGER_VIRTUAL_PORT_END", String(settings.virtualPortRangeEnd)),
+      shellExport("PORT_MANAGER_FIXED_PROTOCOL_PORTS", settings.fixedProtocolPorts.join(",")),
+      shellPrependLibrary(preloadVariable, hookLibraryPath),
+    ];
+
+    if (asdfShimDirectory !== undefined) {
+      commands.push(`export PATH=${shellQuote(asdfShimDirectory)}:"$PATH"`);
+    }
+
+    commands.push(
+      `printf '%s\\n' ${shellQuote(
+        `Port Manager routing active for ${networkId}. Restart servers launched before attach.`,
+      )}`,
+    );
+
+    return commands.join("; ");
+  }
+}
+
+export interface TerminalRoutingInjectionResult {
+  /** True when the command was sent to the selected terminal shell. */
+  readonly injected: boolean;
+  /** User-facing explanation when automatic injection is unavailable. */
+  readonly reason?: string;
 }
 
 export interface HostPortExposureInput {
@@ -338,6 +439,119 @@ function createId(prefix: string): string {
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Sends a routing script into an integrated terminal without relying on OS window automation. */
+async function sendRoutingScriptToVscodeTerminal(
+  terminalWindow: TerminalWindow,
+  script: string,
+): Promise<boolean> {
+  for (const terminal of vscode.window.terminals) {
+    let processId: number | undefined;
+
+    try {
+      processId = await terminal.processId;
+    } catch {
+      processId = undefined;
+    }
+
+    if (processId === undefined || !terminalWindow.candidatePids.includes(processId)) {
+      continue;
+    }
+
+    terminal.sendText(script, true);
+    return true;
+  }
+
+  return false;
+}
+
+/** Sends a routing script into Terminal.app or iTerm2 sessions selected by tty. */
+async function sendRoutingScriptToExternalTerminalWindow(
+  terminalWindow: TerminalWindow,
+  script: string,
+): Promise<boolean> {
+  if (process.platform !== "darwin" || terminalWindow.terminalId === undefined) {
+    return false;
+  }
+
+  const tty = normalizeTerminalTty(terminalWindow.terminalId);
+  return (await runTerminalAppleScript(tty, script)) || (await runITermAppleScript(tty, script));
+}
+
+/** Terminal.app exposes tty on each tab, which lets us target a window without matching titles. */
+async function runTerminalAppleScript(tty: string, script: string): Promise<boolean> {
+  const escapedScript = appleScriptString(script);
+  const escapedTty = appleScriptString(tty);
+  const appleScript = `
+if application "Terminal" is not running then return "missing"
+tell application "Terminal"
+  repeat with windowItem in windows
+    repeat with tabItem in tabs of windowItem
+      if (tty of tabItem) is "${escapedTty}" then
+        do script "${escapedScript}" in tabItem
+        return "ok"
+      end if
+    end repeat
+  end repeat
+end tell
+return "missing"
+`;
+
+  return runAppleScript(appleScript);
+}
+
+/** iTerm2 exposes tty on sessions, so session selection does not depend on mutable titles. */
+async function runITermAppleScript(tty: string, script: string): Promise<boolean> {
+  const escapedScript = appleScriptString(script);
+  const escapedTty = appleScriptString(tty);
+  const appleScript = `
+if application "iTerm2" is not running then return "missing"
+tell application "iTerm2"
+  repeat with windowItem in windows
+    repeat with tabItem in tabs of windowItem
+      repeat with sessionItem in sessions of tabItem
+        if (tty of sessionItem) is "${escapedTty}" then
+          tell sessionItem to write text "${escapedScript}"
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end repeat
+end tell
+return "missing"
+`;
+
+  return runAppleScript(appleScript);
+}
+
+async function runAppleScript(script: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync("osascript", ["-e", script], { timeout: 1500 });
+    return stdout.trim() === "ok";
+  } catch {
+    return false;
+  }
+}
+
+function normalizeTerminalTty(terminalId: string): string {
+  return terminalId.startsWith("/dev/") ? terminalId : path.join("/dev", terminalId);
+}
+
+function shellExport(name: string, value: string): string {
+  return `export ${name}=${shellQuote(value)}`;
+}
+
+function shellPrependLibrary(name: string, libraryPath: string): string {
+  return `export ${name}=${shellQuote(libraryPath)}\${${name}:+":$${name}"}`;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function appleScriptString(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 const DEFAULT_RUNTIMES: readonly NetworkRuntimeDescriptor[] = [

@@ -69,6 +69,7 @@ test("registers external processes with generated ids and routed URLs", () => {
     requestedPort: 3000,
     actualPort: 3002,
     host: "127.0.0.1",
+    networkId: "network-a",
   });
 
   assert.equal(registered.id, "external-1");
@@ -76,6 +77,7 @@ test("registers external processes with generated ids and routed URLs", () => {
   assert.equal(registered.startedAt, fixedStartedAt);
   assert.equal(registered.requestedPort, 3000);
   assert.equal(registered.actualPort, 3002);
+  assert.equal(registered.networkId, "network-a");
   assert.equal(registered.url, "http://127.0.0.1:3002");
 });
 

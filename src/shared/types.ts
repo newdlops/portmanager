@@ -254,6 +254,8 @@ export interface ManagedProcess {
   readonly command: string;
   /** Working directory used to launch or register the process. */
   readonly cwd: string;
+  /** Logical network scope inherited from the terminal that launched the process. */
+  readonly networkId?: string;
   /** Logical port requested by the user or launch profile. */
   readonly requestedPort: number;
   /** Actual TCP port assigned to the running process. */
@@ -371,6 +373,8 @@ export interface LogicalPortRoute {
   readonly actualPort: number;
   /** Host used for URLs and availability checks. */
   readonly host: string;
+  /** Logical network scope this route belongs to, when allocated from an attached terminal. */
+  readonly networkId?: string;
   /** Process row that owns this mapping when known. */
   readonly processId?: string;
   /** Human-readable process name for route table displays and env payloads. */
@@ -392,6 +396,8 @@ export interface AgentAllocateRouteRequest {
   readonly requestedPort: number;
   /** Host used for scanning and URL generation. */
   readonly host: string;
+  /** Logical network scope inherited from an attached terminal window. */
+  readonly networkId?: string;
   /** Number of nearby candidate ports checked after the requested port is busy. */
   readonly scanRange: number;
   /** Candidate generation policy used by the agent. */
@@ -504,6 +510,8 @@ export interface RegisteredProcessInput {
   readonly actualPort: number;
   /** Host used to build the user-facing URL. */
   readonly host: string;
+  /** Logical network scope inherited from an attached terminal window. */
+  readonly networkId?: string;
   /** Optional pending route allocation that this running process consumes. */
   readonly allocationId?: string;
   /** Registration origin; native socket hook rows are managed by listener state. */

@@ -144,7 +144,7 @@ function isNativeTerminalHookSupported(): boolean {
 }
 
 /** Returns the packaged native hook library for the current OS. */
-function getHookLibraryRelativePath(): string {
+export function getHookLibraryRelativePath(): string {
   if (process.platform === "darwin") {
     return path.join("media", "native", "libportmanager_hook.dylib");
   }
@@ -153,7 +153,7 @@ function getHookLibraryRelativePath(): string {
 }
 
 /** Returns the packaged native launcher used to bypass macOS asdf shim scripts. */
-function getAsdfShimLauncherRelativePath(): string {
+export function getAsdfShimLauncherRelativePath(): string {
   return path.join("media", "native", "portmanager_asdf_shim");
 }
 
