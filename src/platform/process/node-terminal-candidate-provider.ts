@@ -31,6 +31,13 @@ interface PosixProcessRow {
   readonly command?: string;
 }
 
+interface TerminalTitleRow {
+  /** Normalized tty id such as ttys003. */
+  readonly terminalId: string;
+  /** Title reported by Terminal.app or iTerm2. */
+  readonly title: string;
+}
+
 interface WindowsProcessRow {
   readonly ProcessId?: number;
   readonly ParentProcessId?: number;
@@ -40,9 +47,12 @@ interface WindowsProcessRow {
 
 /** Uses ps so macOS and Linux share one process scanner path. */
 async function listPosixTerminals(): Promise<readonly TerminalCandidate[]> {
-  const { stdout } = await execFileAsync("ps", ["-Ao", "pid=,ppid=,pgid=,tty=,comm=,args="], {
-    maxBuffer: 1024 * 1024,
-  });
+  const [{ stdout }, titleByTerminalId] = await Promise.all([
+    execFileAsync("ps", ["-Ao", "pid=,ppid=,pgid=,tty=,comm=,args="], {
+      maxBuffer: 1024 * 1024,
+    }),
+    listTerminalTitlesByTty(),
+  ]);
 
   return stdout
     .split(/\r?\n/)
@@ -54,10 +64,145 @@ async function listPosixTerminals(): Promise<readonly TerminalCandidate[]> {
       parentPid: row.parentPid,
       processGroupId: row.processGroupId,
       terminalId: row.terminalId,
+      windowTitle: row.terminalId === undefined ? undefined : titleByTerminalId.get(row.terminalId),
       name: row.name,
       command: row.command,
       vscodeTerminal: false,
     }));
+}
+
+/** Returns terminal window/tab titles keyed by tty when the platform exposes them. */
+async function listTerminalTitlesByTty(): Promise<ReadonlyMap<string, string>> {
+  if (process.platform !== "darwin") {
+    return new Map();
+  }
+
+  const [terminalRows, itermRows] = await Promise.all([listMacTerminalAppTitles(), listMacItermTitles()]);
+  const titles = new Map<string, string>();
+
+  for (const row of [...terminalRows, ...itermRows]) {
+    if (row.title.trim().length === 0 || titles.has(row.terminalId)) {
+      continue;
+    }
+
+    titles.set(row.terminalId, row.title.trim());
+  }
+
+  return titles;
+}
+
+/** Reads Terminal.app tab titles. The app check avoids launching Terminal. */
+async function listMacTerminalAppTitles(): Promise<readonly TerminalTitleRow[]> {
+  if (!(await isMacApplicationRunning("Terminal"))) {
+    return [];
+  }
+
+  const script = `
+tell application "Terminal"
+  set outputText to ""
+  repeat with windowItem in windows
+    repeat with tabItem in tabs of windowItem
+      set titleText to ""
+      try
+        set titleText to custom title of tabItem
+      end try
+      if titleText is missing value or titleText is "" then
+        try
+          set titleText to name of windowItem
+        end try
+      end if
+      set outputText to outputText & (tty of tabItem) & tab & titleText & linefeed
+    end repeat
+  end repeat
+  return outputText
+end tell
+`;
+
+  return runMacTerminalTitleScript(script);
+}
+
+/** Reads iTerm2 session titles. The app check avoids launching iTerm2. */
+async function listMacItermTitles(): Promise<readonly TerminalTitleRow[]> {
+  if (!(await isMacApplicationRunning("iTerm2"))) {
+    return [];
+  }
+
+  const script = `
+tell application "iTerm2"
+  set outputText to ""
+  repeat with windowItem in windows
+    repeat with tabItem in tabs of windowItem
+      repeat with sessionItem in sessions of tabItem
+        set titleText to ""
+        try
+          set titleText to name of sessionItem
+        end try
+        set outputText to outputText & (tty of sessionItem) & tab & titleText & linefeed
+      end repeat
+    end repeat
+  end repeat
+  return outputText
+end tell
+`;
+
+  return runMacTerminalTitleScript(script);
+}
+
+/** Checks running apps without activating or launching them. */
+async function isMacApplicationRunning(processName: string): Promise<boolean> {
+  try {
+    await execFileAsync("pgrep", ["-x", processName], {
+      maxBuffer: 64 * 1024,
+      timeout: 500,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Runs one AppleScript title query and parses tty/title rows. */
+async function runMacTerminalTitleScript(script: string): Promise<readonly TerminalTitleRow[]> {
+  try {
+    const { stdout } = await execFileAsync("osascript", ["-e", script], {
+      maxBuffer: 256 * 1024,
+      timeout: 1000,
+    });
+
+    return parseTerminalTitleRows(stdout);
+  } catch {
+    return [];
+  }
+}
+
+/** Parses osascript output shaped as tty<TAB>title. */
+function parseTerminalTitleRows(output: string): readonly TerminalTitleRow[] {
+  return output
+    .split(/\r?\n/)
+    .map((line) => {
+      const [terminalId, ...titleParts] = line.split("\t");
+      const normalizedTerminalId = normalizeTerminalId(terminalId);
+      const title = titleParts.join("\t").trim();
+
+      if (normalizedTerminalId.length === 0 || title.length === 0) {
+        return undefined;
+      }
+
+      return {
+        terminalId: normalizedTerminalId,
+        title,
+      };
+    })
+    .filter((row): row is TerminalTitleRow => row !== undefined);
+}
+
+/** Normalizes /dev/ttys003 and ttys003 to the same key used by ps. */
+function normalizeTerminalId(value: string | undefined): string {
+  if (value === undefined) {
+    return "";
+  }
+
+  return value.trim().replace(/^\/dev\//, "");
 }
 
 /** Parses the fixed leading ps columns while preserving spaces in args. */

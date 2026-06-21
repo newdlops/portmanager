@@ -112,20 +112,13 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * Attaches a terminal to a network when the selected runtime can actually do
-   * it. The current proxy runtime intentionally rejects this path because it
-   * cannot move existing processes into an isolated namespace.
+   * Attaches a terminal candidate to a network. Runtimes without terminal
+   * isolation support still record a logical association so the UI can bind
+   * user intent before a stronger adapter is installed.
    */
   attachTerminal(networkId: string, terminalPid: number): TerminalAttachment {
     const network = requireNetwork(this.registry.getNetwork(networkId), networkId);
     const runtime = requireRuntime(network.runtimeKind);
-
-    if (!runtime.capabilities.supportsTerminalAttach) {
-      throw new Error(
-        `${runtime.name} cannot attach an existing terminal to an isolated network. Use a runtime adapter with terminal attach support.`,
-      );
-    }
-
     const candidate = this.registry.getSnapshot().terminalCandidates.find((item) => item.pid === terminalPid);
     if (candidate === undefined) {
       throw new Error(`Unknown terminal process: ${terminalPid}`);
@@ -136,13 +129,20 @@ export class PortManagerNetworkService implements DisposableLike {
       networkId,
       rootPid: candidate.pid,
       processGroupId: candidate.processGroupId,
+      terminalTitle: candidate.windowTitle ?? candidate.name,
+      mode: runtime.capabilities.supportsTerminalAttach ? "isolated" : "logical",
       status: "attached",
+      errorMessage: runtime.capabilities.supportsTerminalAttach
+        ? undefined
+        : `${runtime.name} records this terminal but does not isolate its network traffic yet.`,
       attachedAt: new Date().toISOString(),
     });
   }
 
   /** Attaches a user-facing terminal window by resolving it to its root process. */
   attachTerminalWindow(networkId: string, terminalWindowId: string): TerminalAttachment {
+    const network = requireNetwork(this.registry.getNetwork(networkId), networkId);
+    const runtime = requireRuntime(network.runtimeKind);
     const terminalWindow = this.registry
       .getSnapshot()
       .terminalWindows.find((window) => window.id === terminalWindowId);
@@ -151,7 +151,20 @@ export class PortManagerNetworkService implements DisposableLike {
       throw new Error(`Unknown terminal window: ${terminalWindowId}`);
     }
 
-    return this.attachTerminal(networkId, terminalWindow.rootPid);
+    return this.registry.addAttachment({
+      id: createId("attachment"),
+      networkId,
+      rootPid: terminalWindow.rootPid,
+      processGroupId: terminalWindow.processGroupId,
+      terminalWindowId: terminalWindow.id,
+      terminalTitle: terminalWindow.title,
+      mode: runtime.capabilities.supportsTerminalAttach ? "isolated" : "logical",
+      status: "attached",
+      errorMessage: runtime.capabilities.supportsTerminalAttach
+        ? undefined
+        : `${runtime.name} records this terminal window but does not isolate its network traffic yet.`,
+      attachedAt: new Date().toISOString(),
+    });
   }
 
   /** Creates and opens a host TCP exposure through the concrete proxy runtime. */
@@ -275,6 +288,7 @@ async function listVscodeTerminalCandidates(): Promise<readonly TerminalCandidat
       return {
         pid,
         name: terminal.name,
+        windowTitle: terminal.name,
         command: terminal.name,
         vscodeTerminal: true,
       } satisfies TerminalCandidate;

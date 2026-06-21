@@ -162,8 +162,11 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
-    this.dependencies.networkService.attachTerminalWindow(network.id, terminalWindow.id);
+    const attachment = this.dependencies.networkService.attachTerminalWindow(network.id, terminalWindow.id);
     this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage(
+      `Attached "${terminalWindow.title}" to "${network.name}" (${attachment.mode ?? "isolated"} mode).`,
+    );
   }
 
   /** Opens a host TCP listener/proxy for a network target port. */

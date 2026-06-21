@@ -107,6 +107,13 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
       ];
     }
 
+    if (element instanceof LogicalNetworkTreeItem) {
+      const attachments = snapshot.attachments.filter((attachment) => attachment.networkId === element.network.id);
+      return attachments.length > 0
+        ? attachments.map((attachment) => new TerminalAttachmentTreeItem(attachment))
+        : [new EmptyTreeItem("No terminal windows attached", "Attach a window from Terminal Windows")];
+    }
+
     if (element instanceof TerminalWindowTreeItem) {
       const candidateSet = new Set(element.window.candidatePids);
       return snapshot.terminalCandidates
@@ -210,8 +217,11 @@ export class LogicalNetworkTreeItem extends vscode.TreeItem {
     readonly network: LogicalNetwork,
     attachments: readonly TerminalAttachment[],
   ) {
-    super(network.name, vscode.TreeItemCollapsibleState.None);
     const attachmentCount = attachments.filter((attachment) => attachment.networkId === network.id).length;
+    super(
+      network.name,
+      attachmentCount > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
+    );
     this.id = network.id;
     this.description = `${network.runtimeKind} ${network.status}${attachmentCount > 0 ? `, ${attachmentCount} terminals` : ""}`;
     this.tooltip = buildNetworkTooltip(network, attachmentCount);
@@ -253,10 +263,14 @@ export class TerminalAttachmentTreeItem extends vscode.TreeItem {
   readonly contextValue = "terminalAttachment";
 
   constructor(readonly attachment: TerminalAttachment) {
-    super(`PID ${attachment.rootPid}`, vscode.TreeItemCollapsibleState.None);
+    super(attachment.terminalTitle ?? `PID ${attachment.rootPid}`, vscode.TreeItemCollapsibleState.None);
     this.id = attachment.id;
-    this.description = attachment.status;
-    this.iconPath = new vscode.ThemeIcon(attachment.status === "attached" ? "plug" : "warning");
+    this.description = `${attachment.mode ?? "isolated"} ${attachment.status}`;
+    this.tooltip = buildTerminalAttachmentTooltip(attachment);
+    this.iconPath = new vscode.ThemeIcon(
+      attachment.mode === "logical" ? "warning" : "plug",
+      attachment.mode === "logical" ? new vscode.ThemeColor("charts.yellow") : undefined,
+    );
   }
 }
 
@@ -494,6 +508,24 @@ function buildTerminalWindowTooltip(window: TerminalWindow): vscode.MarkdownStri
   return tooltip;
 }
 
+/** Builds tooltip details for an attached terminal window. */
+function buildTerminalAttachmentTooltip(attachment: TerminalAttachment): vscode.MarkdownString {
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.isTrusted = false;
+  tooltip.appendMarkdown(`**${escapeMarkdown(attachment.terminalTitle ?? `PID ${attachment.rootPid}`)}**\n\n`);
+  tooltip.appendMarkdown(`- Mode: \`${attachment.mode ?? "isolated"}\`\n`);
+  tooltip.appendMarkdown(`- Status: \`${attachment.status}\`\n`);
+  tooltip.appendMarkdown(`- Root PID: \`${attachment.rootPid}\`\n`);
+  tooltip.appendMarkdown(`- Process Group: \`${attachment.processGroupId ?? "n/a"}\`\n`);
+  tooltip.appendMarkdown(`- Window ID: \`${escapeMarkdown(attachment.terminalWindowId ?? "n/a")}\`\n`);
+
+  if (attachment.errorMessage) {
+    tooltip.appendMarkdown(`\nWarning: \`${escapeMarkdown(attachment.errorMessage)}\``);
+  }
+
+  return tooltip;
+}
+
 /** Builds tooltip details for one terminal candidate. */
 function buildTerminalTooltip(candidate: TerminalCandidate): vscode.MarkdownString {
   const tooltip = new vscode.MarkdownString(undefined, true);
@@ -503,6 +535,7 @@ function buildTerminalTooltip(candidate: TerminalCandidate): vscode.MarkdownStri
   tooltip.appendMarkdown(`- Parent PID: \`${candidate.parentPid ?? "n/a"}\`\n`);
   tooltip.appendMarkdown(`- Process Group: \`${candidate.processGroupId ?? "n/a"}\`\n`);
   tooltip.appendMarkdown(`- Terminal: \`${escapeMarkdown(candidate.terminalId ?? "n/a")}\`\n`);
+  tooltip.appendMarkdown(`- Window Title: \`${escapeMarkdown(candidate.windowTitle ?? "n/a")}\`\n`);
   tooltip.appendMarkdown(`- Source: \`${candidate.vscodeTerminal ? "VS Code" : "OS"}\`\n`);
   tooltip.appendMarkdown(`- Command: \`${escapeMarkdown(candidate.command ?? "n/a")}\`\n`);
 

@@ -264,10 +264,11 @@ function groupTerminalWindows(candidates: readonly TerminalCandidate[]): readonl
     const root = selectTerminalRoot(group);
     const source = group.some((candidate) => candidate.vscodeTerminal) ? "vscode" : "os";
     const terminalId = root.terminalId ?? group.find((candidate) => candidate.terminalId)?.terminalId;
+    const windowTitle = selectTerminalWindowTitle(group);
 
     return {
       id,
-      title: buildTerminalWindowTitle(source, root, terminalId),
+      title: buildTerminalWindowTitle(source, root, terminalId, windowTitle),
       source,
       terminalId,
       rootPid: root.pid,
@@ -313,12 +314,23 @@ function selectTerminalRoot(group: readonly TerminalCandidate[]): TerminalCandid
   return [...group].sort((left, right) => left.pid - right.pid)[0];
 }
 
+/** Chooses the user-visible terminal title collected from VS Code or the OS. */
+function selectTerminalWindowTitle(group: readonly TerminalCandidate[]): string | undefined {
+  const titledCandidate = group.find((candidate) => candidate.windowTitle?.trim());
+  return titledCandidate?.windowTitle?.trim();
+}
+
 /** Builds a concise label that helps users distinguish terminal windows. */
 function buildTerminalWindowTitle(
   source: TerminalWindow["source"],
   root: TerminalCandidate,
   terminalId: string | undefined,
+  windowTitle: string | undefined,
 ): string {
+  if (windowTitle !== undefined && windowTitle.length > 0) {
+    return windowTitle;
+  }
+
   if (source === "vscode") {
     return `VS Code: ${root.name}`;
   }

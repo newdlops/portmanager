@@ -92,6 +92,7 @@ test("groups noisy terminal process candidates into terminal windows", () => {
       parentPid: 1,
       processGroupId: 100,
       terminalId: "ttys001",
+      windowTitle: "Captain dev cluster",
       name: "zsh",
       command: "/bin/zsh -il",
       vscodeTerminal: false,
@@ -108,6 +109,7 @@ test("groups noisy terminal process candidates into terminal windows", () => {
     {
       pid: 200,
       name: "Extension Host",
+      windowTitle: "API server terminal",
       command: "Extension Host",
       vscodeTerminal: true,
     },
@@ -117,11 +119,12 @@ test("groups noisy terminal process candidates into terminal windows", () => {
 
   assert.equal(windows.length, 2);
   assert.equal(windows[0]?.id, "tty:ttys001");
+  assert.equal(windows[0]?.title, "Captain dev cluster");
   assert.equal(windows[0]?.rootPid, 100);
   assert.equal(windows[0]?.candidateCount, 2);
   assert.deepEqual(windows[0]?.candidatePids, [100, 101]);
   assert.equal(windows[1]?.id, "vscode:200");
-  assert.equal(windows[1]?.title, "VS Code: Extension Host");
+  assert.equal(windows[1]?.title, "API server terminal");
 });
 
 test("rejects duplicate host exposures for the same address and port", () => {
@@ -143,14 +146,22 @@ test("removing a network removes dependent attachments and exposures", () => {
     networkId: "network-1",
     rootPid: 101,
     processGroupId: 101,
+    terminalWindowId: "tty:ttys001",
+    terminalTitle: "Captain dev cluster",
+    mode: "logical",
     status: "attached",
+    errorMessage: "Proxy runtime does not isolate traffic yet.",
     attachedAt: "2026-06-22T00:02:00.000Z",
   });
+  const attachment = registry.getSnapshot().attachments[0];
   registry.addExposure(createExposure());
 
   const removed = registry.removeNetwork("network-1");
   const snapshot = registry.getSnapshot();
 
+  assert.equal(attachment?.terminalTitle, "Captain dev cluster");
+  assert.equal(attachment?.mode, "logical");
+  assert.match(attachment?.errorMessage ?? "", /does not isolate/);
   assert.equal(removed?.id, "network-1");
   assert.deepEqual(snapshot.networks, []);
   assert.deepEqual(snapshot.attachments, []);

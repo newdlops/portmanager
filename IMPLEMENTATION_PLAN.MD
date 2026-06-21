@@ -41,6 +41,7 @@ Port Manager의 기본 구현 방향은 레거시 포트 재할당 UI에서 Logi
 
 - OS 전체 process table 기반 terminal candidate scanner 추가
 - 터미널 후보를 사용자-facing `TerminalWindow`로 그룹화
+- VS Code terminal name과 macOS Terminal/iTerm2 window/tab title을 `TerminalWindow` 표시명으로 사용
   - macOS: Terminal, iTerm2, shell, tty, process group
   - Linux: terminal emulator, shell, tty, process group
   - Windows: Windows Terminal, conhost, PowerShell, cmd, WSL process tree

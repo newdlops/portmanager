@@ -26,6 +26,8 @@ export type LogicalNetworkStatus = "creating" | "running" | "stopped" | "error";
 
 export type TerminalAttachmentStatus = "attached" | "detached" | "error";
 
+export type TerminalAttachmentMode = "isolated" | "logical";
+
 export type NetworkRuntimeKind = "container" | "linuxNamespace" | "nativeHelper" | "proxy";
 
 export type HostPortExposureStatus = "opening" | "active" | "stopped" | "error";
@@ -92,6 +94,8 @@ export interface TerminalCandidate {
   readonly processGroupId?: number;
   /** Terminal device path or Windows console/session identifier when known. */
   readonly terminalId?: string;
+  /** User-visible terminal window/tab title when the platform exposes it. */
+  readonly windowTitle?: string;
   /** Shell or terminal display name. */
   readonly name: string;
   /** Full command line when the platform exposes it. */
@@ -137,6 +141,12 @@ export interface TerminalAttachment {
   readonly rootPid: number;
   /** Process group used to apply runtime context where supported. */
   readonly processGroupId?: number;
+  /** User-facing terminal window id selected for this attachment. */
+  readonly terminalWindowId?: string;
+  /** Title shown to the user when the terminal window was attached. */
+  readonly terminalTitle?: string;
+  /** Whether the runtime actually isolated traffic or only recorded association. */
+  readonly mode?: TerminalAttachmentMode;
   /** Current attachment lifecycle state. */
   readonly status: TerminalAttachmentStatus;
   /** ISO timestamp when the attachment was requested. */

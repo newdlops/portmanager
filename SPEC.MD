@@ -36,7 +36,7 @@ B network
 
 #### Terminal Attachment
 
-사용자가 선택한 터미널 창 또는 세션을 Logical Network에 연결하는 행위다. 내부 구현은 root PID, shell process group, tty 같은 low-level 식별자를 사용하지만, 사용자는 프로세스 목록이 아니라 터미널 창 단위로 선택해야 한다.
+사용자가 선택한 터미널 창 또는 세션을 Logical Network에 연결하는 행위다. 내부 구현은 root PID, shell process group, tty 같은 low-level 식별자를 사용하지만, 사용자는 프로세스 목록이 아니라 터미널 창 title을 기준으로 창 단위 선택을 해야 한다.
 
 #### Host Port Exposure
 
@@ -64,11 +64,11 @@ Logical Network를 실제 시스템에서 구현하는 어댑터다. VS Code 확
 - OS native adapter: Linux network namespace, macOS pf/utun/launch wrapper, Windows WFP/Hyper-V/WSL 기반 구현
 - Proxy adapter: 완전 격리는 아니지만 host exposure와 일부 outbound/inbound 라우팅을 제공하는 fallback
 
-현재 초기 구현은 `Local TCP Proxy` adapter를 제공한다. 이 adapter는 host port exposure를 실제 TCP listener/proxy로 수행하지만, 같은 내부 포트 재사용과 기존 터미널 attach는 지원하지 않는다. UI는 이 capability를 그대로 표시해야 하며, 지원하지 않는 attach 요청은 성공처럼 저장하지 않고 실패로 처리한다.
+현재 초기 구현은 `Local TCP Proxy` adapter를 제공한다. 이 adapter는 host port exposure를 실제 TCP listener/proxy로 수행하고 터미널 창 attach 의도를 logical association으로 저장하지만, 같은 내부 포트 재사용과 실제 터미널 네트워크 격리는 지원하지 않는다. UI는 이 capability를 그대로 표시해야 하며, logical attach와 isolated attach를 구분해서 보여줘야 한다.
 
 #### Terminal Discovery
 
-VS Code 통합 터미널만이 아니라 macOS Terminal/iTerm2, Linux terminal emulator, Windows Terminal, PowerShell, cmd, WSL 터미널의 shell/process tree를 조회하고, 이를 터미널 창/세션 단위로 그룹화해 사용자가 연결할 대상을 선택할 수 있게 하는 기능이다.
+VS Code 통합 터미널만이 아니라 macOS Terminal/iTerm2, Linux terminal emulator, Windows Terminal, PowerShell, cmd, WSL 터미널의 shell/process tree를 조회하고, 이를 터미널 창/세션 단위로 그룹화해 사용자가 연결할 대상을 선택할 수 있게 하는 기능이다. 플랫폼이 window/tab title을 제공하면 그 title을 기본 표시명으로 사용한다.
 
 ### 0.3 기능 요구사항
 
