@@ -77,12 +77,17 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.detachTerminalFromNetwork", (argument) =>
       this.detachTerminalFromNetwork(argument),
     );
+    this.registerCommand(context, "portManager.resetTerminalNetworkSettings", (argument) =>
+      this.resetTerminalNetworkSettings(argument),
+    );
     this.registerCommand(context, "portManager.addHostPortExposure", (argument) =>
       this.addHostPortExposure(argument),
     );
     this.registerCommand(context, "portManager.addHostAccessBinding", (argument) =>
       this.addHostAccessBinding(argument),
     );
+    this.registerCommand(context, "portManager.saveBindingPreset", (argument) => this.saveBindingPreset(argument));
+    this.registerCommand(context, "portManager.applyBindingPreset", (argument) => this.applyBindingPreset(argument));
     this.registerCommand(context, "portManager.removeHostAccessBinding", (argument) =>
       this.removeHostAccessBinding(argument),
     );
@@ -165,12 +170,13 @@ export class PortManagerCommandController implements DisposableLike {
 
   /** Attaches a selected terminal window to a selected network when the runtime supports it. */
   private async attachTerminalToNetwork(argument: unknown): Promise<void> {
-    const terminalWindow = await this.resolveTerminalWindowArgument(argument, "Attach Terminal Window to Network");
+    const directInput = getAttachTerminalInput(argument);
+    const terminalWindow = directInput?.terminalWindow ?? (await this.resolveTerminalWindowArgument(argument, "Attach Terminal Window to Network"));
     if (terminalWindow === undefined) {
       return;
     }
 
-    const network = await this.resolveNetworkArgument(undefined, "Attach Terminal Window to Network");
+    const network = directInput?.network ?? (await this.resolveNetworkArgument(undefined, "Attach Terminal Window to Network"));
     if (network === undefined) {
       return;
     }
@@ -180,6 +186,32 @@ export class PortManagerCommandController implements DisposableLike {
 
     await vscode.window.showInformationMessage(
       `Attached "${terminalWindow.title}" to "${network.name}" (${attachment.mode ?? "isolated"} mode).`,
+    );
+  }
+
+  /** Clears network routing variables from a terminal window and removes tracked attachments. */
+  private async resetTerminalNetworkSettings(argument: unknown): Promise<void> {
+    const attachment = getTerminalAttachmentFromCommandArgument(argument);
+    if (attachment !== undefined) {
+      if (attachment.terminalWindowId !== undefined) {
+        await this.dependencies.networkService.resetTerminalNetworkSettings(attachment.terminalWindowId);
+      } else {
+        await this.dependencies.networkService.detachTerminal(attachment.id);
+      }
+      this.dependencies.treeProvider.refresh();
+      await vscode.window.showInformationMessage(`Reset "${attachment.terminalTitle ?? attachment.rootPid}".`);
+      return;
+    }
+
+    const terminalWindow = await this.resolveTerminalWindowArgument(argument, "Reset Terminal Network Settings");
+    if (terminalWindow === undefined) {
+      return;
+    }
+
+    const removedCount = await this.dependencies.networkService.resetTerminalNetworkSettings(terminalWindow.id);
+    this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage(
+      `Reset "${terminalWindow.title}" network settings${removedCount > 0 ? ` and removed ${removedCount} attachment(s)` : ""}.`,
     );
   }
 
@@ -313,6 +345,63 @@ export class PortManagerCommandController implements DisposableLike {
 
     this.dependencies.networkService.removeHostAccessBinding(binding.id);
     this.dependencies.treeProvider.refresh();
+  }
+
+  /** Saves the selected network's current bindings as a reusable preset. */
+  private async saveBindingPreset(argument: unknown): Promise<void> {
+    const network = await this.resolveNetworkArgument(argument, "Save Binding Preset");
+    if (network === undefined) {
+      return;
+    }
+
+    const name = await vscode.window.showInputBox({
+      title: "Save Binding Preset",
+      prompt: "Preset name",
+      value: `${network.name} bindings`,
+      ignoreFocusOut: true,
+      validateInput: (value) => (value.trim().length === 0 ? "Preset name is required." : undefined),
+    });
+
+    if (name === undefined) {
+      return;
+    }
+
+    const preset = this.dependencies.networkService.saveBindingPreset(name.trim(), network.id);
+    await vscode.window.showInformationMessage(
+      `Saved preset "${preset.name}" (${preset.exposureCount} exposures, ${preset.hostAccessCount} host access).`,
+    );
+  }
+
+  /** Applies a saved binding preset to the selected logical network. */
+  private async applyBindingPreset(argument: unknown): Promise<void> {
+    const network = await this.resolveNetworkArgument(argument, "Apply Binding Preset");
+    if (network === undefined) {
+      return;
+    }
+
+    const presets = this.dependencies.networkService.listBindingPresets();
+    if (presets.length === 0) {
+      await vscode.window.showInformationMessage("No binding presets saved.");
+      return;
+    }
+
+    const selected = await vscode.window.showQuickPick(
+      presets.map((preset) => ({
+        label: preset.name,
+        description: `${preset.exposureCount} exposures, ${preset.hostAccessCount} host access`,
+        detail: `Updated ${preset.updatedAt}`,
+        preset,
+      })),
+      { title: "Apply Binding Preset", placeHolder: "Select a preset" },
+    );
+
+    if (selected === undefined) {
+      return;
+    }
+
+    const preset = await this.dependencies.networkService.applyBindingPreset(selected.preset.id, network.id);
+    this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage(`Applied preset "${preset.name}" to "${network.name}".`);
   }
 
   /** Copies the URL for one active host exposure. */
@@ -1040,6 +1129,45 @@ function formatExposureUrl(exposure: HostPortExposure): string {
   const formattedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 
   return `http://${formattedHost}:${exposure.hostPort}`;
+}
+
+interface AttachTerminalCommandInput {
+  readonly terminalWindow: TerminalWindow;
+  readonly network: LogicalNetwork;
+}
+
+function getAttachTerminalInput(argument: unknown): AttachTerminalCommandInput | undefined {
+  if (typeof argument !== "object" || argument === null) {
+    return undefined;
+  }
+
+  const candidate = argument as Partial<AttachTerminalCommandInput>;
+  if (!isTerminalWindowLike(candidate.terminalWindow) || !isLogicalNetworkLike(candidate.network)) {
+    return undefined;
+  }
+
+  return {
+    terminalWindow: candidate.terminalWindow,
+    network: candidate.network,
+  };
+}
+
+function isTerminalWindowLike(value: unknown): value is TerminalWindow {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const candidate = value as Partial<TerminalWindow>;
+  return typeof candidate.id === "string" && typeof candidate.title === "string" && typeof candidate.rootPid === "number";
+}
+
+function isLogicalNetworkLike(value: unknown): value is LogicalNetwork {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const candidate = value as Partial<LogicalNetwork>;
+  return typeof candidate.id === "string" && typeof candidate.name === "string" && typeof candidate.runtimeKind === "string";
 }
 
 /** Validates the user-facing TCP port range. */

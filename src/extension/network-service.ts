@@ -50,7 +50,43 @@ import {
 import type { PortManagerProcessService } from "./process-service";
 
 const NETWORK_STATE_KEY = "portManager.logicalNetworkState.v1";
+const BINDING_PRESETS_KEY = "portManager.bindingPresets.v1";
 const execFileAsync = promisify(execFile);
+
+export interface BindingPresetSummary {
+  /** Stable preset id stored in VS Code global state. */
+  readonly id: string;
+  /** User-facing preset name. */
+  readonly name: string;
+  /** Number of host exposure rows captured in the preset. */
+  readonly exposureCount: number;
+  /** Number of network-to-host access rows captured in the preset. */
+  readonly hostAccessCount: number;
+  /** ISO timestamp from the latest save. */
+  readonly updatedAt: string;
+}
+
+interface BindingPreset {
+  readonly id: string;
+  readonly name: string;
+  readonly exposures: readonly BindingPresetExposure[];
+  readonly hostAccessBindings: readonly BindingPresetHostAccess[];
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+interface BindingPresetExposure {
+  readonly hostAddress: string;
+  readonly hostPort: number;
+  readonly targetAddress: string;
+  readonly targetPort: number;
+}
+
+interface BindingPresetHostAccess {
+  readonly logicalPort: number;
+  readonly hostAddress: string;
+  readonly hostPort: number;
+}
 
 /**
  * Extension-side application service for the Logical Network mode.
@@ -145,6 +181,17 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Returns the latest logical network snapshot for the sidebar. */
   getSnapshot(): NetworkSnapshot {
     return this.registry.getSnapshot();
+  }
+
+  /** Lists saved binding presets without exposing mutable stored arrays. */
+  listBindingPresets(): readonly BindingPresetSummary[] {
+    return this.loadBindingPresets().map((preset) => ({
+      id: preset.id,
+      name: preset.name,
+      exposureCount: preset.exposures.length,
+      hostAccessCount: preset.hostAccessBindings.length,
+      updatedAt: preset.updatedAt,
+    }));
   }
 
   /** Subscribes to logical network state changes. */
@@ -248,6 +295,12 @@ export class PortManagerNetworkService implements DisposableLike {
 
       if (!result.injected) {
         throw new Error(result.reason ?? `Could not attach "${terminalWindow.title}" with native socket routing.`);
+      }
+    }
+
+    for (const attachment of this.registry.getSnapshot().attachments) {
+      if (attachment.terminalWindowId === terminalWindow.id || attachment.rootPid === terminalWindow.rootPid) {
+        this.registry.removeAttachment(attachment.id);
       }
     }
 
@@ -434,6 +487,115 @@ export class PortManagerNetworkService implements DisposableLike {
     return this.registry.getSnapshot().hostAccessBindings.find((binding) => binding.id === bindingId);
   }
 
+  /** Captures the selected network's bindings as a reusable preset. */
+  saveBindingPreset(name: string, networkId: string): BindingPresetSummary {
+    requireNetwork(this.registry.getNetwork(networkId), networkId);
+    const snapshot = this.registry.getSnapshot();
+    const now = new Date().toISOString();
+    const preset: BindingPreset = {
+      id: createId("binding-preset"),
+      name,
+      exposures: snapshot.exposures
+        .filter((exposure) => exposure.networkId === networkId && exposure.protocol === "tcp")
+        .map((exposure) => ({
+          hostAddress: exposure.hostAddress,
+          hostPort: exposure.hostPort,
+          targetAddress: exposure.targetAddress,
+          targetPort: exposure.targetPort,
+        })),
+      hostAccessBindings: snapshot.hostAccessBindings
+        .filter((binding) => binding.networkId === networkId && binding.protocol === "tcp")
+        .map((binding) => ({
+          logicalPort: binding.logicalPort,
+          hostAddress: binding.hostAddress,
+          hostPort: binding.hostPort,
+        })),
+      createdAt: now,
+      updatedAt: now,
+    };
+    const presets = this.loadBindingPresets().filter((item) => item.name !== name);
+
+    this.saveBindingPresets([...presets, preset]);
+    return {
+      id: preset.id,
+      name: preset.name,
+      exposureCount: preset.exposures.length,
+      hostAccessCount: preset.hostAccessBindings.length,
+      updatedAt: preset.updatedAt,
+    };
+  }
+
+  /** Applies a saved binding preset to the selected logical network. */
+  async applyBindingPreset(presetId: string, networkId: string): Promise<BindingPresetSummary> {
+    requireNetwork(this.registry.getNetwork(networkId), networkId);
+    const preset = this.loadBindingPresets().find((item) => item.id === presetId);
+
+    if (preset === undefined) {
+      throw new Error(`Unknown binding preset: ${presetId}`);
+    }
+
+    for (const binding of preset.hostAccessBindings) {
+      if (this.hasEquivalentHostAccessBinding(networkId, binding)) {
+        continue;
+      }
+
+      this.createHostAccessBinding({
+        networkId,
+        logicalPort: binding.logicalPort,
+        hostAddress: binding.hostAddress,
+        hostPort: binding.hostPort,
+      });
+    }
+
+    for (const exposure of preset.exposures) {
+      if (this.hasEquivalentHostExposure(networkId, exposure)) {
+        continue;
+      }
+
+      await this.createExposure({
+        networkId,
+        hostAddress: exposure.hostAddress,
+        hostPort: exposure.hostPort,
+        targetAddress: exposure.targetAddress,
+        targetPort: exposure.targetPort,
+      });
+    }
+
+    return {
+      id: preset.id,
+      name: preset.name,
+      exposureCount: preset.exposures.length,
+      hostAccessCount: preset.hostAccessBindings.length,
+      updatedAt: preset.updatedAt,
+    };
+  }
+
+  /** Sends native detach settings to one terminal and removes tracked attachments. */
+  async resetTerminalNetworkSettings(terminalWindowId: string): Promise<number> {
+    const snapshot = this.registry.getSnapshot();
+    const terminalWindow = snapshot.terminalWindows.find((item) => item.id === terminalWindowId);
+
+    if (terminalWindow === undefined) {
+      throw new Error(`Unknown terminal window: ${terminalWindowId}`);
+    }
+
+    const relatedAttachments = snapshot.attachments.filter((attachment) => attachment.terminalWindowId === terminalWindowId);
+    const shouldExitContainerShell = relatedAttachments.some(
+      (attachment) => this.registry.getNetwork(attachment.networkId)?.runtimeKind === "container",
+    );
+    const resetCommand = shouldExitContainerShell ? "exit" : this.buildTerminalDetachScript();
+
+    await sendCommandToTerminalWindow(terminalWindow, resetCommand).catch(() => false);
+
+    let removedCount = 0;
+    for (const attachment of relatedAttachments) {
+      this.registry.removeAttachment(attachment.id);
+      removedCount++;
+    }
+
+    return removedCount;
+  }
+
   /** Releases listeners and event subscriptions. */
   dispose(): void {
     for (const disposable of this.disposables.splice(0)) {
@@ -453,6 +615,45 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Persists durable logical network state. */
   private saveState(): void {
     void this.context.globalState.update(NETWORK_STATE_KEY, this.registry.getPersistedState());
+  }
+
+  /** Reads saved binding presets from VS Code global state. */
+  private loadBindingPresets(): readonly BindingPreset[] {
+    return this.context.globalState.get<readonly BindingPreset[]>(BINDING_PRESETS_KEY) ?? [];
+  }
+
+  /** Persists saved binding presets in VS Code global state. */
+  private saveBindingPresets(presets: readonly BindingPreset[]): void {
+    void this.context.globalState.update(BINDING_PRESETS_KEY, presets);
+  }
+
+  /** True when applying a preset would recreate the same host access row. */
+  private hasEquivalentHostAccessBinding(networkId: string, preset: BindingPresetHostAccess): boolean {
+    return this.registry
+      .getSnapshot()
+      .hostAccessBindings.some(
+        (binding) =>
+          binding.networkId === networkId &&
+          binding.protocol === "tcp" &&
+          binding.logicalPort === preset.logicalPort &&
+          binding.hostAddress === preset.hostAddress &&
+          binding.hostPort === preset.hostPort,
+      );
+  }
+
+  /** True when applying a preset would recreate the same host exposure row. */
+  private hasEquivalentHostExposure(networkId: string, preset: BindingPresetExposure): boolean {
+    return this.registry
+      .getSnapshot()
+      .exposures.some(
+        (exposure) =>
+          exposure.networkId === networkId &&
+          exposure.protocol === "tcp" &&
+          exposure.hostAddress === preset.hostAddress &&
+          exposure.hostPort === preset.hostPort &&
+          exposure.targetAddress === preset.targetAddress &&
+          exposure.targetPort === preset.targetPort,
+      );
   }
 
   /**

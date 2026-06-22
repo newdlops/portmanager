@@ -1,4 +1,6 @@
 .vscode/**
+.codex/**
+.mcp.json
 .lh/**
 .codeidx/**
 .zoek-rs/**
@@ -11,6 +13,7 @@ scripts/**
 out/test/**
 dist/**
 *.vsix
+log.txt
 *.map
 **/*.map
 tsconfig.json

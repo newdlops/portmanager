@@ -22,7 +22,10 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   context.subscriptions.push(
-    vscode.window.registerTreeDataProvider("portManager.processes", treeProvider),
+    vscode.window.createTreeView("portManager.processes", {
+      treeDataProvider: treeProvider,
+      dragAndDropController: treeProvider,
+    }),
     networkService,
     processService,
     treeProvider,

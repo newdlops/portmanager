@@ -146,6 +146,16 @@ npm run compile
 npm test
 ```
 
+Build the optional native terminal hook with:
+
+```sh
+npm run build:hook
+```
+
+Packaging and publishing run this hook build again through `vscode:prepublish`. On macOS the generated hook library and asdf shim are ad-hoc signed when `codesign` is available.
+
+For Marketplace release steps, publisher identity, VSIX verification, and native hook packaging checks, see [PUBLISHING.MD](PUBLISHING.MD). The Marketplace publisher ID is `newdlops`.
+
 ## Architecture
 
 - `src/extension`: activation and command orchestration

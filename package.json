@@ -5,7 +5,7 @@
   "version": "0.0.1",
   "publisher": "newdlops",
   "license": "MIT",
-  "preview": true,
+  "icon": "media/icon.png",
   "qna": false,
   "keywords": [
     "port",
@@ -42,8 +42,11 @@
     "onCommand:portManager.refreshTerminals",
     "onCommand:portManager.attachTerminalToNetwork",
     "onCommand:portManager.detachTerminalFromNetwork",
+    "onCommand:portManager.resetTerminalNetworkSettings",
     "onCommand:portManager.addHostPortExposure",
     "onCommand:portManager.addHostAccessBinding",
+    "onCommand:portManager.saveBindingPreset",
+    "onCommand:portManager.applyBindingPreset",
     "onCommand:portManager.removeHostAccessBinding",
     "onCommand:portManager.removeHostPortExposure",
     "onCommand:portManager.copyHostPortExposureUrl",
@@ -128,6 +131,12 @@
         "icon": "$(debug-disconnect)"
       },
       {
+        "command": "portManager.resetTerminalNetworkSettings",
+        "title": "Port Manager: Reset Terminal Network Settings",
+        "category": "Port Manager",
+        "icon": "$(debug-disconnect)"
+      },
+      {
         "command": "portManager.addHostPortExposure",
         "title": "Port Manager: Add Host Port Exposure",
         "category": "Port Manager",
@@ -138,6 +147,18 @@
         "title": "Port Manager: Add Host Access Binding",
         "category": "Port Manager",
         "icon": "$(arrow-swap)"
+      },
+      {
+        "command": "portManager.saveBindingPreset",
+        "title": "Port Manager: Save Binding Preset",
+        "category": "Port Manager",
+        "icon": "$(save)"
+      },
+      {
+        "command": "portManager.applyBindingPreset",
+        "title": "Port Manager: Apply Binding Preset",
+        "category": "Port Manager",
+        "icon": "$(cloud-download)"
       },
       {
         "command": "portManager.removeHostAccessBinding",
@@ -356,9 +377,19 @@
           "group": "network@3"
         },
         {
-          "command": "portManager.removeLogicalNetwork",
+          "command": "portManager.saveBindingPreset",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@4"
+        },
+        {
+          "command": "portManager.applyBindingPreset",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "network@5"
+        },
+        {
+          "command": "portManager.removeLogicalNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "network@6"
         },
         {
           "command": "portManager.refreshTerminals",
@@ -371,9 +402,14 @@
           "group": "terminal@2"
         },
         {
+          "command": "portManager.resetTerminalNetworkSettings",
+          "when": "view == portManager.processes && (viewItem == terminalWindow || viewItem == terminalAttachment)",
+          "group": "terminal@3"
+        },
+        {
           "command": "portManager.detachTerminalFromNetwork",
           "when": "view == portManager.processes && viewItem == terminalAttachment",
-          "group": "terminal@3"
+          "group": "terminal@4"
         },
         {
           "command": "portManager.addHostPortExposure",

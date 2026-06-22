@@ -42,6 +42,7 @@ export interface PortManagerNetworkTreeSource {
 }
 
 type TreeSectionKind = "networks" | "terminals" | "exposures" | "runtime";
+const TERMINAL_WINDOW_MIME = "application/vnd.newdlops.portmanager.terminal-window";
 
 type PortManagerTreeItem =
   | TreeSectionItem
@@ -65,11 +66,19 @@ type PortManagerTreeItem =
  * events. Command handlers receive ManagedProcessTreeItem instances from
  * context menus and can extract the backing process with `getProcessFromItem`.
  */
-export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortManagerTreeItem> {
+export class PortManagerTreeProvider
+  implements vscode.TreeDataProvider<PortManagerTreeItem>, vscode.TreeDragAndDropController<PortManagerTreeItem>
+{
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<PortManagerTreeItem | undefined>();
 
   /** VS Code subscribes to this event to know when it should ask for new rows. */
   readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
+
+  /** MIME types accepted from sidebar drag gestures. */
+  readonly dragMimeTypes = [TERMINAL_WINDOW_MIME];
+
+  /** MIME types accepted when dropping onto logical network rows. */
+  readonly dropMimeTypes = [TERMINAL_WINDOW_MIME];
 
   /**
    * The registry subscription is held so activation disposal can release it
@@ -89,6 +98,53 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
   /** Returns the already constructed TreeItem object. */
   getTreeItem(element: PortManagerTreeItem): vscode.TreeItem {
     return element;
+  }
+
+  /** Stores one dragged terminal window id in the VS Code data-transfer payload. */
+  handleDrag(
+    source: readonly PortManagerTreeItem[],
+    dataTransfer: vscode.DataTransfer,
+    _token: vscode.CancellationToken,
+  ): void {
+    const terminalItem = source.find((item): item is TerminalWindowTreeItem => item instanceof TerminalWindowTreeItem);
+
+    if (terminalItem === undefined) {
+      return;
+    }
+
+    dataTransfer.set(TERMINAL_WINDOW_MIME, new vscode.DataTransferItem(terminalItem.window.id));
+  }
+
+  /** Attaches a dragged terminal window to the logical network it is dropped on. */
+  async handleDrop(
+    target: PortManagerTreeItem | undefined,
+    dataTransfer: vscode.DataTransfer,
+    _token: vscode.CancellationToken,
+  ): Promise<void> {
+    if (!(target instanceof LogicalNetworkTreeItem)) {
+      return;
+    }
+
+    const transferItem = dataTransfer.get(TERMINAL_WINDOW_MIME);
+    const terminalWindowId = typeof transferItem?.value === "string" ? transferItem.value : undefined;
+
+    if (terminalWindowId === undefined) {
+      return;
+    }
+
+    const terminalWindow = this.source
+      .getSnapshot()
+      .terminalWindows.find((candidate) => candidate.id === terminalWindowId);
+
+    if (terminalWindow === undefined) {
+      void vscode.window.showWarningMessage("The dragged terminal window is no longer available.");
+      return;
+    }
+
+    await vscode.commands.executeCommand("portManager.attachTerminalToNetwork", {
+      terminalWindow,
+      network: target.network,
+    });
   }
 
   /**
@@ -120,6 +176,20 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
           "portManager.addHostAccessBinding",
           "arrow-swap",
           "Reach host port from network",
+          element.network,
+        ),
+        new ActionTreeItem(
+          "Save Binding Preset",
+          "portManager.saveBindingPreset",
+          "save",
+          "Save current bindings",
+          element.network,
+        ),
+        new ActionTreeItem(
+          "Apply Binding Preset",
+          "portManager.applyBindingPreset",
+          "cloud-download",
+          "Load saved bindings",
           element.network,
         ),
         ...(attachments.length > 0
@@ -165,6 +235,7 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
         return [
           new ActionTreeItem("Refresh Terminal Windows", "portManager.refreshTerminals", "refresh"),
           new ActionTreeItem("Attach Window to Network", "portManager.attachTerminalToNetwork", "debug-console"),
+          new ActionTreeItem("Reset Terminal Network", "portManager.resetTerminalNetworkSettings", "debug-disconnect"),
           ...(snapshot.terminalWindows.length > 0
             ? snapshot.terminalWindows.map((window) => new TerminalWindowTreeItem(window))
             : [new EmptyTreeItem("No terminal windows discovered", "Open a shell and refresh")]),
