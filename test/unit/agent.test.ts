@@ -60,6 +60,7 @@ test("registers native hook processes as hooked managed rows", async (context) =
       logicalPort: 8000,
       actualPort: 58000,
       host: "localhost",
+      cwd: "/workspace/app",
       networkId: "network-a",
       processId: process.id,
       processName: "node",
@@ -246,6 +247,7 @@ test("updates duplicate hooked registrations for the same active route", async (
       logicalPort: 8004,
       actualPort: 58000,
       host: "127.0.0.1",
+      cwd: "/workspace/app",
       networkId: "network-a",
       processId: first.id,
       processName: "python3",
@@ -378,6 +380,7 @@ test("allocates external routes without blocking on OS listener scans", async (c
   });
 
   assert.equal(allocation.actualPort, 8004);
+  assert.equal(allocation.logicalRoutes[0]?.cwd, "/workspace/app");
 });
 
 test("reserves OS listener ports even when availability probing reports them free", async (context) => {

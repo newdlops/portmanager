@@ -549,6 +549,36 @@ static int pm_json_string(const char *json, const char *key, char *buffer, size_
   return used > 0 ? 0 : -1;
 }
 
+static int pm_path_contains_or_equals(const char *candidate, const char *root) {
+  size_t root_length;
+
+  if (candidate == NULL || root == NULL || candidate[0] == '\0' || root[0] == '\0') {
+    return 0;
+  }
+
+  root_length = strlen(root);
+  if (strcmp(candidate, root) == 0) {
+    return 1;
+  }
+
+  return strncmp(candidate, root, root_length) == 0 && (root[root_length - 1] == '/' || candidate[root_length] == '/');
+}
+
+static int pm_route_matches_cwd(const char *route_json, const char *current_cwd) {
+  char route_cwd[PM_MAX_TEXT];
+
+  if (pm_json_string(route_json, "cwd", route_cwd, sizeof(route_cwd)) != 0) {
+    return 0;
+  }
+
+  /*
+   * Route cwd is usually the project root, while some launchers run from a
+   * package subdirectory. Accept either direction so worktree identity survives
+   * those launcher hops without leaking across sibling checkouts.
+   */
+  return pm_path_contains_or_equals(current_cwd, route_cwd) || pm_path_contains_or_equals(route_cwd, current_cwd);
+}
+
 static const char *pm_network_id_from_bash_env(void) {
   const char *bash_env = getenv("BASH_ENV");
   const char *base_name;
@@ -654,9 +684,9 @@ static int pm_route_network_match_level(const char *route_json) {
   if (network_id == NULL || network_id[0] == '\0') {
     /*
      * Some launcher chains briefly lose the scoped network env while keeping the
-     * injected hook alive. Prefer legacy unscoped rows, but still allow a scoped
-     * route as a fallback so localhost clients do not fall back to the physical
-     * logical port and become ambiguous in the VS Code router.
+     * injected hook alive. Prefer legacy unscoped rows; scoped rows are only a
+     * lower-priority fallback after the caller verifies the cwd still belongs to
+     * the same worktree.
      */
     return pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0 ? 2 : 1;
   }
@@ -918,6 +948,7 @@ static int pm_route_table_lookup(int source_port, int source_is_actual, char *ta
   char *cursor;
   int fallback_port = 0;
   char fallback_host[128];
+  char current_cwd[PM_MAX_TEXT];
 
   pm_default_route_table_path(path, sizeof(path));
   fd = open(path, O_RDONLY);
@@ -947,6 +978,7 @@ static int pm_route_table_lookup(int source_port, int source_is_actual, char *ta
   snprintf(needle, sizeof(needle), "\"%s\": %d", source_is_actual ? "actualPort" : "logicalPort", source_port);
   cursor = buffer;
   fallback_host[0] = '\0';
+  pm_cwd(current_cwd, sizeof(current_cwd));
 
   while ((cursor = strstr(cursor, needle)) != NULL) {
     char *object_start = cursor;
@@ -975,7 +1007,7 @@ static int pm_route_table_lookup(int source_port, int source_is_actual, char *ta
         return logical;
       }
 
-      if (fallback_port == 0) {
+      if (fallback_port == 0 && (source_is_actual || pm_route_matches_cwd(object_start, current_cwd))) {
         fallback_port = logical;
       }
     }
@@ -989,7 +1021,7 @@ static int pm_route_table_lookup(int source_port, int source_is_actual, char *ta
         return actual;
       }
 
-      if (fallback_port == 0) {
+      if (fallback_port == 0 && pm_route_matches_cwd(object_start, current_cwd)) {
         fallback_port = actual;
         if (pm_json_string(object_start, "host", fallback_host, sizeof(fallback_host)) != 0) {
           snprintf(fallback_host, sizeof(fallback_host), "127.0.0.1");

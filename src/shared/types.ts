@@ -407,6 +407,8 @@ export interface LogicalPortRoute {
   readonly actualPort: number;
   /** Host used for URLs and availability checks. */
   readonly host: string;
+  /** Working directory that produced this route, used as a fallback scope when launcher metadata is missing. */
+  readonly cwd?: string;
   /** Logical network scope this route belongs to, when allocated from an attached terminal. */
   readonly networkId?: string;
   /** Process row that owns this mapping when known. */

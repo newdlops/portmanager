@@ -134,6 +134,7 @@ test("snapshot merge keeps managed route context and adds external listeners", (
       logicalPort: 3000,
       actualPort: 3001,
       host: "localhost",
+      cwd: "/workspace/app",
       processId: "managed-1",
       processName: "web",
       status: "running",
