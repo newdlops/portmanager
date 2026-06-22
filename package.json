@@ -1,6 +1,6 @@
 {
   "name": "portmanager",
-  "displayName": "Port Manager",
+  "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
   "version": "0.0.1",
   "publisher": "newdlops",
