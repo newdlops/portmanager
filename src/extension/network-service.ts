@@ -13,6 +13,17 @@ import {
   type ContainerRuntimeTarget,
 } from "../platform/network/container-runtime";
 import { HostPortProxyManager, type HostPortProxyTarget } from "../platform/ports/host-port-proxy";
+import {
+  LogicalPortRouterManager,
+  type LogicalPortRouterConnection,
+  type LogicalPortRouterTarget,
+} from "../platform/ports/logical-port-router";
+import { NodeTcpConnectionProcessResolver } from "../platform/ports/tcp-connection-process-resolver";
+import {
+  buildProcessTreeContext,
+  NodeProcessTableProvider,
+  type ProcessTableRow,
+} from "../platform/process/node-process-table";
 import { NodeTerminalCandidateProvider } from "../platform/process/node-terminal-candidate-provider";
 import type {
   DisposableLike,
@@ -59,6 +70,15 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Local TCP proxy runtime used for concrete host exposure support. */
   private readonly proxyManager: HostPortProxyManager;
 
+  /** Localhost logical-port router used for app-agnostic internal calls. */
+  private readonly logicalPortRouter: LogicalPortRouterManager;
+
+  /** Resolves accepted TCP connection tuples back to client PIDs. */
+  private readonly tcpConnectionProcessResolver: NodeTcpConnectionProcessResolver;
+
+  /** Reads process ancestry so client and listener PIDs can be tied to terminals. */
+  private readonly processTableProvider: NodeProcessTableProvider;
+
   /** Container runtime adapter that provides actual same-port isolation. */
   private readonly containerRuntime: ContainerNetworkRuntimeAdapter;
 
@@ -74,13 +94,26 @@ export class PortManagerNetworkService implements DisposableLike {
     this.proxyManager = new HostPortProxyManager({
       resolve: (exposure) => this.resolveHostExposureTarget(exposure),
     });
+    this.logicalPortRouter = new LogicalPortRouterManager({
+      resolve: (connection) => this.resolveLogicalPortRouterTarget(connection),
+    });
+    this.tcpConnectionProcessResolver = new NodeTcpConnectionProcessResolver();
+    this.processTableProvider = new NodeProcessTableProvider();
     this.registry = new LogicalNetworkRegistry(BASE_RUNTIMES, this.loadState());
     this.disposables.push(
       this.registry.onDidChange(() => {
         this.saveState();
         void this.writeHostAccessBindingsFile();
+        void this.syncLogicalPortRouters();
       }),
     );
+    if (this.processService !== undefined) {
+      this.disposables.push(
+        this.processService.onDidChange(() => {
+          void this.syncLogicalPortRouters();
+        }),
+      );
+    }
   }
 
   /** Loads terminal candidates and reopens persisted host exposures. */
@@ -106,6 +139,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
     await this.refreshTerminals();
+    await this.syncLogicalPortRouters();
   }
 
   /** Returns the latest logical network snapshot for the sidebar. */
@@ -408,6 +442,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     this.registry.dispose();
     void this.proxyManager.dispose();
+    this.logicalPortRouter.dispose();
   }
 
   /** Reads persisted logical network state from VS Code global storage. */
@@ -466,6 +501,152 @@ export class PortManagerNetworkService implements DisposableLike {
       host: exposure.targetAddress,
       port: exposure.targetPort,
     };
+  }
+
+  /**
+   * Resolves a raw localhost logical-port connection to a network route.
+   * This path is intentionally application-agnostic: it uses only the accepted
+   * TCP tuple, process table ancestry, terminal attachments, and route rows.
+   */
+  private async resolveLogicalPortRouterTarget(
+    connection: LogicalPortRouterConnection,
+  ): Promise<LogicalPortRouterTarget> {
+    const clientProcess = await this.tcpConnectionProcessResolver.resolveClientProcess(connection);
+    const processRows = await this.processTableProvider.list();
+    const networkId =
+      clientProcess === undefined ? undefined : this.findAttachedNetworkForPid(clientProcess.pid, processRows);
+
+    if (networkId === undefined) {
+      const uniqueRoute = await this.findUniqueRouteForRouter(connection.logicalPort);
+      if (uniqueRoute === undefined) {
+        throw new Error(`No attached logical network found for localhost:${connection.logicalPort} client.`);
+      }
+
+      return {
+        host: uniqueRoute.host,
+        port: uniqueRoute.actualPort,
+      };
+    }
+
+    const route = await this.findNetworkRouteForRouter(networkId, connection.logicalPort, processRows);
+    if (route === undefined) {
+      throw new Error(`No route for logical port ${connection.logicalPort} in ${networkId}.`);
+    }
+
+    return {
+      host: route.host,
+      port: route.actualPort,
+    };
+  }
+
+  /** Opens localhost routers for every active logical route currently known. */
+  private async syncLogicalPortRouters(): Promise<void> {
+    if (this.processService === undefined) {
+      return;
+    }
+
+    const logicalPorts = this.processService
+      .getSnapshot()
+      .routes.filter(
+        (route) =>
+          route.actualPort !== route.logicalPort &&
+          (route.status === "running" || route.status === "starting"),
+      )
+      .map((route) => route.logicalPort);
+
+    await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);
+  }
+
+  /** Finds a route that belongs to the caller's terminal-bound logical network. */
+  private async findNetworkRouteForRouter(
+    networkId: string,
+    logicalPort: number,
+    processRows: readonly ProcessTableRow[],
+  ): Promise<LogicalPortRoute | undefined> {
+    if (this.processService === undefined) {
+      return undefined;
+    }
+
+    const snapshot = this.processService.getSnapshot();
+    const candidates = snapshot.routes.filter(
+      (route) =>
+        route.logicalPort === logicalPort &&
+        (route.status === "running" || route.status === "starting"),
+    );
+    const exactRoute = candidates.find((route) => route.networkId === networkId);
+
+    if (exactRoute !== undefined) {
+      return exactRoute;
+    }
+
+    for (const route of candidates) {
+      const process = route.processId === undefined ? undefined : snapshot.processes.find((item) => item.id === route.processId);
+      const routeNetworkId =
+        route.networkId ?? process?.networkId ?? (process === undefined ? undefined : this.findAttachedNetworkForPid(process.pid, processRows));
+
+      if (routeNetworkId === networkId) {
+        return route;
+      }
+    }
+
+    return candidates.length === 1 ? candidates[0] : undefined;
+  }
+
+  /**
+   * Allows host-side tooling to reach unambiguous routed ports.
+   * Debug adapters and browsers can originate outside an attached terminal; a
+   * single live route is still safe because there is no network choice to make.
+   */
+  private async findUniqueRouteForRouter(logicalPort: number): Promise<LogicalPortRoute | undefined> {
+    if (this.processService === undefined) {
+      return undefined;
+    }
+
+    const candidates = this.processService
+      .getSnapshot()
+      .routes.filter(
+        (route) =>
+          route.logicalPort === logicalPort &&
+          route.actualPort !== route.logicalPort &&
+          (route.status === "running" || route.status === "starting"),
+      );
+
+    return candidates.length === 1 ? candidates[0] : undefined;
+  }
+
+  /** Maps an arbitrary process PID back to the network attached to its terminal. */
+  private findAttachedNetworkForPid(pid: number, processRows: readonly ProcessTableRow[]): string | undefined {
+    const processContext = buildProcessTreeContext(processRows, pid);
+
+    if (processContext === undefined) {
+      return undefined;
+    }
+
+    for (const attachment of this.registry.getSnapshot().attachments) {
+      if (attachment.status !== "attached") {
+        continue;
+      }
+
+      if (attachment.rootPid === pid || processContext.ancestorPids.includes(attachment.rootPid)) {
+        return attachment.networkId;
+      }
+
+      if (
+        attachment.processGroupId !== undefined &&
+        processContext.row.processGroupId === attachment.processGroupId
+      ) {
+        return attachment.networkId;
+      }
+
+      if (
+        attachment.terminalWindowId?.startsWith("tty:") &&
+        processContext.row.terminalId === attachment.terminalWindowId.slice("tty:".length)
+      ) {
+        return attachment.networkId;
+      }
+    }
+
+    return undefined;
   }
 
   /** Rebuilds runtime descriptors from native hook support and installed container tools. */

@@ -550,6 +550,15 @@ static int pm_json_string(const char *json, const char *key, char *buffer, size_
 
 static const char *pm_current_network_id(void) {
   const char *network_id = getenv("PORT_MANAGER_NETWORK_ID");
+  const char *bash_env;
+  const char *base_name;
+  const char *prefix = "portmanager-bash-env-";
+  const char *suffix = ".sh";
+  size_t prefix_length = strlen(prefix);
+  size_t suffix_length = strlen(suffix);
+  size_t base_length;
+  size_t network_length;
+  static char network_id_from_bash_env[PM_MAX_TEXT];
 
   if (network_id == NULL || network_id[0] == '\0') {
     network_id = getenv("PORT_MANAGER_BORROWED_NETWORK_ID");
@@ -563,7 +572,40 @@ static const char *pm_current_network_id(void) {
     network_id = getenv("NEWDLOPS_PM_BORROWED_NETWORK_ID");
   }
 
-  return network_id;
+  if (network_id != NULL && network_id[0] != '\0') {
+    return network_id;
+  }
+
+  /*
+   * Some macOS shebang and package-manager boundaries preserve BASH_ENV while
+   * dropping the explicit network variables. The generated BASH_ENV filename is
+   * network-scoped, so it is a last-resort source of truth for route scoping.
+   */
+  bash_env = getenv("BASH_ENV");
+  if (bash_env == NULL || bash_env[0] == '\0') {
+    return network_id;
+  }
+
+  base_name = strrchr(bash_env, '/');
+  base_name = base_name == NULL ? bash_env : base_name + 1;
+  base_length = strlen(base_name);
+
+  if (base_length <= prefix_length + suffix_length || strncmp(base_name, prefix, prefix_length) != 0) {
+    return network_id;
+  }
+
+  if (strcmp(base_name + base_length - suffix_length, suffix) != 0) {
+    return network_id;
+  }
+
+  network_length = base_length - prefix_length - suffix_length;
+  if (network_length == 0 || network_length >= sizeof(network_id_from_bash_env)) {
+    return network_id;
+  }
+
+  memcpy(network_id_from_bash_env, base_name + prefix_length, network_length);
+  network_id_from_bash_env[network_length] = '\0';
+  return network_id_from_bash_env;
 }
 
 static void pm_network_scope_payload(char *buffer, size_t size) {
@@ -596,6 +638,21 @@ static int pm_route_matches_network(const char *route_json) {
   }
 
   return strcmp(route_network, network_id) == 0;
+}
+
+static int pm_route_network_match_level(const char *route_json) {
+  const char *network_id = pm_current_network_id();
+  char route_network[PM_MAX_TEXT];
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    return pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0 ? 2 : 0;
+  }
+
+  if (pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0) {
+    return 1;
+  }
+
+  return strcmp(route_network, network_id) == 0 ? 2 : 0;
 }
 
 static int pm_host_access_lookup(int logical_port, char *target_host, size_t target_host_size) {
@@ -846,6 +903,8 @@ static int pm_route_table_lookup(int source_port, int source_is_actual, char *ta
   ssize_t read_count;
   char needle[64];
   char *cursor;
+  int fallback_port = 0;
+  char fallback_host[128];
 
   pm_default_route_table_path(path, sizeof(path));
   fd = open(path, O_RDONLY);
@@ -874,12 +933,15 @@ static int pm_route_table_lookup(int source_port, int source_is_actual, char *ta
   buffer[read_count] = '\0';
   snprintf(needle, sizeof(needle), "\"%s\": %d", source_is_actual ? "actualPort" : "logicalPort", source_port);
   cursor = buffer;
+  fallback_host[0] = '\0';
 
   while ((cursor = strstr(cursor, needle)) != NULL) {
     char *object_start = cursor;
     char *object_end = strchr(cursor, '}');
+    char object_end_saved;
     int logical;
     int actual;
+    int match_level;
 
     while (object_start > buffer && *object_start != '{') {
       object_start--;
@@ -889,26 +951,51 @@ static int pm_route_table_lookup(int source_port, int source_is_actual, char *ta
       break;
     }
 
+    object_end_saved = *object_end;
     *object_end = '\0';
     logical = pm_json_int(object_start, "logicalPort", 0);
     actual = pm_json_int(object_start, "actualPort", 0);
-    if (source_is_actual && actual == source_port && pm_route_matches_network(object_start)) {
-      free(buffer);
-      return logical;
-    }
-
-    if (!source_is_actual && logical == source_port && pm_route_matches_network(object_start)) {
-      if (target_host != NULL && target_host_size > 0 && pm_json_string(object_start, "host", target_host, target_host_size) != 0) {
-        snprintf(target_host, target_host_size, "127.0.0.1");
+    match_level = pm_route_network_match_level(object_start);
+    if (source_is_actual && actual == source_port && match_level > 0) {
+      if (match_level == 2) {
+        free(buffer);
+        return logical;
       }
-      free(buffer);
-      return actual;
+
+      if (fallback_port == 0) {
+        fallback_port = logical;
+      }
     }
 
+    if (!source_is_actual && logical == source_port && match_level > 0) {
+      if (match_level == 2) {
+        if (target_host != NULL && target_host_size > 0 && pm_json_string(object_start, "host", target_host, target_host_size) != 0) {
+          snprintf(target_host, target_host_size, "127.0.0.1");
+        }
+        free(buffer);
+        return actual;
+      }
+
+      if (fallback_port == 0) {
+        fallback_port = actual;
+        if (pm_json_string(object_start, "host", fallback_host, sizeof(fallback_host)) != 0) {
+          snprintf(fallback_host, sizeof(fallback_host), "127.0.0.1");
+        }
+      }
+    }
+
+    *object_end = object_end_saved;
     cursor = object_end + 1;
   }
 
   free(buffer);
+  if (fallback_port > 0) {
+    if (!source_is_actual && target_host != NULL && target_host_size > 0) {
+      snprintf(target_host, target_host_size, "%s", fallback_host[0] == '\0' ? "127.0.0.1" : fallback_host);
+    }
+    return fallback_port;
+  }
+
   return 0;
 }
 
@@ -1008,6 +1095,7 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
     memcpy(&rewritten, addr, addrlen);
     pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
     pm_set_sockaddr_host((struct sockaddr *)&rewritten, target_host);
+    pm_debug("connect host-access logical=%d actual=%d host=%s", logical_port, actual_port, target_host);
     return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
   }
 
@@ -1023,6 +1111,7 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
   memcpy(&rewritten, addr, addrlen);
   pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
   pm_set_sockaddr_host((struct sockaddr *)&rewritten, target_host);
+  pm_debug("connect route logical=%d actual=%d host=%s", logical_port, actual_port, target_host);
   return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
 }
 

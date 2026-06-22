@@ -11,12 +11,14 @@
 - PID와 종료 이벤트 추적
 - 설정된 종료 신호 전달
 - OS process table에서 터미널 후보 탐색
+- OS process table에서 PID, PPID, PGID, TTY 관계 조회
 - UI가 터미널 창/세션으로 그룹화할 수 있는 tty, process group, console 식별자 제공
 
 ## 주요 진입점
 
 - `node-process-launcher.ts`
 - `node-runtime.ts`
+- `node-process-table.ts`
 - `node-terminal-candidate-provider.ts`
 
 ## 외부 의존성
