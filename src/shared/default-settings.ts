@@ -44,7 +44,7 @@ export const DEFAULT_PORT_MANAGER_SETTINGS: PortManagerSettings = {
   watchIntervalMs: 3000,
   notifyOnDetectedConflict: true,
   monitorAllListeningPorts: true,
-  detectTerminalListenFailures: true,
-  routeTerminalCommandsOnStart: true,
+  detectTerminalListenFailures: false,
+  routeTerminalCommandsOnStart: false,
   processKillSignal: "SIGTERM",
 };

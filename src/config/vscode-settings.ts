@@ -19,9 +19,7 @@ import type {
 const DEFAULT_SETTINGS: PortManagerSettings = DEFAULT_PORT_MANAGER_SETTINGS;
 const DEFAULT_CONTAINER_RUNTIME_SETTINGS: ContainerRuntimeSettings = {
   containerRuntime: "auto",
-  containerImage: "node:22-bookworm",
-  containerWorkspacePath: "/workspace",
-  containerShell: "/bin/sh",
+  containerImage: "alpine:3.20",
 };
 
 const VALID_SCAN_DIRECTIONS = new Set<ScanDirection>(["up", "down", "both"]);
@@ -104,17 +102,6 @@ export function readContainerRuntimeSettings(): ContainerRuntimeSettings {
       config.get<string>("containerImage", DEFAULT_CONTAINER_RUNTIME_SETTINGS.containerImage),
       DEFAULT_CONTAINER_RUNTIME_SETTINGS.containerImage,
     ),
-    containerWorkspacePath: normalizeAbsolutePath(
-      config.get<string>(
-        "containerWorkspacePath",
-        DEFAULT_CONTAINER_RUNTIME_SETTINGS.containerWorkspacePath,
-      ),
-      DEFAULT_CONTAINER_RUNTIME_SETTINGS.containerWorkspacePath,
-    ),
-    containerShell: normalizeAbsolutePath(
-      config.get<string>("containerShell", DEFAULT_CONTAINER_RUNTIME_SETTINGS.containerShell),
-      DEFAULT_CONTAINER_RUNTIME_SETTINGS.containerShell,
-    ),
   };
 }
 
@@ -175,12 +162,6 @@ function normalizeContainerRuntime(runtime: ContainerRuntimePreference): Contain
 function normalizeNonEmptyString(value: string, fallback: string): string {
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : fallback;
-}
-
-/** Keeps container paths absolute because Docker workdir and shell require it. */
-function normalizeAbsolutePath(value: string, fallback: string): string {
-  const trimmed = value.trim();
-  return trimmed.startsWith("/") ? trimmed : fallback;
 }
 
 /** Keeps the hashed actual-port pool inside a valid TCP range. */

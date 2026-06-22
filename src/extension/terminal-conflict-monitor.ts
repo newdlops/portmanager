@@ -27,6 +27,13 @@ import type { PortManagerProcessService } from "./process-service";
 export interface TerminalConflictMonitorOptions {
   /** Agent-backed service used to start the routed replacement command. */
   readonly processService: PortManagerProcessService;
+  /** Optional logical-network view used to ignore already attached terminals. */
+  readonly attachmentState?: TerminalAttachmentState;
+}
+
+export interface TerminalAttachmentState {
+  /** True when this terminal is already running under a logical-network runtime. */
+  isTerminalAttached(terminal: vscode.Terminal): Promise<boolean>;
 }
 
 export class TerminalConflictMonitor implements DisposableLike {
@@ -65,6 +72,10 @@ export class TerminalConflictMonitor implements DisposableLike {
   private async watchExecution(event: vscode.TerminalShellExecutionStartEvent): Promise<void> {
     const settings = readPortManagerSettings();
     if (!settings.detectTerminalListenFailures && !settings.routeTerminalCommandsOnStart) {
+      return;
+    }
+
+    if (await this.options.attachmentState?.isTerminalAttached(event.terminal)) {
       return;
     }
 

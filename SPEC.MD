@@ -61,14 +61,17 @@ Logical Network를 실제 시스템에서 구현하는 어댑터다. VS Code 확
 우선 검토 대상:
 
 - Container runtime adapter: Docker, Podman, Colima, nerdctl 같은 컨테이너/VM 기반 격리
+- Native socket hook adapter: 컨테이너를 띄우지 않고 attach 이후 실행되는 프로세스의 `bind/connect`를 pre-bind 단계에서 재매핑하는 컨테이너리스 격리
 - OS native adapter: Linux network namespace, macOS pf/utun/launch wrapper, Windows WFP/Hyper-V/WSL 기반 구현
 - Proxy adapter: 완전 격리는 아니지만 host exposure와 일부 outbound/inbound 라우팅을 제공하는 fallback
 
-Logical Network runtime은 컨테이너 또는 network namespace처럼 터미널 프로세스의 socket namespace를 실제로 분리해야 한다. 논리 네트워크에 속한 프로세스가 `127.0.0.1:3004`에 bind하더라도 그 포트는 호스트 namespace의 `3004`를 차지하면 안 된다. 호스트에서 접근 가능한 포트는 사용자가 만든 Host Port Exposure만 점유한다.
+Logical Network runtime은 컨테이너, network namespace, 또는 native socket hook처럼 터미널 프로세스의 socket bind가 호스트 포트를 직접 점유하지 않게 만들어야 한다. 논리 네트워크에 속한 프로세스가 `127.0.0.1:3004`에 bind하더라도 그 포트는 호스트 namespace의 `3004`를 차지하면 안 된다. 호스트에서 접근 가능한 포트는 사용자가 만든 Host Port Exposure만 점유한다.
+
+Logical Network 생성 시 사용자는 해당 네트워크가 사용할 runtime을 선택한다. Linux `Container` 선택지는 extension이 단일로 관리하는 전역 bridge network와 logical network별 network namespace holder를 사용하고, macOS/Linux `Borrowed Network` 선택지는 native socket hook을 사용해 선택한 터미널이 논리 네트워크를 빌리게 한다. 이 선택은 네트워크의 `runtimeKind`로 저장되며 attach/exposure 동작도 그 runtime을 따른다.
 
 `Local TCP Proxy`는 Host Port Exposure를 구현하는 보조 adapter로만 사용할 수 있다. 이 adapter는 host port listener/proxy를 열 수 있지만, 터미널 창을 컨테이너 수준으로 격리하지 못하고 같은 내부 포트 재사용도 보장하지 못한다. 따라서 `Local TCP Proxy`를 Logical Network runtime으로 선택하거나 terminal attach 성공으로 표시해서는 안 된다. 격리 가능한 runtime이 없으면 Logical Network 생성 또는 attach 단계에서 명확히 실패해야 한다.
 
-초기 격리 runtime은 Docker/Podman container adapter다. Logical Network 생성 시 전용 bridge network와 long-running development container를 만들고, terminal attach는 선택한 터미널에서 `docker exec` 또는 `podman exec`로 container shell에 진입시키는 방식으로 동작한다. 이 shell 안에서 시작한 개발 서버만 Logical Network 내부 포트로 간주한다.
+초기 격리 runtime은 Docker/Podman container adapter와 Native Socket Hook adapter다. Docker/Podman은 Linux에서만 extension 전역의 bridge network를 하나 만들고, 각 Logical Network마다 최소 holder container를 하나 두어 network namespace만 유지한다. terminal attach는 Linux에서 `nsenter --net`로 holder의 network namespace만 빌려 쓰며, 사용자의 파일시스템, 언어 런타임, shell 환경은 host terminal 그대로 유지해야 한다. macOS에서는 Docker Desktop의 Linux VM network namespace를 host 프로세스가 직접 빌릴 수 없으므로 Docker/Podman을 terminal attach runtime으로 사용하지 않는다. macOS의 Borrowed Network는 Native Socket Hook이 담당하며, 새 컨테이너를 만들지 않고 선택한 터미널 shell에 hook 환경을 주입한다. attach 이후 시작한 개발 서버만 Logical Network 내부 포트로 간주한다.
 
 #### Terminal Discovery
 
@@ -381,7 +384,8 @@ OS Listening Ports:
   "portManager.watchIntervalMs": 3000,
   "portManager.notifyOnDetectedConflict": true,
   "portManager.monitorAllListeningPorts": true,
-  "portManager.detectTerminalListenFailures": true,
+  "portManager.detectTerminalListenFailures": false,
+  "portManager.routeTerminalCommandsOnStart": false,
   "portManager.processKillSignal": "SIGTERM"
 }
 ```

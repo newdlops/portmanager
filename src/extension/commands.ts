@@ -12,11 +12,12 @@ import {
   getHostAccessBindingFromCommandArgument,
   getLogicalNetworkFromCommandArgument,
   getProcessFromCommandArgument,
+  getTerminalAttachmentFromCommandArgument,
   getTerminalWindowFromCommandArgument,
 } from "../ui/sidebar/port-manager-tree";
 import type { PortManagerNetworkService } from "./network-service";
 import type { PortManagerProcessService } from "./process-service";
-import { prepareAsdfShimLauncherDirectory } from "./terminal-hook-environment";
+import { prepareAsdfShimLauncherDirectory, prepareShellEnvRestoreScript } from "./terminal-hook-environment";
 import type {
   DisposableLike,
   HostAccessBinding,
@@ -28,6 +29,7 @@ import type {
   NetworkRuntimeKind,
   PortInjectionMode,
   PortManagerSettings,
+  TerminalAttachment,
   TerminalWindow,
 } from "../shared/types";
 
@@ -71,6 +73,9 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.refreshTerminals", () => this.refreshTerminals());
     this.registerCommand(context, "portManager.attachTerminalToNetwork", (argument) =>
       this.attachTerminalToNetwork(argument),
+    );
+    this.registerCommand(context, "portManager.detachTerminalFromNetwork", (argument) =>
+      this.detachTerminalFromNetwork(argument),
     );
     this.registerCommand(context, "portManager.addHostPortExposure", (argument) =>
       this.addHostPortExposure(argument),
@@ -176,6 +181,18 @@ export class PortManagerCommandController implements DisposableLike {
     await vscode.window.showInformationMessage(
       `Attached "${terminalWindow.title}" to "${network.name}" (${attachment.mode ?? "isolated"} mode).`,
     );
+  }
+
+  /** Detaches a terminal attachment and lets the runtime clean up terminal state. */
+  private async detachTerminalFromNetwork(argument: unknown): Promise<void> {
+    const attachment = await this.resolveTerminalAttachmentArgument(argument, "Detach Terminal from Network");
+    if (attachment === undefined) {
+      return;
+    }
+
+    await this.dependencies.networkService.detachTerminal(attachment.id);
+    this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage(`Detached "${attachment.terminalTitle ?? attachment.rootPid}".`);
   }
 
   /** Opens a host TCP listener/proxy for a network target port. */
@@ -615,6 +632,7 @@ export class PortManagerCommandController implements DisposableLike {
 
     await fs.mkdir(hookDirectory, { recursive: true });
     const asdfShimDirectory = prepareAsdfShimLauncherDirectory(hookDirectory, asdfShimLauncherPath);
+    const shellEnvRestorePath = prepareShellEnvRestoreScript(hookDirectory, hookLibraryPath);
     await fs.writeFile(
       hookScriptPath,
       buildShellHookScript({
@@ -626,6 +644,7 @@ export class PortManagerCommandController implements DisposableLike {
         hostAccessFilePath: getDefaultHostAccessBindingsPath(),
         settings,
         asdfShimDirectory,
+        shellEnvRestorePath,
       }),
       "utf8",
     );
@@ -748,6 +767,40 @@ export class PortManagerCommandController implements DisposableLike {
     );
 
     return selected?.terminalWindow;
+  }
+
+  /** Resolves a terminal attachment from tree context or Quick Pick. */
+  private async resolveTerminalAttachmentArgument(
+    argument: unknown,
+    title: string,
+  ): Promise<TerminalAttachment | undefined> {
+    const attachment = getTerminalAttachmentFromCommandArgument(argument);
+
+    if (attachment !== undefined) {
+      return this.dependencies.networkService
+        .getSnapshot()
+        .attachments.find((item) => item.id === attachment.id);
+    }
+
+    const snapshot = this.dependencies.networkService.getSnapshot();
+    if (snapshot.attachments.length === 0) {
+      await vscode.window.showInformationMessage("No terminal attachments exist.");
+      return undefined;
+    }
+
+    const selected = await vscode.window.showQuickPick(
+      snapshot.attachments.map((item) => {
+        const network = snapshot.networks.find((candidate) => candidate.id === item.networkId);
+        return {
+          label: item.terminalTitle ?? `PID ${item.rootPid}`,
+          description: `${network?.name ?? item.networkId} ${item.mode ?? "isolated"} ${item.status}`,
+          attachment: item,
+        };
+      }),
+      { title, placeHolder: "Select a terminal attachment" },
+    );
+
+    return selected?.attachment;
   }
 
   /** Resolves a host exposure from tree context or Quick Pick. */
@@ -903,7 +956,7 @@ async function promptForRuntimeKind(
 
   if (containerLevelRuntimes.length === 0) {
     await vscode.window.showErrorMessage(
-      "No container-level network runtime is available. Logical networks require isolated terminal processes; Local TCP Proxy is only for host exposure.",
+      buildNoLogicalRuntimeMessage(),
     );
     return undefined;
   }
@@ -914,13 +967,9 @@ async function promptForRuntimeKind(
 
   const selected = await vscode.window.showQuickPick(
     containerLevelRuntimes.map((runtime) => ({
-      label: runtime.name,
+      label: runtime.kind === "container" ? `Linux namespace: ${runtime.name}` : `Borrowed network: ${runtime.name}`,
       description: runtime.kind,
-      detail: [
-        runtime.capabilities.supportsSameInternalPorts ? "same internal ports" : "no same-port isolation",
-        runtime.capabilities.supportsTerminalAttach ? "terminal attach" : "no terminal attach",
-        runtime.capabilities.supportsHostExposure ? "host exposure" : "no host exposure",
-      ].join(", "),
+      detail: describeRuntimeChoice(runtime),
       runtime,
     })),
     {
@@ -935,6 +984,32 @@ async function promptForRuntimeKind(
 /** Logical network creation is limited to runtimes that can isolate terminal sockets. */
 function isContainerLevelRuntime(runtime: NetworkRuntimeDescriptor): boolean {
   return runtime.capabilities.supportsSameInternalPorts && runtime.capabilities.supportsTerminalAttach;
+}
+
+/** Explains the runtime choice in the create-network Quick Pick. */
+function describeRuntimeChoice(runtime: NetworkRuntimeDescriptor): string {
+  if (runtime.kind === "container") {
+    return "Linux only: uses one global bridge and a per-network holder, then attaches terminals with only the network namespace changed.";
+  }
+
+  if (runtime.kind === "nativeHelper") {
+    return "macOS/Linux: the selected terminal borrows a logical network through the native socket hook.";
+  }
+
+  return [
+    runtime.capabilities.supportsSameInternalPorts ? "same internal ports" : "no same-port isolation",
+    runtime.capabilities.supportsTerminalAttach ? "terminal attach" : "no terminal attach",
+    runtime.capabilities.supportsHostExposure ? "host exposure" : "no host exposure",
+  ].join(", ");
+}
+
+/** Gives platform-specific guidance when no attach-capable logical network runtime exists. */
+function buildNoLogicalRuntimeMessage(): string {
+  if (process.platform === "darwin") {
+    return "No borrowed network runtime is available. On macOS, build/enable the native socket hook; Docker/Podman namespace attach is Linux-only.";
+  }
+
+  return "No logical network runtime is available. Enable the native socket hook or install a Linux namespace runtime; Local TCP Proxy is only for host exposure.";
 }
 
 /** Uses workspace folder name as the default process label when possible. */
@@ -1075,6 +1150,8 @@ interface ShellHookScriptOptions {
   readonly settings: PortManagerSettings;
   /** Optional PATH directory that bypasses macOS asdf shell-script shims. */
   readonly asdfShimDirectory?: string;
+  /** Optional BASH_ENV fragment that restores DYLD after protected shebang boundaries. */
+  readonly shellEnvRestorePath?: string;
 }
 
 /** Builds the POSIX shell snippet that injects the native socket hook. */
@@ -1087,6 +1164,8 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
   const escapedHostAccessFilePath = shellDoubleQuote(options.hostAccessFilePath);
   const escapedAsdfShimDirectory =
     options.asdfShimDirectory !== undefined ? shellDoubleQuote(options.asdfShimDirectory) : undefined;
+  const escapedShellEnvRestorePath =
+    options.shellEnvRestorePath !== undefined ? shellDoubleQuote(options.shellEnvRestorePath) : undefined;
   const nodeRuntimePrefix = `${ELECTRON_RUN_AS_NODE}=1`;
 
   return `# Port Manager shell hook
@@ -1102,6 +1181,11 @@ export PORT_MANAGER_VIRTUAL_PORT_START="${options.settings.virtualPortRangeStart
 export PORT_MANAGER_VIRTUAL_PORT_END="${options.settings.virtualPortRangeEnd}"
 export PORT_MANAGER_FIXED_PROTOCOL_PORTS="${options.settings.fixedProtocolPorts.join(",")}"
 ${escapedAsdfShimDirectory !== undefined ? `export PATH="${escapedAsdfShimDirectory}:$PATH"` : ""}
+${escapedShellEnvRestorePath !== undefined ? `export PORT_MANAGER_DYLD_INSERT_LIBRARIES="${escapedHookLibraryPath}"
+if [ -n "\${BASH_ENV:-}" ] && [ "\${BASH_ENV}" != "${escapedShellEnvRestorePath}" ]; then
+  export PORT_MANAGER_PREV_BASH_ENV="\${BASH_ENV}"
+fi
+export BASH_ENV="${escapedShellEnvRestorePath}"` : ""}
 
 if [ -z "$\{PORT_MANAGER_HOOK_DAEMON_STARTED:-}" ]; then
   export PORT_MANAGER_HOOK_DAEMON_STARTED=1

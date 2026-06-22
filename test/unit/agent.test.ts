@@ -5,7 +5,7 @@ import * as path from "node:path";
 import test, { type TestContext } from "node:test";
 
 import { PortManagerAgent } from "../../src/agent/port-manager-agent";
-import type { ListeningPort, ProcessLauncher } from "../../src/shared/types";
+import type { ListeningPort, PortAvailabilityProvider, ProcessLauncher } from "../../src/shared/types";
 
 /**
  * Unit tests for daemon-side registration behavior.
@@ -27,6 +27,7 @@ test("registers native hook processes as hooked managed rows", async (context) =
   ];
   const agent = new PortManagerAgent({
     processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
     listeningPortProvider: {
       list: async () => listeners,
     },
@@ -68,6 +69,59 @@ test("registers native hook processes as hooked managed rows", async (context) =
   ]);
 
   listeners = [];
+});
+
+test("preserves pending allocation network scope when a hooked register omits it", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  let listeners: readonly ListeningPort[] = [];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const allocation = await agent.allocateRoute({
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+
+  listeners = [
+    createListener({
+      port: allocation.actualPort,
+      pid: 1234,
+    }),
+  ];
+
+  await agent.registerExistingProcess({
+    pid: 1234,
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    actualPort: allocation.actualPort,
+    host: "127.0.0.1",
+    allocationId: allocation.allocationId,
+    source: "hooked",
+  });
+
+  const snapshot = await agent.listSnapshot();
+
+  assert.equal(snapshot.routes[0]?.networkId, "network-a");
 });
 
 test("marks hooked process rows stopped when their OS listener disappears", async (context) => {
@@ -113,6 +167,15 @@ function createFakeLauncher(): ProcessLauncher {
     launch: async () => ({ pid: 1234, command: "node server.js" }),
     stop: async () => undefined,
     onExit: () => ({ dispose: () => undefined }),
+  };
+}
+
+function createAvailablePortProvider(): PortAvailabilityProvider {
+  return {
+    check: async (port) => ({
+      port,
+      available: true,
+    }),
   };
 }
 

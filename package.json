@@ -41,6 +41,7 @@
     "onCommand:portManager.removeLogicalNetwork",
     "onCommand:portManager.refreshTerminals",
     "onCommand:portManager.attachTerminalToNetwork",
+    "onCommand:portManager.detachTerminalFromNetwork",
     "onCommand:portManager.addHostPortExposure",
     "onCommand:portManager.addHostAccessBinding",
     "onCommand:portManager.removeHostAccessBinding",
@@ -119,6 +120,12 @@
         "title": "Port Manager: Attach Terminal Window to Network",
         "category": "Port Manager",
         "icon": "$(debug-console)"
+      },
+      {
+        "command": "portManager.detachTerminalFromNetwork",
+        "title": "Port Manager: Detach Terminal from Network",
+        "category": "Port Manager",
+        "icon": "$(debug-disconnect)"
       },
       {
         "command": "portManager.addHostPortExposure",
@@ -364,6 +371,11 @@
           "group": "terminal@2"
         },
         {
+          "command": "portManager.detachTerminalFromNetwork",
+          "when": "view == portManager.processes && viewItem == terminalAttachment",
+          "group": "terminal@3"
+        },
+        {
           "command": "portManager.addHostPortExposure",
           "when": "view == portManager.processes && viewItem == section.exposures",
           "group": "exposure@1"
@@ -532,22 +544,12 @@
             "docker",
             "podman"
           ],
-          "description": "Container runtime used for container-level logical networks."
+          "description": "Container runtime used for network-namespace holder containers."
         },
         "portManager.containerImage": {
           "type": "string",
-          "default": "node:22-bookworm",
-          "description": "Image used for long-lived per-network development containers."
-        },
-        "portManager.containerWorkspacePath": {
-          "type": "string",
-          "default": "/workspace",
-          "description": "Path where the workspace is mounted inside logical network containers."
-        },
-        "portManager.containerShell": {
-          "type": "string",
-          "default": "/bin/sh",
-          "description": "Interactive shell launched when attaching a terminal to a container logical network."
+          "default": "alpine:3.20",
+          "description": "Lightweight image used only to keep a logical network namespace alive. Application processes do not run inside this image."
         },
         "portManager.autoOpenBrowser": {
           "type": "boolean",
@@ -583,13 +585,13 @@
         },
         "portManager.detectTerminalListenFailures": {
           "type": "boolean",
-          "default": true,
-          "description": "Detect terminal bind/listen failures and offer to rerun the command through Port Manager routing."
+          "default": false,
+          "description": "Legacy recovery path: detect terminal bind/listen failures and offer to rerun the command through Port Manager routing."
         },
         "portManager.routeTerminalCommandsOnStart": {
           "type": "boolean",
-          "default": true,
-          "description": "When a VS Code terminal command explicitly requests a port, offer to stop it and rerun it through the Port Manager daemon before waiting for bind failure."
+          "default": false,
+          "description": "Legacy recovery path: when a VS Code terminal command explicitly requests a port, offer to stop it and rerun it through the Port Manager daemon before waiting for bind failure."
         },
         "portManager.processKillSignal": {
           "type": "string",

@@ -273,12 +273,8 @@ export interface PortManagerSettings {
 export interface ContainerRuntimeSettings {
   /** Preferred local container CLI. "auto" probes Docker first, then Podman. */
   readonly containerRuntime: ContainerRuntimePreference;
-  /** Image used for long-lived per-network development containers. */
+  /** Lightweight image used only to keep one network namespace holder alive. */
   readonly containerImage: string;
-  /** Workspace path mounted inside the container. */
-  readonly containerWorkspacePath: string;
-  /** Interactive shell launched when a terminal enters the container. */
-  readonly containerShell: string;
 }
 
 export interface ManagedProcess {

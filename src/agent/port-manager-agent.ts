@@ -421,11 +421,19 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Registers an already-running external process in the shared registry. */
   async registerExistingProcess(input: RegisteredProcessInput): Promise<ManagedProcess> {
+    const allocation =
+      input.allocationId !== undefined ? this.pendingRouteAllocations.get(input.allocationId) : undefined;
+
     if (input.allocationId !== undefined) {
       this.pendingRouteAllocations.delete(input.allocationId);
     }
 
-    const process = this.registry.register(input, {
+    const registeredInput =
+      input.networkId === undefined && allocation?.route.networkId !== undefined
+        ? { ...input, networkId: allocation.route.networkId }
+        : input;
+
+    const process = this.registry.register(registeredInput, {
       source: input.source === "hooked" ? "hooked" : "registered",
     });
     this.writeRouteTable(this.buildCurrentLogicalRoutes());

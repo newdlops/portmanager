@@ -259,6 +259,24 @@ static void pm_set_sockaddr_port(struct sockaddr *addr, int port) {
   }
 }
 
+static int pm_set_ipv4_mapped_ipv6(struct in6_addr *target, const char *host) {
+  struct in_addr v4;
+
+  if (strcmp(host, "localhost") == 0) {
+    host = "127.0.0.1";
+  }
+
+  if (inet_pton(AF_INET, host, &v4) != 1) {
+    return 0;
+  }
+
+  memset(target, 0, sizeof(*target));
+  target->s6_addr[10] = 0xff;
+  target->s6_addr[11] = 0xff;
+  memcpy(&target->s6_addr[12], &v4, sizeof(v4));
+  return 1;
+}
+
 static void pm_set_sockaddr_host(struct sockaddr *addr, const char *host) {
   if (host == NULL || host[0] == '\0') {
     return;
@@ -279,8 +297,7 @@ static void pm_set_sockaddr_host(struct sockaddr *addr, const char *host) {
   if (addr->sa_family == AF_INET6) {
     struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
 
-    if (strcmp(host, "localhost") == 0 || strcmp(host, "127.0.0.1") == 0) {
-      inet_pton(AF_INET6, "::1", &in6->sin6_addr);
+    if (pm_set_ipv4_mapped_ipv6(&in6->sin6_addr, host)) {
       return;
     }
 
@@ -531,8 +548,26 @@ static int pm_json_string(const char *json, const char *key, char *buffer, size_
   return used > 0 ? 0 : -1;
 }
 
-static void pm_network_scope_payload(char *buffer, size_t size) {
+static const char *pm_current_network_id(void) {
   const char *network_id = getenv("PORT_MANAGER_NETWORK_ID");
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    network_id = getenv("PORT_MANAGER_BORROWED_NETWORK_ID");
+  }
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    network_id = getenv("NEWDLOPS_PM_NETWORK_ID");
+  }
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    network_id = getenv("NEWDLOPS_PM_BORROWED_NETWORK_ID");
+  }
+
+  return network_id;
+}
+
+static void pm_network_scope_payload(char *buffer, size_t size) {
+  const char *network_id = pm_current_network_id();
   char network_json[PM_MAX_TEXT * 2];
 
   if (size == 0) {
@@ -549,7 +584,7 @@ static void pm_network_scope_payload(char *buffer, size_t size) {
 }
 
 static int pm_route_matches_network(const char *route_json) {
-  const char *network_id = getenv("PORT_MANAGER_NETWORK_ID");
+  const char *network_id = pm_current_network_id();
   char route_network[PM_MAX_TEXT];
 
   if (network_id == NULL || network_id[0] == '\0') {
@@ -780,9 +815,12 @@ static void pm_remember_route(int logical_port, int actual_port, const char *hos
   snprintf(slot->allocation_id, sizeof(slot->allocation_id), "%s", allocation_id);
 }
 
-static int pm_memory_actual_for_logical(int logical_port) {
+static int pm_memory_actual_for_logical(int logical_port, char *target_host, size_t target_host_size) {
   for (int index = 0; index < pm_route_count; index++) {
     if (pm_routes[index].logical_port == logical_port) {
+      if (target_host != NULL && target_host_size > 0) {
+        snprintf(target_host, target_host_size, "%s", pm_routes[index].host);
+      }
       return pm_routes[index].actual_port;
     }
   }
@@ -800,7 +838,7 @@ static int pm_memory_logical_for_actual(int actual_port) {
   return 0;
 }
 
-static int pm_route_table_lookup(int source_port, int source_is_actual) {
+static int pm_route_table_lookup(int source_port, int source_is_actual, char *target_host, size_t target_host_size) {
   char path[PM_MAX_PATH];
   char *buffer;
   int fd;
@@ -860,6 +898,9 @@ static int pm_route_table_lookup(int source_port, int source_is_actual) {
     }
 
     if (!source_is_actual && logical == source_port && pm_route_matches_network(object_start)) {
+      if (target_host != NULL && target_host_size > 0 && pm_json_string(object_start, "host", target_host, target_host_size) != 0) {
+        snprintf(target_host, target_host_size, "127.0.0.1");
+      }
       free(buffer);
       return actual;
     }
@@ -970,9 +1011,9 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
     return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
   }
 
-  actual_port = pm_memory_actual_for_logical(logical_port);
+  actual_port = pm_memory_actual_for_logical(logical_port, target_host, sizeof(target_host));
   if (actual_port == 0) {
-    actual_port = pm_route_table_lookup(logical_port, 0);
+    actual_port = pm_route_table_lookup(logical_port, 0, target_host, sizeof(target_host));
   }
 
   if (actual_port <= 0 || actual_port == logical_port) {
@@ -981,6 +1022,7 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
 
   memcpy(&rewritten, addr, addrlen);
   pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
+  pm_set_sockaddr_host((struct sockaddr *)&rewritten, target_host);
   return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
 }
 
@@ -1007,7 +1049,7 @@ static int pm_getsockname_hook(int sockfd, struct sockaddr *addr, socklen_t *add
   actual_port = pm_sockaddr_port(addr);
   logical_port = pm_memory_logical_for_actual(actual_port);
   if (logical_port == 0) {
-    logical_port = pm_route_table_lookup(actual_port, 1);
+    logical_port = pm_route_table_lookup(actual_port, 1, NULL, 0);
   }
 
   if (logical_port > 0 && logical_port != actual_port) {

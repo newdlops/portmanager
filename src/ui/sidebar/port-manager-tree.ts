@@ -122,6 +122,9 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
           "Reach host port from network",
           element.network,
         ),
+        ...(attachments.length > 0
+          ? [new ActionTreeItem("Detach Terminal", "portManager.detachTerminalFromNetwork", "debug-disconnect")]
+          : []),
         ...exposures.map((exposure) => new HostPortExposureTreeItem(exposure, [element.network])),
         ...hostAccessBindings.map((binding) => new HostAccessBindingTreeItem(binding)),
         ...attachments.map((attachment) => new TerminalAttachmentTreeItem(attachment)),
@@ -183,8 +186,8 @@ export class PortManagerTreeProvider implements vscode.TreeDataProvider<PortMana
             ? []
             : [
                 new PlannedFeatureTreeItem(
-                  "No container isolation runtime",
-                  "Local proxy cannot isolate terminal ports",
+                  "No terminal isolation runtime",
+                  "Local proxy cannot attach terminal ports",
                   "warning",
                 ),
               ]),
@@ -518,6 +521,19 @@ export function getTerminalWindowFromCommandArgument(argument: unknown): Termina
   return undefined;
 }
 
+/** Extracts a terminal attachment from a tree command argument. */
+export function getTerminalAttachmentFromCommandArgument(argument: unknown): TerminalAttachment | undefined {
+  if (argument instanceof TerminalAttachmentTreeItem) {
+    return argument.attachment;
+  }
+
+  if (isTerminalAttachment(argument)) {
+    return argument;
+  }
+
+  return undefined;
+}
+
 /** Extracts a host exposure from a tree command argument. */
 export function getHostPortExposureFromCommandArgument(argument: unknown): HostPortExposure | undefined {
   if (argument instanceof HostPortExposureTreeItem) {
@@ -552,6 +568,18 @@ function isHostAccessBinding(argument: unknown): argument is HostAccessBinding {
     "networkId" in argument &&
     "logicalPort" in argument &&
     "hostPort" in argument
+  );
+}
+
+function isTerminalAttachment(argument: unknown): argument is TerminalAttachment {
+  return (
+    typeof argument === "object" &&
+    argument !== null &&
+    "id" in argument &&
+    "networkId" in argument &&
+    "rootPid" in argument &&
+    "status" in argument &&
+    "attachedAt" in argument
   );
 }
 
@@ -697,7 +725,7 @@ function buildRuntimeTooltip(runtime: NetworkRuntimeDescriptor): vscode.Markdown
 
   if (!isContainerLevelRuntime(runtime)) {
     tooltip.appendMarkdown(
-      "\nWarning: this runtime cannot attach terminals as container-level logical networks.",
+      "\nWarning: this runtime cannot attach terminals as logical networks.",
     );
   }
 

@@ -9,17 +9,18 @@ import type {
 } from "../../shared/types";
 
 /**
- * Docker/Podman-backed runtime for container-level logical networks.
+ * Docker/Podman-backed runtime for network-namespace logical networks.
  *
  * The adapter owns low-level CLI calls and deterministic resource naming. The
  * extension service decides when a logical network should exist and records the
- * resulting domain state after this adapter has prepared the container.
+ * resulting domain state after this adapter has prepared the namespace holder.
  */
 
 const execFileAsync = promisify(execFile);
 const COMMAND_TIMEOUT_MS = 15_000;
 const INSPECT_TIMEOUT_MS = 2_000;
 const PORT_MANAGER_LABEL = "newdlops.portmanager";
+const GLOBAL_NETWORK_NAME = "portmanager-global";
 
 export interface ContainerRuntimeTarget {
   /** Host address reachable from the VS Code extension host. */
@@ -44,24 +45,31 @@ export type ContainerCommandRunner = (
 export interface ContainerNetworkRuntimeAdapterOptions {
   /** Injected command runner used by unit tests to avoid real Docker calls. */
   readonly runCommand?: ContainerCommandRunner;
+  /** Whether the host can enter container network namespaces without changing filesystem/runtime. */
+  readonly supportsHostNetworkNamespace?: boolean;
 }
 
 /**
- * Manages one long-lived container per logical network.
+ * Manages a single global bridge network and one namespace holder per logical network.
  *
- * A terminal "attach" enters that container through `docker exec`; application
- * servers therefore bind inside the container namespace instead of the host
- * namespace. Host ports are still opened only by explicit Host Port Exposure.
+ * The holder container is not a development environment. It only keeps a
+ * network namespace alive. On Linux, attach uses nsenter for that namespace
+ * only, so processes keep the user's host filesystem, binaries, and shell
+ * environment while their sockets bind away from the host namespace.
  */
 export class ContainerNetworkRuntimeAdapter {
   /** Concrete CLI selected by capability probing. */
   private executable: "docker" | "podman" | undefined;
+
+  /** True when host processes can enter a container network namespace directly. */
+  private readonly supportsHostNetworkNamespace: boolean;
 
   /** Low-level command runner; production uses child_process.execFile. */
   private readonly runCommand: ContainerCommandRunner;
 
   constructor(options: ContainerNetworkRuntimeAdapterOptions = {}) {
     this.runCommand = options.runCommand ?? runContainerCommand;
+    this.supportsHostNetworkNamespace = options.supportsHostNetworkNamespace ?? process.platform === "linux";
   }
 
   /** Returns a runtime descriptor when Docker or Podman is available. */
@@ -69,7 +77,7 @@ export class ContainerNetworkRuntimeAdapter {
     for (const executable of runtimeCandidates(settings.containerRuntime)) {
       if (await this.canRun(executable)) {
         this.executable = executable;
-        return descriptorForExecutable(executable);
+        return descriptorForExecutable(executable, this.supportsHostNetworkNamespace);
       }
     }
 
@@ -77,20 +85,16 @@ export class ContainerNetworkRuntimeAdapter {
     return undefined;
   }
 
-  /** Creates or starts the isolated container backing one logical network. */
-  async createNetwork(
-    network: LogicalNetwork,
-    settings: ContainerRuntimeSettings,
-    workspaceFolder: string | undefined,
-  ): Promise<void> {
+  /** Creates or starts the namespace holder backing one logical network. */
+  async createNetwork(network: LogicalNetwork, settings: ContainerRuntimeSettings): Promise<void> {
     const executable = this.requireExecutable();
     const resourceNames = containerResourceNames(network.id);
 
-    await this.ensureBridgeNetwork(executable, resourceNames.networkName, network.id);
-    await this.ensureContainer(executable, resourceNames, network, settings, workspaceFolder);
+    await this.ensureGlobalBridgeNetwork(executable);
+    await this.ensureNamespaceHolder(executable, resourceNames, network, settings);
   }
 
-  /** Stops and removes runtime resources for one logical network. */
+  /** Stops and removes the namespace holder for one logical network. */
   async removeNetwork(networkId: string): Promise<void> {
     const executable = this.requireExecutable();
     const resourceNames = containerResourceNames(networkId);
@@ -98,29 +102,32 @@ export class ContainerNetworkRuntimeAdapter {
     await this.runCommand(executable, ["rm", "-f", resourceNames.containerName], {
       timeoutMs: COMMAND_TIMEOUT_MS,
     }).catch(() => undefined);
-    await this.runCommand(executable, ["network", "rm", resourceNames.networkName], {
-      timeoutMs: COMMAND_TIMEOUT_MS,
-    }).catch(() => undefined);
   }
 
-  /** Builds the host-shell command that enters the network container. */
-  buildAttachCommand(networkId: string, settings: ContainerRuntimeSettings): string {
+  /** Builds the host-shell command that enters only the holder's network namespace. */
+  async buildAttachCommand(networkId: string): Promise<string> {
+    if (!this.supportsHostNetworkNamespace) {
+      throw new Error("Container network attach without changing the runtime environment requires Linux nsenter.");
+    }
+
     const executable = this.requireExecutable();
     const { containerName } = containerResourceNames(networkId);
-    const shell = normalizeContainerShell(settings.containerShell);
-    const workspacePath = normalizeContainerWorkspacePath(settings.containerWorkspacePath);
-    const innerCommand = `cd ${shellQuote(workspacePath)} && exec ${shellQuote(shell)} -l`;
+    const holderPid = await this.inspectContainerPid(executable, containerName);
+
+    if (holderPid <= 0) {
+      throw new Error(`Container namespace holder ${containerName} is not running.`);
+    }
 
     return [
-      executable,
-      "exec",
-      "-it",
-      "-w",
-      shellQuote(workspacePath),
-      shellQuote(containerName),
-      shellQuote(shell),
+      "nsenter",
+      "--target",
+      String(holderPid),
+      "--net",
+      "--preserve-credentials",
+      "--",
+      "sh",
       "-lc",
-      shellQuote(innerCommand),
+      shellQuote('cd "$PWD" && exec "${SHELL:-/bin/sh}" -l'),
     ].join(" ");
   }
 
@@ -147,7 +154,9 @@ export class ContainerNetworkRuntimeAdapter {
 
   /** Returns the selected runtime descriptor after a successful detect call. */
   getDescriptor(): NetworkRuntimeDescriptor | undefined {
-    return this.executable === undefined ? undefined : descriptorForExecutable(this.executable);
+    return this.executable === undefined
+      ? undefined
+      : descriptorForExecutable(this.executable, this.supportsHostNetworkNamespace);
   }
 
   /** Checks whether a candidate CLI is installed and responsive. */
@@ -160,9 +169,9 @@ export class ContainerNetworkRuntimeAdapter {
     }
   }
 
-  /** Ensures the per-network bridge network exists before starting containers. */
-  private async ensureBridgeNetwork(executable: string, networkName: string, networkId: string): Promise<void> {
-    if (await this.resourceExists(executable, ["network", "inspect", networkName])) {
+  /** Ensures the singleton bridge network exists before starting namespace holders. */
+  private async ensureGlobalBridgeNetwork(executable: string): Promise<void> {
+    if (await this.resourceExists(executable, ["network", "inspect", GLOBAL_NETWORK_NAME])) {
       return;
     }
 
@@ -174,20 +183,19 @@ export class ContainerNetworkRuntimeAdapter {
         "--label",
         `${PORT_MANAGER_LABEL}=1`,
         "--label",
-        `${PORT_MANAGER_LABEL}.network-id=${networkId}`,
-        networkName,
+        `${PORT_MANAGER_LABEL}.scope=global-network`,
+        GLOBAL_NETWORK_NAME,
       ],
       { timeoutMs: COMMAND_TIMEOUT_MS },
     );
   }
 
-  /** Creates the long-lived container if needed, otherwise starts it. */
-  private async ensureContainer(
+  /** Creates the long-lived network namespace holder if needed, otherwise starts it. */
+  private async ensureNamespaceHolder(
     executable: string,
     resourceNames: ContainerRuntimeResourceNames,
     network: LogicalNetwork,
     settings: ContainerRuntimeSettings,
-    workspaceFolder: string | undefined,
   ): Promise<void> {
     if (await this.resourceExists(executable, ["container", "inspect", resourceNames.containerName])) {
       await this.runCommand(executable, ["start", resourceNames.containerName], {
@@ -196,8 +204,6 @@ export class ContainerNetworkRuntimeAdapter {
       return;
     }
 
-    const workspacePath = normalizeContainerWorkspacePath(settings.containerWorkspacePath);
-    const shell = normalizeContainerShell(settings.containerShell);
     const args = [
       "run",
       "-d",
@@ -212,14 +218,10 @@ export class ContainerNetworkRuntimeAdapter {
       "--label",
       `${PORT_MANAGER_LABEL}.network-name=${network.name}`,
       "--network",
-      resourceNames.networkName,
+      GLOBAL_NETWORK_NAME,
     ];
 
-    if (workspaceFolder !== undefined) {
-      args.push("-v", `${workspaceFolder}:${workspacePath}`, "-w", workspacePath);
-    }
-
-    args.push(settings.containerImage, shell, "-lc", "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done");
+    args.push(settings.containerImage, "sh", "-lc", "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done");
 
     await this.runCommand(executable, args, { timeoutMs: COMMAND_TIMEOUT_MS });
   }
@@ -233,6 +235,18 @@ export class ContainerNetworkRuntimeAdapter {
     );
 
     return result.stdout.trim();
+  }
+
+  /** Reads the host-visible init PID so nsenter can borrow only the network namespace. */
+  private async inspectContainerPid(executable: string, containerName: string): Promise<number> {
+    const result = await this.runCommand(
+      executable,
+      ["container", "inspect", "-f", "{{.State.Pid}}", containerName],
+      { timeoutMs: INSPECT_TIMEOUT_MS },
+    );
+    const pid = Number.parseInt(result.stdout.trim(), 10);
+
+    return Number.isInteger(pid) ? pid : 0;
   }
 
   /** Tests for CLI resource existence without surfacing missing-resource errors. */
@@ -256,11 +270,9 @@ export class ContainerNetworkRuntimeAdapter {
 }
 
 interface ContainerRuntimeResourceNames {
-  /** Docker/Podman bridge network name for this logical network. */
-  readonly networkName: string;
-  /** Long-lived container name for terminal shells. */
+  /** Long-lived container name for the logical network namespace holder. */
   readonly containerName: string;
-  /** Container hostname shown inside the shell. */
+  /** Container hostname used only for runtime diagnostics. */
   readonly hostname: string;
 }
 
@@ -301,16 +313,19 @@ function runtimeCandidates(preference: ContainerRuntimePreference): readonly ("d
 }
 
 /** Builds a capability descriptor for the selected container CLI. */
-function descriptorForExecutable(executable: "docker" | "podman"): NetworkRuntimeDescriptor {
+function descriptorForExecutable(
+  executable: "docker" | "podman",
+  supportsHostNetworkNamespace: boolean,
+): NetworkRuntimeDescriptor {
   return {
     id: executable,
-    name: executable === "docker" ? "Docker Container Runtime" : "Podman Container Runtime",
+    name: executable === "docker" ? "Docker Network Namespace" : "Podman Network Namespace",
     kind: "container",
     capabilities: {
-      supportsSameInternalPorts: true,
-      supportsTerminalAttach: true,
+      supportsSameInternalPorts: supportsHostNetworkNamespace,
+      supportsTerminalAttach: supportsHostNetworkNamespace,
       supportsHostExposure: true,
-      requiresPrivilegedHelper: false,
+      requiresPrivilegedHelper: supportsHostNetworkNamespace,
       requiresContainerRuntime: true,
     },
   };
@@ -321,8 +336,7 @@ function containerResourceNames(networkId: string): ContainerRuntimeResourceName
   const suffix = sanitizeResourceName(networkId).slice(0, 48);
 
   return {
-    networkName: `portmanager-net-${suffix}`,
-    containerName: `portmanager-dev-${suffix}`,
+    containerName: `portmanager-netns-${suffix}`,
     hostname: `pm-${suffix}`.slice(0, 63),
   };
 }
@@ -333,19 +347,7 @@ function sanitizeResourceName(value: string): string {
   return sanitized.length > 0 ? sanitized : "network";
 }
 
-/** Normalizes the in-container workspace path used by run and exec commands. */
-function normalizeContainerWorkspacePath(value: string): string {
-  const trimmed = value.trim();
-  return trimmed.length > 0 && trimmed.startsWith("/") ? trimmed : "/workspace";
-}
-
-/** Normalizes the shell path used for keepalive and interactive attach. */
-function normalizeContainerShell(value: string): string {
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : "/bin/sh";
-}
-
-/** Quotes one value for a POSIX-like host or container shell. */
+/** Quotes one value for a POSIX-like shell command. */
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
