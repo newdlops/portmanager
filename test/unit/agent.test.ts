@@ -5,6 +5,7 @@ import * as path from "node:path";
 import test, { type TestContext } from "node:test";
 
 import { PortManagerAgent } from "../../src/agent/port-manager-agent";
+import { getNetworkRouteTablePath, getRouteTablePathForLogicalPort } from "../../src/agent/route-table";
 import type { ListeningPort, PortAvailabilityProvider, ProcessLauncher } from "../../src/shared/types";
 
 /**
@@ -68,6 +69,8 @@ test("registers native hook processes as hooked managed rows", async (context) =
       source: "hooked",
     },
   ]);
+  assert.deepEqual(readRouteTable(getNetworkRouteTablePath("network-a", routeTablePath)).routes, snapshot.routes);
+  assert.deepEqual(readRouteTable(getRouteTablePathForLogicalPort(8000, "network-a", routeTablePath)).routes, snapshot.routes);
 
   listeners = [];
 });
@@ -460,6 +463,189 @@ test("reuses pending route allocations for sender-first and receiver-first order
   assert.equal(laterSenderAllocation.actualPort, firstReceiverAllocation.actualPort);
 });
 
+test("reuses active receiver routes instead of creating sender-side pending routes", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const checkedPorts: number[] = [];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: {
+      check: async (port) => {
+        checkedPorts.push(port);
+        return {
+          port,
+          available: port !== 58000,
+        };
+      },
+    },
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 1234,
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    actualPort: 58000,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+
+  const allocation = await agent.allocateRoute({
+    name: "wait-on",
+    command: "wait-on http://localhost:8004/healthz",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+  const routeTable = readRouteTable(getNetworkRouteTablePath("network-a", routeTablePath));
+  const routeEntryTable = readRouteTable(getRouteTablePathForLogicalPort(8004, "network-a", routeTablePath));
+
+  assert.equal(allocation.allocationId, "");
+  assert.equal(allocation.actualPort, 58000);
+  assert.deepEqual(checkedPorts, []);
+  assert.equal(routeTable.routes.length, 1);
+  assert.equal((routeTable.routes[0] as { actualPort?: number }).actualPort, 58000);
+  assert.equal((routeTable.routes[0] as { source?: string }).source, "hooked");
+  assert.deepEqual(routeEntryTable.routes, routeTable.routes);
+});
+
+test("removes stale pending routes when a receiver registers without an allocation id", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const senderAllocation = await agent.allocateRoute({
+    name: "wait-on",
+    command: "wait-on http://localhost:8004/healthz",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+
+  await agent.registerExistingProcess({
+    pid: 1234,
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    actualPort: senderAllocation.actualPort,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+
+  const released = await agent.releaseRouteAllocation(senderAllocation.allocationId);
+  const routeTable = readRouteTable(getNetworkRouteTablePath("network-a", routeTablePath));
+  const routeEntryTable = readRouteTable(getRouteTablePathForLogicalPort(8004, "network-a", routeTablePath));
+
+  assert.equal(released, false);
+  assert.equal(routeTable.routes.length, 1);
+  assert.equal((routeTable.routes[0] as { actualPort?: number }).actualPort, senderAllocation.actualPort);
+  assert.equal((routeTable.routes[0] as { source?: string }).source, "hooked");
+  assert.deepEqual(routeEntryTable.routes, routeTable.routes);
+});
+
+test("serializes receiver registration behind in-flight sender allocation", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const checkStarted = deferred<void>();
+  const releaseCheck = deferred<void>();
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: {
+      check: async (port) => {
+        checkStarted.resolve();
+        await releaseCheck.promise;
+        return {
+          port,
+          available: true,
+        };
+      },
+    },
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const senderAllocationPromise = agent.allocateRoute({
+    name: "wait-on",
+    command: "wait-on http://localhost:8004/healthz",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58000,
+  });
+
+  await checkStarted.promise;
+
+  let receiverRegistered = false;
+  const receiverRegistrationPromise = agent
+    .registerExistingProcess({
+      pid: 1234,
+      name: "python3",
+      command: "python manage.py runserver 8004",
+      cwd: "/workspace/app",
+      requestedPort: 8004,
+      actualPort: 58000,
+      host: "127.0.0.1",
+      networkId: "network-a",
+      source: "hooked",
+    })
+    .then((process) => {
+      receiverRegistered = true;
+      return process;
+    });
+
+  await waitOneTurn();
+  assert.equal(receiverRegistered, false);
+
+  releaseCheck.resolve();
+  const [senderAllocation] = await Promise.all([senderAllocationPromise, receiverRegistrationPromise]);
+  const routeTable = readRouteTable(getNetworkRouteTablePath("network-a", routeTablePath));
+
+  assert.equal(senderAllocation.actualPort, 58000);
+  assert.equal(routeTable.routes.length, 1);
+  assert.equal((routeTable.routes[0] as { actualPort?: number }).actualPort, 58000);
+  assert.equal((routeTable.routes[0] as { source?: string }).source, "hooked");
+});
+
 test("reserves OS listener ports even when availability probing reports them free", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const listeners: readonly ListeningPort[] = [
@@ -536,6 +722,24 @@ async function runListenerPoll(agent: PortManagerAgent): Promise<void> {
   await (agent as unknown as { pollListeningPorts(): Promise<void> }).pollListeningPorts();
 }
 
+function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T | PromiseLike<T>) => void } {
+  let resolvePromise: (value: T | PromiseLike<T>) => void = () => undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+
+  return {
+    promise,
+    resolve: resolvePromise,
+  };
+}
+
+async function waitOneTurn(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
 function readRouteTable(routeTablePath: string): { routes: readonly unknown[] } {
   return JSON.parse(fs.readFileSync(routeTablePath, "utf8")) as { routes: readonly unknown[] };
 }
@@ -544,6 +748,12 @@ function createRouteTablePath(context: TestContext): string {
   const routeTablePath = path.join(os.tmpdir(), `portmanager-agent-test-${process.pid}-${Date.now()}.json`);
   context.after(() => {
     fs.rmSync(routeTablePath, { force: true });
+    const parsedPath = path.parse(routeTablePath);
+    for (const fileName of fs.readdirSync(parsedPath.dir)) {
+      if (fileName.startsWith(`${parsedPath.name}-`) && fileName.endsWith(parsedPath.ext)) {
+        fs.rmSync(path.join(parsedPath.dir, fileName), { force: true });
+      }
+    }
   });
 
   return routeTablePath;

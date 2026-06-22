@@ -5,7 +5,12 @@ import * as path from "node:path";
 import { ManagedProcessRegistry } from "../core/process-registry";
 import { PortRoutingService } from "../core/port-routing";
 import { SimpleEventEmitter } from "../shared/events";
-import { getDefaultRouteTablePath } from "./route-table";
+import {
+  getDefaultRouteTablePath,
+  getNetworkRouteTablePath,
+  getRouteTablePathForLogicalPort,
+  getRouteTablePathForNetwork,
+} from "./route-table";
 import type {
   AgentAllocateRouteRequest,
   AgentSnapshot,
@@ -226,8 +231,14 @@ export class PortManagerAgent implements DisposableLike {
   /** Last broadcast signature, used to skip unchanged polling updates. */
   private lastSnapshotSignature = "";
 
-  /** Last route table content signature, used to avoid timer-driven file churn. */
-  private lastRouteTableSignature = "";
+  /** Last route table content signature by file path, used to avoid timer-driven file churn. */
+  private readonly routeTableSignaturesByPath = new Map<string, string>();
+
+  /** Network ids that already had a scoped table, so empty updates can clear stale rows. */
+  private readonly writtenRouteTableNetworkIds = new Set<string>();
+
+  /** Route-entry files written for individual logical endpoints. */
+  private readonly writtenRouteTableEntryPaths = new Set<string>();
 
   /** Node net server once listen() has been called. */
   private server: Server | undefined;
@@ -270,6 +281,7 @@ export class PortManagerAgent implements DisposableLike {
     this.defaultHost = options.defaultHost ?? "localhost";
     this.defaultCwd = options.defaultCwd ?? process.cwd();
     this.routeTablePath = options.routeTablePath ?? getDefaultRouteTablePath();
+    this.clearStaleScopedRouteTables();
     this.agentMainPath = options.agentMainPath;
     this.listenerScanIntervalMs = normalizeListenerScanInterval(options.listenerScanIntervalMs);
     this.externalListenerGraceMs = normalizeExternalListenerGraceMs(options.externalListenerGraceMs);
@@ -347,6 +359,24 @@ export class PortManagerAgent implements DisposableLike {
       this.cleanupExpiredRouteAllocations();
 
       const networkRouteScope = normalizeNetworkId(input.networkId);
+      const activeRoute = this.findReusableActiveRoute(input.requestedPort, networkRouteScope);
+      if (activeRoute !== undefined) {
+        const logicalRoutes = this.buildCurrentLogicalRoutes();
+        this.writeRouteTable(logicalRoutes);
+        this.queueSnapshotBroadcast();
+
+        return {
+          allocationId: "",
+          requestedPort: input.requestedPort,
+          actualPort: activeRoute.actualPort,
+          host: activeRoute.host,
+          routed: activeRoute.actualPort !== input.requestedPort,
+          logicalRoutes,
+          logicalRoutesFile: getRouteTablePathForNetwork(networkRouteScope, this.routeTablePath),
+          expiresAt: this.now().toISOString(),
+        };
+      }
+
       const reusableAllocation = this.findReusablePendingRouteAllocation(input.requestedPort, networkRouteScope);
       if (reusableAllocation !== undefined) {
         const refreshedAllocation = this.refreshPendingRouteAllocation(reusableAllocation);
@@ -361,7 +391,7 @@ export class PortManagerAgent implements DisposableLike {
           host: refreshedAllocation.route.host,
           routed: refreshedAllocation.route.actualPort !== input.requestedPort,
           logicalRoutes,
-          logicalRoutesFile: this.routeTablePath,
+          logicalRoutesFile: getRouteTablePathForNetwork(networkRouteScope, this.routeTablePath),
           expiresAt: new Date(refreshedAllocation.expiresAtMs).toISOString(),
         };
       }
@@ -397,14 +427,19 @@ export class PortManagerAgent implements DisposableLike {
         host: input.host,
         routed: decision.routed,
         logicalRoutes,
-        logicalRoutesFile: this.routeTablePath,
+        logicalRoutesFile: getRouteTablePathForNetwork(networkRouteScope, this.routeTablePath),
         expiresAt: new Date(expiresAtMs).toISOString(),
       };
     });
   }
 
   /** Releases a pending route allocation that did not become a process row. */
-  releaseRouteAllocation(allocationId: string): boolean {
+  async releaseRouteAllocation(allocationId: string): Promise<boolean> {
+    return this.runExclusiveRouteOperation(async () => this.releaseRouteAllocationExclusive(allocationId));
+  }
+
+  /** Releases a pending allocation while the route-state queue is held. */
+  private releaseRouteAllocationExclusive(allocationId: string): boolean {
     const released = this.pendingRouteAllocations.delete(allocationId);
 
     if (released) {
@@ -487,6 +522,11 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Registers an already-running external process in the shared registry. */
   async registerExistingProcess(input: RegisteredProcessInput): Promise<ManagedProcess> {
+    return this.runExclusiveRouteOperation(async () => this.registerExistingProcessExclusive(input));
+  }
+
+  /** Registers an external process while pending routes and table writes are serialized. */
+  private async registerExistingProcessExclusive(input: RegisteredProcessInput): Promise<ManagedProcess> {
     const allocation =
       input.allocationId !== undefined ? this.pendingRouteAllocations.get(input.allocationId) : undefined;
 
@@ -503,6 +543,7 @@ export class PortManagerAgent implements DisposableLike {
       registeredInput,
       input.source === "hooked" ? "hooked" : "registered",
     );
+    this.removePendingRouteAllocationsForIdentity(process.requestedPort, normalizeNetworkId(process.networkId));
     this.missingListenerStateByProcessId.delete(process.id);
     this.writeRouteTable(this.buildCurrentLogicalRoutes());
 
@@ -514,6 +555,14 @@ export class PortManagerAgent implements DisposableLike {
    * create, but the registry is still marked stopped so users can clear rows.
    */
   async stopProcess(id: string, signal: ProcessKillSignal = this.defaultKillSignal): Promise<ManagedProcess | undefined> {
+    return this.runExclusiveRouteOperation(async () => this.stopProcessExclusive(id, signal));
+  }
+
+  /** Stops a process while route table updates remain ordered with allocations. */
+  private async stopProcessExclusive(
+    id: string,
+    signal: ProcessKillSignal = this.defaultKillSignal,
+  ): Promise<ManagedProcess | undefined> {
     const process = this.registry.get(id);
 
     if (process === undefined) {
@@ -622,6 +671,11 @@ export class PortManagerAgent implements DisposableLike {
    * the latest listening-port scan.
    */
   async removeProcess(id: string): Promise<ManagedProcess | undefined> {
+    return this.runExclusiveRouteOperation(async () => this.removeProcessExclusive(id));
+  }
+
+  /** Removes a process while route table updates remain ordered with allocations. */
+  private async removeProcessExclusive(id: string): Promise<ManagedProcess | undefined> {
     const removedProcess = this.registry.remove(id);
     this.launchProfilesByProcessId.delete(id);
     this.missingListenerStateByProcessId.delete(id);
@@ -949,6 +1003,26 @@ export class PortManagerAgent implements DisposableLike {
   }
 
   /**
+   * Finds a running receiver route for the same logical endpoint.
+   * A sender whose route-file lookup missed should attach to this live mapping
+   * instead of creating a new pending route that can shadow the receiver.
+   */
+  private findReusableActiveRoute(logicalPort: number, networkId: string | undefined): LogicalPortRoute | undefined {
+    const routeIdentity = buildLogicalRouteIdentity({
+      logicalPort,
+      actualPort: logicalPort,
+      host: this.defaultHost,
+      ...(networkId ? { networkId } : {}),
+      status: "running",
+      source: "hooked",
+    });
+
+    return buildLogicalRoutes(this.registry.list(), []).find(
+      (route) => buildLogicalRouteIdentity(route) === routeIdentity,
+    );
+  }
+
+  /**
    * Finds a live sender/receiver reservation for the same logical endpoint.
    * Both bind() and connect() use allocateRoute; whichever arrives second must
    * converge on the actual port chosen by the first side.
@@ -969,6 +1043,24 @@ export class PortManagerAgent implements DisposableLike {
     return [...this.pendingRouteAllocations.values()].find(
       (allocation) => buildLogicalRouteIdentity(allocation.route) === routeIdentity,
     );
+  }
+
+  /** Removes stale sender-first reservations once a receiver is authoritative. */
+  private removePendingRouteAllocationsForIdentity(logicalPort: number, networkId: string | undefined): void {
+    const routeIdentity = buildLogicalRouteIdentity({
+      logicalPort,
+      actualPort: logicalPort,
+      host: this.defaultHost,
+      ...(networkId ? { networkId } : {}),
+      status: "starting",
+      source: "allocated",
+    });
+
+    for (const [allocationId, allocation] of this.pendingRouteAllocations) {
+      if (buildLogicalRouteIdentity(allocation.route) === routeIdentity) {
+        this.pendingRouteAllocations.delete(allocationId);
+      }
+    }
   }
 
   /** Extends a reused endpoint reservation so retrying clients keep it alive. */
@@ -1038,24 +1130,124 @@ export class PortManagerAgent implements DisposableLike {
     }
   }
 
-  /** Writes the latest dynamic route table for already-running children. */
+  /** Writes the latest dynamic route table for active and pending logical routes. */
   private writeRouteTable(routes: readonly LogicalPortRoute[]): void {
+    this.writeRouteEntryFiles(routes);
+    this.writeRouteTableFile(this.routeTablePath, routes);
+
+    const currentNetworkIds = new Set<string>();
+    const routesByNetworkId = new Map<string, LogicalPortRoute[]>();
+
+    for (const route of routes) {
+      const networkId = normalizeNetworkId(route.networkId);
+      if (networkId === undefined) {
+        continue;
+      }
+
+      currentNetworkIds.add(networkId);
+      routesByNetworkId.set(networkId, [...(routesByNetworkId.get(networkId) ?? []), route]);
+    }
+
+    /*
+     * Network-scoped route tables reduce cross-network file contention. The
+     * union with previously written networks lets us replace removed networks
+     * with an empty complete table instead of leaving stale rows behind.
+     */
+    const networkIdsToWrite = new Set([...this.writtenRouteTableNetworkIds, ...currentNetworkIds]);
+    for (const networkId of networkIdsToWrite) {
+      const networkRoutes = routesByNetworkId.get(networkId) ?? [];
+      const writeSucceeded = this.writeRouteTableFile(
+        getNetworkRouteTablePath(networkId, this.routeTablePath),
+        networkRoutes,
+      );
+
+      if (!writeSucceeded) {
+        continue;
+      }
+
+      if (currentNetworkIds.has(networkId)) {
+        this.writtenRouteTableNetworkIds.add(networkId);
+      } else {
+        this.writtenRouteTableNetworkIds.delete(networkId);
+      }
+    }
+  }
+
+  /** Writes one small route file per logical endpoint to remove shared-file polling races. */
+  private writeRouteEntryFiles(routes: readonly LogicalPortRoute[]): void {
+    const currentRouteEntryPaths = new Set<string>();
+
+    for (const route of routes) {
+      const routeEntryPath = getRouteTablePathForLogicalPort(
+        route.logicalPort,
+        normalizeNetworkId(route.networkId),
+        this.routeTablePath,
+      );
+
+      if (this.writeRouteTableFile(routeEntryPath, [route])) {
+        currentRouteEntryPaths.add(routeEntryPath);
+      }
+    }
+
+    for (const staleRouteEntryPath of this.writtenRouteTableEntryPaths) {
+      if (currentRouteEntryPaths.has(staleRouteEntryPath)) {
+        continue;
+      }
+
+      try {
+        fs.rmSync(staleRouteEntryPath, { force: true });
+        this.routeTableSignaturesByPath.delete(staleRouteEntryPath);
+      } catch {
+        // Best-effort stale route cleanup. Missing files fall back to daemon
+        // allocation, so route table cleanup must not fail process lifecycle.
+      }
+    }
+
+    this.writtenRouteTableEntryPaths.clear();
+    for (const routeEntryPath of currentRouteEntryPaths) {
+      this.writtenRouteTableEntryPaths.add(routeEntryPath);
+    }
+  }
+
+  /** Atomically replaces one route table file when its content changed. */
+  private writeRouteTableFile(routeTablePath: string, routes: readonly LogicalPortRoute[]): boolean {
     const routeTableSignature = buildRouteTableSignature(routes);
-    if (routeTableSignature === this.lastRouteTableSignature && fs.existsSync(this.routeTablePath)) {
-      return;
+    if (routeTableSignature === this.routeTableSignaturesByPath.get(routeTablePath) && fs.existsSync(routeTablePath)) {
+      return true;
     }
 
     try {
-      fs.mkdirSync(path.dirname(this.routeTablePath), { recursive: true });
-      fs.writeFileSync(
-        this.routeTablePath,
+      fs.mkdirSync(path.dirname(routeTablePath), { recursive: true });
+      writeAtomicRouteTableFile(
+        routeTablePath,
         `${JSON.stringify({ updatedAt: this.now().toISOString(), routes }, null, 2)}\n`,
-        "utf8",
       );
-      this.lastRouteTableSignature = routeTableSignature;
+      this.routeTableSignaturesByPath.set(routeTablePath, routeTableSignature);
+      return true;
     } catch {
       // Route table file updates are a convenience channel. Snapshot delivery
       // and managed process lifecycle should continue if the write fails.
+      return false;
+    }
+  }
+
+  /**
+   * Removes network-scoped tables left by a previous daemon generation.
+   * The global table is overwritten by the next snapshot for backward
+   * compatibility, but scoped files are otherwise invisible until reused.
+   */
+  private clearStaleScopedRouteTables(): void {
+    const parsedPath = path.parse(this.routeTablePath);
+
+    try {
+      for (const fileName of fs.readdirSync(parsedPath.dir)) {
+        if (fileName.startsWith(`${parsedPath.name}-`) && fileName.endsWith(parsedPath.ext)) {
+          fs.rmSync(path.join(parsedPath.dir, fileName), { force: true });
+        }
+      }
+    } catch {
+      // Stale scoped tables are best-effort cleanup; routing can still use
+      // daemon allocation responses if filesystem cleanup is unavailable.
     }
   }
 
@@ -1222,13 +1414,15 @@ function buildLogicalRoutes(
       source: process.source ?? "managed",
     }));
 
-  return dedupeLogicalRoutes([...routes, ...pendingRoutes.map((route) => ({ ...route }))]);
+  return dedupeLogicalRoutes([...pendingRoutes.map((route) => ({ ...route })), ...routes]);
 }
 
 /**
  * The native route lookup is keyed by logical port and network scope. If a dev
- * server re-registers during rapid restarts, only the newest mapping for that
- * identity should remain visible to child processes.
+ * server re-registers during rapid restarts, only the newest active mapping
+ * for that identity should remain visible to child processes. Pending routes
+ * are listed before active routes so a live receiver remains authoritative if
+ * stale sender-first reservations overlap it.
  */
 function dedupeLogicalRoutes(routes: readonly LogicalPortRoute[]): readonly LogicalPortRoute[] {
   const routesByIdentity = new Map<string, LogicalPortRoute>();
@@ -1460,6 +1654,27 @@ function buildSnapshotSignature(snapshot: AgentSnapshot): string {
 /** Builds a content-only route table signature for write de-duplication. */
 function buildRouteTableSignature(routes: readonly LogicalPortRoute[]): string {
   return JSON.stringify(buildRouteSignatureRows(routes));
+}
+
+/**
+ * Replaces a route table without exposing partial JSON to native hook readers.
+ * Readers either see the previous complete file or the new complete file.
+ */
+function writeAtomicRouteTableFile(routeTablePath: string, content: string): void {
+  const temporaryPath = `${routeTablePath}.${process.pid}.${randomUUID()}.tmp`;
+
+  try {
+    fs.writeFileSync(temporaryPath, content, "utf8");
+    fs.renameSync(temporaryPath, routeTablePath);
+  } catch (error) {
+    try {
+      fs.rmSync(temporaryPath, { force: true });
+    } catch {
+      // Best-effort cleanup only; the original write error is more useful.
+    }
+
+    throw error;
+  }
 }
 
 /** Normalizes route rows so snapshot and route-file signatures stay aligned. */

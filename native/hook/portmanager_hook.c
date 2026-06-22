@@ -207,6 +207,23 @@ static void pm_default_route_table_path(char *buffer, size_t size) {
   snprintf(buffer, size, "/tmp/newdlops-portmanager-routes-%ld.json", (long)getuid());
 }
 
+static void pm_route_entry_path(const char *route_table_path, int logical_port, char *buffer, size_t size) {
+  const char *file_name;
+  const char *extension;
+
+  file_name = strrchr(route_table_path, '/');
+  file_name = file_name == NULL ? route_table_path : file_name + 1;
+  extension = strrchr(file_name, '.');
+
+  if (extension != NULL) {
+    size_t prefix_length = (size_t)(extension - route_table_path);
+    snprintf(buffer, size, "%.*s-port-%d%s", (int)prefix_length, route_table_path, logical_port, extension);
+    return;
+  }
+
+  snprintf(buffer, size, "%s-port-%d.json", route_table_path, logical_port);
+}
+
 static void pm_default_host_access_path(char *buffer, size_t size) {
   const char *configured = getenv("PORT_MANAGER_HOST_ACCESS_FILE");
 
@@ -938,8 +955,12 @@ static int pm_memory_logical_for_actual(int actual_port) {
   return 0;
 }
 
-static int pm_route_table_lookup(int source_port, int source_is_actual, char *target_host, size_t target_host_size) {
-  char path[PM_MAX_PATH];
+static int pm_route_table_lookup_file(
+  const char *path,
+  int source_port,
+  int source_is_actual,
+  char *target_host,
+  size_t target_host_size) {
   char *buffer;
   int fd;
   struct stat stat_buffer;
@@ -950,7 +971,6 @@ static int pm_route_table_lookup(int source_port, int source_is_actual, char *ta
   char fallback_host[128];
   char current_cwd[PM_MAX_TEXT];
 
-  pm_default_route_table_path(path, sizeof(path));
   fd = open(path, O_RDONLY);
   if (fd < 0) {
     return 0;
@@ -1044,6 +1064,33 @@ static int pm_route_table_lookup(int source_port, int source_is_actual, char *ta
   return 0;
 }
 
+static int pm_route_table_lookup(int source_port, int source_is_actual, char *target_host, size_t target_host_size) {
+  char path[PM_MAX_PATH];
+  char route_entry_path[PM_MAX_PATH];
+  int route_entry_port;
+
+  pm_default_route_table_path(path, sizeof(path));
+  if (!source_is_actual) {
+    /*
+     * Sender polling can hammer several logical ports at once. Try the
+     * per-endpoint route file first so unrelated logical ports never race on
+     * the shared network aggregate.
+     */
+    pm_route_entry_path(path, source_port, route_entry_path, sizeof(route_entry_path));
+    route_entry_port = pm_route_table_lookup_file(
+      route_entry_path,
+      source_port,
+      source_is_actual,
+      target_host,
+      target_host_size);
+    if (route_entry_port > 0) {
+      return route_entry_port;
+    }
+  }
+
+  return pm_route_table_lookup_file(path, source_port, source_is_actual, target_host, target_host_size);
+}
+
 static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   struct sockaddr_storage rewritten;
   char host[128];
@@ -1074,24 +1121,30 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
 
   pm_sockaddr_host(addr, host, sizeof(host));
   allocation_id[0] = '\0';
-  actual_port = logical_port;
+  actual_port = pm_route_table_lookup(logical_port, 0, host, sizeof(host));
 
   result = -1;
   for (int attempt = 0; attempt < PM_BIND_ALLOCATION_ATTEMPTS; attempt++) {
-    allocation_id[0] = '\0';
-    actual_port = logical_port;
+    int route_table_candidate = actual_port > 0 && attempt == 0;
 
-    pm_hook_depth++;
-    if (pm_allocate_route(logical_port, host, &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
-      pm_hook_depth--;
-      if (attempt + 1 < PM_BIND_ALLOCATION_ATTEMPTS) {
-        usleep(50000);
-        continue;
+    if (!route_table_candidate) {
+      allocation_id[0] = '\0';
+      actual_port = logical_port;
+
+      pm_hook_depth++;
+      if (pm_allocate_route(logical_port, host, &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
+        pm_hook_depth--;
+        if (attempt + 1 < PM_BIND_ALLOCATION_ATTEMPTS) {
+          usleep(50000);
+          continue;
+        }
+        errno = EAGAIN;
+        return -1;
       }
-      errno = EAGAIN;
-      return -1;
+      pm_hook_depth--;
+    } else {
+      pm_debug("bind reusing route table logical=%d actual=%d host=%s", logical_port, actual_port, host);
     }
-    pm_hook_depth--;
 
     memcpy(&rewritten, addr, addrlen);
     pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
@@ -1103,7 +1156,9 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
 
     {
       int saved_errno = errno;
-      pm_release_allocation(allocation_id);
+      if (!route_table_candidate) {
+        pm_release_allocation(allocation_id);
+      }
       allocation_id[0] = '\0';
 
       if (saved_errno == EADDRINUSE && attempt + 1 < PM_BIND_ALLOCATION_ATTEMPTS) {

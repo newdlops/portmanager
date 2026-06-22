@@ -5,7 +5,11 @@ import * as path from "node:path";
 import { promisify } from "node:util";
 import * as vscode from "vscode";
 import { getAgentSocketPath } from "../agent/agent-socket";
-import { getDefaultHostAccessBindingsPath, getDefaultRouteTablePath } from "../agent/route-table";
+import {
+  getDefaultHostAccessBindingsPath,
+  getDefaultRouteTablePath,
+  getRouteTablePathForNetwork,
+} from "../agent/route-table";
 import { readContainerRuntimeSettings, readPortManagerSettings } from "../config/vscode-settings";
 import { LogicalNetworkRegistry, type LogicalNetworkRegistryState } from "../core/networks/logical-network-registry";
 import {
@@ -1014,7 +1018,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("NEWDLOPS_PM_BORROWED_NETWORK_ID", networkId),
       shellExport("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath()),
       shellExport("PORT_MANAGER_AGENT_MAIN", agentMainPath),
-      shellExport("PORT_MANAGER_ROUTES_FILE", getDefaultRouteTablePath()),
+      shellExport("PORT_MANAGER_ROUTES_FILE", getRouteTablePathForNetwork(networkId)),
       shellExport("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath()),
       shellExport("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange)),
       shellExport("PORT_MANAGER_ROUTING_MODE", settings.routingMode),

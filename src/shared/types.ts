@@ -447,7 +447,7 @@ export interface AgentAllocateRouteRequest {
 }
 
 export interface PortRouteAllocation {
-  /** Short-lived id used to release or replace the pending route. */
+  /** Short-lived id used to release or replace the pending route; empty when reusing an active route. */
   readonly allocationId: string;
   /** Requested logical port. */
   readonly requestedPort: number;
