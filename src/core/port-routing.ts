@@ -54,15 +54,15 @@ export class PortRoutingService {
   async route(request: PortRoutingRequest): Promise<PortRoutingDecision> {
     this.validateRequest(request);
 
+    const routingMode = request.routingMode ?? DEFAULT_ROUTING_MODE;
+    if (routingMode === "hashed") {
+      return this.routeHashed(request);
+    }
+
     const requestedPortStatus = await this.availabilityProvider.check(
       request.requestedPort,
       request.host,
     );
-    const routingMode = request.routingMode ?? DEFAULT_ROUTING_MODE;
-
-    if (routingMode === "hashed") {
-      return this.routeHashed(request, requestedPortStatus);
-    }
 
     if (requestedPortStatus.available) {
       return {
@@ -109,9 +109,15 @@ export class PortRoutingService {
    */
   private async routeHashed(
     request: PortRoutingRequest,
-    requestedPortStatus: PortAvailability,
   ): Promise<PortRoutingDecision> {
     const checkedCandidates: PortAvailability[] = [];
+    const requestedPortStatus: PortAvailability = {
+      port: request.requestedPort,
+      available: false,
+      owner: {
+        name: "Port Manager logical route",
+      },
+    };
 
     for (const candidatePort of buildHashedPortCandidates({
       requestedPort: request.requestedPort,

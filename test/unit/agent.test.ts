@@ -124,7 +124,7 @@ test("preserves pending allocation network scope when a hooked register omits it
   assert.equal(snapshot.routes[0]?.networkId, "network-a");
 });
 
-test("keeps hooked process rows during transient listener scan misses", async (context) => {
+test("keeps hooked process rows during request snapshots and transient background misses", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   let nowMs = Date.parse(fixedUpdatedAt);
   let listeners: readonly ListeningPort[] = [
@@ -141,6 +141,8 @@ test("keeps hooked process rows during transient listener scan misses", async (c
     agentPid: 777,
     now: () => new Date(nowMs),
     routeTablePath,
+    externalListenerGraceMs: 10_000,
+    externalListenerMissingScanThreshold: 2,
   });
   context.after(() => agent.dispose());
 
@@ -156,13 +158,26 @@ test("keeps hooked process rows during transient listener scan misses", async (c
   });
 
   listeners = [];
-  const transientSnapshot = await agent.listSnapshot();
+  const requestSnapshot = await agent.refreshSnapshot();
 
-  assert.equal(transientSnapshot.processes[0]?.source, "hooked");
-  assert.equal(transientSnapshot.processes[0]?.status, "running");
-  assert.equal(transientSnapshot.routes.length, 1);
+  assert.equal(requestSnapshot.processes[0]?.source, "hooked");
+  assert.equal(requestSnapshot.processes[0]?.status, "running");
+  assert.equal(requestSnapshot.routes.length, 1);
+  assert.equal(readRouteTable(routeTablePath).routes.length, 1);
+
+  await runListenerPoll(agent);
+  const firstMissSnapshot = await agent.listSnapshot();
+
+  assert.equal(firstMissSnapshot.processes[0]?.status, "running");
+  assert.equal(firstMissSnapshot.routes.length, 1);
 
   nowMs += 10_001;
+  const lateRequestSnapshot = await agent.refreshSnapshot();
+
+  assert.equal(lateRequestSnapshot.processes[0]?.status, "running");
+  assert.equal(lateRequestSnapshot.routes.length, 1);
+
+  await runListenerPoll(agent);
   const stoppedSnapshot = await agent.listSnapshot();
 
   assert.equal(stoppedSnapshot.processes[0]?.source, "hooked");
@@ -334,6 +349,37 @@ test("reserves active registry ports while listener scans are in grace", async (
   assert.equal(allocation.actualPort, 3001);
 });
 
+test("allocates external routes without blocking on OS listener scans", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => {
+        throw new Error("listener scan should stay out of the bind allocation path");
+      },
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const allocation = await agent.allocateRoute({
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    scanRange: 2,
+    scanDirection: "up",
+    routingMode: "nearest",
+  });
+
+  assert.equal(allocation.actualPort, 8004);
+});
+
 test("reserves OS listener ports even when availability probing reports them free", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const listeners: readonly ListeningPort[] = [
@@ -356,6 +402,8 @@ test("reserves OS listener ports even when availability probing reports them fre
     routeTablePath,
   });
   context.after(() => agent.dispose());
+
+  await agent.refreshSnapshot();
 
   const allocation = await agent.allocateRoute({
     name: "node",
@@ -402,6 +450,14 @@ function createListener(overrides: Partial<ListeningPort> = {}): ListeningPort {
     updatedAt: fixedUpdatedAt,
     ...overrides,
   };
+}
+
+async function runListenerPoll(agent: PortManagerAgent): Promise<void> {
+  await (agent as unknown as { pollListeningPorts(): Promise<void> }).pollListeningPorts();
+}
+
+function readRouteTable(routeTablePath: string): { routes: readonly unknown[] } {
+  return JSON.parse(fs.readFileSync(routeTablePath, "utf8")) as { routes: readonly unknown[] };
 }
 
 function createRouteTablePath(context: TestContext): string {

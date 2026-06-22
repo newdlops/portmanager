@@ -1050,7 +1050,8 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
         usleep(50000);
         continue;
       }
-      return pm_real_bind(sockfd, addr, addrlen);
+      errno = EAGAIN;
+      return -1;
     }
     pm_hook_depth--;
 

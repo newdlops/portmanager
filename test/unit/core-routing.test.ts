@@ -87,7 +87,7 @@ test("hashed routing keeps the logical requested port unoccupied", async () => {
   assert.equal(decision.actualPort, expectedActualPort);
   assert.notEqual(decision.actualPort, 8000);
   assert.equal(decision.routed, true);
-  assert.deepEqual(provider.checkedPorts, [8000, expectedActualPort]);
+  assert.deepEqual(provider.checkedPorts, [expectedActualPort]);
 });
 
 test("hashed routing linearly probes the virtual range after a collision", async () => {
@@ -113,7 +113,7 @@ test("hashed routing linearly probes the virtual range after a collision", async
   });
 
   assert.equal(decision.actualPort, firstCandidates[1]);
-  assert.deepEqual(provider.checkedPorts, [3000, firstCandidates[0], firstCandidates[1]]);
+  assert.deepEqual(provider.checkedPorts, [firstCandidates[0], firstCandidates[1]]);
 });
 
 test("scans upward candidates until a free port is found", async () => {

@@ -46,7 +46,8 @@ import {
 const DEFAULT_KILL_SIGNAL: ProcessKillSignal = "SIGTERM";
 const DETECTED_PROCESS_ID_PREFIX = "detected:";
 const DEFAULT_LISTENER_SCAN_INTERVAL_MS = 3_000;
-const DEFAULT_EXTERNAL_LISTENER_GRACE_MS = 10_000;
+const DEFAULT_EXTERNAL_LISTENER_GRACE_MS = 60_000;
+const DEFAULT_EXTERNAL_LISTENER_MISSING_SCAN_THRESHOLD = 3;
 const ROUTE_ALLOCATION_TTL_MS = 30_000;
 
 export interface PortManagerAgentOptions {
@@ -78,6 +79,8 @@ export interface PortManagerAgentOptions {
   readonly listenerScanIntervalMs?: number;
   /** Grace period before hook/manual rows are stopped after a missing listener scan. */
   readonly externalListenerGraceMs?: number;
+  /** Consecutive missing OS scans required before hook/manual rows can be stopped. */
+  readonly externalListenerMissingScanThreshold?: number;
 }
 
 export interface BuildAgentSnapshotOptions {
@@ -119,6 +122,21 @@ interface PendingRouteAllocation {
   readonly route: LogicalPortRoute;
   /** Millisecond deadline after which the pending route is discarded. */
   readonly expiresAtMs: number;
+}
+
+interface MissingExternalListenerState {
+  /** First background scan time when the registered listener was absent. */
+  readonly sinceMs: number;
+  /** Consecutive background scans that failed to observe the registered listener. */
+  readonly scanCount: number;
+}
+
+interface BuildSnapshotRuntimeOptions {
+  /**
+   * True only for daemon background cleanup. Request/registration snapshots
+   * must not let slow OS listener scans remove hook-owned routes.
+   */
+  readonly reconcileExternalListeners?: boolean;
 }
 
 /**
@@ -193,14 +211,17 @@ export class PortManagerAgent implements DisposableLike {
   /** Delay that absorbs short autoreload and process-table visibility gaps. */
   private readonly externalListenerGraceMs: number;
 
+  /** Missing scan count required before external listener cleanup can stop rows. */
+  private readonly externalListenerMissingScanThreshold: number;
+
   /** Timer that keeps OS Listening Ports fresh without manual refresh. */
   private listenerScanTimer: NodeJS.Timeout | undefined;
 
   /** Prevents overlapping lsof/netstat scans when an interval tick is slow. */
   private listenerScanInFlight = false;
 
-  /** First scan timestamp when an external process listener disappeared. */
-  private readonly missingListenerSinceByProcessId = new Map<string, number>();
+  /** Background cleanup state for hook/manual rows absent from OS scans. */
+  private readonly missingListenerStateByProcessId = new Map<string, MissingExternalListenerState>();
 
   /** Last broadcast signature, used to skip unchanged polling updates. */
   private lastSnapshotSignature = "";
@@ -252,6 +273,9 @@ export class PortManagerAgent implements DisposableLike {
     this.agentMainPath = options.agentMainPath;
     this.listenerScanIntervalMs = normalizeListenerScanInterval(options.listenerScanIntervalMs);
     this.externalListenerGraceMs = normalizeExternalListenerGraceMs(options.externalListenerGraceMs);
+    this.externalListenerMissingScanThreshold = normalizeExternalListenerMissingScanThreshold(
+      options.externalListenerMissingScanThreshold,
+    );
 
     this.subscriptions.push(
       this.registry.onDidChange(() => {
@@ -321,7 +345,6 @@ export class PortManagerAgent implements DisposableLike {
   async allocateRoute(input: AgentAllocateRouteRequest): Promise<PortRouteAllocation> {
     return this.runExclusiveRouteOperation(async () => {
       this.cleanupExpiredRouteAllocations();
-      await this.refreshReservedListeningPorts();
 
       const networkRouteScope = normalizeNetworkId(input.networkId);
       const decision = await this.routingService.route({
@@ -461,7 +484,7 @@ export class PortManagerAgent implements DisposableLike {
       registeredInput,
       input.source === "hooked" ? "hooked" : "registered",
     );
-    this.missingListenerSinceByProcessId.delete(process.id);
+    this.missingListenerStateByProcessId.delete(process.id);
     this.writeRouteTable(this.buildCurrentLogicalRoutes());
 
     return process;
@@ -483,7 +506,7 @@ export class PortManagerAgent implements DisposableLike {
     }
 
     const stoppedProcess = this.registry.stop(id, this.now().toISOString());
-    this.missingListenerSinceByProcessId.delete(id);
+    this.missingListenerStateByProcessId.delete(id);
     this.writeRouteTable(this.buildCurrentLogicalRoutes());
 
     return stoppedProcess;
@@ -582,7 +605,7 @@ export class PortManagerAgent implements DisposableLike {
   async removeProcess(id: string): Promise<ManagedProcess | undefined> {
     const removedProcess = this.registry.remove(id);
     this.launchProfilesByProcessId.delete(id);
-    this.missingListenerSinceByProcessId.delete(id);
+    this.missingListenerStateByProcessId.delete(id);
 
     if (removedProcess !== undefined) {
       this.writeRouteTable(this.buildCurrentLogicalRoutes());
@@ -814,7 +837,7 @@ export class PortManagerAgent implements DisposableLike {
     this.listenerScanInFlight = true;
 
     try {
-      const snapshot = await this.buildSnapshot();
+      const snapshot = await this.buildSnapshot({ reconcileExternalListeners: true });
       const nextSignature = buildSnapshotSignature(snapshot);
 
       if (this.clients.size > 0 && nextSignature !== this.lastSnapshotSignature) {
@@ -834,12 +857,14 @@ export class PortManagerAgent implements DisposableLike {
    * The merge function is exported separately so the de-duplication policy is
    * unit-testable without a real child process or OS command.
    */
-  private async buildSnapshot(): Promise<AgentSnapshot> {
+  private async buildSnapshot(options: BuildSnapshotRuntimeOptions = {}): Promise<AgentSnapshot> {
     this.cleanupExpiredRouteAllocations();
 
     const listeners = await this.listeningPortProvider.list();
     this.updateReservedListeningPorts(listeners);
-    this.reconcileRegisteredProcessesWithListeners(listeners);
+    if (options.reconcileExternalListeners === true) {
+      this.reconcileRegisteredProcessesWithListeners(listeners);
+    }
     const snapshot = buildAgentSnapshot({
       agentPid: this.agentPid,
       registryProcesses: this.registry.list(),
@@ -865,21 +890,28 @@ export class PortManagerAgent implements DisposableLike {
 
     for (const process of this.registry.list()) {
       if (process.status !== "running" || !isListenerOwnedExternalProcess(process)) {
-        this.missingListenerSinceByProcessId.delete(process.id);
+        this.missingListenerStateByProcessId.delete(process.id);
         continue;
       }
 
       if (activeListenerKeys.has(buildListenerKey(process.pid, process.actualPort))) {
-        this.missingListenerSinceByProcessId.delete(process.id);
+        this.missingListenerStateByProcessId.delete(process.id);
         continue;
       }
 
-      const missingSinceMs = this.missingListenerSinceByProcessId.get(process.id) ?? nowMs;
-      this.missingListenerSinceByProcessId.set(process.id, missingSinceMs);
+      const previousState = this.missingListenerStateByProcessId.get(process.id);
+      const missingState: MissingExternalListenerState = {
+        sinceMs: previousState?.sinceMs ?? nowMs,
+        scanCount: (previousState?.scanCount ?? 0) + 1,
+      };
+      this.missingListenerStateByProcessId.set(process.id, missingState);
 
-      if (nowMs - missingSinceMs >= this.externalListenerGraceMs) {
+      if (
+        nowMs - missingState.sinceMs >= this.externalListenerGraceMs &&
+        missingState.scanCount >= this.externalListenerMissingScanThreshold
+      ) {
         this.registry.stop(process.id, this.now().toISOString());
-        this.missingListenerSinceByProcessId.delete(process.id);
+        this.missingListenerStateByProcessId.delete(process.id);
       }
     }
   }
@@ -987,7 +1019,7 @@ export class PortManagerAgent implements DisposableLike {
     }
 
     this.registry.stop(process.id, this.now().toISOString());
-    this.missingListenerSinceByProcessId.delete(process.id);
+    this.missingListenerStateByProcessId.delete(process.id);
   }
 
   /**
@@ -1323,6 +1355,15 @@ function normalizeExternalListenerGraceMs(graceMs: number | undefined): number {
   }
 
   return Math.max(0, Math.trunc(graceMs));
+}
+
+/** Requires repeated background misses before trusting listener disappearance. */
+function normalizeExternalListenerMissingScanThreshold(threshold: number | undefined): number {
+  if (threshold === undefined || !Number.isFinite(threshold)) {
+    return DEFAULT_EXTERNAL_LISTENER_MISSING_SCAN_THRESHOLD;
+  }
+
+  return Math.max(1, Math.trunc(threshold));
 }
 
 /**
