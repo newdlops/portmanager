@@ -113,6 +113,7 @@ export class LocalAgentClient implements PortManagerProcessService {
   async start(): Promise<void> {
     await this.ensureConnected();
     await this.refresh();
+    await this.ensureCompatibleAgent();
   }
 
   /** Stops the singleton local agent and resets the extension-side snapshot. */
@@ -337,7 +338,7 @@ export class LocalAgentClient implements PortManagerProcessService {
    * client still retries the shared socket.
    */
   private startAgentProcess(): void {
-    const agentMainPath = this.context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
+    const agentMainPath = this.getAgentMainPath();
 
     if (!fs.existsSync(agentMainPath)) {
       throw new Error(`Port Manager agent entrypoint is missing: ${agentMainPath}`);
@@ -353,6 +354,37 @@ export class LocalAgentClient implements PortManagerProcessService {
       windowsHide: true,
     });
     this.childProcess.unref();
+  }
+
+  /**
+   * Replaces a singleton daemon that was left running by an older extension.
+   * Native hooks and route allocation share one socket, so mixing a new
+   * terminal hook with an old daemon can reintroduce stale routing behavior.
+   */
+  private async ensureCompatibleAgent(): Promise<void> {
+    const expectedAgentMainPath = normalizeAgentMainPath(this.getAgentMainPath());
+    const actualAgentMainPath = normalizeAgentMainPath(this.snapshot.daemon.agentMainPath);
+
+    if (actualAgentMainPath === expectedAgentMainPath) {
+      return;
+    }
+
+    await this.stopDaemon();
+    await delay(150);
+    await this.ensureConnected();
+    await this.refresh();
+
+    const restartedAgentMainPath = normalizeAgentMainPath(this.snapshot.daemon.agentMainPath);
+    if (restartedAgentMainPath !== expectedAgentMainPath) {
+      throw new Error(
+        "Port Manager connected to a stale daemon. Stop the daemon and reload the extension before attaching terminals.",
+      );
+    }
+  }
+
+  /** Returns the compiled agent entrypoint owned by this extension instance. */
+  private getAgentMainPath(): string {
+    return this.context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
   }
 
   /** Wires line-delimited JSON handling for one socket connection. */
@@ -519,6 +551,19 @@ function normalizeAgentSnapshot(snapshot: AgentSnapshot): AgentSnapshot {
     routes,
     updatedAt,
   };
+}
+
+/** Normalizes optional daemon paths before comparing extension instances. */
+function normalizeAgentMainPath(agentMainPath: string | undefined): string | undefined {
+  if (agentMainPath === undefined || agentMainPath.trim().length === 0) {
+    return undefined;
+  }
+
+  try {
+    return fs.realpathSync.native(agentMainPath);
+  } catch {
+    return path.resolve(agentMainPath);
+  }
 }
 
 /** Builds daemon status objects with all required UI-safe defaults. */

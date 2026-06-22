@@ -21,6 +21,23 @@ const TERMINAL_MUTATOR_OPTIONS: vscode.EnvironmentVariableMutatorOptions = {
   applyAtShellIntegration: true,
 };
 
+export const RUNTIME_SHIM_DIRECTORY_ENV = "PORT_MANAGER_RUNTIME_SHIM_DIR";
+const PRELOAD_RUNTIME_LAUNCHER_NAMES = [
+  "node",
+  "python",
+  "python3",
+  "python3.8",
+  "python3.9",
+  "python3.10",
+  "python3.11",
+  "python3.12",
+  "python3.13",
+  "python3.14",
+  "ruby",
+  "php",
+  "perl",
+];
+
 /** Applies and refreshes terminal environment variables owned by Port Manager. */
 export function configureTerminalHookEnvironment(context: vscode.ExtensionContext): DisposableLike {
   const applyEnvironment = () => {
@@ -66,7 +83,7 @@ function applyTerminalHookEnvironment(context: vscode.ExtensionContext): void {
   collection.replace("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath(), TERMINAL_MUTATOR_OPTIONS);
   applyRoutingSettings(collection, settings);
   collection.prepend(preloadVariable, `${hookLibraryPath}${path.delimiter}`, TERMINAL_MUTATOR_OPTIONS);
-  applyAsdfShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath);
+  applyRuntimeShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath);
 
   if (shellEnvRestorePath !== undefined) {
     collection.replace("PORT_MANAGER_DYLD_INSERT_LIBRARIES", hookLibraryPath, TERMINAL_MUTATOR_OPTIONS);
@@ -104,32 +121,49 @@ export function shouldInjectTerminalHook(settings: PortManagerSettings): boolean
 }
 
 /**
- * Creates a PATH directory that shadows asdf shell-script shims with native
- * launchers. This preserves DYLD_INSERT_LIBRARIES for the real runtime on
- * macOS, where protected shebang interpreters can strip DYLD_* variables.
+ * Creates a PATH directory that shadows common runtime names with native
+ * launchers. This preserves DYLD_INSERT_LIBRARIES for the real server process
+ * on macOS, where protected launch boundaries can strip DYLD_* variables.
+ *
+ * This is not part of routing policy. It only keeps the preload hook present
+ * so bind/connect can still be routed from the socket address and port.
  */
-export function prepareAsdfShimLauncherDirectory(
+export function prepareRuntimeShimLauncherDirectory(
   baseDirectory: string,
   launcherPath: string,
 ): string | undefined {
   const sourceShimDirectory = getAsdfShimDirectory();
 
-  if (process.platform !== "darwin" || sourceShimDirectory === undefined || !fs.existsSync(launcherPath)) {
+  if (process.platform !== "darwin" || !fs.existsSync(launcherPath)) {
     return undefined;
   }
 
-  const targetDirectory = path.join(baseDirectory, "asdf-shims");
+  const targetDirectory = path.join(baseDirectory, "runtime-shims");
   fs.mkdirSync(targetDirectory, { recursive: true });
 
-  for (const entry of fs.readdirSync(sourceShimDirectory, { withFileTypes: true })) {
-    if (entry.name === "asdf" || entry.name.startsWith(".") || (!entry.isFile() && !entry.isSymbolicLink())) {
-      continue;
-    }
+  for (const runtimeName of PRELOAD_RUNTIME_LAUNCHER_NAMES) {
+    ensureSymlink(path.join(targetDirectory, runtimeName), launcherPath);
+  }
 
-    ensureSymlink(path.join(targetDirectory, entry.name), launcherPath);
+  if (sourceShimDirectory !== undefined) {
+    for (const entry of fs.readdirSync(sourceShimDirectory, { withFileTypes: true })) {
+      if (entry.name === "asdf" || entry.name.startsWith(".") || (!entry.isFile() && !entry.isSymbolicLink())) {
+        continue;
+      }
+
+      ensureSymlink(path.join(targetDirectory, entry.name), launcherPath);
+    }
   }
 
   return targetDirectory;
+}
+
+/** Compatibility wrapper for older call sites and external imports. */
+export function prepareAsdfShimLauncherDirectory(
+  baseDirectory: string,
+  launcherPath: string,
+): string | undefined {
+  return prepareRuntimeShimLauncherDirectory(baseDirectory, launcherPath);
 }
 
 /**
@@ -157,15 +191,16 @@ export function prepareShellEnvRestoreScript(
   return targetPath;
 }
 
-/** Adds the generated asdf launcher shims ahead of regular asdf shims. */
-function applyAsdfShimLauncherPath(
+/** Adds generated runtime launchers ahead of protected runtime entrypoints. */
+function applyRuntimeShimLauncherPath(
   collection: vscode.EnvironmentVariableCollection,
   baseDirectory: string,
   launcherPath: string,
 ): void {
-  const launcherDirectory = prepareAsdfShimLauncherDirectory(baseDirectory, launcherPath);
+  const launcherDirectory = prepareRuntimeShimLauncherDirectory(baseDirectory, launcherPath);
 
   if (launcherDirectory !== undefined) {
+    collection.replace(RUNTIME_SHIM_DIRECTORY_ENV, launcherDirectory, TERMINAL_MUTATOR_OPTIONS);
     collection.prepend("PATH", `${launcherDirectory}${path.delimiter}`, TERMINAL_MUTATOR_OPTIONS);
   }
 }

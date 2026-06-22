@@ -476,6 +476,8 @@ export interface AgentDaemonStatus {
   readonly updatedAt: string;
   /** Dynamic route table JSON file path shared with managed processes. */
   readonly routeTablePath?: string;
+  /** Compiled agent entrypoint path for detecting stale daemons after extension updates. */
+  readonly agentMainPath?: string;
   /** Number of raw OS listeners in the latest daemon scan. */
   readonly listenerCount: number;
   /** Number of active logical route rows in the latest daemon snapshot. */

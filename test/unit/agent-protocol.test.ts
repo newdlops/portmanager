@@ -108,6 +108,7 @@ test("snapshot merge keeps managed route context and adds external listeners", (
     registryProcesses: [managedProcess],
     listeners,
     updatedAt: fixedUpdatedAt,
+    agentMainPath: "/extension/out/src/agent/agent-main.js",
     defaultHost: "localhost",
     defaultCwd: "/workspace/app",
   });
@@ -116,6 +117,7 @@ test("snapshot merge keeps managed route context and adds external listeners", (
   assert.equal(snapshot.updatedAt, fixedUpdatedAt);
   assert.equal(snapshot.daemon.status, "running");
   assert.equal(snapshot.daemon.pid, 777);
+  assert.equal(snapshot.daemon.agentMainPath, "/extension/out/src/agent/agent-main.js");
   assert.equal(snapshot.daemon.listenerCount, 2);
   assert.equal(snapshot.daemon.routeCount, 1);
   assert.equal(snapshot.processes.length, 2);

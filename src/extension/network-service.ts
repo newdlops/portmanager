@@ -43,8 +43,9 @@ import type {
 import {
   getAsdfShimLauncherRelativePath,
   getHookLibraryRelativePath,
-  prepareAsdfShimLauncherDirectory,
+  prepareRuntimeShimLauncherDirectory,
   prepareShellEnvRestoreScript,
+  RUNTIME_SHIM_DIRECTORY_ENV,
   shouldInjectTerminalHook,
 } from "./terminal-hook-environment";
 import type { PortManagerProcessService } from "./process-service";
@@ -900,7 +901,7 @@ export class PortManagerNetworkService implements DisposableLike {
   private buildTerminalRoutingScript(networkId: string, settings: PortManagerSettings): string {
     const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
     const asdfShimLauncherPath = this.context.asAbsolutePath(getAsdfShimLauncherRelativePath());
-    const asdfShimDirectory = prepareAsdfShimLauncherDirectory(
+    const runtimeShimDirectory = prepareRuntimeShimLauncherDirectory(
       this.context.globalStorageUri.fsPath,
       asdfShimLauncherPath,
     );
@@ -933,8 +934,11 @@ export class PortManagerNetworkService implements DisposableLike {
       );
     }
 
-    if (asdfShimDirectory !== undefined) {
-      commands.push(`export PATH=${shellQuote(asdfShimDirectory)}:"$PATH"`);
+    if (runtimeShimDirectory !== undefined) {
+      commands.push(
+        shellExport(RUNTIME_SHIM_DIRECTORY_ENV, runtimeShimDirectory),
+        `export PATH=${shellQuote(runtimeShimDirectory)}:"$PATH"`,
+      );
     }
 
     commands.push(
@@ -950,7 +954,7 @@ export class PortManagerNetworkService implements DisposableLike {
   private buildTerminalDetachScript(): string {
     const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
     const asdfShimLauncherPath = this.context.asAbsolutePath(getAsdfShimLauncherRelativePath());
-    const asdfShimDirectory = prepareAsdfShimLauncherDirectory(
+    const runtimeShimDirectory = prepareRuntimeShimLauncherDirectory(
       this.context.globalStorageUri.fsPath,
       asdfShimLauncherPath,
     );
@@ -970,6 +974,7 @@ export class PortManagerNetworkService implements DisposableLike {
       "PORT_MANAGER_VIRTUAL_PORT_END",
       "PORT_MANAGER_FIXED_PROTOCOL_PORTS",
       "PORT_MANAGER_DYLD_INSERT_LIBRARIES",
+      RUNTIME_SHIM_DIRECTORY_ENV,
     ];
     const commands = variables.map((variable) => `unset ${variable}`);
 
@@ -984,8 +989,8 @@ export class PortManagerNetworkService implements DisposableLike {
       `if [ "\${${preloadVariable}:-}" = ${shellQuote(hookLibraryPath)} ]; then unset ${preloadVariable}; else export ${preloadVariable}="\${${preloadVariable}#${shellPatternLiteral(`${hookLibraryPath}:`)}}"; fi`,
     );
 
-    if (asdfShimDirectory !== undefined) {
-      commands.push(`export PATH="\${PATH#${shellPatternLiteral(`${asdfShimDirectory}:`)}}"`);
+    if (runtimeShimDirectory !== undefined) {
+      commands.push(`export PATH="\${PATH#${shellPatternLiteral(`${runtimeShimDirectory}:`)}}"`);
     }
 
     commands.push(`printf '%s\\n' ${shellQuote("Port Manager routing detached from this shell.")}`);

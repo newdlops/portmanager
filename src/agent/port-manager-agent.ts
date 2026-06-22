@@ -71,6 +71,8 @@ export interface PortManagerAgentOptions {
   readonly defaultCwd?: string;
   /** JSON route table path shared with launched child processes. */
   readonly routeTablePath?: string;
+  /** Compiled daemon entrypoint path used by clients to detect stale agents. */
+  readonly agentMainPath?: string;
   /** Interval for daemon-side OS listener polling. */
   readonly listenerScanIntervalMs?: number;
 }
@@ -90,6 +92,8 @@ export interface BuildAgentSnapshotOptions {
   readonly daemonStartedAt?: string;
   /** Dynamic JSON route table path shared with launched processes. */
   readonly routeTablePath?: string;
+  /** Compiled daemon entrypoint path used by clients to detect stale agents. */
+  readonly agentMainPath?: string;
   /** Detected listener row ids hidden by removeProcess. */
   readonly suppressedDetectedProcessIds?: ReadonlySet<string>;
   /** Host used when a listener address is not user-friendly for HTTP URLs. */
@@ -174,6 +178,9 @@ export class PortManagerAgent implements DisposableLike {
   /** JSON file path that stores the latest logical routing table. */
   private readonly routeTablePath: string;
 
+  /** Compiled daemon entrypoint path for stale-daemon detection. */
+  private readonly agentMainPath: string | undefined;
+
   /** Interval for rescanning the OS listening table while clients are attached. */
   private readonly listenerScanIntervalMs: number;
 
@@ -230,6 +237,7 @@ export class PortManagerAgent implements DisposableLike {
     this.defaultHost = options.defaultHost ?? "localhost";
     this.defaultCwd = options.defaultCwd ?? process.cwd();
     this.routeTablePath = options.routeTablePath ?? getDefaultRouteTablePath();
+    this.agentMainPath = options.agentMainPath;
     this.listenerScanIntervalMs = normalizeListenerScanInterval(options.listenerScanIntervalMs);
 
     this.subscriptions.push(
@@ -817,6 +825,7 @@ export class PortManagerAgent implements DisposableLike {
       updatedAt: this.now().toISOString(),
       daemonStartedAt: this.startedAt,
       routeTablePath: this.routeTablePath,
+      agentMainPath: this.agentMainPath,
       suppressedDetectedProcessIds: this.suppressedDetectedProcessIds,
       defaultHost: this.defaultHost,
       defaultCwd: this.defaultCwd,
@@ -945,6 +954,7 @@ export function buildAgentSnapshot(options: BuildAgentSnapshotOptions): AgentSna
     updatedAt: options.updatedAt,
     startedAt: options.daemonStartedAt,
     routeTablePath: options.routeTablePath,
+    agentMainPath: options.agentMainPath,
     listenerCount: normalizedListeners.length,
     routeCount: routes.length,
   });
@@ -965,6 +975,7 @@ function buildDaemonStatus(options: {
   readonly updatedAt: string;
   readonly startedAt?: string;
   readonly routeTablePath?: string;
+  readonly agentMainPath?: string;
   readonly listenerCount: number;
   readonly routeCount: number;
 }): AgentDaemonStatus {
@@ -974,6 +985,7 @@ function buildDaemonStatus(options: {
     startedAt: options.startedAt,
     updatedAt: options.updatedAt,
     routeTablePath: options.routeTablePath,
+    agentMainPath: options.agentMainPath,
     listenerCount: options.listenerCount,
     routeCount: options.routeCount,
     monitoringAllListeners: true,

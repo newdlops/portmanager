@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -21,6 +22,7 @@
 
 #define PM_MAX_PATH 4096
 #define PM_MAX_LINE 4096
+#define PM_RUNTIME_SHIM_DIR_ENV "PORT_MANAGER_RUNTIME_SHIM_DIR"
 
 static const char *pm_basename(const char *path) {
   char *copy;
@@ -153,6 +155,97 @@ static int pm_asdf_which(const char *tool_name, char *buffer, size_t size) {
   return buffer[0] == '/' ? 0 : -1;
 }
 
+static int pm_realpath_or_copy(const char *path, char *buffer, size_t size) {
+  char resolved[PM_MAX_PATH];
+
+  if (path == NULL || path[0] == '\0' || size == 0) {
+    return -1;
+  }
+
+  if (realpath(path, resolved) != NULL) {
+    snprintf(buffer, size, "%s", resolved);
+    return 0;
+  }
+
+  snprintf(buffer, size, "%s", path);
+  return 0;
+}
+
+static int pm_same_directory(const char *left, const char *right) {
+  char left_path[PM_MAX_PATH];
+  char right_path[PM_MAX_PATH];
+
+  if (pm_realpath_or_copy(left, left_path, sizeof(left_path)) != 0 ||
+      pm_realpath_or_copy(right, right_path, sizeof(right_path)) != 0) {
+    return 0;
+  }
+
+  return strcmp(left_path, right_path) == 0;
+}
+
+static int pm_is_executable_file(const char *path) {
+  struct stat stat_buffer;
+
+  if (stat(path, &stat_buffer) != 0 || !S_ISREG(stat_buffer.st_mode)) {
+    return 0;
+  }
+
+  return access(path, X_OK) == 0;
+}
+
+static int pm_find_on_path(const char *tool_name, char *buffer, size_t size) {
+  const char *path_env = getenv("PATH");
+  const char *shim_directory = getenv(PM_RUNTIME_SHIM_DIR_ENV);
+  const char *cursor;
+
+  if (tool_name == NULL || tool_name[0] == '\0' || strchr(tool_name, '/') != NULL ||
+      path_env == NULL || path_env[0] == '\0') {
+    return -1;
+  }
+
+  cursor = path_env;
+  while (cursor != NULL) {
+    const char *separator = strchr(cursor, ':');
+    size_t directory_length = separator == NULL ? strlen(cursor) : (size_t)(separator - cursor);
+    char directory[PM_MAX_PATH];
+    char candidate[PM_MAX_PATH];
+
+    if (directory_length == 0) {
+      snprintf(directory, sizeof(directory), ".");
+    } else if (directory_length >= sizeof(directory)) {
+      goto next_path_entry;
+    } else {
+      memcpy(directory, cursor, directory_length);
+      directory[directory_length] = '\0';
+    }
+
+    if (shim_directory != NULL && shim_directory[0] != '\0' && pm_same_directory(directory, shim_directory)) {
+      goto next_path_entry;
+    }
+
+    snprintf(candidate, sizeof(candidate), "%s/%s", directory, tool_name);
+    if (pm_is_executable_file(candidate)) {
+      return pm_realpath_or_copy(candidate, buffer, size);
+    }
+
+next_path_entry:
+    if (separator == NULL) {
+      break;
+    }
+    cursor = separator + 1;
+  }
+
+  return -1;
+}
+
+static int pm_resolve_tool(const char *tool_name, char *buffer, size_t size) {
+  if (pm_asdf_which(tool_name, buffer, size) == 0) {
+    return 0;
+  }
+
+  return pm_find_on_path(tool_name, buffer, size);
+}
+
 static int pm_read_shebang(const char *path, char *buffer, size_t size) {
   FILE *file = fopen(path, "r");
 
@@ -229,7 +322,7 @@ static int pm_exec_env_script(const char *script_path, int argc, char **argv) {
   }
   *cursor = '\0';
 
-  if (tool[0] == '\0' || pm_asdf_which(tool, interpreter_path, sizeof(interpreter_path)) != 0) {
+  if (tool[0] == '\0' || pm_resolve_tool(tool, interpreter_path, sizeof(interpreter_path)) != 0) {
     return -1;
   }
 
@@ -265,8 +358,8 @@ int main(int argc, char **argv) {
     return 127;
   }
 
-  if (pm_asdf_which(tool_name, executable_path, sizeof(executable_path)) != 0) {
-    fprintf(stderr, "portmanager-asdf-shim: could not resolve asdf tool %s\n", tool_name);
+  if (pm_resolve_tool(tool_name, executable_path, sizeof(executable_path)) != 0) {
+    fprintf(stderr, "portmanager-asdf-shim: could not resolve runtime tool %s\n", tool_name);
     return 127;
   }
 
