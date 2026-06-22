@@ -19,6 +19,8 @@ export interface PortManagerProcessService {
   start(): Promise<void>;
   /** Stops the local daemon without stopping already running application processes. */
   stopDaemon(): Promise<void>;
+  /** Replaces the local daemon with the active extension build. */
+  restartDaemon(): Promise<void>;
   /** Returns the latest complete daemon snapshot known to the extension. */
   getSnapshot(): AgentSnapshot;
   /** Returns the latest agent snapshot rows in sidebar display order. */

@@ -347,6 +347,25 @@ export class PortManagerAgent implements DisposableLike {
       this.cleanupExpiredRouteAllocations();
 
       const networkRouteScope = normalizeNetworkId(input.networkId);
+      const reusableAllocation = this.findReusablePendingRouteAllocation(input.requestedPort, networkRouteScope);
+      if (reusableAllocation !== undefined) {
+        const refreshedAllocation = this.refreshPendingRouteAllocation(reusableAllocation);
+        const logicalRoutes = this.buildCurrentLogicalRoutes();
+        this.writeRouteTable(logicalRoutes);
+        this.queueSnapshotBroadcast();
+
+        return {
+          allocationId: refreshedAllocation.id,
+          requestedPort: input.requestedPort,
+          actualPort: refreshedAllocation.route.actualPort,
+          host: refreshedAllocation.route.host,
+          routed: refreshedAllocation.route.actualPort !== input.requestedPort,
+          logicalRoutes,
+          logicalRoutesFile: this.routeTablePath,
+          expiresAt: new Date(refreshedAllocation.expiresAtMs).toISOString(),
+        };
+      }
+
       const decision = await this.routingService.route({
         requestedPort: input.requestedPort,
         host: input.host,
@@ -927,6 +946,40 @@ export class PortManagerAgent implements DisposableLike {
     return [...this.pendingRouteAllocations.values()]
       .sort((left, right) => left.id.localeCompare(right.id))
       .map((allocation) => ({ ...allocation.route }));
+  }
+
+  /**
+   * Finds a live sender/receiver reservation for the same logical endpoint.
+   * Both bind() and connect() use allocateRoute; whichever arrives second must
+   * converge on the actual port chosen by the first side.
+   */
+  private findReusablePendingRouteAllocation(
+    logicalPort: number,
+    networkId: string | undefined,
+  ): PendingRouteAllocation | undefined {
+    const routeIdentity = buildLogicalRouteIdentity({
+      logicalPort,
+      actualPort: logicalPort,
+      host: this.defaultHost,
+      ...(networkId ? { networkId } : {}),
+      status: "starting",
+      source: "allocated",
+    });
+
+    return [...this.pendingRouteAllocations.values()].find(
+      (allocation) => buildLogicalRouteIdentity(allocation.route) === routeIdentity,
+    );
+  }
+
+  /** Extends a reused endpoint reservation so retrying clients keep it alive. */
+  private refreshPendingRouteAllocation(allocation: PendingRouteAllocation): PendingRouteAllocation {
+    const refreshedAllocation = {
+      ...allocation,
+      expiresAtMs: this.now().getTime() + ROUTE_ALLOCATION_TTL_MS,
+    };
+
+    this.pendingRouteAllocations.set(allocation.id, refreshedAllocation);
+    return refreshedAllocation;
   }
 
   /** True when a short-lived route allocation already owns this actual port. */

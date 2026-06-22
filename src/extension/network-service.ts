@@ -24,8 +24,10 @@ import {
   NodeProcessTableProvider,
   type ProcessTableRow,
 } from "../platform/process/node-process-table";
+import { NodeProcessEnvironmentProvider } from "../platform/process/node-process-environment";
 import { NodeTerminalCandidateProvider } from "../platform/process/node-terminal-candidate-provider";
 import type {
+  AgentDaemonStatus,
   DisposableLike,
   HostAccessBinding,
   HostPortExposure,
@@ -66,6 +68,13 @@ export interface BindingPresetSummary {
   readonly hostAccessCount: number;
   /** ISO timestamp from the latest save. */
   readonly updatedAt: string;
+}
+
+export interface TerminalNetworkResetSummary {
+  /** Number of discovered terminal windows that received a reset command. */
+  readonly terminalCount: number;
+  /** Number of persisted attachment rows removed from the logical network state. */
+  readonly removedAttachmentCount: number;
 }
 
 interface BindingPreset {
@@ -117,6 +126,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Reads process ancestry so client and listener PIDs can be tied to terminals. */
   private readonly processTableProvider: NodeProcessTableProvider;
 
+  /** Reads inherited Port Manager routing scope from local client processes. */
+  private readonly processEnvironmentProvider: NodeProcessEnvironmentProvider;
+
   /** Container runtime adapter that provides actual same-port isolation. */
   private readonly containerRuntime: ContainerNetworkRuntimeAdapter;
 
@@ -137,6 +149,7 @@ export class PortManagerNetworkService implements DisposableLike {
     });
     this.tcpConnectionProcessResolver = new NodeTcpConnectionProcessResolver();
     this.processTableProvider = new NodeProcessTableProvider();
+    this.processEnvironmentProvider = new NodeProcessEnvironmentProvider();
     this.registry = new LogicalNetworkRegistry(BASE_RUNTIMES, this.loadState());
     this.disposables.push(
       this.registry.onDidChange(() => {
@@ -183,6 +196,11 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Returns the latest logical network snapshot for the sidebar. */
   getSnapshot(): NetworkSnapshot {
     return this.registry.getSnapshot();
+  }
+
+  /** Returns daemon status when process service is available for the sidebar. */
+  getDaemonStatus(): AgentDaemonStatus {
+    return this.processService?.getSnapshot().daemon ?? createDisconnectedDaemonStatus();
   }
 
   /** Lists saved binding presets without exposing mutable stored arrays. */
@@ -598,6 +616,28 @@ export class PortManagerNetworkService implements DisposableLike {
     return removedCount;
   }
 
+  /** Resets Port Manager routing environment in every discovered terminal. */
+  async resetAllTerminalNetworkSettings(): Promise<TerminalNetworkResetSummary> {
+    await this.refreshTerminals().catch(() => []);
+
+    const terminalWindows = this.registry.getSnapshot().terminalWindows;
+    let removedAttachmentCount = 0;
+
+    for (const terminalWindow of terminalWindows) {
+      removedAttachmentCount += await this.resetTerminalNetworkSettings(terminalWindow.id).catch(() => 0);
+    }
+
+    for (const attachment of this.registry.getSnapshot().attachments) {
+      this.registry.removeAttachment(attachment.id);
+      removedAttachmentCount++;
+    }
+
+    return {
+      terminalCount: terminalWindows.length,
+      removedAttachmentCount,
+    };
+  }
+
   /** Releases listeners and event subscriptions. */
   dispose(): void {
     for (const disposable of this.disposables.splice(0)) {
@@ -715,9 +755,9 @@ export class PortManagerNetworkService implements DisposableLike {
     connection: LogicalPortRouterConnection,
   ): Promise<LogicalPortRouterTarget> {
     const clientProcess = await this.tcpConnectionProcessResolver.resolveClientProcess(connection);
-    const processRows = await this.processTableProvider.list();
+    const processRows = await this.processTableProvider.list().catch(() => []);
     const networkId =
-      clientProcess === undefined ? undefined : this.findAttachedNetworkForPid(clientProcess.pid, processRows);
+      clientProcess === undefined ? undefined : await this.findClientNetworkForRouter(clientProcess.pid, processRows);
 
     if (networkId === undefined) {
       const uniqueRoute = await this.findUniqueRouteForRouter(connection.logicalPort, processRows);
@@ -758,6 +798,20 @@ export class PortManagerNetworkService implements DisposableLike {
       .map((route) => route.logicalPort);
 
     await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);
+  }
+
+  /**
+   * Resolves the caller's network from the most direct runtime signal first.
+   * Native hook clients inherit PORT_MANAGER_NETWORK_ID even when VS Code's
+   * terminal attachment snapshot cannot map a deep process tree reliably.
+   */
+  private async findClientNetworkForRouter(
+    pid: number,
+    processRows: readonly ProcessTableRow[],
+  ): Promise<string | undefined> {
+    const environmentNetworkId = await this.processEnvironmentProvider.readRoutingNetworkId(pid).catch(() => undefined);
+
+    return environmentNetworkId ?? this.findAttachedNetworkForPid(pid, processRows);
   }
 
   /** Finds a route that belongs to the caller's terminal-bound logical network. */
@@ -1215,6 +1269,20 @@ function ensureNoHostAccessConflict(
 
 function createId(prefix: string): string {
   return `${prefix}-${randomUUID()}`;
+}
+
+/** Builds a UI-safe daemon status when the process service is unavailable. */
+function createDisconnectedDaemonStatus(): AgentDaemonStatus {
+  return {
+    status: "disconnected",
+    pid: 0,
+    updatedAt: new Date(0).toISOString(),
+    listenerCount: 0,
+    routeCount: 0,
+    monitoringAllListeners: false,
+    versionStatus: "unknown",
+    restartRequired: false,
+  };
 }
 
 function formatError(error: unknown): string {

@@ -52,6 +52,7 @@
     "onCommand:portManager.copyHostPortExposureUrl",
     "onCommand:portManager.openHostPortExposureUrl",
     "onCommand:portManager.startDaemon",
+    "onCommand:portManager.restartDaemon",
     "onCommand:portManager.stopDaemon",
     "onCommand:portManager.showDaemonStatus",
     "onCommand:portManager.startManagedProcess",
@@ -191,6 +192,12 @@
         "icon": "$(server-process)"
       },
       {
+        "command": "portManager.restartDaemon",
+        "title": "Port Manager: Restart Daemon",
+        "category": "Port Manager",
+        "icon": "$(debug-restart)"
+      },
+      {
         "command": "portManager.stopDaemon",
         "title": "Port Manager: Stop Daemon",
         "category": "Port Manager",
@@ -309,6 +316,10 @@
       "commandPalette": [
         {
           "command": "portManager.startDaemon",
+          "when": "false"
+        },
+        {
+          "command": "portManager.restartDaemon",
           "when": "false"
         },
         {
@@ -437,14 +448,19 @@
           "group": "exposure@4"
         },
         {
-          "command": "portManager.stopDaemon",
+          "command": "portManager.restartDaemon",
           "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
           "group": "daemon@1"
         },
         {
-          "command": "portManager.showDaemonStatus",
+          "command": "portManager.stopDaemon",
           "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
           "group": "daemon@2"
+        },
+        {
+          "command": "portManager.showDaemonStatus",
+          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
+          "group": "daemon@3"
         },
         {
           "command": "portManager.openRoutedUrl",

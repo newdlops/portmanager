@@ -383,6 +383,83 @@ test("allocates external routes without blocking on OS listener scans", async (c
   assert.equal(allocation.logicalRoutes[0]?.cwd, "/workspace/app");
 });
 
+test("reuses pending route allocations for sender-first and receiver-first ordering", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const senderAllocation = await agent.allocateRoute({
+    name: "wait-on",
+    command: "wait-on http://localhost:8004/healthz",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+  const receiverAllocation = await agent.allocateRoute({
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+
+  assert.equal(receiverAllocation.allocationId, senderAllocation.allocationId);
+  assert.equal(receiverAllocation.actualPort, senderAllocation.actualPort);
+  assert.equal(receiverAllocation.logicalRoutes.length, 1);
+  assert.equal(receiverAllocation.logicalRoutes[0]?.actualPort, senderAllocation.actualPort);
+
+  const firstReceiverAllocation = await agent.allocateRoute({
+    name: "python3",
+    command: "python manage.py runserver 8005",
+    cwd: "/workspace/app",
+    requestedPort: 8005,
+    host: "127.0.0.1",
+    networkId: "network-b",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+  const laterSenderAllocation = await agent.allocateRoute({
+    name: "wait-on",
+    command: "wait-on http://localhost:8005/healthz",
+    cwd: "/workspace/app",
+    requestedPort: 8005,
+    host: "127.0.0.1",
+    networkId: "network-b",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+
+  assert.equal(laterSenderAllocation.allocationId, firstReceiverAllocation.allocationId);
+  assert.equal(laterSenderAllocation.actualPort, firstReceiverAllocation.actualPort);
+});
+
 test("reserves OS listener ports even when availability probing reports them free", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const listeners: readonly ListeningPort[] = [

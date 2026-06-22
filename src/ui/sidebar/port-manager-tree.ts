@@ -37,11 +37,13 @@ export interface ManagedProcessTreeSource {
 export interface PortManagerNetworkTreeSource {
   /** Returns the latest logical-network snapshot. */
   getSnapshot(): NetworkSnapshot;
+  /** Returns daemon lifecycle and version status for management rows. */
+  getDaemonStatus(): AgentDaemonStatus;
   /** Notifies the tree when networks, terminals, or exposures change. */
   onDidChange(listener: () => void): DisposableLike;
 }
 
-type TreeSectionKind = "networks" | "terminals" | "exposures" | "runtime";
+type TreeSectionKind = "networks" | "terminals" | "exposures" | "runtime" | "daemon";
 const TERMINAL_WINDOW_MIME = "application/vnd.newdlops.portmanager.terminal-window";
 
 type PortManagerTreeItem =
@@ -155,6 +157,7 @@ export class PortManagerTreeProvider
    */
   getChildren(element?: PortManagerTreeItem): PortManagerTreeItem[] {
     const snapshot = this.source.getSnapshot();
+    const daemon = this.source.getDaemonStatus();
 
     if (element === undefined) {
       return [
@@ -162,6 +165,7 @@ export class PortManagerTreeProvider
         new TreeSectionItem("terminals", "Terminal Windows", `${snapshot.terminalWindows.length} windows`, "terminal"),
         new TreeSectionItem("exposures", "Host Port Exposures", `${snapshot.exposures.length} bindings`, "ports-view-icon"),
         new TreeSectionItem("runtime", "Runtime Adapter", `${snapshot.runtimes.length} available`, "circuit-board"),
+        new TreeSectionItem("daemon", "Daemon", formatDaemonSummary(daemon), daemon.restartRequired ? "warning" : "server-process"),
       ];
     }
 
@@ -263,6 +267,14 @@ export class PortManagerTreeProvider
                 ),
               ]),
           ...snapshot.runtimes.map((runtime) => new RuntimeAdapterTreeItem(runtime)),
+        ];
+      case "daemon":
+        return [
+          new ActionTreeItem("Restart Daemon", "portManager.restartDaemon", "debug-restart"),
+          new ActionTreeItem("Start Daemon", "portManager.startDaemon", "server-process"),
+          new ActionTreeItem("Stop Daemon", "portManager.stopDaemon", "debug-disconnect"),
+          new ActionTreeItem("Daemon Status", "portManager.showDaemonStatus", "pulse"),
+          ...buildDaemonChildren(daemon),
         ];
     }
   }
@@ -443,6 +455,7 @@ class RuntimeAdapterTreeItem extends vscode.TreeItem {
 function buildActionChildren(): PortManagerTreeItem[] {
   return [
     new ActionTreeItem("Start Daemon", "portManager.startDaemon", "server-process"),
+    new ActionTreeItem("Restart Daemon", "portManager.restartDaemon", "debug-restart"),
     new ActionTreeItem("Stop Daemon", "portManager.stopDaemon", "debug-disconnect"),
     new ActionTreeItem("Daemon Status", "portManager.showDaemonStatus", "pulse"),
     new ActionTreeItem("Start Managed Process", "portManager.startManagedProcess", "run"),
@@ -526,9 +539,16 @@ class EmptyTreeItem extends vscode.TreeItem {
 function buildDaemonChildren(daemon: AgentDaemonStatus): PortManagerTreeItem[] {
   const children: PortManagerTreeItem[] = [
     new DaemonStatusTreeItem("Status", daemon.status, daemon.status === "running" ? "pass" : "warning"),
+    new DaemonStatusTreeItem(
+      "Version",
+      daemon.versionStatus ?? "unknown",
+      daemon.restartRequired ? "warning" : "verified",
+    ),
     new DaemonStatusTreeItem("PID", daemon.pid > 0 ? String(daemon.pid) : "n/a", "server-process"),
     new DaemonStatusTreeItem("Listeners", String(daemon.listenerCount), "radio-tower"),
     new DaemonStatusTreeItem("Routes", String(daemon.routeCount), "references"),
+    new DaemonStatusTreeItem("Agent Main", daemon.agentMainPath ?? "n/a", "file-code"),
+    new DaemonStatusTreeItem("Expected Agent", daemon.expectedAgentMainPath ?? "n/a", "file-code"),
     new DaemonStatusTreeItem("Route Table File", daemon.routeTablePath ?? "n/a", "json"),
     new DaemonStatusTreeItem("Updated", daemon.updatedAt, "clock"),
   ];
@@ -542,7 +562,8 @@ function buildDaemonChildren(daemon: AgentDaemonStatus): PortManagerTreeItem[] {
 
 /** One-line daemon summary for the root section. */
 function formatDaemonSummary(daemon: AgentDaemonStatus): string {
-  return daemon.pid > 0 ? `${daemon.status} pid ${daemon.pid}` : daemon.status;
+  const version = daemon.restartRequired ? "stale" : (daemon.versionStatus ?? "unknown");
+  return daemon.pid > 0 ? `${daemon.status} pid ${daemon.pid}, ${version}` : daemon.status;
 }
 
 /** Counts non-detected process rows for the managed process section label. */

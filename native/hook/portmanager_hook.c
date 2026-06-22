@@ -1167,6 +1167,29 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
     actual_port = pm_route_table_lookup(logical_port, 0, target_host, sizeof(target_host));
   }
 
+  if (actual_port == 0 && !pm_is_fixed_protocol_port(logical_port)) {
+    char allocation_id[PM_MAX_TEXT];
+
+    pm_sockaddr_host(addr, target_host, sizeof(target_host));
+    allocation_id[0] = '\0';
+
+    pm_hook_depth++;
+    if (pm_allocate_route(logical_port, target_host, &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
+      actual_port = 0;
+    }
+    pm_hook_depth--;
+
+    if (actual_port > 0) {
+      /*
+       * connect() may arrive before the server bind(). Keep the daemon's
+       * pending route as the shared endpoint reservation, but do not cache it
+       * forever in-process; if the daemon TTL expires, later retries can
+       * allocate the next live reservation.
+       */
+      pm_debug("connect allocated route logical=%d actual=%d host=%s allocation=%s", logical_port, actual_port, target_host, allocation_id);
+    }
+  }
+
   if (actual_port <= 0 || actual_port == logical_port) {
     return pm_real_connect(sockfd, addr, addrlen);
   }

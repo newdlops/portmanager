@@ -105,6 +105,7 @@ export class PortManagerCommandController implements DisposableLike {
       this.openHostPortExposureUrl(argument),
     );
     this.registerCommand(context, "portManager.startDaemon", () => this.startDaemon());
+    this.registerCommand(context, "portManager.restartDaemon", () => this.restartDaemon());
     this.registerCommand(context, "portManager.stopDaemon", () => this.stopDaemon());
     this.registerCommand(context, "portManager.showDaemonStatus", () => this.showDaemonStatus());
     this.registerCommand(context, "portManager.startManagedProcess", () => this.startManagedProcess());
@@ -443,8 +444,44 @@ export class PortManagerCommandController implements DisposableLike {
     this.dependencies.treeProvider.refresh();
 
     const daemon = this.dependencies.processService.getSnapshot().daemon;
+    if (daemon.restartRequired) {
+      const selection = await vscode.window.showWarningMessage(
+        `Port Manager daemon is stale: pid ${daemon.pid}. Restart it and reset all terminal routing settings?`,
+        "Restart Daemon",
+      );
+
+      if (selection === "Restart Daemon") {
+        await this.restartDaemon({ skipConfirmation: true });
+      }
+      return;
+    }
+
     await vscode.window.showInformationMessage(
       `Port Manager daemon ${daemon.status}: pid ${daemon.pid}, ${daemon.listenerCount} listeners, ${daemon.routeCount} routes`,
+    );
+  }
+
+  /** Restarts the shared daemon and clears routing variables from every terminal. */
+  private async restartDaemon(options: { readonly skipConfirmation?: boolean } = {}): Promise<void> {
+    if (!options.skipConfirmation) {
+      const selection = await vscode.window.showWarningMessage(
+        "Restart the Port Manager daemon? This resets Port Manager routing variables in all discovered terminal windows.",
+        { modal: true },
+        "Restart Daemon",
+      );
+
+      if (selection !== "Restart Daemon") {
+        return;
+      }
+    }
+
+    await this.dependencies.processService.restartDaemon();
+    const resetSummary = await this.dependencies.networkService.resetAllTerminalNetworkSettings();
+    this.dependencies.treeProvider.refresh();
+
+    const daemon = this.dependencies.processService.getSnapshot().daemon;
+    await vscode.window.showInformationMessage(
+      `Port Manager daemon restarted: pid ${daemon.pid}. Reset ${resetSummary.terminalCount} terminal(s), removed ${resetSummary.removedAttachmentCount} attachment(s).`,
     );
   }
 
@@ -470,10 +507,13 @@ export class PortManagerCommandController implements DisposableLike {
     await this.dependencies.processService.refresh();
     const daemon = this.dependencies.processService.getSnapshot().daemon;
     const routeTablePath = daemon.routeTablePath ? `\nRoute table: ${daemon.routeTablePath}` : "";
+    const version = `\nVersion: ${daemon.versionStatus ?? "unknown"}${daemon.restartRequired ? " (restart required)" : ""}`;
+    const agentMainPath = daemon.agentMainPath ? `\nAgent main: ${daemon.agentMainPath}` : "";
+    const expectedAgentMainPath = daemon.expectedAgentMainPath ? `\nExpected agent: ${daemon.expectedAgentMainPath}` : "";
     const errorMessage = daemon.errorMessage ? `\nWarning: ${daemon.errorMessage}` : "";
 
     await vscode.window.showInformationMessage(
-      `Daemon ${daemon.status}. PID: ${daemon.pid || "n/a"}. Listeners: ${daemon.listenerCount}. Routes: ${daemon.routeCount}.${routeTablePath}${errorMessage}`,
+      `Daemon ${daemon.status}. PID: ${daemon.pid || "n/a"}. Listeners: ${daemon.listenerCount}. Routes: ${daemon.routeCount}.${version}${agentMainPath}${expectedAgentMainPath}${routeTablePath}${errorMessage}`,
       { modal: true },
     );
   }

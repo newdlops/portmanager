@@ -113,7 +113,6 @@ export class LocalAgentClient implements PortManagerProcessService {
   async start(): Promise<void> {
     await this.ensureConnected();
     await this.refresh();
-    await this.ensureCompatibleAgent();
   }
 
   /** Stops the singleton local agent and resets the extension-side snapshot. */
@@ -145,6 +144,18 @@ export class LocalAgentClient implements PortManagerProcessService {
     this.childProcess = undefined;
     this.snapshot = createEmptySnapshot();
     this.changeEvents.emit();
+  }
+
+  /** Restarts the singleton daemon using this extension's compiled agent. */
+  async restartDaemon(): Promise<void> {
+    await this.stopDaemon();
+    await delay(150);
+    await this.ensureConnected();
+    await this.refresh();
+
+    if (this.snapshot.daemon.restartRequired) {
+      throw new Error("Port Manager daemon restarted, but it still does not match the active extension build.");
+    }
   }
 
   /** Returns the latest complete agent snapshot for status and tree sections. */
@@ -356,36 +367,6 @@ export class LocalAgentClient implements PortManagerProcessService {
     this.childProcess.unref();
   }
 
-  /**
-   * Replaces a singleton daemon that was left running by an older extension.
-   * Native hooks and route allocation share one socket, so mixing a new
-   * terminal hook with an old daemon can reintroduce stale routing behavior.
-   */
-  private async ensureCompatibleAgent(): Promise<void> {
-    const agentMainPath = this.getAgentMainPath();
-    const expectedAgentMainPath = normalizeAgentMainPath(agentMainPath);
-    const actualAgentMainPath = normalizeAgentMainPath(this.snapshot.daemon.agentMainPath);
-
-    if (actualAgentMainPath === expectedAgentMainPath && !isDaemonOlderThanAgentMain(this.snapshot.daemon, agentMainPath)) {
-      return;
-    }
-
-    await this.stopDaemon();
-    await delay(150);
-    await this.ensureConnected();
-    await this.refresh();
-
-    const restartedAgentMainPath = normalizeAgentMainPath(this.snapshot.daemon.agentMainPath);
-    if (
-      restartedAgentMainPath !== expectedAgentMainPath ||
-      isDaemonOlderThanAgentMain(this.snapshot.daemon, agentMainPath)
-    ) {
-      throw new Error(
-        "Port Manager connected to a stale daemon. Stop the daemon and reload the extension before attaching terminals.",
-      );
-    }
-  }
-
   /** Returns the compiled agent entrypoint owned by this extension instance. */
   private getAgentMainPath(): string {
     return this.context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
@@ -489,7 +470,7 @@ export class LocalAgentClient implements PortManagerProcessService {
 
   /** Stores a new snapshot and notifies tree subscribers. */
   private applySnapshot(snapshot: AgentSnapshot): void {
-    this.snapshot = normalizeAgentSnapshot(snapshot);
+    this.snapshot = annotateDaemonCompatibility(normalizeAgentSnapshot(snapshot), this.getAgentMainPath());
     this.changeEvents.emit();
   }
 
@@ -557,6 +538,53 @@ function normalizeAgentSnapshot(snapshot: AgentSnapshot): AgentSnapshot {
   };
 }
 
+/**
+ * Adds extension-local daemon compatibility metadata to the daemon snapshot.
+ * The daemon cannot judge this itself because stale processes may be running
+ * code from a previous extension install at the same socket path.
+ */
+function annotateDaemonCompatibility(snapshot: AgentSnapshot, expectedAgentMainPath: string): AgentSnapshot {
+  const daemon = snapshot.daemon;
+  const expectedPath = normalizeAgentMainPath(expectedAgentMainPath);
+  const actualPath = normalizeAgentMainPath(daemon.agentMainPath);
+
+  if (daemon.status !== "running" || daemon.pid <= 0) {
+    return {
+      ...snapshot,
+      daemon: {
+        ...daemon,
+        expectedAgentMainPath: expectedPath,
+        versionStatus: "unknown",
+        restartRequired: false,
+      },
+    };
+  }
+
+  const missingAgentMetadata = actualPath === undefined;
+  const pathMismatch = actualPath !== undefined && actualPath !== expectedPath;
+  const olderThanCurrentBuild = isDaemonOlderThanAgentMain(daemon, expectedAgentMainPath);
+  const restartRequired = missingAgentMetadata || pathMismatch || olderThanCurrentBuild;
+  const warning = restartRequired
+    ? appendDaemonWarning(
+        daemon.errorMessage,
+        missingAgentMetadata
+          ? "Connected daemon does not expose version metadata; restart it with the active extension build."
+          : "Connected daemon is older than the active extension build; restart required.",
+      )
+    : daemon.errorMessage;
+
+  return {
+    ...snapshot,
+    daemon: {
+      ...daemon,
+      expectedAgentMainPath: expectedPath,
+      versionStatus: restartRequired ? "stale" : "current",
+      restartRequired,
+      errorMessage: warning,
+    },
+  };
+}
+
 /** Normalizes optional daemon paths before comparing extension instances. */
 function normalizeAgentMainPath(agentMainPath: string | undefined): string | undefined {
   if (agentMainPath === undefined || agentMainPath.trim().length === 0) {
@@ -596,6 +624,19 @@ function isDaemonOlderThanAgentMain(daemon: AgentDaemonStatus, agentMainPath: st
 /** Builds daemon status objects with all required UI-safe defaults. */
 function createDaemonStatus(status: AgentDaemonStatus): AgentDaemonStatus {
   return status;
+}
+
+/** Appends a warning without duplicating text across repeated snapshots. */
+function appendDaemonWarning(existingMessage: string | undefined, warning: string): string {
+  if (existingMessage === undefined || existingMessage.trim().length === 0) {
+    return warning;
+  }
+
+  if (existingMessage.includes(warning)) {
+    return existingMessage;
+  }
+
+  return `${existingMessage} ${warning}`;
 }
 
 /** Small retry delay helper for agent startup polling. */

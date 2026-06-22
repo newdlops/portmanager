@@ -466,6 +466,7 @@ export interface PortRouteAllocation {
 }
 
 export type AgentDaemonState = "starting" | "running" | "disconnected" | "error";
+export type AgentDaemonVersionStatus = "current" | "stale" | "unknown";
 
 export interface AgentDaemonStatus {
   /** Current extension-side view of the local daemon lifecycle. */
@@ -480,6 +481,12 @@ export interface AgentDaemonStatus {
   readonly routeTablePath?: string;
   /** Compiled agent entrypoint path for detecting stale daemons after extension updates. */
   readonly agentMainPath?: string;
+  /** Current extension's expected agent entrypoint, when known by the client. */
+  readonly expectedAgentMainPath?: string;
+  /** Whether the connected daemon matches the active extension build. */
+  readonly versionStatus?: AgentDaemonVersionStatus;
+  /** True when commands should restart the daemon before new terminal attaches. */
+  readonly restartRequired?: boolean;
   /** Number of raw OS listeners in the latest daemon scan. */
   readonly listenerCount: number;
   /** Number of active logical route rows in the latest daemon snapshot. */
