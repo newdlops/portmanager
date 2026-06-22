@@ -900,6 +900,7 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Builds the shell commands that make later child processes join one logical network scope. */
   private buildTerminalRoutingScript(networkId: string, settings: PortManagerSettings): string {
     const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
+    const agentMainPath = this.context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
     const asdfShimLauncherPath = this.context.asAbsolutePath(getAsdfShimLauncherRelativePath());
     const runtimeShimDirectory = prepareRuntimeShimLauncherDirectory(
       this.context.globalStorageUri.fsPath,
@@ -916,6 +917,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("NEWDLOPS_PM_NETWORK_ID", networkId),
       shellExport("NEWDLOPS_PM_BORROWED_NETWORK_ID", networkId),
       shellExport("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath()),
+      shellExport("PORT_MANAGER_AGENT_MAIN", agentMainPath),
       shellExport("PORT_MANAGER_ROUTES_FILE", getDefaultRouteTablePath()),
       shellExport("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath()),
       shellExport("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange)),
@@ -966,6 +968,8 @@ export class PortManagerNetworkService implements DisposableLike {
       "NEWDLOPS_PM_NETWORK_ID",
       "NEWDLOPS_PM_BORROWED_NETWORK_ID",
       "PORT_MANAGER_AGENT_SOCKET",
+      "PORT_MANAGER_AGENT_MAIN",
+      "PORT_MANAGER_HOOK_DAEMON_STARTED",
       "PORT_MANAGER_ROUTES_FILE",
       "PORT_MANAGER_HOST_ACCESS_FILE",
       "PORT_MANAGER_SCAN_RANGE",

@@ -46,6 +46,7 @@ import {
 const DEFAULT_KILL_SIGNAL: ProcessKillSignal = "SIGTERM";
 const DETECTED_PROCESS_ID_PREFIX = "detected:";
 const DEFAULT_LISTENER_SCAN_INTERVAL_MS = 3_000;
+const DEFAULT_EXTERNAL_LISTENER_GRACE_MS = 10_000;
 const ROUTE_ALLOCATION_TTL_MS = 30_000;
 
 export interface PortManagerAgentOptions {
@@ -75,6 +76,8 @@ export interface PortManagerAgentOptions {
   readonly agentMainPath?: string;
   /** Interval for daemon-side OS listener polling. */
   readonly listenerScanIntervalMs?: number;
+  /** Grace period before hook/manual rows are stopped after a missing listener scan. */
+  readonly externalListenerGraceMs?: number;
 }
 
 export interface BuildAgentSnapshotOptions {
@@ -145,6 +148,9 @@ export class PortManagerAgent implements DisposableLike {
   /** Short-lived route reservations created for external terminal wrappers. */
   private readonly pendingRouteAllocations = new Map<string, PendingRouteAllocation>();
 
+  /** Last OS listener ports captured before or during route allocation. */
+  private reservedListeningPorts = new Set<number>();
+
   /** Serializes route decisions so concurrent binds cannot reserve one actual port. */
   private routeOperationQueue: Promise<void> = Promise.resolve();
 
@@ -184,11 +190,17 @@ export class PortManagerAgent implements DisposableLike {
   /** Interval for rescanning the OS listening table while clients are attached. */
   private readonly listenerScanIntervalMs: number;
 
+  /** Delay that absorbs short autoreload and process-table visibility gaps. */
+  private readonly externalListenerGraceMs: number;
+
   /** Timer that keeps OS Listening Ports fresh without manual refresh. */
   private listenerScanTimer: NodeJS.Timeout | undefined;
 
   /** Prevents overlapping lsof/netstat scans when an interval tick is slow. */
   private listenerScanInFlight = false;
+
+  /** First scan timestamp when an external process listener disappeared. */
+  private readonly missingListenerSinceByProcessId = new Map<string, number>();
 
   /** Last broadcast signature, used to skip unchanged polling updates. */
   private lastSnapshotSignature = "";
@@ -239,6 +251,7 @@ export class PortManagerAgent implements DisposableLike {
     this.routeTablePath = options.routeTablePath ?? getDefaultRouteTablePath();
     this.agentMainPath = options.agentMainPath;
     this.listenerScanIntervalMs = normalizeListenerScanInterval(options.listenerScanIntervalMs);
+    this.externalListenerGraceMs = normalizeExternalListenerGraceMs(options.externalListenerGraceMs);
 
     this.subscriptions.push(
       this.registry.onDidChange(() => {
@@ -308,6 +321,7 @@ export class PortManagerAgent implements DisposableLike {
   async allocateRoute(input: AgentAllocateRouteRequest): Promise<PortRouteAllocation> {
     return this.runExclusiveRouteOperation(async () => {
       this.cleanupExpiredRouteAllocations();
+      await this.refreshReservedListeningPorts();
 
       const networkRouteScope = normalizeNetworkId(input.networkId);
       const decision = await this.routingService.route({
@@ -383,6 +397,8 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Starts a managed process while the route-decision lock is held. */
   private async startManagedProcessExclusive(input: AgentStartManagedProcessRequest): Promise<ManagedProcess> {
+    await this.refreshReservedListeningPorts();
+
     const decision = await this.routingService.route({
       requestedPort: input.requestedPort,
       host: input.host,
@@ -441,9 +457,11 @@ export class PortManagerAgent implements DisposableLike {
         ? { ...input, networkId: allocation.route.networkId }
         : input;
 
-    const process = this.registry.register(registeredInput, {
-      source: input.source === "hooked" ? "hooked" : "registered",
-    });
+    const process = this.upsertRegisteredProcess(
+      registeredInput,
+      input.source === "hooked" ? "hooked" : "registered",
+    );
+    this.missingListenerSinceByProcessId.delete(process.id);
     this.writeRouteTable(this.buildCurrentLogicalRoutes());
 
     return process;
@@ -465,6 +483,7 @@ export class PortManagerAgent implements DisposableLike {
     }
 
     const stoppedProcess = this.registry.stop(id, this.now().toISOString());
+    this.missingListenerSinceByProcessId.delete(id);
     this.writeRouteTable(this.buildCurrentLogicalRoutes());
 
     return stoppedProcess;
@@ -505,6 +524,8 @@ export class PortManagerAgent implements DisposableLike {
     };
 
     return this.runExclusiveRouteOperation(async () => {
+      await this.refreshReservedListeningPorts();
+
       const decision = await this.routingService.route({
         requestedPort: nextProfile.requestedPort,
         host: nextProfile.host,
@@ -561,6 +582,7 @@ export class PortManagerAgent implements DisposableLike {
   async removeProcess(id: string): Promise<ManagedProcess | undefined> {
     const removedProcess = this.registry.remove(id);
     this.launchProfilesByProcessId.delete(id);
+    this.missingListenerSinceByProcessId.delete(id);
 
     if (removedProcess !== undefined) {
       this.writeRouteTable(this.buildCurrentLogicalRoutes());
@@ -816,6 +838,7 @@ export class PortManagerAgent implements DisposableLike {
     this.cleanupExpiredRouteAllocations();
 
     const listeners = await this.listeningPortProvider.list();
+    this.updateReservedListeningPorts(listeners);
     this.reconcileRegisteredProcessesWithListeners(listeners);
     const snapshot = buildAgentSnapshot({
       agentPid: this.agentPid,
@@ -838,14 +861,25 @@ export class PortManagerAgent implements DisposableLike {
   /** Marks hook-registered external processes stopped when their listener exits. */
   private reconcileRegisteredProcessesWithListeners(listeners: readonly ListeningPort[]): void {
     const activeListenerKeys = new Set(listeners.map((listener) => buildListenerKey(listener.pid, listener.port)));
+    const nowMs = this.now().getTime();
 
     for (const process of this.registry.list()) {
       if (process.status !== "running" || !isListenerOwnedExternalProcess(process)) {
+        this.missingListenerSinceByProcessId.delete(process.id);
         continue;
       }
 
-      if (!activeListenerKeys.has(buildListenerKey(process.pid, process.actualPort))) {
+      if (activeListenerKeys.has(buildListenerKey(process.pid, process.actualPort))) {
+        this.missingListenerSinceByProcessId.delete(process.id);
+        continue;
+      }
+
+      const missingSinceMs = this.missingListenerSinceByProcessId.get(process.id) ?? nowMs;
+      this.missingListenerSinceByProcessId.set(process.id, missingSinceMs);
+
+      if (nowMs - missingSinceMs >= this.externalListenerGraceMs) {
         this.registry.stop(process.id, this.now().toISOString());
+        this.missingListenerSinceByProcessId.delete(process.id);
       }
     }
   }
@@ -866,7 +900,46 @@ export class PortManagerAgent implements DisposableLike {
   /** True when a short-lived route allocation already owns this actual port. */
   private isActualPortReserved(port: number): boolean {
     this.cleanupExpiredRouteAllocations();
-    return [...this.pendingRouteAllocations.values()].some((allocation) => allocation.route.actualPort === port);
+    if ([...this.pendingRouteAllocations.values()].some((allocation) => allocation.route.actualPort === port)) {
+      return true;
+    }
+
+    /*
+     * A listener can disappear briefly while a dev server reloads or while the
+     * OS command table is catching up. Keep active registry ports reserved so
+     * another concurrent bind cannot claim the same actual port during grace.
+     */
+    if (
+      this.registry
+        .list()
+        .some((process) => process.status === "running" && process.source !== "detected" && process.actualPort === port)
+    ) {
+      return true;
+    }
+
+    return this.reservedListeningPorts.has(port);
+  }
+
+  /**
+   * Refreshes OS listener reservations before route selection. This protects the
+   * route policy when a low-level availability probe is affected by preload
+   * state or process-table timing and incorrectly reports a busy port as free.
+   */
+  private async refreshReservedListeningPorts(): Promise<void> {
+    try {
+      this.updateReservedListeningPorts(await this.listeningPortProvider.list());
+    } catch {
+      // Availability probing remains the source of truth when lsof/netstat fail.
+    }
+  }
+
+  /** Replaces the reservation cache with one coherent listener scan. */
+  private updateReservedListeningPorts(listeners: readonly ListeningPort[]): void {
+    this.reservedListeningPorts = new Set(
+      listeners
+        .map((listener) => listener.port)
+        .filter((port) => Number.isInteger(port) && port > 0 && port <= 65_535),
+    );
   }
 
   /** Removes abandoned route allocations after their TTL. */
@@ -914,6 +987,55 @@ export class PortManagerAgent implements DisposableLike {
     }
 
     this.registry.stop(process.id, this.now().toISOString());
+    this.missingListenerSinceByProcessId.delete(process.id);
+  }
+
+  /**
+   * Native hooks can register the same logical route more than once during
+   * autoreload or shebang handoff. Updating the existing row keeps route table
+   * ownership stable instead of accumulating stale duplicate rows.
+   */
+  private upsertRegisteredProcess(input: RegisteredProcessInput, source: "hooked" | "registered"): ManagedProcess {
+    const existingProcess = this.findRegisteredProcessForRoute(input, source);
+
+    if (existingProcess === undefined) {
+      return this.registry.register(input, { source });
+    }
+
+    return this.registry.update(existingProcess.id, {
+      pid: input.pid,
+      name: input.name,
+      command: input.command,
+      cwd: input.cwd,
+      networkId: normalizeNetworkId(input.networkId),
+      actualPort: input.actualPort,
+      status: "running",
+      startedAt: this.now().toISOString(),
+      stoppedAt: undefined,
+      url: buildUrl(input.host || this.defaultHost, input.actualPort),
+      errorMessage: undefined,
+      source,
+    });
+  }
+
+  /** Finds the active row that owns the same route identity, ignoring PID churn. */
+  private findRegisteredProcessForRoute(
+    input: RegisteredProcessInput,
+    source: "hooked" | "registered",
+  ): ManagedProcess | undefined {
+    const inputNetworkId = normalizeNetworkId(input.networkId);
+
+    return this.registry.list().find((process) => {
+      if (process.status !== "running" || process.source !== source) {
+        return false;
+      }
+
+      return (
+        process.requestedPort === input.requestedPort &&
+        process.actualPort === input.actualPort &&
+        normalizeNetworkId(process.networkId) === inputNetworkId
+      );
+    });
   }
 }
 
@@ -1014,7 +1136,33 @@ function buildLogicalRoutes(
       source: process.source ?? "managed",
     }));
 
-  return [...routes, ...pendingRoutes.map((route) => ({ ...route }))];
+  return dedupeLogicalRoutes([...routes, ...pendingRoutes.map((route) => ({ ...route }))]);
+}
+
+/**
+ * The native route lookup is keyed by logical port and network scope. If a dev
+ * server re-registers during rapid restarts, only the newest mapping for that
+ * identity should remain visible to child processes.
+ */
+function dedupeLogicalRoutes(routes: readonly LogicalPortRoute[]): readonly LogicalPortRoute[] {
+  const routesByIdentity = new Map<string, LogicalPortRoute>();
+
+  for (const route of routes) {
+    const identity = buildLogicalRouteIdentity(route);
+
+    if (routesByIdentity.has(identity)) {
+      routesByIdentity.delete(identity);
+    }
+
+    routesByIdentity.set(identity, { ...route });
+  }
+
+  return [...routesByIdentity.values()];
+}
+
+/** Matches the native hook's lookup identity: network scope plus logical port. */
+function buildLogicalRouteIdentity(route: LogicalPortRoute): string {
+  return `${route.networkId ?? ""}:${route.logicalPort}`;
 }
 
 /** Creates the route row for a process before the registry has assigned an id. */
@@ -1166,6 +1314,15 @@ function normalizeListenerScanInterval(intervalMs: number | undefined): number {
   }
 
   return Math.max(1_000, Math.trunc(intervalMs));
+}
+
+/** Keeps external listener cleanup delayed enough for autoreload handoffs. */
+function normalizeExternalListenerGraceMs(graceMs: number | undefined): number {
+  if (graceMs === undefined || !Number.isFinite(graceMs)) {
+    return DEFAULT_EXTERNAL_LISTENER_GRACE_MS;
+  }
+
+  return Math.max(0, Math.trunc(graceMs));
 }
 
 /**

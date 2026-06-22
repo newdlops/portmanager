@@ -24,6 +24,14 @@ const TERMINAL_MUTATOR_OPTIONS: vscode.EnvironmentVariableMutatorOptions = {
 export const RUNTIME_SHIM_DIRECTORY_ENV = "PORT_MANAGER_RUNTIME_SHIM_DIR";
 const PRELOAD_RUNTIME_LAUNCHER_NAMES = [
   "node",
+  "npm",
+  "npx",
+  "yarn",
+  "pnpm",
+  "pnpx",
+  "corepack",
+  "uv",
+  "uvx",
   "python",
   "python3",
   "python3.8",
@@ -36,6 +44,11 @@ const PRELOAD_RUNTIME_LAUNCHER_NAMES = [
   "ruby",
   "php",
   "perl",
+  "vite",
+  "concurrently",
+  "dotenv",
+  "wait-on",
+  "retry",
 ];
 
 /** Applies and refreshes terminal environment variables owned by Port Manager. */

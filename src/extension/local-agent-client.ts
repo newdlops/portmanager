@@ -362,10 +362,11 @@ export class LocalAgentClient implements PortManagerProcessService {
    * terminal hook with an old daemon can reintroduce stale routing behavior.
    */
   private async ensureCompatibleAgent(): Promise<void> {
-    const expectedAgentMainPath = normalizeAgentMainPath(this.getAgentMainPath());
+    const agentMainPath = this.getAgentMainPath();
+    const expectedAgentMainPath = normalizeAgentMainPath(agentMainPath);
     const actualAgentMainPath = normalizeAgentMainPath(this.snapshot.daemon.agentMainPath);
 
-    if (actualAgentMainPath === expectedAgentMainPath) {
+    if (actualAgentMainPath === expectedAgentMainPath && !isDaemonOlderThanAgentMain(this.snapshot.daemon, agentMainPath)) {
       return;
     }
 
@@ -375,7 +376,10 @@ export class LocalAgentClient implements PortManagerProcessService {
     await this.refresh();
 
     const restartedAgentMainPath = normalizeAgentMainPath(this.snapshot.daemon.agentMainPath);
-    if (restartedAgentMainPath !== expectedAgentMainPath) {
+    if (
+      restartedAgentMainPath !== expectedAgentMainPath ||
+      isDaemonOlderThanAgentMain(this.snapshot.daemon, agentMainPath)
+    ) {
       throw new Error(
         "Port Manager connected to a stale daemon. Stop the daemon and reload the extension before attaching terminals.",
       );
@@ -563,6 +567,29 @@ function normalizeAgentMainPath(agentMainPath: string | undefined): string | und
     return fs.realpathSync.native(agentMainPath);
   } catch {
     return path.resolve(agentMainPath);
+  }
+}
+
+/**
+ * A daemon can survive extension file replacement while keeping the same path.
+ * Compare startup time with the compiled entrypoint mtime so attach commands
+ * do not keep talking to old in-memory routing code after a rebuild/install.
+ */
+function isDaemonOlderThanAgentMain(daemon: AgentDaemonStatus, agentMainPath: string): boolean {
+  if (daemon.startedAt === undefined) {
+    return false;
+  }
+
+  const daemonStartedAtMs = Date.parse(daemon.startedAt);
+  if (!Number.isFinite(daemonStartedAtMs)) {
+    return false;
+  }
+
+  try {
+    const agentMainModifiedAtMs = fs.statSync(agentMainPath).mtimeMs;
+    return daemonStartedAtMs + 1_000 < agentMainModifiedAtMs;
+  } catch {
+    return false;
   }
 }
 

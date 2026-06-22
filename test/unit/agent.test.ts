@@ -124,7 +124,53 @@ test("preserves pending allocation network scope when a hooked register omits it
   assert.equal(snapshot.routes[0]?.networkId, "network-a");
 });
 
-test("marks hooked process rows stopped when their OS listener disappears", async (context) => {
+test("keeps hooked process rows during transient listener scan misses", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  let nowMs = Date.parse(fixedUpdatedAt);
+  let listeners: readonly ListeningPort[] = [
+    createListener({
+      port: 58000,
+      pid: 1234,
+    }),
+  ];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    agentPid: 777,
+    now: () => new Date(nowMs),
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 1234,
+    name: "node",
+    command: "node server.js",
+    cwd: "/workspace/app",
+    requestedPort: 8000,
+    actualPort: 58000,
+    host: "localhost",
+    source: "hooked",
+  });
+
+  listeners = [];
+  const transientSnapshot = await agent.listSnapshot();
+
+  assert.equal(transientSnapshot.processes[0]?.source, "hooked");
+  assert.equal(transientSnapshot.processes[0]?.status, "running");
+  assert.equal(transientSnapshot.routes.length, 1);
+
+  nowMs += 10_001;
+  const stoppedSnapshot = await agent.listSnapshot();
+
+  assert.equal(stoppedSnapshot.processes[0]?.source, "hooked");
+  assert.equal(stoppedSnapshot.processes[0]?.status, "stopped");
+  assert.deepEqual(stoppedSnapshot.routes, []);
+});
+
+test("updates duplicate hooked registrations for the same active route", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   let listeners: readonly ListeningPort[] = [
     createListener({
@@ -143,23 +189,187 @@ test("marks hooked process rows stopped when their OS listener disappears", asyn
   });
   context.after(() => agent.dispose());
 
+  const first = await agent.registerExistingProcess({
+    pid: 1234,
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    actualPort: 58000,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+
+  listeners = [
+    createListener({
+      port: 58000,
+      pid: 5678,
+      processName: "python3",
+      command: "python manage.py runserver 8004",
+    }),
+  ];
+
+  const updated = await agent.registerExistingProcess({
+    pid: 5678,
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    actualPort: 58000,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+  const snapshot = await agent.listSnapshot();
+
+  assert.equal(updated.id, first.id);
+  assert.equal(snapshot.processes.filter((process) => process.source === "hooked").length, 1);
+  assert.equal(snapshot.processes[0]?.pid, 5678);
+  assert.deepEqual(snapshot.routes, [
+    {
+      logicalPort: 8004,
+      actualPort: 58000,
+      host: "127.0.0.1",
+      networkId: "network-a",
+      processId: first.id,
+      processName: "python3",
+      status: "running",
+      source: "hooked",
+    },
+  ]);
+});
+
+test("uses latest route table row for repeated logical ports in the same network", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const listeners: readonly ListeningPort[] = [
+    createListener({
+      port: 58000,
+      pid: 1234,
+    }),
+    createListener({
+      id: "tcp:127.0.0.1:58001:5678",
+      port: 58001,
+      pid: 5678,
+    }),
+  ];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 1234,
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    actualPort: 58000,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+  const latest = await agent.registerExistingProcess({
+    pid: 5678,
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    actualPort: 58001,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+  const snapshot = await agent.listSnapshot();
+
+  assert.equal(snapshot.routes.length, 1);
+  assert.equal(snapshot.routes[0]?.processId, latest.id);
+  assert.equal(snapshot.routes[0]?.actualPort, 58001);
+});
+
+test("reserves active registry ports while listener scans are in grace", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const listeners: readonly ListeningPort[] = [];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
   await agent.registerExistingProcess({
     pid: 1234,
     name: "node",
     command: "node server.js",
     cwd: "/workspace/app",
-    requestedPort: 8000,
-    actualPort: 58000,
+    requestedPort: 3000,
+    actualPort: 3000,
     host: "localhost",
     source: "hooked",
   });
 
-  listeners = [];
-  const snapshot = await agent.listSnapshot();
+  const allocation = await agent.allocateRoute({
+    name: "node",
+    command: "node other.js",
+    cwd: "/workspace/other",
+    requestedPort: 3000,
+    host: "localhost",
+    networkId: "network-b",
+    scanRange: 2,
+    scanDirection: "up",
+    routingMode: "nearest",
+  });
 
-  assert.equal(snapshot.processes[0]?.source, "hooked");
-  assert.equal(snapshot.processes[0]?.status, "stopped");
-  assert.deepEqual(snapshot.routes, []);
+  assert.equal(allocation.actualPort, 3001);
+});
+
+test("reserves OS listener ports even when availability probing reports them free", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const listeners: readonly ListeningPort[] = [
+    createListener({
+      id: "tcp:127.0.0.1:3000:4321",
+      port: 3000,
+      pid: 4321,
+      processName: "Code Helper",
+      command: "Code Helper",
+    }),
+  ];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const allocation = await agent.allocateRoute({
+    name: "node",
+    command: "node server.js",
+    cwd: "/workspace/app",
+    requestedPort: 3000,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    scanRange: 2,
+    scanDirection: "up",
+    routingMode: "nearest",
+  });
+
+  assert.equal(allocation.actualPort, 3001);
 });
 
 function createFakeLauncher(): ProcessLauncher {

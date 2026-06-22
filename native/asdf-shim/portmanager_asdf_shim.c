@@ -22,6 +22,7 @@
 
 #define PM_MAX_PATH 4096
 #define PM_MAX_LINE 4096
+#define PM_MAX_TEXT 512
 #define PM_RUNTIME_SHIM_DIR_ENV "PORT_MANAGER_RUNTIME_SHIM_DIR"
 
 static const char *pm_basename(const char *path) {
@@ -78,19 +79,85 @@ static void pm_restore_dyld(void) {
   free(merged);
 }
 
+static const char *pm_network_id_from_bash_env(void) {
+  const char *bash_env = getenv("BASH_ENV");
+  const char *base_name;
+  const char *prefix = "portmanager-bash-env-";
+  const char *suffix = ".sh";
+  size_t prefix_length = strlen(prefix);
+  size_t suffix_length = strlen(suffix);
+  size_t base_length;
+  size_t network_length;
+  static char network_id_from_bash_env[PM_MAX_TEXT];
+
+  /*
+   * A scoped BASH_ENV filename identifies the currently attached terminal. It
+   * is more authoritative than env vars inherited from an older package manager
+   * or shell process.
+   */
+  if (bash_env == NULL || bash_env[0] == '\0') {
+    return NULL;
+  }
+
+  base_name = strrchr(bash_env, '/');
+  base_name = base_name == NULL ? bash_env : base_name + 1;
+  base_length = strlen(base_name);
+
+  if (base_length <= prefix_length + suffix_length || strncmp(base_name, prefix, prefix_length) != 0) {
+    return NULL;
+  }
+
+  if (strcmp(base_name + base_length - suffix_length, suffix) != 0) {
+    return NULL;
+  }
+
+  network_length = base_length - prefix_length - suffix_length;
+  if (network_length == 0 || network_length >= sizeof(network_id_from_bash_env)) {
+    return NULL;
+  }
+
+  memcpy(network_id_from_bash_env, base_name + prefix_length, network_length);
+  network_id_from_bash_env[network_length] = '\0';
+  return network_id_from_bash_env;
+}
+
+static void pm_export_network_scope(const char *network_id) {
+  if (network_id == NULL || network_id[0] == '\0') {
+    return;
+  }
+
+  setenv("PORT_MANAGER_NETWORK_ID", network_id, 1);
+  setenv("PORT_MANAGER_BORROWED_NETWORK_ID", network_id, 1);
+  setenv("NEWDLOPS_PM_NETWORK_ID", network_id, 1);
+  setenv("NEWDLOPS_PM_BORROWED_NETWORK_ID", network_id, 1);
+}
+
 static void pm_restore_network_scope(void) {
-  const char *network_id = getenv("PORT_MANAGER_NETWORK_ID");
+  const char *network_id = pm_network_id_from_bash_env();
   const char *borrowed_network_id = getenv("PORT_MANAGER_BORROWED_NETWORK_ID");
   const char *alias_network_id = getenv("NEWDLOPS_PM_NETWORK_ID");
   const char *alias_borrowed_network_id = getenv("NEWDLOPS_PM_BORROWED_NETWORK_ID");
 
-  if ((network_id == NULL || network_id[0] == '\0') && borrowed_network_id != NULL && borrowed_network_id[0] != '\0') {
-    setenv("PORT_MANAGER_NETWORK_ID", borrowed_network_id, 1);
-  } else if ((network_id == NULL || network_id[0] == '\0') && alias_network_id != NULL && alias_network_id[0] != '\0') {
-    setenv("PORT_MANAGER_NETWORK_ID", alias_network_id, 1);
-  } else if ((network_id == NULL || network_id[0] == '\0') && alias_borrowed_network_id != NULL && alias_borrowed_network_id[0] != '\0') {
-    setenv("PORT_MANAGER_NETWORK_ID", alias_borrowed_network_id, 1);
+  if (network_id != NULL && network_id[0] != '\0') {
+    pm_export_network_scope(network_id);
+    return;
   }
+
+  network_id = getenv("PORT_MANAGER_NETWORK_ID");
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    network_id = borrowed_network_id;
+  }
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    network_id = alias_network_id;
+  }
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    network_id = alias_borrowed_network_id;
+  }
+
+  pm_export_network_scope(network_id);
 }
 
 static int pm_read_all(int fd, char *buffer, size_t size) {

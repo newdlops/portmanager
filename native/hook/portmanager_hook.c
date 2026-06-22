@@ -37,6 +37,7 @@
 #define PM_DEFAULT_VIRTUAL_START 53000
 #define PM_DEFAULT_VIRTUAL_END 59999
 #define PM_DEFAULT_FIXED_PROTOCOL_PORTS "22,25,53,80,110,143,389,443,465,587,993,995,1433,1521,3306,33060,5432,5672,6379,9200,9300,11211,27017"
+#define PM_BIND_ALLOCATION_ATTEMPTS 4
 
 typedef int (*pm_bind_fn)(int, const struct sockaddr *, socklen_t);
 typedef int (*pm_connect_fn)(int, const struct sockaddr *, socklen_t);
@@ -548,9 +549,8 @@ static int pm_json_string(const char *json, const char *key, char *buffer, size_
   return used > 0 ? 0 : -1;
 }
 
-static const char *pm_current_network_id(void) {
-  const char *network_id = getenv("PORT_MANAGER_NETWORK_ID");
-  const char *bash_env;
+static const char *pm_network_id_from_bash_env(void) {
+  const char *bash_env = getenv("BASH_ENV");
   const char *base_name;
   const char *prefix = "portmanager-bash-env-";
   const char *suffix = ".sh";
@@ -559,6 +559,46 @@ static const char *pm_current_network_id(void) {
   size_t base_length;
   size_t network_length;
   static char network_id_from_bash_env[PM_MAX_TEXT];
+
+  /*
+   * The generated BASH_ENV file is scoped to the currently attached terminal.
+   * Prefer it over inherited variables so stale runtime children cannot keep
+   * registering routes under a previous terminal network.
+   */
+  if (bash_env == NULL || bash_env[0] == '\0') {
+    return NULL;
+  }
+
+  base_name = strrchr(bash_env, '/');
+  base_name = base_name == NULL ? bash_env : base_name + 1;
+  base_length = strlen(base_name);
+
+  if (base_length <= prefix_length + suffix_length || strncmp(base_name, prefix, prefix_length) != 0) {
+    return NULL;
+  }
+
+  if (strcmp(base_name + base_length - suffix_length, suffix) != 0) {
+    return NULL;
+  }
+
+  network_length = base_length - prefix_length - suffix_length;
+  if (network_length == 0 || network_length >= sizeof(network_id_from_bash_env)) {
+    return NULL;
+  }
+
+  memcpy(network_id_from_bash_env, base_name + prefix_length, network_length);
+  network_id_from_bash_env[network_length] = '\0';
+  return network_id_from_bash_env;
+}
+
+static const char *pm_current_network_id(void) {
+  const char *network_id = pm_network_id_from_bash_env();
+
+  if (network_id != NULL && network_id[0] != '\0') {
+    return network_id;
+  }
+
+  network_id = getenv("PORT_MANAGER_NETWORK_ID");
 
   if (network_id == NULL || network_id[0] == '\0') {
     network_id = getenv("PORT_MANAGER_BORROWED_NETWORK_ID");
@@ -572,40 +612,7 @@ static const char *pm_current_network_id(void) {
     network_id = getenv("NEWDLOPS_PM_BORROWED_NETWORK_ID");
   }
 
-  if (network_id != NULL && network_id[0] != '\0') {
-    return network_id;
-  }
-
-  /*
-   * Some macOS shebang and package-manager boundaries preserve BASH_ENV while
-   * dropping the explicit network variables. The generated BASH_ENV filename is
-   * network-scoped, so it is a last-resort source of truth for route scoping.
-   */
-  bash_env = getenv("BASH_ENV");
-  if (bash_env == NULL || bash_env[0] == '\0') {
-    return network_id;
-  }
-
-  base_name = strrchr(bash_env, '/');
-  base_name = base_name == NULL ? bash_env : base_name + 1;
-  base_length = strlen(base_name);
-
-  if (base_length <= prefix_length + suffix_length || strncmp(base_name, prefix, prefix_length) != 0) {
-    return network_id;
-  }
-
-  if (strcmp(base_name + base_length - suffix_length, suffix) != 0) {
-    return network_id;
-  }
-
-  network_length = base_length - prefix_length - suffix_length;
-  if (network_length == 0 || network_length >= sizeof(network_id_from_bash_env)) {
-    return network_id;
-  }
-
-  memcpy(network_id_from_bash_env, base_name + prefix_length, network_length);
-  network_id_from_bash_env[network_length] = '\0';
-  return network_id_from_bash_env;
+  return network_id;
 }
 
 static void pm_network_scope_payload(char *buffer, size_t size) {
@@ -1031,28 +1038,45 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
   allocation_id[0] = '\0';
   actual_port = logical_port;
 
-  pm_hook_depth++;
-  if (pm_allocate_route(logical_port, host, &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
-    pm_hook_depth--;
-    return pm_real_bind(sockfd, addr, addrlen);
-  }
-  pm_hook_depth--;
-
-  memcpy(&rewritten, addr, addrlen);
-  pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
-
-  result = pm_real_bind(sockfd, (struct sockaddr *)&rewritten, addrlen);
-  if (result != 0 && errno == EADDRINUSE && actual_port != logical_port) {
-    pm_release_allocation(allocation_id);
+  result = -1;
+  for (int attempt = 0; attempt < PM_BIND_ALLOCATION_ATTEMPTS; attempt++) {
     allocation_id[0] = '\0';
+    actual_port = logical_port;
 
     pm_hook_depth++;
-    if (pm_allocate_route(logical_port, host, &actual_port, allocation_id, sizeof(allocation_id)) == 0) {
-      memcpy(&rewritten, addr, addrlen);
-      pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
-      result = pm_real_bind(sockfd, (struct sockaddr *)&rewritten, addrlen);
+    if (pm_allocate_route(logical_port, host, &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
+      pm_hook_depth--;
+      if (attempt + 1 < PM_BIND_ALLOCATION_ATTEMPTS) {
+        usleep(50000);
+        continue;
+      }
+      return pm_real_bind(sockfd, addr, addrlen);
     }
     pm_hook_depth--;
+
+    memcpy(&rewritten, addr, addrlen);
+    pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
+
+    result = pm_real_bind(sockfd, (struct sockaddr *)&rewritten, addrlen);
+    if (result == 0) {
+      break;
+    }
+
+    {
+      int saved_errno = errno;
+      pm_release_allocation(allocation_id);
+      allocation_id[0] = '\0';
+
+      if (saved_errno == EADDRINUSE && attempt + 1 < PM_BIND_ALLOCATION_ATTEMPTS) {
+        pm_debug("bind collision logical=%d actual=%d retry=%d", logical_port, actual_port, attempt + 1);
+        usleep(50000);
+        errno = saved_errno;
+        continue;
+      }
+
+      errno = saved_errno;
+      break;
+    }
   }
 
   if (result == 0) {
