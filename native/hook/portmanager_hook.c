@@ -652,7 +652,13 @@ static int pm_route_network_match_level(const char *route_json) {
   char route_network[PM_MAX_TEXT];
 
   if (network_id == NULL || network_id[0] == '\0') {
-    return pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0 ? 2 : 0;
+    /*
+     * Some launcher chains briefly lose the scoped network env while keeping the
+     * injected hook alive. Prefer legacy unscoped rows, but still allow a scoped
+     * route as a fallback so localhost clients do not fall back to the physical
+     * logical port and become ambiguous in the VS Code router.
+     */
+    return pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0 ? 2 : 1;
   }
 
   if (pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0) {

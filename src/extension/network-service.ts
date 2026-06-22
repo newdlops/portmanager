@@ -29,6 +29,7 @@ import type {
   DisposableLike,
   HostAccessBinding,
   HostPortExposure,
+  ManagedProcess,
   LogicalNetwork,
   LogicalPortRoute,
   NetworkRuntimeDescriptor,
@@ -719,7 +720,7 @@ export class PortManagerNetworkService implements DisposableLike {
       clientProcess === undefined ? undefined : this.findAttachedNetworkForPid(clientProcess.pid, processRows);
 
     if (networkId === undefined) {
-      const uniqueRoute = await this.findUniqueRouteForRouter(connection.logicalPort);
+      const uniqueRoute = await this.findUniqueRouteForRouter(connection.logicalPort, processRows);
       if (uniqueRoute === undefined) {
         throw new Error(`No attached logical network found for localhost:${connection.logicalPort} client.`);
       }
@@ -799,21 +800,62 @@ export class PortManagerNetworkService implements DisposableLike {
    * Debug adapters and browsers can originate outside an attached terminal; a
    * single live route is still safe because there is no network choice to make.
    */
-  private async findUniqueRouteForRouter(logicalPort: number): Promise<LogicalPortRoute | undefined> {
+  private async findUniqueRouteForRouter(
+    logicalPort: number,
+    processRows: readonly ProcessTableRow[],
+  ): Promise<LogicalPortRoute | undefined> {
     if (this.processService === undefined) {
       return undefined;
     }
 
-    const candidates = this.processService
-      .getSnapshot()
-      .routes.filter(
-        (route) =>
-          route.logicalPort === logicalPort &&
-          route.actualPort !== route.logicalPort &&
-          (route.status === "running" || route.status === "starting"),
-      );
+    const snapshot = this.processService.getSnapshot();
+    const candidates = snapshot.routes.filter(
+      (route) =>
+        route.logicalPort === logicalPort &&
+        route.actualPort !== route.logicalPort &&
+        (route.status === "running" || route.status === "starting"),
+    );
 
-    return candidates.length === 1 ? candidates[0] : undefined;
+    if (candidates.length === 1) {
+      return candidates[0];
+    }
+
+    return this.findSingleAttachedRouteForRouter(candidates, snapshot.processes, processRows);
+  }
+
+  /**
+   * Falls back to the only attached network candidate when a host-side client
+   * cannot be mapped back to a terminal PID. This keeps launcher chains that
+   * briefly lose hook metadata from failing just because stale rows from another
+   * network still exist in the daemon snapshot.
+   */
+  private findSingleAttachedRouteForRouter(
+    candidates: readonly LogicalPortRoute[],
+    processes: readonly ManagedProcess[],
+    processRows: readonly ProcessTableRow[],
+  ): LogicalPortRoute | undefined {
+    const attachedNetworkIds = new Set(
+      this.registry
+        .getSnapshot()
+        .attachments.filter((attachment) => attachment.status === "attached")
+        .map((attachment) => attachment.networkId),
+    );
+    const candidateByNetworkId = new Map<string, LogicalPortRoute>();
+
+    for (const route of candidates) {
+      const process =
+        route.processId === undefined ? undefined : processes.find((item) => item.id === route.processId);
+      const routeNetworkId =
+        route.networkId ??
+        process?.networkId ??
+        (process === undefined ? undefined : this.findAttachedNetworkForPid(process.pid, processRows));
+
+      if (routeNetworkId !== undefined && attachedNetworkIds.has(routeNetworkId)) {
+        candidateByNetworkId.set(routeNetworkId, route);
+      }
+    }
+
+    return candidateByNetworkId.size === 1 ? [...candidateByNetworkId.values()][0] : undefined;
   }
 
   /** Maps an arbitrary process PID back to the network attached to its terminal. */
