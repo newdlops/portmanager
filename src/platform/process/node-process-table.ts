@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const PROCESS_TABLE_SNAPSHOT_TTL_MS = 250;
 
 export interface ProcessTableRow {
   /** OS process id. */
@@ -32,6 +33,11 @@ interface NodeProcessTableProviderOptions {
   readonly commandRunner?: CommandRunner;
 }
 
+interface ProcessTableSnapshot {
+  readonly rows: readonly ProcessTableRow[];
+  readonly expiresAtMs: number;
+}
+
 /**
  * Reads the local process table needed to map arbitrary processes to terminals.
  *
@@ -40,6 +46,11 @@ interface NodeProcessTableProviderOptions {
  */
 export class NodeProcessTableProvider {
   private readonly runCommand: CommandRunner;
+  /** Point-in-time process table shared by router connections in the same burst. */
+  private snapshot?: ProcessTableSnapshot;
+
+  /** In-flight ps call reused by concurrent ancestry checks. */
+  private request?: Promise<readonly ProcessTableRow[]>;
 
   constructor(options: NodeProcessTableProviderOptions = {}) {
     this.runCommand = options.commandRunner ?? runExecFile;
@@ -51,8 +62,34 @@ export class NodeProcessTableProvider {
       return [];
     }
 
-    const { stdout } = await this.runCommand("ps", ["-Ao", "pid=,ppid=,pgid=,tty="]);
-    return parsePosixProcessTable(toText(stdout));
+    const now = Date.now();
+
+    if (this.snapshot !== undefined && this.snapshot.expiresAtMs > now) {
+      return this.snapshot.rows;
+    }
+
+    if (this.request !== undefined) {
+      return this.request;
+    }
+
+    let request: Promise<readonly ProcessTableRow[]>;
+    request = this.runCommand("ps", ["-Ao", "pid=,ppid=,pgid=,tty="])
+      .then(({ stdout }) => {
+        const rows = parsePosixProcessTable(toText(stdout));
+        this.snapshot = {
+          rows,
+          expiresAtMs: Date.now() + PROCESS_TABLE_SNAPSHOT_TTL_MS,
+        };
+        return rows;
+      })
+      .finally(() => {
+        if (this.request === request) {
+          this.request = undefined;
+        }
+      });
+
+    this.request = request;
+    return request;
   }
 }
 

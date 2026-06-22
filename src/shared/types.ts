@@ -20,6 +20,8 @@ export type ProcessSource = "managed" | "registered" | "hooked" | "detected" | "
 
 export type PortProtocol = "tcp";
 
+export type LogicalPortRouteDirection = "listen" | "send";
+
 export type NetworkPortProtocol = "tcp" | "udp";
 
 export type LogicalNetworkStatus = "creating" | "running" | "stopped" | "error";
@@ -405,6 +407,8 @@ export interface LogicalPortRoute {
   readonly logicalPort: number;
   /** Actual OS listening port assigned by Port Manager. */
   readonly actualPort: number;
+  /** Direction of this endpoint state: listener ownership or sender reservation. */
+  readonly routeDirection?: LogicalPortRouteDirection;
   /** Host used for URLs and availability checks. */
   readonly host: string;
   /** Working directory that produced this route, used as a fallback scope when launcher metadata is missing. */
@@ -434,6 +438,8 @@ export interface AgentAllocateRouteRequest {
   readonly host: string;
   /** Logical network scope inherited from an attached terminal window. */
   readonly networkId?: string;
+  /** Whether this allocation is preparing a listener bind or a sender connect. */
+  readonly routeDirection?: LogicalPortRouteDirection;
   /** Number of nearby candidate ports checked after the requested port is busy. */
   readonly scanRange: number;
   /** Candidate generation policy used by the agent. */

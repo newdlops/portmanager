@@ -3,12 +3,16 @@ import { promisify } from "node:util";
 import type { LogicalPortRouterConnection } from "./logical-port-router";
 
 const execFileAsync = promisify(execFile);
+const ESTABLISHED_CONNECTION_SNAPSHOT_TTL_MS = 250;
+const PROCESS_CWD_CACHE_TTL_MS = 5000;
 
 export interface TcpConnectionProcess {
   /** PID that owns the client side of an accepted TCP connection. */
   readonly pid: number;
   /** Short process name from the OS table, used only for diagnostics. */
   readonly processName?: string;
+  /** Working directory used to disambiguate identical logical ports across projects. */
+  readonly cwd?: string;
 }
 
 interface CommandResult {
@@ -37,6 +41,16 @@ interface ParsedConnection {
   readonly remote: ParsedConnectionEndpoint;
 }
 
+interface EstablishedConnectionSnapshot {
+  readonly output: string;
+  readonly expiresAtMs: number;
+}
+
+interface ProcessCwdSnapshot {
+  readonly cwd?: string;
+  readonly expiresAtMs: number;
+}
+
 /**
  * Resolves the process that initiated a local TCP connection.
  *
@@ -45,6 +59,20 @@ interface ParsedConnection {
  */
 export class NodeTcpConnectionProcessResolver {
   private readonly runCommand: CommandRunner;
+  /**
+   * Point-in-time TCP table shared by router connections accepted in the same
+   * burst. Without this, polling clients can spawn one global lsof per socket.
+   */
+  private establishedConnectionsSnapshot?: EstablishedConnectionSnapshot;
+
+  /** In-flight global lsof call reused by concurrent socket resolutions. */
+  private establishedConnectionsRequest?: Promise<string>;
+
+  /** Short-lived cwd cache keyed by PID; process cwd is stable for this use. */
+  private readonly cwdSnapshotsByPid = new Map<number, ProcessCwdSnapshot>();
+
+  /** In-flight cwd lookups keyed by PID, preventing duplicate narrow lsof calls. */
+  private readonly cwdRequestsByPid = new Map<number, Promise<string | undefined>>();
 
   constructor(options: TcpConnectionProcessResolverOptions = {}) {
     this.runCommand = options.commandRunner ?? runExecFile;
@@ -56,8 +84,100 @@ export class NodeTcpConnectionProcessResolver {
       return undefined;
     }
 
-    const { stdout } = await this.runCommand("lsof", ["-nP", "-iTCP", "-sTCP:ESTABLISHED", "-Fpcn"]);
-    return parseClientProcessFromLsof(toText(stdout), connection);
+    const establishedConnections = await this.readEstablishedConnections();
+    const clientProcess = parseClientProcessFromLsof(establishedConnections, connection);
+
+    if (clientProcess === undefined) {
+      return undefined;
+    }
+
+    const cwd = await this.resolveProcessCwd(clientProcess.pid).catch(() => undefined);
+    return cwd === undefined ? clientProcess : { ...clientProcess, cwd };
+  }
+
+  /**
+   * Reads cwd in a second, narrow lsof call.
+   *
+   * Process environment and terminal ancestry can be hidden by macOS privacy
+   * boundaries. cwd is still commonly visible for same-user tools such as
+   * wait-on, and gives the router a stable fallback scope.
+   */
+  private async resolveProcessCwd(pid: number): Promise<string | undefined> {
+    const now = Date.now();
+    const cached = this.cwdSnapshotsByPid.get(pid);
+
+    if (cached !== undefined) {
+      if (cached.expiresAtMs > now) {
+        return cached.cwd;
+      }
+
+      this.cwdSnapshotsByPid.delete(pid);
+    }
+
+    const currentRequest = this.cwdRequestsByPid.get(pid);
+    if (currentRequest !== undefined) {
+      return currentRequest;
+    }
+
+    let request: Promise<string | undefined>;
+    request = this.runCommand("lsof", ["-nP", "-a", "-p", String(pid), "-d", "cwd", "-Fn"])
+      .then(({ stdout }) => {
+        const cwd = parseProcessCwdFromLsof(toText(stdout));
+        this.cwdSnapshotsByPid.set(pid, {
+          cwd,
+          expiresAtMs: Date.now() + PROCESS_CWD_CACHE_TTL_MS,
+        });
+        return cwd;
+      })
+      .finally(() => {
+        if (this.cwdRequestsByPid.get(pid) === request) {
+          this.cwdRequestsByPid.delete(pid);
+        }
+      });
+
+    this.cwdRequestsByPid.set(pid, request);
+    return request;
+  }
+
+  /**
+   * Reads established TCP sockets through one shared snapshot.
+   *
+   * The logical router accepts many short-lived connections when tools poll a
+   * server port. A small TTL is enough to cover that burst while still keeping
+   * tuple data fresh for the next accepted socket.
+   */
+  private async readEstablishedConnections(): Promise<string> {
+    const now = Date.now();
+
+    if (
+      this.establishedConnectionsSnapshot !== undefined &&
+      this.establishedConnectionsSnapshot.expiresAtMs > now
+    ) {
+      return this.establishedConnectionsSnapshot.output;
+    }
+
+    if (this.establishedConnectionsRequest !== undefined) {
+      return this.establishedConnectionsRequest;
+    }
+
+    let request: Promise<string>;
+    request = this.runCommand("lsof", ["-nP", "-iTCP", "-sTCP:ESTABLISHED", "-Fpcn"])
+      .then(({ stdout }) => {
+        const output = toText(stdout);
+        this.establishedConnectionsSnapshot = {
+          output,
+          expiresAtMs: Date.now() + ESTABLISHED_CONNECTION_SNAPSHOT_TTL_MS,
+        };
+        return output;
+      })
+      .finally(() => {
+        if (this.establishedConnectionsRequest === request) {
+          this.establishedConnectionsRequest = undefined;
+        }
+      });
+
+    this.establishedConnectionsRequest = request;
+    return request;
   }
 }
 
@@ -102,6 +222,23 @@ export function parseClientProcessFromLsof(
         pid: current.pid,
         processName: current.processName,
       };
+    }
+  }
+
+  return undefined;
+}
+
+/** Parses the first lsof file-name field from a cwd-only query. */
+export function parseProcessCwdFromLsof(output: string): string | undefined {
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || line[0] !== "n") {
+      continue;
+    }
+
+    const cwd = line.slice(1).trim();
+    if (cwd.length > 0) {
+      return cwd;
     }
   }
 

@@ -68,6 +68,17 @@ test("recognizes external route allocation request methods", () => {
       allocationId: "allocation:test",
     },
   } as const;
+  const releaseProcessRouteMessage = {
+    id: "request-release-process-route",
+    method: "releaseProcessRoute",
+    payload: {
+      pid: 1234,
+      allocationId: "allocation:test",
+      requestedPort: 8000,
+      actualPort: 58000,
+      networkId: "network-a",
+    },
+  } as const;
   const shutdownMessage = {
     id: "request-shutdown",
     method: "shutdownDaemon",
@@ -75,6 +86,7 @@ test("recognizes external route allocation request methods", () => {
 
   assert.equal(isAgentRequestMessage(allocateMessage), true);
   assert.equal(isAgentRequestMessage(releaseMessage), true);
+  assert.equal(isAgentRequestMessage(releaseProcessRouteMessage), true);
   assert.equal(isAgentRequestMessage(shutdownMessage), true);
 });
 
@@ -133,6 +145,7 @@ test("snapshot merge keeps managed route context and adds external listeners", (
     {
       logicalPort: 3000,
       actualPort: 3001,
+      routeDirection: "listen",
       host: "localhost",
       cwd: "/workspace/app",
       processId: "managed-1",
@@ -166,6 +179,7 @@ test("snapshot merge includes pending external route allocations", () => {
     {
       logicalPort: 8000,
       actualPort: 58000,
+      routeDirection: "listen",
       host: "localhost",
       processName: "external-cli",
       status: "starting",

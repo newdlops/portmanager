@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const PROCESS_ENVIRONMENT_CACHE_TTL_MS = 5000;
 
 const ROUTING_NETWORK_VARIABLES = [
   "PORT_MANAGER_NETWORK_ID",
@@ -21,6 +22,11 @@ interface NodeProcessEnvironmentProviderOptions {
   readonly commandRunner?: CommandRunner;
 }
 
+interface ProcessEnvironmentSnapshot {
+  readonly networkId?: string;
+  readonly expiresAtMs: number;
+}
+
 /**
  * Reads Port Manager routing scope from another local process.
  *
@@ -30,6 +36,11 @@ interface NodeProcessEnvironmentProviderOptions {
  */
 export class NodeProcessEnvironmentProvider {
   private readonly runCommand: CommandRunner;
+  /** Short-lived per-PID routing-scope cache for bursty logical router clients. */
+  private readonly snapshotsByPid = new Map<number, ProcessEnvironmentSnapshot>();
+
+  /** In-flight per-PID environment reads so duplicate router connections share one ps call. */
+  private readonly requestsByPid = new Map<number, Promise<string | undefined>>();
 
   constructor(options: NodeProcessEnvironmentProviderOptions = {}) {
     this.runCommand = options.commandRunner ?? runExecFile;
@@ -41,8 +52,40 @@ export class NodeProcessEnvironmentProvider {
       return undefined;
     }
 
-    const { stdout } = await this.runCommand("ps", ["eww", "-p", String(pid)]);
-    return parseRoutingNetworkIdFromProcessEnvironment(toText(stdout));
+    const now = Date.now();
+    const cached = this.snapshotsByPid.get(pid);
+
+    if (cached !== undefined) {
+      if (cached.expiresAtMs > now) {
+        return cached.networkId;
+      }
+
+      this.snapshotsByPid.delete(pid);
+    }
+
+    const currentRequest = this.requestsByPid.get(pid);
+    if (currentRequest !== undefined) {
+      return currentRequest;
+    }
+
+    let request: Promise<string | undefined>;
+    request = this.runCommand("ps", ["eww", "-p", String(pid)])
+      .then(({ stdout }) => {
+        const networkId = parseRoutingNetworkIdFromProcessEnvironment(toText(stdout));
+        this.snapshotsByPid.set(pid, {
+          networkId,
+          expiresAtMs: Date.now() + PROCESS_ENVIRONMENT_CACHE_TTL_MS,
+        });
+        return networkId;
+      })
+      .finally(() => {
+        if (this.requestsByPid.get(pid) === request) {
+          this.requestsByPid.delete(pid);
+        }
+      });
+
+    this.requestsByPid.set(pid, request);
+    return request;
   }
 }
 

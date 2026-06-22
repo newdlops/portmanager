@@ -60,6 +60,7 @@ test("registers native hook processes as hooked managed rows", async (context) =
     {
       logicalPort: 8000,
       actualPort: 58000,
+      routeDirection: "listen",
       host: "localhost",
       cwd: "/workspace/app",
       networkId: "network-a",
@@ -73,6 +74,114 @@ test("registers native hook processes as hooked managed rows", async (context) =
   assert.deepEqual(readRouteTable(getRouteTablePathForLogicalPort(8000, "network-a", routeTablePath)).routes, snapshot.routes);
 
   listeners = [];
+});
+
+test("releases hooked process routes and removes endpoint files when the owner exits", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  let listeners: readonly ListeningPort[] = [
+    createListener({
+      port: 58000,
+      pid: 1234,
+    }),
+  ];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 1234,
+    name: "node",
+    command: "node server.js",
+    cwd: "/workspace/app",
+    requestedPort: 8000,
+    actualPort: 58000,
+    host: "localhost",
+    networkId: "network-a",
+    source: "hooked",
+  });
+
+  const networkRouteTablePath = getNetworkRouteTablePath("network-a", routeTablePath);
+  const routeEntryPath = getRouteTablePathForLogicalPort(8000, "network-a", routeTablePath);
+  assert.equal(fs.existsSync(routeEntryPath), true);
+
+  listeners = [];
+  const released = await agent.releaseProcessRoute({
+    pid: 1234,
+    requestedPort: 8000,
+    actualPort: 58000,
+    networkId: "network-a",
+  });
+  const snapshot = await agent.listSnapshot();
+
+  assert.equal(released, true);
+  assert.equal(snapshot.processes[0]?.status, "stopped");
+  assert.deepEqual(snapshot.routes, []);
+  assert.deepEqual(readRouteTable(networkRouteTablePath).routes, []);
+  assert.equal(fs.existsSync(routeEntryPath), false);
+});
+
+test("keeps hooked process routes when another PID still owns the listener", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  let listeners: readonly ListeningPort[] = [
+    createListener({
+      port: 58000,
+      pid: 1234,
+    }),
+  ];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 1234,
+    name: "daphne-parent",
+    command: "python manage.py runserver 8000",
+    cwd: "/workspace/app",
+    requestedPort: 8000,
+    actualPort: 58000,
+    host: "localhost",
+    networkId: "network-a",
+    source: "hooked",
+  });
+
+  listeners = [
+    createListener({
+      port: 58000,
+      pid: 4321,
+      processName: "daphne-worker",
+      command: "python manage.py runserver 8000",
+    }),
+  ];
+  const released = await agent.releaseProcessRoute({
+    pid: 1234,
+    requestedPort: 8000,
+    actualPort: 58000,
+    networkId: "network-a",
+  });
+  const snapshot = await agent.listSnapshot();
+  const routeEntryPath = getRouteTablePathForLogicalPort(8000, "network-a", routeTablePath);
+
+  assert.equal(released, false);
+  assert.equal(snapshot.processes[0]?.status, "running");
+  assert.equal(snapshot.processes[0]?.pid, 4321);
+  assert.equal(snapshot.routes.length, 1);
+  assert.equal(fs.existsSync(routeEntryPath), true);
 });
 
 test("preserves pending allocation network scope when a hooked register omits it", async (context) => {
@@ -97,6 +206,7 @@ test("preserves pending allocation network scope when a hooked register omits it
     requestedPort: 8004,
     host: "127.0.0.1",
     networkId: "network-a",
+    routeDirection: "listen",
     scanRange: 20,
     scanDirection: "up",
     routingMode: "hashed",
@@ -126,6 +236,98 @@ test("preserves pending allocation network scope when a hooked register omits it
   const snapshot = await agent.listSnapshot();
 
   assert.equal(snapshot.routes[0]?.networkId, "network-a");
+});
+
+test("removes expired pending allocation endpoint files", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  let nowMs = Date.parse(fixedUpdatedAt);
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: () => new Date(nowMs),
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.allocateRoute({
+    name: "wait-on",
+    command: "wait-on http://localhost:8004/healthz",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    routeDirection: "send",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+
+  const networkRouteTablePath = getNetworkRouteTablePath("network-a", routeTablePath);
+  const routeEntryPath = getRouteTablePathForLogicalPort(8004, "network-a", routeTablePath);
+  assert.equal(fs.existsSync(routeEntryPath), true);
+
+  nowMs += 30_001;
+  const snapshot = await agent.listSnapshot();
+
+  assert.deepEqual(snapshot.routes, []);
+  assert.deepEqual(readRouteTable(networkRouteTablePath).routes, []);
+  assert.equal(fs.existsSync(routeEntryPath), false);
+});
+
+test("keeps expired pending route files while the actual listener is alive", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  let nowMs = Date.parse(fixedUpdatedAt);
+  let listeners: readonly ListeningPort[] = [];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    agentPid: 777,
+    now: () => new Date(nowMs),
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const allocation = await agent.allocateRoute({
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    routeDirection: "listen",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+
+  const networkRouteTablePath = getNetworkRouteTablePath("network-a", routeTablePath);
+  const routeEntryPath = getRouteTablePathForLogicalPort(8004, "network-a", routeTablePath);
+  listeners = [
+    createListener({
+      port: allocation.actualPort,
+      pid: 4321,
+      processName: "python3",
+    }),
+  ];
+
+  nowMs += 30_001;
+  const snapshot = await agent.listSnapshot();
+
+  assert.equal(snapshot.routes.length, 1);
+  assert.equal((snapshot.routes[0] as { actualPort?: number }).actualPort, allocation.actualPort);
+  assert.equal(readRouteTable(networkRouteTablePath).routes.length, 1);
+  assert.equal(fs.existsSync(routeEntryPath), true);
 });
 
 test("keeps hooked process rows during request snapshots and transient background misses", async (context) => {
@@ -249,6 +451,7 @@ test("updates duplicate hooked registrations for the same active route", async (
     {
       logicalPort: 8004,
       actualPort: 58000,
+      routeDirection: "listen",
       host: "127.0.0.1",
       cwd: "/workspace/app",
       networkId: "network-a",
@@ -407,6 +610,7 @@ test("reuses pending route allocations for sender-first and receiver-first order
     requestedPort: 8004,
     host: "127.0.0.1",
     networkId: "network-a",
+    routeDirection: "send",
     scanRange: 20,
     scanDirection: "up",
     routingMode: "hashed",
@@ -420,6 +624,7 @@ test("reuses pending route allocations for sender-first and receiver-first order
     requestedPort: 8004,
     host: "127.0.0.1",
     networkId: "network-a",
+    routeDirection: "listen",
     scanRange: 20,
     scanDirection: "up",
     routingMode: "hashed",
@@ -439,6 +644,7 @@ test("reuses pending route allocations for sender-first and receiver-first order
     requestedPort: 8005,
     host: "127.0.0.1",
     networkId: "network-b",
+    routeDirection: "listen",
     scanRange: 20,
     scanDirection: "up",
     routingMode: "hashed",
@@ -452,6 +658,7 @@ test("reuses pending route allocations for sender-first and receiver-first order
     requestedPort: 8005,
     host: "127.0.0.1",
     networkId: "network-b",
+    routeDirection: "send",
     scanRange: 20,
     scanDirection: "up",
     routingMode: "hashed",
@@ -461,6 +668,77 @@ test("reuses pending route allocations for sender-first and receiver-first order
 
   assert.equal(laterSenderAllocation.allocationId, firstReceiverAllocation.allocationId);
   assert.equal(laterSenderAllocation.actualPort, firstReceiverAllocation.actualPort);
+});
+
+test("promotes sender-first reservations into listener routes", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const senderAllocation = await agent.allocateRoute({
+    name: "wait-on",
+    command: "wait-on http://localhost:8004/healthz",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    routeDirection: "send",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+  const pendingRouteEntry = readRouteTable(getRouteTablePathForLogicalPort(8004, "network-a", routeTablePath));
+
+  assert.equal((pendingRouteEntry.routes[0] as { routeDirection?: string }).routeDirection, "send");
+
+  const receiverAllocation = await agent.allocateRoute({
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    routeDirection: "listen",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+
+  assert.equal(receiverAllocation.allocationId, senderAllocation.allocationId);
+  assert.equal(receiverAllocation.actualPort, senderAllocation.actualPort);
+
+  await agent.registerExistingProcess({
+    pid: 1234,
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    actualPort: receiverAllocation.actualPort,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    allocationId: receiverAllocation.allocationId,
+    source: "hooked",
+  });
+
+  const routeEntryTable = readRouteTable(getRouteTablePathForLogicalPort(8004, "network-a", routeTablePath));
+
+  assert.equal(routeEntryTable.routes.length, 1);
+  assert.equal((routeEntryTable.routes[0] as { actualPort?: number }).actualPort, senderAllocation.actualPort);
+  assert.equal((routeEntryTable.routes[0] as { routeDirection?: string }).routeDirection, "listen");
+  assert.equal((routeEntryTable.routes[0] as { source?: string }).source, "hooked");
 });
 
 test("reuses active receiver routes instead of creating sender-side pending routes", async (context) => {
@@ -505,6 +783,7 @@ test("reuses active receiver routes instead of creating sender-side pending rout
     requestedPort: 8004,
     host: "127.0.0.1",
     networkId: "network-a",
+    routeDirection: "send",
     scanRange: 20,
     scanDirection: "up",
     routingMode: "hashed",
@@ -521,6 +800,51 @@ test("reuses active receiver routes instead of creating sender-side pending rout
   assert.equal((routeTable.routes[0] as { actualPort?: number }).actualPort, 58000);
   assert.equal((routeTable.routes[0] as { source?: string }).source, "hooked");
   assert.deepEqual(routeEntryTable.routes, routeTable.routes);
+});
+
+test("does not reuse active listener routes for a new listener allocation", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 1234,
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    actualPort: 58000,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+
+  const allocation = await agent.allocateRoute({
+    name: "python3",
+    command: "python manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    routeDirection: "listen",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58001,
+  });
+
+  assert.notEqual(allocation.allocationId, "");
+  assert.equal(allocation.actualPort, 58001);
 });
 
 test("removes stale pending routes when a receiver registers without an allocation id", async (context) => {
@@ -544,6 +868,7 @@ test("removes stale pending routes when a receiver registers without an allocati
     requestedPort: 8004,
     host: "127.0.0.1",
     networkId: "network-a",
+    routeDirection: "send",
     scanRange: 20,
     scanDirection: "up",
     routingMode: "hashed",
@@ -606,6 +931,7 @@ test("serializes receiver registration behind in-flight sender allocation", asyn
     requestedPort: 8004,
     host: "127.0.0.1",
     networkId: "network-a",
+    routeDirection: "send",
     scanRange: 20,
     scanDirection: "up",
     routingMode: "hashed",

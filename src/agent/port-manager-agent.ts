@@ -17,6 +17,7 @@ import type {
   AgentStartManagedProcessRequest,
   DisposableLike,
   AgentDaemonStatus,
+  LogicalPortRouteDirection,
   LogicalPortRoute,
   ListeningPort,
   ListeningPortProvider,
@@ -35,6 +36,7 @@ import {
   NdjsonMessageBuffer,
   type AgentRequestMessage,
   type RemoveProcessPayload,
+  type ReleaseProcessRoutePayload,
   type RestartProcessPayload,
   type ReleaseRouteAllocationPayload,
   type StopProcessPayload,
@@ -296,7 +298,7 @@ export class PortManagerAgent implements DisposableLike {
     );
     this.subscriptions.push(
       this.processLauncher.onExit((pid) => {
-        this.markExitedProcessStopped(pid);
+        void this.runExclusiveRouteOperation(async () => this.markExitedProcessStopped(pid));
       }),
     );
   }
@@ -359,7 +361,9 @@ export class PortManagerAgent implements DisposableLike {
       this.cleanupExpiredRouteAllocations();
 
       const networkRouteScope = normalizeNetworkId(input.networkId);
-      const activeRoute = this.findReusableActiveRoute(input.requestedPort, networkRouteScope);
+      const routeDirection = normalizeRouteDirection(input.routeDirection);
+      const activeRoute =
+        routeDirection === "send" ? this.findReusableActiveRoute(input.requestedPort, networkRouteScope) : undefined;
       if (activeRoute !== undefined) {
         const logicalRoutes = this.buildCurrentLogicalRoutes();
         this.writeRouteTable(logicalRoutes);
@@ -408,7 +412,7 @@ export class PortManagerAgent implements DisposableLike {
       });
       const allocationId = `allocation:${randomUUID()}`;
       const expiresAtMs = this.now().getTime() + ROUTE_ALLOCATION_TTL_MS;
-      const route = buildAllocatedLogicalRoute(input, decision.actualPort);
+      const route = buildAllocatedLogicalRoute(input, decision.actualPort, routeDirection);
 
       this.pendingRouteAllocations.set(allocationId, {
         id: allocationId,
@@ -443,6 +447,64 @@ export class PortManagerAgent implements DisposableLike {
     const released = this.pendingRouteAllocations.delete(allocationId);
 
     if (released) {
+      this.writeRouteTable(this.buildCurrentLogicalRoutes());
+      this.queueSnapshotBroadcast();
+    }
+
+    return released;
+  }
+
+  /**
+   * Releases a route owned by an external hook process that is exiting.
+   * The native hook cannot know the registry id, so it identifies ownership by
+   * PID plus logical/actual route identity. A newer process with the same route
+   * but a different PID is intentionally left alone.
+   */
+  async releaseProcessRoute(input: ReleaseProcessRoutePayload): Promise<boolean> {
+    return this.runExclusiveRouteOperation(async () => this.releaseProcessRouteExclusive(input));
+  }
+
+  /** Releases an external process route while route files are updated in order. */
+  private async releaseProcessRouteExclusive(input: ReleaseProcessRoutePayload): Promise<boolean> {
+    const inputNetworkId = normalizeNetworkId(input.networkId);
+    const activeListener = await this.findActiveListenerForActualPort(input.actualPort);
+    let released = false;
+    let retained = false;
+
+    if (input.allocationId !== undefined && input.allocationId.length > 0) {
+      released = this.pendingRouteAllocations.delete(input.allocationId) || released;
+    }
+
+    for (const process of this.registry.list()) {
+      if (
+        process.status !== "running" ||
+        process.source === "detected" ||
+        process.pid !== input.pid ||
+        process.requestedPort !== input.requestedPort ||
+        process.actualPort !== input.actualPort ||
+        (inputNetworkId !== undefined && normalizeNetworkId(process.networkId) !== inputNetworkId)
+      ) {
+        continue;
+      }
+
+      if (activeListener !== undefined) {
+        /*
+         * Autoreload and worker handoff can make the process that registered the
+         * route exit while another PID still owns the listening socket. Keep the
+         * route alive because the actual network target is still valid.
+         */
+        this.adoptExternalListenerOwner(process, activeListener);
+        this.missingListenerStateByProcessId.delete(process.id);
+        retained = true;
+        continue;
+      }
+
+      this.registry.stop(process.id, this.now().toISOString());
+      this.missingListenerStateByProcessId.delete(process.id);
+      released = true;
+    }
+
+    if (released || retained) {
       this.writeRouteTable(this.buildCurrentLogicalRoutes());
       this.queueSnapshotBroadcast();
     }
@@ -795,6 +857,8 @@ export class PortManagerAgent implements DisposableLike {
         const payload = request.payload as ReleaseRouteAllocationPayload;
         return this.releaseRouteAllocation(payload.allocationId);
       }
+      case "releaseProcessRoute":
+        return this.releaseProcessRoute(request.payload as ReleaseProcessRoutePayload);
       case "shutdownDaemon":
         return this.shutdownDaemon();
       case "startManagedProcess":
@@ -931,10 +995,9 @@ export class PortManagerAgent implements DisposableLike {
    * unit-testable without a real child process or OS command.
    */
   private async buildSnapshot(options: BuildSnapshotRuntimeOptions = {}): Promise<AgentSnapshot> {
-    this.cleanupExpiredRouteAllocations();
-
     const listeners = await this.listeningPortProvider.list();
     this.updateReservedListeningPorts(listeners);
+    this.cleanupExpiredRouteAllocations(this.reservedListeningPorts);
     if (options.reconcileExternalListeners === true) {
       this.reconcileRegisteredProcessesWithListeners(listeners);
     }
@@ -959,6 +1022,7 @@ export class PortManagerAgent implements DisposableLike {
   /** Marks hook-registered external processes stopped when their listener exits. */
   private reconcileRegisteredProcessesWithListeners(listeners: readonly ListeningPort[]): void {
     const activeListenerKeys = new Set(listeners.map((listener) => buildListenerKey(listener.pid, listener.port)));
+    const listenersByActualPort = buildListenersByActualPort(listeners);
     const nowMs = this.now().getTime();
 
     for (const process of this.registry.list()) {
@@ -968,6 +1032,13 @@ export class PortManagerAgent implements DisposableLike {
       }
 
       if (activeListenerKeys.has(buildListenerKey(process.pid, process.actualPort))) {
+        this.missingListenerStateByProcessId.delete(process.id);
+        continue;
+      }
+
+      const listenerForActualPort = listenersByActualPort.get(process.actualPort);
+      if (listenerForActualPort !== undefined) {
+        this.adoptExternalListenerOwner(process, listenerForActualPort);
         this.missingListenerStateByProcessId.delete(process.id);
         continue;
       }
@@ -1011,6 +1082,7 @@ export class PortManagerAgent implements DisposableLike {
     const routeIdentity = buildLogicalRouteIdentity({
       logicalPort,
       actualPort: logicalPort,
+      routeDirection: "listen",
       host: this.defaultHost,
       ...(networkId ? { networkId } : {}),
       status: "running",
@@ -1031,33 +1103,25 @@ export class PortManagerAgent implements DisposableLike {
     logicalPort: number,
     networkId: string | undefined,
   ): PendingRouteAllocation | undefined {
-    const routeIdentity = buildLogicalRouteIdentity({
+    const routeIdentity = buildLogicalEndpointIdentity({
       logicalPort,
-      actualPort: logicalPort,
-      host: this.defaultHost,
       ...(networkId ? { networkId } : {}),
-      status: "starting",
-      source: "allocated",
     });
 
     return [...this.pendingRouteAllocations.values()].find(
-      (allocation) => buildLogicalRouteIdentity(allocation.route) === routeIdentity,
+      (allocation) => buildLogicalEndpointIdentity(allocation.route) === routeIdentity,
     );
   }
 
   /** Removes stale sender-first reservations once a receiver is authoritative. */
   private removePendingRouteAllocationsForIdentity(logicalPort: number, networkId: string | undefined): void {
-    const routeIdentity = buildLogicalRouteIdentity({
+    const routeIdentity = buildLogicalEndpointIdentity({
       logicalPort,
-      actualPort: logicalPort,
-      host: this.defaultHost,
       ...(networkId ? { networkId } : {}),
-      status: "starting",
-      source: "allocated",
     });
 
     for (const [allocationId, allocation] of this.pendingRouteAllocations) {
-      if (buildLogicalRouteIdentity(allocation.route) === routeIdentity) {
+      if (buildLogicalEndpointIdentity(allocation.route) === routeIdentity) {
         this.pendingRouteAllocations.delete(allocationId);
       }
     }
@@ -1119,14 +1183,50 @@ export class PortManagerAgent implements DisposableLike {
     );
   }
 
-  /** Removes abandoned route allocations after their TTL. */
-  private cleanupExpiredRouteAllocations(): void {
+  /** Finds a live OS listener on one actual routed port, if the scanner is available. */
+  private async findActiveListenerForActualPort(actualPort: number): Promise<ListeningPort | undefined> {
+    try {
+      const listeners = await this.listeningPortProvider.list();
+      this.updateReservedListeningPorts(listeners);
+      return listeners.find((listener) => listener.port === actualPort);
+    } catch {
+      // If listener scans fail, fall back to the explicit lifecycle signal.
+      return undefined;
+    }
+  }
+
+  /** Updates an external route owner when the listening socket moved to another PID. */
+  private adoptExternalListenerOwner(process: ManagedProcess, listener: ListeningPort): void {
+    const nextPid = listener.pid ?? process.pid;
+    const nextName = listener.processName ?? process.name;
+    const nextCommand = listener.command ?? process.command;
+
+    if (nextPid === process.pid && nextName === process.name && nextCommand === process.command) {
+      return;
+    }
+
+    this.registry.update(process.id, {
+      pid: nextPid,
+      name: nextName,
+      command: nextCommand,
+    });
+  }
+
+  /** Removes abandoned route allocations after their TTL unless a listener owns the actual port. */
+  private cleanupExpiredRouteAllocations(activeListenerPorts: ReadonlySet<number> = this.reservedListeningPorts): void {
     const nowMs = this.now().getTime();
 
     for (const [id, allocation] of this.pendingRouteAllocations) {
-      if (allocation.expiresAtMs <= nowMs) {
-        this.pendingRouteAllocations.delete(id);
+      if (allocation.expiresAtMs > nowMs) {
+        continue;
       }
+
+      if (activeListenerPorts.has(allocation.route.actualPort)) {
+        this.refreshPendingRouteAllocation(allocation);
+        continue;
+      }
+
+      this.pendingRouteAllocations.delete(id);
     }
   }
 
@@ -1176,6 +1276,7 @@ export class PortManagerAgent implements DisposableLike {
   /** Writes one small route file per logical endpoint to remove shared-file polling races. */
   private writeRouteEntryFiles(routes: readonly LogicalPortRoute[]): void {
     const currentRouteEntryPaths = new Set<string>();
+    const routesByEntryPath = new Map<string, LogicalPortRoute[]>();
 
     for (const route of routes) {
       const routeEntryPath = getRouteTablePathForLogicalPort(
@@ -1184,7 +1285,11 @@ export class PortManagerAgent implements DisposableLike {
         this.routeTablePath,
       );
 
-      if (this.writeRouteTableFile(routeEntryPath, [route])) {
+      routesByEntryPath.set(routeEntryPath, [...(routesByEntryPath.get(routeEntryPath) ?? []), route]);
+    }
+
+    for (const [routeEntryPath, entryRoutes] of routesByEntryPath) {
+      if (this.writeRouteTableFile(routeEntryPath, entryRoutes)) {
         currentRouteEntryPaths.add(routeEntryPath);
       }
     }
@@ -1265,6 +1370,7 @@ export class PortManagerAgent implements DisposableLike {
 
     this.registry.stop(process.id, this.now().toISOString());
     this.missingListenerStateByProcessId.delete(process.id);
+    this.writeRouteTable(this.buildCurrentLogicalRoutes());
   }
 
   /**
@@ -1400,11 +1506,16 @@ function buildLogicalRoutes(
   processes: readonly ManagedProcess[],
   pendingRoutes: readonly LogicalPortRoute[] = [],
 ): readonly LogicalPortRoute[] {
+  const normalizedPendingRoutes = pendingRoutes.map((route) => ({
+    ...route,
+    routeDirection: normalizeRouteDirection(route.routeDirection),
+  }));
   const routes = processes
     .filter((process) => process.status === "running" && process.source !== "detected")
     .map((process) => ({
       logicalPort: process.requestedPort,
       actualPort: process.actualPort,
+      routeDirection: "listen" as const,
       host: routeHostFromUrl(process.url),
       cwd: process.cwd,
       ...(process.networkId ? { networkId: process.networkId } : {}),
@@ -1414,7 +1525,7 @@ function buildLogicalRoutes(
       source: process.source ?? "managed",
     }));
 
-  return dedupeLogicalRoutes([...pendingRoutes.map((route) => ({ ...route })), ...routes]);
+  return dedupeLogicalRoutes([...normalizedPendingRoutes, ...routes]);
 }
 
 /**
@@ -1442,6 +1553,11 @@ function dedupeLogicalRoutes(routes: readonly LogicalPortRoute[]): readonly Logi
 
 /** Matches the native hook's lookup identity: network scope plus logical port. */
 function buildLogicalRouteIdentity(route: LogicalPortRoute): string {
+  return `${buildLogicalEndpointIdentity(route)}:${normalizeRouteDirection(route.routeDirection)}`;
+}
+
+/** Matches a logical endpoint before deciding which direction owns it. */
+function buildLogicalEndpointIdentity(route: Pick<LogicalPortRoute, "networkId" | "logicalPort">): string {
   return `${route.networkId ?? ""}:${route.logicalPort}`;
 }
 
@@ -1450,6 +1566,7 @@ function buildPendingLogicalRoute(input: AgentStartManagedProcessRequest, actual
   return {
     logicalPort: input.requestedPort,
     actualPort,
+    routeDirection: "listen",
     host: input.host,
     cwd: input.cwd,
     processName: input.name,
@@ -1459,10 +1576,15 @@ function buildPendingLogicalRoute(input: AgentStartManagedProcessRequest, actual
 }
 
 /** Creates a route row for an external CLI process before it is spawned. */
-function buildAllocatedLogicalRoute(input: AgentAllocateRouteRequest, actualPort: number): LogicalPortRoute {
+function buildAllocatedLogicalRoute(
+  input: AgentAllocateRouteRequest,
+  actualPort: number,
+  routeDirection: LogicalPortRouteDirection = normalizeRouteDirection(input.routeDirection),
+): LogicalPortRoute {
   return {
     logicalPort: input.requestedPort,
     actualPort,
+    routeDirection,
     host: input.host,
     cwd: input.cwd,
     ...logicalNetworkRouteScope(input.networkId),
@@ -1470,6 +1592,11 @@ function buildAllocatedLogicalRoute(input: AgentAllocateRouteRequest, actualPort
     status: "starting",
     source: "allocated",
   };
+}
+
+/** Existing clients did not send a direction; those allocations are listener reservations. */
+function normalizeRouteDirection(direction: LogicalPortRouteDirection | undefined): LogicalPortRouteDirection {
+  return direction === "send" ? "send" : "listen";
 }
 
 /** Normalizes absent or blank terminal network scope to the unscoped route path. */
@@ -1508,6 +1635,20 @@ function buildActiveTrackedListenerKeys(processes: readonly ManagedProcess[]): R
 /** Creates a stable listener match key from the OS PID and TCP port. */
 function buildListenerKey(pid: number | undefined, port: number): string {
   return `${pid ?? "unknown"}:${port}`;
+}
+
+/** Indexes listeners by actual TCP port, preferring rows with a concrete PID. */
+function buildListenersByActualPort(listeners: readonly ListeningPort[]): ReadonlyMap<number, ListeningPort> {
+  const listenersByActualPort = new Map<number, ListeningPort>();
+
+  for (const listener of listeners) {
+    const existingListener = listenersByActualPort.get(listener.port);
+    if (existingListener === undefined || existingListener.pid === undefined) {
+      listenersByActualPort.set(listener.port, { ...listener });
+    }
+  }
+
+  return listenersByActualPort;
 }
 
 /**
@@ -1683,6 +1824,7 @@ function buildRouteSignatureRows(routes: readonly LogicalPortRoute[]): readonly 
     .map((route) => [
       route.logicalPort,
       route.actualPort,
+      normalizeRouteDirection(route.routeDirection),
       route.host,
       route.cwd ?? "",
       route.networkId ?? "",

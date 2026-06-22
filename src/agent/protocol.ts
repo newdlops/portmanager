@@ -23,6 +23,7 @@ export type AgentRequestMethod =
   | "listSnapshot"
   | "allocateRoute"
   | "releaseRouteAllocation"
+  | "releaseProcessRoute"
   | "shutdownDaemon"
   | "startManagedProcess"
   | "registerExistingProcess"
@@ -115,10 +116,24 @@ export interface ReleaseRouteAllocationPayload {
   readonly allocationId: string;
 }
 
+export interface ReleaseProcessRoutePayload {
+  /** PID of the hooked or registered process that owned the route. */
+  readonly pid: number;
+  /** Pending allocation id when the process exits before registration completes. */
+  readonly allocationId?: string;
+  /** Logical port originally requested by the process. */
+  readonly requestedPort: number;
+  /** Actual port the process bound after routing. */
+  readonly actualPort: number;
+  /** Logical network scope inherited by the process, when present. */
+  readonly networkId?: string;
+}
+
 export type AgentRequestPayloadByMethod = {
   readonly listSnapshot: undefined;
   readonly allocateRoute: AgentAllocateRouteRequest;
   readonly releaseRouteAllocation: ReleaseRouteAllocationPayload;
+  readonly releaseProcessRoute: ReleaseProcessRoutePayload;
   readonly shutdownDaemon: undefined;
   readonly startManagedProcess: AgentStartManagedProcessRequest;
   readonly registerExistingProcess: RegisteredProcessInput;
@@ -132,6 +147,7 @@ export type AgentResponsePayloadByMethod = {
   readonly listSnapshot: AgentSnapshot;
   readonly allocateRoute: PortRouteAllocation;
   readonly releaseRouteAllocation: boolean;
+  readonly releaseProcessRoute: boolean;
   readonly shutdownDaemon: boolean;
   readonly startManagedProcess: ManagedProcess;
   readonly registerExistingProcess: ManagedProcess;
@@ -243,6 +259,7 @@ function isAgentRequestMethod(value: unknown): value is AgentRequestMethod {
     value === "listSnapshot" ||
     value === "allocateRoute" ||
     value === "releaseRouteAllocation" ||
+    value === "releaseProcessRoute" ||
     value === "shutdownDaemon" ||
     value === "startManagedProcess" ||
     value === "registerExistingProcess" ||

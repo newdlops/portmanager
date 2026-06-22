@@ -64,6 +64,8 @@ static pm_route_mapping pm_routes[PM_MAX_ROUTES];
 static int pm_route_count = 0;
 static unsigned long pm_request_sequence = 1;
 
+static void pm_release_process_routes(void);
+
 static int pm_hook_enabled(void) {
   const char *disabled = getenv("PORT_MANAGER_HOOK_DISABLED");
   const char *enabled = getenv("PORT_MANAGER_HOOK");
@@ -96,6 +98,10 @@ static void pm_debug(const char *format, ...) {
 
 __attribute__((constructor)) static void pm_hook_loaded(void) {
   pm_debug("loaded");
+}
+
+__attribute__((destructor)) static void pm_hook_unloaded(void) {
+  pm_release_process_routes();
 }
 
 static void *pm_resolve_symbol(const char *name) {
@@ -694,6 +700,20 @@ static int pm_route_matches_network(const char *route_json) {
   return strcmp(route_network, network_id) == 0;
 }
 
+static int pm_route_direction_matches(const char *route_json, const char *required_direction) {
+  char route_direction[32];
+
+  if (required_direction == NULL || required_direction[0] == '\0') {
+    return 1;
+  }
+
+  if (pm_json_string(route_json, "routeDirection", route_direction, sizeof(route_direction)) != 0) {
+    return strcmp(required_direction, "listen") == 0;
+  }
+
+  return strcmp(route_direction, required_direction) == 0;
+}
+
 static int pm_route_network_match_level(const char *route_json) {
   const char *network_id = pm_current_network_id();
   char route_network[PM_MAX_TEXT];
@@ -786,12 +806,19 @@ static int pm_response_ok(const char *response) {
   return strstr(response, "\"ok\":true") != NULL || strstr(response, "\"ok\": true") != NULL;
 }
 
-static int pm_allocate_route(int logical_port, const char *host, int *actual_port, char *allocation_id, size_t allocation_size) {
+static int pm_allocate_route(
+  int logical_port,
+  const char *host,
+  const char *route_direction,
+  int *actual_port,
+  char *allocation_id,
+  size_t allocation_size) {
   char cwd[PM_MAX_TEXT];
   char command[PM_MAX_TEXT];
   char cwd_json[PM_MAX_TEXT * 2];
   char command_json[PM_MAX_TEXT * 2];
   char host_json[256];
+  char route_direction_json[32];
   char network_payload[PM_MAX_TEXT * 3];
   char request[PM_MAX_REQUEST];
   char response[PM_MAX_RESPONSE];
@@ -802,13 +829,14 @@ static int pm_allocate_route(int logical_port, const char *host, int *actual_por
   pm_json_escape(cwd, cwd_json, sizeof(cwd_json));
   pm_json_escape(command, command_json, sizeof(command_json));
   pm_json_escape(host, host_json, sizeof(host_json));
+  pm_json_escape(route_direction == NULL ? "listen" : route_direction, route_direction_json, sizeof(route_direction_json));
   pm_network_scope_payload(network_payload, sizeof(network_payload));
   response[0] = '\0';
 
   snprintf(
     request,
     sizeof(request),
-    "{\"id\":\"hook-%ld-%lu\",\"method\":\"allocateRoute\",\"payload\":{\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"host\":\"%s\"%s,\"scanRange\":%d,\"scanDirection\":\"up\",\"routingMode\":\"%s\",\"virtualPortRangeStart\":%d,\"virtualPortRangeEnd\":%d}}\n",
+    "{\"id\":\"hook-%ld-%lu\",\"method\":\"allocateRoute\",\"payload\":{\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"host\":\"%s\",\"routeDirection\":\"%s\"%s,\"scanRange\":%d,\"scanDirection\":\"up\",\"routingMode\":\"%s\",\"virtualPortRangeStart\":%d,\"virtualPortRangeEnd\":%d}}\n",
     (long)getpid(),
     sequence,
     command_json,
@@ -816,13 +844,19 @@ static int pm_allocate_route(int logical_port, const char *host, int *actual_por
     cwd_json,
     logical_port,
     host_json,
+    route_direction_json,
     network_payload,
     pm_parse_int_env("PORT_MANAGER_SCAN_RANGE", PM_DEFAULT_SCAN_RANGE),
     pm_routing_mode(),
     pm_parse_int_env("PORT_MANAGER_VIRTUAL_PORT_START", PM_DEFAULT_VIRTUAL_START),
     pm_parse_int_env("PORT_MANAGER_VIRTUAL_PORT_END", PM_DEFAULT_VIRTUAL_END));
 
-  pm_debug("allocating route logical=%d host=%s mode=%s", logical_port, host, pm_routing_mode());
+  pm_debug(
+    "allocating route logical=%d host=%s direction=%s mode=%s",
+    logical_port,
+    host,
+    route_direction_json,
+    pm_routing_mode());
   if (pm_agent_roundtrip(request, response, sizeof(response)) != 0 || !pm_response_ok(response)) {
     pm_debug("allocateRoute failed logical=%d response=%.240s", logical_port, response);
     return -1;
@@ -908,6 +942,42 @@ static void pm_release_allocation(const char *allocation_id) {
   (void)pm_send_simple_payload("releaseRouteAllocation", payload);
 }
 
+static int pm_release_process_route(const pm_route_mapping *route) {
+  char allocation_json[PM_MAX_TEXT * 2];
+  char network_payload[PM_MAX_TEXT * 3];
+  char payload[PM_MAX_REQUEST];
+
+  if (route == NULL || route->logical_port <= 0 || route->actual_port <= 0) {
+    return 0;
+  }
+
+  pm_json_escape(route->allocation_id, allocation_json, sizeof(allocation_json));
+  pm_network_scope_payload(network_payload, sizeof(network_payload));
+  snprintf(
+    payload,
+    sizeof(payload),
+    "{\"pid\":%ld,\"allocationId\":\"%s\",\"requestedPort\":%d,\"actualPort\":%d%s}",
+    (long)getpid(),
+    allocation_json,
+    route->logical_port,
+    route->actual_port,
+    network_payload);
+  return pm_send_simple_payload("releaseProcessRoute", payload);
+}
+
+static void pm_release_process_routes(void) {
+  /*
+   * Listener scans are intentionally conservative, but the process that owns a
+   * route knows when it is exiting. Release those rows here so endpoint route
+   * files cannot keep pointing at a dead actual port until the next scan grace.
+   */
+  for (int index = 0; index < pm_route_count; index++) {
+    if (pm_release_process_route(&pm_routes[index]) != 0) {
+      break;
+    }
+  }
+}
+
 static void pm_remember_route(int logical_port, int actual_port, const char *host, const char *allocation_id) {
   pm_route_mapping *slot;
 
@@ -959,6 +1029,7 @@ static int pm_route_table_lookup_file(
   const char *path,
   int source_port,
   int source_is_actual,
+  const char *required_direction,
   char *target_host,
   size_t target_host_size) {
   char *buffer;
@@ -1021,6 +1092,12 @@ static int pm_route_table_lookup_file(
     logical = pm_json_int(object_start, "logicalPort", 0);
     actual = pm_json_int(object_start, "actualPort", 0);
     match_level = pm_route_network_match_level(object_start);
+    if (!pm_route_direction_matches(object_start, required_direction)) {
+      *object_end = object_end_saved;
+      cursor = object_end + 1;
+      continue;
+    }
+
     if (source_is_actual && actual == source_port && match_level > 0) {
       if (match_level == 2) {
         free(buffer);
@@ -1064,7 +1141,12 @@ static int pm_route_table_lookup_file(
   return 0;
 }
 
-static int pm_route_table_lookup(int source_port, int source_is_actual, char *target_host, size_t target_host_size) {
+static int pm_route_table_lookup(
+  int source_port,
+  int source_is_actual,
+  const char *required_direction,
+  char *target_host,
+  size_t target_host_size) {
   char path[PM_MAX_PATH];
   char route_entry_path[PM_MAX_PATH];
   int route_entry_port;
@@ -1081,6 +1163,7 @@ static int pm_route_table_lookup(int source_port, int source_is_actual, char *ta
       route_entry_path,
       source_port,
       source_is_actual,
+      required_direction,
       target_host,
       target_host_size);
     if (route_entry_port > 0) {
@@ -1088,7 +1171,7 @@ static int pm_route_table_lookup(int source_port, int source_is_actual, char *ta
     }
   }
 
-  return pm_route_table_lookup_file(path, source_port, source_is_actual, target_host, target_host_size);
+  return pm_route_table_lookup_file(path, source_port, source_is_actual, required_direction, target_host, target_host_size);
 }
 
 static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
@@ -1121,7 +1204,7 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
 
   pm_sockaddr_host(addr, host, sizeof(host));
   allocation_id[0] = '\0';
-  actual_port = pm_route_table_lookup(logical_port, 0, host, sizeof(host));
+  actual_port = pm_route_table_lookup(logical_port, 0, "send", host, sizeof(host));
 
   result = -1;
   for (int attempt = 0; attempt < PM_BIND_ALLOCATION_ATTEMPTS; attempt++) {
@@ -1132,7 +1215,7 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
       actual_port = logical_port;
 
       pm_hook_depth++;
-      if (pm_allocate_route(logical_port, host, &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
+      if (pm_allocate_route(logical_port, host, "listen", &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
         pm_hook_depth--;
         if (attempt + 1 < PM_BIND_ALLOCATION_ATTEMPTS) {
           usleep(50000);
@@ -1219,7 +1302,7 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
 
   actual_port = pm_memory_actual_for_logical(logical_port, target_host, sizeof(target_host));
   if (actual_port == 0) {
-    actual_port = pm_route_table_lookup(logical_port, 0, target_host, sizeof(target_host));
+    actual_port = pm_route_table_lookup(logical_port, 0, "listen", target_host, sizeof(target_host));
   }
 
   if (actual_port == 0 && !pm_is_fixed_protocol_port(logical_port)) {
@@ -1229,7 +1312,7 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
     allocation_id[0] = '\0';
 
     pm_hook_depth++;
-    if (pm_allocate_route(logical_port, target_host, &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
+    if (pm_allocate_route(logical_port, target_host, "send", &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
       actual_port = 0;
     }
     pm_hook_depth--;
@@ -1279,7 +1362,7 @@ static int pm_getsockname_hook(int sockfd, struct sockaddr *addr, socklen_t *add
   actual_port = pm_sockaddr_port(addr);
   logical_port = pm_memory_logical_for_actual(actual_port);
   if (logical_port == 0) {
-    logical_port = pm_route_table_lookup(actual_port, 1, NULL, 0);
+    logical_port = pm_route_table_lookup(actual_port, 1, "listen", NULL, 0);
   }
 
   if (logical_port > 0 && logical_port != actual_port) {

@@ -11,10 +11,12 @@ Logical Network, Terminal Attachment, Host Port Exposure의 순수 도메인 상
 - Host Port Exposure 상태 저장
 - Network snapshot 생성
 - 상태 변경 이벤트 발행
+- logical route 후보를 작업 디렉터리 범위로 좁히는 순수 선택 로직
 
 ## 주요 진입점
 
 - `logical-network-registry.ts`
+- `logical-route-selection.ts`
 
 ## 외부 의존성
 

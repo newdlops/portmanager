@@ -12,6 +12,7 @@ import {
 } from "../agent/route-table";
 import { readContainerRuntimeSettings, readPortManagerSettings } from "../config/vscode-settings";
 import { LogicalNetworkRegistry, type LogicalNetworkRegistryState } from "../core/networks/logical-network-registry";
+import { findRoutesMatchingClientCwd } from "../core/networks/logical-route-selection";
 import {
   ContainerNetworkRuntimeAdapter,
   type ContainerRuntimeTarget,
@@ -764,6 +765,18 @@ export class PortManagerNetworkService implements DisposableLike {
       clientProcess === undefined ? undefined : await this.findClientNetworkForRouter(clientProcess.pid, processRows);
 
     if (networkId === undefined) {
+      const cwdRoute =
+        clientProcess?.cwd === undefined
+          ? undefined
+          : this.findClientCwdRouteForRouter(connection.logicalPort, clientProcess.cwd, processRows);
+
+      if (cwdRoute !== undefined) {
+        return {
+          host: cwdRoute.host,
+          port: cwdRoute.actualPort,
+        };
+      }
+
       const uniqueRoute = await this.findUniqueRouteForRouter(connection.logicalPort, processRows);
       if (uniqueRoute === undefined) {
         throw new Error(`No attached logical network found for localhost:${connection.logicalPort} client.`);
@@ -797,6 +810,7 @@ export class PortManagerNetworkService implements DisposableLike {
       .routes.filter(
         (route) =>
           route.actualPort !== route.logicalPort &&
+          isListenRoute(route) &&
           (route.status === "running" || route.status === "starting"),
       )
       .map((route) => route.logicalPort);
@@ -832,6 +846,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const candidates = snapshot.routes.filter(
       (route) =>
         route.logicalPort === logicalPort &&
+        isListenRoute(route) &&
         (route.status === "running" || route.status === "starting"),
     );
     const exactRoute = candidates.find((route) => route.networkId === networkId);
@@ -871,8 +886,33 @@ export class PortManagerNetworkService implements DisposableLike {
       (route) =>
         route.logicalPort === logicalPort &&
         route.actualPort !== route.logicalPort &&
+        isListenRoute(route) &&
         (route.status === "running" || route.status === "starting"),
     );
+
+    if (candidates.length === 1) {
+      return candidates[0];
+    }
+
+    return this.findSingleAttachedRouteForRouter(candidates, snapshot.processes, processRows);
+  }
+
+  /**
+   * Uses client cwd as a deterministic fallback when environment variables and
+   * terminal ancestry are unavailable. This keeps simultaneous logical ports in
+   * sibling projects from collapsing into the global "unique route" fallback.
+   */
+  private findClientCwdRouteForRouter(
+    logicalPort: number,
+    clientCwd: string,
+    processRows: readonly ProcessTableRow[],
+  ): LogicalPortRoute | undefined {
+    if (this.processService === undefined) {
+      return undefined;
+    }
+
+    const snapshot = this.processService.getSnapshot();
+    const candidates = findRoutesMatchingClientCwd(snapshot.routes, logicalPort, clientCwd);
 
     if (candidates.length === 1) {
       return candidates[0];
@@ -1303,8 +1343,14 @@ function findMatchingRoute(
     (route) =>
       route.networkId === networkId &&
       route.logicalPort === logicalPort &&
+      isListenRoute(route) &&
       (route.status === "running" || route.status === "starting"),
   );
+}
+
+/** Sender reservations are not live targets for host exposure or logical routers. */
+function isListenRoute(route: LogicalPortRoute): boolean {
+  return route.routeDirection === undefined || route.routeDirection === "listen";
 }
 
 /** Converts the container adapter target into the socket proxy contract. */
