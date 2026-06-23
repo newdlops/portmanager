@@ -227,6 +227,13 @@ export class PortManagerTreeProvider
           element.network,
         ),
         new ActionTreeItem(
+          "Attach Process",
+          "portManager.attachProcessToNetwork",
+          "debug-alt",
+          "Attach existing backend PID",
+          element.network,
+        ),
+        new ActionTreeItem(
           "Copy Terminal Script",
           "portManager.copyTerminalRoutingScript",
           "copy",

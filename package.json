@@ -42,6 +42,7 @@
     "onCommand:portManager.refreshTerminals",
     "onCommand:portManager.refreshContainerServices",
     "onCommand:portManager.attachTerminalToNetwork",
+    "onCommand:portManager.attachProcessToNetwork",
     "onCommand:portManager.attachVscodeWindowTerminalsToNetwork",
     "onCommand:portManager.detachVscodeWindowTerminalsFromNetwork",
     "onCommand:portManager.copyTerminalRoutingScript",
@@ -140,6 +141,12 @@
         "title": "Port Manager: Attach Terminal Window to Network",
         "category": "Port Manager",
         "icon": "$(debug-console)"
+      },
+      {
+        "command": "portManager.attachProcessToNetwork",
+        "title": "Port Manager: Attach Process to Network",
+        "category": "Port Manager",
+        "icon": "$(debug-alt)"
       },
       {
         "command": "portManager.attachVscodeWindowTerminalsToNetwork",
@@ -450,29 +457,34 @@
           "group": "network@5"
         },
         {
-          "command": "portManager.attachVscodeWindowTerminalsToNetwork",
+          "command": "portManager.attachProcessToNetwork",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@6"
         },
         {
-          "command": "portManager.copyTerminalRoutingScript",
+          "command": "portManager.attachVscodeWindowTerminalsToNetwork",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@7"
         },
         {
-          "command": "portManager.saveBindingPreset",
+          "command": "portManager.copyTerminalRoutingScript",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@8"
         },
         {
-          "command": "portManager.applyBindingPreset",
+          "command": "portManager.saveBindingPreset",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@9"
         },
         {
-          "command": "portManager.removeLogicalNetwork",
+          "command": "portManager.applyBindingPreset",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@10"
+        },
+        {
+          "command": "portManager.removeLogicalNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "network@11"
         },
         {
           "command": "portManager.refreshContainerServices",

@@ -30,6 +30,7 @@ import type {
   DisposableLike,
   HostAccessBinding,
   HostPortExposure,
+  ListeningPort,
   LogicalNetwork,
   ManagedProcess,
   ManagedProcessStartInput,
@@ -82,6 +83,9 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.refreshContainerServices", () => this.refreshContainerServices());
     this.registerCommand(context, "portManager.attachTerminalToNetwork", (argument) =>
       this.attachTerminalToNetwork(argument),
+    );
+    this.registerCommand(context, "portManager.attachProcessToNetwork", (argument) =>
+      this.attachProcessToNetwork(argument),
     );
     this.registerCommand(context, "portManager.attachVscodeWindowTerminalsToNetwork", (argument) =>
       this.attachVscodeWindowTerminalsToNetwork(argument),
@@ -237,6 +241,32 @@ export class PortManagerCommandController implements DisposableLike {
 
     await vscode.window.showInformationMessage(
       `Attached "${terminalWindow.title}" to "${network.name}" (${attachment.mode ?? "isolated"} mode).`,
+    );
+  }
+
+  /** Attaches an existing backend process so localhost client traffic can resolve to one network. */
+  private async attachProcessToNetwork(argument: unknown): Promise<void> {
+    const directInput = getAttachProcessInput(argument);
+    const network =
+      directInput?.network ?? (await this.resolveNetworkArgument(argument, "Attach Process to Network"));
+    if (network === undefined) {
+      return;
+    }
+
+    const target = await this.resolveProcessAttachTarget(directInput, "Attach Process to Network");
+    if (target === undefined) {
+      return;
+    }
+
+    const attachment = await this.dependencies.networkService.attachProcessToNetwork(
+      network.id,
+      target.pid,
+      target.title,
+    );
+    this.dependencies.treeProvider.refresh();
+
+    await vscode.window.showInformationMessage(
+      `Attached "${attachment.terminalTitle ?? `PID ${attachment.rootPid}`}" to "${network.name}" for localhost client routing.`,
     );
   }
 
@@ -1230,6 +1260,87 @@ export class PortManagerCommandController implements DisposableLike {
     return selected?.terminalWindow;
   }
 
+  /** Resolves an arbitrary local process from known listeners or a manual PID/port entry. */
+  private async resolveProcessAttachTarget(
+    input: AttachProcessCommandInput | undefined,
+    title: string,
+  ): Promise<ProcessAttachTarget | undefined> {
+    await this.dependencies.processService.start();
+    await this.dependencies.processService.refresh().catch(() => undefined);
+    const listeners = this.dependencies.processService.getSnapshot().listeners.filter(
+      (listener): listener is ListeningPort & { readonly pid: number } => listener.pid !== undefined,
+    );
+
+    if (input?.pid !== undefined) {
+      const target = buildProcessAttachTargetFromPid(input.pid, listeners);
+      return input.title === undefined ? target : { ...target, title: input.title };
+    }
+
+    if (input?.port !== undefined) {
+      const target = buildProcessAttachTargetFromPort(input.port, listeners);
+      if (target === undefined) {
+        throw new Error(`No visible local listener owns port ${input.port}. Pass pid instead.`);
+      }
+      return input.title === undefined ? target : { ...target, title: input.title };
+    }
+
+    const listenerItems = dedupeListeningPortsByPidAndPort(listeners).map((listener) => ({
+      label: `${listener.localAddress}:${listener.port}`,
+      description: `pid ${listener.pid}${listener.processName ? `, ${listener.processName}` : ""}`,
+      detail: listener.command,
+      target: buildProcessAttachTargetFromListener(listener),
+    }));
+    const manualItem = {
+      label: "Enter PID or listening port",
+      description: "Use this for backend ports from extension logs",
+      target: undefined,
+      manual: true,
+    };
+    const selected = await vscode.window.showQuickPick([...listenerItems, manualItem], {
+      title,
+      placeHolder: "Select a backend process or enter a PID/port",
+    });
+
+    if (selected === undefined) {
+      return undefined;
+    }
+
+    if (!("manual" in selected)) {
+      return selected.target;
+    }
+
+    const rawValue = await vscode.window.showInputBox({
+      title,
+      prompt: "PID or listening TCP port, for example the Django Shell backend port 49343",
+      ignoreFocusOut: true,
+      validateInput: (value) =>
+        parsePositiveIntegerText(value) === undefined ? "Enter a positive integer PID or TCP port." : undefined,
+    });
+    const value = parsePositiveIntegerText(rawValue);
+
+    if (value === undefined) {
+      return undefined;
+    }
+
+    const listenerTarget = buildProcessAttachTargetFromPort(value, listeners);
+    if (listenerTarget !== undefined) {
+      return listenerTarget;
+    }
+
+    const interpretation = await vscode.window.showQuickPick(
+      [
+        {
+          label: `Attach PID ${value}`,
+          description: "No local listener was found on that port",
+          target: buildProcessAttachTargetFromPid(value, listeners),
+        },
+      ],
+      { title, placeHolder: `No listener was found on port ${value}` },
+    );
+
+    return interpretation?.target;
+  }
+
   /** Resolves a container service candidate from tree context or Quick Pick. */
   private async resolveContainerServiceCandidateArgument(
     argument: unknown,
@@ -1755,6 +1866,18 @@ interface AttachTerminalCommandInput {
   readonly network: LogicalNetwork;
 }
 
+interface AttachProcessCommandInput {
+  readonly network?: LogicalNetwork;
+  readonly pid?: number;
+  readonly port?: number;
+  readonly title?: string;
+}
+
+interface ProcessAttachTarget {
+  readonly pid: number;
+  readonly title: string;
+}
+
 interface AttachContainerCommandInput {
   readonly containerService?: ContainerServiceCandidate;
   readonly network?: LogicalNetwork;
@@ -1775,6 +1898,81 @@ function getAttachTerminalInput(argument: unknown): AttachTerminalCommandInput |
     terminalWindow: candidate.terminalWindow,
     network: candidate.network,
   };
+}
+
+function getAttachProcessInput(argument: unknown): AttachProcessCommandInput | undefined {
+  if (typeof argument !== "object" || argument === null) {
+    return undefined;
+  }
+
+  const candidate = argument as {
+    readonly network?: unknown;
+    readonly pid?: unknown;
+    readonly port?: unknown;
+    readonly title?: unknown;
+  };
+  const pid = typeof candidate.pid === "number" && Number.isInteger(candidate.pid) ? candidate.pid : undefined;
+  const port = typeof candidate.port === "number" && Number.isInteger(candidate.port) ? candidate.port : undefined;
+  const title = typeof candidate.title === "string" && candidate.title.trim().length > 0 ? candidate.title.trim() : undefined;
+  const network = isLogicalNetworkLike(candidate.network) ? candidate.network : undefined;
+
+  if (pid === undefined && port === undefined && title === undefined && network === undefined) {
+    return undefined;
+  }
+
+  return {
+    ...(network !== undefined ? { network } : {}),
+    ...(pid !== undefined ? { pid } : {}),
+    ...(port !== undefined ? { port } : {}),
+    ...(title !== undefined ? { title } : {}),
+  };
+}
+
+function buildProcessAttachTargetFromPid(
+  pid: number,
+  listeners: readonly (ListeningPort & { readonly pid: number })[],
+): ProcessAttachTarget {
+  const listener = listeners.find((item) => item.pid === pid);
+  return listener === undefined ? { pid, title: `Process ${pid}` } : buildProcessAttachTargetFromListener(listener);
+}
+
+function buildProcessAttachTargetFromPort(
+  port: number,
+  listeners: readonly (ListeningPort & { readonly pid: number })[],
+): ProcessAttachTarget | undefined {
+  const listener = listeners.find((item) => item.port === port);
+  return listener === undefined ? undefined : buildProcessAttachTargetFromListener(listener);
+}
+
+function buildProcessAttachTargetFromListener(listener: ListeningPort & { readonly pid: number }): ProcessAttachTarget {
+  return {
+    pid: listener.pid,
+    title: `${listener.processName ?? "Process"} ${listener.pid} (${listener.localAddress}:${listener.port})`,
+  };
+}
+
+function dedupeListeningPortsByPidAndPort(
+  listeners: readonly (ListeningPort & { readonly pid: number })[],
+): readonly (ListeningPort & { readonly pid: number })[] {
+  const seen = new Set<string>();
+  const deduped: Array<ListeningPort & { readonly pid: number }> = [];
+
+  for (const listener of listeners) {
+    const key = `${listener.pid}:${listener.port}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    deduped.push(listener);
+  }
+
+  return deduped;
+}
+
+function parsePositiveIntegerText(value: string | undefined): number | undefined {
+  const parsed = value === undefined ? Number.NaN : Number.parseInt(value.trim(), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 interface NetworkApiInput {

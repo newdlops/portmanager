@@ -82,6 +82,7 @@ const VSCODE_WINDOW_TERMINAL_BINDING_KEY = "portManager.vscodeWindowTerminalBind
 const COMPOSE_PROJECT_ROUTING_FILE_NAME = "compose-project-routing.tsv";
 const TERMINAL_ATTACHMENT_MARKER_DIRECTORY_NAME = "terminal-attachments";
 const MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX = "manual-terminal:";
+const PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX = "process-terminal:";
 const execFileAsync = promisify(execFile);
 
 export interface BindingPresetSummary {
@@ -191,6 +192,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Current VS Code window/workspace default network for newly opened terminals. */
   private vscodeWindowTerminalBinding: VscodeWindowTerminalBinding | undefined;
 
+  /** Guards daemon route rehydration so snapshot events cannot recursively register compose routes. */
+  private composeRouteRestoreInFlight: Promise<void> | undefined;
+
   /** Extension-local state changes that are not owned by the pure registry. */
   private readonly localChangeEvents = new SimpleEventEmitter<void>();
 
@@ -211,9 +215,14 @@ export class PortManagerNetworkService implements DisposableLike {
     this.proxyManager = new HostPortProxyManager({
       resolve: (exposure) => this.resolveHostExposureTarget(exposure),
     });
-    this.logicalPortRouter = new LogicalPortRouterManager({
-      resolve: (connection) => this.resolveLogicalPortRouterTarget(connection),
-    });
+    this.logicalPortRouter = new LogicalPortRouterManager(
+      {
+        resolve: (connection) => this.resolveLogicalPortRouterTarget(connection),
+      },
+      {
+        nativeRouterPath: this.context.asAbsolutePath(getTcpRouterHelperRelativePath()),
+      },
+    );
     this.tcpConnectionProcessResolver = new NodeTcpConnectionProcessResolver();
     this.processTableProvider = new NodeProcessTableProvider();
     this.processEnvironmentProvider = new NodeProcessEnvironmentProvider();
@@ -232,6 +241,7 @@ export class PortManagerNetworkService implements DisposableLike {
       this.disposables.push(
         this.processService.onDidChange(() => {
           void this.syncLogicalPortRouters();
+          void this.restorePersistedComposeRoutesIfMissing();
         }),
       );
     }
@@ -279,6 +289,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
     await this.writeComposeProjectRoutingFile();
+    await this.restorePersistedComposeRoutesIfMissing();
     await this.refreshTerminals();
     void this.refreshContainerServices();
     await this.syncLogicalPortRouters();
@@ -387,6 +398,7 @@ export class PortManagerNetworkService implements DisposableLike {
     ]);
     const candidates = [...vscodeCandidates, ...osCandidates];
     this.registry.setTerminalCandidates(candidates);
+    this.syncProcessAttachmentLiveness(processRows);
     await this.syncManualTerminalAttachmentMarkers(processRows).catch(() => undefined);
 
     return this.registry.getSnapshot().terminalWindows;
@@ -623,6 +635,43 @@ export class PortManagerNetworkService implements DisposableLike {
             attachment.processGroupId === processId ||
             attachment.terminalWindowId === `vscode:${processId}`),
       );
+  }
+
+  /**
+   * Associates an already-running local process with a logical network.
+   *
+   * This is intentionally weaker than terminal hook injection: it lets the
+   * localhost logical router classify outgoing client connections from the
+   * process, but it cannot retroactively rewrite already-loaded bind hooks.
+   */
+  async attachProcessToNetwork(networkId: string, pid: number, title?: string): Promise<TerminalAttachment> {
+    requireNetwork(this.registry.getNetwork(networkId), networkId);
+    if (!Number.isInteger(pid) || pid <= 0) {
+      throw new Error(`Invalid process id: ${pid}`);
+    }
+
+    const processRows = await this.processTableProvider.list().catch(() => []);
+    const processRow = processRows.find((row) => row.pid === pid);
+    const attachment: TerminalAttachment = {
+      id: createProcessTerminalAttachmentId(networkId, pid),
+      networkId,
+      rootPid: pid,
+      processGroupId: processRow?.processGroupId,
+      terminalTitle: title?.trim() || `Process ${pid}`,
+      mode: "logical",
+      status: "attached",
+      attachedAt: new Date().toISOString(),
+      errorMessage:
+        "Existing process attachment routes localhost clients only. Restart it from an attached terminal for bind isolation.",
+    };
+
+    for (const existing of this.registry.getSnapshot().attachments) {
+      if (existing.rootPid === pid || existing.id === attachment.id) {
+        this.registry.removeAttachment(existing.id);
+      }
+    }
+
+    return this.registry.addAttachment(attachment);
   }
 
   /**
@@ -1164,6 +1213,86 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
+   * Rehydrates persisted compose attachments into the singleton daemon.
+   *
+   * Compose attachment rows live in VS Code globalState, while route rows live in
+   * the shared daemon. A daemon restart can therefore leave hidden clone
+   * containers running with an empty route table. Re-registering the endpoints is
+   * idempotent because the daemon upserts compose routes by network/logical/actual
+   * port identity.
+   */
+  private async restorePersistedComposeRoutesIfMissing(): Promise<void> {
+    if (this.composeRouteRestoreInFlight !== undefined) {
+      return this.composeRouteRestoreInFlight;
+    }
+
+    const attachments = this.registry
+      .getSnapshot()
+      .composeAttachments.filter((attachment) => attachment.status === "attached" && attachment.ports.length > 0);
+    if (attachments.length === 0 || this.processService === undefined || !this.hasMissingPersistedComposeRoutes(attachments)) {
+      return;
+    }
+
+    this.composeRouteRestoreInFlight = this.restorePersistedComposeRoutes(attachments).finally(() => {
+      this.composeRouteRestoreInFlight = undefined;
+    });
+
+    return this.composeRouteRestoreInFlight;
+  }
+
+  /** Returns true when at least one persisted compose endpoint is absent from the daemon snapshot. */
+  private hasMissingPersistedComposeRoutes(attachments: readonly ComposeAttachment[]): boolean {
+    if (this.processService === undefined) {
+      return false;
+    }
+
+    const routes = this.processService.getSnapshot().routes;
+    return attachments.some((attachment) =>
+      attachment.ports.some((port) => !hasComposeRoute(routes, attachment.networkId, port)),
+    );
+  }
+
+  /** Registers every persisted compose endpoint and updates stale process ids. */
+  private async restorePersistedComposeRoutes(attachments: readonly ComposeAttachment[]): Promise<void> {
+    if (this.processService === undefined) {
+      return;
+    }
+
+    await this.processService.start();
+
+    for (const attachment of attachments) {
+      const ports: ComposePublishedPort[] = [];
+
+      try {
+        const cwd = attachment.mutation?.workingDirectory ?? composeWorkingDirectoryFromFiles(attachment.composeFiles);
+        for (const port of attachment.ports) {
+          const process = await this.processService.registerExistingProcess(
+            buildComposeRegisteredProcessInput(attachment, port, cwd),
+          );
+
+          ports.push({
+            ...port,
+            processId: process.id,
+          });
+        }
+
+        this.registry.updateComposeAttachment({
+          ...attachment,
+          ports,
+          status: "attached",
+          errorMessage: undefined,
+        });
+      } catch (error) {
+        this.registry.updateComposeAttachment({
+          ...attachment,
+          status: "error",
+          errorMessage: formatError(error),
+        });
+      }
+    }
+  }
+
+  /**
    * Resolves a network-owned host binding to the live process port. The binding
    * stores the network-local logical port, while the daemon snapshot carries the
    * current actual port assigned by the native hook.
@@ -1403,18 +1532,20 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Maps an arbitrary process PID back to the network attached to its terminal. */
   private findAttachedNetworkForPid(pid: number, processRows: readonly ProcessTableRow[]): string | undefined {
+    const attachments = this.registry.getSnapshot().attachments.filter((attachment) => attachment.status === "attached");
+    const directAttachment = attachments.find((attachment) => attachment.rootPid === pid);
+    if (directAttachment !== undefined) {
+      return directAttachment.networkId;
+    }
+
     const processContext = buildProcessTreeContext(processRows, pid);
 
     if (processContext === undefined) {
       return undefined;
     }
 
-    for (const attachment of this.registry.getSnapshot().attachments) {
-      if (attachment.status !== "attached") {
-        continue;
-      }
-
-      if (attachment.rootPid === pid || processContext.ancestorPids.includes(attachment.rootPid)) {
+    for (const attachment of attachments) {
+      if (processContext.ancestorPids.includes(attachment.rootPid)) {
         return attachment.networkId;
       }
 
@@ -1569,6 +1700,20 @@ export class PortManagerNetworkService implements DisposableLike {
     }
   }
 
+  /** Removes process-only attachments after their owner PID exits. */
+  private syncProcessAttachmentLiveness(processRows: readonly ProcessTableRow[]): void {
+    const liveProcessIds = new Set(processRows.map((row) => row.pid));
+
+    for (const attachment of this.registry.getSnapshot().attachments) {
+      if (
+        attachment.id.startsWith(PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX) &&
+        !liveProcessIds.has(attachment.rootPid)
+      ) {
+        this.registry.removeAttachment(attachment.id);
+      }
+    }
+  }
+
   /** Reads all manually pasted terminal attachment markers from global storage. */
   private async readManualTerminalAttachmentMarkers(): Promise<readonly TerminalAttachmentMarker[]> {
     const markerDirectory = this.getTerminalAttachmentMarkerDirectoryPath();
@@ -1652,6 +1797,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const commands = [
       shellExport("PORT_MANAGER_HOOK", "1"),
       shellExport("PORT_MANAGER_NETWORK_ID", networkId),
+      shellExport("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID", networkId),
       shellExport("PORT_MANAGER_BORROWED_NETWORK_ID", networkId),
       shellExport("NEWDLOPS_PM_NETWORK_ID", networkId),
       shellExport("NEWDLOPS_PM_BORROWED_NETWORK_ID", networkId),
@@ -1707,6 +1853,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const variables = [
       "PORT_MANAGER_HOOK",
       "PORT_MANAGER_NETWORK_ID",
+      "PORT_MANAGER_ROUTE_TABLE_NETWORK_ID",
       "PORT_MANAGER_BORROWED_NETWORK_ID",
       "NEWDLOPS_PM_NETWORK_ID",
       "NEWDLOPS_PM_BORROWED_NETWORK_ID",
@@ -1950,6 +2097,23 @@ function composeWorkingDirectoryFromFiles(composeFiles: readonly string[]): stri
   return firstFile === undefined ? undefined : path.dirname(firstFile);
 }
 
+/** Checks whether the daemon already owns the persisted compose endpoint route. */
+function hasComposeRoute(
+  routes: readonly LogicalPortRoute[],
+  networkId: string,
+  port: ComposePublishedPort,
+): boolean {
+  return routes.some(
+    (route) =>
+      route.source === "compose" &&
+      route.networkId === networkId &&
+      route.logicalPort === port.logicalPort &&
+      route.actualPort === port.actualHostPort &&
+      route.host === port.actualHostAddress &&
+      isListenRoute(route),
+  );
+}
+
 function ensureComposePublishedPortsAreIsolated(ports: readonly ComposePublishedPort[]): void {
   const directHostPorts = ports.filter(
     (port) => port.actualHostPort === port.logicalPort && isLocalHostAddress(port.actualHostAddress),
@@ -2086,6 +2250,11 @@ function nativeHookPlatformName(): string {
 /** Returns the packaged helper that can feed input into generic PTY-backed terminals. */
 function getTtyInputHelperRelativePath(): string {
   return path.join("media", "native", "portmanager_tty_input");
+}
+
+/** Returns the packaged native TCP router helper used for the logical-router data plane. */
+function getTcpRouterHelperRelativePath(): string {
+  return path.join("media", "native", "portmanager_tcp_router");
 }
 
 /** Fails before route rows can persist invalid TCP endpoint state. */
@@ -2359,6 +2528,11 @@ function createManualTerminalAttachmentId(networkId: string, terminalWindowId: s
   return `${MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX}${encodeURIComponent(networkId)}:${encodeURIComponent(
     terminalWindowId,
   )}`;
+}
+
+/** Keeps explicit process attachments stable across repeated user actions. */
+function createProcessTerminalAttachmentId(networkId: string, pid: number): string {
+  return `${PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX}${encodeURIComponent(networkId)}:${pid}`;
 }
 
 /** Parses the TSV marker emitted by copied routing scripts. */

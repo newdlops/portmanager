@@ -8,6 +8,7 @@ import {
   parseProcessCwdFromLsof,
 } from "../../src/platform/ports/tcp-connection-process-resolver";
 import type { LogicalPortRouterConnection } from "../../src/platform/ports/logical-port-router";
+import { parseNativeRouterQueryLine } from "../../src/platform/ports/logical-port-router";
 import {
   buildProcessTreeContext,
   NodeProcessTableProvider,
@@ -41,6 +42,19 @@ test("resolves client PID from an established TCP tuple without process-name rul
   });
 
   assert.equal(process?.pid, 101);
+});
+
+test("parses native logical router control requests", () => {
+  const query = parseNativeRouterQueryLine("CONNECT\t42\t15432\t127.0.0.1\t15432\t127.0.0.1\t49152");
+
+  assert.deepEqual(query, {
+    id: "42",
+    logicalPort: 15432,
+    localAddress: "127.0.0.1",
+    localPort: 15432,
+    remoteAddress: "127.0.0.1",
+    remotePort: 49152,
+  });
 });
 
 test("parses client cwd from a cwd-only lsof query", () => {

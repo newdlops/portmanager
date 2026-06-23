@@ -688,6 +688,10 @@ static const char *pm_current_network_id(void) {
   network_id = getenv("PORT_MANAGER_NETWORK_ID");
 
   if (network_id == NULL || network_id[0] == '\0') {
+    network_id = getenv("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID");
+  }
+
+  if (network_id == NULL || network_id[0] == '\0') {
     network_id = getenv("PORT_MANAGER_BORROWED_NETWORK_ID");
   }
 
