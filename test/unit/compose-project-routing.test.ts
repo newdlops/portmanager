@@ -40,6 +40,7 @@ test("docker compose wrapper targets the attached clone project by cwd and netwo
         networkId: "network-a",
         runtime: "docker",
         workingDirectory: projectDir,
+        originalProjectName: "workspace",
         attachedProjectName: "network-a-app-1234",
       },
     ]),
@@ -274,6 +275,60 @@ test("docker PATH shim rewrites child process docker invocations without shell f
   }
 });
 
+test("docker-compose PATH shim rewrites standalone compose project selections", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-standalone-compose-path-shim-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const shimDir = path.join(tempDir, "shim");
+  const realBinDir = path.join(tempDir, "real-bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(shimDir, { recursive: true });
+  fs.mkdirSync(realBinDir, { recursive: true });
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        originalProjectName: "workspace",
+        attachedProjectName: "network-a-app-1234",
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(path.join(shimDir, "docker-compose"), buildRuntimeCommandShimScript("docker-compose"), {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+  fs.writeFileSync(
+    path.join(realBinDir, "docker-compose"),
+    "#!/bin/sh\nprintf 'env=%s\\n' \"${COMPOSE_PROJECT_NAME:-}\"\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n",
+    {
+      encoding: "utf8",
+      mode: 0o700,
+    },
+  );
+
+  try {
+    const output = execFileSync("docker-compose", ["-p", "workspace", "restart", "postgres"], {
+      cwd: projectDir,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${shimDir}${path.delimiter}${realBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        PORT_MANAGER_COMPOSE_ROUTING_FILE: routingFile,
+        PORT_MANAGER_NETWORK_ID: "network-a",
+      },
+    });
+
+    assert.equal(output, "env=\n<-p>\n<network-a-app-1234>\n<restart>\n<postgres>\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("docker wrapper rewrites full container hashes when stored mapping is short", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-container-full-hash-routing-"));
   const projectDir = path.join(tempDir, "workspace", "app");
@@ -344,6 +399,7 @@ test("docker compose wrapper targets clone project after Docker global options",
         networkId: "network-a",
         runtime: "docker",
         workingDirectory: projectDir,
+        originalProjectName: "workspace",
         attachedProjectName: "network-a-app-1234",
       },
     ]),
@@ -365,6 +421,106 @@ test("docker compose wrapper targets clone project after Docker global options",
           `export PATH=${shellQuote(binDir)}:$PATH`,
           `cd ${shellQuote(projectDir)}`,
           "docker --context desktop-linux compose ps",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output.trim(), "network-a-app-1234");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("docker compose wrapper rewrites explicit original project selections to the attached clone", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-explicit-original-routing-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        originalProjectName: "workspace",
+        attachedProjectName: "network-a-app-1234",
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(binDir, "docker"),
+    "#!/bin/sh\nprintf 'env=%s\\n' \"${COMPOSE_PROJECT_NAME:-}\"\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n",
+    {
+      encoding: "utf8",
+      mode: 0o700,
+    },
+  );
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker compose -p workspace restart postgres",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output, "env=\n<compose>\n<-p>\n<network-a-app-1234>\n<restart>\n<postgres>\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("docker compose wrapper rewrites COMPOSE_PROJECT_NAME for the original project only", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-env-original-routing-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        originalProjectName: "workspace",
+        attachedProjectName: "network-a-app-1234",
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nprintf '%s\\n' \"${COMPOSE_PROJECT_NAME:-}\"\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "COMPOSE_PROJECT_NAME=workspace docker compose restart postgres",
         ].join("\n"),
       ],
       { encoding: "utf8" },
@@ -472,6 +628,7 @@ test("docker compose wrapper leaves explicit project selections untouched", () =
         networkId: "network-a",
         runtime: "docker",
         workingDirectory: projectDir,
+        originalProjectName: "workspace",
         attachedProjectName: "network-a-app-1234",
       },
     ]),

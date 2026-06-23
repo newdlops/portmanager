@@ -322,11 +322,15 @@ function writeRuntimeCommandShims(targetDirectory: string, runtimeCommandShimPat
   if (runtimeCommandShimPath !== undefined && fs.existsSync(runtimeCommandShimPath)) {
     ensureSymlink(path.join(targetDirectory, "docker"), runtimeCommandShimPath);
     ensureSymlink(path.join(targetDirectory, "podman"), runtimeCommandShimPath);
+    ensureSymlink(path.join(targetDirectory, "docker-compose"), runtimeCommandShimPath);
+    ensureSymlink(path.join(targetDirectory, "podman-compose"), runtimeCommandShimPath);
     return;
   }
 
   writeRuntimeCommandShim(path.join(targetDirectory, "docker"), buildRuntimeCommandShimScript("docker"));
   writeRuntimeCommandShim(path.join(targetDirectory, "podman"), buildRuntimeCommandShimScript("podman"));
+  writeRuntimeCommandShim(path.join(targetDirectory, "docker-compose"), buildRuntimeCommandShimScript("docker-compose"));
+  writeRuntimeCommandShim(path.join(targetDirectory, "podman-compose"), buildRuntimeCommandShimScript("podman-compose"));
 }
 
 function writeRuntimeCommandShim(filePath: string, contents: string): void {
@@ -398,8 +402,20 @@ if [ -n "\${PORT_MANAGER_DYLD_INSERT_LIBRARIES:-}" ]; then
   esac
 fi
 
+if [ -n "\${PORT_MANAGER_RUNTIME_SHIM_DIR:-}" ]; then
+  case ":\${PATH:-}:" in
+    *:"\${PORT_MANAGER_RUNTIME_SHIM_DIR}":*) ;;
+    *) export PATH="\${PORT_MANAGER_RUNTIME_SHIM_DIR}\${PATH:+:$PATH}" ;;
+  esac
+  hash -r 2>/dev/null || true
+fi
+
 if [ -n "\${PORT_MANAGER_COMPOSE_ROUTING_FILE:-}" ]; then
 ${buildComposeProjectRoutingFunctionScript()}
+  if [ -n "\${BASH_VERSION:-}" ]; then
+    eval 'docker-compose() { __port_manager_run_standalone_compose_with_routing docker docker-compose "$@"; }'
+    eval 'podman-compose() { __port_manager_run_standalone_compose_with_routing podman podman-compose "$@"; }'
+  fi
 fi
 `;
 }

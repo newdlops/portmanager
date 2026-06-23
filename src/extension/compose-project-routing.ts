@@ -15,6 +15,8 @@ export interface ComposeProjectRoutingRow {
   readonly runtime: "docker" | "podman";
   /** Original compose working directory used by the user's shell. */
   readonly workingDirectory: string;
+  /** Compose project name that the host shell or scripts would normally target. */
+  readonly originalProjectName?: string;
   /** Network-scoped compose project name created by clone attach. */
   readonly attachedProjectName: string;
   /** Direct container id/name rewrites for Docker CLI commands like exec/logs. */
@@ -35,13 +37,17 @@ export interface ComposeContainerRoutingMapping {
 /** Serializes rows as tab-separated text so shell wrappers can read it cheaply. */
 export function serializeComposeProjectRoutingRows(rows: readonly ComposeProjectRoutingRow[]): string {
   const lines = rows.flatMap((row) => {
-    const baseFields = [
+    const projectFields = [
       "project",
       sanitizeField(row.networkId),
       row.runtime,
       sanitizeField(trimTrailingSlashes(row.workingDirectory)),
       sanitizeField(row.attachedProjectName),
-    ].join("\t");
+    ];
+    if (row.originalProjectName !== undefined) {
+      projectFields.push(sanitizeField(row.originalProjectName));
+    }
+    const baseFields = projectFields.join("\t");
     const containerFields = (row.containerMappings ?? []).map((mapping) =>
       [
         "container",
@@ -72,7 +78,16 @@ ${buildComposeProjectRoutingFunctionScript()}`;
 }
 
 /** Builds an executable PATH shim for child_process.spawn("docker", ...). */
-export function buildRuntimeCommandShimScript(runtime: "docker" | "podman"): string {
+export type RuntimeCommandShimName = "docker" | "podman" | "docker-compose" | "podman-compose";
+
+export function buildRuntimeCommandShimScript(runtime: RuntimeCommandShimName): string {
+  const standaloneCompose =
+    runtime === "docker-compose"
+      ? `__port_manager_run_standalone_compose_with_routing docker docker-compose "$@"`
+      : runtime === "podman-compose"
+        ? `__port_manager_run_standalone_compose_with_routing podman podman-compose "$@"`
+        : `${runtime} "$@"`;
+
   return `#!/bin/sh
 __pm_shim_dir="$(CDPATH= cd "$(dirname "$0")" && pwd)"
 __pm_new_path=""
@@ -90,29 +105,13 @@ export PATH
 
 ${buildComposeProjectRoutingFunctionScript()}
 
-${runtime} "$@"
+${standaloneCompose}
 `;
 }
 
 /** Builds wrapper functions that can also be embedded in BASH_ENV restore files. */
 export function buildComposeProjectRoutingFunctionScript(): string {
-  return `__port_manager_compose_args_have_project() {
-  if [ -n "\${COMPOSE_PROJECT_NAME:-}" ]; then
-    return 0
-  fi
-
-  for __pm_arg in "$@"; do
-    case "\${__pm_arg}" in
-      -p|--project-name|-p*|--project-name=*)
-        return 0
-        ;;
-    esac
-  done
-
-  return 1
-}
-
-__port_manager_runtime_first_command() {
+  return `__port_manager_runtime_first_command() {
   __pm_skip_next=0
 
   for __pm_arg in "$@"; do
@@ -192,18 +191,19 @@ __port_manager_runtime_container_subcommand() {
   return 1
 }
 
-__port_manager_compose_project_for_runtime() {
+__port_manager_compose_route_for_runtime() {
   __pm_runtime="$1"
   __pm_file="\${PORT_MANAGER_COMPOSE_ROUTING_FILE:-}"
   __pm_network="\${PORT_MANAGER_NETWORK_ID:-\${NEWDLOPS_PM_NETWORK_ID:-}}"
-  __pm_best_project=""
+  __pm_best_attached_project=""
+  __pm_best_original_project=""
   __pm_best_length=0
 
   if [ -z "\${__pm_file}" ] || [ -z "\${__pm_network}" ] || [ ! -r "\${__pm_file}" ]; then
     return 1
   fi
 
-  while IFS="$(printf '\\t')" read -r __pm_row_kind __pm_row_network __pm_row_runtime __pm_workdir __pm_project __pm_rest; do
+  while IFS="$(printf '\\t')" read -r __pm_row_kind __pm_row_network __pm_row_runtime __pm_workdir __pm_attached_project __pm_original_project __pm_rest; do
     if [ "\${__pm_row_kind}" != "project" ]; then
       continue
     fi
@@ -216,15 +216,32 @@ __port_manager_compose_project_for_runtime() {
       __pm_length=\${#__pm_workdir}
       if [ "\${__pm_length}" -ge "\${__pm_best_length}" ]; then
         __pm_best_length="\${__pm_length}"
-        __pm_best_project="\${__pm_project}"
+        __pm_best_attached_project="\${__pm_attached_project}"
+        __pm_best_original_project="\${__pm_original_project}"
       fi
     fi
   done < "\${__pm_file}"
 
-  if [ -n "\${__pm_best_project}" ]; then
-    printf '%s\\n' "\${__pm_best_project}"
+  if [ -n "\${__pm_best_attached_project}" ]; then
+    printf '%s\\t%s\\n' "\${__pm_best_attached_project}" "\${__pm_best_original_project}"
     return 0
   fi
+
+  return 1
+}
+
+__port_manager_compose_args_have_project() {
+  if [ -n "\${COMPOSE_PROJECT_NAME:-}" ]; then
+    return 0
+  fi
+
+  for __pm_arg in "$@"; do
+    case "\${__pm_arg}" in
+      -p|--project-name|-p*|--project-name=*)
+        return 0
+        ;;
+    esac
+  done
 
   return 1
 }
@@ -358,14 +375,91 @@ __port_manager_run_runtime_with_container_routing() {
   eval "command \${__pm_runtime}\${__pm_args}"
 }
 
+__port_manager_run_compose_command_with_routing() {
+  __pm_route_runtime="$1"
+  __pm_command="$2"
+  shift 2
+  __pm_route="$(__port_manager_compose_route_for_runtime "\${__pm_route_runtime}")"
+  if [ -z "\${__pm_route}" ]; then
+    command "\${__pm_command}" "$@"
+    return $?
+  fi
+
+  __pm_tab="$(printf '\\t')"
+  __pm_attached_project="\${__pm_route%%\${__pm_tab}*}"
+  __pm_original_project="\${__pm_route#*\${__pm_tab}}"
+  __pm_env_project="\${COMPOSE_PROJECT_NAME:-}"
+  __pm_args=""
+  __pm_rewrite_next=0
+  __pm_rewrote_project=0
+
+  for __pm_arg in "$@"; do
+    if [ "\${__pm_rewrite_next}" = "1" ]; then
+      if [ -n "\${__pm_original_project}" ] && [ "\${__pm_arg}" = "\${__pm_original_project}" ]; then
+        __pm_arg="\${__pm_attached_project}"
+        __pm_rewrote_project=1
+      fi
+      __pm_rewrite_next=0
+      __pm_args="\${__pm_args} $(__port_manager_shell_quote "\${__pm_arg}")"
+      continue
+    fi
+
+    case "\${__pm_arg}" in
+      -p|--project-name)
+        __pm_rewrite_next=1
+        __pm_args="\${__pm_args} $(__port_manager_shell_quote "\${__pm_arg}")"
+        continue
+        ;;
+      --project-name=*)
+        __pm_value="\${__pm_arg#--project-name=}"
+        if [ -n "\${__pm_original_project}" ] && [ "\${__pm_value}" = "\${__pm_original_project}" ]; then
+          __pm_arg="--project-name=\${__pm_attached_project}"
+          __pm_rewrote_project=1
+        fi
+        ;;
+      -p?*)
+        __pm_value="\${__pm_arg#-p}"
+        if [ -n "\${__pm_original_project}" ] && [ "\${__pm_value}" = "\${__pm_original_project}" ]; then
+          __pm_arg="-p\${__pm_attached_project}"
+          __pm_rewrote_project=1
+        fi
+        ;;
+    esac
+
+    __pm_args="\${__pm_args} $(__port_manager_shell_quote "\${__pm_arg}")"
+  done
+
+  if ! __port_manager_compose_args_have_project "$@"; then
+    (COMPOSE_PROJECT_NAME="\${__pm_attached_project}"; export COMPOSE_PROJECT_NAME; eval "command \${__pm_command}\${__pm_args}")
+    return $?
+  fi
+
+  if [ -n "\${__pm_original_project}" ] && [ "\${__pm_env_project}" = "\${__pm_original_project}" ]; then
+    (COMPOSE_PROJECT_NAME="\${__pm_attached_project}"; export COMPOSE_PROJECT_NAME; eval "command \${__pm_command}\${__pm_args}")
+    return $?
+  fi
+
+  eval "command \${__pm_command}\${__pm_args}"
+}
+
+__port_manager_run_runtime_with_compose_routing() {
+  __pm_runtime="$1"
+  shift
+  __port_manager_run_compose_command_with_routing "\${__pm_runtime}" "\${__pm_runtime}" "$@"
+}
+
+__port_manager_run_standalone_compose_with_routing() {
+  __pm_route_runtime="$1"
+  __pm_command="$2"
+  shift 2
+  __port_manager_run_compose_command_with_routing "\${__pm_route_runtime}" "\${__pm_command}" "$@"
+}
+
 docker() {
   __pm_first_command="$(__port_manager_runtime_first_command "$@")"
-  if [ "\${__pm_first_command}" = "compose" ] && ! __port_manager_compose_args_have_project "$@"; then
-    __pm_project="$(__port_manager_compose_project_for_runtime docker)"
-    if [ -n "\${__pm_project}" ]; then
-      COMPOSE_PROJECT_NAME="\${__pm_project}" command docker "$@"
-      return $?
-    fi
+  if [ "\${__pm_first_command}" = "compose" ]; then
+    __port_manager_run_runtime_with_compose_routing docker "$@"
+    return $?
   fi
 
   if [ "\${__pm_first_command}" != "compose" ] && __port_manager_runtime_command_may_reference_container "$@"; then
@@ -378,12 +472,9 @@ docker() {
 
 podman() {
   __pm_first_command="$(__port_manager_runtime_first_command "$@")"
-  if [ "\${__pm_first_command}" = "compose" ] && ! __port_manager_compose_args_have_project "$@"; then
-    __pm_project="$(__port_manager_compose_project_for_runtime podman)"
-    if [ -n "\${__pm_project}" ]; then
-      COMPOSE_PROJECT_NAME="\${__pm_project}" command podman "$@"
-      return $?
-    fi
+  if [ "\${__pm_first_command}" = "compose" ]; then
+    __port_manager_run_runtime_with_compose_routing podman "$@"
+    return $?
   fi
 
   if [ "\${__pm_first_command}" != "compose" ] && __port_manager_runtime_command_may_reference_container "$@"; then

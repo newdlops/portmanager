@@ -60,6 +60,20 @@ static void pm_copy(char *destination, size_t size, const char *source) {
   snprintf(destination, size, "%s", source);
 }
 
+/** Removes line endings left on the final TSV field after splitting a row. */
+static void pm_trim_line_end(char *value) {
+  size_t length;
+
+  if (value == NULL) {
+    return;
+  }
+
+  length = strlen(value);
+  while (length > 0 && (value[length - 1] == '\n' || value[length - 1] == '\r')) {
+    value[--length] = '\0';
+  }
+}
+
 /** Resolves a path when possible but keeps non-existing PATH entries comparable. */
 static int pm_realpath_or_copy(const char *path, char *buffer, size_t size) {
   char resolved[PM_MAX_PATH];
@@ -265,14 +279,8 @@ static int pm_first_command_index(int argc, char **argv) {
   return -1;
 }
 
-/** Explicit compose project selections must win over Port Manager's clone project. */
-static int pm_compose_args_have_project(int argc, char **argv) {
-  const char *compose_project_name = getenv("COMPOSE_PROJECT_NAME");
-
-  if (compose_project_name != NULL && compose_project_name[0] != '\0') {
-    return 1;
-  }
-
+/** Returns true when argv itself contains a compose project option. */
+static int pm_compose_argv_has_project(int argc, char **argv) {
   for (int index = 1; index < argc; index++) {
     const char *arg = argv[index];
 
@@ -283,6 +291,13 @@ static int pm_compose_args_have_project(int argc, char **argv) {
   }
 
   return 0;
+}
+
+/** Explicit compose project selections include either argv or environment state. */
+static int pm_compose_args_have_project(int argc, char **argv) {
+  const char *compose_project_name = getenv("COMPOSE_PROJECT_NAME");
+
+  return (compose_project_name != NULL && compose_project_name[0] != '\0') || pm_compose_argv_has_project(argc, argv);
 }
 
 /** Chooses the active logical network from the terminal hook environment. */
@@ -336,6 +351,14 @@ static int pm_parse_route_row(char *line, pm_route_row *row) {
   pm_copy(row->original_name, sizeof(row->original_name), fields[5]);
   pm_copy(row->attached_id, sizeof(row->attached_id), fields[6]);
   pm_copy(row->attached_name, sizeof(row->attached_name), fields[7]);
+  pm_trim_line_end(row->kind);
+  pm_trim_line_end(row->network_id);
+  pm_trim_line_end(row->runtime);
+  pm_trim_line_end(row->workdir);
+  pm_trim_line_end(row->project_or_original_id);
+  pm_trim_line_end(row->original_name);
+  pm_trim_line_end(row->attached_id);
+  pm_trim_line_end(row->attached_name);
 
   return row->kind[0] != '\0';
 }
@@ -367,7 +390,7 @@ static int pm_cwd_matches_workdir(const char *workdir) {
 }
 
 /** Finds the most-specific attached compose project for the current cwd/runtime/network. */
-static int pm_find_compose_project(const char *runtime, char *project, size_t size) {
+static int pm_find_compose_route(const char *runtime, char *attached_project, size_t attached_size, char *original_project, size_t original_size) {
   const char *file_path = getenv(PM_COMPOSE_ROUTING_FILE_ENV);
   const char *network_id = pm_network_id();
   FILE *file;
@@ -400,14 +423,102 @@ static int pm_find_compose_project(const char *runtime, char *project, size_t si
     workdir_length = strlen(row.workdir);
     if (pm_cwd_matches_workdir(row.workdir) && workdir_length >= best_length) {
       best_length = workdir_length;
-      pm_copy(project, size, row.project_or_original_id);
-      found = project[0] != '\0';
+      pm_copy(attached_project, attached_size, row.project_or_original_id);
+      pm_copy(original_project, original_size, row.original_name);
+      found = attached_project[0] != '\0';
     }
   }
 
   free(line);
   fclose(file);
   return found ? 0 : -1;
+}
+
+/** Allocates one rewritten compose project option argument. */
+static char *pm_replace_project_option_value(const char *prefix, const char *attached_project) {
+  size_t prefix_length = strlen(prefix);
+  size_t project_length = strlen(attached_project);
+  char *value = malloc(prefix_length + project_length + 1);
+
+  if (value == NULL) {
+    return NULL;
+  }
+
+  memcpy(value, prefix, prefix_length);
+  memcpy(value + prefix_length, attached_project, project_length + 1);
+  return value;
+}
+
+/** Copies argv while replacing explicit references to the original compose project. */
+static char **pm_rewrite_compose_project_args(const char *real_runtime_path, int argc, char **argv, const char *original_project, const char *attached_project) {
+  char **next_argv = calloc((size_t)argc + 1, sizeof(char *));
+  int rewrite_next = 0;
+
+  if (next_argv == NULL) {
+    return NULL;
+  }
+
+  next_argv[0] = (char *)real_runtime_path;
+  for (int index = 1; index < argc; index++) {
+    const char *arg = argv[index];
+
+    if (rewrite_next) {
+      next_argv[index] = strcmp(arg, original_project) == 0 ? strdup(attached_project) : argv[index];
+      rewrite_next = 0;
+      continue;
+    }
+
+    if (strcmp(arg, "-p") == 0 || strcmp(arg, "--project-name") == 0) {
+      next_argv[index] = argv[index];
+      rewrite_next = 1;
+      continue;
+    }
+
+    if (strncmp(arg, "--project-name=", 15) == 0) {
+      const char *value = arg + 15;
+      next_argv[index] = strcmp(value, original_project) == 0
+                           ? pm_replace_project_option_value("--project-name=", attached_project)
+                           : argv[index];
+      if (next_argv[index] == NULL) {
+        free(next_argv);
+        return NULL;
+      }
+      continue;
+    }
+
+    if (strncmp(arg, "-p", 2) == 0 && arg[2] != '\0') {
+      const char *value = arg + 2;
+      next_argv[index] = strcmp(value, original_project) == 0
+                           ? pm_replace_project_option_value("-p", attached_project)
+                           : argv[index];
+      if (next_argv[index] == NULL) {
+        free(next_argv);
+        return NULL;
+      }
+      continue;
+    }
+
+    next_argv[index] = argv[index];
+  }
+
+  next_argv[argc] = NULL;
+  return next_argv;
+}
+
+/** Copies argv without changing user arguments. */
+static char **pm_copy_runtime_args(const char *real_runtime_path, int argc, char **argv) {
+  char **next_argv = calloc((size_t)argc + 1, sizeof(char *));
+
+  if (next_argv == NULL) {
+    return NULL;
+  }
+
+  next_argv[0] = (char *)real_runtime_path;
+  for (int index = 1; index < argc; index++) {
+    next_argv[index] = argv[index];
+  }
+  next_argv[argc] = NULL;
+  return next_argv;
 }
 
 /** Identifies Docker commands where an argv token may be a container reference. */
@@ -531,37 +642,60 @@ static char **pm_rewrite_container_args(const char *runtime, const char *real_ru
   return next_argv;
 }
 
-/** Derives the runtime name from the symlink name, with an env escape hatch for tests. */
-static const char *pm_runtime_name(char **argv) {
-  const char *runtime = pm_basename(argv[0]);
+/** Derives route runtime and executable name from the symlink used to enter the shim. */
+static int pm_resolve_invocation(char **argv, char *runtime, size_t runtime_size, char *executable, size_t executable_size, int *standalone_compose) {
+  const char *name = pm_basename(argv[0]);
   const char *override = getenv("PORT_MANAGER_DOCKER_SHIM_RUNTIME");
 
-  if (runtime != NULL && (strcmp(runtime, "docker") == 0 || strcmp(runtime, "podman") == 0)) {
-    return runtime;
+  *standalone_compose = 0;
+
+  if (name != NULL && (strcmp(name, "docker") == 0 || strcmp(name, "podman") == 0)) {
+    pm_copy(runtime, runtime_size, name);
+    pm_copy(executable, executable_size, name);
+    return 0;
+  }
+
+  if (name != NULL && strcmp(name, "docker-compose") == 0) {
+    pm_copy(runtime, runtime_size, "docker");
+    pm_copy(executable, executable_size, "docker-compose");
+    *standalone_compose = 1;
+    return 0;
+  }
+
+  if (name != NULL && strcmp(name, "podman-compose") == 0) {
+    pm_copy(runtime, runtime_size, "podman");
+    pm_copy(executable, executable_size, "podman-compose");
+    *standalone_compose = 1;
+    return 0;
   }
 
   if (override != NULL && (strcmp(override, "docker") == 0 || strcmp(override, "podman") == 0)) {
-    return override;
+    pm_copy(runtime, runtime_size, override);
+    pm_copy(executable, executable_size, override);
+    return 0;
   }
 
-  return NULL;
+  return -1;
 }
 
 int main(int argc, char **argv) {
-  const char *runtime = pm_runtime_name(argv);
+  char runtime[PM_MAX_RUNTIME];
+  char runtime_executable[PM_MAX_RUNTIME];
   char real_runtime_path[PM_MAX_PATH];
-  char compose_project[PM_MAX_FIELD];
+  char attached_project[PM_MAX_FIELD];
+  char original_project[PM_MAX_FIELD];
   char **next_argv;
   char *clean_path;
   int command_index;
+  int standalone_compose;
 
-  if (runtime == NULL) {
-    fprintf(stderr, "portmanager-docker-shim: invoke through docker or podman symlink\n");
+  if (pm_resolve_invocation(argv, runtime, sizeof(runtime), runtime_executable, sizeof(runtime_executable), &standalone_compose) != 0) {
+    fprintf(stderr, "portmanager-docker-shim: invoke through docker, podman, docker-compose, or podman-compose symlink\n");
     return 127;
   }
 
-  if (pm_find_runtime_on_path(runtime, real_runtime_path, sizeof(real_runtime_path)) != 0) {
-    fprintf(stderr, "portmanager-docker-shim: could not resolve real %s on PATH\n", runtime);
+  if (pm_find_runtime_on_path(runtime_executable, real_runtime_path, sizeof(real_runtime_path)) != 0) {
+    fprintf(stderr, "portmanager-docker-shim: could not resolve real %s on PATH\n", runtime_executable);
     return 127;
   }
 
@@ -572,23 +706,26 @@ int main(int argc, char **argv) {
   }
 
   command_index = pm_first_command_index(argc, argv);
-  if (command_index >= 0 && strcmp(argv[command_index], "compose") == 0 && !pm_compose_args_have_project(argc, argv)) {
-    if (pm_find_compose_project(runtime, compose_project, sizeof(compose_project)) == 0) {
-      setenv("COMPOSE_PROJECT_NAME", compose_project, 1);
+  if (standalone_compose || (command_index >= 0 && strcmp(argv[command_index], "compose") == 0)) {
+    if (pm_find_compose_route(runtime, attached_project, sizeof(attached_project), original_project, sizeof(original_project)) == 0) {
+      const char *env_project = getenv("COMPOSE_PROJECT_NAME");
+      int env_matches_original = env_project != NULL && original_project[0] != '\0' && strcmp(env_project, original_project) == 0;
+      if (!pm_compose_args_have_project(argc, argv) || env_matches_original) {
+        setenv("COMPOSE_PROJECT_NAME", attached_project, 1);
+      }
+      if (original_project[0] != '\0' && pm_compose_argv_has_project(argc, argv)) {
+        next_argv = pm_rewrite_compose_project_args(real_runtime_path, argc, argv, original_project, attached_project);
+      } else {
+        next_argv = pm_copy_runtime_args(real_runtime_path, argc, argv);
+      }
+    } else {
+      next_argv = pm_copy_runtime_args(real_runtime_path, argc, argv);
     }
-  }
-
-  if (command_index >= 0 && strcmp(argv[command_index], "compose") != 0 &&
+  } else if (command_index >= 0 && strcmp(argv[command_index], "compose") != 0 &&
       pm_runtime_command_may_reference_container(argc, argv, command_index)) {
     next_argv = pm_rewrite_container_args(runtime, real_runtime_path, argc, argv);
   } else {
-    next_argv = calloc((size_t)argc + 1, sizeof(char *));
-    if (next_argv != NULL) {
-      next_argv[0] = real_runtime_path;
-      for (int index = 1; index < argc; index++) {
-        next_argv[index] = argv[index];
-      }
-    }
+    next_argv = pm_copy_runtime_args(real_runtime_path, argc, argv);
   }
 
   if (next_argv == NULL) {
