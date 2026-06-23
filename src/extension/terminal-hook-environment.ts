@@ -6,6 +6,10 @@ import { getAgentSocketPath } from "../agent/agent-socket";
 import { getDefaultHostAccessBindingsPath, getDefaultRouteTablePath } from "../agent/route-table";
 import { readPortManagerSettings } from "../config/vscode-settings";
 import type { DisposableLike, PortManagerSettings } from "../shared/types";
+import {
+  buildComposeProjectRoutingFunctionScript,
+  buildRuntimeCommandShimScript,
+} from "./compose-project-routing";
 
 /**
  * Keeps new VS Code terminals on the pre-bind routing path.
@@ -147,13 +151,14 @@ export function prepareRuntimeShimLauncherDirectory(
   launcherPath: string,
 ): string | undefined {
   const sourceShimDirectory = getAsdfShimDirectory();
-
-  if (process.platform !== "darwin" || !fs.existsSync(launcherPath)) {
-    return undefined;
-  }
-
   const targetDirectory = path.join(baseDirectory, "runtime-shims");
   fs.mkdirSync(targetDirectory, { recursive: true });
+  writeRuntimeCommandShim(path.join(targetDirectory, "docker"), buildRuntimeCommandShimScript("docker"));
+  writeRuntimeCommandShim(path.join(targetDirectory, "podman"), buildRuntimeCommandShimScript("podman"));
+
+  if (process.platform !== "darwin" || !fs.existsSync(launcherPath)) {
+    return targetDirectory;
+  }
 
   for (const runtimeName of PRELOAD_RUNTIME_LAUNCHER_NAMES) {
     ensureSymlink(path.join(targetDirectory, runtimeName), launcherPath);
@@ -269,6 +274,21 @@ function ensureSymlink(linkPath: string, targetPath: string): void {
   fs.symlinkSync(targetPath, linkPath);
 }
 
+function writeRuntimeCommandShim(filePath: string, contents: string): void {
+  try {
+    const existing = fs.readFileSync(filePath, "utf8");
+    if (existing === contents) {
+      fs.chmodSync(filePath, 0o700);
+      return;
+    }
+  } catch {
+    // Missing, unreadable, or non-file paths are replaced below.
+  }
+
+  fs.rmSync(filePath, { recursive: true, force: true });
+  fs.writeFileSync(filePath, contents, { encoding: "utf8", mode: 0o700 });
+}
+
 function shellEnvRestoreFileName(scope: ShellEnvRestoreScope): string {
   if (scope.networkId === undefined) {
     return "portmanager-bash-env.sh";
@@ -316,6 +336,10 @@ if [ -n "\${PORT_MANAGER_DYLD_INSERT_LIBRARIES:-}" ]; then
     *:"\${PORT_MANAGER_DYLD_INSERT_LIBRARIES}":*) ;;
     *) export DYLD_INSERT_LIBRARIES="\${PORT_MANAGER_DYLD_INSERT_LIBRARIES}\${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}" ;;
   esac
+fi
+
+if [ -n "\${PORT_MANAGER_COMPOSE_ROUTING_FILE:-}" ]; then
+${buildComposeProjectRoutingFunctionScript()}
 fi
 `;
 }

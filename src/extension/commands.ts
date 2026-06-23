@@ -236,10 +236,34 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
+    const composeAttachMode =
+      directInput?.composeAttachMode ??
+      (candidate.composeProject === undefined ? "as-is" : await promptForComposeAttachMode(candidate));
+    if (composeAttachMode === undefined) {
+      return;
+    }
+    const allowStatefulClone =
+      composeAttachMode === "clone" ? await confirmStatefulComposeClone(candidate) : false;
+    if (allowStatefulClone === undefined) {
+      return;
+    }
+
     const attachment = await this.dependencies.networkService.attachComposePublishedPorts({
       networkId: network.id,
       projectName: candidate.composeProject ?? candidate.containerName,
-      cwd: getDefaultWorkspaceFolder() ?? process.cwd(),
+      cwd: candidate.composeWorkingDirectory ?? getDefaultWorkspaceFolder() ?? process.cwd(),
+      composeFiles: candidate.composeConfigFiles,
+      ...(candidate.composeProject !== undefined
+        ? {
+            composeMutation: {
+              mode: composeAttachMode === "clone" ? "clone" : "in-place",
+              allowStatefulClone,
+              runtime: candidate.runtime,
+              workingDirectory: candidate.composeWorkingDirectory ?? getDefaultWorkspaceFolder() ?? process.cwd(),
+              composeFiles: candidate.composeConfigFiles,
+            },
+          }
+        : {}),
       ports: candidate.ports.map((port) => ({
         serviceName: port.serviceName,
         logicalPort: port.logicalPort,
@@ -1069,9 +1093,10 @@ export class PortManagerCommandController implements DisposableLike {
     const candidate = getContainerServiceCandidateFromCommandArgument(argument);
 
     if (candidate !== undefined) {
-      return this.dependencies.networkService
-        .getSnapshot()
-        .containerServiceCandidates.find((item) => item.id === candidate.id);
+      return resolveLatestContainerServiceCandidate(
+        this.dependencies.networkService.getSnapshot().containerServiceCandidates,
+        candidate,
+      );
     }
 
     const candidates = this.dependencies.networkService.getSnapshot().containerServiceCandidates;
@@ -1307,11 +1332,147 @@ async function promptForInjectionMode(): Promise<PortInjectionMode | undefined> 
 
 /** Builds a concise label for compose services while preserving raw container names. */
 function formatContainerServiceLabel(candidate: ContainerServiceCandidate): string {
-  if (candidate.composeProject !== undefined || candidate.composeService !== undefined) {
-    return `${candidate.composeProject ?? "compose"}/${candidate.composeService ?? candidate.containerName}`;
+  if (candidate.composeProject !== undefined && candidate.composeService !== undefined) {
+    return `${candidate.composeProject}/${candidate.composeService}`;
+  }
+
+  if (candidate.composeProject !== undefined) {
+    return candidate.composeProject;
   }
 
   return candidate.containerName;
+}
+
+function resolveLatestContainerServiceCandidate(
+  candidates: readonly ContainerServiceCandidate[],
+  candidate: ContainerServiceCandidate,
+): ContainerServiceCandidate | undefined {
+  const directCandidate = candidates.find((item) => item.id === candidate.id);
+  if (directCandidate !== undefined) {
+    return directCandidate;
+  }
+
+  if (!candidate.id.startsWith("compose-project:") || candidate.composeProject === undefined) {
+    return undefined;
+  }
+
+  const group = candidates.filter(
+    (item) =>
+      item.runtime === candidate.runtime &&
+      item.composeProject === candidate.composeProject &&
+      sameComposeContext(item, candidate),
+  );
+  if (group.length === 0) {
+    return undefined;
+  }
+
+  return {
+    id: candidate.id,
+    runtime: candidate.runtime,
+    containerId: candidate.composeProject,
+    containerName: candidate.composeProject,
+    composeProject: candidate.composeProject,
+    ...(group[0]?.composeWorkingDirectory !== undefined
+      ? { composeWorkingDirectory: group[0].composeWorkingDirectory }
+      : {}),
+    ...(group.flatMap((item) => [...(item.composeConfigFiles ?? [])]).length > 0
+      ? { composeConfigFiles: uniqueStrings(group.flatMap((item) => [...(item.composeConfigFiles ?? [])])) }
+      : {}),
+    ports: group.flatMap((item) => [...item.ports]),
+  };
+}
+
+function sameComposeContext(candidate: ContainerServiceCandidate, reference: ContainerServiceCandidate): boolean {
+  const referenceFiles = reference.composeConfigFiles ?? [];
+  const candidateFiles = candidate.composeConfigFiles ?? [];
+
+  if (
+    reference.composeWorkingDirectory !== undefined &&
+    candidate.composeWorkingDirectory !== reference.composeWorkingDirectory
+  ) {
+    return false;
+  }
+
+  if (referenceFiles.length === 0) {
+    return true;
+  }
+
+  return referenceFiles.length === candidateFiles.length && referenceFiles.every((file, index) => candidateFiles[index] === file);
+}
+
+type ComposeAttachMode = "clone" | "as-is";
+
+async function promptForComposeAttachMode(
+  candidate: ContainerServiceCandidate,
+): Promise<ComposeAttachMode | undefined> {
+  const selected = await vscode.window.showQuickPick(
+    [
+      {
+        label: "Clone and hide host ports",
+        description: "Recreate services under a network-scoped Compose project",
+        detail: "Frees original host ports so the original Compose project can be started again.",
+        mode: "clone" as const,
+      },
+      {
+        label: "Attach as-is",
+        description: "Restart the current Compose project with hidden ports",
+        detail: "Keeps the original project name and recreates selected services with logical-network port routes.",
+        mode: "as-is" as const,
+      },
+    ],
+    {
+      title: "Attach Compose to Network",
+      placeHolder: `Choose how to attach ${formatContainerServiceLabel(candidate)}`,
+    },
+  );
+
+  return selected?.mode;
+}
+
+async function confirmStatefulComposeClone(
+  candidate: ContainerServiceCandidate,
+): Promise<boolean | undefined> {
+  const statefulServices = inferStatefulComposeServices(candidate);
+  if (statefulServices.length === 0) {
+    return true;
+  }
+
+  const selected = await vscode.window.showWarningMessage(
+    `Clone will stop the original service and copy Docker volumes for stateful service${statefulServices.length === 1 ? "" : "s"}: ${statefulServices.join(", ")}. Continue only if the database can tolerate a point-in-time clone.`,
+    { modal: true },
+    "Clone anyway",
+  );
+
+  return selected === "Clone anyway" ? true : undefined;
+}
+
+function inferStatefulComposeServices(candidate: ContainerServiceCandidate): readonly string[] {
+  const services = new Set<string>();
+
+  for (const port of candidate.ports) {
+    const serviceName = port.serviceName.toLowerCase().replace(/[-_]+/g, " ");
+    const protocolName = port.protocolName?.toLowerCase();
+    const statefulProtocol =
+      protocolName !== undefined &&
+      ["postgresql", "postgres", "mysql", "mariadb", "redis", "rabbitmq", "mongodb", "mongo"].includes(
+        protocolName,
+      );
+    const statefulPort = [5432, 3306, 33060, 6379, 5672, 15672, 27017, 9200, 9300, 50051].includes(
+      port.containerPort,
+    );
+
+    if (
+      statefulProtocol ||
+      statefulPort ||
+      /\b(db|database|postgres|postgresql|mysql|mariadb|redis|rabbitmq|mongo|mongodb|weaviate|elastic|opensearch)\b/.test(
+        serviceName,
+      )
+    ) {
+      services.add(port.serviceName);
+    }
+  }
+
+  return [...services].sort();
 }
 
 /** Lets users choose a runtime adapter when more than one is available. */
@@ -1440,6 +1601,7 @@ interface AttachTerminalCommandInput {
 interface AttachContainerCommandInput {
   readonly containerService?: ContainerServiceCandidate;
   readonly network?: LogicalNetwork;
+  readonly composeAttachMode?: ComposeAttachMode;
 }
 
 function getAttachTerminalInput(argument: unknown): AttachTerminalCommandInput | undefined {
@@ -1471,6 +1633,7 @@ function getAttachContainerInput(argument: unknown): AttachContainerCommandInput
   return {
     containerService: candidate.containerService,
     network: candidate.network,
+    composeAttachMode: candidate.composeAttachMode,
   };
 }
 
@@ -1581,6 +1744,10 @@ function getShellProfilePaths(): readonly string[] {
 /** Removes duplicate profile paths while preserving the intended source order. */
 function uniquePaths(paths: readonly string[]): readonly string[] {
   return [...new Set(paths)];
+}
+
+function uniqueStrings(values: readonly string[]): readonly string[] {
+  return [...new Set(values.filter((value) => value.length > 0))];
 }
 
 interface ShellHookScriptOptions {

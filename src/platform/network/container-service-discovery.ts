@@ -63,7 +63,7 @@ export class ContainerServiceDiscoveryAdapter {
   }
 }
 
-interface RuntimeContainerRow {
+export interface RuntimeContainerRow {
   readonly ID?: string;
   readonly Id?: string;
   readonly Names?: string;
@@ -97,6 +97,14 @@ function toContainerServiceCandidate(
   const labels = parseLabels(row.Labels);
   const composeProject = readLabel(labels, "com.docker.compose.project", "io.podman.compose.project");
   const composeService = readLabel(labels, "com.docker.compose.service", "io.podman.compose.service");
+  const composeWorkingDirectory = readLabel(
+    labels,
+    "com.docker.compose.project.working_dir",
+    "io.podman.compose.project.working_dir",
+  );
+  const composeConfigFiles = parseComposeConfigFiles(
+    readLabel(labels, "com.docker.compose.project.config_files", "io.podman.compose.project.config_files"),
+  );
   const serviceName = composeService ?? containerName;
   const ports = parsePublishedPorts(row.Ports ?? "", serviceName);
 
@@ -113,6 +121,8 @@ function toContainerServiceCandidate(
     ...(row.Status ? { status: row.Status } : {}),
     ...(composeProject ? { composeProject } : {}),
     ...(composeService ? { composeService } : {}),
+    ...(composeWorkingDirectory ? { composeWorkingDirectory } : {}),
+    ...(composeConfigFiles.length > 0 ? { composeConfigFiles } : {}),
     ports,
   };
 }
@@ -202,7 +212,7 @@ function normalizeHostAddress(host: string): string {
   return host;
 }
 
-function parseRuntimeContainerRow(line: string): RuntimeContainerRow | undefined {
+export function parseRuntimeContainerRow(line: string): RuntimeContainerRow | undefined {
   try {
     const parsed = JSON.parse(line) as unknown;
     return typeof parsed === "object" && parsed !== null ? (parsed as RuntimeContainerRow) : undefined;
@@ -213,16 +223,31 @@ function parseRuntimeContainerRow(line: string): RuntimeContainerRow | undefined
 
 function parseLabels(value: string | undefined): ReadonlyMap<string, string> {
   const labels = new Map<string, string>();
+  let currentKey: string | undefined;
+
   for (const rawLabel of value?.split(",") ?? []) {
     const separatorIndex = rawLabel.indexOf("=");
     if (separatorIndex <= 0) {
+      if (currentKey !== undefined) {
+        labels.set(currentKey, `${labels.get(currentKey) ?? ""},${rawLabel}`);
+      }
       continue;
     }
 
-    labels.set(rawLabel.slice(0, separatorIndex), rawLabel.slice(separatorIndex + 1));
+    currentKey = rawLabel.slice(0, separatorIndex);
+    labels.set(currentKey, rawLabel.slice(separatorIndex + 1));
   }
 
   return labels;
+}
+
+function parseComposeConfigFiles(value: string | undefined): readonly string[] {
+  return (
+    value
+      ?.split(",")
+      .map((file) => file.trim())
+      .filter((file) => file.length > 0) ?? []
+  );
 }
 
 function readLabel(labels: ReadonlyMap<string, string>, ...keys: readonly string[]): string | undefined {
@@ -271,12 +296,13 @@ function isTcpPort(port: number): boolean {
 async function runContainerCommand(
   executable: string,
   args: readonly string[],
-  options: { readonly timeoutMs?: number } = {},
+  options: { readonly timeoutMs?: number; readonly cwd?: string } = {},
 ): Promise<ContainerCommandResult> {
   try {
     const result = await execFileAsync(executable, [...args], {
       timeout: options.timeoutMs ?? LIST_TIMEOUT_MS,
       maxBuffer: 1024 * 1024,
+      ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
     });
 
     return {

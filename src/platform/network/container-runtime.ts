@@ -39,7 +39,7 @@ export interface ContainerCommandResult {
 export type ContainerCommandRunner = (
   executable: string,
   args: readonly string[],
-  options?: { readonly timeoutMs?: number },
+  options?: { readonly timeoutMs?: number; readonly cwd?: string },
 ) => Promise<ContainerCommandResult>;
 
 export interface ContainerNetworkRuntimeAdapterOptions {
@@ -277,15 +277,16 @@ interface ContainerRuntimeResourceNames {
 }
 
 /** Executes a container CLI command and preserves stderr in thrown errors. */
-async function runContainerCommand(
+export async function runContainerCommand(
   executable: string,
   args: readonly string[],
-  options: { readonly timeoutMs?: number } = {},
+  options: { readonly timeoutMs?: number; readonly cwd?: string } = {},
 ): Promise<ContainerCommandResult> {
   try {
     const result = await execFileAsync(executable, [...args], {
       timeout: options.timeoutMs ?? COMMAND_TIMEOUT_MS,
       maxBuffer: 1024 * 1024,
+      ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
     });
 
     return {

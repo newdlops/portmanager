@@ -357,6 +357,29 @@ static int pm_sockaddr_is_local(const struct sockaddr *addr) {
   return 0;
 }
 
+static int pm_host_is_local_name(const char *host) {
+  return host == NULL ||
+         host[0] == '\0' ||
+         strcmp(host, "localhost") == 0 ||
+         strcmp(host, "127.0.0.1") == 0 ||
+         strcmp(host, "0.0.0.0") == 0 ||
+         strcmp(host, "::1") == 0 ||
+         strcmp(host, "::") == 0 ||
+         strcmp(host, "::ffff:127.0.0.1") == 0;
+}
+
+static int pm_hosts_are_same_route_target(const char *left, const char *right) {
+  if (pm_host_is_local_name(left) && pm_host_is_local_name(right)) {
+    return 1;
+  }
+
+  if (left == NULL || right == NULL) {
+    return left == right;
+  }
+
+  return strcmp(left, right) == 0;
+}
+
 static void pm_sockaddr_host(const struct sockaddr *addr, char *buffer, size_t size) {
   if (addr->sa_family == AF_INET) {
     const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
@@ -1063,7 +1086,8 @@ static int pm_route_table_lookup_file(
   int source_is_actual,
   const char *required_direction,
   char *target_host,
-  size_t target_host_size) {
+  size_t target_host_size,
+  int *is_compose_route) {
   char *buffer;
   int fd;
   struct stat stat_buffer;
@@ -1071,8 +1095,13 @@ static int pm_route_table_lookup_file(
   char needle[64];
   char *cursor;
   int fallback_port = 0;
+  int fallback_is_compose = 0;
   char fallback_host[128];
   char current_cwd[PM_MAX_TEXT];
+
+  if (is_compose_route != NULL) {
+    *is_compose_route = 0;
+  }
 
   fd = open(path, O_RDONLY);
   if (fd < 0) {
@@ -1143,12 +1172,16 @@ static int pm_route_table_lookup_file(
 
     if (source_is_actual && actual == source_port && match_level > 0) {
       if (match_level == 2) {
+        if (is_compose_route != NULL) {
+          *is_compose_route = pm_route_is_compose(object_start);
+        }
         free(buffer);
         return logical;
       }
 
       if (fallback_port == 0 && (source_is_actual || pm_route_matches_cwd(object_start, current_cwd))) {
         fallback_port = logical;
+        fallback_is_compose = pm_route_is_compose(object_start);
       }
     }
 
@@ -1157,12 +1190,16 @@ static int pm_route_table_lookup_file(
         if (target_host != NULL && target_host_size > 0 && pm_json_string(object_start, "host", target_host, target_host_size) != 0) {
           snprintf(target_host, target_host_size, "127.0.0.1");
         }
+        if (is_compose_route != NULL) {
+          *is_compose_route = pm_route_is_compose(object_start);
+        }
         free(buffer);
         return actual;
       }
 
       if (fallback_port == 0 && pm_route_matches_cwd(object_start, current_cwd)) {
         fallback_port = actual;
+        fallback_is_compose = pm_route_is_compose(object_start);
         if (pm_json_string(object_start, "host", fallback_host, sizeof(fallback_host)) != 0) {
           snprintf(fallback_host, sizeof(fallback_host), "127.0.0.1");
         }
@@ -1178,13 +1215,16 @@ static int pm_route_table_lookup_file(
     if (!source_is_actual && target_host != NULL && target_host_size > 0) {
       snprintf(target_host, target_host_size, "%s", fallback_host[0] == '\0' ? "127.0.0.1" : fallback_host);
     }
+    if (is_compose_route != NULL) {
+      *is_compose_route = fallback_is_compose;
+    }
     return fallback_port;
   }
 
   return 0;
 }
 
-static int pm_compose_claim_blocks_connect(int logical_port) {
+static int pm_compose_claim_blocks_port_by_key(int port, const char *port_key) {
   char path[PM_MAX_PATH];
   char *buffer;
   int fd;
@@ -1218,7 +1258,7 @@ static int pm_compose_claim_blocks_connect(int logical_port) {
   }
 
   buffer[read_count] = '\0';
-  snprintf(needle, sizeof(needle), "\"logicalPort\": %d", logical_port);
+  snprintf(needle, sizeof(needle), "\"%s\": %d", port_key, port);
   cursor = buffer;
 
   while ((cursor = strstr(cursor, needle)) != NULL) {
@@ -1226,6 +1266,7 @@ static int pm_compose_claim_blocks_connect(int logical_port) {
     char *object_end = strchr(cursor, '}');
     char object_end_saved;
     int logical;
+    int actual;
 
     while (object_start > buffer && *object_start != '{') {
       object_start--;
@@ -1238,9 +1279,10 @@ static int pm_compose_claim_blocks_connect(int logical_port) {
     object_end_saved = *object_end;
     *object_end = '\0';
     logical = pm_json_int(object_start, "logicalPort", 0);
+    actual = pm_json_int(object_start, "actualPort", 0);
 
     if (
-      logical == logical_port &&
+      (logical == port || actual == port) &&
       pm_route_is_compose(object_start) &&
       pm_route_direction_matches(object_start, "listen") &&
       pm_route_is_foreign_to_current_network(object_start)
@@ -1258,15 +1300,30 @@ static int pm_compose_claim_blocks_connect(int logical_port) {
   return 0;
 }
 
+static int pm_compose_claim_blocks_port(int port) {
+  /*
+   * Docker keeps the host-published port open after attach. Treat both the
+   * logical service port and the actual host port as private compose claims so
+   * another logical network cannot reach either endpoint through localhost.
+   */
+  return pm_compose_claim_blocks_port_by_key(port, "logicalPort") ||
+         pm_compose_claim_blocks_port_by_key(port, "actualPort");
+}
+
 static int pm_route_table_lookup(
   int source_port,
   int source_is_actual,
   const char *required_direction,
   char *target_host,
-  size_t target_host_size) {
+  size_t target_host_size,
+  int *is_compose_route) {
   char path[PM_MAX_PATH];
   char route_entry_path[PM_MAX_PATH];
   int route_entry_port;
+
+  if (is_compose_route != NULL) {
+    *is_compose_route = 0;
+  }
 
   pm_default_route_table_path(path, sizeof(path));
   if (!source_is_actual) {
@@ -1282,13 +1339,21 @@ static int pm_route_table_lookup(
       source_is_actual,
       required_direction,
       target_host,
-      target_host_size);
+      target_host_size,
+      is_compose_route);
     if (route_entry_port > 0) {
       return route_entry_port;
     }
   }
 
-  return pm_route_table_lookup_file(path, source_port, source_is_actual, required_direction, target_host, target_host_size);
+  return pm_route_table_lookup_file(
+    path,
+    source_port,
+    source_is_actual,
+    required_direction,
+    target_host,
+    target_host_size,
+    is_compose_route);
 }
 
 static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
@@ -1314,14 +1379,14 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
     return pm_real_bind(sockfd, addr, addrlen);
   }
 
-  if (pm_is_fixed_protocol_port(logical_port)) {
+  if (pm_is_fixed_protocol_port(logical_port) && !pm_compose_claim_blocks_port(logical_port)) {
     pm_debug("preserving fixed protocol bind port=%d", logical_port);
     return pm_real_bind(sockfd, addr, addrlen);
   }
 
   pm_sockaddr_host(addr, host, sizeof(host));
   allocation_id[0] = '\0';
-  actual_port = pm_route_table_lookup(logical_port, 0, "send", host, sizeof(host));
+  actual_port = pm_route_table_lookup(logical_port, 0, "send", host, sizeof(host), NULL);
 
   result = -1;
   for (int attempt = 0; attempt < PM_BIND_ALLOCATION_ATTEMPTS; attempt++) {
@@ -1393,6 +1458,7 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
 static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   struct sockaddr_storage rewritten;
   char target_host[128];
+  int route_is_compose;
   int logical_port;
   int actual_port;
 
@@ -1408,12 +1474,13 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
 
   logical_port = pm_sockaddr_port(addr);
   target_host[0] = '\0';
+  route_is_compose = 0;
   actual_port = pm_memory_actual_for_logical(logical_port, target_host, sizeof(target_host));
   if (actual_port == 0) {
-    actual_port = pm_route_table_lookup(logical_port, 0, "listen", target_host, sizeof(target_host));
+    actual_port = pm_route_table_lookup(logical_port, 0, "listen", target_host, sizeof(target_host), &route_is_compose);
   }
 
-  if (actual_port == 0 && pm_compose_claim_blocks_connect(logical_port)) {
+  if (actual_port == 0 && pm_compose_claim_blocks_port(logical_port)) {
     pm_debug("connect blocked by foreign compose claim logical=%d", logical_port);
     errno = ECONNREFUSED;
     return -1;
@@ -1453,7 +1520,32 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
     }
   }
 
-  if (actual_port <= 0 || actual_port == logical_port) {
+  if (actual_port <= 0) {
+    return pm_real_connect(sockfd, addr, addrlen);
+  }
+
+  if (actual_port == logical_port) {
+    char original_host[128];
+
+    pm_sockaddr_host(addr, original_host, sizeof(original_host));
+    if (target_host[0] != '\0' && !pm_hosts_are_same_route_target(original_host, target_host)) {
+      memcpy(&rewritten, addr, addrlen);
+      pm_set_sockaddr_host((struct sockaddr *)&rewritten, target_host);
+      pm_debug("connect route-host logical=%d actual=%d host=%s", logical_port, actual_port, target_host);
+      return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
+    }
+
+    if (route_is_compose) {
+      /*
+       * A compose route that still points at the same localhost port is not an
+       * isolated endpoint. Letting it pass through would silently reach Docker's
+       * host-published port, possibly from the wrong logical network.
+       */
+      pm_debug("connect refusing same-port compose route logical=%d", logical_port);
+      errno = ECONNREFUSED;
+      return -1;
+    }
+
     return pm_real_connect(sockfd, addr, addrlen);
   }
 
@@ -1487,7 +1579,7 @@ static int pm_getsockname_hook(int sockfd, struct sockaddr *addr, socklen_t *add
   actual_port = pm_sockaddr_port(addr);
   logical_port = pm_memory_logical_for_actual(actual_port);
   if (logical_port == 0) {
-    logical_port = pm_route_table_lookup(actual_port, 1, "listen", NULL, 0);
+    logical_port = pm_route_table_lookup(actual_port, 1, "listen", NULL, 0, NULL);
   }
 
   if (logical_port > 0 && logical_port != actual_port) {

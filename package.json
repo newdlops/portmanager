@@ -331,24 +331,14 @@
           "group": "navigation@4"
         },
         {
-          "command": "portManager.refreshContainerServices",
+          "command": "portManager.refresh",
           "when": "view == portManager.processes",
           "group": "navigation@5"
         },
         {
-          "command": "portManager.refreshTerminals",
-          "when": "view == portManager.processes",
-          "group": "navigation@6"
-        },
-        {
-          "command": "portManager.refresh",
-          "when": "view == portManager.processes",
-          "group": "navigation@7"
-        },
-        {
           "command": "portManager.openSettings",
           "when": "view == portManager.processes",
-          "group": "navigation@8"
+          "group": "navigation@6"
         }
       ],
       "commandPalette": [
@@ -463,6 +453,11 @@
         {
           "command": "portManager.attachContainerToNetwork",
           "when": "view == portManager.processes && viewItem == containerServiceCandidate",
+          "group": "container@3"
+        },
+        {
+          "command": "portManager.attachContainerToNetwork",
+          "when": "view == portManager.processes && viewItem == composeProjectCandidate",
           "group": "container@3"
         },
         {

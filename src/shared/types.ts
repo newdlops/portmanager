@@ -40,6 +40,8 @@ export type ComposeAttachmentStatus = "attached" | "detached" | "error";
 
 export type ContainerRuntimePreference = "auto" | "docker" | "podman";
 
+export type ComposePortMutationMode = "clone" | "in-place";
+
 /**
  * A user-facing network scope where duplicated app-internal ports remain
  * meaningful. Runtime adapters decide whether this is backed by a container,
@@ -232,6 +234,51 @@ export interface ComposePublishedPort {
 }
 
 /**
+ * Runtime mutation performed when a compose project is attached through the
+ * UI. The original project is stopped after a hidden, network-scoped clone is
+ * started, so the original host-published ports become available again.
+ */
+export interface ComposePortMutationState {
+  /** Whether attach used a hidden clone or recreated the original project. */
+  readonly mode: ComposePortMutationMode;
+  /** Runtime CLI that owns both the original and hidden compose projects. */
+  readonly runtime: "docker" | "podman";
+  /** Compose project name discovered from the user's original running stack. */
+  readonly originalProjectName: string;
+  /** Network-scoped compose project name used for the hidden attached clone. */
+  readonly attachedProjectName: string;
+  /** Directory where compose commands should run when files are relative. */
+  readonly workingDirectory?: string;
+  /** Compose files used to recreate and later restore the project. */
+  readonly composeFiles: readonly string[];
+  /** Services intentionally moved into the hidden attached clone. */
+  readonly services: readonly string[];
+  /** Generated override file that replaces published ports with hidden ports. */
+  readonly overrideFile: string;
+  /** Host-published endpoints before attach stopped the original project. */
+  readonly originalPorts: readonly ComposePublishedPort[];
+  /** Hidden Docker-published endpoints routed inside the logical network. */
+  readonly hiddenPorts: readonly ComposePublishedPort[];
+  /** Container id/name rewrites from the original compose service to its clone. */
+  readonly containerMappings?: readonly ComposeContainerMutationMapping[];
+  /** Docker volume copies created for clone mode; preserved on detach. */
+  readonly clonedVolumeNames?: readonly string[];
+}
+
+export interface ComposeContainerMutationMapping {
+  /** Compose service that owns both containers. */
+  readonly serviceName: string;
+  /** Full original container id before clone attach stopped it. */
+  readonly originalContainerId: string;
+  /** Original container name shown by Docker/Podman. */
+  readonly originalContainerName: string;
+  /** Full attached clone container id. */
+  readonly attachedContainerId: string;
+  /** Attached clone container name shown by Docker/Podman. */
+  readonly attachedContainerName: string;
+}
+
+/**
  * A compose project attached to a logical network through host-published
  * service ports. These routes shadow same-number host ports while active and
  * disappear when the compose attachment is removed.
@@ -247,6 +294,8 @@ export interface ComposeAttachment {
   readonly composeFiles: readonly string[];
   /** Published service ports owned by this attachment. */
   readonly ports: readonly ComposePublishedPort[];
+  /** Compose runtime mutation state used to restore the original project. */
+  readonly mutation?: ComposePortMutationState;
   /** Current attachment lifecycle state. */
   readonly status: ComposeAttachmentStatus;
   /** ISO timestamp when this compose attachment was registered. */
@@ -277,6 +326,10 @@ export interface ContainerServiceCandidate {
   readonly composeProject?: string;
   /** Compose service label when the container was started by compose. */
   readonly composeService?: string;
+  /** Compose project working directory label, when the runtime exposes it. */
+  readonly composeWorkingDirectory?: string;
+  /** Compose file labels needed to recreate the project during attach. */
+  readonly composeConfigFiles?: readonly string[];
   /** Host-published TCP service ports that can become logical routes. */
   readonly ports: readonly ComposePublishedPort[];
 }

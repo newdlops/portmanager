@@ -16,7 +16,9 @@ import { findRoutesMatchingClientCwd } from "../core/networks/logical-route-sele
 import {
   ContainerNetworkRuntimeAdapter,
   type ContainerRuntimeTarget,
+  runContainerCommand,
 } from "../platform/network/container-runtime";
+import { ComposePublishMutator } from "../platform/network/compose-publish-mutator";
 import { ContainerServiceDiscoveryAdapter } from "../platform/network/container-service-discovery";
 import { HostPortProxyManager, type HostPortProxyTarget } from "../platform/ports/host-port-proxy";
 import {
@@ -35,6 +37,8 @@ import { NodeTerminalCandidateProvider } from "../platform/process/node-terminal
 import type {
   AgentDaemonStatus,
   ComposeAttachment,
+  ComposePortMutationMode,
+  ComposePortMutationState,
   ComposePublishedPort,
   ContainerServiceCandidate,
   DisposableLike,
@@ -61,10 +65,16 @@ import {
   RUNTIME_SHIM_DIRECTORY_ENV,
   shouldInjectTerminalHook,
 } from "./terminal-hook-environment";
+import {
+  buildComposeProjectRoutingShell,
+  serializeComposeProjectRoutingRows,
+  type ComposeProjectRoutingRow,
+} from "./compose-project-routing";
 import type { PortManagerProcessService } from "./process-service";
 
 const NETWORK_STATE_KEY = "portManager.logicalNetworkState.v1";
 const BINDING_PRESETS_KEY = "portManager.bindingPresets.v1";
+const COMPOSE_PROJECT_ROUTING_FILE_NAME = "compose-project-routing.tsv";
 const execFileAsync = promisify(execFile);
 
 export interface BindingPresetSummary {
@@ -145,6 +155,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Docker/Podman published-port discovery used for UI attach candidates. */
   private readonly containerServiceDiscovery: ContainerServiceDiscoveryAdapter;
 
+  /** Mutates Compose publish rules so attached services release host ports. */
+  private readonly composePublishMutator: ComposePublishMutator;
+
   /** VS Code event subscriptions owned by this service. */
   private readonly disposables: DisposableLike[] = [];
 
@@ -155,6 +168,10 @@ export class PortManagerNetworkService implements DisposableLike {
     this.terminalCandidateProvider = new NodeTerminalCandidateProvider();
     this.containerRuntime = new ContainerNetworkRuntimeAdapter();
     this.containerServiceDiscovery = new ContainerServiceDiscoveryAdapter();
+    this.composePublishMutator = new ComposePublishMutator({
+      storageDirectory: path.join(this.context.globalStorageUri.fsPath, "compose-overrides"),
+      runCommand: runContainerCommand,
+    });
     this.proxyManager = new HostPortProxyManager({
       resolve: (exposure) => this.resolveHostExposureTarget(exposure),
     });
@@ -169,6 +186,7 @@ export class PortManagerNetworkService implements DisposableLike {
       this.registry.onDidChange(() => {
         this.saveState();
         void this.writeHostAccessBindingsFile();
+        void this.writeComposeProjectRoutingFile();
         void this.syncLogicalPortRouters();
       }),
     );
@@ -204,6 +222,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.refreshRuntimeDescriptors();
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
+    await this.writeComposeProjectRoutingFile();
     await this.refreshTerminals();
     void this.refreshContainerServices();
     await this.syncLogicalPortRouters();
@@ -551,7 +570,7 @@ export class PortManagerNetworkService implements DisposableLike {
    * the same host port; removing the attachment restores host fallback.
    */
   async attachComposePublishedPorts(input: ComposePublishedPortsInput): Promise<ComposeAttachment> {
-    requireNetwork(this.registry.getNetwork(input.networkId), input.networkId);
+    const network = requireNetwork(this.registry.getNetwork(input.networkId), input.networkId);
     if (this.processService === undefined) {
       throw new Error("Compose published ports require the Port Manager daemon.");
     }
@@ -569,16 +588,43 @@ export class PortManagerNetworkService implements DisposableLike {
       attachedAt: new Date().toISOString(),
     };
     const registeredProcessIds: string[] = [];
-
-    this.registry.addComposeAttachment(attachment);
+    let registeredAttachment = attachment;
+    let mutation: ComposePortMutationState | undefined;
 
     try {
+      if (input.composeMutation !== undefined) {
+        const mutationResult = await this.composePublishMutator.hidePublishedPorts({
+          mode: input.composeMutation.mode,
+          allowStatefulClone: input.composeMutation.allowStatefulClone,
+          runtime: input.composeMutation.runtime,
+          networkName: network.name,
+          originalProjectName: attachment.projectName,
+          workingDirectory: input.composeMutation.workingDirectory ?? input.cwd,
+          composeFiles: input.composeMutation.composeFiles ?? input.composeFiles ?? [],
+          ports: attachment.ports,
+        });
+
+        mutation = mutationResult.state;
+        registeredAttachment = {
+          ...attachment,
+          composeFiles: mutation.composeFiles,
+          ports: mutationResult.ports,
+          mutation,
+        };
+      }
+
+      ensureComposePublishedPortsAreIsolated(registeredAttachment.ports);
+      registeredAttachment = this.registry.addComposeAttachment(registeredAttachment);
       await this.processService.start();
 
       const ports: ComposePublishedPort[] = [];
-      for (const port of attachment.ports) {
+      for (const port of registeredAttachment.ports) {
         const process = await this.processService.registerExistingProcess(
-          buildComposeRegisteredProcessInput(attachment, port, input.cwd),
+          buildComposeRegisteredProcessInput(
+            registeredAttachment,
+            port,
+            input.cwd ?? mutation?.workingDirectory,
+          ),
         );
 
         registeredProcessIds.push(process.id);
@@ -589,12 +635,15 @@ export class PortManagerNetworkService implements DisposableLike {
       }
 
       return this.registry.updateComposeAttachment({
-        ...attachment,
+        ...registeredAttachment,
         ports,
       });
     } catch (error) {
       for (const processId of registeredProcessIds) {
         await this.processService.removeProcess(processId).catch(() => undefined);
+      }
+      if (mutation !== undefined) {
+        await this.composePublishMutator.restorePublishedPorts(mutation).catch(() => undefined);
       }
       this.registry.removeComposeAttachment(attachment.id);
       throw error;
@@ -609,6 +658,19 @@ export class PortManagerNetworkService implements DisposableLike {
 
     if (attachment === undefined) {
       return undefined;
+    }
+
+    if (attachment.mutation !== undefined) {
+      try {
+        await this.composePublishMutator.restorePublishedPorts(attachment.mutation);
+      } catch (error) {
+        this.registry.updateComposeAttachment({
+          ...attachment,
+          status: "error",
+          errorMessage: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
     }
 
     for (const port of attachment.ports) {
@@ -1157,6 +1219,24 @@ export class PortManagerNetworkService implements DisposableLike {
     );
   }
 
+  /**
+   * Writes clone compose project mappings consumed by attached terminal shell
+   * wrappers. This is separate from port routes because `docker compose` chooses
+   * the project before any application socket can be intercepted.
+   */
+  private async writeComposeProjectRoutingFile(): Promise<void> {
+    const rows = buildComposeProjectRoutingRows(this.registry.getSnapshot().composeAttachments);
+    const filePath = this.getComposeProjectRoutingFilePath();
+
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, serializeComposeProjectRoutingRows(rows), "utf8");
+  }
+
+  /** Stable path read by shell wrappers installed into network-attached terminals. */
+  private getComposeProjectRoutingFilePath(): string {
+    return path.join(this.context.globalStorageUri.fsPath, COMPOSE_PROJECT_ROUTING_FILE_NAME);
+  }
+
   /** Builds the shell commands that make later child processes join one logical network scope. */
   private buildTerminalRoutingScript(networkId: string, settings: PortManagerSettings): string {
     const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
@@ -1181,6 +1261,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_ROUTES_FILE", getRouteTablePathForNetwork(networkId)),
       shellExport("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath()),
       shellExport("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath()),
+      buildComposeProjectRoutingShell(this.getComposeProjectRoutingFilePath()),
       shellExport("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange)),
       shellExport("PORT_MANAGER_ROUTING_MODE", settings.routingMode),
       shellExport("PORT_MANAGER_VIRTUAL_PORT_START", String(settings.virtualPortRangeStart)),
@@ -1232,6 +1313,7 @@ export class PortManagerNetworkService implements DisposableLike {
       "PORT_MANAGER_AGENT_MAIN",
       "PORT_MANAGER_HOOK_DAEMON_STARTED",
       "PORT_MANAGER_ROUTES_FILE",
+      "PORT_MANAGER_COMPOSE_ROUTING_FILE",
       "PORT_MANAGER_HOST_ACCESS_FILE",
       "PORT_MANAGER_SCAN_RANGE",
       "PORT_MANAGER_ROUTING_MODE",
@@ -1258,6 +1340,9 @@ export class PortManagerNetworkService implements DisposableLike {
       commands.push(`export PATH="\${PATH#${shellPatternLiteral(`${runtimeShimDirectory}:`)}}"`);
     }
 
+    commands.push(
+      "unset -f docker podman __port_manager_compose_args_have_project __port_manager_runtime_first_command __port_manager_runtime_container_subcommand __port_manager_compose_project_for_runtime __port_manager_cwd_matches_workdir __port_manager_container_target_for_runtime __port_manager_shell_quote __port_manager_runtime_command_may_reference_container __port_manager_run_runtime_with_container_routing 2>/dev/null || true",
+    );
     commands.push(`printf '%s\\n' ${shellQuote("Port Manager routing detached from this shell.")}`);
 
     return commands.join("; ");
@@ -1304,8 +1389,23 @@ export interface ComposePublishedPortsInput {
   readonly cwd?: string;
   /** Compose files that describe the project, when known. */
   readonly composeFiles?: readonly string[];
+  /** Optional mutating flow that releases the original Docker-published ports. */
+  readonly composeMutation?: ComposePublishMutationInput;
   /** Published service endpoints to register into this logical network. */
   readonly ports: readonly ComposePublishedPortInput[];
+}
+
+export interface ComposePublishMutationInput {
+  /** Clone changes project name; in-place recreates the original compose project. */
+  readonly mode?: ComposePortMutationMode;
+  /** Explicit confirmation for clone attach of stateful services with persistent mounts. */
+  readonly allowStatefulClone?: boolean;
+  /** Runtime CLI that owns the discovered compose services. */
+  readonly runtime: "docker" | "podman";
+  /** Directory where compose commands should resolve relative files. */
+  readonly workingDirectory?: string;
+  /** Compose config files discovered from runtime labels. */
+  readonly composeFiles?: readonly string[];
 }
 
 export interface ComposePublishedPortInput {
@@ -1376,6 +1476,74 @@ function normalizeComposePublishedPort(input: ComposePublishedPortInput): Compos
       ? { protocolName: input.protocolName.trim() }
       : {}),
   };
+}
+
+function buildComposeProjectRoutingRows(
+  attachments: readonly ComposeAttachment[],
+): readonly ComposeProjectRoutingRow[] {
+  return attachments.flatMap((attachment) => {
+    const mutation = attachment.mutation;
+    if (
+      attachment.status !== "attached" ||
+      mutation === undefined ||
+      mutation.mode !== "clone" ||
+      mutation.attachedProjectName === mutation.originalProjectName
+    ) {
+      return [];
+    }
+
+    const workingDirectory = mutation.workingDirectory ?? composeWorkingDirectoryFromFiles(mutation.composeFiles);
+    if (workingDirectory === undefined) {
+      return [];
+    }
+
+    return [
+      {
+        networkId: attachment.networkId,
+        runtime: mutation.runtime,
+        workingDirectory,
+        attachedProjectName: mutation.attachedProjectName,
+        containerMappings: mutation.containerMappings,
+      },
+    ];
+  });
+}
+
+function composeWorkingDirectoryFromFiles(composeFiles: readonly string[]): string | undefined {
+  const firstFile = composeFiles.find((file) => file.trim().length > 0);
+  return firstFile === undefined ? undefined : path.dirname(firstFile);
+}
+
+function ensureComposePublishedPortsAreIsolated(ports: readonly ComposePublishedPort[]): void {
+  const directHostPorts = ports.filter(
+    (port) => port.actualHostPort === port.logicalPort && isLocalHostAddress(port.actualHostAddress),
+  );
+
+  if (directHostPorts.length === 0) {
+    return;
+  }
+
+  throw new Error(
+    `Compose/container attach requires a hidden host port that differs from the logical port. Recreate the service with hidden ports or choose Compose clone/as-is attach. Direct host port${directHostPorts.length === 1 ? "" : "s"}: ${directHostPorts.map(formatDirectHostPort).join(", ")}.`,
+  );
+}
+
+function isLocalHostAddress(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return (
+    normalized.length === 0 ||
+    normalized === "localhost" ||
+    normalized === "127.0.0.1" ||
+    normalized === "0.0.0.0" ||
+    normalized === "::1" ||
+    normalized === "::" ||
+    normalized === "[::]" ||
+    normalized === "::ffff:127.0.0.1"
+  );
+}
+
+function formatDirectHostPort(port: ComposePublishedPort): string {
+  return `${port.serviceName}:${port.logicalPort}->${port.actualHostAddress}:${port.actualHostPort}`;
 }
 
 /** Builds the daemon process row that owns one compose published-port route. */

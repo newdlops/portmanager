@@ -55,6 +55,7 @@ type PortManagerTreeItem =
   | LogicalNetworkTreeItem
   | TerminalWindowTreeItem
   | TerminalCandidateTreeItem
+  | ComposeProjectCandidateTreeItem
   | ContainerServiceCandidateTreeItem
   | ContainerPublishedPortTreeItem
   | TerminalAttachmentTreeItem
@@ -171,7 +172,7 @@ export class PortManagerTreeProvider
         new TreeSectionItem(
           "containers",
           "Compose / Containers",
-          `${snapshot.containerServiceCandidates.length} services`,
+          formatContainerSectionDescription(snapshot.containerServiceCandidates),
           "server-environment",
         ),
         new TreeSectionItem("exposures", "Host Port Exposures", `${snapshot.exposures.length} bindings`, "ports-view-icon"),
@@ -242,6 +243,10 @@ export class PortManagerTreeProvider
         .map((candidate) => new TerminalCandidateTreeItem(candidate));
     }
 
+    if (element instanceof ComposeProjectCandidateTreeItem) {
+      return element.candidates.map((candidate) => new ContainerServiceCandidateTreeItem(candidate));
+    }
+
     if (element instanceof ContainerServiceCandidateTreeItem) {
       return element.candidate.ports.map((port) => new ContainerPublishedPortTreeItem(element.candidate, port));
     }
@@ -281,7 +286,7 @@ export class PortManagerTreeProvider
           new ActionTreeItem("Refresh Services", "portManager.refreshContainerServices", "refresh"),
           new ActionTreeItem("Attach Service to Network", "portManager.attachContainerToNetwork", "plug"),
           ...(snapshot.containerServiceCandidates.length > 0
-            ? snapshot.containerServiceCandidates.map((candidate) => new ContainerServiceCandidateTreeItem(candidate))
+            ? buildContainerServiceTreeItems(snapshot.containerServiceCandidates)
             : [new EmptyTreeItem("No published container ports", "Start compose services and refresh")]),
         ];
       case "exposures":
@@ -442,12 +447,56 @@ export class TerminalCandidateTreeItem extends vscode.TreeItem {
   }
 }
 
+/** Compose project row that owns one or more service/container candidates. */
+export class ComposeProjectCandidateTreeItem extends vscode.TreeItem {
+  readonly contextValue = "composeProjectCandidate";
+  readonly aggregateCandidate: ContainerServiceCandidate;
+
+  constructor(
+    readonly projectName: string,
+    readonly runtime: ContainerServiceCandidate["runtime"],
+    readonly candidates: readonly ContainerServiceCandidate[],
+  ) {
+    const ports = candidates.flatMap((candidate) => [...candidate.ports]);
+
+    super(projectName, vscode.TreeItemCollapsibleState.Collapsed);
+    this.aggregateCandidate = {
+      id: buildComposeProjectCandidateId(
+        runtime,
+        projectName,
+        candidates[0]?.composeWorkingDirectory,
+        uniqueStrings(candidates.flatMap((candidate) => [...(candidate.composeConfigFiles ?? [])])),
+      ),
+      runtime,
+      containerId: projectName,
+      containerName: projectName,
+      composeProject: projectName,
+      ...(candidates[0]?.composeWorkingDirectory !== undefined
+        ? { composeWorkingDirectory: candidates[0].composeWorkingDirectory }
+        : {}),
+      ...(candidates.flatMap((candidate) => [...(candidate.composeConfigFiles ?? [])]).length > 0
+        ? { composeConfigFiles: uniqueStrings(candidates.flatMap((candidate) => [...(candidate.composeConfigFiles ?? [])])) }
+        : {}),
+      ports,
+    };
+    this.id = this.aggregateCandidate.id;
+    this.description = `${candidates.length} services, ${ports.length} port${ports.length === 1 ? "" : "s"}`;
+    this.tooltip = buildComposeProjectCandidateTooltip(projectName, runtime, candidates);
+    this.iconPath = new vscode.ThemeIcon("server-environment");
+    this.command = {
+      command: "portManager.attachContainerToNetwork",
+      title: "Attach Compose Project to Network",
+      arguments: [{ containerService: this.aggregateCandidate }],
+    };
+  }
+}
+
 /** Docker/Podman container or compose service with host-published ports. */
 export class ContainerServiceCandidateTreeItem extends vscode.TreeItem {
   readonly contextValue = "containerServiceCandidate";
 
   constructor(readonly candidate: ContainerServiceCandidate) {
-    super(formatContainerServiceLabel(candidate), vscode.TreeItemCollapsibleState.Collapsed);
+    super(formatContainerServiceTreeLabel(candidate), vscode.TreeItemCollapsibleState.Collapsed);
     this.id = candidate.id;
     this.description = `${candidate.runtime}, ${candidate.ports.length} port${candidate.ports.length === 1 ? "" : "s"}`;
     this.tooltip = buildContainerServiceTooltip(candidate);
@@ -709,6 +758,10 @@ export function getTerminalWindowFromCommandArgument(argument: unknown): Termina
 export function getContainerServiceCandidateFromCommandArgument(
   argument: unknown,
 ): ContainerServiceCandidate | undefined {
+  if (argument instanceof ComposeProjectCandidateTreeItem) {
+    return argument.aggregateCandidate;
+  }
+
   if (argument instanceof ContainerServiceCandidateTreeItem) {
     return argument.candidate;
   }
@@ -862,6 +915,10 @@ function buildComposeAttachmentTooltip(attachment: ComposeAttachment): vscode.Ma
   tooltip.appendMarkdown(`- Network ID: \`${escapeMarkdown(attachment.networkId)}\`\n`);
   tooltip.appendMarkdown(`- Status: \`${attachment.status}\`\n`);
   tooltip.appendMarkdown(`- Attached: \`${attachment.attachedAt}\`\n`);
+  if (attachment.mutation !== undefined) {
+    tooltip.appendMarkdown(`- Original Project: \`${escapeMarkdown(attachment.mutation.originalProjectName)}\`\n`);
+    tooltip.appendMarkdown(`- Hidden Project: \`${escapeMarkdown(attachment.mutation.attachedProjectName)}\`\n`);
+  }
 
   for (const port of attachment.ports) {
     tooltip.appendMarkdown(
@@ -943,11 +1000,35 @@ function buildContainerServiceTooltip(candidate: ContainerServiceCandidate): vsc
   if (candidate.composeProject || candidate.composeService) {
     tooltip.appendMarkdown(`- Compose Project: \`${escapeMarkdown(candidate.composeProject ?? "n/a")}\`\n`);
     tooltip.appendMarkdown(`- Compose Service: \`${escapeMarkdown(candidate.composeService ?? "n/a")}\`\n`);
+    tooltip.appendMarkdown(`- Compose CWD: \`${escapeMarkdown(candidate.composeWorkingDirectory ?? "n/a")}\`\n`);
+    tooltip.appendMarkdown(`- Compose Files: \`${escapeMarkdown(candidate.composeConfigFiles?.join(", ") ?? "n/a")}\`\n`);
   }
 
   for (const port of candidate.ports) {
     tooltip.appendMarkdown(
       `- ${escapeMarkdown(port.serviceName)}: \`${port.logicalPort} -> ${escapeMarkdown(port.actualHostAddress)}:${port.actualHostPort}\` container \`${port.containerPort}\`\n`,
+    );
+  }
+
+  return tooltip;
+}
+
+/** Builds tooltip details for one compose project group. */
+function buildComposeProjectCandidateTooltip(
+  projectName: string,
+  runtime: ContainerServiceCandidate["runtime"],
+  candidates: readonly ContainerServiceCandidate[],
+): vscode.MarkdownString {
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.isTrusted = false;
+  tooltip.appendMarkdown(`**${escapeMarkdown(projectName)}**\n\n`);
+  tooltip.appendMarkdown(`- Runtime: \`${runtime}\`\n`);
+  tooltip.appendMarkdown(`- Services: \`${candidates.length}\`\n`);
+  tooltip.appendMarkdown(`- Published Ports: \`${candidates.reduce((total, candidate) => total + candidate.ports.length, 0)}\`\n`);
+
+  for (const candidate of candidates) {
+    tooltip.appendMarkdown(
+      `- ${escapeMarkdown(candidate.composeService ?? candidate.containerName)}: \`${candidate.ports.map(formatComposePort).join(", ")}\`\n`,
     );
   }
 
@@ -1019,11 +1100,81 @@ function formatComposePort(port: ComposeAttachment["ports"][number]): string {
 
 /** Labels compose services as project/service and raw containers by name. */
 function formatContainerServiceLabel(candidate: ContainerServiceCandidate): string {
-  if (candidate.composeProject !== undefined || candidate.composeService !== undefined) {
-    return `${candidate.composeProject ?? "compose"}/${candidate.composeService ?? candidate.containerName}`;
+  if (candidate.composeProject !== undefined && candidate.composeService !== undefined) {
+    return `${candidate.composeProject}/${candidate.composeService}`;
+  }
+
+  if (candidate.composeProject !== undefined) {
+    return candidate.composeProject;
   }
 
   return candidate.containerName;
+}
+
+function formatContainerServiceTreeLabel(candidate: ContainerServiceCandidate): string {
+  return candidate.composeService ?? formatContainerServiceLabel(candidate);
+}
+
+/** Groups compose service containers under their compose project while keeping raw containers flat. */
+function buildContainerServiceTreeItems(
+  candidates: readonly ContainerServiceCandidate[],
+): Array<ComposeProjectCandidateTreeItem | ContainerServiceCandidateTreeItem> {
+  const composeGroups = new Map<string, ContainerServiceCandidate[]>();
+  const rawCandidates: ContainerServiceCandidate[] = [];
+
+  for (const candidate of candidates) {
+    if (candidate.composeProject === undefined) {
+      rawCandidates.push(candidate);
+      continue;
+    }
+
+    const key = buildComposeProjectCandidateId(
+      candidate.runtime,
+      candidate.composeProject,
+      candidate.composeWorkingDirectory,
+      candidate.composeConfigFiles ?? [],
+    );
+    composeGroups.set(key, [...(composeGroups.get(key) ?? []), candidate]);
+  }
+
+  return [
+    ...[...composeGroups.values()].map((group) => {
+      const first = group[0]!;
+      return new ComposeProjectCandidateTreeItem(first.composeProject!, first.runtime, group);
+    }),
+    ...rawCandidates.map((candidate) => new ContainerServiceCandidateTreeItem(candidate)),
+  ];
+}
+
+function buildComposeProjectCandidateId(
+  runtime: ContainerServiceCandidate["runtime"],
+  projectName: string,
+  workingDirectory?: string,
+  composeConfigFiles: readonly string[] = [],
+): string {
+  return `compose-project:${runtime}:${projectName}:${workingDirectory ?? ""}:${composeConfigFiles.join("|")}`;
+}
+
+function formatContainerSectionDescription(candidates: readonly ContainerServiceCandidate[]): string {
+  const composeProjectCount = new Set(
+    candidates
+      .filter((candidate) => candidate.composeProject !== undefined)
+      .map((candidate) =>
+        buildComposeProjectCandidateId(
+          candidate.runtime,
+          candidate.composeProject!,
+          candidate.composeWorkingDirectory,
+          candidate.composeConfigFiles ?? [],
+        ),
+      ),
+  ).size;
+  const rawContainerCount = candidates.filter((candidate) => candidate.composeProject === undefined).length;
+  const details = [
+    composeProjectCount > 0 ? `${composeProjectCount} compose` : undefined,
+    rawContainerCount > 0 ? `${rawContainerCount} containers` : undefined,
+  ].filter((item): item is string => item !== undefined);
+
+  return details.length === 0 ? "0 services" : details.join(", ");
 }
 
 /** Builds tooltip details for one runtime adapter. */
@@ -1194,6 +1345,10 @@ function colorForStatus(status: ProcessStatus): vscode.ThemeColor | undefined {
     case "starting":
       return new vscode.ThemeColor("charts.yellow");
   }
+}
+
+function uniqueStrings(values: readonly string[]): readonly string[] {
+  return [...new Set(values.filter((value) => value.length > 0))];
 }
 
 /** Escapes markdown metacharacters used in process names and command strings. */
