@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { NativeProcessLookupProvider } from "./native-process-lookup";
 
 const execFileAsync = promisify(execFile);
 const PROCESS_TABLE_SNAPSHOT_TTL_MS = 250;
@@ -31,6 +32,10 @@ type CommandRunner = (file: string, args: readonly string[]) => Promise<CommandR
 interface NodeProcessTableProviderOptions {
   /** Injectable command boundary so unit tests can use fixed process tables. */
   readonly commandRunner?: CommandRunner;
+  /** Optional native helper used before the shell-command fallback. */
+  readonly nativeLookupProvider?: NativeProcessLookupProvider;
+  /** Packaged native helper path passed by the VS Code extension context. */
+  readonly nativeLookupPath?: string;
 }
 
 interface ProcessTableSnapshot {
@@ -46,6 +51,8 @@ interface ProcessTableSnapshot {
  */
 export class NodeProcessTableProvider {
   private readonly runCommand: CommandRunner;
+  /** Optional C helper for low-latency process table snapshots. */
+  private readonly nativeLookupProvider?: NativeProcessLookupProvider;
   /** Point-in-time process table shared by router connections in the same burst. */
   private snapshot?: ProcessTableSnapshot;
 
@@ -54,6 +61,11 @@ export class NodeProcessTableProvider {
 
   constructor(options: NodeProcessTableProviderOptions = {}) {
     this.runCommand = options.commandRunner ?? runExecFile;
+    this.nativeLookupProvider =
+      options.nativeLookupProvider ??
+      (options.commandRunner === undefined || options.nativeLookupPath !== undefined
+        ? new NativeProcessLookupProvider({ helperPath: options.nativeLookupPath })
+        : undefined);
   }
 
   /** Returns one process-table snapshot for terminal ancestry checks. */
@@ -73,9 +85,8 @@ export class NodeProcessTableProvider {
     }
 
     let request: Promise<readonly ProcessTableRow[]>;
-    request = this.runCommand("ps", ["-Ao", "pid=,ppid=,pgid=,tty="])
-      .then(({ stdout }) => {
-        const rows = parsePosixProcessTable(toText(stdout));
+    request = this.readRows()
+      .then((rows) => {
         this.snapshot = {
           rows,
           expiresAtMs: Date.now() + PROCESS_TABLE_SNAPSHOT_TTL_MS,
@@ -90,6 +101,19 @@ export class NodeProcessTableProvider {
 
     this.request = request;
     return request;
+  }
+
+  /** Reads native rows first, preserving the previous ps implementation as fallback. */
+  private async readRows(): Promise<readonly ProcessTableRow[]> {
+    if (this.nativeLookupProvider !== undefined) {
+      const nativeRows = await this.nativeLookupProvider.listProcessTableRows();
+      if (nativeRows !== undefined) {
+        return nativeRows;
+      }
+    }
+
+    const { stdout } = await this.runCommand("ps", ["-Ao", "pid=,ppid=,pgid=,tty="]);
+    return parsePosixProcessTable(toText(stdout));
   }
 }
 

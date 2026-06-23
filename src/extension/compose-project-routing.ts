@@ -62,8 +62,12 @@ export function serializeComposeProjectRoutingRows(rows: readonly ComposeProject
 }
 
 /** Exports the dynamic map path and installs runtime wrappers in the current shell. */
-export function buildComposeProjectRoutingShell(filePath: string): string {
+export function buildComposeProjectRoutingShell(filePath: string, nativeContainerMapPath?: string): string {
+  const nativeHelperExport =
+    nativeContainerMapPath === undefined ? "" : `${shellExport("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath)}\n`;
+
   return `${shellExport("PORT_MANAGER_COMPOSE_ROUTING_FILE", filePath)}
+${nativeHelperExport}
 ${buildComposeProjectRoutingFunctionScript()}`;
 }
 
@@ -258,6 +262,15 @@ __port_manager_container_target_for_runtime() {
 
   if [ -z "\${__pm_file}" ] || [ -z "\${__pm_network}" ] || [ -z "\${__pm_token}" ] || [ ! -r "\${__pm_file}" ]; then
     return 1
+  fi
+
+  __pm_helper="\${PORT_MANAGER_CONTAINER_MAP_HELPER:-}"
+  if [ -n "\${__pm_helper}" ] && [ -x "\${__pm_helper}" ]; then
+    __pm_mapped="$("\${__pm_helper}" "\${__pm_file}" "\${__pm_network}" "\${__pm_runtime}" "\${__pm_token}" 2>/dev/null || true)"
+    if [ -n "\${__pm_mapped}" ]; then
+      printf '%s\\n' "\${__pm_mapped}"
+      return 0
+    fi
   fi
 
   __pm_token_suffix=""

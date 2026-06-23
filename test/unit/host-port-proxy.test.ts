@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
 import * as net from "node:net";
+import * as path from "node:path";
 import test from "node:test";
 
-import { HostPortProxyManager } from "../../src/platform/ports/host-port-proxy";
+import { HostPortProxyManager, parseNativeHostProxyQueryLine } from "../../src/platform/ports/host-port-proxy";
 import type { HostPortExposure } from "../../src/shared/types";
 
 test("forwards TCP bytes from a host exposure to the target listener", async () => {
@@ -70,6 +72,59 @@ test("resolves host exposure targets when each inbound connection starts", async
   await proxy.dispose();
   await closeServer(target);
 });
+
+test("parses native host exposure connection query lines", () => {
+  assert.deepEqual(parseNativeHostProxyQueryLine("CONNECT\t7\t127.0.0.1\t3000\t127.0.0.1\t49152"), {
+    id: "7",
+    localAddress: "127.0.0.1",
+    localPort: 3000,
+    remoteAddress: "127.0.0.1",
+    remotePort: 49152,
+  });
+  assert.equal(parseNativeHostProxyQueryLine("READY\t127.0.0.1\t3000"), undefined);
+  assert.deepEqual(parseNativeHostProxyQueryLine("CONNECT\t8\t127.0.0.1\tbad\t127.0.0.1\talso-bad"), {
+    id: "8",
+    localAddress: "127.0.0.1",
+    remoteAddress: "127.0.0.1",
+  });
+});
+
+test(
+  "forwards TCP bytes through the native host exposure helper when available",
+  { skip: !isExecutableFile(getNativeHostExposureProxyPath()) },
+  async () => {
+    const target = net.createServer((socket) => {
+      socket.once("data", (chunk) => {
+        socket.end(`native:${chunk.toString("utf8")}`);
+      });
+    });
+
+    await listen(target, 0, "127.0.0.1");
+    const targetPort = getServerPort(target);
+    const hostPort = await getAvailablePort();
+    const proxy = new HostPortProxyManager(
+      {
+        resolve: (exposure) => ({
+          host: exposure.targetAddress,
+          port: targetPort,
+        }),
+      },
+      {
+        nativeProxyPath: getNativeHostExposureProxyPath(),
+      },
+    );
+    const exposure = createExposure({ hostPort, targetPort: 3004 });
+
+    await proxy.open(exposure);
+
+    const response = await sendTcpMessage(exposure.hostPort, "127.0.0.1", "hello");
+
+    assert.equal(response, "native:hello");
+
+    await proxy.dispose();
+    await closeServer(target);
+  },
+);
 
 function createExposure(overrides: Partial<HostPortExposure> = {}): HostPortExposure {
   return {
@@ -142,4 +197,17 @@ function closeServer(server: net.Server): Promise<void> {
       resolve();
     });
   });
+}
+
+function getNativeHostExposureProxyPath(): string {
+  return path.join(process.cwd(), "media", "native", "portmanager_host_exposure_proxy");
+}
+
+function isExecutableFile(filePath: string): boolean {
+  try {
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }

@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { NativeProcessLookupProvider } from "../process/native-process-lookup";
 import type { LogicalPortRouterConnection } from "./logical-port-router";
 
 const execFileAsync = promisify(execFile);
@@ -24,6 +25,10 @@ type CommandRunner = (file: string, args: readonly string[]) => Promise<CommandR
 interface TcpConnectionProcessResolverOptions {
   /** Injectable command boundary so tests do not depend on host lsof output. */
   readonly commandRunner?: CommandRunner;
+  /** Optional native helper used before the cwd lsof fallback. */
+  readonly nativeLookupProvider?: NativeProcessLookupProvider;
+  /** Packaged native helper path passed by the VS Code extension context. */
+  readonly nativeLookupPath?: string;
 }
 
 interface LsofProcessContext {
@@ -59,6 +64,8 @@ interface ProcessCwdSnapshot {
  */
 export class NodeTcpConnectionProcessResolver {
   private readonly runCommand: CommandRunner;
+  /** Optional C helper for cwd lookup after lsof identifies the client PID. */
+  private readonly nativeLookupProvider?: NativeProcessLookupProvider;
   /**
    * Point-in-time TCP table shared by router connections accepted in the same
    * burst. Without this, polling clients can spawn one global lsof per socket.
@@ -76,6 +83,11 @@ export class NodeTcpConnectionProcessResolver {
 
   constructor(options: TcpConnectionProcessResolverOptions = {}) {
     this.runCommand = options.commandRunner ?? runExecFile;
+    this.nativeLookupProvider =
+      options.nativeLookupProvider ??
+      (options.commandRunner === undefined || options.nativeLookupPath !== undefined
+        ? new NativeProcessLookupProvider({ helperPath: options.nativeLookupPath })
+        : undefined);
   }
 
   /** Returns the client process for a router connection, when the OS exposes it. */
@@ -120,9 +132,8 @@ export class NodeTcpConnectionProcessResolver {
     }
 
     let request: Promise<string | undefined>;
-    request = this.runCommand("lsof", ["-nP", "-a", "-p", String(pid), "-d", "cwd", "-Fn"])
-      .then(({ stdout }) => {
-        const cwd = parseProcessCwdFromLsof(toText(stdout));
+    request = this.resolveProcessCwdUncached(pid)
+      .then((cwd) => {
         this.cwdSnapshotsByPid.set(pid, {
           cwd,
           expiresAtMs: Date.now() + PROCESS_CWD_CACHE_TTL_MS,
@@ -137,6 +148,19 @@ export class NodeTcpConnectionProcessResolver {
 
     this.cwdRequestsByPid.set(pid, request);
     return request;
+  }
+
+  /** Reads native cwd first and falls back to the previous narrow lsof query. */
+  private async resolveProcessCwdUncached(pid: number): Promise<string | undefined> {
+    if (this.nativeLookupProvider !== undefined) {
+      const nativeCwd = (await this.nativeLookupProvider.inspectProcess(pid))?.cwd;
+      if (nativeCwd !== undefined) {
+        return nativeCwd;
+      }
+    }
+
+    const { stdout } = await this.runCommand("lsof", ["-nP", "-a", "-p", String(pid), "-d", "cwd", "-Fn"]);
+    return parseProcessCwdFromLsof(toText(stdout));
   }
 
   /**

@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { NativeProcessLookupProvider } from "./native-process-lookup";
 
 const execFileAsync = promisify(execFile);
 const PROCESS_ENVIRONMENT_CACHE_TTL_MS = 5000;
@@ -20,6 +21,10 @@ type CommandRunner = (file: string, args: readonly string[]) => Promise<CommandR
 interface NodeProcessEnvironmentProviderOptions {
   /** Injectable command boundary so tests can parse fixed process output. */
   readonly commandRunner?: CommandRunner;
+  /** Optional native helper used before the shell-command fallback. */
+  readonly nativeLookupProvider?: NativeProcessLookupProvider;
+  /** Packaged native helper path passed by the VS Code extension context. */
+  readonly nativeLookupPath?: string;
 }
 
 interface ProcessEnvironmentSnapshot {
@@ -36,6 +41,8 @@ interface ProcessEnvironmentSnapshot {
  */
 export class NodeProcessEnvironmentProvider {
   private readonly runCommand: CommandRunner;
+  /** Optional C helper for same-user environment lookup without ps parsing. */
+  private readonly nativeLookupProvider?: NativeProcessLookupProvider;
   /** Short-lived per-PID routing-scope cache for bursty logical router clients. */
   private readonly snapshotsByPid = new Map<number, ProcessEnvironmentSnapshot>();
 
@@ -44,6 +51,11 @@ export class NodeProcessEnvironmentProvider {
 
   constructor(options: NodeProcessEnvironmentProviderOptions = {}) {
     this.runCommand = options.commandRunner ?? runExecFile;
+    this.nativeLookupProvider =
+      options.nativeLookupProvider ??
+      (options.commandRunner === undefined || options.nativeLookupPath !== undefined
+        ? new NativeProcessLookupProvider({ helperPath: options.nativeLookupPath })
+        : undefined);
   }
 
   /** Returns the inherited logical network id for a process, when visible. */
@@ -69,9 +81,8 @@ export class NodeProcessEnvironmentProvider {
     }
 
     let request: Promise<string | undefined>;
-    request = this.runCommand("ps", ["eww", "-p", String(pid)])
-      .then(({ stdout }) => {
-        const networkId = parseRoutingNetworkIdFromProcessEnvironment(toText(stdout));
+    request = this.readNetworkId(pid)
+      .then((networkId) => {
         this.snapshotsByPid.set(pid, {
           networkId,
           expiresAtMs: Date.now() + PROCESS_ENVIRONMENT_CACHE_TTL_MS,
@@ -86,6 +97,19 @@ export class NodeProcessEnvironmentProvider {
 
     this.requestsByPid.set(pid, request);
     return request;
+  }
+
+  /** Reads native environment first, preserving ps output parsing as fallback. */
+  private async readNetworkId(pid: number): Promise<string | undefined> {
+    if (this.nativeLookupProvider !== undefined) {
+      const nativeNetworkId = (await this.nativeLookupProvider.inspectProcess(pid))?.networkId;
+      if (nativeNetworkId !== undefined) {
+        return nativeNetworkId;
+      }
+    }
+
+    const { stdout } = await this.runCommand("ps", ["eww", "-p", String(pid)]);
+    return parseRoutingNetworkIdFromProcessEnvironment(toText(stdout));
   }
 }
 

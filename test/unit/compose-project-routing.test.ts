@@ -412,6 +412,51 @@ test("docker wrapper rewrites container path arguments for cp", () => {
   }
 });
 
+test("docker wrapper prefers native container mapper when available", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-container-map-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+  const helperPath = path.join(tempDir, "portmanager_container_map");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(routingFile, "", "utf8");
+  fs.writeFileSync(
+    helperPath,
+    "#!/bin/sh\nif [ \"$4\" = \"abc123\" ]; then printf '%s\\n' native-def987; exit 0; fi\nexit 1\n",
+    {
+      encoding: "utf8",
+      mode: 0o700,
+    },
+  );
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile, helperPath),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker kill abc123",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output, "<kill>\n<native-def987>\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("docker compose wrapper leaves explicit project selections untouched", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-routing-explicit-"));
   const projectDir = path.join(tempDir, "workspace", "app");

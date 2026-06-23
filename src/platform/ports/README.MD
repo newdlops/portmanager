@@ -28,10 +28,11 @@
 - `net`
 - `child_process`
 - `media/native/portmanager_tcp_router`
+- `media/native/portmanager_host_exposure_proxy`
 - 운영체제별 포트 조회 명령
 
 ## 주의사항
 
 명령 실행 실패는 확장 전체 실패가 아니라 세부 정보 누락으로 처리한다.
-`host-port-proxy.ts`는 Host Port Exposure를 위한 listener/proxy만 담당한다. 이 proxy는 컨테이너 수준의 Logical Network 격리를 제공하지 않으며, 터미널 프로세스가 호스트 포트 namespace를 점유하지 않게 만드는 책임을 갖지 않는다.
+`host-port-proxy.ts`는 Host Port Exposure를 위한 listener/proxy만 담당한다. 가능한 환경에서는 native helper로 accept/connect/byte-copy 데이터 plane을 실행하고, helper가 없거나 시작에 실패하면 Node.js stream proxy로 fallback한다. 이 proxy는 컨테이너 수준의 Logical Network 격리를 제공하지 않으며, 터미널 프로세스가 호스트 포트 namespace를 점유하지 않게 만드는 책임을 갖지 않는다.
 `logical-port-router.ts`는 라우팅 정책 판단을 TypeScript에 남기고, 패키지된 native helper가 있으면 accept/connect/byte copy 데이터 plane만 위임한다. helper를 사용할 수 없는 환경에서는 기존 Node.js stream router로 fallback한다.

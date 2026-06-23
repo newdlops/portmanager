@@ -34,6 +34,7 @@ import {
   NodeProcessTableProvider,
   type ProcessTableRow,
 } from "../platform/process/node-process-table";
+import { getProcessLookupHelperRelativePath } from "../platform/process/native-process-lookup";
 import { NodeProcessEnvironmentProvider } from "../platform/process/node-process-environment";
 import { NodeTerminalCandidateProvider } from "../platform/process/node-terminal-candidate-provider";
 import type {
@@ -64,6 +65,7 @@ import {
   applyTerminalHookEnvironment,
   getAsdfShimLauncherRelativePath,
   getHookLibraryRelativePath,
+  getRuntimeCommandShimRelativePath,
   prepareRuntimeShimLauncherDirectory,
   prepareShellEnvRestoreScript,
   RUNTIME_SHIM_DIRECTORY_ENV,
@@ -212,9 +214,14 @@ export class PortManagerNetworkService implements DisposableLike {
       storageDirectory: path.join(this.context.globalStorageUri.fsPath, "compose-overrides"),
       runCommand: runContainerCommand,
     });
-    this.proxyManager = new HostPortProxyManager({
-      resolve: (exposure) => this.resolveHostExposureTarget(exposure),
-    });
+    this.proxyManager = new HostPortProxyManager(
+      {
+        resolve: (exposure) => this.resolveHostExposureTarget(exposure),
+      },
+      {
+        nativeProxyPath: this.context.asAbsolutePath(getHostExposureProxyHelperRelativePath()),
+      },
+    );
     this.logicalPortRouter = new LogicalPortRouterManager(
       {
         resolve: (connection) => this.resolveLogicalPortRouterTarget(connection),
@@ -223,9 +230,16 @@ export class PortManagerNetworkService implements DisposableLike {
         nativeRouterPath: this.context.asAbsolutePath(getTcpRouterHelperRelativePath()),
       },
     );
-    this.tcpConnectionProcessResolver = new NodeTcpConnectionProcessResolver();
-    this.processTableProvider = new NodeProcessTableProvider();
-    this.processEnvironmentProvider = new NodeProcessEnvironmentProvider();
+    const nativeProcessLookupPath = this.context.asAbsolutePath(getProcessLookupHelperRelativePath());
+    this.tcpConnectionProcessResolver = new NodeTcpConnectionProcessResolver({
+      nativeLookupPath: nativeProcessLookupPath,
+    });
+    this.processTableProvider = new NodeProcessTableProvider({
+      nativeLookupPath: nativeProcessLookupPath,
+    });
+    this.processEnvironmentProvider = new NodeProcessEnvironmentProvider({
+      nativeLookupPath: nativeProcessLookupPath,
+    });
     this.registry = new LogicalNetworkRegistry(BASE_RUNTIMES, this.loadState());
     this.vscodeWindowTerminalBinding = this.loadVscodeWindowTerminalBinding();
     this.disposables.push(
@@ -1786,10 +1800,13 @@ export class PortManagerNetworkService implements DisposableLike {
     const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
     const agentMainPath = this.context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
     const nativeAgentPath = this.context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
+    const nativeContainerMapPath = this.context.asAbsolutePath(path.join("media", "native", "portmanager_container_map"));
     const asdfShimLauncherPath = this.context.asAbsolutePath(getAsdfShimLauncherRelativePath());
+    const runtimeCommandShimPath = this.context.asAbsolutePath(getRuntimeCommandShimRelativePath());
     const runtimeShimDirectory = prepareRuntimeShimLauncherDirectory(
       this.context.globalStorageUri.fsPath,
       asdfShimLauncherPath,
+      runtimeCommandShimPath,
     );
     const shellEnvRestorePath = prepareShellEnvRestoreScript(this.context.globalStorageUri.fsPath, hookLibraryPath, {
       networkId,
@@ -1805,12 +1822,13 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath()),
       shellExport("PORT_MANAGER_AGENT_MAIN", agentMainPath),
       shellExport("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath),
+      shellExport("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath),
       shellExport("PORT_MANAGER_ROUTES_FILE", getRouteTablePathForNetwork(networkId)),
       shellExport("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath()),
       shellExport("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath()),
       shellExport("PORT_MANAGER_TERMINAL_ATTACHMENT_DIR", this.getTerminalAttachmentMarkerDirectoryPath()),
       buildTerminalAttachmentMarkerWriteShell(),
-      buildComposeProjectRoutingShell(this.getComposeProjectRoutingFilePath()),
+      buildComposeProjectRoutingShell(this.getComposeProjectRoutingFilePath(), nativeContainerMapPath),
       shellExport("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange)),
       shellExport("PORT_MANAGER_ROUTING_MODE", settings.routingMode),
       shellExport("PORT_MANAGER_VIRTUAL_PORT_START", String(settings.virtualPortRangeStart)),
@@ -1847,9 +1865,11 @@ export class PortManagerNetworkService implements DisposableLike {
   private buildTerminalDetachScript(): string {
     const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
     const asdfShimLauncherPath = this.context.asAbsolutePath(getAsdfShimLauncherRelativePath());
+    const runtimeCommandShimPath = this.context.asAbsolutePath(getRuntimeCommandShimRelativePath());
     const runtimeShimDirectory = prepareRuntimeShimLauncherDirectory(
       this.context.globalStorageUri.fsPath,
       asdfShimLauncherPath,
+      runtimeCommandShimPath,
     );
     const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
     const variables = [
@@ -1862,6 +1882,7 @@ export class PortManagerNetworkService implements DisposableLike {
       "PORT_MANAGER_AGENT_SOCKET",
       "PORT_MANAGER_AGENT_MAIN",
       "PORT_MANAGER_AGENT_EXECUTABLE",
+      "PORT_MANAGER_CONTAINER_MAP_HELPER",
       "PORT_MANAGER_HOOK_DAEMON_STARTED",
       "PORT_MANAGER_ROUTES_FILE",
       "PORT_MANAGER_COMPOSE_ROUTING_FILE",
@@ -2258,6 +2279,11 @@ function getTtyInputHelperRelativePath(): string {
 /** Returns the packaged native TCP router helper used for the logical-router data plane. */
 function getTcpRouterHelperRelativePath(): string {
   return path.join("media", "native", "portmanager_tcp_router");
+}
+
+/** Returns the packaged native TCP proxy helper used for host exposure data plane. */
+function getHostExposureProxyHelperRelativePath(): string {
+  return path.join("media", "native", "portmanager_host_exposure_proxy");
 }
 
 /** Fails before route rows can persist invalid TCP endpoint state. */

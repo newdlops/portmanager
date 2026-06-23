@@ -1079,15 +1079,21 @@ export class PortManagerCommandController implements DisposableLike {
     const settings = readPortManagerSettings();
     const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
     const asdfShimLauncherPath = context.asAbsolutePath(getAsdfShimLauncherRelativePath());
+    const runtimeCommandShimPath = context.asAbsolutePath(getRuntimeCommandShimRelativePath());
     const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
     const nativeAgentPath = context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
+    const nativeContainerMapPath = context.asAbsolutePath(path.join("media", "native", "portmanager_container_map"));
     const hookDirectory = path.join(os.homedir(), ".portmanager");
     const hookScriptPath = path.join(hookDirectory, "portmanager-hook.sh");
     const shellProfilePaths = getShellProfilePaths();
     const sourceLine = `. "${hookScriptPath}"`;
 
     await fs.mkdir(hookDirectory, { recursive: true });
-    const runtimeShimDirectory = prepareRuntimeShimLauncherDirectory(hookDirectory, asdfShimLauncherPath);
+    const runtimeShimDirectory = prepareRuntimeShimLauncherDirectory(
+      hookDirectory,
+      asdfShimLauncherPath,
+      runtimeCommandShimPath,
+    );
     const shellEnvRestorePath = prepareShellEnvRestoreScript(hookDirectory, hookLibraryPath);
     await fs.writeFile(
       hookScriptPath,
@@ -1095,6 +1101,7 @@ export class PortManagerCommandController implements DisposableLike {
         hookLibraryPath,
         agentMainPath,
         nativeAgentPath,
+        nativeContainerMapPath,
         nodeExecutablePath: process.execPath,
         socketPath: getAgentSocketPath(),
         routeTablePath: getDefaultRouteTablePath(),
@@ -2112,6 +2119,11 @@ function getAsdfShimLauncherRelativePath(): string {
   return path.join("media", "native", "portmanager_asdf_shim");
 }
 
+/** Returns the packaged native Docker/Podman PATH shim. */
+function getRuntimeCommandShimRelativePath(): string {
+  return path.join("media", "native", "portmanager_docker_shim");
+}
+
 /**
  * Chooses startup files for the current POSIX shell. Updating both login and
  * interactive profiles makes new OS terminals inherit the native hook env.
@@ -2150,6 +2162,8 @@ interface ShellHookScriptOptions {
   readonly agentMainPath: string;
   /** Native daemon executable used before falling back to the Node entrypoint. */
   readonly nativeAgentPath: string;
+  /** Native helper used by shell fallback wrappers for container token mapping. */
+  readonly nativeContainerMapPath: string;
   /** Node or Electron executable used to run compiled extension JS in Node mode. */
   readonly nodeExecutablePath: string;
   /** Singleton agent socket path shared with VS Code windows. */
@@ -2171,6 +2185,7 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
   const escapedHookLibraryPath = shellDoubleQuote(options.hookLibraryPath);
   const escapedAgentMainPath = shellDoubleQuote(options.agentMainPath);
   const escapedNativeAgentPath = shellDoubleQuote(options.nativeAgentPath);
+  const escapedNativeContainerMapPath = shellDoubleQuote(options.nativeContainerMapPath);
   const escapedNodeExecutablePath = shellDoubleQuote(options.nodeExecutablePath);
   const escapedSocketPath = shellDoubleQuote(options.socketPath);
   const escapedRouteTablePath = shellDoubleQuote(options.routeTablePath);
@@ -2191,6 +2206,7 @@ export PORT_MANAGER_GLOBAL_ROUTES_FILE="${escapedRouteTablePath}"
 export PORT_MANAGER_HOST_ACCESS_FILE="${escapedHostAccessFilePath}"
 export PORT_MANAGER_AGENT_MAIN="${escapedAgentMainPath}"
 export PORT_MANAGER_AGENT_EXECUTABLE="${escapedNativeAgentPath}"
+export PORT_MANAGER_CONTAINER_MAP_HELPER="${escapedNativeContainerMapPath}"
 export PORT_MANAGER_SCAN_RANGE="${options.settings.scanRange}"
 export PORT_MANAGER_ROUTING_MODE="${options.settings.routingMode}"
 export PORT_MANAGER_VIRTUAL_PORT_START="${options.settings.virtualPortRangeStart}"

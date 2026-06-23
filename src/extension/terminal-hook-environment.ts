@@ -113,7 +113,9 @@ export function applyTerminalHookEnvironment(
   const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
   const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
   const nativeAgentPath = context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
+  const nativeContainerMapPath = context.asAbsolutePath(path.join("media", "native", "portmanager_container_map"));
   const asdfShimLauncherPath = context.asAbsolutePath(getAsdfShimLauncherRelativePath());
+  const runtimeCommandShimPath = context.asAbsolutePath(getRuntimeCommandShimRelativePath());
   const shellEnvRestorePath = prepareShellEnvRestoreScript(context.globalStorageUri.fsPath, hookLibraryPath, {
     networkId: scope.networkId,
   });
@@ -128,6 +130,7 @@ export function applyTerminalHookEnvironment(
   collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_AGENT_MAIN", agentMainPath, TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath, TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_ROUTES_FILE", getRouteTablePathForNetwork(scope.networkId), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath(), TERMINAL_MUTATOR_OPTIONS);
@@ -136,7 +139,7 @@ export function applyTerminalHookEnvironment(
   }
   applyRoutingSettings(collection, settings);
   collection.prepend(preloadVariable, `${hookLibraryPath}${path.delimiter}`, TERMINAL_MUTATOR_OPTIONS);
-  applyRuntimeShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath);
+  applyRuntimeShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath, runtimeCommandShimPath);
 
   if (shellEnvRestorePath !== undefined) {
     collection.replace("PORT_MANAGER_DYLD_INSERT_LIBRARIES", hookLibraryPath, TERMINAL_MUTATOR_OPTIONS);
@@ -184,12 +187,12 @@ export function shouldInjectTerminalHook(settings: PortManagerSettings): boolean
 export function prepareRuntimeShimLauncherDirectory(
   baseDirectory: string,
   launcherPath: string,
+  runtimeCommandShimPath?: string,
 ): string | undefined {
   const sourceShimDirectory = getAsdfShimDirectory();
   const targetDirectory = path.join(baseDirectory, "runtime-shims");
   fs.mkdirSync(targetDirectory, { recursive: true });
-  writeRuntimeCommandShim(path.join(targetDirectory, "docker"), buildRuntimeCommandShimScript("docker"));
-  writeRuntimeCommandShim(path.join(targetDirectory, "podman"), buildRuntimeCommandShimScript("podman"));
+  writeRuntimeCommandShims(targetDirectory, runtimeCommandShimPath);
 
   if (process.platform !== "darwin" || !fs.existsSync(launcherPath)) {
     return targetDirectory;
@@ -250,8 +253,9 @@ function applyRuntimeShimLauncherPath(
   collection: vscode.EnvironmentVariableCollection,
   baseDirectory: string,
   launcherPath: string,
+  runtimeCommandShimPath: string,
 ): void {
-  const launcherDirectory = prepareRuntimeShimLauncherDirectory(baseDirectory, launcherPath);
+  const launcherDirectory = prepareRuntimeShimLauncherDirectory(baseDirectory, launcherPath, runtimeCommandShimPath);
 
   if (launcherDirectory !== undefined) {
     collection.replace(RUNTIME_SHIM_DIRECTORY_ENV, launcherDirectory, TERMINAL_MUTATOR_OPTIONS);
@@ -276,6 +280,11 @@ export function getHookLibraryRelativePath(): string {
 /** Returns the packaged native launcher used to bypass macOS asdf shim scripts. */
 export function getAsdfShimLauncherRelativePath(): string {
   return path.join("media", "native", "portmanager_asdf_shim");
+}
+
+/** Returns the packaged native Docker/Podman PATH shim. */
+export function getRuntimeCommandShimRelativePath(): string {
+  return path.join("media", "native", "portmanager_docker_shim");
 }
 
 /** Locates the user's asdf shim directory without requiring asdf to be loaded. */
@@ -307,6 +316,17 @@ function ensureSymlink(linkPath: string, targetPath: string): void {
 
   fs.rmSync(linkPath, { force: true });
   fs.symlinkSync(targetPath, linkPath);
+}
+
+function writeRuntimeCommandShims(targetDirectory: string, runtimeCommandShimPath: string | undefined): void {
+  if (runtimeCommandShimPath !== undefined && fs.existsSync(runtimeCommandShimPath)) {
+    ensureSymlink(path.join(targetDirectory, "docker"), runtimeCommandShimPath);
+    ensureSymlink(path.join(targetDirectory, "podman"), runtimeCommandShimPath);
+    return;
+  }
+
+  writeRuntimeCommandShim(path.join(targetDirectory, "docker"), buildRuntimeCommandShimScript("docker"));
+  writeRuntimeCommandShim(path.join(targetDirectory, "podman"), buildRuntimeCommandShimScript("podman"));
 }
 
 function writeRuntimeCommandShim(filePath: string, contents: string): void {
