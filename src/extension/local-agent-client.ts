@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { getAgentSocketPath, removeStaleSocketFile } from "../agent/agent-socket";
+import { getAgentSocketPath, getAgentStartupLockPath, removeStaleSocketFile } from "../agent/agent-socket";
 import { readPortManagerSettings } from "../config/vscode-settings";
 import { buildNodeRuntimeEnvironment } from "../platform/process/node-runtime";
 import { SimpleEventEmitter } from "../shared/events";
@@ -73,6 +73,9 @@ interface PendingRequest {
   /** Timeout guard so command promises do not hang forever. */
   readonly timer: NodeJS.Timeout;
 }
+
+const AGENT_STARTUP_LOCK_STALE_MS = 10_000;
+const AGENT_STARTUP_LOCK_WAIT_MS = 5_000;
 
 /**
  * Agent-backed process service used by commands and the sidebar provider.
@@ -298,7 +301,25 @@ export class LocalAgentClient implements PortManagerProcessService {
       this.attachSocketHandlers(this.socket);
       return;
     } catch {
-      this.startAgentProcess();
+      // Fall through to the startup lock. Another VS Code window may already
+      // be racing to create the singleton daemon.
+    }
+
+    const releaseStartupLock = await this.acquireAgentStartupLock();
+    if (this.socket && !this.socket.destroyed) {
+      releaseStartupLock();
+      return;
+    }
+    try {
+      try {
+        this.socket = await this.openSocket();
+        this.attachSocketHandlers(this.socket);
+        return;
+      } catch {
+        this.startAgentProcess();
+      }
+    } finally {
+      releaseStartupLock();
     }
 
     const deadline = Date.now() + 5000;
@@ -317,6 +338,57 @@ export class LocalAgentClient implements PortManagerProcessService {
     }
 
     throw lastError instanceof Error ? lastError : new Error("Failed to connect to Port Manager agent.");
+  }
+
+  /** Serializes daemon startup across extension hosts in different VS Code windows. */
+  private async acquireAgentStartupLock(): Promise<() => void> {
+    const lockPath = getAgentStartupLockPath();
+    const deadline = Date.now() + AGENT_STARTUP_LOCK_WAIT_MS;
+
+    for (;;) {
+      try {
+        const fd = fs.openSync(lockPath, "wx");
+        fs.writeFileSync(fd, `${process.pid}\n${new Date().toISOString()}\n`, "utf8");
+        return () => {
+          try {
+            fs.closeSync(fd);
+          } catch {
+            // The descriptor may already have been closed during process teardown.
+          }
+          try {
+            fs.unlinkSync(lockPath);
+          } catch {
+            // Another client may have cleaned a stale lock while this window exited.
+          }
+        };
+      } catch (error) {
+        if (!isFileExistsError(error)) {
+          throw error instanceof Error ? error : new Error(String(error));
+        }
+
+        await this.connectIfSocketAppeared().catch(() => undefined);
+        if (this.socket && !this.socket.destroyed) {
+          return () => undefined;
+        }
+
+        removeStaleStartupLock(lockPath);
+        if (Date.now() >= deadline) {
+          throw new Error(`Timed out waiting for Port Manager daemon startup lock: ${lockPath}`);
+        }
+
+        await delay(100);
+      }
+    }
+  }
+
+  /** Connects to a daemon that another VS Code window may have just started. */
+  private async connectIfSocketAppeared(): Promise<void> {
+    if (this.socket && !this.socket.destroyed) {
+      return;
+    }
+
+    this.socket = await this.openSocket();
+    this.attachSocketHandlers(this.socket);
   }
 
   /** Opens the OS-specific local socket used by the singleton agent. */
@@ -637,6 +709,23 @@ function appendDaemonWarning(existingMessage: string | undefined, warning: strin
   }
 
   return `${existingMessage} ${warning}`;
+}
+
+function isFileExistsError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "EEXIST";
+}
+
+function removeStaleStartupLock(lockPath: string): void {
+  try {
+    const stat = fs.statSync(lockPath);
+    if (Date.now() - stat.mtimeMs < AGENT_STARTUP_LOCK_STALE_MS) {
+      return;
+    }
+
+    fs.unlinkSync(lockPath);
+  } catch {
+    // Missing or inaccessible lock files are handled by the next acquire loop.
+  }
 }
 
 /** Small retry delay helper for agent startup polling. */

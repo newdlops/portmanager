@@ -457,16 +457,16 @@ function groupTerminalWindows(candidates: readonly TerminalCandidate[]): readonl
 
 /** Chooses the grouping key that best represents a terminal window on each platform. */
 function terminalWindowGroupKey(candidate: TerminalCandidate): string {
-  if (candidate.vscodeTerminal) {
-    return `vscode:${candidate.pid}`;
-  }
-
   if (candidate.terminalId !== undefined) {
     return `tty:${candidate.terminalId}`;
   }
 
   if (candidate.processGroupId !== undefined) {
     return `pgid:${candidate.processGroupId}`;
+  }
+
+  if (candidate.vscodeTerminal) {
+    return `vscode:${candidate.pid}`;
   }
 
   return `pid:${candidate.pid}`;

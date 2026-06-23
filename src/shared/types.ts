@@ -30,6 +30,8 @@ export type TerminalAttachmentStatus = "attached" | "detached" | "error";
 
 export type TerminalAttachmentMode = "isolated" | "logical";
 
+export type VscodeWindowTerminalBindingStatus = "attached" | "error";
+
 export type NetworkRuntimeKind = "container" | "linuxNamespace" | "nativeHelper" | "proxy";
 
 export type HostPortExposureStatus = "opening" | "active" | "stopped" | "error";
@@ -161,6 +163,26 @@ export interface TerminalAttachment {
   readonly status: TerminalAttachmentStatus;
   /** ISO timestamp when the attachment was requested. */
   readonly attachedAt: string;
+  /** Last attach failure or runtime warning, if any. */
+  readonly errorMessage?: string;
+}
+
+/**
+ * Current VS Code window/workspace terminal default. Existing terminals receive
+ * the same routing script best-effort; new terminals inherit the environment
+ * through VS Code's terminal environment collection.
+ */
+export interface VscodeWindowTerminalBinding {
+  /** Stable row id for the current VS Code workspace/window scope. */
+  readonly id: string;
+  /** Logical network injected into all new VS Code terminals in this window. */
+  readonly networkId: string;
+  /** Current lifecycle state for UI display. */
+  readonly status: VscodeWindowTerminalBindingStatus;
+  /** ISO timestamp when the window default was applied. */
+  readonly attachedAt: string;
+  /** Number of already-open VS Code terminals that accepted the routing script. */
+  readonly injectedTerminalCount: number;
   /** Last attach failure or runtime warning, if any. */
   readonly errorMessage?: string;
 }
@@ -343,6 +365,8 @@ export interface NetworkSnapshot {
   readonly terminalWindows: readonly TerminalWindow[];
   /** Terminal-to-network attachment records. */
   readonly attachments: readonly TerminalAttachment[];
+  /** Optional current VS Code window terminal default. */
+  readonly vscodeWindowTerminalBinding?: VscodeWindowTerminalBinding;
   /** Host port bindings owned by Port Manager. */
   readonly exposures: readonly HostPortExposure[];
   /** Network-to-host port bindings visible from attached terminals. */

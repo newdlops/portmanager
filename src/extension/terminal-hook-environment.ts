@@ -3,7 +3,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { getAgentSocketPath } from "../agent/agent-socket";
-import { getDefaultHostAccessBindingsPath, getDefaultRouteTablePath } from "../agent/route-table";
+import {
+  getDefaultHostAccessBindingsPath,
+  getDefaultRouteTablePath,
+  getRouteTablePathForNetwork,
+} from "../agent/route-table";
 import { readPortManagerSettings } from "../config/vscode-settings";
 import type { DisposableLike, PortManagerSettings } from "../shared/types";
 import {
@@ -55,10 +59,20 @@ const PRELOAD_RUNTIME_LAUNCHER_NAMES = [
   "retry",
 ];
 
+export interface TerminalHookEnvironmentScope {
+  /** Logical network applied to every new VS Code terminal in this extension host. */
+  readonly networkId: string;
+  /** Dynamic Compose/container routing map consumed by Docker/Podman shims. */
+  readonly composeRoutingFilePath?: string;
+}
+
 /** Applies and refreshes terminal environment variables owned by Port Manager. */
-export function configureTerminalHookEnvironment(context: vscode.ExtensionContext): DisposableLike {
+export function configureTerminalHookEnvironment(
+  context: vscode.ExtensionContext,
+  scopeProvider: () => TerminalHookEnvironmentScope | undefined = () => undefined,
+): DisposableLike {
   const applyEnvironment = () => {
-    applyTerminalHookEnvironment(context);
+    applyTerminalHookEnvironment(context, scopeProvider());
   };
   const configurationSubscription = vscode.workspace.onDidChangeConfiguration((event) => {
     if (event.affectsConfiguration("portManager")) {
@@ -77,7 +91,10 @@ export function configureTerminalHookEnvironment(context: vscode.ExtensionContex
 }
 
 /** Replaces the extension-owned terminal env collection from current settings. */
-function applyTerminalHookEnvironment(context: vscode.ExtensionContext): void {
+export function applyTerminalHookEnvironment(
+  context: vscode.ExtensionContext,
+  scope: TerminalHookEnvironmentScope | undefined,
+): void {
   const collection = context.environmentVariableCollection;
   const settings = readPortManagerSettings();
 
@@ -85,20 +102,35 @@ function applyTerminalHookEnvironment(context: vscode.ExtensionContext): void {
   collection.persistent = false;
   collection.description = "Port Manager routes terminal TCP binds through the local daemon.";
 
+  if (scope === undefined) {
+    return;
+  }
+
   if (!shouldInjectTerminalHook(settings)) {
     return;
   }
 
   const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
+  const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
   const asdfShimLauncherPath = context.asAbsolutePath(getAsdfShimLauncherRelativePath());
-  const shellEnvRestorePath = prepareShellEnvRestoreScript(context.globalStorageUri.fsPath, hookLibraryPath);
+  const shellEnvRestorePath = prepareShellEnvRestoreScript(context.globalStorageUri.fsPath, hookLibraryPath, {
+    networkId: scope.networkId,
+  });
   const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
 
   collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_BORROWED_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("NEWDLOPS_PM_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("NEWDLOPS_PM_BORROWED_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_MAIN", agentMainPath, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_ROUTES_FILE", getRouteTablePathForNetwork(scope.networkId), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath(), TERMINAL_MUTATOR_OPTIONS);
+  if (scope.composeRoutingFilePath !== undefined) {
+    collection.replace("PORT_MANAGER_COMPOSE_ROUTING_FILE", scope.composeRoutingFilePath, TERMINAL_MUTATOR_OPTIONS);
+  }
   applyRoutingSettings(collection, settings);
   collection.prepend(preloadVariable, `${hookLibraryPath}${path.delimiter}`, TERMINAL_MUTATOR_OPTIONS);
   applyRuntimeShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath);

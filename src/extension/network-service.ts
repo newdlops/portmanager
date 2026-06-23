@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -13,6 +14,7 @@ import {
 import { readContainerRuntimeSettings, readPortManagerSettings } from "../config/vscode-settings";
 import { LogicalNetworkRegistry, type LogicalNetworkRegistryState } from "../core/networks/logical-network-registry";
 import { findRoutesMatchingClientCwd } from "../core/networks/logical-route-selection";
+import { SimpleEventEmitter } from "../shared/events";
 import {
   ContainerNetworkRuntimeAdapter,
   type ContainerRuntimeTarget,
@@ -56,8 +58,10 @@ import type {
   TerminalCandidate,
   TerminalCandidateProvider,
   TerminalWindow,
+  VscodeWindowTerminalBinding,
 } from "../shared/types";
 import {
+  applyTerminalHookEnvironment,
   getAsdfShimLauncherRelativePath,
   getHookLibraryRelativePath,
   prepareRuntimeShimLauncherDirectory,
@@ -74,7 +78,10 @@ import type { PortManagerProcessService } from "./process-service";
 
 const NETWORK_STATE_KEY = "portManager.logicalNetworkState.v1";
 const BINDING_PRESETS_KEY = "portManager.bindingPresets.v1";
+const VSCODE_WINDOW_TERMINAL_BINDING_KEY = "portManager.vscodeWindowTerminalBinding.v1";
 const COMPOSE_PROJECT_ROUTING_FILE_NAME = "compose-project-routing.tsv";
+const TERMINAL_ATTACHMENT_MARKER_DIRECTORY_NAME = "terminal-attachments";
+const MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX = "manual-terminal:";
 const execFileAsync = promisify(execFile);
 
 export interface BindingPresetSummary {
@@ -97,6 +104,20 @@ export interface TerminalNetworkResetSummary {
   readonly removedAttachmentCount: number;
 }
 
+export interface VscodeWindowTerminalAttachSummary {
+  /** Current VS Code window/workspace binding after attach. */
+  readonly binding: VscodeWindowTerminalBinding;
+  /** Already-open VS Code terminals that accepted the routing script. */
+  readonly injectedTerminalCount: number;
+}
+
+export interface VscodeWindowTerminalDetachSummary {
+  /** True when a stored VS Code window binding existed and was cleared. */
+  readonly removedBinding: boolean;
+  /** Already-open VS Code terminals that accepted the detach script. */
+  readonly detachedTerminalCount: number;
+}
+
 interface BindingPreset {
   readonly id: string;
   readonly name: string;
@@ -117,6 +138,15 @@ interface BindingPresetHostAccess {
   readonly logicalPort: number;
   readonly hostAddress: string;
   readonly hostPort: number;
+}
+
+interface TerminalAttachmentMarker {
+  readonly networkId: string;
+  readonly terminalId?: string;
+  readonly pid?: number;
+  readonly processGroupId?: number;
+  readonly attachedAt: string;
+  readonly filePath: string;
 }
 
 /**
@@ -158,6 +188,12 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Mutates Compose publish rules so attached services release host ports. */
   private readonly composePublishMutator: ComposePublishMutator;
 
+  /** Current VS Code window/workspace default network for newly opened terminals. */
+  private vscodeWindowTerminalBinding: VscodeWindowTerminalBinding | undefined;
+
+  /** Extension-local state changes that are not owned by the pure registry. */
+  private readonly localChangeEvents = new SimpleEventEmitter<void>();
+
   /** VS Code event subscriptions owned by this service. */
   private readonly disposables: DisposableLike[] = [];
 
@@ -182,12 +218,14 @@ export class PortManagerNetworkService implements DisposableLike {
     this.processTableProvider = new NodeProcessTableProvider();
     this.processEnvironmentProvider = new NodeProcessEnvironmentProvider();
     this.registry = new LogicalNetworkRegistry(BASE_RUNTIMES, this.loadState());
+    this.vscodeWindowTerminalBinding = this.loadVscodeWindowTerminalBinding();
     this.disposables.push(
       this.registry.onDidChange(() => {
         this.saveState();
         void this.writeHostAccessBindingsFile();
         void this.writeComposeProjectRoutingFile();
         void this.syncLogicalPortRouters();
+        this.reconcileVscodeWindowTerminalBinding();
       }),
     );
     if (this.processService !== undefined) {
@@ -201,7 +239,22 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Loads terminal candidates and reopens persisted host exposures. */
   async start(): Promise<void> {
+    await fs.mkdir(this.getTerminalAttachmentMarkerDirectoryPath(), { recursive: true }).catch(() => undefined);
+    const terminalAttachmentMarkerWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(this.getTerminalAttachmentMarkerDirectoryPath(), "*.tsv"),
+    );
+
     this.disposables.push(
+      terminalAttachmentMarkerWatcher,
+      terminalAttachmentMarkerWatcher.onDidCreate(() => {
+        void this.refreshTerminals();
+      }),
+      terminalAttachmentMarkerWatcher.onDidChange(() => {
+        void this.refreshTerminals();
+      }),
+      terminalAttachmentMarkerWatcher.onDidDelete(() => {
+        void this.refreshTerminals();
+      }),
       vscode.window.onDidOpenTerminal(() => {
         void this.refreshTerminals();
       }),
@@ -215,11 +268,14 @@ export class PortManagerNetworkService implements DisposableLike {
         ) {
           void this.refreshRuntimeDescriptors();
           void this.refreshContainerServices();
+          this.applyVscodeWindowTerminalEnvironment();
         }
       }),
     );
 
     await this.refreshRuntimeDescriptors();
+    this.reconcileVscodeWindowTerminalBinding();
+    this.applyVscodeWindowTerminalEnvironment();
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
     await this.writeComposeProjectRoutingFile();
@@ -230,7 +286,12 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Returns the latest logical network snapshot for the sidebar. */
   getSnapshot(): NetworkSnapshot {
-    return this.registry.getSnapshot();
+    return {
+      ...this.registry.getSnapshot(),
+      ...(this.vscodeWindowTerminalBinding !== undefined
+        ? { vscodeWindowTerminalBinding: this.vscodeWindowTerminalBinding }
+        : {}),
+    };
   }
 
   /** Returns daemon status when process service is available for the sidebar. */
@@ -251,7 +312,15 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Subscribes to logical network state changes. */
   onDidChange(listener: () => void): DisposableLike {
-    return this.registry.onDidChange(listener);
+    const registrySubscription = this.registry.onDidChange(listener);
+    const localSubscription = this.localChangeEvents.subscribe(listener);
+
+    return {
+      dispose: () => {
+        registrySubscription.dispose();
+        localSubscription.dispose();
+      },
+    };
   }
 
   /** Creates a network row for the runtime adapter selected at creation time. */
@@ -304,17 +373,21 @@ export class PortManagerNetworkService implements DisposableLike {
       await this.containerRuntime.removeNetwork(networkId).catch(() => undefined);
     }
 
+    await this.removeManualTerminalAttachmentMarkersForNetwork(networkId).catch(() => undefined);
+
     return this.registry.removeNetwork(networkId);
   }
 
   /** Refreshes VS Code and external OS terminal windows. */
   async refreshTerminals(): Promise<readonly TerminalWindow[]> {
+    const processRows = await this.listProcessRowsForTerminalControl();
     const [vscodeCandidates, osCandidates] = await Promise.all([
-      listVscodeTerminalCandidates(),
+      listVscodeTerminalCandidates(processRows),
       this.terminalCandidateProvider.list().catch(() => []),
     ]);
     const candidates = [...vscodeCandidates, ...osCandidates];
     this.registry.setTerminalCandidates(candidates);
+    await this.syncManualTerminalAttachmentMarkers(processRows).catch(() => undefined);
 
     return this.registry.getSnapshot().terminalWindows;
   }
@@ -356,7 +429,13 @@ export class PortManagerNetworkService implements DisposableLike {
     if (runtime.kind === "container") {
       await this.containerRuntime.createNetwork(network, readContainerRuntimeSettings());
       const attachCommand = await this.containerRuntime.buildAttachCommand(network.id);
-      const sent = await sendCommandToTerminalWindow(terminalWindow, attachCommand);
+      const processRows = await this.listProcessRowsForTerminalControl();
+      const sent = await sendCommandToTerminalWindow(
+        terminalWindow,
+        attachCommand,
+        processRows,
+        this.getTtyInputHelperPath(),
+      );
       if (!sent) {
         throw new Error(`Could not send network namespace attach command to "${terminalWindow.title}".`);
       }
@@ -391,6 +470,93 @@ export class PortManagerNetworkService implements DisposableLike {
     });
   }
 
+  /**
+   * Makes the current VS Code window/workspace default every new terminal to a
+   * logical network. Existing VS Code terminals receive the normal attach script
+   * best-effort because already-running shells cannot inherit env collection
+   * changes retroactively.
+   */
+  async attachVscodeWindowTerminalsToNetwork(networkId: string): Promise<VscodeWindowTerminalAttachSummary> {
+    const network = requireNetwork(this.registry.getNetwork(networkId), networkId);
+    const runtime = requireRuntime(this.registry.getSnapshot().runtimes, network.runtimeKind);
+    requireNativeHelperRuntime(runtime);
+
+    const settings = readPortManagerSettings();
+    if (!settings.enabled) {
+      throw new Error("Port Manager is disabled in settings.");
+    }
+    if (!shouldInjectTerminalHook(settings)) {
+      throw new Error(`Native terminal routing is not supported on ${process.platform}.`);
+    }
+
+    await this.processService?.start();
+    const binding: VscodeWindowTerminalBinding = {
+      id: "vscode-window",
+      networkId,
+      status: "attached",
+      attachedAt: new Date().toISOString(),
+      injectedTerminalCount: 0,
+    };
+
+    this.vscodeWindowTerminalBinding = binding;
+    this.saveVscodeWindowTerminalBinding();
+    this.applyVscodeWindowTerminalEnvironment();
+
+    const injectedTerminalCount = await this.injectRoutingIntoOpenVscodeTerminals(networkId, settings);
+    const updatedBinding = {
+      ...binding,
+      injectedTerminalCount,
+    };
+    this.vscodeWindowTerminalBinding = updatedBinding;
+    this.saveVscodeWindowTerminalBinding();
+    this.localChangeEvents.emit();
+
+    return {
+      binding: updatedBinding,
+      injectedTerminalCount,
+    };
+  }
+
+  /** Clears the current VS Code window/workspace terminal default and resets open VS Code terminals. */
+  async detachVscodeWindowTerminalsFromNetwork(): Promise<VscodeWindowTerminalDetachSummary> {
+    const removedBinding = this.vscodeWindowTerminalBinding !== undefined;
+    this.vscodeWindowTerminalBinding = undefined;
+    this.saveVscodeWindowTerminalBinding();
+    this.applyVscodeWindowTerminalEnvironment();
+
+    const detachedTerminalCount = sendCommandToOpenVscodeTerminals(this.buildTerminalDetachScript());
+    await this.refreshTerminals().catch(() => []);
+
+    this.localChangeEvents.emit();
+    return {
+      removedBinding,
+      detachedTerminalCount,
+    };
+  }
+
+  /** Returns the native hook script that an external terminal owner can write to its shell stdin. */
+  async createTerminalRoutingScript(networkId: string): Promise<string> {
+    const network = requireNetwork(this.registry.getNetwork(networkId), networkId);
+    const runtime = requireRuntime(this.registry.getSnapshot().runtimes, network.runtimeKind);
+    requireNativeHelperRuntime(runtime);
+
+    const settings = readPortManagerSettings();
+    if (!settings.enabled) {
+      throw new Error("Port Manager is disabled in settings.");
+    }
+    if (!shouldInjectTerminalHook(settings)) {
+      throw new Error(`Native terminal routing is not supported on ${process.platform}.`);
+    }
+
+    await this.processService?.start();
+    return this.buildTerminalRoutingScript(network.id, settings);
+  }
+
+  /** Returns the shell snippet that removes Port Manager routing variables from a custom terminal shell. */
+  createTerminalDetachScript(): string {
+    return this.buildTerminalDetachScript();
+  }
+
   /** Detaches one terminal window from its logical network runtime. */
   async detachTerminal(attachmentId: string): Promise<TerminalAttachment | undefined> {
     const attachment = this.registry.getSnapshot().attachments.find((item) => item.id === attachmentId);
@@ -406,11 +572,23 @@ export class PortManagerNetworkService implements DisposableLike {
         : this.registry.getSnapshot().terminalWindows.find((item) => item.id === attachment.terminalWindowId);
 
     if (terminalWindow !== undefined) {
+      const processRows = await this.listProcessRowsForTerminalControl();
       if (network?.runtimeKind === "container") {
-        await sendCommandToTerminalWindow(terminalWindow, "exit").catch(() => false);
+        await sendCommandToTerminalWindow(terminalWindow, "exit", processRows, this.getTtyInputHelperPath()).catch(
+          () => false,
+        );
       } else if (network?.runtimeKind === "nativeHelper") {
-        await sendCommandToTerminalWindow(terminalWindow, this.buildTerminalDetachScript()).catch(() => false);
+        await sendCommandToTerminalWindow(
+          terminalWindow,
+          this.buildTerminalDetachScript(),
+          processRows,
+          this.getTtyInputHelperPath(),
+        ).catch(() => false);
       }
+    }
+
+    if (attachment.id.startsWith(MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX) && terminalWindow !== undefined) {
+      await this.removeManualTerminalAttachmentMarkersForTerminalWindow(terminalWindow).catch(() => undefined);
     }
 
     return this.registry.removeAttachment(attachmentId);
@@ -418,6 +596,11 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** True when a VS Code terminal already belongs to one logical network. */
   async isTerminalAttached(terminal: vscode.Terminal): Promise<boolean> {
+    if (this.vscodeWindowTerminalBinding !== undefined) {
+      void terminal;
+      return true;
+    }
+
     let processId: number | undefined;
 
     try {
@@ -474,17 +657,21 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     const script = this.buildTerminalRoutingScript(networkId, settings);
-    if (terminalWindow.source === "vscode" && (await sendRoutingScriptToVscodeTerminal(terminalWindow, script))) {
+    const processRows = await this.listProcessRowsForTerminalControl();
+    if (await sendRoutingScriptToVscodeTerminal(terminalWindow, script, processRows)) {
       return { injected: true };
     }
 
-    if (await sendRoutingScriptToExternalTerminalWindow(terminalWindow, script)) {
+    if (await sendRoutingScriptToExternalTerminalWindow(terminalWindow, script, this.getTtyInputHelperPath())) {
       return { injected: true };
     }
 
     return {
       injected: false,
-      reason: `Could not find a controllable terminal session for "${terminalWindow.title}".`,
+      reason:
+        terminalWindow.terminalId === undefined
+          ? `Could not find a controllable terminal session for "${terminalWindow.title}".`
+          : `Could not inject routing into "${terminalWindow.title}" via VS Code API, generic PTY input, Terminal.app, or iTerm2.`,
     };
   }
 
@@ -784,8 +971,15 @@ export class PortManagerNetworkService implements DisposableLike {
       (attachment) => this.registry.getNetwork(attachment.networkId)?.runtimeKind === "container",
     );
     const resetCommand = shouldExitContainerShell ? "exit" : this.buildTerminalDetachScript();
+    const processRows = await this.listProcessRowsForTerminalControl();
 
-    await sendCommandToTerminalWindow(terminalWindow, resetCommand).catch(() => false);
+    await sendCommandToTerminalWindow(
+      terminalWindow,
+      resetCommand,
+      processRows,
+      this.getTtyInputHelperPath(),
+    ).catch(() => false);
+    await this.removeManualTerminalAttachmentMarkersForTerminalWindow(terminalWindow).catch(() => undefined);
 
     let removedCount = 0;
     for (const attachment of relatedAttachments) {
@@ -812,6 +1006,9 @@ export class PortManagerNetworkService implements DisposableLike {
       removedAttachmentCount++;
     }
 
+    await this.detachVscodeWindowTerminalsFromNetwork().catch(() => undefined);
+    await this.clearManualTerminalAttachmentMarkers().catch(() => undefined);
+
     return {
       terminalCount: terminalWindows.length,
       removedAttachmentCount,
@@ -825,6 +1022,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     this.registry.dispose();
+    this.localChangeEvents.clear();
     void this.proxyManager.dispose();
     this.logicalPortRouter.dispose();
   }
@@ -837,6 +1035,71 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Persists durable logical network state. */
   private saveState(): void {
     void this.context.globalState.update(NETWORK_STATE_KEY, this.registry.getPersistedState());
+  }
+
+  /** Reads the current VS Code workspace/window terminal default. */
+  private loadVscodeWindowTerminalBinding(): VscodeWindowTerminalBinding | undefined {
+    const binding = this.context.workspaceState.get<VscodeWindowTerminalBinding>(VSCODE_WINDOW_TERMINAL_BINDING_KEY);
+    if (binding === undefined || this.registry.getNetwork(binding.networkId) === undefined) {
+      return undefined;
+    }
+
+    return binding;
+  }
+
+  /** Persists the VS Code workspace/window terminal default separately from host-global network state. */
+  private saveVscodeWindowTerminalBinding(): void {
+    void this.context.workspaceState.update(VSCODE_WINDOW_TERMINAL_BINDING_KEY, this.vscodeWindowTerminalBinding);
+  }
+
+  /** Clears stale window defaults when their logical network is removed. */
+  private reconcileVscodeWindowTerminalBinding(): void {
+    if (
+      this.vscodeWindowTerminalBinding === undefined ||
+      this.registry.getNetwork(this.vscodeWindowTerminalBinding.networkId) !== undefined
+    ) {
+      return;
+    }
+
+    this.vscodeWindowTerminalBinding = undefined;
+    this.saveVscodeWindowTerminalBinding();
+    this.applyVscodeWindowTerminalEnvironment();
+    this.localChangeEvents.emit();
+  }
+
+  /** Updates VS Code's new-terminal environment for the current window/workspace. */
+  private applyVscodeWindowTerminalEnvironment(): void {
+    applyTerminalHookEnvironment(
+      this.context,
+      this.vscodeWindowTerminalBinding === undefined
+        ? undefined
+        : {
+            networkId: this.vscodeWindowTerminalBinding.networkId,
+            composeRoutingFilePath: this.getComposeProjectRoutingFilePath(),
+          },
+    );
+  }
+
+  /** Sends the current network routing script to all already-open VS Code terminals. */
+  private async injectRoutingIntoOpenVscodeTerminals(
+    networkId: string,
+    settings: PortManagerSettings,
+  ): Promise<number> {
+    const injectedTerminalCount = sendCommandToOpenVscodeTerminals(
+      this.buildTerminalRoutingScript(networkId, settings),
+    );
+    await this.refreshTerminals().catch(() => []);
+    return injectedTerminalCount;
+  }
+
+  /** Reads process rows used only to match VS Code Terminal objects to OS-discovered TTY rows. */
+  private async listProcessRowsForTerminalControl(): Promise<readonly ProcessTableRow[]> {
+    return this.processTableProvider.list().catch(() => []);
+  }
+
+  /** Packaged helper used to inject commands into generic PTY-backed terminal sessions. */
+  private getTtyInputHelperPath(): string {
+    return this.context.asAbsolutePath(getTtyInputHelperRelativePath());
   }
 
   /** Reads saved binding presets from VS Code global state. */
@@ -1237,6 +1500,142 @@ export class PortManagerNetworkService implements DisposableLike {
     return path.join(this.context.globalStorageUri.fsPath, COMPOSE_PROJECT_ROUTING_FILE_NAME);
   }
 
+  /**
+   * Reconciles marker files written by manually pasted routing scripts with
+   * the normal attachment registry. Custom terminal UIs can run the same shell
+   * script without exposing a VS Code Terminal object, so tty/pid markers are
+   * the generic handoff from shell state back to the extension UI.
+   */
+  private async syncManualTerminalAttachmentMarkers(processRows: readonly ProcessTableRow[]): Promise<void> {
+    const markers = await this.readManualTerminalAttachmentMarkers();
+    const snapshot = this.registry.getSnapshot();
+    const terminalWindows = snapshot.terminalWindows;
+    const liveProcessIds = new Set(processRows.map((row) => row.pid));
+    const existingManualAttachments = snapshot.attachments.filter((attachment) =>
+      attachment.id.startsWith(MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX),
+    );
+    const nextAttachments: TerminalAttachment[] = [];
+    const staleMarkerPaths: string[] = [];
+
+    for (const marker of markers) {
+      const network = this.registry.getNetwork(marker.networkId);
+      const terminalWindow = findTerminalWindowForMarker(marker, terminalWindows);
+
+      if (network === undefined) {
+        staleMarkerPaths.push(marker.filePath);
+        continue;
+      }
+
+      if (terminalWindow === undefined) {
+        if (marker.pid !== undefined && !liveProcessIds.has(marker.pid)) {
+          staleMarkerPaths.push(marker.filePath);
+        }
+        continue;
+      }
+
+      const existingNonManualAttachment = snapshot.attachments.find(
+        (attachment) =>
+          !attachment.id.startsWith(MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX) &&
+          (attachment.terminalWindowId === terminalWindow.id || attachment.rootPid === terminalWindow.rootPid),
+      );
+
+      if (existingNonManualAttachment !== undefined) {
+        continue;
+      }
+
+      nextAttachments.push({
+        id: createManualTerminalAttachmentId(marker.networkId, terminalWindow.id),
+        networkId: network.id,
+        rootPid: terminalWindow.rootPid,
+        processGroupId: terminalWindow.processGroupId ?? marker.processGroupId,
+        terminalWindowId: terminalWindow.id,
+        terminalTitle: terminalWindow.title,
+        mode: "isolated",
+        status: "attached",
+        attachedAt: marker.attachedAt,
+      });
+    }
+
+    for (const attachment of existingManualAttachments) {
+      this.registry.removeAttachment(attachment.id);
+    }
+
+    for (const attachment of nextAttachments) {
+      this.registry.addAttachment(attachment);
+    }
+
+    for (const markerPath of staleMarkerPaths) {
+      await fs.rm(markerPath, { force: true }).catch(() => undefined);
+    }
+  }
+
+  /** Reads all manually pasted terminal attachment markers from global storage. */
+  private async readManualTerminalAttachmentMarkers(): Promise<readonly TerminalAttachmentMarker[]> {
+    const markerDirectory = this.getTerminalAttachmentMarkerDirectoryPath();
+    let entries: readonly Dirent[];
+
+    try {
+      entries = await fs.readdir(markerDirectory, { withFileTypes: true });
+    } catch (error) {
+      if (isNodeErrorWithCode(error, "ENOENT")) {
+        return [];
+      }
+      throw error;
+    }
+
+    const markers: TerminalAttachmentMarker[] = [];
+
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".tsv")) {
+        continue;
+      }
+
+      const filePath = path.join(markerDirectory, entry.name);
+      const contents = await fs.readFile(filePath, "utf8").catch(() => undefined);
+      const marker = contents === undefined ? undefined : parseTerminalAttachmentMarker(contents, filePath);
+
+      if (marker !== undefined) {
+        markers.push(marker);
+      }
+    }
+
+    return markers;
+  }
+
+  /** Removes marker files that belong to one visible terminal window. */
+  private async removeManualTerminalAttachmentMarkersForTerminalWindow(
+    terminalWindow: TerminalWindow,
+  ): Promise<void> {
+    const markers = await this.readManualTerminalAttachmentMarkers();
+
+    await Promise.all(
+      markers
+        .filter((marker) => isTerminalWindowMarkerMatch(marker, terminalWindow))
+        .map((marker) => fs.rm(marker.filePath, { force: true }).catch(() => undefined)),
+    );
+  }
+
+  /** Removes marker files scoped to a network being deleted. */
+  private async removeManualTerminalAttachmentMarkersForNetwork(networkId: string): Promise<void> {
+    const markers = await this.readManualTerminalAttachmentMarkers();
+
+    await Promise.all(
+      markers
+        .filter((marker) => marker.networkId === networkId)
+        .map((marker) => fs.rm(marker.filePath, { force: true }).catch(() => undefined)),
+    );
+  }
+
+  /** Clears every manual marker when the user asks for a global terminal reset. */
+  private async clearManualTerminalAttachmentMarkers(): Promise<void> {
+    await fs.rm(this.getTerminalAttachmentMarkerDirectoryPath(), { recursive: true, force: true });
+  }
+
+  /** Directory shared between copied shell snippets and extension-side refresh. */
+  private getTerminalAttachmentMarkerDirectoryPath(): string {
+    return path.join(this.context.globalStorageUri.fsPath, TERMINAL_ATTACHMENT_MARKER_DIRECTORY_NAME);
+  }
+
   /** Builds the shell commands that make later child processes join one logical network scope. */
   private buildTerminalRoutingScript(networkId: string, settings: PortManagerSettings): string {
     const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
@@ -1261,6 +1660,8 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_ROUTES_FILE", getRouteTablePathForNetwork(networkId)),
       shellExport("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath()),
       shellExport("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath()),
+      shellExport("PORT_MANAGER_TERMINAL_ATTACHMENT_DIR", this.getTerminalAttachmentMarkerDirectoryPath()),
+      buildTerminalAttachmentMarkerWriteShell(),
       buildComposeProjectRoutingShell(this.getComposeProjectRoutingFilePath()),
       shellExport("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange)),
       shellExport("PORT_MANAGER_ROUTING_MODE", settings.routingMode),
@@ -1315,6 +1716,7 @@ export class PortManagerNetworkService implements DisposableLike {
       "PORT_MANAGER_ROUTES_FILE",
       "PORT_MANAGER_COMPOSE_ROUTING_FILE",
       "PORT_MANAGER_HOST_ACCESS_FILE",
+      "PORT_MANAGER_TERMINAL_ATTACHMENT_DIR",
       "PORT_MANAGER_SCAN_RANGE",
       "PORT_MANAGER_ROUTING_MODE",
       "PORT_MANAGER_VIRTUAL_PORT_START",
@@ -1323,7 +1725,7 @@ export class PortManagerNetworkService implements DisposableLike {
       "PORT_MANAGER_DYLD_INSERT_LIBRARIES",
       RUNTIME_SHIM_DIRECTORY_ENV,
     ];
-    const commands = variables.map((variable) => `unset ${variable}`);
+    const commands = [buildTerminalAttachmentMarkerRemoveShell(), ...variables.map((variable) => `unset ${variable}`)];
 
     if (process.platform === "darwin") {
       commands.push(
@@ -1424,7 +1826,9 @@ export interface ComposePublishedPortInput {
 }
 
 /** Includes VS Code integrated terminals in the same model as OS-discovered shells. */
-async function listVscodeTerminalCandidates(): Promise<readonly TerminalCandidate[]> {
+async function listVscodeTerminalCandidates(
+  processRows: readonly ProcessTableRow[],
+): Promise<readonly TerminalCandidate[]> {
   const terminals: Array<TerminalCandidate | undefined> = await Promise.all(
     vscode.window.terminals.map(async (terminal) => {
       let pid: number | undefined;
@@ -1439,8 +1843,12 @@ async function listVscodeTerminalCandidates(): Promise<readonly TerminalCandidat
         return undefined;
       }
 
+      const processContext = findTerminalProcessContext(processRows, pid);
       return {
         pid,
+        parentPid: processContext?.parentPid,
+        processGroupId: processContext?.processGroupId,
+        terminalId: processContext?.terminalId,
         name: terminal.name,
         windowTitle: terminal.name,
         command: terminal.name,
@@ -1450,6 +1858,34 @@ async function listVscodeTerminalCandidates(): Promise<readonly TerminalCandidat
   );
 
   return terminals.filter((candidate): candidate is TerminalCandidate => candidate !== undefined);
+}
+
+interface TerminalProcessContext {
+  readonly parentPid?: number;
+  readonly processGroupId?: number;
+  readonly terminalId?: string;
+}
+
+/** Enriches VS Code terminal API rows with OS process identity used for grouping and control. */
+function findTerminalProcessContext(
+  processRows: readonly ProcessTableRow[],
+  terminalProcessId: number,
+): TerminalProcessContext | undefined {
+  const processContext = buildProcessTreeContext(processRows, terminalProcessId);
+  if (processContext === undefined) {
+    return undefined;
+  }
+
+  const processGroupId = processContext.row.processGroupId;
+  const terminalId =
+    processContext.row.terminalId ??
+    processRows.find((row) => row.processGroupId === processGroupId && row.terminalId !== undefined)?.terminalId;
+
+  return {
+    parentPid: processContext.row.parentPid,
+    processGroupId,
+    terminalId,
+  };
 }
 
 function requireNetwork(network: LogicalNetwork | undefined, networkId: string): LogicalNetwork {
@@ -1599,6 +2035,18 @@ function requireContainerLevelRuntime(runtime: NetworkRuntimeDescriptor): void {
   );
 }
 
+/** Window-wide terminal defaults require env collection based native hook routing. */
+function requireNativeHelperRuntime(runtime: NetworkRuntimeDescriptor): void {
+  if (runtime.kind === "nativeHelper") {
+    return;
+  }
+
+  throw new Error(
+    `${runtime.name} cannot attach every new VS Code terminal from environment variables. ` +
+      "Use a Borrowed Network native hook runtime for VS Code-window terminal defaults.",
+  );
+}
+
 /** True for runtimes selectable when creating a logical network. */
 function isContainerLevelRuntime(runtime: NetworkRuntimeDescriptor): boolean {
   return runtime.capabilities.supportsSameInternalPorts && runtime.capabilities.supportsTerminalAttach;
@@ -1633,6 +2081,11 @@ function nativeHookPlatformName(): string {
     default:
       return process.platform;
   }
+}
+
+/** Returns the packaged helper that can feed input into generic PTY-backed terminals. */
+function getTtyInputHelperRelativePath(): string {
+  return path.join("media", "native", "portmanager_tty_input");
 }
 
 /** Fails before route rows can persist invalid TCP endpoint state. */
@@ -1737,27 +2190,36 @@ function toHostPortProxyTarget(target: ContainerRuntimeTarget): HostPortProxyTar
 }
 
 /** Sends a command into a terminal window using the best available platform route. */
-async function sendCommandToTerminalWindow(terminalWindow: TerminalWindow, command: string): Promise<boolean> {
-  if (terminalWindow.source === "vscode" && (await sendCommandToVscodeTerminal(terminalWindow, command))) {
+async function sendCommandToTerminalWindow(
+  terminalWindow: TerminalWindow,
+  command: string,
+  processRows: readonly ProcessTableRow[] = [],
+  ttyInputHelperPath?: string,
+): Promise<boolean> {
+  if (await sendCommandToVscodeTerminal(terminalWindow, command, processRows)) {
     return true;
   }
 
-  return sendCommandToExternalTerminalWindow(terminalWindow, command);
+  return sendCommandToExternalTerminalWindow(terminalWindow, command, ttyInputHelperPath);
 }
 
 /** Sends a command into an integrated terminal without relying on OS window automation. */
 async function sendRoutingScriptToVscodeTerminal(
   terminalWindow: TerminalWindow,
   script: string,
+  processRows: readonly ProcessTableRow[] = [],
 ): Promise<boolean> {
-  return sendCommandToVscodeTerminal(terminalWindow, script);
+  return sendCommandToVscodeTerminal(terminalWindow, script, processRows);
 }
 
 /** Sends a command into an integrated terminal without relying on OS window automation. */
 async function sendCommandToVscodeTerminal(
   terminalWindow: TerminalWindow,
   command: string,
+  processRows: readonly ProcessTableRow[] = [],
 ): Promise<boolean> {
+  const nameMatchedTerminals: vscode.Terminal[] = [];
+
   for (const terminal of vscode.window.terminals) {
     let processId: number | undefined;
 
@@ -1767,7 +2229,11 @@ async function sendCommandToVscodeTerminal(
       processId = undefined;
     }
 
-    if (processId === undefined || !terminalWindow.candidatePids.includes(processId)) {
+    if (isVscodeTerminalNameMatch(terminalWindow, terminal)) {
+      nameMatchedTerminals.push(terminal);
+    }
+
+    if (processId === undefined || !isVscodeTerminalProcessMatch(terminalWindow, processId, processRows)) {
       continue;
     }
 
@@ -1775,28 +2241,226 @@ async function sendCommandToVscodeTerminal(
     return true;
   }
 
+  if (nameMatchedTerminals.length === 1) {
+    nameMatchedTerminals[0].sendText(command, true);
+    return true;
+  }
+
+  if (
+    vscode.window.activeTerminal !== undefined &&
+    isVscodeTerminalNameMatch(terminalWindow, vscode.window.activeTerminal)
+  ) {
+    vscode.window.activeTerminal.sendText(command, true);
+    return true;
+  }
+
   return false;
+}
+
+/** Matches process-less VS Code pseudoterminals by stable display names only when unambiguous. */
+function isVscodeTerminalNameMatch(terminalWindow: TerminalWindow, terminal: vscode.Terminal): boolean {
+  const terminalName = normalizeTerminalDisplayName(terminal.name);
+  const windowTitle = normalizeTerminalDisplayName(terminalWindow.title);
+  const terminalId = normalizeTerminalDisplayName(terminalWindow.terminalId);
+
+  return (
+    terminalName.length > 0 &&
+    (terminalName === windowTitle ||
+      (terminalId.length > 0 && (terminalName === terminalId || terminalName === `Terminal ${terminalId}`)))
+  );
+}
+
+/** Keeps terminal display-name comparisons insensitive to /dev prefixes and whitespace churn. */
+function normalizeTerminalDisplayName(value: string | undefined): string {
+  return value?.trim().replace(/^\/dev\//, "") ?? "";
+}
+
+/** Matches VS Code's Terminal object process back to a terminal row discovered through ps/TTY. */
+function isVscodeTerminalProcessMatch(
+  terminalWindow: TerminalWindow,
+  terminalProcessId: number,
+  processRows: readonly ProcessTableRow[],
+): boolean {
+  if (
+    terminalWindow.rootPid === terminalProcessId ||
+    terminalWindow.processGroupId === terminalProcessId ||
+    terminalWindow.candidatePids.includes(terminalProcessId)
+  ) {
+    return true;
+  }
+
+  const processContext = buildProcessTreeContext(processRows, terminalProcessId);
+  if (processContext === undefined) {
+    return false;
+  }
+
+  if (processContext.ancestorPids.some((pid) => terminalWindow.candidatePids.includes(pid))) {
+    return true;
+  }
+
+  const terminalRowsByPid = new Map(processRows.map((row) => [row.pid, row]));
+  const relatedRows = [
+    processContext.row,
+    ...processContext.ancestorPids.flatMap((pid) => {
+      const row = terminalRowsByPid.get(pid);
+      return row === undefined ? [] : [row];
+    }),
+  ];
+
+  if (
+    terminalWindow.processGroupId !== undefined &&
+    relatedRows.some((row) => row.processGroupId === terminalWindow.processGroupId)
+  ) {
+    return true;
+  }
+
+  const terminalId = normalizeProcessTerminalId(terminalWindow.terminalId);
+  return (
+    terminalId !== undefined &&
+    relatedRows.some((row) => normalizeProcessTerminalId(row.terminalId) === terminalId)
+  );
+}
+
+/** Normalizes ps and AppleScript TTY spellings to the same compact id. */
+function normalizeProcessTerminalId(value: string | undefined): string | undefined {
+  const normalized = value?.trim().replace(/^\/dev\//, "");
+  return normalized === undefined || normalized.length === 0 || normalized === "?" ? undefined : normalized;
+}
+
+/** Finds the visible terminal window that corresponds to a manually executed routing script. */
+function findTerminalWindowForMarker(
+  marker: TerminalAttachmentMarker,
+  terminalWindows: readonly TerminalWindow[],
+): TerminalWindow | undefined {
+  return terminalWindows.find((terminalWindow) => isTerminalWindowMarkerMatch(marker, terminalWindow));
+}
+
+/** Compares marker identity against the same grouped terminal model shown in the sidebar. */
+function isTerminalWindowMarkerMatch(marker: TerminalAttachmentMarker, terminalWindow: TerminalWindow): boolean {
+  const markerTerminalId = normalizeProcessTerminalId(marker.terminalId);
+  const terminalWindowId = normalizeProcessTerminalId(terminalWindow.terminalId);
+
+  if (markerTerminalId !== undefined && terminalWindowId === markerTerminalId) {
+    return true;
+  }
+
+  if (
+    marker.pid !== undefined &&
+    (terminalWindow.rootPid === marker.pid || terminalWindow.candidatePids.includes(marker.pid))
+  ) {
+    return true;
+  }
+
+  return marker.processGroupId !== undefined && terminalWindow.processGroupId === marker.processGroupId;
+}
+
+/** Keeps manual attachment ids deterministic so refresh can update them idempotently. */
+function createManualTerminalAttachmentId(networkId: string, terminalWindowId: string): string {
+  return `${MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX}${encodeURIComponent(networkId)}:${encodeURIComponent(
+    terminalWindowId,
+  )}`;
+}
+
+/** Parses the TSV marker emitted by copied routing scripts. */
+function parseTerminalAttachmentMarker(contents: string, filePath: string): TerminalAttachmentMarker | undefined {
+  const line = contents.split(/\r?\n/).find((item) => item.trim().length > 0);
+
+  if (line === undefined) {
+    return undefined;
+  }
+
+  const [networkIdText, terminalIdText, pidText, processGroupIdText, attachedAtText] = line.split("\t");
+  const networkId = networkIdText?.trim();
+
+  if (networkId === undefined || networkId.length === 0) {
+    return undefined;
+  }
+
+  const attachedAt =
+    attachedAtText !== undefined && Number.isFinite(Date.parse(attachedAtText.trim()))
+      ? attachedAtText.trim()
+      : new Date().toISOString();
+
+  return {
+    networkId,
+    terminalId: normalizeProcessTerminalId(terminalIdText),
+    pid: parseOptionalPositiveInteger(pidText),
+    processGroupId: parseOptionalPositiveInteger(processGroupIdText),
+    attachedAt,
+    filePath,
+  };
+}
+
+/** Parses optional shell marker ids without treating blanks as zero. */
+function parseOptionalPositiveInteger(value: string | undefined): number | undefined {
+  const parsed = value === undefined || value.trim().length === 0 ? Number.NaN : Number.parseInt(value.trim(), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/** Sends a command to every integrated terminal owned by this VS Code window. */
+function sendCommandToOpenVscodeTerminals(command: string): number {
+  let sentCount = 0;
+
+  for (const terminal of vscode.window.terminals) {
+    try {
+      terminal.sendText(command, true);
+      sentCount += 1;
+    } catch {
+      // A disposed terminal can remain visible briefly while VS Code settles events.
+    }
+  }
+
+  return sentCount;
 }
 
 /** Sends a routing script into Terminal.app or iTerm2 sessions selected by tty. */
 async function sendRoutingScriptToExternalTerminalWindow(
   terminalWindow: TerminalWindow,
   script: string,
+  ttyInputHelperPath?: string,
 ): Promise<boolean> {
-  return sendCommandToExternalTerminalWindow(terminalWindow, script);
+  return sendCommandToExternalTerminalWindow(terminalWindow, script, ttyInputHelperPath);
 }
 
 /** Sends a command into Terminal.app or iTerm2 sessions selected by tty. */
 async function sendCommandToExternalTerminalWindow(
   terminalWindow: TerminalWindow,
   command: string,
+  ttyInputHelperPath?: string,
 ): Promise<boolean> {
   if (process.platform !== "darwin" || terminalWindow.terminalId === undefined) {
-    return false;
+    return terminalWindow.terminalId === undefined
+      ? false
+      : runGenericTtyInput(normalizeTerminalTty(terminalWindow.terminalId), command, ttyInputHelperPath);
   }
 
   const tty = normalizeTerminalTty(terminalWindow.terminalId);
-  return (await runTerminalAppleScript(tty, command)) || (await runITermAppleScript(tty, command));
+  return (
+    (await runGenericTtyInput(tty, command, ttyInputHelperPath)) ||
+    (await runTerminalAppleScript(tty, command)) ||
+    (await runITermAppleScript(tty, command))
+  );
+}
+
+/** Generic PTY input fallback for terminals that are not exposed through VS Code, Terminal.app, or iTerm2 APIs. */
+async function runGenericTtyInput(
+  tty: string,
+  command: string,
+  ttyInputHelperPath: string | undefined,
+): Promise<boolean> {
+  if (ttyInputHelperPath === undefined || process.platform === "win32") {
+    return false;
+  }
+
+  try {
+    await execFileAsync(ttyInputHelperPath, [tty, command], {
+      timeout: 1500,
+      maxBuffer: 256 * 1024,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Terminal.app exposes tty on each tab, which lets us target a window without matching titles. */
@@ -1858,6 +2522,36 @@ function normalizeTerminalTty(terminalId: string): string {
   return terminalId.startsWith("/dev/") ? terminalId : path.join("/dev", terminalId);
 }
 
+/** Shell fragment that records a manually routed shell for later sidebar refresh. */
+function buildTerminalAttachmentMarkerWriteShell(): string {
+  return [
+    'mkdir -p "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR" 2>/dev/null || true',
+    '__pm_tty="$(tty 2>/dev/null || true)"',
+    '__pm_tty="${__pm_tty#/dev/}"',
+    'if [ "$__pm_tty" = "not a tty" ]; then __pm_tty=""; fi',
+    '__pm_pid="$$"',
+    '__pm_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d " " || true)"',
+    '__pm_marker_key="$(printf \'%s\' "${__pm_tty:-pid-$__pm_pid}" | sed \'s#[^A-Za-z0-9._-]#_#g\')"',
+    'printf \'%s\\t%s\\t%s\\t%s\\t%s\\n\' "$PORT_MANAGER_NETWORK_ID" "$__pm_tty" "$__pm_pid" "$__pm_pgid" "$(date -u \'+%Y-%m-%dT%H:%M:%SZ\' 2>/dev/null || date \'+%Y-%m-%dT%H:%M:%SZ\')" > "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR/$__pm_marker_key.tsv" 2>/dev/null || true',
+    "unset __pm_tty __pm_pid __pm_pgid __pm_marker_key",
+  ].join("; ");
+}
+
+/** Shell fragment that removes the marker for the current shell before env reset. */
+function buildTerminalAttachmentMarkerRemoveShell(): string {
+  return [
+    'if [ -n "${PORT_MANAGER_TERMINAL_ATTACHMENT_DIR:-}" ]; then',
+    '__pm_tty="$(tty 2>/dev/null || true)"',
+    '__pm_tty="${__pm_tty#/dev/}"',
+    'if [ "$__pm_tty" = "not a tty" ]; then __pm_tty=""; fi',
+    '__pm_pid="$$"',
+    '__pm_marker_key="$(printf \'%s\' "${__pm_tty:-pid-$__pm_pid}" | sed \'s#[^A-Za-z0-9._-]#_#g\')"',
+    'rm -f "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR/$__pm_marker_key.tsv" 2>/dev/null || true',
+    "unset __pm_tty __pm_pid __pm_marker_key",
+    "fi",
+  ].join("; ");
+}
+
 function shellExport(name: string, value: string): string {
   return `export ${name}=${shellQuote(value)}`;
 }
@@ -1876,6 +2570,10 @@ function shellPatternLiteral(value: string): string {
 
 function appleScriptString(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function isNodeErrorWithCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
 function isNetworkScopedComposeRoute(route: LogicalPortRoute): boolean {

@@ -3,6 +3,16 @@ import { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import { LocalAgentClient } from "./local-agent-client";
 import { PortManagerCommandController } from "./commands";
 import { PortManagerNetworkService } from "./network-service";
+import type { LogicalNetwork } from "../shared/types";
+
+export interface PortManagerExtensionApi {
+  /** Lists logical networks so terminal-owning extensions can choose one without importing UI code. */
+  listLogicalNetworks(): readonly LogicalNetwork[];
+  /** Returns a shell snippet that the caller can write into its own terminal stdin. */
+  getTerminalRoutingScript(input: { readonly networkId: string }): Promise<string>;
+  /** Returns a shell snippet that clears Port Manager routing variables. */
+  getTerminalDetachScript(): string;
+}
 
 /**
  * VS Code activation entry point for Port Manager.
@@ -11,7 +21,7 @@ import { PortManagerNetworkService } from "./network-service";
  * platform adapters through interfaces, UI reads from the registry, and command
  * handlers orchestrate user workflows.
  */
-export function activate(context: vscode.ExtensionContext): void {
+export function activate(context: vscode.ExtensionContext): PortManagerExtensionApi {
   const processService = new LocalAgentClient(context);
   const networkService = new PortManagerNetworkService(context, processService);
   const treeProvider = new PortManagerTreeProvider(networkService);
@@ -33,10 +43,20 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   commandController.register(context);
-  void networkService.start().catch((error) => {
+  const startPromise = networkService.start();
+  void startPromise.catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     void vscode.window.showErrorMessage(`Port Manager network service failed to start: ${message}`);
   });
+
+  return {
+    listLogicalNetworks: () => networkService.getSnapshot().networks,
+    getTerminalRoutingScript: async (input) => {
+      await startPromise;
+      return networkService.createTerminalRoutingScript(input.networkId);
+    },
+    getTerminalDetachScript: () => networkService.createTerminalDetachScript(),
+  };
 }
 
 /**

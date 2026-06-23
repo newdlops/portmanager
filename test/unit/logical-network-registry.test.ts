@@ -209,6 +209,39 @@ test("groups noisy terminal process candidates into terminal windows", () => {
   assert.equal(windows[1]?.title, "API server terminal");
 });
 
+test("merges VS Code terminal candidates with OS rows that share a tty", () => {
+  const registry = new LogicalNetworkRegistry([runtime]);
+  registry.setTerminalCandidates([
+    {
+      pid: 200,
+      parentPid: 1,
+      processGroupId: 200,
+      terminalId: "ttys007",
+      name: "API server terminal",
+      windowTitle: "API server terminal",
+      command: "API server terminal",
+      vscodeTerminal: true,
+    },
+    {
+      pid: 201,
+      parentPid: 200,
+      processGroupId: 200,
+      terminalId: "ttys007",
+      name: "zsh",
+      command: "/bin/zsh -il",
+      vscodeTerminal: false,
+    },
+  ]);
+
+  const windows = registry.getSnapshot().terminalWindows;
+
+  assert.equal(windows.length, 1);
+  assert.equal(windows[0]?.id, "tty:ttys007");
+  assert.equal(windows[0]?.source, "vscode");
+  assert.equal(windows[0]?.title, "API server terminal");
+  assert.deepEqual(windows[0]?.candidatePids, [200, 201]);
+});
+
 test("rejects duplicate host exposures for the same address and port", () => {
   const registry = new LogicalNetworkRegistry([runtime]);
   registry.addNetwork(createNetwork());

@@ -83,6 +83,22 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.attachTerminalToNetwork", (argument) =>
       this.attachTerminalToNetwork(argument),
     );
+    this.registerCommand(context, "portManager.attachVscodeWindowTerminalsToNetwork", (argument) =>
+      this.attachVscodeWindowTerminalsToNetwork(argument),
+    );
+    this.registerCommand(context, "portManager.detachVscodeWindowTerminalsFromNetwork", () =>
+      this.detachVscodeWindowTerminalsFromNetwork(),
+    );
+    this.registerCommand(context, "portManager.copyTerminalRoutingScript", (argument) =>
+      this.copyTerminalRoutingScript(argument),
+    );
+    this.registerApiCommand(context, "portManager.listLogicalNetworks", () => this.listLogicalNetworks());
+    this.registerApiCommand(context, "portManager.getTerminalRoutingScript", (argument) =>
+      this.getTerminalRoutingScript(argument),
+    );
+    this.registerApiCommand(context, "portManager.getTerminalDetachScript", () =>
+      this.dependencies.networkService.createTerminalDetachScript(),
+    );
     this.registerCommand(context, "portManager.attachContainerToNetwork", (argument) =>
       this.attachContainerToNetwork(argument),
     );
@@ -207,11 +223,104 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
-    const attachment = await this.dependencies.networkService.attachTerminalWindow(network.id, terminalWindow.id);
+    let attachment: TerminalAttachment;
+    try {
+      attachment = await this.dependencies.networkService.attachTerminalWindow(network.id, terminalWindow.id);
+    } catch (error) {
+      if (await this.offerTerminalRoutingScriptFallback(error, network, terminalWindow)) {
+        return;
+      }
+
+      throw error;
+    }
     this.dependencies.treeProvider.refresh();
 
     await vscode.window.showInformationMessage(
       `Attached "${terminalWindow.title}" to "${network.name}" (${attachment.mode ?? "isolated"} mode).`,
+    );
+  }
+
+  /** Applies one logical network to every new terminal opened by this VS Code window. */
+  private async attachVscodeWindowTerminalsToNetwork(argument: unknown): Promise<void> {
+    const network = await this.resolveNetworkArgument(argument, "Attach VS Code Window Terminals to Network");
+    if (network === undefined) {
+      return;
+    }
+
+    const result = await this.dependencies.networkService.attachVscodeWindowTerminalsToNetwork(network.id);
+    this.dependencies.treeProvider.refresh();
+
+    await vscode.window.showInformationMessage(
+      `VS Code window terminals now use "${network.name}". Updated ${result.injectedTerminalCount} open terminal${result.injectedTerminalCount === 1 ? "" : "s"}.`,
+    );
+  }
+
+  /** Clears the current VS Code window-wide terminal network default. */
+  private async detachVscodeWindowTerminalsFromNetwork(): Promise<void> {
+    const result = await this.dependencies.networkService.detachVscodeWindowTerminalsFromNetwork();
+    this.dependencies.treeProvider.refresh();
+
+    await vscode.window.showInformationMessage(
+      result.removedBinding
+        ? `VS Code window terminal network cleared. Updated ${result.detachedTerminalCount} open terminal${result.detachedTerminalCount === 1 ? "" : "s"}.`
+        : "No VS Code window terminal network was active.",
+    );
+  }
+
+  /** Returns logical networks for external terminal-owning extensions. */
+  private listLogicalNetworks(): readonly LogicalNetwork[] {
+    return this.dependencies.networkService.getSnapshot().networks;
+  }
+
+  /** Returns a shell snippet that another extension can write to its custom terminal stdin. */
+  private async getTerminalRoutingScript(argument: unknown): Promise<string> {
+    const network = this.resolveNetworkForApi(argument);
+    return this.dependencies.networkService.createTerminalRoutingScript(network.id);
+  }
+
+  /** Offers a generic clipboard fallback when no controllable terminal input path exists. */
+  private async offerTerminalRoutingScriptFallback(
+    error: unknown,
+    network: LogicalNetwork,
+    terminalWindow: TerminalWindow,
+  ): Promise<boolean> {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/Could not (find|inject|send)/i.test(message)) {
+      return false;
+    }
+
+    const selection = await vscode.window.showWarningMessage(
+      `Could not write to "${terminalWindow.title}" automatically. Copy the routing script and paste it into that terminal prompt.`,
+      "Copy Script",
+      "Show Error",
+    );
+
+    if (selection === "Show Error") {
+      throw error;
+    }
+    if (selection !== "Copy Script") {
+      return true;
+    }
+
+    const script = await this.dependencies.networkService.createTerminalRoutingScript(network.id);
+    await vscode.env.clipboard.writeText(script);
+    await vscode.window.showInformationMessage(
+      `Copied terminal routing script for "${network.name}". Paste it into "${terminalWindow.title}".`,
+    );
+    return true;
+  }
+
+  /** Copies a terminal attach script for custom terminal UIs that own their own stdin. */
+  private async copyTerminalRoutingScript(argument: unknown): Promise<void> {
+    const network = await this.resolveNetworkArgument(argument, "Copy Terminal Routing Script");
+    if (network === undefined) {
+      return;
+    }
+
+    const script = await this.dependencies.networkService.createTerminalRoutingScript(network.id);
+    await vscode.env.clipboard.writeText(script);
+    await vscode.window.showInformationMessage(
+      `Copied terminal routing script for "${network.name}". Paste it into the custom terminal prompt.`,
     );
   }
 
@@ -1058,6 +1167,42 @@ export class PortManagerCommandController implements DisposableLike {
     return selected?.network;
   }
 
+  /** Resolves a network for machine-facing API commands without opening UI prompts. */
+  private resolveNetworkForApi(argument: unknown): LogicalNetwork {
+    const networks = this.dependencies.networkService.getSnapshot().networks;
+    const directNetwork = getLogicalNetworkFromCommandArgument(argument);
+    const input = parseNetworkApiInput(argument);
+    const networkId = directNetwork?.id ?? input.networkId;
+    const networkName = directNetwork?.name ?? input.networkName;
+
+    if (networkId !== undefined) {
+      const network = networks.find((item) => item.id === networkId);
+      if (network !== undefined) {
+        return network;
+      }
+
+      throw new Error(`Unknown logical network: ${networkId}`);
+    }
+
+    if (networkName !== undefined) {
+      const matches = networks.filter((item) => item.name === networkName);
+      if (matches.length === 1) {
+        return matches[0];
+      }
+      if (matches.length > 1) {
+        throw new Error(`Multiple logical networks are named "${networkName}". Pass networkId instead.`);
+      }
+
+      throw new Error(`Unknown logical network: ${networkName}`);
+    }
+
+    if (networks.length === 1) {
+      return networks[0];
+    }
+
+    throw new Error("Pass networkId to choose a logical network.");
+  }
+
   /** Resolves a terminal window from tree context or Quick Pick. */
   private async resolveTerminalWindowArgument(argument: unknown, title: string): Promise<TerminalWindow | undefined> {
     const terminalWindow = getTerminalWindowFromCommandArgument(argument);
@@ -1253,6 +1398,18 @@ export class PortManagerCommandController implements DisposableLike {
         await showCommandError(error);
       }
     });
+
+    context.subscriptions.push(disposable);
+    this.disposables.push(disposable);
+  }
+
+  /** Registers machine-facing commands that return values to other extensions. */
+  private registerApiCommand<T>(
+    context: vscode.ExtensionContext,
+    command: string,
+    handler: (...args: unknown[]) => Promise<T> | T,
+  ): void {
+    const disposable = vscode.commands.registerCommand(command, (...args: unknown[]) => handler(...args));
 
     context.subscriptions.push(disposable);
     this.disposables.push(disposable);
@@ -1617,6 +1774,42 @@ function getAttachTerminalInput(argument: unknown): AttachTerminalCommandInput |
   return {
     terminalWindow: candidate.terminalWindow,
     network: candidate.network,
+  };
+}
+
+interface NetworkApiInput {
+  readonly networkId?: string;
+  readonly networkName?: string;
+}
+
+/** Accepts compact command input from external extensions without importing Port Manager types. */
+function parseNetworkApiInput(argument: unknown): NetworkApiInput {
+  if (typeof argument !== "object" || argument === null) {
+    return {};
+  }
+
+  const candidate = argument as {
+    readonly id?: unknown;
+    readonly name?: unknown;
+    readonly networkId?: unknown;
+    readonly networkName?: unknown;
+  };
+  const networkId =
+    typeof candidate.networkId === "string"
+      ? candidate.networkId
+      : typeof candidate.id === "string"
+        ? candidate.id
+        : undefined;
+  const networkName =
+    typeof candidate.networkName === "string"
+      ? candidate.networkName
+      : typeof candidate.name === "string"
+        ? candidate.name
+        : undefined;
+
+  return {
+    ...(networkId !== undefined ? { networkId } : {}),
+    ...(networkName !== undefined ? { networkName } : {}),
   };
 }
 

@@ -17,6 +17,7 @@ import type {
   TerminalAttachment,
   TerminalCandidate,
   TerminalWindow,
+  VscodeWindowTerminalBinding,
 } from "../../shared/types";
 
 /**
@@ -58,6 +59,7 @@ type PortManagerTreeItem =
   | ComposeProjectCandidateTreeItem
   | ContainerServiceCandidateTreeItem
   | ContainerPublishedPortTreeItem
+  | VscodeWindowTerminalBindingTreeItem
   | TerminalAttachmentTreeItem
   | ComposeAttachmentTreeItem
   | HostPortExposureTreeItem
@@ -168,7 +170,12 @@ export class PortManagerTreeProvider
     if (element === undefined) {
       return [
         new TreeSectionItem("networks", "Logical Networks", `${snapshot.networks.length} networks`, "vm"),
-        new TreeSectionItem("terminals", "Terminal Windows", `${snapshot.terminalWindows.length} windows`, "terminal"),
+        new TreeSectionItem(
+          "terminals",
+          "Terminal Windows",
+          formatTerminalSectionDescription(snapshot.terminalWindows, snapshot.vscodeWindowTerminalBinding, snapshot.networks),
+          "terminal",
+        ),
         new TreeSectionItem(
           "containers",
           "Compose / Containers",
@@ -186,6 +193,9 @@ export class PortManagerTreeProvider
       const exposures = snapshot.exposures.filter((exposure) => exposure.networkId === element.network.id);
       const hostAccessBindings = snapshot.hostAccessBindings.filter((binding) => binding.networkId === element.network.id);
       const composeAttachments = snapshot.composeAttachments.filter((attachment) => attachment.networkId === element.network.id);
+      const windowTerminalBinding = snapshot.vscodeWindowTerminalBinding?.networkId === element.network.id
+        ? snapshot.vscodeWindowTerminalBinding
+        : undefined;
       return [
         new ActionTreeItem("Add Host Binding", "portManager.addHostPortExposure", "add", "Expose network port", element.network),
         new ActionTreeItem(
@@ -210,6 +220,20 @@ export class PortManagerTreeProvider
           { network: element.network },
         ),
         new ActionTreeItem(
+          "Use for VS Code Terminals",
+          "portManager.attachVscodeWindowTerminalsToNetwork",
+          "terminal",
+          "Attach this VS Code window",
+          element.network,
+        ),
+        new ActionTreeItem(
+          "Copy Terminal Script",
+          "portManager.copyTerminalRoutingScript",
+          "copy",
+          "Paste into custom terminal UI",
+          element.network,
+        ),
+        new ActionTreeItem(
           "Save Binding Preset",
           "portManager.saveBindingPreset",
           "save",
@@ -229,8 +253,15 @@ export class PortManagerTreeProvider
         ...exposures.map((exposure) => new HostPortExposureTreeItem(exposure, [element.network])),
         ...hostAccessBindings.map((binding) => new HostAccessBindingTreeItem(binding)),
         ...composeAttachments.map((attachment) => new ComposeAttachmentTreeItem(attachment)),
+        ...(windowTerminalBinding !== undefined
+          ? [new VscodeWindowTerminalBindingTreeItem(windowTerminalBinding, element.network)]
+          : []),
         ...attachments.map((attachment) => new TerminalAttachmentTreeItem(attachment)),
-        ...(attachments.length === 0 && exposures.length === 0 && hostAccessBindings.length === 0 && composeAttachments.length === 0
+        ...(attachments.length === 0 &&
+        exposures.length === 0 &&
+        hostAccessBindings.length === 0 &&
+        composeAttachments.length === 0 &&
+        windowTerminalBinding === undefined
           ? [new EmptyTreeItem("No bindings or terminal windows", "Attach a window or add a host binding")]
           : []),
       ];
@@ -275,8 +306,17 @@ export class PortManagerTreeProvider
       case "terminals":
         return [
           new ActionTreeItem("Refresh Terminal Windows", "portManager.refreshTerminals", "refresh"),
-          new ActionTreeItem("Attach Window to Network", "portManager.attachTerminalToNetwork", "debug-console"),
+          new ActionTreeItem("Attach VS Code Window", "portManager.attachVscodeWindowTerminalsToNetwork", "terminal"),
+          new ActionTreeItem("Detach VS Code Window", "portManager.detachVscodeWindowTerminalsFromNetwork", "debug-disconnect"),
           new ActionTreeItem("Reset Terminal Network", "portManager.resetTerminalNetworkSettings", "debug-disconnect"),
+          ...(snapshot.vscodeWindowTerminalBinding !== undefined
+            ? [
+                new VscodeWindowTerminalBindingTreeItem(
+                  snapshot.vscodeWindowTerminalBinding,
+                  snapshot.networks.find((network) => network.id === snapshot.vscodeWindowTerminalBinding?.networkId),
+                ),
+              ]
+            : []),
           ...(snapshot.terminalWindows.length > 0
             ? snapshot.terminalWindows.map((window) => new TerminalWindowTreeItem(window))
             : [new EmptyTreeItem("No terminal windows discovered", "Open a shell and refresh")]),
@@ -541,6 +581,29 @@ export class TerminalAttachmentTreeItem extends vscode.TreeItem {
   }
 }
 
+/** Current VS Code window-wide terminal network default. */
+export class VscodeWindowTerminalBindingTreeItem extends vscode.TreeItem {
+  readonly contextValue = "vscodeWindowTerminalBinding";
+
+  constructor(
+    readonly binding: VscodeWindowTerminalBinding,
+    network: LogicalNetwork | undefined,
+  ) {
+    super("VS Code Window Terminals", vscode.TreeItemCollapsibleState.None);
+    this.id = binding.id;
+    this.description = network?.name ?? binding.networkId;
+    this.tooltip = buildVscodeWindowTerminalBindingTooltip(binding, network);
+    this.iconPath = new vscode.ThemeIcon(
+      binding.status === "attached" ? "terminal" : "warning",
+      binding.status === "error" ? new vscode.ThemeColor("testing.iconFailed") : undefined,
+    );
+    this.command = {
+      command: "portManager.detachVscodeWindowTerminalsFromNetwork",
+      title: "Detach VS Code Window Terminals",
+    };
+  }
+}
+
 /** Host exposure row backed by an active or failed local listener/proxy. */
 export class HostPortExposureTreeItem extends vscode.TreeItem {
   readonly contextValue: string;
@@ -705,6 +768,19 @@ function buildDaemonChildren(daemon: AgentDaemonStatus): PortManagerTreeItem[] {
 function formatDaemonSummary(daemon: AgentDaemonStatus): string {
   const version = daemon.restartRequired ? "stale" : (daemon.versionStatus ?? "unknown");
   return daemon.pid > 0 ? `${daemon.status} pid ${daemon.pid}, ${version}` : daemon.status;
+}
+
+function formatTerminalSectionDescription(
+  terminalWindows: readonly TerminalWindow[],
+  binding: VscodeWindowTerminalBinding | undefined,
+  networks: readonly LogicalNetwork[],
+): string {
+  if (binding === undefined) {
+    return `${terminalWindows.length} windows`;
+  }
+
+  const network = networks.find((item) => item.id === binding.networkId);
+  return `${terminalWindows.length} windows, ${network?.name ?? binding.networkId}`;
 }
 
 /** Counts non-detected process rows for the managed process section label. */
@@ -965,6 +1041,27 @@ function buildTerminalAttachmentTooltip(attachment: TerminalAttachment): vscode.
 
   if (attachment.errorMessage) {
     tooltip.appendMarkdown(`\nWarning: \`${escapeMarkdown(attachment.errorMessage)}\``);
+  }
+
+  return tooltip;
+}
+
+/** Builds tooltip details for the VS Code window-wide terminal default. */
+function buildVscodeWindowTerminalBindingTooltip(
+  binding: VscodeWindowTerminalBinding,
+  network: LogicalNetwork | undefined,
+): vscode.MarkdownString {
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.isTrusted = false;
+  tooltip.appendMarkdown("**VS Code Window Terminals**\n\n");
+  tooltip.appendMarkdown(`- Network: \`${escapeMarkdown(network?.name ?? binding.networkId)}\`\n`);
+  tooltip.appendMarkdown(`- Network ID: \`${escapeMarkdown(binding.networkId)}\`\n`);
+  tooltip.appendMarkdown(`- Status: \`${binding.status}\`\n`);
+  tooltip.appendMarkdown(`- Open Terminals Updated: \`${binding.injectedTerminalCount}\`\n`);
+  tooltip.appendMarkdown(`- Attached: \`${escapeMarkdown(binding.attachedAt)}\`\n`);
+
+  if (binding.errorMessage) {
+    tooltip.appendMarkdown(`\nWarning: \`${escapeMarkdown(binding.errorMessage)}\``);
   }
 
   return tooltip;

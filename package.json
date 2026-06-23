@@ -42,6 +42,12 @@
     "onCommand:portManager.refreshTerminals",
     "onCommand:portManager.refreshContainerServices",
     "onCommand:portManager.attachTerminalToNetwork",
+    "onCommand:portManager.attachVscodeWindowTerminalsToNetwork",
+    "onCommand:portManager.detachVscodeWindowTerminalsFromNetwork",
+    "onCommand:portManager.copyTerminalRoutingScript",
+    "onCommand:portManager.listLogicalNetworks",
+    "onCommand:portManager.getTerminalRoutingScript",
+    "onCommand:portManager.getTerminalDetachScript",
     "onCommand:portManager.attachContainerToNetwork",
     "onCommand:portManager.detachTerminalFromNetwork",
     "onCommand:portManager.resetTerminalNetworkSettings",
@@ -134,6 +140,24 @@
         "title": "Port Manager: Attach Terminal Window to Network",
         "category": "Port Manager",
         "icon": "$(debug-console)"
+      },
+      {
+        "command": "portManager.attachVscodeWindowTerminalsToNetwork",
+        "title": "Port Manager: Attach VS Code Window Terminals to Network",
+        "category": "Port Manager",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "portManager.detachVscodeWindowTerminalsFromNetwork",
+        "title": "Port Manager: Detach VS Code Window Terminals from Network",
+        "category": "Port Manager",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "portManager.copyTerminalRoutingScript",
+        "title": "Port Manager: Copy Terminal Routing Script",
+        "category": "Port Manager",
+        "icon": "$(copy)"
       },
       {
         "command": "portManager.attachContainerToNetwork",
@@ -426,19 +450,29 @@
           "group": "network@5"
         },
         {
-          "command": "portManager.saveBindingPreset",
+          "command": "portManager.attachVscodeWindowTerminalsToNetwork",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@6"
         },
         {
-          "command": "portManager.applyBindingPreset",
+          "command": "portManager.copyTerminalRoutingScript",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@7"
         },
         {
-          "command": "portManager.removeLogicalNetwork",
+          "command": "portManager.saveBindingPreset",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@8"
+        },
+        {
+          "command": "portManager.applyBindingPreset",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "network@9"
+        },
+        {
+          "command": "portManager.removeLogicalNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "network@10"
         },
         {
           "command": "portManager.refreshContainerServices",
@@ -471,8 +505,18 @@
           "group": "terminal@2"
         },
         {
+          "command": "portManager.attachVscodeWindowTerminalsToNetwork",
+          "when": "view == portManager.processes && viewItem == section.terminals",
+          "group": "terminal@2"
+        },
+        {
           "command": "portManager.resetTerminalNetworkSettings",
           "when": "view == portManager.processes && (viewItem == terminalWindow || viewItem == terminalAttachment)",
+          "group": "terminal@3"
+        },
+        {
+          "command": "portManager.detachVscodeWindowTerminalsFromNetwork",
+          "when": "view == portManager.processes && (viewItem == section.terminals || viewItem == vscodeWindowTerminalBinding)",
           "group": "terminal@3"
         },
         {

@@ -22,6 +22,16 @@ export function getAgentSocketPath(): string {
   return path.join(os.tmpdir(), `newdlops-portmanager-agent-${userId}.sock`);
 }
 
+/** Lock file used so concurrent VS Code windows do not spawn duplicate agents. */
+export function getAgentStartupLockPath(): string {
+  if (process.platform === "win32") {
+    return path.join(os.tmpdir(), "newdlops-portmanager-agent.lock");
+  }
+
+  const userId = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;
+  return path.join(os.tmpdir(), `newdlops-portmanager-agent-${userId}.lock`);
+}
+
 /**
  * Removes a stale Unix-domain socket after connection has already failed.
  * Active agents are not touched because a healthy socket would have accepted
