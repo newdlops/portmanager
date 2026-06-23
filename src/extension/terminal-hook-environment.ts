@@ -112,6 +112,7 @@ export function applyTerminalHookEnvironment(
 
   const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
   const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
+  const nativeAgentPath = context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
   const asdfShimLauncherPath = context.asAbsolutePath(getAsdfShimLauncherRelativePath());
   const shellEnvRestorePath = prepareShellEnvRestoreScript(context.globalStorageUri.fsPath, hookLibraryPath, {
     networkId: scope.networkId,
@@ -126,6 +127,7 @@ export function applyTerminalHookEnvironment(
   collection.replace("NEWDLOPS_PM_BORROWED_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_AGENT_MAIN", agentMainPath, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath, TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_ROUTES_FILE", getRouteTablePathForNetwork(scope.networkId), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath(), TERMINAL_MUTATOR_OPTIONS);

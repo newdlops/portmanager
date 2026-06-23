@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 import { spawn, type ChildProcess } from "node:child_process";
+import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
 import { getAgentSocketPath, removeStaleSocketFile } from "../agent/agent-socket";
+import { getDefaultRouteTablePath } from "../agent/route-table";
 import {
   encodeAgentMessage,
   NdjsonMessageBuffer,
@@ -99,7 +101,7 @@ async function main(args: readonly string[]): Promise<void> {
       return;
     }
 
-    const client = new AgentCliClient(resolveAgentMainPath());
+    const client = new AgentCliClient(resolveAgentMainPath(), resolveNativeAgentPath());
     await client.connectOrStart();
 
     if (parsed.command === "status") {
@@ -224,7 +226,10 @@ class AgentCliClient {
   /** Monotonic id suffix for this CLI process. */
   private nextRequestId = 1;
 
-  constructor(private readonly agentMainPath: string) {}
+  constructor(
+    private readonly agentMainPath: string,
+    private readonly nativeAgentPath: string,
+  ) {}
 
   /** Connects to an existing daemon or starts one from this extension package. */
   async connectOrStart(): Promise<void> {
@@ -287,11 +292,34 @@ class AgentCliClient {
     this.rejectAllPending(new Error("Port Manager CLI client disposed."));
   }
 
-  /** Starts the local daemon as a detached Node process. */
+  /** Starts the local daemon, preferring the native implementation when packaged. */
   private startAgentProcess(): void {
     const socketPath = getAgentSocketPath();
     removeStaleSocketFile(socketPath);
 
+    if (canRunNativeAgent(this.nativeAgentPath)) {
+      const child = spawn(
+        this.nativeAgentPath,
+        ["--socket", socketPath, "--route-table", getDefaultRouteTablePath(), "--agent-main", this.agentMainPath],
+        {
+          detached: true,
+          env: buildNodeRuntimeEnvironment(),
+          stdio: "ignore",
+          windowsHide: true,
+        },
+      );
+      child.once("error", () => {
+        this.startNodeAgentProcess(socketPath);
+      });
+      child.unref();
+      return;
+    }
+
+    this.startNodeAgentProcess(socketPath);
+  }
+
+  /** Starts the previous Node daemon when the native binary cannot be used. */
+  private startNodeAgentProcess(socketPath: string): void {
     const child = spawn(process.execPath, [this.agentMainPath, "--socket", socketPath], {
       detached: true,
       env: buildNodeRuntimeEnvironment(),
@@ -520,6 +548,24 @@ function openSocket(): Promise<net.Socket> {
 /** Finds the compiled daemon entrypoint relative to this compiled CLI file. */
 function resolveAgentMainPath(): string {
   return path.resolve(__dirname, "..", "agent", "agent-main.js");
+}
+
+/** Finds the packaged native daemon binary relative to the compiled CLI file. */
+function resolveNativeAgentPath(): string {
+  return path.resolve(__dirname, "..", "..", "..", "media", "native", "portmanager_agent");
+}
+
+function canRunNativeAgent(nativeAgentPath: string): boolean {
+  if (process.platform === "win32") {
+    return false;
+  }
+
+  try {
+    fs.accessSync(nativeAgentPath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Returns the child PID after Node has emitted spawn. */

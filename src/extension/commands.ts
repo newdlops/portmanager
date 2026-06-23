@@ -1080,6 +1080,7 @@ export class PortManagerCommandController implements DisposableLike {
     const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
     const asdfShimLauncherPath = context.asAbsolutePath(getAsdfShimLauncherRelativePath());
     const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
+    const nativeAgentPath = context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
     const hookDirectory = path.join(os.homedir(), ".portmanager");
     const hookScriptPath = path.join(hookDirectory, "portmanager-hook.sh");
     const shellProfilePaths = getShellProfilePaths();
@@ -1093,6 +1094,7 @@ export class PortManagerCommandController implements DisposableLike {
       buildShellHookScript({
         hookLibraryPath,
         agentMainPath,
+        nativeAgentPath,
         nodeExecutablePath: process.execPath,
         socketPath: getAgentSocketPath(),
         routeTablePath: getDefaultRouteTablePath(),
@@ -2146,6 +2148,8 @@ interface ShellHookScriptOptions {
   readonly hookLibraryPath: string;
   /** Agent entrypoint used when no daemon socket exists yet. */
   readonly agentMainPath: string;
+  /** Native daemon executable used before falling back to the Node entrypoint. */
+  readonly nativeAgentPath: string;
   /** Node or Electron executable used to run compiled extension JS in Node mode. */
   readonly nodeExecutablePath: string;
   /** Singleton agent socket path shared with VS Code windows. */
@@ -2166,6 +2170,7 @@ interface ShellHookScriptOptions {
 function buildShellHookScript(options: ShellHookScriptOptions): string {
   const escapedHookLibraryPath = shellDoubleQuote(options.hookLibraryPath);
   const escapedAgentMainPath = shellDoubleQuote(options.agentMainPath);
+  const escapedNativeAgentPath = shellDoubleQuote(options.nativeAgentPath);
   const escapedNodeExecutablePath = shellDoubleQuote(options.nodeExecutablePath);
   const escapedSocketPath = shellDoubleQuote(options.socketPath);
   const escapedRouteTablePath = shellDoubleQuote(options.routeTablePath);
@@ -2185,6 +2190,7 @@ export PORT_MANAGER_ROUTES_FILE="${escapedRouteTablePath}"
 export PORT_MANAGER_GLOBAL_ROUTES_FILE="${escapedRouteTablePath}"
 export PORT_MANAGER_HOST_ACCESS_FILE="${escapedHostAccessFilePath}"
 export PORT_MANAGER_AGENT_MAIN="${escapedAgentMainPath}"
+export PORT_MANAGER_AGENT_EXECUTABLE="${escapedNativeAgentPath}"
 export PORT_MANAGER_SCAN_RANGE="${options.settings.scanRange}"
 export PORT_MANAGER_ROUTING_MODE="${options.settings.routingMode}"
 export PORT_MANAGER_VIRTUAL_PORT_START="${options.settings.virtualPortRangeStart}"
@@ -2202,7 +2208,11 @@ if [ -z "$\{PORT_MANAGER_HOOK_DAEMON_STARTED:-}" ]; then
   export PORT_MANAGER_HOOK_DAEMON_STARTED=1
   ${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e 'const net=require("node:net");const fs=require("node:fs");const socketPath=process.argv[1];const socket=net.createConnection(socketPath);const timer=setTimeout(()=>{socket.destroy();try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);},500);socket.once("connect",()=>{clearTimeout(timer);socket.end();process.exit(0);});socket.once("error",()=>{clearTimeout(timer);try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);});' "$PORT_MANAGER_AGENT_SOCKET" >/dev/null 2>&1
   if [ $? -ne 0 ]; then
-    ${daemonRuntimePrefix} nohup "${escapedNodeExecutablePath}" "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" >/tmp/newdlops-portmanager-agent.log 2>&1 &
+    if [ -x "$PORT_MANAGER_AGENT_EXECUTABLE" ]; then
+      ${daemonRuntimePrefix} nohup "$PORT_MANAGER_AGENT_EXECUTABLE" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" --agent-main "$PORT_MANAGER_AGENT_MAIN" >/tmp/newdlops-portmanager-agent.log 2>&1 &
+    else
+      ${daemonRuntimePrefix} nohup "${escapedNodeExecutablePath}" "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" >/tmp/newdlops-portmanager-agent.log 2>&1 &
+    fi
   fi
 fi
 

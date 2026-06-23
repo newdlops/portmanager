@@ -4,6 +4,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { getAgentSocketPath, getAgentStartupLockPath, removeStaleSocketFile } from "../agent/agent-socket";
+import { getDefaultRouteTablePath } from "../agent/route-table";
 import { readPortManagerSettings } from "../config/vscode-settings";
 import { buildNodeRuntimeEnvironment } from "../platform/process/node-runtime";
 import { SimpleEventEmitter } from "../shared/events";
@@ -416,9 +417,9 @@ export class LocalAgentClient implements PortManagerProcessService {
   }
 
   /**
-   * Starts the local agent as a detached Node process. When another VS Code
-   * window starts it first, this process may exit after failing to bind; the
-   * client still retries the shared socket.
+   * Starts the local agent as a detached native process when available. The
+   * Node daemon remains the fallback for unsupported platforms or development
+   * builds that have not produced the native binary yet.
    */
   private startAgentProcess(): void {
     const agentMainPath = this.getAgentMainPath();
@@ -430,6 +431,30 @@ export class LocalAgentClient implements PortManagerProcessService {
     const socketPath = getAgentSocketPath();
     removeStaleSocketFile(socketPath);
 
+    const nativeAgentPath = this.getNativeAgentPath();
+    if (canRunNativeAgent(nativeAgentPath)) {
+      this.childProcess = spawn(
+        nativeAgentPath,
+        ["--socket", socketPath, "--route-table", getDefaultRouteTablePath(), "--agent-main", agentMainPath],
+        {
+          detached: true,
+          env: buildNodeRuntimeEnvironment(),
+          stdio: "ignore",
+          windowsHide: true,
+        },
+      );
+      this.childProcess.once("error", () => {
+        this.startNodeAgentProcess(agentMainPath, socketPath);
+      });
+      this.childProcess.unref();
+      return;
+    }
+
+    this.startNodeAgentProcess(agentMainPath, socketPath);
+  }
+
+  /** Starts the previous Node daemon implementation as a compatibility fallback. */
+  private startNodeAgentProcess(agentMainPath: string, socketPath: string): void {
     this.childProcess = spawn(process.execPath, [agentMainPath, "--socket", socketPath], {
       detached: true,
       env: buildNodeRuntimeEnvironment(),
@@ -442,6 +467,11 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Returns the compiled agent entrypoint owned by this extension instance. */
   private getAgentMainPath(): string {
     return this.context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
+  }
+
+  /** Returns the packaged native daemon binary for macOS/Linux builds. */
+  private getNativeAgentPath(): string {
+    return this.context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
   }
 
   /** Wires line-delimited JSON handling for one socket connection. */
@@ -725,6 +755,19 @@ function removeStaleStartupLock(lockPath: string): void {
     fs.unlinkSync(lockPath);
   } catch {
     // Missing or inaccessible lock files are handled by the next acquire loop.
+  }
+}
+
+function canRunNativeAgent(nativeAgentPath: string): boolean {
+  if (process.platform === "win32") {
+    return false;
+  }
+
+  try {
+    fs.accessSync(nativeAgentPath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
   }
 }
 
