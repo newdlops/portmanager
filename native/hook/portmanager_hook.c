@@ -213,6 +213,17 @@ static void pm_default_route_table_path(char *buffer, size_t size) {
   snprintf(buffer, size, "/tmp/newdlops-portmanager-routes-%ld.json", (long)getuid());
 }
 
+static void pm_default_global_route_table_path(char *buffer, size_t size) {
+  const char *configured = getenv("PORT_MANAGER_GLOBAL_ROUTES_FILE");
+
+  if (configured != NULL && configured[0] != '\0') {
+    snprintf(buffer, size, "%s", configured);
+    return;
+  }
+
+  snprintf(buffer, size, "/tmp/newdlops-portmanager-routes-%ld.json", (long)getuid());
+}
+
 static void pm_route_entry_path(const char *route_table_path, int logical_port, char *buffer, size_t size) {
   const char *file_name;
   const char *extension;
@@ -735,6 +746,27 @@ static int pm_route_network_match_level(const char *route_json) {
   return strcmp(route_network, network_id) == 0 ? 2 : 0;
 }
 
+static int pm_route_is_compose(const char *route_json) {
+  char source[32];
+
+  return pm_json_string(route_json, "source", source, sizeof(source)) == 0 && strcmp(source, "compose") == 0;
+}
+
+static int pm_route_is_foreign_to_current_network(const char *route_json) {
+  const char *network_id = pm_current_network_id();
+  char route_network[PM_MAX_TEXT];
+
+  if (pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0) {
+    return 0;
+  }
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    return 1;
+  }
+
+  return strcmp(route_network, network_id) != 0;
+}
+
 static int pm_host_access_lookup(int logical_port, char *target_host, size_t target_host_size) {
   char path[PM_MAX_PATH];
   char *buffer;
@@ -1098,6 +1130,17 @@ static int pm_route_table_lookup_file(
       continue;
     }
 
+    /*
+     * Compose/container routes are network-local claims over host-published
+     * ports. A scoped route for another network must not become a cwd/global
+     * fallback, otherwise localhost:<logical> would leak through host publish.
+     */
+    if (pm_route_is_compose(object_start) && match_level < 2) {
+      *object_end = object_end_saved;
+      cursor = object_end + 1;
+      continue;
+    }
+
     if (source_is_actual && actual == source_port && match_level > 0) {
       if (match_level == 2) {
         free(buffer);
@@ -1138,6 +1181,80 @@ static int pm_route_table_lookup_file(
     return fallback_port;
   }
 
+  return 0;
+}
+
+static int pm_compose_claim_blocks_connect(int logical_port) {
+  char path[PM_MAX_PATH];
+  char *buffer;
+  int fd;
+  struct stat stat_buffer;
+  ssize_t read_count;
+  char needle[64];
+  char *cursor;
+
+  pm_default_global_route_table_path(path, sizeof(path));
+  fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    return 0;
+  }
+
+  if (fstat(fd, &stat_buffer) != 0 || stat_buffer.st_size <= 0 || stat_buffer.st_size > 1024 * 1024) {
+    close(fd);
+    return 0;
+  }
+
+  buffer = (char *)malloc((size_t)stat_buffer.st_size + 1);
+  if (buffer == NULL) {
+    close(fd);
+    return 0;
+  }
+
+  read_count = read(fd, buffer, (size_t)stat_buffer.st_size);
+  close(fd);
+  if (read_count <= 0) {
+    free(buffer);
+    return 0;
+  }
+
+  buffer[read_count] = '\0';
+  snprintf(needle, sizeof(needle), "\"logicalPort\": %d", logical_port);
+  cursor = buffer;
+
+  while ((cursor = strstr(cursor, needle)) != NULL) {
+    char *object_start = cursor;
+    char *object_end = strchr(cursor, '}');
+    char object_end_saved;
+    int logical;
+
+    while (object_start > buffer && *object_start != '{') {
+      object_start--;
+    }
+
+    if (object_end == NULL) {
+      break;
+    }
+
+    object_end_saved = *object_end;
+    *object_end = '\0';
+    logical = pm_json_int(object_start, "logicalPort", 0);
+
+    if (
+      logical == logical_port &&
+      pm_route_is_compose(object_start) &&
+      pm_route_direction_matches(object_start, "listen") &&
+      pm_route_is_foreign_to_current_network(object_start)
+    ) {
+      *object_end = object_end_saved;
+      free(buffer);
+      return 1;
+    }
+
+    *object_end = object_end_saved;
+    cursor = object_end + 1;
+  }
+
+  free(buffer);
   return 0;
 }
 
@@ -1291,18 +1408,26 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
 
   logical_port = pm_sockaddr_port(addr);
   target_host[0] = '\0';
-  actual_port = pm_host_access_lookup(logical_port, target_host, sizeof(target_host));
-  if (actual_port > 0) {
-    memcpy(&rewritten, addr, addrlen);
-    pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
-    pm_set_sockaddr_host((struct sockaddr *)&rewritten, target_host);
-    pm_debug("connect host-access logical=%d actual=%d host=%s", logical_port, actual_port, target_host);
-    return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
-  }
-
   actual_port = pm_memory_actual_for_logical(logical_port, target_host, sizeof(target_host));
   if (actual_port == 0) {
     actual_port = pm_route_table_lookup(logical_port, 0, "listen", target_host, sizeof(target_host));
+  }
+
+  if (actual_port == 0 && pm_compose_claim_blocks_connect(logical_port)) {
+    pm_debug("connect blocked by foreign compose claim logical=%d", logical_port);
+    errno = ECONNREFUSED;
+    return -1;
+  }
+
+  if (actual_port == 0) {
+    actual_port = pm_host_access_lookup(logical_port, target_host, sizeof(target_host));
+    if (actual_port > 0) {
+      memcpy(&rewritten, addr, addrlen);
+      pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
+      pm_set_sockaddr_host((struct sockaddr *)&rewritten, target_host);
+      pm_debug("connect host-access logical=%d actual=%d host=%s", logical_port, actual_port, target_host);
+      return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
+    }
   }
 
   if (actual_port == 0 && !pm_is_fixed_protocol_port(logical_port)) {

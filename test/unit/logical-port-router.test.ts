@@ -117,6 +117,19 @@ test("does not match sibling projects when route cwd fallback is used", () => {
   assert.deepEqual(matches.map((item) => item.actualPort), [58465]);
 });
 
+test("does not select compose routes through cwd fallback", () => {
+  const routes: LogicalPortRoute[] = [
+    {
+      ...route("compose-network", 15432, 57001, "/Users/lky/project/fix-payroll"),
+      source: "compose",
+    },
+  ];
+
+  const matches = findRoutesMatchingClientCwd(routes, 15432, "/Users/lky/project/fix-payroll");
+
+  assert.deepEqual(matches, []);
+});
+
 test("builds process ancestry from PID, PPID, PGID, and TTY only", () => {
   const rows = parsePosixProcessTable(`
     10 1 10 ttys001

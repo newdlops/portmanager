@@ -28,6 +28,8 @@ The previous managed-process routing, native hook, and rerun-on-failure implemen
 - Persist logical networks, terminal attachments, and host exposures in VS Code global state.
 - Discover VS Code integrated terminals and OS shell processes as grouped Terminal Windows with visible titles.
 - Attach a terminal window to a logical network as a persisted association.
+- Register Docker Compose published ports as logical-network service routes, so named protocol ports can shadow host fallback ports while the compose project is up.
+- Discover running Docker/Podman services with published ports and attach them from the Compose / Containers sidebar section.
 - Start every primary network command from sidebar action rows, not only Command Palette.
 - Expose a host TCP port to a target address and port through `Local TCP Proxy`.
 - Close proxy listeners when exposures or networks are removed.
@@ -84,6 +86,8 @@ npm run dev
 ```
 
 When a hooked process calls `bind(8000)`, the hook asks the same per-user daemon to allocate an actual port, rewrites the bind call, and registers the logical route. Fixed protocol ports such as SSH, MySQL, and PostgreSQL are preserved by default because the port number itself is part of the protocol contract. When another hooked local process calls `connect(...:8000)`, the hook reads the daemon route table and redirects the connection to the actual port.
+
+Compose published ports can be attached to a logical network from the sidebar. Refresh the Compose / Containers section to discover running Docker/Podman services, then attach a service candidate to a network; Port Manager registers every published TCP port for that service. For example, if a compose PostgreSQL service is published on hidden host port `57001`, it is registered as logical `15432 -> 127.0.0.1:57001`. Attached clients keep using `localhost:15432`; while the compose attachment exists it shadows host `15432` inside the selected logical network, and removing the attachment restores host fallback behavior.
 
 ## Local Agent
 

@@ -17,6 +17,7 @@ import {
   ContainerNetworkRuntimeAdapter,
   type ContainerRuntimeTarget,
 } from "../platform/network/container-runtime";
+import { ContainerServiceDiscoveryAdapter } from "../platform/network/container-service-discovery";
 import { HostPortProxyManager, type HostPortProxyTarget } from "../platform/ports/host-port-proxy";
 import {
   LogicalPortRouterManager,
@@ -33,6 +34,9 @@ import { NodeProcessEnvironmentProvider } from "../platform/process/node-process
 import { NodeTerminalCandidateProvider } from "../platform/process/node-terminal-candidate-provider";
 import type {
   AgentDaemonStatus,
+  ComposeAttachment,
+  ComposePublishedPort,
+  ContainerServiceCandidate,
   DisposableLike,
   HostAccessBinding,
   HostPortExposure,
@@ -43,6 +47,7 @@ import type {
   NetworkRuntimeKind,
   NetworkSnapshot,
   PortManagerSettings,
+  RegisteredProcessInput,
   TerminalAttachment,
   TerminalCandidate,
   TerminalCandidateProvider,
@@ -137,6 +142,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Container runtime adapter that provides actual same-port isolation. */
   private readonly containerRuntime: ContainerNetworkRuntimeAdapter;
 
+  /** Docker/Podman published-port discovery used for UI attach candidates. */
+  private readonly containerServiceDiscovery: ContainerServiceDiscoveryAdapter;
+
   /** VS Code event subscriptions owned by this service. */
   private readonly disposables: DisposableLike[] = [];
 
@@ -146,6 +154,7 @@ export class PortManagerNetworkService implements DisposableLike {
   ) {
     this.terminalCandidateProvider = new NodeTerminalCandidateProvider();
     this.containerRuntime = new ContainerNetworkRuntimeAdapter();
+    this.containerServiceDiscovery = new ContainerServiceDiscoveryAdapter();
     this.proxyManager = new HostPortProxyManager({
       resolve: (exposure) => this.resolveHostExposureTarget(exposure),
     });
@@ -187,6 +196,7 @@ export class PortManagerNetworkService implements DisposableLike {
           event.affectsConfiguration("portManager.enabled")
         ) {
           void this.refreshRuntimeDescriptors();
+          void this.refreshContainerServices();
         }
       }),
     );
@@ -195,6 +205,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
     await this.refreshTerminals();
+    void this.refreshContainerServices();
     await this.syncLogicalPortRouters();
   }
 
@@ -256,9 +267,18 @@ export class PortManagerNetworkService implements DisposableLike {
     const snapshot = this.registry.getSnapshot();
     const network = snapshot.networks.find((item) => item.id === networkId);
     const exposures = snapshot.exposures.filter((exposure) => exposure.networkId === networkId);
+    const composeAttachments = snapshot.composeAttachments.filter((attachment) => attachment.networkId === networkId);
 
     for (const exposure of exposures) {
       await this.proxyManager.close(exposure.id);
+    }
+
+    for (const attachment of composeAttachments) {
+      for (const port of attachment.ports) {
+        if (port.processId !== undefined) {
+          await this.processService?.removeProcess(port.processId).catch(() => undefined);
+        }
+      }
     }
 
     if (network?.runtimeKind === "container") {
@@ -278,6 +298,16 @@ export class PortManagerNetworkService implements DisposableLike {
     this.registry.setTerminalCandidates(candidates);
 
     return this.registry.getSnapshot().terminalWindows;
+  }
+
+  /** Refreshes Docker/Podman containers that publish host ports for easy attach. */
+  async refreshContainerServices(): Promise<readonly ContainerServiceCandidate[]> {
+    const candidates = await this.containerServiceDiscovery
+      .list(readContainerRuntimeSettings())
+      .catch(() => []);
+
+    this.registry.setContainerServiceCandidates(candidates);
+    return this.registry.getSnapshot().containerServiceCandidates;
   }
 
   /**
@@ -510,6 +540,89 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Returns one network-to-host access binding from the latest snapshot. */
   getHostAccessBinding(bindingId: string): HostAccessBinding | undefined {
     return this.registry.getSnapshot().hostAccessBindings.find((binding) => binding.id === bindingId);
+  }
+
+  /**
+   * Registers host-published compose service ports as network-local routes.
+   *
+   * Compose keeps running in Docker's own network, but attached terminal
+   * clients see these endpoints as local logical-network services. When a
+   * compose route exists for a named protocol port such as 15432, it shadows
+   * the same host port; removing the attachment restores host fallback.
+   */
+  async attachComposePublishedPorts(input: ComposePublishedPortsInput): Promise<ComposeAttachment> {
+    requireNetwork(this.registry.getNetwork(input.networkId), input.networkId);
+    if (this.processService === undefined) {
+      throw new Error("Compose published ports require the Port Manager daemon.");
+    }
+    if (input.ports.length === 0) {
+      throw new Error("At least one compose published port is required.");
+    }
+
+    const attachment: ComposeAttachment = {
+      id: createId("compose"),
+      networkId: input.networkId,
+      projectName: assertNonEmptyString(input.projectName, "Compose project name"),
+      composeFiles: [...(input.composeFiles ?? [])],
+      ports: input.ports.map(normalizeComposePublishedPort),
+      status: "attached",
+      attachedAt: new Date().toISOString(),
+    };
+    const registeredProcessIds: string[] = [];
+
+    this.registry.addComposeAttachment(attachment);
+
+    try {
+      await this.processService.start();
+
+      const ports: ComposePublishedPort[] = [];
+      for (const port of attachment.ports) {
+        const process = await this.processService.registerExistingProcess(
+          buildComposeRegisteredProcessInput(attachment, port, input.cwd),
+        );
+
+        registeredProcessIds.push(process.id);
+        ports.push({
+          ...port,
+          processId: process.id,
+        });
+      }
+
+      return this.registry.updateComposeAttachment({
+        ...attachment,
+        ports,
+      });
+    } catch (error) {
+      for (const processId of registeredProcessIds) {
+        await this.processService.removeProcess(processId).catch(() => undefined);
+      }
+      this.registry.removeComposeAttachment(attachment.id);
+      throw error;
+    }
+  }
+
+  /** Removes a compose route attachment and its daemon route rows. */
+  async removeComposeAttachment(attachmentId: string): Promise<ComposeAttachment | undefined> {
+    const attachment = this.registry
+      .getSnapshot()
+      .composeAttachments.find((candidate) => candidate.id === attachmentId);
+
+    if (attachment === undefined) {
+      return undefined;
+    }
+
+    for (const port of attachment.ports) {
+      if (port.processId !== undefined) {
+        await this.processService?.removeProcess(port.processId).catch(() => undefined);
+      }
+    }
+
+    return this.registry.removeComposeAttachment(attachmentId);
+  }
+
+  /** Returns one compose attachment from the latest snapshot. */
+  getComposeAttachment(attachmentId: string): ComposeAttachment | undefined {
+    return this.registry.getSnapshot().composeAttachments.find((attachment) => attachment.id === attachmentId);
   }
 
   /** Captures the selected network's bindings as a reusable preset. */
@@ -890,11 +1003,18 @@ export class PortManagerNetworkService implements DisposableLike {
         (route.status === "running" || route.status === "starting"),
     );
 
-    if (candidates.length === 1) {
-      return candidates[0];
+    /*
+     * Compose/container attachments deliberately shadow host-published ports
+     * only inside their owning logical network. Host-side fallback would make
+     * those services reachable without network membership, so exclude them.
+     */
+    const fallbackCandidates = candidates.filter((route) => !isNetworkScopedComposeRoute(route));
+
+    if (fallbackCandidates.length === 1) {
+      return fallbackCandidates[0];
     }
 
-    return this.findSingleAttachedRouteForRouter(candidates, snapshot.processes, processRows);
+    return this.findSingleAttachedRouteForRouter(fallbackCandidates, snapshot.processes, processRows);
   }
 
   /**
@@ -1059,6 +1179,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath()),
       shellExport("PORT_MANAGER_AGENT_MAIN", agentMainPath),
       shellExport("PORT_MANAGER_ROUTES_FILE", getRouteTablePathForNetwork(networkId)),
+      shellExport("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath()),
       shellExport("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath()),
       shellExport("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange)),
       shellExport("PORT_MANAGER_ROUTING_MODE", settings.routingMode),
@@ -1174,6 +1295,34 @@ export interface HostPortExposureInput {
   readonly targetPort: number;
 }
 
+export interface ComposePublishedPortsInput {
+  /** Logical network whose attached clients should see these compose endpoints. */
+  readonly networkId: string;
+  /** Compose project name shown in UI and route diagnostics. */
+  readonly projectName: string;
+  /** Working directory used for daemon route rows and cwd fallback matching. */
+  readonly cwd?: string;
+  /** Compose files that describe the project, when known. */
+  readonly composeFiles?: readonly string[];
+  /** Published service endpoints to register into this logical network. */
+  readonly ports: readonly ComposePublishedPortInput[];
+}
+
+export interface ComposePublishedPortInput {
+  /** Compose service that owns the container-side listener. */
+  readonly serviceName: string;
+  /** Logical-network port used by clients, for example PostgreSQL 15432. */
+  readonly logicalPort: number;
+  /** Docker-published host address reachable from the extension host. */
+  readonly actualHostAddress: string;
+  /** Docker-published host port, often allocated from a hidden range. */
+  readonly actualHostPort: number;
+  /** Container-side port for diagnostics; defaults to logicalPort. */
+  readonly containerPort?: number;
+  /** Optional named protocol label such as postgresql, mysql, redis, or http. */
+  readonly protocolName?: string;
+}
+
 /** Includes VS Code integrated terminals in the same model as OS-discovered shells. */
 async function listVscodeTerminalCandidates(): Promise<readonly TerminalCandidate[]> {
   const terminals: Array<TerminalCandidate | undefined> = await Promise.all(
@@ -1209,6 +1358,47 @@ function requireNetwork(network: LogicalNetwork | undefined, networkId: string):
   }
 
   return network;
+}
+
+/** Converts command/API input into the persisted compose endpoint contract. */
+function normalizeComposePublishedPort(input: ComposePublishedPortInput): ComposePublishedPort {
+  assertTcpPort(input.logicalPort, "Logical compose port");
+  assertTcpPort(input.actualHostPort, "Actual compose host port");
+
+  return {
+    serviceName: assertNonEmptyString(input.serviceName, "Compose service name"),
+    logicalPort: input.logicalPort,
+    actualHostAddress: assertNonEmptyString(input.actualHostAddress, "Compose published host address"),
+    actualHostPort: input.actualHostPort,
+    containerPort: input.containerPort ?? input.logicalPort,
+    protocol: "tcp",
+    ...(input.protocolName !== undefined && input.protocolName.trim().length > 0
+      ? { protocolName: input.protocolName.trim() }
+      : {}),
+  };
+}
+
+/** Builds the daemon process row that owns one compose published-port route. */
+function buildComposeRegisteredProcessInput(
+  attachment: ComposeAttachment,
+  port: ComposePublishedPort,
+  cwd: string | undefined,
+): RegisteredProcessInput {
+  const protocolLabel = port.protocolName === undefined ? "" : `/${port.protocolName}`;
+
+  return {
+    // Docker may hide the concrete owner PID behind a VM or proxy. A later OS
+    // listener scan can adopt the real PID when the platform exposes it.
+    pid: 0,
+    name: `${attachment.projectName}:${port.serviceName}${protocolLabel}`,
+    command: `docker compose service ${attachment.projectName}/${port.serviceName}`,
+    cwd: cwd ?? attachment.composeFiles[0] ?? process.cwd(),
+    requestedPort: port.logicalPort,
+    actualPort: port.actualHostPort,
+    host: port.actualHostAddress,
+    networkId: attachment.networkId,
+    source: "compose",
+  };
 }
 
 function requireRuntime(
@@ -1275,6 +1465,23 @@ function nativeHookPlatformName(): string {
     default:
       return process.platform;
   }
+}
+
+/** Fails before route rows can persist invalid TCP endpoint state. */
+function assertTcpPort(port: number, label: string): void {
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`${label} must be a TCP port between 1 and 65535.`);
+  }
+}
+
+/** Normalizes user-provided labels and host fields before they reach route state. */
+function assertNonEmptyString(value: string, label: string): string {
+  const normalized = value.trim();
+  if (normalized.length === 0) {
+    throw new Error(`${label} is required.`);
+  }
+
+  return normalized;
 }
 
 /** Prevents duplicate exposure rows before the platform bind call. */
@@ -1501,6 +1708,10 @@ function shellPatternLiteral(value: string): string {
 
 function appleScriptString(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function isNetworkScopedComposeRoute(route: LogicalPortRoute): boolean {
+  return route.source === "compose" && route.networkId !== undefined && route.networkId.trim().length > 0;
 }
 
 const BASE_RUNTIMES: readonly NetworkRuntimeDescriptor[] = [

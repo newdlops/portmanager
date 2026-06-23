@@ -5,6 +5,10 @@ import {
   ContainerNetworkRuntimeAdapter,
   type ContainerCommandRunner,
 } from "../../src/platform/network/container-runtime";
+import {
+  ContainerServiceDiscoveryAdapter,
+  parseContainerRows,
+} from "../../src/platform/network/container-service-discovery";
 import type { ContainerRuntimeSettings, HostPortExposure, LogicalNetwork } from "../../src/shared/types";
 
 const settings: ContainerRuntimeSettings = {
@@ -115,6 +119,82 @@ test("resolves host exposure targets to the container bridge address", async () 
     host: "172.18.0.2",
     port: 3000,
   });
+});
+
+test("parses compose containers with published TCP ports as attach candidates", () => {
+  const candidates = parseContainerRows("docker", [
+    {
+      ID: "abc123",
+      Names: "workspace-postgres-1",
+      Image: "postgres:16",
+      Status: "Up 2 minutes",
+      Ports: "127.0.0.1:15432->5432/tcp, 0.0.0.0:18080->8080/tcp, 8081/tcp",
+      Labels: "com.docker.compose.project=workspace,com.docker.compose.service=postgres",
+    },
+  ]);
+
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0]?.id, "docker:abc123");
+  assert.equal(candidates[0]?.composeProject, "workspace");
+  assert.equal(candidates[0]?.composeService, "postgres");
+  assert.deepEqual(
+    candidates[0]?.ports.map((port) => ({
+      serviceName: port.serviceName,
+      logicalPort: port.logicalPort,
+      actualHostAddress: port.actualHostAddress,
+      actualHostPort: port.actualHostPort,
+      containerPort: port.containerPort,
+      protocolName: port.protocolName,
+    })),
+    [
+      {
+        serviceName: "postgres",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 15432,
+        containerPort: 5432,
+        protocolName: "postgresql",
+      },
+      {
+        serviceName: "postgres",
+        logicalPort: 18080,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 18080,
+        containerPort: 8080,
+        protocolName: undefined,
+      },
+    ],
+  );
+});
+
+test("discovers published port candidates through the configured runtime", async () => {
+  const calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
+  const adapter = new ContainerServiceDiscoveryAdapter({
+    runCommand: async (executable, args) => {
+      calls.push({ executable, args });
+      return {
+        stdout: JSON.stringify({
+          ID: "def456",
+          Names: "redis",
+          Ports: "0.0.0.0:16379->6379/tcp",
+          Labels: "",
+        }),
+        stderr: "",
+      };
+    },
+  });
+
+  const candidates = await adapter.list({ containerRuntime: "docker", containerImage: "alpine:3.20" });
+
+  assert.deepEqual(calls, [
+    {
+      executable: "docker",
+      args: ["container", "ls", "--format", "{{json .}}"],
+    },
+  ]);
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0]?.containerName, "redis");
+  assert.equal(candidates[0]?.ports[0]?.protocolName, "redis");
 });
 
 function createRecordingRunner(

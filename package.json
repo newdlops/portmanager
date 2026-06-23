@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -40,11 +40,15 @@
     "onCommand:portManager.createLogicalNetwork",
     "onCommand:portManager.removeLogicalNetwork",
     "onCommand:portManager.refreshTerminals",
+    "onCommand:portManager.refreshContainerServices",
     "onCommand:portManager.attachTerminalToNetwork",
+    "onCommand:portManager.attachContainerToNetwork",
     "onCommand:portManager.detachTerminalFromNetwork",
     "onCommand:portManager.resetTerminalNetworkSettings",
     "onCommand:portManager.addHostPortExposure",
     "onCommand:portManager.addHostAccessBinding",
+    "onCommand:portManager.addComposePublishedPort",
+    "onCommand:portManager.removeComposeAttachment",
     "onCommand:portManager.saveBindingPreset",
     "onCommand:portManager.applyBindingPreset",
     "onCommand:portManager.removeHostAccessBinding",
@@ -120,10 +124,22 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "portManager.refreshContainerServices",
+        "title": "Port Manager: Refresh Services",
+        "category": "Port Manager",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "portManager.attachTerminalToNetwork",
         "title": "Port Manager: Attach Terminal Window to Network",
         "category": "Port Manager",
         "icon": "$(debug-console)"
+      },
+      {
+        "command": "portManager.attachContainerToNetwork",
+        "title": "Port Manager: Attach Service to Network",
+        "category": "Port Manager",
+        "icon": "$(server-environment)"
       },
       {
         "command": "portManager.detachTerminalFromNetwork",
@@ -148,6 +164,18 @@
         "title": "Port Manager: Add Host Access Binding",
         "category": "Port Manager",
         "icon": "$(arrow-swap)"
+      },
+      {
+        "command": "portManager.addComposePublishedPort",
+        "title": "Port Manager: Add Compose Published Port",
+        "category": "Port Manager",
+        "icon": "$(database)"
+      },
+      {
+        "command": "portManager.removeComposeAttachment",
+        "title": "Port Manager: Remove Compose Attachment",
+        "category": "Port Manager",
+        "icon": "$(trash)"
       },
       {
         "command": "portManager.saveBindingPreset",
@@ -298,19 +326,29 @@
           "group": "navigation@3"
         },
         {
-          "command": "portManager.refreshTerminals",
+          "command": "portManager.addComposePublishedPort",
           "when": "view == portManager.processes",
           "group": "navigation@4"
         },
         {
-          "command": "portManager.refresh",
+          "command": "portManager.refreshContainerServices",
           "when": "view == portManager.processes",
           "group": "navigation@5"
         },
         {
-          "command": "portManager.openSettings",
+          "command": "portManager.refreshTerminals",
           "when": "view == portManager.processes",
           "group": "navigation@6"
+        },
+        {
+          "command": "portManager.refresh",
+          "when": "view == portManager.processes",
+          "group": "navigation@7"
+        },
+        {
+          "command": "portManager.openSettings",
+          "when": "view == portManager.processes",
+          "group": "navigation@8"
         }
       ],
       "commandPalette": [
@@ -388,19 +426,44 @@
           "group": "network@3"
         },
         {
-          "command": "portManager.saveBindingPreset",
+          "command": "portManager.addComposePublishedPort",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@4"
         },
         {
-          "command": "portManager.applyBindingPreset",
+          "command": "portManager.attachContainerToNetwork",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@5"
         },
         {
-          "command": "portManager.removeLogicalNetwork",
+          "command": "portManager.saveBindingPreset",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@6"
+        },
+        {
+          "command": "portManager.applyBindingPreset",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "network@7"
+        },
+        {
+          "command": "portManager.removeLogicalNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "network@8"
+        },
+        {
+          "command": "portManager.refreshContainerServices",
+          "when": "view == portManager.processes && viewItem == section.containers",
+          "group": "container@1"
+        },
+        {
+          "command": "portManager.attachContainerToNetwork",
+          "when": "view == portManager.processes && viewItem == section.containers",
+          "group": "container@2"
+        },
+        {
+          "command": "portManager.attachContainerToNetwork",
+          "when": "view == portManager.processes && viewItem == containerServiceCandidate",
+          "group": "container@3"
         },
         {
           "command": "portManager.refreshTerminals",
@@ -446,6 +509,11 @@
           "command": "portManager.removeHostAccessBinding",
           "when": "view == portManager.processes && viewItem == hostAccessBinding",
           "group": "exposure@4"
+        },
+        {
+          "command": "portManager.removeComposeAttachment",
+          "when": "view == portManager.processes && viewItem == composeAttachment",
+          "group": "exposure@5"
         },
         {
           "command": "portManager.restartDaemon",

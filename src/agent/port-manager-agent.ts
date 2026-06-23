@@ -601,10 +601,7 @@ export class PortManagerAgent implements DisposableLike {
         ? { ...input, networkId: allocation.route.networkId }
         : input;
 
-    const process = this.upsertRegisteredProcess(
-      registeredInput,
-      input.source === "hooked" ? "hooked" : "registered",
-    );
+    const process = this.upsertRegisteredProcess(registeredInput, normalizeRegisteredProcessSource(input.source));
     this.removePendingRouteAllocationsForIdentity(process.requestedPort, normalizeNetworkId(process.networkId));
     this.missingListenerStateByProcessId.delete(process.id);
     this.writeRouteTable(this.buildCurrentLogicalRoutes());
@@ -1378,7 +1375,7 @@ export class PortManagerAgent implements DisposableLike {
    * autoreload or shebang handoff. Updating the existing row keeps route table
    * ownership stable instead of accumulating stale duplicate rows.
    */
-  private upsertRegisteredProcess(input: RegisteredProcessInput, source: "hooked" | "registered"): ManagedProcess {
+  private upsertRegisteredProcess(input: RegisteredProcessInput, source: RegisteredRouteSource): ManagedProcess {
     const existingProcess = this.findRegisteredProcessForRoute(input, source);
 
     if (existingProcess === undefined) {
@@ -1404,7 +1401,7 @@ export class PortManagerAgent implements DisposableLike {
   /** Finds the active row that owns the same route identity, ignoring PID churn. */
   private findRegisteredProcessForRoute(
     input: RegisteredProcessInput,
-    source: "hooked" | "registered",
+    source: RegisteredRouteSource,
   ): ManagedProcess | undefined {
     const inputNetworkId = normalizeNetworkId(input.networkId);
 
@@ -1427,7 +1424,18 @@ export class PortManagerAgent implements DisposableLike {
  * did not spawn them and cannot rely on child-process exit events.
  */
 function isListenerOwnedExternalProcess(process: ManagedProcess): boolean {
-  return process.source === "registered" || process.source === "hooked";
+  return process.source === "registered" || process.source === "hooked" || process.source === "compose";
+}
+
+type RegisteredRouteSource = "hooked" | "registered" | "compose";
+
+/** Normalizes older/manual registrations to the generic registered route source. */
+function normalizeRegisteredProcessSource(source: RegisteredProcessInput["source"]): RegisteredRouteSource {
+  if (source === "hooked" || source === "compose") {
+    return source;
+  }
+
+  return "registered";
 }
 
 /**

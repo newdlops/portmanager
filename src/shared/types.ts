@@ -16,7 +16,7 @@ export type PortInjectionMode = "env" | "template" | "argument";
 
 export type ProcessKillSignal = NodeJS.Signals | "SIGKILL" | "SIGTERM";
 
-export type ProcessSource = "managed" | "registered" | "hooked" | "detected" | "allocated";
+export type ProcessSource = "managed" | "registered" | "hooked" | "compose" | "detected" | "allocated";
 
 export type PortProtocol = "tcp";
 
@@ -35,6 +35,8 @@ export type NetworkRuntimeKind = "container" | "linuxNamespace" | "nativeHelper"
 export type HostPortExposureStatus = "opening" | "active" | "stopped" | "error";
 
 export type HostAccessBindingStatus = "active" | "error";
+
+export type ComposeAttachmentStatus = "attached" | "detached" | "error";
 
 export type ContainerRuntimePreference = "auto" | "docker" | "podman";
 
@@ -205,6 +207,80 @@ export interface HostAccessBinding {
   readonly errorMessage?: string;
 }
 
+/**
+ * One Docker Compose published port that is visible as a logical-network local
+ * service. The container may publish to an arbitrary hidden host port, but
+ * attached terminal clients keep using the named protocol's logical port.
+ */
+export interface ComposePublishedPort {
+  /** Compose service that owns the container-side listener. */
+  readonly serviceName: string;
+  /** Port used by attached logical-network clients, for example PostgreSQL 15432. */
+  readonly logicalPort: number;
+  /** Host address where Docker published the service for Port Manager to reach. */
+  readonly actualHostAddress: string;
+  /** Host port where Docker published the service, often a hidden allocated port. */
+  readonly actualHostPort: number;
+  /** Container-side port for diagnostics; defaults to the logical port in command flows. */
+  readonly containerPort: number;
+  /** Transport protocol for the published endpoint. */
+  readonly protocol: NetworkPortProtocol;
+  /** Optional protocol/service label such as postgresql, mysql, redis, or http. */
+  readonly protocolName?: string;
+  /** Agent process row that writes this endpoint into route tables. */
+  readonly processId?: string;
+}
+
+/**
+ * A compose project attached to a logical network through host-published
+ * service ports. These routes shadow same-number host ports while active and
+ * disappear when the compose attachment is removed.
+ */
+export interface ComposeAttachment {
+  /** Stable attachment row id. */
+  readonly id: string;
+  /** Logical network whose clients should see these compose endpoints. */
+  readonly networkId: string;
+  /** Compose project or stack name shown to users. */
+  readonly projectName: string;
+  /** Compose files used to launch the project, when known. */
+  readonly composeFiles: readonly string[];
+  /** Published service ports owned by this attachment. */
+  readonly ports: readonly ComposePublishedPort[];
+  /** Current attachment lifecycle state. */
+  readonly status: ComposeAttachmentStatus;
+  /** ISO timestamp when this compose attachment was registered. */
+  readonly attachedAt: string;
+  /** Last registration or route maintenance error, if any. */
+  readonly errorMessage?: string;
+}
+
+/**
+ * A running container or compose service discovered from Docker/Podman. These
+ * rows are transient UI candidates; attaching one creates a ComposeAttachment
+ * with durable route rows.
+ */
+export interface ContainerServiceCandidate {
+  /** Stable UI id derived from runtime and container id. */
+  readonly id: string;
+  /** Container runtime that reported this candidate. */
+  readonly runtime: "docker" | "podman";
+  /** Container id from the runtime CLI. */
+  readonly containerId: string;
+  /** User-facing container name. */
+  readonly containerName: string;
+  /** Image name shown for diagnostics. */
+  readonly image?: string;
+  /** Runtime status text such as Up 2 minutes. */
+  readonly status?: string;
+  /** Compose project label when the container was started by compose. */
+  readonly composeProject?: string;
+  /** Compose service label when the container was started by compose. */
+  readonly composeService?: string;
+  /** Host-published TCP service ports that can become logical routes. */
+  readonly ports: readonly ComposePublishedPort[];
+}
+
 export interface NetworkSnapshot {
   /** Logical networks known to the current VS Code window. */
   readonly networks: readonly LogicalNetwork[];
@@ -218,6 +294,10 @@ export interface NetworkSnapshot {
   readonly exposures: readonly HostPortExposure[];
   /** Network-to-host port bindings visible from attached terminals. */
   readonly hostAccessBindings: readonly HostAccessBinding[];
+  /** Compose project endpoints that shadow host ports inside logical networks. */
+  readonly composeAttachments: readonly ComposeAttachment[];
+  /** Latest Docker/Podman published-port candidates discovered for UI attach flows. */
+  readonly containerServiceCandidates: readonly ContainerServiceCandidate[];
   /** Runtime adapters available on this platform/build. */
   readonly runtimes: readonly NetworkRuntimeDescriptor[];
   /** ISO timestamp for this snapshot. */
@@ -565,8 +645,8 @@ export interface RegisteredProcessInput {
   readonly networkId?: string;
   /** Optional pending route allocation that this running process consumes. */
   readonly allocationId?: string;
-  /** Registration origin; native socket hook rows are managed by listener state. */
-  readonly source?: "registered" | "hooked";
+  /** Registration origin; hook and compose rows are managed by listener state. */
+  readonly source?: "registered" | "hooked" | "compose";
 }
 
 export interface ManagedProcessStartInput {

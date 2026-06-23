@@ -2,6 +2,8 @@ import * as vscode from "vscode";
 import type {
   AgentDaemonStatus,
   AgentSnapshot,
+  ComposeAttachment,
+  ContainerServiceCandidate,
   DisposableLike,
   HostAccessBinding,
   HostPortExposure,
@@ -43,7 +45,7 @@ export interface PortManagerNetworkTreeSource {
   onDidChange(listener: () => void): DisposableLike;
 }
 
-type TreeSectionKind = "networks" | "terminals" | "exposures" | "runtime" | "daemon";
+type TreeSectionKind = "networks" | "terminals" | "containers" | "exposures" | "runtime" | "daemon";
 const TERMINAL_WINDOW_MIME = "application/vnd.newdlops.portmanager.terminal-window";
 
 type PortManagerTreeItem =
@@ -53,7 +55,10 @@ type PortManagerTreeItem =
   | LogicalNetworkTreeItem
   | TerminalWindowTreeItem
   | TerminalCandidateTreeItem
+  | ContainerServiceCandidateTreeItem
+  | ContainerPublishedPortTreeItem
   | TerminalAttachmentTreeItem
+  | ComposeAttachmentTreeItem
   | HostPortExposureTreeItem
   | HostAccessBindingTreeItem
   | RuntimeAdapterTreeItem
@@ -163,6 +168,12 @@ export class PortManagerTreeProvider
       return [
         new TreeSectionItem("networks", "Logical Networks", `${snapshot.networks.length} networks`, "vm"),
         new TreeSectionItem("terminals", "Terminal Windows", `${snapshot.terminalWindows.length} windows`, "terminal"),
+        new TreeSectionItem(
+          "containers",
+          "Compose / Containers",
+          `${snapshot.containerServiceCandidates.length} services`,
+          "server-environment",
+        ),
         new TreeSectionItem("exposures", "Host Port Exposures", `${snapshot.exposures.length} bindings`, "ports-view-icon"),
         new TreeSectionItem("runtime", "Runtime Adapter", `${snapshot.runtimes.length} available`, "circuit-board"),
         new TreeSectionItem("daemon", "Daemon", formatDaemonSummary(daemon), daemon.restartRequired ? "warning" : "server-process"),
@@ -173,6 +184,7 @@ export class PortManagerTreeProvider
       const attachments = snapshot.attachments.filter((attachment) => attachment.networkId === element.network.id);
       const exposures = snapshot.exposures.filter((exposure) => exposure.networkId === element.network.id);
       const hostAccessBindings = snapshot.hostAccessBindings.filter((binding) => binding.networkId === element.network.id);
+      const composeAttachments = snapshot.composeAttachments.filter((attachment) => attachment.networkId === element.network.id);
       return [
         new ActionTreeItem("Add Host Binding", "portManager.addHostPortExposure", "add", "Expose network port", element.network),
         new ActionTreeItem(
@@ -181,6 +193,20 @@ export class PortManagerTreeProvider
           "arrow-swap",
           "Reach host port from network",
           element.network,
+        ),
+        new ActionTreeItem(
+          "Add Compose Port",
+          "portManager.addComposePublishedPort",
+          "database",
+          "Attach published service port",
+          element.network,
+        ),
+        new ActionTreeItem(
+          "Attach Service",
+          "portManager.attachContainerToNetwork",
+          "server-environment",
+          "Use discovered published ports",
+          { network: element.network },
         ),
         new ActionTreeItem(
           "Save Binding Preset",
@@ -201,8 +227,9 @@ export class PortManagerTreeProvider
           : []),
         ...exposures.map((exposure) => new HostPortExposureTreeItem(exposure, [element.network])),
         ...hostAccessBindings.map((binding) => new HostAccessBindingTreeItem(binding)),
+        ...composeAttachments.map((attachment) => new ComposeAttachmentTreeItem(attachment)),
         ...attachments.map((attachment) => new TerminalAttachmentTreeItem(attachment)),
-        ...(attachments.length === 0 && exposures.length === 0 && hostAccessBindings.length === 0
+        ...(attachments.length === 0 && exposures.length === 0 && hostAccessBindings.length === 0 && composeAttachments.length === 0
           ? [new EmptyTreeItem("No bindings or terminal windows", "Attach a window or add a host binding")]
           : []),
       ];
@@ -213,6 +240,10 @@ export class PortManagerTreeProvider
       return snapshot.terminalCandidates
         .filter((candidate) => candidateSet.has(candidate.pid))
         .map((candidate) => new TerminalCandidateTreeItem(candidate));
+    }
+
+    if (element instanceof ContainerServiceCandidateTreeItem) {
+      return element.candidate.ports.map((port) => new ContainerPublishedPortTreeItem(element.candidate, port));
     }
 
     if (!(element instanceof TreeSectionItem)) {
@@ -231,6 +262,7 @@ export class PortManagerTreeProvider
                   snapshot.attachments,
                   snapshot.exposures,
                   snapshot.hostAccessBindings,
+                  snapshot.composeAttachments,
                 ),
               )
             : [new EmptyTreeItem("No logical networks", "Create one here")]),
@@ -243,6 +275,14 @@ export class PortManagerTreeProvider
           ...(snapshot.terminalWindows.length > 0
             ? snapshot.terminalWindows.map((window) => new TerminalWindowTreeItem(window))
             : [new EmptyTreeItem("No terminal windows discovered", "Open a shell and refresh")]),
+        ];
+      case "containers":
+        return [
+          new ActionTreeItem("Refresh Services", "portManager.refreshContainerServices", "refresh"),
+          new ActionTreeItem("Attach Service to Network", "portManager.attachContainerToNetwork", "plug"),
+          ...(snapshot.containerServiceCandidates.length > 0
+            ? snapshot.containerServiceCandidates.map((candidate) => new ContainerServiceCandidateTreeItem(candidate))
+            : [new EmptyTreeItem("No published container ports", "Start compose services and refresh")]),
         ];
       case "exposures":
         return [
@@ -338,22 +378,40 @@ export class LogicalNetworkTreeItem extends vscode.TreeItem {
     attachments: readonly TerminalAttachment[],
     exposures: readonly HostPortExposure[] = [],
     hostAccessBindings: readonly HostAccessBinding[] = [],
+    composeAttachments: readonly ComposeAttachment[] = [],
   ) {
     const attachmentCount = attachments.filter((attachment) => attachment.networkId === network.id).length;
     const exposureCount = exposures.filter((exposure) => exposure.networkId === network.id).length;
     const hostAccessCount = hostAccessBindings.filter((binding) => binding.networkId === network.id).length;
+    const composeCount = composeAttachments.filter((attachment) => attachment.networkId === network.id).length;
     super(
       network.name,
-      attachmentCount > 0 || exposureCount > 0 || hostAccessCount > 0
+      attachmentCount > 0 || exposureCount > 0 || hostAccessCount > 0 || composeCount > 0
         ? vscode.TreeItemCollapsibleState.Collapsed
         : vscode.TreeItemCollapsibleState.None,
     );
     this.id = network.id;
-    this.description = buildNetworkDescription(network, attachmentCount, exposureCount, hostAccessCount);
-    this.tooltip = buildNetworkTooltip(network, attachmentCount, exposureCount, hostAccessCount);
+    this.description = buildNetworkDescription(network, attachmentCount, exposureCount, hostAccessCount, composeCount);
+    this.tooltip = buildNetworkTooltip(network, attachmentCount, exposureCount, hostAccessCount, composeCount);
     this.iconPath = new vscode.ThemeIcon(
       network.status === "running" ? "vm-active" : "vm-outline",
       network.status === "error" ? new vscode.ThemeColor("testing.iconFailed") : undefined,
+    );
+  }
+}
+
+/** Compose published service ports that currently shadow host fallback ports. */
+export class ComposeAttachmentTreeItem extends vscode.TreeItem {
+  readonly contextValue = "composeAttachment";
+
+  constructor(readonly attachment: ComposeAttachment) {
+    super(attachment.projectName, vscode.TreeItemCollapsibleState.None);
+    this.id = attachment.id;
+    this.description = attachment.ports.map(formatComposePort).join(", ");
+    this.tooltip = buildComposeAttachmentTooltip(attachment);
+    this.iconPath = new vscode.ThemeIcon(
+      attachment.status === "attached" ? "database" : "warning",
+      attachment.status === "error" ? new vscode.ThemeColor("testing.iconFailed") : undefined,
     );
   }
 }
@@ -381,6 +439,40 @@ export class TerminalCandidateTreeItem extends vscode.TreeItem {
     this.description = `pid ${candidate.pid}${candidate.vscodeTerminal ? ", VS Code" : ""}`;
     this.tooltip = buildTerminalTooltip(candidate);
     this.iconPath = new vscode.ThemeIcon(candidate.vscodeTerminal ? "terminal" : "debug-console");
+  }
+}
+
+/** Docker/Podman container or compose service with host-published ports. */
+export class ContainerServiceCandidateTreeItem extends vscode.TreeItem {
+  readonly contextValue = "containerServiceCandidate";
+
+  constructor(readonly candidate: ContainerServiceCandidate) {
+    super(formatContainerServiceLabel(candidate), vscode.TreeItemCollapsibleState.Collapsed);
+    this.id = candidate.id;
+    this.description = `${candidate.runtime}, ${candidate.ports.length} port${candidate.ports.length === 1 ? "" : "s"}`;
+    this.tooltip = buildContainerServiceTooltip(candidate);
+    this.iconPath = new vscode.ThemeIcon(candidate.composeProject ? "server-environment" : "server-process");
+    this.command = {
+      command: "portManager.attachContainerToNetwork",
+      title: "Attach Service to Network",
+      arguments: [{ containerService: candidate }],
+    };
+  }
+}
+
+/** One host-published container port under a discovered container candidate. */
+export class ContainerPublishedPortTreeItem extends vscode.TreeItem {
+  readonly contextValue = "containerPublishedPort";
+
+  constructor(
+    readonly candidate: ContainerServiceCandidate,
+    readonly port: ContainerServiceCandidate["ports"][number],
+  ) {
+    super(`${port.actualHostAddress}:${port.actualHostPort}`, vscode.TreeItemCollapsibleState.None);
+    this.id = `${candidate.id}:${port.actualHostAddress}:${port.actualHostPort}:${port.containerPort}`;
+    this.description = `container ${port.containerPort}${port.protocolName ? ` ${port.protocolName}` : ""}`;
+    this.tooltip = buildContainerPortTooltip(candidate, port);
+    this.iconPath = new vscode.ThemeIcon("plug");
   }
 }
 
@@ -613,6 +705,25 @@ export function getTerminalWindowFromCommandArgument(argument: unknown): Termina
   return undefined;
 }
 
+/** Extracts a container service candidate from a tree command argument. */
+export function getContainerServiceCandidateFromCommandArgument(
+  argument: unknown,
+): ContainerServiceCandidate | undefined {
+  if (argument instanceof ContainerServiceCandidateTreeItem) {
+    return argument.candidate;
+  }
+
+  if (isAttachContainerInput(argument)) {
+    return argument.containerService;
+  }
+
+  if (isContainerServiceCandidate(argument)) {
+    return argument;
+  }
+
+  return undefined;
+}
+
 /** Extracts a terminal attachment from a tree command argument. */
 export function getTerminalAttachmentFromCommandArgument(argument: unknown): TerminalAttachment | undefined {
   if (argument instanceof TerminalAttachmentTreeItem) {
@@ -652,6 +763,19 @@ export function getHostAccessBindingFromCommandArgument(argument: unknown): Host
   return undefined;
 }
 
+/** Extracts a compose attachment from a tree command argument. */
+export function getComposeAttachmentFromCommandArgument(argument: unknown): ComposeAttachment | undefined {
+  if (argument instanceof ComposeAttachmentTreeItem) {
+    return argument.attachment;
+  }
+
+  if (isComposeAttachment(argument)) {
+    return argument;
+  }
+
+  return undefined;
+}
+
 function isHostAccessBinding(argument: unknown): argument is HostAccessBinding {
   return (
     typeof argument === "object" &&
@@ -660,6 +784,17 @@ function isHostAccessBinding(argument: unknown): argument is HostAccessBinding {
     "networkId" in argument &&
     "logicalPort" in argument &&
     "hostPort" in argument
+  );
+}
+
+function isComposeAttachment(argument: unknown): argument is ComposeAttachment {
+  return (
+    typeof argument === "object" &&
+    argument !== null &&
+    "id" in argument &&
+    "networkId" in argument &&
+    "projectName" in argument &&
+    "ports" in argument
   );
 }
 
@@ -680,11 +815,13 @@ function buildNetworkDescription(
   attachmentCount: number,
   exposureCount: number,
   hostAccessCount: number,
+  composeCount: number,
 ): string {
   const details = [
     attachmentCount > 0 ? `${attachmentCount} terminals` : undefined,
     exposureCount > 0 ? `${exposureCount} bindings` : undefined,
     hostAccessCount > 0 ? `${hostAccessCount} host access` : undefined,
+    composeCount > 0 ? `${composeCount} compose` : undefined,
   ].filter((item): item is string => item !== undefined);
 
   return `${network.runtimeKind} ${network.status}${details.length > 0 ? `, ${details.join(", ")}` : ""}`;
@@ -696,6 +833,7 @@ function buildNetworkTooltip(
   attachmentCount: number,
   exposureCount: number,
   hostAccessCount: number,
+  composeCount: number,
 ): vscode.MarkdownString {
   const tooltip = new vscode.MarkdownString(undefined, true);
   tooltip.isTrusted = false;
@@ -706,10 +844,37 @@ function buildNetworkTooltip(
   tooltip.appendMarkdown(`- Attachments: \`${attachmentCount}\`\n`);
   tooltip.appendMarkdown(`- Host Bindings: \`${exposureCount}\`\n`);
   tooltip.appendMarkdown(`- Host Access: \`${hostAccessCount}\`\n`);
+  tooltip.appendMarkdown(`- Compose Attachments: \`${composeCount}\`\n`);
   tooltip.appendMarkdown(`- Created: \`${network.createdAt}\`\n`);
 
   if (network.errorMessage) {
     tooltip.appendMarkdown(`\nError: \`${escapeMarkdown(network.errorMessage)}\``);
+  }
+
+  return tooltip;
+}
+
+/** Builds tooltip details for one compose attachment. */
+function buildComposeAttachmentTooltip(attachment: ComposeAttachment): vscode.MarkdownString {
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.isTrusted = false;
+  tooltip.appendMarkdown(`**${escapeMarkdown(attachment.projectName)}**\n\n`);
+  tooltip.appendMarkdown(`- Network ID: \`${escapeMarkdown(attachment.networkId)}\`\n`);
+  tooltip.appendMarkdown(`- Status: \`${attachment.status}\`\n`);
+  tooltip.appendMarkdown(`- Attached: \`${attachment.attachedAt}\`\n`);
+
+  for (const port of attachment.ports) {
+    tooltip.appendMarkdown(
+      `- ${escapeMarkdown(port.serviceName)}: \`${port.logicalPort} -> ${escapeMarkdown(port.actualHostAddress)}:${port.actualHostPort}\``,
+    );
+    if (port.protocolName) {
+      tooltip.appendMarkdown(` \`${escapeMarkdown(port.protocolName)}\``);
+    }
+    tooltip.appendMarkdown("\n");
+  }
+
+  if (attachment.errorMessage) {
+    tooltip.appendMarkdown(`\nError: \`${escapeMarkdown(attachment.errorMessage)}\``);
   }
 
   return tooltip;
@@ -764,6 +929,49 @@ function buildTerminalTooltip(candidate: TerminalCandidate): vscode.MarkdownStri
   return tooltip;
 }
 
+/** Builds tooltip details for one discovered container or compose service. */
+function buildContainerServiceTooltip(candidate: ContainerServiceCandidate): vscode.MarkdownString {
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.isTrusted = false;
+  tooltip.appendMarkdown(`**${escapeMarkdown(formatContainerServiceLabel(candidate))}**\n\n`);
+  tooltip.appendMarkdown(`- Runtime: \`${candidate.runtime}\`\n`);
+  tooltip.appendMarkdown(`- Container: \`${escapeMarkdown(candidate.containerName)}\`\n`);
+  tooltip.appendMarkdown(`- ID: \`${escapeMarkdown(candidate.containerId)}\`\n`);
+  tooltip.appendMarkdown(`- Image: \`${escapeMarkdown(candidate.image ?? "n/a")}\`\n`);
+  tooltip.appendMarkdown(`- Status: \`${escapeMarkdown(candidate.status ?? "n/a")}\`\n`);
+
+  if (candidate.composeProject || candidate.composeService) {
+    tooltip.appendMarkdown(`- Compose Project: \`${escapeMarkdown(candidate.composeProject ?? "n/a")}\`\n`);
+    tooltip.appendMarkdown(`- Compose Service: \`${escapeMarkdown(candidate.composeService ?? "n/a")}\`\n`);
+  }
+
+  for (const port of candidate.ports) {
+    tooltip.appendMarkdown(
+      `- ${escapeMarkdown(port.serviceName)}: \`${port.logicalPort} -> ${escapeMarkdown(port.actualHostAddress)}:${port.actualHostPort}\` container \`${port.containerPort}\`\n`,
+    );
+  }
+
+  return tooltip;
+}
+
+/** Builds tooltip details for one container published port. */
+function buildContainerPortTooltip(
+  candidate: ContainerServiceCandidate,
+  port: ContainerServiceCandidate["ports"][number],
+): vscode.MarkdownString {
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.isTrusted = false;
+  tooltip.appendMarkdown(`**Published Port**\n\n`);
+  tooltip.appendMarkdown(`- Service: \`${escapeMarkdown(port.serviceName)}\`\n`);
+  tooltip.appendMarkdown(`- Container: \`${escapeMarkdown(candidate.containerName)}\`\n`);
+  tooltip.appendMarkdown(`- Host: \`${escapeMarkdown(port.actualHostAddress)}:${port.actualHostPort}\`\n`);
+  tooltip.appendMarkdown(`- Container Port: \`${port.containerPort}\`\n`);
+  tooltip.appendMarkdown(`- Default Logical Port: \`${port.logicalPort}\`\n`);
+  tooltip.appendMarkdown(`- Protocol: \`${port.protocolName ?? port.protocol}\`\n`);
+
+  return tooltip;
+}
+
 /** Builds tooltip details for one host port exposure. */
 function buildExposureTooltip(
   exposure: HostPortExposure,
@@ -801,6 +1009,21 @@ function buildHostAccessBindingTooltip(binding: HostAccessBinding): vscode.Markd
   }
 
   return tooltip;
+}
+
+/** Formats one compose route as logical port to actual published endpoint. */
+function formatComposePort(port: ComposeAttachment["ports"][number]): string {
+  const protocol = port.protocolName === undefined ? "" : ` ${port.protocolName}`;
+  return `${port.logicalPort} -> ${port.actualHostPort}${protocol}`;
+}
+
+/** Labels compose services as project/service and raw containers by name. */
+function formatContainerServiceLabel(candidate: ContainerServiceCandidate): string {
+  if (candidate.composeProject !== undefined || candidate.composeService !== undefined) {
+    return `${candidate.composeProject ?? "compose"}/${candidate.composeService ?? candidate.containerName}`;
+  }
+
+  return candidate.containerName;
 }
 
 /** Builds tooltip details for one runtime adapter. */
@@ -854,6 +1077,8 @@ function sourceLabel(process: ManagedProcess): string {
       return "hooked";
     case "registered":
       return "registered";
+    case "compose":
+      return "compose";
     case "allocated":
       return "allocated";
     case "managed":
@@ -1031,6 +1256,29 @@ function isTerminalWindow(value: unknown): value is TerminalWindow {
     typeof candidate.rootPid === "number" &&
     typeof candidate.candidateCount === "number"
   );
+}
+
+function isContainerServiceCandidate(value: unknown): value is ContainerServiceCandidate {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const candidate = value as Partial<ContainerServiceCandidate>;
+  return (
+    typeof candidate.id === "string" &&
+    typeof candidate.runtime === "string" &&
+    typeof candidate.containerId === "string" &&
+    typeof candidate.containerName === "string" &&
+    Array.isArray(candidate.ports)
+  );
+}
+
+function isAttachContainerInput(value: unknown): value is { readonly containerService: ContainerServiceCandidate } {
+  if (typeof value !== "object" || value === null || !("containerService" in value)) {
+    return false;
+  }
+
+  return isContainerServiceCandidate((value as { readonly containerService?: unknown }).containerService);
 }
 
 function isHostPortExposure(value: unknown): value is HostPortExposure {

@@ -3,6 +3,8 @@ import test from "node:test";
 
 import { LogicalNetworkRegistry } from "../../src/core/networks/logical-network-registry";
 import type {
+  ComposeAttachment,
+  ContainerServiceCandidate,
   HostAccessBinding,
   HostPortExposure,
   LogicalNetwork,
@@ -62,6 +64,52 @@ function createHostAccessBinding(overrides: Partial<HostAccessBinding> = {}): Ho
   };
 }
 
+function createComposeAttachment(overrides: Partial<ComposeAttachment> = {}): ComposeAttachment {
+  return {
+    id: "compose-1",
+    networkId: "network-1",
+    projectName: "workspace",
+    composeFiles: [],
+    ports: [
+      {
+        serviceName: "postgres",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 57001,
+        containerPort: 5432,
+        protocol: "tcp",
+        protocolName: "postgresql",
+      },
+    ],
+    status: "attached",
+    attachedAt: "2026-06-22T00:04:00.000Z",
+    ...overrides,
+  };
+}
+
+function createContainerServiceCandidate(overrides: Partial<ContainerServiceCandidate> = {}): ContainerServiceCandidate {
+  return {
+    id: "docker:abc123",
+    runtime: "docker",
+    containerId: "abc123",
+    containerName: "workspace-postgres-1",
+    composeProject: "workspace",
+    composeService: "postgres",
+    ports: [
+      {
+        serviceName: "postgres",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 15432,
+        containerPort: 5432,
+        protocol: "tcp",
+        protocolName: "postgresql",
+      },
+    ],
+    ...overrides,
+  };
+}
+
 test("stores networks, terminal candidates, and exposures in snapshots", () => {
   const registry = new LogicalNetworkRegistry([runtime]);
   let eventCount = 0;
@@ -81,6 +129,8 @@ test("stores networks, terminal candidates, and exposures in snapshots", () => {
   ]);
   registry.addExposure(createExposure());
   registry.addHostAccessBinding(createHostAccessBinding());
+  registry.addComposeAttachment(createComposeAttachment());
+  registry.setContainerServiceCandidates([createContainerServiceCandidate()]);
 
   const snapshot = registry.getSnapshot();
 
@@ -104,8 +154,16 @@ test("stores networks, terminal candidates, and exposures in snapshots", () => {
     snapshot.hostAccessBindings.map((binding) => binding.id),
     ["host-access-1"],
   );
+  assert.deepEqual(
+    snapshot.composeAttachments.map((attachment) => attachment.id),
+    ["compose-1"],
+  );
+  assert.deepEqual(
+    snapshot.containerServiceCandidates.map((candidate) => candidate.id),
+    ["docker:abc123"],
+  );
   assert.equal(snapshot.runtimes[0]?.id, "proxy");
-  assert.equal(eventCount, 4);
+  assert.equal(eventCount, 6);
 });
 
 test("groups noisy terminal process candidates into terminal windows", () => {
@@ -191,6 +249,7 @@ test("removing a network removes dependent attachments and exposures", () => {
   const attachment = registry.getSnapshot().attachments[0];
   registry.addExposure(createExposure());
   registry.addHostAccessBinding(createHostAccessBinding());
+  registry.addComposeAttachment(createComposeAttachment());
 
   const removed = registry.removeNetwork("network-1");
   const snapshot = registry.getSnapshot();
@@ -203,6 +262,18 @@ test("removing a network removes dependent attachments and exposures", () => {
   assert.deepEqual(snapshot.attachments, []);
   assert.deepEqual(snapshot.exposures, []);
   assert.deepEqual(snapshot.hostAccessBindings, []);
+  assert.deepEqual(snapshot.composeAttachments, []);
+});
+
+test("rejects duplicate compose routes in the same logical network", () => {
+  const registry = new LogicalNetworkRegistry([runtime]);
+  registry.addNetwork(createNetwork());
+  registry.addComposeAttachment(createComposeAttachment());
+
+  assert.throws(
+    () => registry.addComposeAttachment(createComposeAttachment({ id: "compose-2", projectName: "other" })),
+    /Compose route already exists/,
+  );
 });
 
 test("persisted state excludes transient terminal candidates", () => {
@@ -223,4 +294,5 @@ test("persisted state excludes transient terminal candidates", () => {
     ["network-1"],
   );
   assert.equal("terminalCandidates" in persisted, false);
+  assert.equal("containerServiceCandidates" in persisted, false);
 });

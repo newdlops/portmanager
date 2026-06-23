@@ -802,6 +802,71 @@ test("reuses active receiver routes instead of creating sender-side pending rout
   assert.deepEqual(routeEntryTable.routes, routeTable.routes);
 });
 
+test("reuses active compose routes before allocating host fallback routes", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const checkedPorts: number[] = [];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: {
+      check: async (port) => {
+        checkedPorts.push(port);
+        return {
+          port,
+          available: true,
+        };
+      },
+    },
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 0,
+    name: "workspace:postgres/postgresql",
+    command: "docker compose service workspace/postgres",
+    cwd: "/workspace/app",
+    requestedPort: 15432,
+    actualPort: 57001,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "compose",
+  });
+
+  const allocation = await agent.allocateRoute({
+    name: "psql",
+    command: "psql postgresql://localhost:15432/app",
+    cwd: "/workspace/app",
+    requestedPort: 15432,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    routeDirection: "send",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 57000,
+    virtualPortRangeEnd: 57010,
+  });
+  const routeTable = readRouteTable(getNetworkRouteTablePath("network-a", routeTablePath));
+  const routeEntryTable = readRouteTable(getRouteTablePathForLogicalPort(15432, "network-a", routeTablePath));
+  const globalRouteTable = readRouteTable(routeTablePath);
+
+  assert.equal(allocation.allocationId, "");
+  assert.equal(allocation.actualPort, 57001);
+  assert.deepEqual(checkedPorts, []);
+  assert.equal(globalRouteTable.routes.length, 1);
+  assert.equal((globalRouteTable.routes[0] as { source?: string }).source, "compose");
+  assert.equal(routeTable.routes.length, 1);
+  assert.equal((routeTable.routes[0] as { source?: string }).source, "compose");
+  assert.equal((routeTable.routes[0] as { logicalPort?: number }).logicalPort, 15432);
+  assert.equal((routeTable.routes[0] as { actualPort?: number }).actualPort, 57001);
+  assert.deepEqual(routeEntryTable.routes, routeTable.routes);
+});
+
 test("does not reuse active listener routes for a new listener allocation", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const agent = new PortManagerAgent({

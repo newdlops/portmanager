@@ -1,5 +1,7 @@
 import { SimpleEventEmitter } from "../../shared/events";
 import type {
+  ComposeAttachment,
+  ContainerServiceCandidate,
   DisposableLike,
   HostAccessBinding,
   HostPortExposure,
@@ -31,11 +33,17 @@ export class LogicalNetworkRegistry implements DisposableLike {
   /** Network-to-host binding rows keyed by binding id. */
   private readonly hostAccessBindings = new Map<string, HostAccessBinding>();
 
+  /** Compose project endpoint rows keyed by attachment id. */
+  private readonly composeAttachments = new Map<string, ComposeAttachment>();
+
   /** Latest transient terminal discovery results. */
   private terminalCandidates: readonly TerminalCandidate[] = [];
 
   /** User-facing terminal windows grouped from transient process candidates. */
   private terminalWindows: readonly TerminalWindow[] = [];
+
+  /** Latest transient Docker/Podman published-port candidates. */
+  private containerServiceCandidates: readonly ContainerServiceCandidate[] = [];
 
   /** Runtime descriptors available to the current extension session. */
   private runtimes: readonly NetworkRuntimeDescriptor[];
@@ -61,6 +69,10 @@ export class LogicalNetworkRegistry implements DisposableLike {
     for (const binding of initialState?.hostAccessBindings ?? []) {
       this.hostAccessBindings.set(binding.id, binding);
     }
+
+    for (const attachment of initialState?.composeAttachments ?? []) {
+      this.composeAttachments.set(attachment.id, attachment);
+    }
   }
 
   /** Subscribes to any registry mutation. */
@@ -77,6 +89,8 @@ export class LogicalNetworkRegistry implements DisposableLike {
       attachments: [...this.attachments.values()],
       exposures: [...this.exposures.values()],
       hostAccessBindings: [...this.hostAccessBindings.values()],
+      composeAttachments: [...this.composeAttachments.values()],
+      containerServiceCandidates: this.containerServiceCandidates,
       runtimes: this.runtimes,
       updatedAt: new Date().toISOString(),
     };
@@ -89,6 +103,7 @@ export class LogicalNetworkRegistry implements DisposableLike {
       attachments: [...this.attachments.values()],
       exposures: [...this.exposures.values()],
       hostAccessBindings: [...this.hostAccessBindings.values()],
+      composeAttachments: [...this.composeAttachments.values()],
     };
   }
 
@@ -102,6 +117,12 @@ export class LogicalNetworkRegistry implements DisposableLike {
   setTerminalCandidates(candidates: readonly TerminalCandidate[]): void {
     this.terminalCandidates = dedupeTerminalCandidates(candidates);
     this.terminalWindows = groupTerminalWindows(this.terminalCandidates);
+    this.emitChange();
+  }
+
+  /** Replaces transient Docker/Podman service candidates shown in the UI. */
+  setContainerServiceCandidates(candidates: readonly ContainerServiceCandidate[]): void {
+    this.containerServiceCandidates = dedupeContainerServiceCandidates(candidates);
     this.emitChange();
   }
 
@@ -140,6 +161,12 @@ export class LogicalNetworkRegistry implements DisposableLike {
     for (const [bindingId, binding] of this.hostAccessBindings) {
       if (binding.networkId === networkId) {
         this.hostAccessBindings.delete(bindingId);
+      }
+    }
+
+    for (const [attachmentId, attachment] of this.composeAttachments) {
+      if (attachment.networkId === networkId) {
+        this.composeAttachments.delete(attachmentId);
       }
     }
 
@@ -258,6 +285,46 @@ export class LogicalNetworkRegistry implements DisposableLike {
     return binding;
   }
 
+  /** Stores a compose project attachment after its published ports become route rows. */
+  addComposeAttachment(attachment: ComposeAttachment): ComposeAttachment {
+    if (!this.networks.has(attachment.networkId)) {
+      throw new Error(`Unknown logical network: ${attachment.networkId}`);
+    }
+
+    if (this.composeAttachments.has(attachment.id)) {
+      throw new Error(`Compose attachment already exists: ${attachment.id}`);
+    }
+
+    this.ensureNoComposePortConflict(attachment);
+    this.composeAttachments.set(attachment.id, attachment);
+    this.emitChange();
+    return attachment;
+  }
+
+  /** Updates a compose attachment after endpoint route rows change. */
+  updateComposeAttachment(attachment: ComposeAttachment): ComposeAttachment {
+    if (!this.composeAttachments.has(attachment.id)) {
+      throw new Error(`Unknown compose attachment: ${attachment.id}`);
+    }
+
+    this.ensureNoComposePortConflict(attachment);
+    this.composeAttachments.set(attachment.id, attachment);
+    this.emitChange();
+    return attachment;
+  }
+
+  /** Removes a compose attachment row after its route rows have been removed. */
+  removeComposeAttachment(attachmentId: string): ComposeAttachment | undefined {
+    const attachment = this.composeAttachments.get(attachmentId);
+    if (attachment === undefined) {
+      return undefined;
+    }
+
+    this.composeAttachments.delete(attachmentId);
+    this.emitChange();
+    return attachment;
+  }
+
   /** Releases registry listeners. */
   dispose(): void {
     this.changeEvents.clear();
@@ -265,6 +332,40 @@ export class LogicalNetworkRegistry implements DisposableLike {
 
   private emitChange(): void {
     this.changeEvents.emit();
+  }
+
+  /**
+   * A logical network can shadow a host port with one compose service endpoint,
+   * but two active compose endpoints for the same logical port would make
+   * routing nondeterministic.
+   */
+  private ensureNoComposePortConflict(attachment: ComposeAttachment): void {
+    const seenPorts = new Set<string>();
+
+    for (const port of attachment.ports) {
+      const key = `${attachment.networkId}:${port.protocol}:${port.logicalPort}`;
+      if (seenPorts.has(key)) {
+        throw new Error(`Compose attachment has duplicate logical port ${port.logicalPort}.`);
+      }
+
+      seenPorts.add(key);
+    }
+
+    for (const existing of this.composeAttachments.values()) {
+      if (existing.id === attachment.id || existing.networkId !== attachment.networkId) {
+        continue;
+      }
+
+      for (const existingPort of existing.ports) {
+        const conflict = attachment.ports.find(
+          (port) => port.protocol === existingPort.protocol && port.logicalPort === existingPort.logicalPort,
+        );
+
+        if (conflict !== undefined) {
+          throw new Error(`Compose route already exists for logical port ${conflict.logicalPort}.`);
+        }
+      }
+    }
   }
 }
 
@@ -277,6 +378,8 @@ export interface LogicalNetworkRegistryState {
   readonly exposures: readonly HostPortExposure[];
   /** Persisted network-to-host access rows. */
   readonly hostAccessBindings?: readonly HostAccessBinding[];
+  /** Persisted compose project endpoint rows. */
+  readonly composeAttachments?: readonly ComposeAttachment[];
 }
 
 /** Keeps one row per visible terminal root while preserving discovery order. */
@@ -291,6 +394,25 @@ function dedupeTerminalCandidates(candidates: readonly TerminalCandidate[]): rea
     }
 
     seen.add(key);
+    deduped.push(candidate);
+  }
+
+  return deduped;
+}
+
+/** Keeps one row per runtime/container id while preserving discovery order. */
+function dedupeContainerServiceCandidates(
+  candidates: readonly ContainerServiceCandidate[],
+): readonly ContainerServiceCandidate[] {
+  const seen = new Set<string>();
+  const deduped: ContainerServiceCandidate[] = [];
+
+  for (const candidate of candidates) {
+    if (seen.has(candidate.id)) {
+      continue;
+    }
+
+    seen.add(candidate.id);
     deduped.push(candidate);
   }
 

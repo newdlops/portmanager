@@ -54,6 +54,16 @@ type HostPortExposure = {
 };
 ```
 
+#### Compose Published Port Attachment
+
+Docker Compose 같은 컨테이너 서비스가 이미 호스트 머신에 publish한 포트를 Logical Network의 내부 서비스 포트로 등록하는 행위다. 이 방식은 컨테이너를 터미널과 같은 실제 network namespace로 옮기지 않는다. 대신 Compose가 publish한 실제 host endpoint를 Port Manager route table에 기록해, 같은 Logical Network에 붙은 터미널/프로세스의 `connect(localhost:<logicalPort>)`가 해당 endpoint로 재매핑되게 한다.
+
+예를 들어 A network의 Compose PostgreSQL이 container `5432`를 host `127.0.0.1:57001`로 publish했다면, Port Manager는 A network의 logical `15432 -> 127.0.0.1:57001` route를 등록할 수 있다. 그러면 A network 안의 클라이언트는 계속 `localhost:15432`를 사용한다.
+
+Compose route는 같은 Logical Network에서 같은 logical port의 Host Access fallback보다 우선한다. 따라서 Compose가 떠 있으면 `localhost:15432`는 Compose PostgreSQL을 보고, Compose attachment가 제거되면 같은 주소는 다시 호스트 머신의 `15432` fallback을 볼 수 있어야 한다.
+
+확장은 Docker/Podman에서 실행 중인 컨테이너와 Compose service의 published port를 탐색해 UI 후보로 보여줘야 한다. 사용자는 서비스 후보를 선택하고 Logical Network를 고르면, 해당 서비스가 publish한 모든 TCP 포트가 attachment로 등록되어야 한다. 이 탐색 후보는 일시적인 UI 상태이며, 실제 route 보장은 attachment가 생성된 뒤 `ComposeAttachment`와 agent route row가 담당한다.
+
 #### Network Runtime Adapter
 
 Logical Network를 실제 시스템에서 구현하는 어댑터다. VS Code 확장만으로 모든 플랫폼에서 임의 프로세스의 network namespace를 만들 수는 없으므로, 런타임 구현은 인터페이스 뒤에 둔다.

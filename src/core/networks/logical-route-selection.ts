@@ -25,6 +25,7 @@ export function findRoutesMatchingClientCwd(
       route.logicalPort === logicalPort &&
       route.actualPort !== route.logicalPort &&
       (route.routeDirection === undefined || route.routeDirection === "listen") &&
+      route.source !== "compose" &&
       route.cwd !== undefined &&
       (route.status === "running" || route.status === "starting"),
   );

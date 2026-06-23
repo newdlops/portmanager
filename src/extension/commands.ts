@@ -8,6 +8,8 @@ import { readPortManagerSettings, openPortManagerSettings } from "../config/vsco
 import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
 import type { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import {
+  getComposeAttachmentFromCommandArgument,
+  getContainerServiceCandidateFromCommandArgument,
   getHostPortExposureFromCommandArgument,
   getHostAccessBindingFromCommandArgument,
   getLogicalNetworkFromCommandArgument,
@@ -23,6 +25,8 @@ import {
   RUNTIME_SHIM_DIRECTORY_ENV,
 } from "./terminal-hook-environment";
 import type {
+  ComposeAttachment,
+  ContainerServiceCandidate,
   DisposableLike,
   HostAccessBinding,
   HostPortExposure,
@@ -75,8 +79,12 @@ export class PortManagerCommandController implements DisposableLike {
       this.removeLogicalNetwork(argument),
     );
     this.registerCommand(context, "portManager.refreshTerminals", () => this.refreshTerminals());
+    this.registerCommand(context, "portManager.refreshContainerServices", () => this.refreshContainerServices());
     this.registerCommand(context, "portManager.attachTerminalToNetwork", (argument) =>
       this.attachTerminalToNetwork(argument),
+    );
+    this.registerCommand(context, "portManager.attachContainerToNetwork", (argument) =>
+      this.attachContainerToNetwork(argument),
     );
     this.registerCommand(context, "portManager.detachTerminalFromNetwork", (argument) =>
       this.detachTerminalFromNetwork(argument),
@@ -89,6 +97,12 @@ export class PortManagerCommandController implements DisposableLike {
     );
     this.registerCommand(context, "portManager.addHostAccessBinding", (argument) =>
       this.addHostAccessBinding(argument),
+    );
+    this.registerCommand(context, "portManager.addComposePublishedPort", (argument) =>
+      this.addComposePublishedPort(argument),
+    );
+    this.registerCommand(context, "portManager.removeComposeAttachment", (argument) =>
+      this.removeComposeAttachment(argument),
     );
     this.registerCommand(context, "portManager.saveBindingPreset", (argument) => this.saveBindingPreset(argument));
     this.registerCommand(context, "portManager.applyBindingPreset", (argument) => this.applyBindingPreset(argument));
@@ -173,6 +187,13 @@ export class PortManagerCommandController implements DisposableLike {
     await vscode.window.showInformationMessage(`Discovered ${windows.length} terminal windows.`);
   }
 
+  /** Refreshes Docker/Podman containers with host-published ports. */
+  private async refreshContainerServices(): Promise<void> {
+    const candidates = await this.dependencies.networkService.refreshContainerServices();
+    this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage(`Discovered ${candidates.length} container services.`);
+  }
+
   /** Attaches a selected terminal window to a selected network when the runtime supports it. */
   private async attachTerminalToNetwork(argument: unknown): Promise<void> {
     const directInput = getAttachTerminalInput(argument);
@@ -191,6 +212,47 @@ export class PortManagerCommandController implements DisposableLike {
 
     await vscode.window.showInformationMessage(
       `Attached "${terminalWindow.title}" to "${network.name}" (${attachment.mode ?? "isolated"} mode).`,
+    );
+  }
+
+  /** Attaches a discovered container or compose service's published ports to a logical network. */
+  private async attachContainerToNetwork(argument: unknown): Promise<void> {
+    const directInput = getAttachContainerInput(argument);
+    const candidate =
+      directInput?.containerService ??
+      (await this.resolveContainerServiceCandidateArgument(argument, "Attach Service to Network"));
+    if (candidate === undefined) {
+      return;
+    }
+
+    const network =
+      directInput?.network ?? (await this.resolveNetworkArgument(undefined, "Attach Service to Network"));
+    if (network === undefined) {
+      return;
+    }
+
+    if (candidate.ports.length === 0) {
+      await vscode.window.showInformationMessage(`"${formatContainerServiceLabel(candidate)}" has no published TCP ports.`);
+      return;
+    }
+
+    const attachment = await this.dependencies.networkService.attachComposePublishedPorts({
+      networkId: network.id,
+      projectName: candidate.composeProject ?? candidate.containerName,
+      cwd: getDefaultWorkspaceFolder() ?? process.cwd(),
+      ports: candidate.ports.map((port) => ({
+        serviceName: port.serviceName,
+        logicalPort: port.logicalPort,
+        actualHostAddress: port.actualHostAddress,
+        actualHostPort: port.actualHostPort,
+        containerPort: port.containerPort,
+        protocolName: port.protocolName,
+      })),
+    });
+
+    this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage(
+      `Attached "${formatContainerServiceLabel(candidate)}" to "${network.name}" (${attachment.ports.length} port${attachment.ports.length === 1 ? "" : "s"}).`,
     );
   }
 
@@ -328,6 +390,100 @@ export class PortManagerCommandController implements DisposableLike {
     await vscode.window.showInformationMessage(
       `Bound "${network.name}" logical port ${binding.logicalPort} to host ${binding.hostAddress}:${binding.hostPort}.`,
     );
+  }
+
+  /** Registers one Docker Compose published service port as a network-local route. */
+  private async addComposePublishedPort(argument: unknown): Promise<void> {
+    const settings = readPortManagerSettings();
+    const network = await this.resolveNetworkArgument(argument, "Add Compose Published Port");
+    if (network === undefined) {
+      return;
+    }
+
+    const cwd = getDefaultWorkspaceFolder() ?? process.cwd();
+    const projectName = await vscode.window.showInputBox({
+      title: "Add Compose Published Port",
+      prompt: "Compose project name",
+      value: path.basename(cwd),
+      ignoreFocusOut: true,
+      validateInput: (value) => (value.trim().length === 0 ? "Project name is required." : undefined),
+    });
+
+    if (!projectName) {
+      return;
+    }
+
+    const serviceName = await vscode.window.showInputBox({
+      title: "Add Compose Published Port",
+      prompt: "Compose service name",
+      placeHolder: "postgres",
+      ignoreFocusOut: true,
+      validateInput: (value) => (value.trim().length === 0 ? "Service name is required." : undefined),
+    });
+
+    if (!serviceName) {
+      return;
+    }
+
+    const logicalPort = await promptForPort("Logical network port", settings.preferredPorts[0] ?? 15_432);
+    if (logicalPort === undefined) {
+      return;
+    }
+
+    const actualHostAddress = await vscode.window.showInputBox({
+      title: "Add Compose Published Port",
+      prompt: "Docker-published host address",
+      value: "127.0.0.1",
+      ignoreFocusOut: true,
+      validateInput: (value) => (value.trim().length === 0 ? "Host address is required." : undefined),
+    });
+
+    if (!actualHostAddress) {
+      return;
+    }
+
+    const actualHostPort = await promptForPort("Docker-published host port", logicalPort);
+    if (actualHostPort === undefined) {
+      return;
+    }
+
+    const protocolName = await vscode.window.showInputBox({
+      title: "Add Compose Published Port",
+      prompt: "Protocol label",
+      value: inferProtocolName(logicalPort),
+      placeHolder: "postgresql",
+      ignoreFocusOut: true,
+    });
+
+    const attachment = await this.dependencies.networkService.attachComposePublishedPorts({
+      networkId: network.id,
+      projectName: projectName.trim(),
+      cwd,
+      ports: [
+        {
+          serviceName: serviceName.trim(),
+          logicalPort,
+          actualHostAddress: actualHostAddress.trim(),
+          actualHostPort,
+          protocolName: protocolName?.trim(),
+        },
+      ],
+    });
+
+    this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage(`Attached compose project "${attachment.projectName}".`);
+  }
+
+  /** Removes compose route rows so same-number host ports become fallback again. */
+  private async removeComposeAttachment(argument: unknown): Promise<void> {
+    const attachment = await this.resolveComposeAttachmentArgument(argument, "Remove Compose Attachment");
+    if (attachment === undefined) {
+      return;
+    }
+
+    await this.dependencies.networkService.removeComposeAttachment(attachment.id);
+    this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage(`Removed compose project "${attachment.projectName}".`);
   }
 
   /** Removes one host exposure and closes its local listener. */
@@ -636,7 +792,10 @@ export class PortManagerCommandController implements DisposableLike {
 
   /** Forces the tree provider to request the latest registry snapshot. */
   private async refresh(): Promise<void> {
-    await this.dependencies.networkService.refreshTerminals();
+    await Promise.all([
+      this.dependencies.networkService.refreshTerminals(),
+      this.dependencies.networkService.refreshContainerServices(),
+    ]);
     this.dependencies.treeProvider.refresh();
   }
 
@@ -902,6 +1061,38 @@ export class PortManagerCommandController implements DisposableLike {
     return selected?.terminalWindow;
   }
 
+  /** Resolves a container service candidate from tree context or Quick Pick. */
+  private async resolveContainerServiceCandidateArgument(
+    argument: unknown,
+    title: string,
+  ): Promise<ContainerServiceCandidate | undefined> {
+    const candidate = getContainerServiceCandidateFromCommandArgument(argument);
+
+    if (candidate !== undefined) {
+      return this.dependencies.networkService
+        .getSnapshot()
+        .containerServiceCandidates.find((item) => item.id === candidate.id);
+    }
+
+    const candidates = this.dependencies.networkService.getSnapshot().containerServiceCandidates;
+    if (candidates.length === 0) {
+      await vscode.window.showInformationMessage("No published container services discovered.");
+      return undefined;
+    }
+
+    const selected = await vscode.window.showQuickPick(
+      candidates.map((item) => ({
+        label: formatContainerServiceLabel(item),
+        description: `${item.runtime}, ${item.ports.length} port${item.ports.length === 1 ? "" : "s"}`,
+        detail: item.ports.map(formatComposePublishedPort).join(", "),
+        candidate: item,
+      })),
+      { title, placeHolder: "Select a container or compose service" },
+    );
+
+    return selected?.candidate;
+  }
+
   /** Resolves a terminal attachment from tree context or Quick Pick. */
   private async resolveTerminalAttachmentArgument(
     argument: unknown,
@@ -989,6 +1180,39 @@ export class PortManagerCommandController implements DisposableLike {
     );
 
     return selected?.binding;
+  }
+
+  /** Resolves a compose attachment from tree context or Quick Pick. */
+  private async resolveComposeAttachmentArgument(
+    argument: unknown,
+    title: string,
+  ): Promise<ComposeAttachment | undefined> {
+    const attachment = getComposeAttachmentFromCommandArgument(argument);
+
+    if (attachment !== undefined) {
+      return this.dependencies.networkService.getComposeAttachment(attachment.id);
+    }
+
+    const snapshot = this.dependencies.networkService.getSnapshot();
+    if (snapshot.composeAttachments.length === 0) {
+      await vscode.window.showInformationMessage("No compose attachments exist.");
+      return undefined;
+    }
+
+    const selected = await vscode.window.showQuickPick(
+      snapshot.composeAttachments.map((item) => {
+        const network = snapshot.networks.find((candidate) => candidate.id === item.networkId);
+        return {
+          label: item.projectName,
+          description: `${network?.name ?? item.networkId} ${item.status}`,
+          detail: item.ports.map(formatComposePublishedPort).join(", "),
+          attachment: item,
+        };
+      }),
+      { title, placeHolder: "Select a compose attachment" },
+    );
+
+    return selected?.attachment;
   }
 
   /** Registers one command and wraps thrown errors in a user-visible message. */
@@ -1079,6 +1303,15 @@ async function promptForInjectionMode(): Promise<PortInjectionMode | undefined> 
   );
 
   return selected?.mode;
+}
+
+/** Builds a concise label for compose services while preserving raw container names. */
+function formatContainerServiceLabel(candidate: ContainerServiceCandidate): string {
+  if (candidate.composeProject !== undefined || candidate.composeService !== undefined) {
+    return `${candidate.composeProject ?? "compose"}/${candidate.composeService ?? candidate.containerName}`;
+  }
+
+  return candidate.containerName;
 }
 
 /** Lets users choose a runtime adapter when more than one is available. */
@@ -1175,9 +1408,38 @@ function formatExposureUrl(exposure: HostPortExposure): string {
   return `http://${formattedHost}:${exposure.hostPort}`;
 }
 
+/** Gives named protocol ports useful defaults without constraining custom values. */
+function inferProtocolName(port: number): string {
+  switch (port) {
+    case 15432:
+    case 5432:
+      return "postgresql";
+    case 13306:
+    case 3306:
+      return "mysql";
+    case 16379:
+    case 6379:
+      return "redis";
+    case 15672:
+      return "rabbitmq";
+    default:
+      return "";
+  }
+}
+
+/** Formats one compose endpoint for Quick Pick details and notifications. */
+function formatComposePublishedPort(port: { readonly logicalPort: number; readonly actualHostAddress: string; readonly actualHostPort: number }): string {
+  return `${port.logicalPort} -> ${port.actualHostAddress}:${port.actualHostPort}`;
+}
+
 interface AttachTerminalCommandInput {
   readonly terminalWindow: TerminalWindow;
   readonly network: LogicalNetwork;
+}
+
+interface AttachContainerCommandInput {
+  readonly containerService?: ContainerServiceCandidate;
+  readonly network?: LogicalNetwork;
 }
 
 function getAttachTerminalInput(argument: unknown): AttachTerminalCommandInput | undefined {
@@ -1192,6 +1454,22 @@ function getAttachTerminalInput(argument: unknown): AttachTerminalCommandInput |
 
   return {
     terminalWindow: candidate.terminalWindow,
+    network: candidate.network,
+  };
+}
+
+function getAttachContainerInput(argument: unknown): AttachContainerCommandInput | undefined {
+  if (typeof argument !== "object" || argument === null) {
+    return undefined;
+  }
+
+  const candidate = argument as Partial<AttachContainerCommandInput>;
+  if (candidate.containerService === undefined && candidate.network === undefined) {
+    return undefined;
+  }
+
+  return {
+    containerService: candidate.containerService,
     network: candidate.network,
   };
 }
@@ -1346,6 +1624,7 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
 export PORT_MANAGER_HOOK=1
 export PORT_MANAGER_AGENT_SOCKET="${escapedSocketPath}"
 export PORT_MANAGER_ROUTES_FILE="${escapedRouteTablePath}"
+export PORT_MANAGER_GLOBAL_ROUTES_FILE="${escapedRouteTablePath}"
 export PORT_MANAGER_HOST_ACCESS_FILE="${escapedHostAccessFilePath}"
 export PORT_MANAGER_AGENT_MAIN="${escapedAgentMainPath}"
 export PORT_MANAGER_SCAN_RANGE="${options.settings.scanRange}"
