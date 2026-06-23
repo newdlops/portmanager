@@ -863,7 +863,6 @@ export class PortManagerNetworkService implements DisposableLike {
         };
       }
 
-      ensureComposePublishedPortsAreIsolated(registeredAttachment.ports);
       registeredAttachment = this.registry.addComposeAttachment(registeredAttachment);
       await this.processService.start();
 
@@ -2136,38 +2135,6 @@ function hasComposeRoute(
       route.host === port.actualHostAddress &&
       isListenRoute(route),
   );
-}
-
-function ensureComposePublishedPortsAreIsolated(ports: readonly ComposePublishedPort[]): void {
-  const directHostPorts = ports.filter(
-    (port) => port.actualHostPort === port.logicalPort && isLocalHostAddress(port.actualHostAddress),
-  );
-
-  if (directHostPorts.length === 0) {
-    return;
-  }
-
-  throw new Error(
-    `Compose/container attach requires a hidden host port that differs from the logical port. Recreate the service with hidden ports or choose Compose clone/as-is attach. Direct host port${directHostPorts.length === 1 ? "" : "s"}: ${directHostPorts.map(formatDirectHostPort).join(", ")}.`,
-  );
-}
-
-function isLocalHostAddress(host: string): boolean {
-  const normalized = host.trim().toLowerCase();
-  return (
-    normalized.length === 0 ||
-    normalized === "localhost" ||
-    normalized === "127.0.0.1" ||
-    normalized === "0.0.0.0" ||
-    normalized === "::1" ||
-    normalized === "::" ||
-    normalized === "[::]" ||
-    normalized === "::ffff:127.0.0.1"
-  );
-}
-
-function formatDirectHostPort(port: ComposePublishedPort): string {
-  return `${port.serviceName}:${port.logicalPort}->${port.actualHostAddress}:${port.actualHostPort}`;
 }
 
 /** Builds the daemon process row that owns one compose published-port route. */

@@ -420,7 +420,17 @@ int pm_parse_register_input(const char *payload, pm_register_input *input) {
   pm_default_text(input->cwd, sizeof(input->cwd), ".");
   pm_default_text(input->host, sizeof(input->host), "localhost");
   pm_default_text(input->source, sizeof(input->source), "registered");
-  return input->pid > 0 && input->requested_port > 0 && input->actual_port > 0 ? 0 : -1;
+  /*
+   * Compose registrations are route rows for Docker-published endpoints, not a
+   * directly owned OS process. Docker Desktop can hide the concrete listener
+   * behind a VM/proxy, so extension-side Compose attach intentionally sends
+   * pid 0 until listener reconciliation can adopt a real owner.
+   */
+  return (input->pid > 0 || strcmp(input->source, "compose") == 0) &&
+                 input->requested_port > 0 &&
+                 input->actual_port > 0
+             ? 0
+             : -1;
 }
 
 int pm_parse_start_input(const char *payload, pm_start_input *input) {

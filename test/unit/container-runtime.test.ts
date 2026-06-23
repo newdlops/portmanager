@@ -211,6 +211,7 @@ test("mutates compose services into a hidden network-scoped project", async (con
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-mutator-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
   const composeFile = path.join(tempDir, "compose.yaml");
+  const staleOverrideFile = path.join(tempDir, "a-app-workspace-bc74e5f2.ports.override.yaml");
   fs.writeFileSync(composeFile, "services:\n  postgres:\n    image: postgres:16\n", "utf8");
 
   const calls: Array<{
@@ -292,7 +293,7 @@ test("mutates compose services into a hidden network-scoped project", async (con
     networkName: "A app",
     originalProjectName: "workspace",
     workingDirectory: tempDir,
-    composeFiles: [composeFile],
+    composeFiles: [composeFile, staleOverrideFile],
     ports: [
       {
         serviceName: "postgres",
@@ -309,6 +310,7 @@ test("mutates compose services into a hidden network-scoped project", async (con
   assert.equal(result.state.originalProjectName, "workspace");
   assert.equal(result.state.mode, "clone");
   assert.equal(result.state.attachedProjectName, "a-app-workspace-bc74e5f2");
+  assert.deepEqual(result.state.composeFiles, [composeFile]);
   assert.deepEqual(result.state.containerMappings, [
     {
       serviceName: "postgres",
@@ -344,6 +346,7 @@ test("mutates compose services into a hidden network-scoped project", async (con
     "compose",
     "container",
   ]);
+  assert.deepEqual(calls[0]?.args, ["compose", "-p", "workspace", "-f", composeFile, "config", "--services"]);
   assert.deepEqual(calls[6]?.args.slice(0, 8), [
     "compose",
     "-p",

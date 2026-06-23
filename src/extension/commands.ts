@@ -387,22 +387,25 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
-    const attachment = await this.dependencies.networkService.attachComposePublishedPorts({
-      networkId: network.id,
-      projectName: candidate.composeProject ?? candidate.containerName,
-      cwd: candidate.composeWorkingDirectory ?? getDefaultWorkspaceFolder() ?? process.cwd(),
-      composeFiles: candidate.composeConfigFiles,
-      ...(candidate.composeProject !== undefined
+    const composeMutation =
+      candidate.composeProject !== undefined && composeAttachMode === "clone"
         ? {
             composeMutation: {
-              mode: composeAttachMode === "clone" ? "clone" : "in-place",
+              mode: "clone" as const,
               allowStatefulClone,
               runtime: candidate.runtime,
               workingDirectory: candidate.composeWorkingDirectory ?? getDefaultWorkspaceFolder() ?? process.cwd(),
               composeFiles: candidate.composeConfigFiles,
             },
           }
-        : {}),
+        : {};
+
+    const attachment = await this.dependencies.networkService.attachComposePublishedPorts({
+      networkId: network.id,
+      projectName: candidate.composeProject ?? candidate.containerName,
+      cwd: candidate.composeWorkingDirectory ?? getDefaultWorkspaceFolder() ?? process.cwd(),
+      composeFiles: candidate.composeConfigFiles,
+      ...composeMutation,
       ports: candidate.ports.map((port) => ({
         serviceName: port.serviceName,
         logicalPort: port.logicalPort,
@@ -1692,8 +1695,8 @@ async function promptForComposeAttachMode(
       },
       {
         label: "Attach as-is",
-        description: "Restart the current Compose project with hidden ports",
-        detail: "Keeps the original project name and recreates selected services with logical-network port routes.",
+        description: "Register the current published ports without restarting Compose",
+        detail: "Keeps the original containers exactly as they are and only adds logical-network route rows.",
         mode: "as-is" as const,
       },
     ],

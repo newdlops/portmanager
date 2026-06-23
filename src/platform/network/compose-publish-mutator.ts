@@ -152,7 +152,12 @@ export class ComposePublishMutator {
     const originalProjectName = assertNonEmptyString(input.originalProjectName, "Compose project name");
     const attachedProjectName =
       mode === "clone" ? buildAttachedProjectName(input.networkName, originalProjectName) : originalProjectName;
-    const composeFiles = await this.resolveComposeFiles(input.workingDirectory, input.composeFiles ?? []);
+    const composeFiles = this.removeGeneratedOverrideFiles(
+      await this.resolveComposeFiles(input.workingDirectory, input.composeFiles ?? []),
+    );
+    if (composeFiles.length === 0) {
+      throw new Error("Compose attach needs the original compose files; generated Port Manager overrides cannot be used alone.");
+    }
     const requestedServices = uniqueStrings(input.ports.map((port) => port.serviceName));
     const originalContext: ComposeCommandContext = {
       runtime: input.runtime,
@@ -183,7 +188,7 @@ export class ComposePublishMutator {
       runtime: input.runtime,
       projectName: attachedProjectName,
       workingDirectory: input.workingDirectory,
-      composeFiles: [...composeFiles, overrideFile],
+      composeFiles: appendUniqueComposeFile(composeFiles, overrideFile),
     };
     let originalStopped = false;
     let hiddenStarted = false;
@@ -318,6 +323,25 @@ export class ComposePublishMutator {
     }
 
     return discoveredFiles;
+  }
+
+  /**
+   * Docker labels on a previously attached clone can include Port Manager's
+   * generated override. Treat it as runtime state, not as a source compose file,
+   * so a later mutation cannot stack the same `-f` file onto itself.
+   */
+  private removeGeneratedOverrideFiles(composeFiles: readonly string[]): readonly string[] {
+    const storageDirectory = normalizeComparablePath(this.storageDirectory);
+
+    return composeFiles.filter((file) => {
+      const normalizedFile = normalizeComparablePath(file);
+      return (
+        normalizedFile === undefined ||
+        storageDirectory === undefined ||
+        path.dirname(normalizedFile) !== storageDirectory ||
+        !path.basename(normalizedFile).endsWith(".ports.override.yaml")
+      );
+    });
   }
 
   /** Writes a Compose override whose only job is to replace published ports. */
@@ -916,6 +940,21 @@ function quoteYamlString(value: string): string {
 
 function uniqueStrings(values: readonly string[]): readonly string[] {
   return [...new Set(values.filter((value) => value.length > 0))];
+}
+
+function appendUniqueComposeFile(composeFiles: readonly string[], overrideFile: string): readonly string[] {
+  const overridePath = normalizeComparablePath(overrideFile);
+  const existingFiles = composeFiles.filter((file) => normalizeComparablePath(file) !== overridePath);
+  return [...existingFiles, overrideFile];
+}
+
+function normalizeComparablePath(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+
+  return path.normalize(path.resolve(trimmed));
 }
 
 function assertNonEmptyString(value: string, label: string): string {
