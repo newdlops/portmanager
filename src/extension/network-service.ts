@@ -41,6 +41,7 @@ import { NodeTerminalCandidateProvider } from "../platform/process/node-terminal
 import type {
   AgentDaemonStatus,
   ComposeAttachment,
+  ComposeContainerMutationMapping,
   ComposePortMutationMode,
   ComposePortMutationState,
   ComposePublishedPort,
@@ -1467,18 +1468,27 @@ export class PortManagerNetworkService implements DisposableLike {
           attachment.ports,
         )
         .catch(() => attachment.ports);
+      const refreshedMutation = await this.refreshComposeContainerMappings(attachment, settings);
+      const portsChanged = composePortsChanged(attachment.ports, refreshedPorts);
+      const mappingsChanged = composeContainerMappingsChanged(
+        attachment.mutation?.containerMappings ?? [],
+        refreshedMutation?.containerMappings ?? [],
+      );
 
-      if (!composePortsChanged(attachment.ports, refreshedPorts)) {
+      if (!portsChanged && !mappingsChanged) {
         continue;
       }
 
-      await this.processService.start();
-      await this.removeComposeRouteProcesses(attachment, attachment.ports);
+      if (portsChanged) {
+        await this.processService.start();
+        await this.removeComposeRouteProcesses(attachment, attachment.ports);
+      }
 
       restoredAttachments.push(
         this.registry.updateComposeAttachment({
           ...attachment,
-          ports: refreshedPorts.map(dropComposeProcessId),
+          ports: portsChanged ? refreshedPorts.map(dropComposeProcessId) : attachment.ports,
+          ...(refreshedMutation !== undefined ? { mutation: refreshedMutation } : {}),
           status: "attached",
           errorMessage: undefined,
         }),
@@ -1489,6 +1499,38 @@ export class PortManagerNetworkService implements DisposableLike {
       await this.restorePersistedComposeRoutes(restoredAttachments);
       void this.syncLogicalPortRouters();
     }
+  }
+
+  /** Refreshes clone container id rewrites without changing attach policy state. */
+  private async refreshComposeContainerMappings(
+    attachment: ComposeAttachment,
+    settings: ReturnType<typeof readContainerRuntimeSettings>,
+  ): Promise<ComposePortMutationState | undefined> {
+    const mutation = attachment.mutation;
+    if (
+      mutation === undefined ||
+      mutation.mode !== "clone" ||
+      mutation.containerMappings === undefined ||
+      mutation.containerMappings.length === 0
+    ) {
+      return mutation;
+    }
+
+    const containerMappings = await this.containerServiceDiscovery
+      .refreshComposeContainerMappings(
+        settings,
+        mutation.originalProjectName,
+        mutation.attachedProjectName,
+        mutation.composeFiles,
+        mutation.services,
+        mutation.containerMappings,
+      )
+      .catch(() => mutation.containerMappings);
+
+    return {
+      ...mutation,
+      containerMappings,
+    };
   }
 
   /** Removes old daemon rows before the same logical route is re-registered with a new actual port. */
@@ -2497,6 +2539,26 @@ function composePortsChanged(
         port.containerPort !== nextPort.containerPort ||
         port.protocol !== nextPort.protocol ||
         port.serviceName !== nextPort.serviceName
+      );
+    })
+  );
+}
+
+function composeContainerMappingsChanged(
+  currentMappings: readonly ComposeContainerMutationMapping[],
+  nextMappings: readonly ComposeContainerMutationMapping[],
+): boolean {
+  return (
+    currentMappings.length !== nextMappings.length ||
+    currentMappings.some((mapping, index) => {
+      const nextMapping = nextMappings[index];
+      return (
+        nextMapping === undefined ||
+        mapping.serviceName !== nextMapping.serviceName ||
+        mapping.originalContainerId !== nextMapping.originalContainerId ||
+        mapping.originalContainerName !== nextMapping.originalContainerName ||
+        mapping.attachedContainerId !== nextMapping.attachedContainerId ||
+        mapping.attachedContainerName !== nextMapping.attachedContainerName
       );
     })
   );

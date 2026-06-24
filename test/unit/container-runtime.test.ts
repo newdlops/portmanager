@@ -363,6 +363,240 @@ test("refreshes clone hidden host ports after compose recreates containers", asy
   assert.equal(ports[0]?.processId, "managed-process-14");
 });
 
+test("refreshes clone container hash mappings after compose recreates containers", async () => {
+  const adapter = new ContainerServiceDiscoveryAdapter({
+    runCommand: async (_executable, args) => {
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify([
+            { Id: "newclone987", Name: "/network-workspace-postgres-1" },
+            { Id: "original123", Name: "/workspace-postgres-1" },
+          ]),
+          stderr: "",
+        };
+      }
+      assert.deepEqual(args, ["container", "ls", "-a", "--format", "{{json .}}"]);
+      return {
+        stdout: [
+          JSON.stringify({
+            ID: "newclone987",
+            Names: "network-workspace-postgres-1",
+            Ports: "127.0.0.1:51612->5432/tcp",
+            Labels:
+              "com.docker.compose.project=network-workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml,/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml",
+          }),
+          JSON.stringify({
+            ID: "original123",
+            Names: "workspace-postgres-1",
+            Ports: "",
+            Labels:
+              "com.docker.compose.project=workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml",
+          }),
+        ].join("\n"),
+        stderr: "",
+      };
+    },
+  });
+
+  const mappings = await adapter.refreshComposeContainerMappings(
+    { containerRuntime: "docker", containerImage: "alpine:3.20" },
+    "workspace",
+    "network-workspace",
+    [
+      "/workspace/compose.yaml",
+      "/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml",
+    ],
+    ["db"],
+    [
+      {
+        serviceName: "db",
+        originalContainerId: "original123",
+        originalContainerName: "workspace-postgres-1",
+        attachedContainerId: "oldclone123",
+        attachedContainerName: "network-workspace-postgres-1",
+      },
+      {
+        serviceName: "",
+        originalContainerId: "olderclone456",
+        originalContainerName: "",
+        attachedContainerId: "oldclone123",
+        attachedContainerName: "network-workspace-postgres-1",
+      },
+    ],
+  );
+
+  assert.deepEqual(mappings, [
+    {
+      serviceName: "db",
+      originalContainerId: "original123",
+      originalContainerName: "workspace-postgres-1",
+      attachedContainerId: "newclone987",
+      attachedContainerName: "network-workspace-postgres-1",
+    },
+    {
+      serviceName: "__portmanager_alias__:db",
+      originalContainerId: "oldclone123",
+      originalContainerName: "oldclone123",
+      attachedContainerId: "newclone987",
+      attachedContainerName: "network-workspace-postgres-1",
+    },
+    {
+      serviceName: "__portmanager_alias__:db",
+      originalContainerId: "olderclone456",
+      originalContainerName: "olderclone456",
+      attachedContainerId: "newclone987",
+      attachedContainerName: "network-workspace-postgres-1",
+    },
+  ]);
+});
+
+test("refreshes clone container mappings with inspect names when list rows omit names", async () => {
+  const mutableCalls: string[][] = [];
+  const adapter = new ContainerServiceDiscoveryAdapter({
+    runCommand: async (_executable, args) => {
+      mutableCalls.push([...args]);
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify([
+            { Id: "newclone987", Name: "/network-workspace-postgres-1" },
+            { Id: "original123", Name: "/workspace-postgres-1" },
+          ]),
+          stderr: "",
+        };
+      }
+
+      return {
+        stdout: [
+          JSON.stringify({
+            ID: "newclone987",
+            Ports: "127.0.0.1:51612->5432/tcp",
+            Labels:
+              "com.docker.compose.project=network-workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml,/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml",
+          }),
+          JSON.stringify({
+            ID: "original123",
+            Ports: "",
+            Labels:
+              "com.docker.compose.project=workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml",
+          }),
+        ].join("\n"),
+        stderr: "",
+      };
+    },
+  });
+
+  const mappings = await adapter.refreshComposeContainerMappings(
+    { containerRuntime: "docker", containerImage: "alpine:3.20" },
+    "workspace",
+    "network-workspace",
+    [
+      "/workspace/compose.yaml",
+      "/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml",
+    ],
+    ["db"],
+    [
+      {
+        serviceName: "db",
+        originalContainerId: "original123",
+        originalContainerName: "stale-original-name",
+        attachedContainerId: "oldclone123",
+        attachedContainerName: "stale-clone-name",
+      },
+    ],
+  );
+
+  assert.deepEqual(mutableCalls, [
+    ["container", "ls", "-a", "--format", "{{json .}}"],
+    ["container", "inspect", "newclone987", "original123"],
+  ]);
+  assert.deepEqual(mappings[0], {
+    serviceName: "db",
+    originalContainerId: "original123",
+    originalContainerName: "workspace-postgres-1",
+    attachedContainerId: "newclone987",
+    attachedContainerName: "network-workspace-postgres-1",
+  });
+});
+
+test("mutates compose services with inspect container names when list rows omit names", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-mutator-inspect-names-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  fs.writeFileSync(composeFile, "services:\n  postgres:\n    image: postgres:16\n", "utf8");
+  let containerListCount = 0;
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config")) {
+        return { stdout: "postgres\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        containerListCount += 1;
+        return {
+          stdout: JSON.stringify({
+            ID: containerListCount === 1 ? "original123" : "hidden123",
+            Ports: containerListCount === 1 ? "127.0.0.1:15432->5432/tcp" : "127.0.0.1:57001->5432/tcp",
+            Labels:
+              containerListCount === 1
+                ? "com.docker.compose.project=workspace,com.docker.compose.service=postgres"
+                : "com.docker.compose.project=a-app-workspace-bc74e5f2,com.docker.compose.service=postgres",
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        const id = args[2];
+        return {
+          stdout: JSON.stringify([
+            {
+              Id: id,
+              Name: id === "original123" ? "/captain_postgres" : "/a-app-workspace-postgres-1",
+              Config: {
+                Labels: {
+                  "com.docker.compose.service": "postgres",
+                },
+              },
+              Mounts: [],
+            },
+          ]),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    runtime: "docker",
+    networkName: "A app",
+    originalProjectName: "workspace",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    ports: [
+      {
+        serviceName: "postgres",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 15432,
+        containerPort: 5432,
+        protocol: "tcp",
+        protocolName: "postgresql",
+      },
+    ],
+  });
+
+  assert.deepEqual(result.state.containerMappings, [
+    {
+      serviceName: "postgres",
+      originalContainerId: "original123",
+      originalContainerName: "captain_postgres",
+      attachedContainerId: "hidden123",
+      attachedContainerName: "a-app-workspace-postgres-1",
+    },
+  ]);
+});
+
 test("mutates compose services into a hidden network-scoped project", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-mutator-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
@@ -519,6 +753,7 @@ test("mutates compose services into a hidden network-scoped project", async (con
     "volume",
     "run",
     "compose",
+    "container",
     "container",
   ]);
   assert.deepEqual(calls[0]?.args, ["compose", "-p", "workspace", "-f", composeFile, "config", "--services"]);
@@ -764,6 +999,7 @@ test("mutates compose services in-place without resetting container names", asyn
       ["container", "inspect", "original123"],
       ["compose", "-p", "workspace", "-f", composeFile, "-f", result.state.overrideFile, "up"],
       ["container", "ls", "--no-trunc", "--format", "{{json .}}"],
+      ["container", "inspect", "hidden123"],
     ],
   );
 });

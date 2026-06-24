@@ -9,7 +9,7 @@
  *
  * Compose mutation policy stays in TypeScript. This helper only performs the
  * low-level, deterministic token transform used by shell wrappers:
- * original container id/name -> attached clone container id.
+ * original container id/name -> attached clone container name when available.
  */
 
 static char *pm_trim_line(char *line) {
@@ -80,8 +80,12 @@ static int pm_token_matches_mapping(
   return 0;
 }
 
-static int pm_write_target(const char *attached_id, const char *suffix) {
-  if (printf("%s%s\n", attached_id, suffix) < 0) {
+static const char *pm_target_container_name(const char *attached_id, const char *attached_name) {
+  return attached_name != NULL && attached_name[0] != '\0' ? attached_name : attached_id;
+}
+
+static int pm_write_target(const char *target, const char *suffix) {
+  if (printf("%s%s\n", target, suffix) < 0) {
     return 1;
   }
 
@@ -161,7 +165,7 @@ int main(int argc, char **argv) {
     }
 
     if (pm_token_matches_mapping(token, fields[4], fields[5], fields[6], fields[7], field_count >= 9 ? fields[8] : "")) {
-      char *next_target = strdup(fields[6]);
+      char *next_target = strdup(pm_target_container_name(fields[6], fields[7]));
       if (next_target == NULL) {
         free(target);
         free(line);

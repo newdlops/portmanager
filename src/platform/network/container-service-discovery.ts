@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type {
+  ComposeContainerMutationMapping,
   ComposePublishedPort,
   ContainerRuntimePreference,
   ContainerRuntimeSettings,
@@ -18,6 +19,7 @@ import type { ContainerCommandResult, ContainerCommandRunner } from "./container
 
 const execFileAsync = promisify(execFile);
 const LIST_TIMEOUT_MS = 5_000;
+const CONTAINER_ALIAS_SERVICE_PREFIX = "__portmanager_alias__:";
 
 export interface ContainerServiceDiscoveryOptions {
   /** Injected command runner used by unit tests to avoid real Docker calls. */
@@ -111,6 +113,45 @@ export class ContainerServiceDiscoveryAdapter {
     return ports;
   }
 
+  /**
+   * Refreshes service-to-container rewrites for a hidden compose clone.
+   *
+   * Docker gives recreated containers a new id. The shell-side Docker wrapper
+   * must keep routing both original project tokens and stale clone hashes to
+   * the currently running clone container, otherwise lifecycle commands can
+   * escape back to the host project or target a deleted container id.
+   */
+  async refreshComposeContainerMappings(
+    settings: ContainerRuntimeSettings,
+    originalProjectName: string,
+    attachedProjectName: string,
+    composeFiles: readonly string[],
+    services: readonly string[],
+    currentMappings: readonly ComposeContainerMutationMapping[],
+  ): Promise<readonly ComposeContainerMutationMapping[]> {
+    if (attachedProjectName.trim().length === 0 || currentMappings.length === 0) {
+      return currentMappings;
+    }
+
+    for (const executable of runtimeCandidates(settings.containerRuntime)) {
+      try {
+        const rows = await this.listRuntimeRows(executable, true);
+        return refreshContainerMappingsFromIdentities(
+          originalProjectName,
+          attachedProjectName,
+          composeFiles,
+          services,
+          currentMappings,
+          parseComposeContainerIdentities(await this.enrichRuntimeRowsWithInspectNames(executable, rows)),
+        );
+      } catch {
+        // Try the next configured runtime.
+      }
+    }
+
+    return currentMappings;
+  }
+
   /** Reads JSON rows from `docker container ls` or `podman container ls`. */
   private async listRuntimeRows(
     executable: "docker" | "podman",
@@ -129,6 +170,34 @@ export class ContainerServiceDiscoveryAdapter {
       .map(parseRuntimeContainerRow)
       .filter((row): row is RuntimeContainerRow => row !== undefined);
   }
+
+  /**
+   * Fills container names from inspect when `container ls` omits or normalizes
+   * them differently. Routing maps use names as stable command targets, so this
+   * repair keeps recreated compose containers addressable after id churn.
+   */
+  private async enrichRuntimeRowsWithInspectNames(
+    executable: "docker" | "podman",
+    rows: readonly RuntimeContainerRow[],
+  ): Promise<readonly RuntimeContainerRow[]> {
+    const containerIds = uniqueStrings(
+      rows
+        .map((row) => readFirstString(row.ID, row.Id))
+        .filter((id): id is string => id !== undefined),
+    );
+    if (containerIds.length === 0) {
+      return rows;
+    }
+
+    try {
+      const result = await this.runCommand(executable, ["container", "inspect", ...containerIds], {
+        timeoutMs: LIST_TIMEOUT_MS,
+      });
+      return mergeRuntimeContainerRowsWithInspectNames(rows, parseRuntimeContainerInspectIdentityRows(result.stdout));
+    } catch {
+      return rows;
+    }
+  }
 }
 
 export interface RuntimeContainerRow {
@@ -140,6 +209,20 @@ export interface RuntimeContainerRow {
   readonly Status?: string;
   readonly Ports?: string;
   readonly Labels?: string;
+}
+
+export interface RuntimeContainerInspectIdentityRow {
+  readonly ID?: string;
+  readonly Id?: string;
+  readonly Name?: string;
+}
+
+interface ComposeContainerIdentity {
+  readonly id: string;
+  readonly name: string;
+  readonly composeProject: string;
+  readonly composeService: string;
+  readonly composeConfigFiles: readonly string[];
 }
 
 /** Converts runtime JSON rows into attachable service candidates. */
@@ -201,6 +284,31 @@ function toContainerServiceCandidate(
     ...(composeConfigFiles.length > 0 ? { composeConfigFiles } : {}),
     ports,
   };
+}
+
+function parseComposeContainerIdentities(rows: readonly RuntimeContainerRow[]): readonly ComposeContainerIdentity[] {
+  return rows
+    .map((row) => {
+      const id = readFirstString(row.ID, row.Id);
+      const name = normalizeContainerName(readFirstString(row.Names, row.Name));
+      const labels = parseLabels(row.Labels);
+      const composeProject = readLabel(labels, "com.docker.compose.project", "io.podman.compose.project");
+      const composeService = readLabel(labels, "com.docker.compose.service", "io.podman.compose.service");
+      if (id === undefined || name === undefined || composeProject === undefined || composeService === undefined) {
+        return undefined;
+      }
+
+      return {
+        id,
+        name,
+        composeProject,
+        composeService,
+        composeConfigFiles: parseComposeConfigFiles(
+          readLabel(labels, "com.docker.compose.project.config_files", "io.podman.compose.project.config_files"),
+        ),
+      };
+    })
+    .filter((identity): identity is ComposeContainerIdentity => identity !== undefined);
 }
 
 /** Parses Docker/Podman `Ports` text into host-published TCP endpoints. */
@@ -301,6 +409,37 @@ export function parseRuntimeContainerRow(line: string): RuntimeContainerRow | un
   } catch {
     return undefined;
   }
+}
+
+export function parseRuntimeContainerInspectIdentityRows(value: string): readonly RuntimeContainerInspectIdentityRow[] {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is RuntimeContainerInspectIdentityRow => typeof item === "object" && item !== null)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function mergeRuntimeContainerRowsWithInspectNames(
+  rows: readonly RuntimeContainerRow[],
+  inspectedRows: readonly RuntimeContainerInspectIdentityRow[],
+): readonly RuntimeContainerRow[] {
+  return rows.map((row) => {
+    const containerId = readFirstString(row.ID, row.Id);
+    const inspectedName =
+      containerId === undefined ? undefined : findInspectedContainerName(inspectedRows, containerId);
+    if (inspectedName === undefined) {
+      return row;
+    }
+
+    return {
+      ...row,
+      Names: inspectedName,
+      Name: inspectedName,
+    };
+  });
 }
 
 function parseLabels(value: string | undefined): ReadonlyMap<string, string> {
@@ -450,6 +589,162 @@ function refreshPortsFromCandidates(
   });
 }
 
+function refreshContainerMappingsFromIdentities(
+  originalProjectName: string,
+  attachedProjectName: string,
+  composeFiles: readonly string[],
+  services: readonly string[],
+  currentMappings: readonly ComposeContainerMutationMapping[],
+  identities: readonly ComposeContainerIdentity[],
+): readonly ComposeContainerMutationMapping[] {
+  const sourceComposeFiles = composeFiles.filter((file) => !isPortManagerOverrideFile(file));
+  const originalByService = groupIdentitiesByService(
+    identities.filter(
+      (identity) =>
+        identity.composeProject === originalProjectName &&
+        composeCandidateMatchesFiles(identity.composeConfigFiles, sourceComposeFiles),
+    ),
+  );
+  const attachedByService = groupIdentitiesByService(
+    identities.filter(
+      (identity) =>
+        identity.composeProject === attachedProjectName &&
+        composeCandidateMatchesFiles(identity.composeConfigFiles, sourceComposeFiles),
+    ),
+  );
+  const currentCanonicalByService = new Map(
+    currentMappings
+      .filter((mapping) => !isContainerAliasMapping(mapping))
+      .map((mapping) => [mapping.serviceName, mapping]),
+  );
+  const serviceNames = uniqueStrings([
+    ...services,
+    ...currentCanonicalByService.keys(),
+    ...originalByService.keys(),
+    ...attachedByService.keys(),
+  ]);
+  const canonicalMappings: ComposeContainerMutationMapping[] = [];
+
+  for (const serviceName of serviceNames) {
+    const currentMapping = currentCanonicalByService.get(serviceName);
+    const original = singleIdentity(originalByService.get(serviceName));
+    const attached = singleIdentity(attachedByService.get(serviceName));
+    const attachedContainerId = attached?.id ?? currentMapping?.attachedContainerId;
+    const attachedContainerName = attached?.name ?? currentMapping?.attachedContainerName;
+    if (attachedContainerId === undefined || attachedContainerName === undefined) {
+      continue;
+    }
+
+    canonicalMappings.push({
+      serviceName,
+      originalContainerId: original?.id ?? currentMapping?.originalContainerId ?? attachedContainerId,
+      originalContainerName: original?.name ?? currentMapping?.originalContainerName ?? attachedContainerName,
+      attachedContainerId,
+      attachedContainerName,
+    });
+  }
+
+  if (canonicalMappings.length === 0) {
+    return currentMappings;
+  }
+
+  const nextByService = new Map(canonicalMappings.map((mapping) => [mapping.serviceName, mapping]));
+  const currentServiceByAttachedId = new Map(
+    [...currentCanonicalByService.values()].map((mapping) => [mapping.attachedContainerId, mapping.serviceName]),
+  );
+  const aliasMappings: ComposeContainerMutationMapping[] = [];
+  const aliasKeys = new Set<string>();
+
+  for (const currentMapping of currentMappings) {
+    const serviceName =
+      !isContainerAliasMapping(currentMapping)
+        ? currentMapping.serviceName
+        : currentServiceByAttachedId.get(currentMapping.attachedContainerId);
+    const nextMapping = serviceName === undefined ? undefined : nextByService.get(serviceName);
+    if (nextMapping === undefined) {
+      continue;
+    }
+
+    if (currentMapping.attachedContainerId !== nextMapping.attachedContainerId) {
+      pushContainerAlias(aliasMappings, aliasKeys, currentMapping.attachedContainerId, "", nextMapping);
+    }
+
+    if (isContainerAliasMapping(currentMapping) && currentMapping.originalContainerId !== nextMapping.attachedContainerId) {
+      pushContainerAlias(
+        aliasMappings,
+        aliasKeys,
+        currentMapping.originalContainerId,
+        currentMapping.originalContainerName,
+        nextMapping,
+      );
+    }
+  }
+
+  return [...canonicalMappings, ...aliasMappings];
+}
+
+function pushContainerAlias(
+  aliases: ComposeContainerMutationMapping[],
+  keys: Set<string>,
+  sourceId: string,
+  sourceName: string,
+  target: ComposeContainerMutationMapping,
+): void {
+  if (sourceId.length === 0 || sourceId === target.attachedContainerId || sourceId === target.originalContainerId) {
+    return;
+  }
+
+  const key = `${sourceId}\0${target.attachedContainerId}`;
+  if (keys.has(key)) {
+    return;
+  }
+
+  keys.add(key);
+  aliases.push({
+    serviceName: `${CONTAINER_ALIAS_SERVICE_PREFIX}${target.serviceName}`,
+    originalContainerId: sourceId,
+    originalContainerName: sourceName.length === 0 || sourceName === target.attachedContainerName ? sourceId : sourceName,
+    attachedContainerId: target.attachedContainerId,
+    attachedContainerName: target.attachedContainerName,
+  });
+}
+
+function isContainerAliasMapping(mapping: ComposeContainerMutationMapping): boolean {
+  return mapping.serviceName.length === 0 || mapping.serviceName.startsWith(CONTAINER_ALIAS_SERVICE_PREFIX);
+}
+
+function groupIdentitiesByService(
+  identities: readonly ComposeContainerIdentity[],
+): ReadonlyMap<string, readonly ComposeContainerIdentity[]> {
+  const grouped = new Map<string, ComposeContainerIdentity[]>();
+
+  for (const identity of identities) {
+    grouped.set(identity.composeService, [...(grouped.get(identity.composeService) ?? []), identity]);
+  }
+
+  return grouped;
+}
+
+function singleIdentity(identities: readonly ComposeContainerIdentity[] | undefined): ComposeContainerIdentity | undefined {
+  return identities?.length === 1 ? identities[0] : undefined;
+}
+
+function uniqueStrings(values: readonly string[]): readonly string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const value of values) {
+    if (value.length === 0 || seen.has(value)) {
+      continue;
+    }
+
+    seen.add(value);
+    result.push(value);
+  }
+
+  return result;
+}
+
 function resolveRefreshedLogicalPort(storedPort: ComposePublishedPort, livePort: ComposePublishedPort): number {
   if (livePort.logicalPort !== livePort.actualHostPort || storedPort.logicalPort === storedPort.actualHostPort) {
     return livePort.logicalPort;
@@ -588,6 +883,29 @@ function readFirstString(...values: readonly (string | undefined)[]): string | u
 function normalizeContainerName(value: string | undefined): string | undefined {
   const normalized = value?.split(",")[0]?.trim().replace(/^\/+/, "");
   return normalized === undefined || normalized.length === 0 ? undefined : normalized;
+}
+
+function findInspectedContainerName(
+  inspectedRows: readonly RuntimeContainerInspectIdentityRow[],
+  containerId: string,
+): string | undefined {
+  for (const row of inspectedRows) {
+    const inspectedId = readFirstString(row.ID, row.Id);
+    if (inspectedId === undefined || !sameContainerId(inspectedId, containerId)) {
+      continue;
+    }
+
+    const name = normalizeContainerName(row.Name);
+    if (name !== undefined) {
+      return name;
+    }
+  }
+
+  return undefined;
+}
+
+function sameContainerId(left: string, right: string): boolean {
+  return left === right || left.startsWith(right) || right.startsWith(left);
 }
 
 function inferProtocolName(port: number): string | undefined {

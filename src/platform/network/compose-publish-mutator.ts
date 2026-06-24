@@ -10,6 +10,7 @@ import type {
 } from "../../shared/types";
 import type { ContainerCommandRunner } from "./container-runtime";
 import {
+  mergeRuntimeContainerRowsWithInspectNames,
   parseContainerRows,
   parseRuntimeContainerRow,
   type RuntimeContainerRow,
@@ -76,6 +77,11 @@ interface ComposeServiceContainer {
   readonly id: string;
   readonly name: string;
   readonly serviceName: string;
+}
+
+interface ComposeServiceContainerList {
+  readonly containers: readonly ComposeServiceContainer[];
+  readonly inspectedRows: readonly RuntimeContainerInspectRow[];
 }
 
 interface RuntimeContainerInspectRow {
@@ -172,8 +178,13 @@ export class ComposePublishMutator {
     const disabledOverrideServices =
       mode === "clone" ? definedServices.filter((service) => !services.includes(service)) : [];
     const ports = input.ports.filter((port) => services.includes(port.serviceName));
-    const originalContainers = await this.listComposeServiceContainers(input.runtime, originalProjectName, services);
-    const originalServiceMounts = await this.inspectServiceMounts(input.runtime, originalContainers);
+    const originalContainerList = await this.listComposeServiceContainers(input.runtime, originalProjectName, services);
+    const originalContainers = originalContainerList.containers;
+    const originalServiceMounts = await this.inspectServiceMounts(
+      input.runtime,
+      originalContainers,
+      originalContainerList.inspectedRows,
+    );
     const statefulCloneServices = findStatefulCloneServices(ports, originalServiceMounts);
     if (mode === "clone" && statefulCloneServices.length > 0 && input.allowStatefulClone !== true) {
       throw new Error(
@@ -441,17 +452,9 @@ export class ComposePublishMutator {
     runtime: "docker" | "podman",
     originalProjectName: string,
     services: readonly string[],
-  ): Promise<readonly ComposeServiceContainer[]> {
+  ): Promise<ComposeServiceContainerList> {
     const serviceSet = new Set(services);
-    const result = await this.runCommand(runtime, ["container", "ls", "--no-trunc", "--format", "{{json .}}"], {
-      timeoutMs: LIST_TIMEOUT_MS,
-    });
-    const rows = result.stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0)
-      .map(parseRuntimeContainerRow)
-      .filter((row): row is RuntimeContainerRow => row !== undefined);
+    const { rows, inspectedRows } = await this.listRuntimeRowsWithInspectNames(runtime);
     const candidates = parseContainerRows(runtime, rows).filter(
       (candidate) =>
         candidate.composeProject === originalProjectName &&
@@ -459,26 +462,36 @@ export class ComposePublishMutator {
         serviceSet.has(candidate.composeService),
     );
 
-    return candidates.map((candidate) => ({
-      id: candidate.containerId,
-      name: candidate.containerName,
-      serviceName: candidate.composeService!,
-    }));
+    return {
+      containers: candidates.map((candidate) => ({
+        id: candidate.containerId,
+        name: candidate.containerName,
+        serviceName: candidate.composeService!,
+      })),
+      inspectedRows,
+    };
   }
 
   /** Converts Docker inspect mount rows into exact hidden-project overrides. */
   private async inspectServiceMounts(
     runtime: "docker" | "podman",
     containers: readonly ComposeServiceContainer[],
+    inspectedRows: readonly RuntimeContainerInspectRow[] = [],
   ): Promise<ReadonlyMap<string, readonly ComposeServiceMount[]>> {
     if (containers.length === 0) {
       throw new Error("No running compose service containers were found for attach.");
     }
 
-    const result = await this.runCommand(runtime, ["container", "inspect", ...containers.map((container) => container.id)], {
-      timeoutMs: LIST_TIMEOUT_MS,
-    });
-    const inspected = parseContainerInspectRows(result.stdout);
+    const inspected =
+      inspectedRows.length > 0
+        ? inspectedRows
+        : parseContainerInspectRows(
+            (
+              await this.runCommand(runtime, ["container", "inspect", ...containers.map((container) => container.id)], {
+                timeoutMs: LIST_TIMEOUT_MS,
+              })
+            ).stdout,
+          );
     if (inspected.length === 0) {
       throw new Error("Container inspect did not return mount metadata for compose attach.");
     }
@@ -578,6 +591,21 @@ export class ComposePublishMutator {
     runtime: "docker" | "podman",
     attachedProjectName: string,
   ): Promise<readonly ContainerServiceCandidate[]> {
+    const { rows } = await this.listRuntimeRowsWithInspectNames(runtime);
+    return parseContainerRows(runtime, rows).filter((candidate) => candidate.composeProject === attachedProjectName);
+  }
+
+  /**
+   * Reads runtime list rows and repairs container names from inspect.
+   *
+   * Docker/Podman summary rows are optimized for display and can omit names in
+   * edge cases. Attach state needs the exact runtime name because later Docker
+   * lifecycle commands are rewritten to that stable target instead of a stale id.
+   */
+  private async listRuntimeRowsWithInspectNames(runtime: "docker" | "podman"): Promise<{
+    readonly rows: readonly RuntimeContainerRow[];
+    readonly inspectedRows: readonly RuntimeContainerInspectRow[];
+  }> {
     const result = await this.runCommand(runtime, ["container", "ls", "--no-trunc", "--format", "{{json .}}"], {
       timeoutMs: LIST_TIMEOUT_MS,
     });
@@ -587,7 +615,28 @@ export class ComposePublishMutator {
       .filter((line) => line.length > 0)
       .map(parseRuntimeContainerRow)
       .filter((row): row is RuntimeContainerRow => row !== undefined);
-    return parseContainerRows(runtime, rows).filter((candidate) => candidate.composeProject === attachedProjectName);
+
+    const containerIds = uniqueStrings(
+      rows
+        .map((row) => readRuntimeContainerId(row))
+        .filter((id): id is string => id !== undefined),
+    );
+    if (containerIds.length === 0) {
+      return { rows, inspectedRows: [] };
+    }
+
+    try {
+      const inspectResult = await this.runCommand(runtime, ["container", "inspect", ...containerIds], {
+        timeoutMs: LIST_TIMEOUT_MS,
+      });
+      const inspectedRows = parseContainerInspectRows(inspectResult.stdout);
+      return {
+        rows: mergeRuntimeContainerRowsWithInspectNames(rows, inspectedRows),
+        inspectedRows,
+      };
+    } catch {
+      return { rows, inspectedRows: [] };
+    }
   }
 
   /** Runs `docker compose` or `podman compose` with persisted cwd/file context. */
@@ -981,6 +1030,11 @@ function trimProjectName(value: string, maxLength: number): string {
 
 function quoteYamlString(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
+}
+
+function readRuntimeContainerId(row: RuntimeContainerRow): string | undefined {
+  const id = (row.ID ?? row.Id)?.trim();
+  return id === undefined || id.length === 0 ? undefined : id;
 }
 
 function uniqueStrings(values: readonly string[]): readonly string[] {

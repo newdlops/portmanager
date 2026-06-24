@@ -8,7 +8,7 @@ Compose attach 중 생성된 원본 컨테이너와 hidden clone 컨테이너의
 
 - extension이 작성한 compose/container routing TSV를 읽는다.
 - 현재 logical network와 runtime에 맞는 container mapping row만 선택한다.
-- Docker/Podman CLI 인자의 컨테이너 id prefix, 전체 id, 컨테이너 이름, `container:/path` 형식을 clone 컨테이너 id로 변환한다.
+- Docker/Podman CLI 인자의 컨테이너 id prefix, 전체 id, 컨테이너 이름, `container:/path` 형식을 안정적인 clone 컨테이너 target으로 변환한다.
 - 매핑이 없거나 여러 개면 아무 출력 없이 실패한다.
 
 ## 주요 진입점

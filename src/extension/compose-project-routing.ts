@@ -632,7 +632,11 @@ __port_manager_container_target_scan_file_for_runtime() {
 
     if [ "\${__pm_matched}" = "1" ]; then
       __pm_matches=$((__pm_matches + 1))
-      __pm_target="\${__pm_attached_id}\${__pm_scan_suffix}"
+      if [ -n "\${__pm_attached_name}" ]; then
+        __pm_target="\${__pm_attached_name}\${__pm_scan_suffix}"
+      else
+        __pm_target="\${__pm_attached_id}\${__pm_scan_suffix}"
+      fi
     fi
   done < "\${__pm_scan_file}"
 
@@ -750,6 +754,64 @@ __port_manager_shell_quote() {
   printf "'"
 }
 
+__port_manager_compose_should_detach_up() {
+  __pm_standalone="$1"
+  shift
+  __pm_seen_compose="\${__pm_standalone}"
+  __pm_skip_next=0
+  __pm_seen_up=0
+
+  for __pm_arg in "$@"; do
+    if [ "\${__pm_skip_next}" = "1" ]; then
+      __pm_skip_next=0
+      continue
+    fi
+
+    if [ "\${__pm_seen_compose}" = "0" ]; then
+      if [ "\${__pm_arg}" = "compose" ]; then
+        __pm_seen_compose=1
+      fi
+      continue
+    fi
+
+    if [ "\${__pm_seen_up}" = "0" ]; then
+      case "\${__pm_arg}" in
+        -f|--file|-p|--project-name|--profile|--env-file|--project-directory|--parallel|--progress|--ansi)
+          __pm_skip_next=1
+          continue
+          ;;
+        -f?*|--file=*|-p?*|--project-name=*|--profile=*|--env-file=*|--project-directory=*|--parallel=*|--progress=*|--ansi=*)
+          continue
+          ;;
+        --compatibility|--dry-run|--verbose|--help|-h|--all-resources)
+          continue
+          ;;
+        -*)
+          continue
+          ;;
+        up)
+          __pm_seen_up=1
+          continue
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+    fi
+
+    case "\${__pm_arg}" in
+      -d|--detach|--wait|--abort-on-container-exit|--abort-on-container-failure|--exit-code-from|--attach|--attach-dependencies|--menu)
+        return 1
+        ;;
+      --detach=*|--wait=*|--abort-on-container-exit=*|--abort-on-container-failure=*|--exit-code-from=*|--attach=*|--attach-dependencies=*|--menu=*)
+        return 1
+        ;;
+    esac
+  done
+
+  [ "\${__pm_seen_up}" = "1" ]
+}
+
 __port_manager_runtime_command_may_reference_container() {
   __pm_first_command="$(__port_manager_runtime_first_command "$@")"
 
@@ -800,12 +862,55 @@ __port_manager_run_compose_command_with_routing() {
   __pm_attached_project="\${__pm_route%%\${__pm_tab}*}"
   __pm_args=""
   __pm_rewrite_next=0
+  __pm_detach_up=0
+  __pm_detach_inserted=0
+  __pm_detach_seen_compose="\${__pm_standalone_compose}"
+  __pm_detach_skip_next=0
+  __pm_detach_waiting_subcommand=1
+  if __port_manager_compose_should_detach_up "\${__pm_standalone_compose}" "$@"; then
+    __pm_detach_up=1
+  fi
 
   for __pm_arg in "$@"; do
+    __pm_original_arg="\${__pm_arg}"
+    __pm_insert_detach_after_arg=0
+    if [ "\${__pm_detach_up}" = "1" ] && [ "\${__pm_detach_inserted}" = "0" ]; then
+      if [ "\${__pm_detach_skip_next}" = "1" ]; then
+        __pm_detach_skip_next=0
+      elif [ "\${__pm_detach_seen_compose}" = "0" ]; then
+        if [ "\${__pm_original_arg}" = "compose" ]; then
+          __pm_detach_seen_compose=1
+        fi
+      elif [ "\${__pm_detach_waiting_subcommand}" = "1" ]; then
+        case "\${__pm_original_arg}" in
+          -f|--file|-p|--project-name|--profile|--env-file|--project-directory|--parallel|--progress|--ansi)
+            __pm_detach_skip_next=1
+            ;;
+          -f?*|--file=*|-p?*|--project-name=*|--profile=*|--env-file=*|--project-directory=*|--parallel=*|--progress=*|--ansi=*)
+            ;;
+          --compatibility|--dry-run|--verbose|--help|-h|--all-resources)
+            ;;
+          -*)
+            ;;
+          up)
+            __pm_insert_detach_after_arg=1
+            __pm_detach_inserted=1
+            __pm_detach_waiting_subcommand=0
+            ;;
+          *)
+            __pm_detach_waiting_subcommand=0
+            ;;
+        esac
+      fi
+    fi
+
     if [ "\${__pm_rewrite_next}" = "1" ]; then
       __pm_arg="\${__pm_attached_project}"
       __pm_rewrite_next=0
       __pm_args="\${__pm_args} $(__port_manager_shell_quote "\${__pm_arg}")"
+      if [ "\${__pm_insert_detach_after_arg}" = "1" ]; then
+        __pm_args="\${__pm_args} --detach"
+      fi
       continue
     fi
 
@@ -824,7 +929,13 @@ __port_manager_run_compose_command_with_routing() {
     esac
 
     __pm_args="\${__pm_args} $(__port_manager_shell_quote "\${__pm_arg}")"
+    if [ "\${__pm_insert_detach_after_arg}" = "1" ]; then
+      __pm_args="\${__pm_args} --detach"
+    fi
   done
+  if [ "\${__pm_detach_up}" = "1" ] && [ "\${__pm_detach_inserted}" = "0" ]; then
+    __pm_args="\${__pm_args} --detach"
+  fi
 
   (COMPOSE_PROJECT_NAME="\${__pm_attached_project}"; export COMPOSE_PROJECT_NAME; eval "command \${__pm_command}\${__pm_args}")
 }

@@ -8,7 +8,7 @@ Docker/Podman PATH 앞에 놓이는 native 실행 파일로 Compose clone routin
 
 - `docker`/`podman`/`docker-compose`/`podman-compose` 실제 실행 파일을 shim 디렉터리 밖의 PATH에서 찾는다.
 - attached logical network의 compose project map을 읽어 Compose project 이름을 clone project로 바꾼다.
-- Docker/Podman container 대상 명령에서 원본 container id/name을 attached clone container id로 바꾼다.
+- Docker/Podman container 대상 명령에서 원본 container id/name을 안정적인 attached clone container target으로 바꾼다.
 - routing TSV가 비어 있어도 route table과 Docker Compose label을 이용해 원본 container hash를 clone container로 복구한다.
 - `docker cp container:path` 형태의 container 경로 인자를 보존하며 container 부분만 바꾼다.
 

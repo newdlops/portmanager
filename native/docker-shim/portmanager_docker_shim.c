@@ -1122,6 +1122,41 @@ static int pm_compose_subcommand_index(int argc, char **argv, int command_index,
   return argc;
 }
 
+static int pm_compose_up_option_keeps_foreground(const char *arg) {
+  return strcmp(arg, "-d") == 0 || strcmp(arg, "--detach") == 0 ||
+         strcmp(arg, "--wait") == 0 ||
+         strcmp(arg, "--abort-on-container-exit") == 0 ||
+         strcmp(arg, "--abort-on-container-failure") == 0 ||
+         strcmp(arg, "--exit-code-from") == 0 ||
+         strcmp(arg, "--attach") == 0 ||
+         strcmp(arg, "--attach-dependencies") == 0 ||
+         strcmp(arg, "--menu") == 0 ||
+         strncmp(arg, "--detach=", 9) == 0 ||
+         strncmp(arg, "--wait=", 7) == 0 ||
+         strncmp(arg, "--abort-on-container-exit=", 26) == 0 ||
+         strncmp(arg, "--abort-on-container-failure=", 29) == 0 ||
+         strncmp(arg, "--exit-code-from=", 17) == 0 ||
+         strncmp(arg, "--attach=", 9) == 0 ||
+         strncmp(arg, "--attach-dependencies=", 22) == 0 ||
+         strncmp(arg, "--menu=", 7) == 0;
+}
+
+static int pm_compose_should_detach_up(int argc, char **argv, int command_index, int standalone_compose) {
+  int subcommand_index = pm_compose_subcommand_index(argc, argv, command_index, standalone_compose);
+
+  if (subcommand_index >= argc || strcmp(argv[subcommand_index], "up") != 0) {
+    return 0;
+  }
+
+  for (int index = subcommand_index + 1; index < argc; index++) {
+    if (pm_compose_up_option_keeps_foreground(argv[index])) {
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
 static const char *pm_find_json_key(const char *json, const char *key) {
   char pattern[128];
   snprintf(pattern, sizeof(pattern), "\"%s\"", key);
@@ -1497,7 +1532,9 @@ static char **pm_rewrite_compose_args(
   int insert_override = override_file != NULL && override_file[0] != '\0' &&
                         !pm_argv_references_compose_file(argc, argv, override_file);
   int override_index = insert_override ? pm_compose_subcommand_index(argc, argv, command_index, standalone_compose) : -1;
-  char **next_argv = calloc((size_t)argc + (insert_override ? 3 : 1), sizeof(char *));
+  int detach_up = pm_compose_should_detach_up(argc, argv, command_index, standalone_compose);
+  int subcommand_index = detach_up ? pm_compose_subcommand_index(argc, argv, command_index, standalone_compose) : -1;
+  char **next_argv = calloc((size_t)argc + (insert_override ? 3 : 1) + (detach_up ? 1 : 0), sizeof(char *));
   int rewrite_next = 0;
   int out_index = 1;
 
@@ -1557,6 +1594,10 @@ static char **pm_rewrite_compose_args(
     }
 
     next_argv[out_index++] = argv[index];
+    if (detach_up && index == subcommand_index) {
+      next_argv[out_index++] = "--detach";
+      detach_up = 0;
+    }
   }
 
   if (insert_override && override_index == argc) {
@@ -1567,6 +1608,10 @@ static char **pm_rewrite_compose_args(
       return NULL;
     }
     out_index++;
+  }
+
+  if (detach_up) {
+    next_argv[out_index++] = "--detach";
   }
 
   next_argv[out_index] = NULL;
@@ -1965,7 +2010,13 @@ static int pm_container_target_scan_file(const char *file_path, void *context) {
 
     if (matched) {
       search->matches++;
-      snprintf(search->target, sizeof(search->target), "%s%s", row.attached_id, search->suffix == NULL ? "" : search->suffix);
+      snprintf(
+        search->target,
+        sizeof(search->target),
+        "%s%s",
+        row.attached_name[0] == '\0' ? row.attached_id : row.attached_name,
+        search->suffix == NULL ? "" : search->suffix
+      );
     }
   }
 

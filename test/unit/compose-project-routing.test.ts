@@ -275,7 +275,7 @@ test("docker wrapper routes service lifecycle signals by compose project name ou
       { encoding: "utf8" },
     );
 
-    assert.equal(output, "<stop>\n<def9876543210000>\n");
+    assert.equal(output, "<stop>\n<network-a-workspace-postgres-1>\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -419,7 +419,7 @@ test("docker wrapper resolves duplicate service names from the cwd scoped compos
       { encoding: "utf8" },
     );
 
-    assert.equal(output, "<stop>\n<seconddef987654>\n");
+    assert.equal(output, "<stop>\n<network-a-second-postgres-1>\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -525,7 +525,7 @@ test("docker wrapper rewrites original container id prefixes to the attached clo
       { encoding: "utf8" },
     );
 
-    assert.equal(output, "<exec>\n<-it>\n<def9876543210000>\n<bash>\n<-lc>\n<echo hi>\n");
+    assert.equal(output, "<exec>\n<-it>\n<network-a-app-postgres-1>\n<bash>\n<-lc>\n<echo hi>\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -561,7 +561,70 @@ test("docker wrapper rewrites lifecycle signal commands for original container h
       { encoding: "utf8" },
     );
 
-    assert.equal(output, "<kill>\n<--signal>\n<HUP>\n<def9876543210000>\n");
+    assert.equal(output, "<kill>\n<--signal>\n<HUP>\n<network-a-app-postgres-1>\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("docker wrapper rewrites stale clone hashes to the current clone hash", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-container-stale-hash-routing-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        attachedProjectName: "network-a-app-1234",
+        containerMappings: [
+          {
+            serviceName: "postgres",
+            originalContainerId: "abc1234567890000",
+            originalContainerName: "workspace-postgres-1",
+            attachedContainerId: "newdef9876543210",
+            attachedContainerName: "network-a-app-postgres-1",
+          },
+          {
+            serviceName: "__portmanager_alias__:postgres",
+            originalContainerId: "olddef9876543210",
+            originalContainerName: "olddef9876543210",
+            attachedContainerId: "newdef9876543210",
+            attachedContainerName: "network-a-app-postgres-1",
+          },
+        ],
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker stop olddef9876543210",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output, "<stop>\n<network-a-app-postgres-1>\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -597,7 +660,7 @@ test("docker wrapper rewrites lifecycle commands for compose service names", () 
       { encoding: "utf8" },
     );
 
-    assert.equal(output, "<stop>\n<def9876543210000>\n");
+    assert.equal(output, "<stop>\n<network-a-app-postgres-1>\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -633,7 +696,7 @@ test("docker wrapper rewrites container hashes after Docker global options", () 
       { encoding: "utf8" },
     );
 
-    assert.equal(output, "<--context>\n<desktop-linux>\n<logs>\n<def9876543210000>\n");
+    assert.equal(output, "<--context>\n<desktop-linux>\n<logs>\n<network-a-app-postgres-1>\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -670,7 +733,7 @@ test("docker wrapper rewrites container hashes outside the compose working direc
       { encoding: "utf8" },
     );
 
-    assert.equal(output, "<logs>\n<def9876543210000>\n");
+    assert.equal(output, "<logs>\n<network-a-app-postgres-1>\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -708,7 +771,7 @@ test("docker PATH shim rewrites child process docker invocations without shell f
       },
     });
 
-    assert.equal(output, "<kill>\n<--signal>\n<HUP>\n<def9876543210000>\n");
+    assert.equal(output, "<kill>\n<--signal>\n<HUP>\n<network-a-app-postgres-1>\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -872,7 +935,7 @@ test("docker wrapper rewrites full container hashes when stored mapping is short
       { encoding: "utf8" },
     );
 
-    assert.equal(output, "<logs>\n<def987>\n");
+    assert.equal(output, "<logs>\n<network-a-app-postgres-1>\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -908,7 +971,7 @@ test("docker wrapper routes lifecycle commands that already target attached clon
       { encoding: "utf8" },
     );
 
-    assert.equal(output, "<kill>\n<def9876543210000>\n");
+    assert.equal(output, "<kill>\n<network-a-app-postgres-1>\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -1144,7 +1207,7 @@ test("docker wrapper rewrites container path arguments for cp", () => {
       { encoding: "utf8" },
     );
 
-    assert.equal(output, "<cp>\n<def9876543210000:/tmp/report.txt>\n<./report.txt>\n");
+    assert.equal(output, "<cp>\n<network-a-app-postgres-1:/tmp/report.txt>\n<./report.txt>\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -1243,6 +1306,174 @@ test("docker compose wrapper forces explicit project selections to the attached 
   }
 });
 
+test("docker compose wrapper detaches routed clone up commands from terminal lifetime", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-up-detach-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        originalProjectName: "workspace",
+        attachedProjectName: "network-a-app-1234",
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(binDir, "docker"),
+    "#!/bin/sh\nprintf 'env=%s\\n' \"${COMPOSE_PROJECT_NAME:-}\"\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n",
+    {
+      encoding: "utf8",
+      mode: 0o700,
+    },
+  );
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker compose -p workspace up db",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output, "env=network-a-app-1234\n<compose>\n<-p>\n<network-a-app-1234>\n<up>\n<--detach>\n<db>\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("docker compose wrapper detaches file-routed up commands without an explicit project flag", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-file-up-detach-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const scriptDir = path.join(tempDir, "workspace", "scripts");
+  const binDir = path.join(tempDir, "bin");
+  const composeFile = path.join(projectDir, "docker", "development.yaml");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(path.dirname(composeFile), { recursive: true });
+  fs.mkdirSync(scriptDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(composeFile, "services: {}\n", "utf8");
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        composeFiles: [composeFile],
+        originalProjectName: "workspace",
+        attachedProjectName: "network-a-app-1234",
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(binDir, "docker"),
+    "#!/bin/sh\nprintf 'env=%s\\n' \"${COMPOSE_PROJECT_NAME:-}\"\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n",
+    {
+      encoding: "utf8",
+      mode: 0o700,
+    },
+  );
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(scriptDir)}`,
+          `docker compose -f ${shellQuote(composeFile)} up`,
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(
+      output,
+      [
+        "env=network-a-app-1234",
+        "<compose>",
+        "<-f>",
+        `<${composeFile}>`,
+        "<up>",
+        "<--detach>",
+        "",
+      ].join("\n"),
+    );
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("docker compose wrapper preserves explicit routed foreground up options", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-up-foreground-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        originalProjectName: "workspace",
+        attachedProjectName: "network-a-app-1234",
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker compose -p workspace up --abort-on-container-exit db",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output, "<compose>\n<-p>\n<network-a-app-1234>\n<up>\n<--abort-on-container-exit>\n<db>\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test(
   "native docker PATH shim prefers per-compose route files inside one network",
   { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
@@ -1319,6 +1550,140 @@ test(
           "<-p>",
           "<network-a-second-2222>",
           "<ps>",
+          "",
+        ].join("\n"),
+      );
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "native docker PATH shim detaches routed clone up commands",
+  { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
+  () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-compose-up-detach-"));
+    const projectDir = path.join(tempDir, "workspace", "app");
+    const shimDir = path.join(tempDir, "shim");
+    const realBinDir = path.join(tempDir, "real-bin");
+    const routingFile = path.join(tempDir, "compose-project-routing-network-a.tsv");
+
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.mkdirSync(shimDir, { recursive: true });
+    fs.mkdirSync(realBinDir, { recursive: true });
+    fs.writeFileSync(
+      routingFile,
+      serializeComposeProjectRoutingRows([
+        {
+          networkId: "network-a",
+          runtime: "docker",
+          workingDirectory: projectDir,
+          originalProjectName: "workspace",
+          attachedProjectName: "network-a-workspace-1234",
+        },
+      ]),
+      "utf8",
+    );
+    fs.symlinkSync(getNativeDockerShimPath(), path.join(shimDir, "docker"));
+    fs.writeFileSync(
+      path.join(realBinDir, "docker"),
+      "#!/bin/sh\nprintf 'env=%s\\n' \"${COMPOSE_PROJECT_NAME:-}\"\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n",
+      {
+        encoding: "utf8",
+        mode: 0o700,
+      },
+    );
+
+    try {
+      const output = execFileSync("docker", ["compose", "-p", "workspace", "up", "db"], {
+        cwd: projectDir,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${shimDir}${path.delimiter}${realBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          PORT_MANAGER_RUNTIME_SHIM_DIR: shimDir,
+          PORT_MANAGER_COMPOSE_ROUTING_FILE: routingFile,
+          PORT_MANAGER_NETWORK_ID: "network-a",
+          PORT_MANAGER_BORROWED_NETWORK_ID: "",
+          NEWDLOPS_PM_NETWORK_ID: "",
+          NEWDLOPS_PM_BORROWED_NETWORK_ID: "",
+        },
+      });
+
+      assert.equal(output, "env=network-a-workspace-1234\n<compose>\n<-p>\n<network-a-workspace-1234>\n<up>\n<--detach>\n<db>\n");
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "native docker PATH shim detaches file-routed up commands without an explicit project flag",
+  { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
+  () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-compose-file-up-detach-"));
+    const projectDir = path.join(tempDir, "workspace", "app");
+    const scriptDir = path.join(tempDir, "workspace", "scripts");
+    const shimDir = path.join(tempDir, "shim");
+    const realBinDir = path.join(tempDir, "real-bin");
+    const composeFile = path.join(projectDir, "docker", "development.yaml");
+    const routingFile = path.join(tempDir, "compose-project-routing-network-a.tsv");
+
+    fs.mkdirSync(path.dirname(composeFile), { recursive: true });
+    fs.mkdirSync(scriptDir, { recursive: true });
+    fs.mkdirSync(shimDir, { recursive: true });
+    fs.mkdirSync(realBinDir, { recursive: true });
+    fs.writeFileSync(composeFile, "services: {}\n", "utf8");
+    fs.writeFileSync(
+      routingFile,
+      serializeComposeProjectRoutingRows([
+        {
+          networkId: "network-a",
+          runtime: "docker",
+          workingDirectory: projectDir,
+          composeFiles: [composeFile],
+          originalProjectName: "workspace",
+          attachedProjectName: "network-a-app-1234",
+        },
+      ]),
+      "utf8",
+    );
+    fs.symlinkSync(getNativeDockerShimPath(), path.join(shimDir, "docker"));
+    fs.writeFileSync(
+      path.join(realBinDir, "docker"),
+      "#!/bin/sh\nprintf 'env=%s\\n' \"${COMPOSE_PROJECT_NAME:-}\"\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n",
+      {
+        encoding: "utf8",
+        mode: 0o700,
+      },
+    );
+
+    try {
+      const output = execFileSync("docker", ["compose", "-f", composeFile, "up"], {
+        cwd: scriptDir,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${shimDir}${path.delimiter}${realBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          PORT_MANAGER_RUNTIME_SHIM_DIR: shimDir,
+          PORT_MANAGER_COMPOSE_ROUTING_FILE: routingFile,
+          PORT_MANAGER_NETWORK_ID: "network-a",
+          PORT_MANAGER_BORROWED_NETWORK_ID: "",
+          NEWDLOPS_PM_NETWORK_ID: "",
+          NEWDLOPS_PM_BORROWED_NETWORK_ID: "",
+        },
+      });
+
+      assert.equal(
+        output,
+        [
+          "env=network-a-app-1234",
+          "<compose>",
+          "<-f>",
+          `<${composeFile}>`,
+          "<up>",
+          "<--detach>",
           "",
         ].join("\n"),
       );
