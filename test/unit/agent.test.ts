@@ -608,7 +608,7 @@ test("reuses pending route allocations for sender-first and receiver-first order
     command: "wait-on http://localhost:8004/healthz",
     cwd: "/workspace/app",
     requestedPort: 8004,
-    host: "127.0.0.1",
+    host: "::1",
     networkId: "network-a",
     routeDirection: "send",
     scanRange: 20,
@@ -689,7 +689,7 @@ test("promotes sender-first reservations into listener routes", async (context) 
     command: "wait-on http://localhost:8004/healthz",
     cwd: "/workspace/app",
     requestedPort: 8004,
-    host: "127.0.0.1",
+    host: "::1",
     networkId: "network-a",
     routeDirection: "send",
     scanRange: 20,
@@ -737,6 +737,7 @@ test("promotes sender-first reservations into listener routes", async (context) 
 
   assert.equal(routeEntryTable.routes.length, 1);
   assert.equal((routeEntryTable.routes[0] as { actualPort?: number }).actualPort, senderAllocation.actualPort);
+  assert.equal((routeEntryTable.routes[0] as { host?: string }).host, "127.0.0.1");
   assert.equal((routeEntryTable.routes[0] as { routeDirection?: string }).routeDirection, "listen");
   assert.equal((routeEntryTable.routes[0] as { source?: string }).source, "hooked");
 });
@@ -931,7 +932,7 @@ test("removes stale pending routes when a receiver registers without an allocati
     command: "wait-on http://localhost:8004/healthz",
     cwd: "/workspace/app",
     requestedPort: 8004,
-    host: "127.0.0.1",
+    host: "::1",
     networkId: "network-a",
     routeDirection: "send",
     scanRange: 20,
@@ -960,6 +961,7 @@ test("removes stale pending routes when a receiver registers without an allocati
   assert.equal(released, false);
   assert.equal(routeTable.routes.length, 1);
   assert.equal((routeTable.routes[0] as { actualPort?: number }).actualPort, senderAllocation.actualPort);
+  assert.equal((routeTable.routes[0] as { host?: string }).host, "127.0.0.1");
   assert.equal((routeTable.routes[0] as { source?: string }).source, "hooked");
   assert.deepEqual(routeEntryTable.routes, routeTable.routes);
 });

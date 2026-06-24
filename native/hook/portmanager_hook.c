@@ -666,29 +666,6 @@ static int pm_sockaddr_is_local(const struct sockaddr *addr) {
   return 0;
 }
 
-static int pm_host_is_local_name(const char *host) {
-  return host == NULL ||
-         host[0] == '\0' ||
-         strcmp(host, "localhost") == 0 ||
-         strcmp(host, "127.0.0.1") == 0 ||
-         strcmp(host, "0.0.0.0") == 0 ||
-         strcmp(host, "::1") == 0 ||
-         strcmp(host, "::") == 0 ||
-         strcmp(host, "::ffff:127.0.0.1") == 0;
-}
-
-static int pm_hosts_are_same_route_target(const char *left, const char *right) {
-  if (pm_host_is_local_name(left) && pm_host_is_local_name(right)) {
-    return 1;
-  }
-
-  if (left == NULL || right == NULL) {
-    return left == right;
-  }
-
-  return strcmp(left, right) == 0;
-}
-
 static void pm_sockaddr_host(const struct sockaddr *addr, char *buffer, size_t size) {
   if (addr->sa_family == AF_INET) {
     const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
@@ -1924,7 +1901,12 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
 
   pm_sockaddr_host(addr, host, sizeof(host));
   allocation_id[0] = '\0';
-  actual_port = pm_route_table_lookup(logical_port, 0, "send", host, sizeof(host), NULL);
+  /*
+   * Sender-first reservations can be created by clients that resolve localhost
+   * to ::1. The listener must reuse only the reserved actual port; its route
+   * host must remain the address that bind() was asked to open.
+   */
+  actual_port = pm_route_table_lookup(logical_port, 0, "send", NULL, 0, NULL);
 
   result = -1;
   for (int attempt = 0; attempt < PM_BIND_ALLOCATION_ATTEMPTS; attempt++) {
@@ -2072,7 +2054,11 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
     char original_host[128];
 
     pm_sockaddr_host(addr, original_host, sizeof(original_host));
-    if (target_host[0] != '\0' && !pm_hosts_are_same_route_target(original_host, target_host)) {
+    /*
+     * Same-port routes still need host correction. An IPv6 localhost client
+     * cannot reach a server that actually bound only 127.0.0.1.
+     */
+    if (target_host[0] != '\0' && strcmp(original_host, target_host) != 0) {
       memcpy(&rewritten, addr, addrlen);
       pm_set_sockaddr_host((struct sockaddr *)&rewritten, target_host);
       pm_debug("connect route-host logical=%d actual=%d host=%s", logical_port, actual_port, target_host);
