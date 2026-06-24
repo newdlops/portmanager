@@ -393,6 +393,13 @@ export class ComposePublishMutator {
       if (servicePorts.length === 0) {
         lines.push("    ports: !override []");
       } else {
+        lines.push("    labels:");
+        lines.push("      newdlops.portmanager.compose-clone-service: '1'");
+        for (const port of servicePorts) {
+          lines.push(
+            `      ${quoteYamlString(buildLogicalPortLabelKey(port.containerPort, port.protocol))}: ${quoteYamlString(String(port.logicalPort))}`,
+          );
+        }
         lines.push("    ports: !override");
         for (const port of servicePorts) {
           lines.push(`      - ${quoteYamlString(`127.0.0.1::${port.containerPort}/${port.protocol}`)}`);
@@ -624,6 +631,10 @@ function groupPortsByService(
 
 function buildPortKey(port: ComposePublishedPort): string {
   return `${port.serviceName}:${port.containerPort}:${port.protocol}`;
+}
+
+function buildLogicalPortLabelKey(containerPort: number, protocol: string): string {
+  return `newdlops.portmanager.logical-port.${containerPort}.${protocol}`;
 }
 
 function resolveHiddenPorts(

@@ -177,6 +177,49 @@ test("parses compose containers with published TCP ports as attach candidates", 
   );
 });
 
+test("parses Port Manager clone logical-port labels instead of hidden host ports", () => {
+  const candidates = parseContainerRows("docker", [
+    {
+      ID: "clone123",
+      Names: "network-postgres-1",
+      Image: "postgres:16",
+      Status: "Up 2 minutes",
+      Ports: "127.0.0.1:61421->5432/tcp",
+      Labels:
+        "com.docker.compose.project=network-workspace,com.docker.compose.service=postgres,com.docker.compose.project.config_files=/workspace/compose.yaml,/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml,newdlops.portmanager.compose-clone-service=1,newdlops.portmanager.logical-port.5432.tcp=15432",
+    },
+  ]);
+
+  assert.equal(candidates[0]?.ports[0]?.logicalPort, 15432);
+  assert.equal(candidates[0]?.ports[0]?.actualHostPort, 61421);
+});
+
+test("recovers Port Manager clone logical ports from stopped original Docker Desktop labels", () => {
+  const cloneRow = {
+    ID: "clone123",
+    Names: "network-postgres-1",
+    Image: "postgres:16",
+    Status: "Up 2 minutes",
+    Ports: "127.0.0.1:61421->5432/tcp",
+    Labels:
+      "com.docker.compose.project=network-workspace,com.docker.compose.service=postgres,com.docker.compose.project.config_files=/workspace/compose.yaml,/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml",
+  };
+  const originalRow = {
+    ID: "original123",
+    Names: "workspace-postgres-1",
+    Image: "postgres:16",
+    Status: "Exited (0)",
+    Ports: "",
+    Labels:
+      "com.docker.compose.project=workspace,com.docker.compose.service=postgres,com.docker.compose.project.config_files=/workspace/compose.yaml,desktop.docker.io/ports.scheme=v2,desktop.docker.io/ports/5432/tcp=:15432",
+  };
+
+  const candidates = parseContainerRows("docker", [cloneRow], [cloneRow, originalRow]);
+
+  assert.equal(candidates[0]?.ports[0]?.logicalPort, 15432);
+  assert.equal(candidates[0]?.ports[0]?.actualHostPort, 61421);
+});
+
 test("discovers published port candidates through the configured runtime", async () => {
   const calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
   const adapter = new ContainerServiceDiscoveryAdapter({
@@ -201,10 +244,58 @@ test("discovers published port candidates through the configured runtime", async
       executable: "docker",
       args: ["container", "ls", "--format", "{{json .}}"],
     },
+    {
+      executable: "docker",
+      args: ["container", "ls", "-a", "--format", "{{json .}}"],
+    },
   ]);
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0]?.containerName, "redis");
   assert.equal(candidates[0]?.ports[0]?.protocolName, "redis");
+});
+
+test("recovers persisted clone attachment logical ports from original container labels", async () => {
+  const adapter = new ContainerServiceDiscoveryAdapter({
+    runCommand: async (_executable, args) => {
+      assert.deepEqual(args, ["container", "ls", "-a", "--format", "{{json .}}"]);
+      return {
+        stdout: [
+          JSON.stringify({
+            ID: "original123",
+            Names: "workspace-postgres-1",
+            Ports: "",
+            Labels:
+              "com.docker.compose.project=workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml,desktop.docker.io/ports.scheme=v2,desktop.docker.io/ports/5432/tcp=:15432",
+          }),
+        ].join("\n"),
+        stderr: "",
+      };
+    },
+  });
+
+  const ports = await adapter.recoverPortManagerClonePorts(
+    { containerRuntime: "docker", containerImage: "alpine:3.20" },
+    [
+      "/workspace/compose.yaml",
+      "/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml",
+    ],
+    [
+      {
+        serviceName: "db",
+        logicalPort: 61421,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 61421,
+        containerPort: 5432,
+        protocol: "tcp",
+        protocolName: "postgresql",
+        processId: "managed-process-2",
+      },
+    ],
+  );
+
+  assert.equal(ports[0]?.logicalPort, 15432);
+  assert.equal(ports[0]?.actualHostPort, 61421);
+  assert.equal(ports[0]?.processId, "managed-process-2");
 });
 
 test("mutates compose services into a hidden network-scoped project", async (context) => {
@@ -342,6 +433,8 @@ test("mutates compose services into a hidden network-scoped project", async (con
   assert.match(overrideText, /networks: !override/);
   assert.match(overrideText, /pm_isolated/);
   assert.match(overrideText, /ports: !override/);
+  assert.match(overrideText, /newdlops\.portmanager\.compose-clone-service: '1'/);
+  assert.match(overrideText, /'?newdlops\.portmanager\.logical-port\.5432\.tcp'?: '15432'/);
   assert.match(overrideText, /127\.0\.0\.1::5432\/tcp/);
   assert.match(overrideText, /volumes: !override/);
   assert.match(overrideText, /target: '\/var\/lib\/postgresql\/data'/);

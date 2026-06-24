@@ -302,6 +302,7 @@ export class PortManagerNetworkService implements DisposableLike {
     this.applyVscodeWindowTerminalEnvironment();
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
+    await this.repairPersistedPortManagerCloneComposeAttachments();
     await this.writeComposeProjectRoutingFile();
     await this.restorePersistedComposeRoutesIfMissing();
     await this.refreshTerminals();
@@ -1253,6 +1254,50 @@ export class PortManagerNetworkService implements DisposableLike {
     return this.composeRouteRestoreInFlight;
   }
 
+  /**
+   * Repairs clone attachments that were accidentally registered from the clone.
+   *
+   * When a Port Manager-generated compose project is attached as-is, Docker's
+   * hidden host port can be persisted as the logical port. The discovery adapter
+   * can recover the original host port from stopped original containers, then
+   * the normal compose route restore path re-registers the daemon rows.
+   */
+  private async repairPersistedPortManagerCloneComposeAttachments(): Promise<void> {
+    const attachments = this.registry
+      .getSnapshot()
+      .composeAttachments.filter((attachment) => attachment.status === "attached" && attachment.mutation === undefined);
+
+    if (attachments.length === 0) {
+      return;
+    }
+
+    const settings = readContainerRuntimeSettings();
+    for (const attachment of attachments) {
+      const recoveredPorts = await this.containerServiceDiscovery
+        .recoverPortManagerClonePorts(settings, attachment.composeFiles, attachment.ports)
+        .catch(() => attachment.ports);
+
+      if (!composePortsChanged(attachment.ports, recoveredPorts)) {
+        continue;
+      }
+
+      if (this.processService !== undefined) {
+        await this.processService.start().catch(() => undefined);
+        await Promise.all(
+          attachment.ports
+            .map((port) => port.processId)
+            .filter((processId): processId is string => processId !== undefined)
+            .map((processId) => this.processService!.removeProcess(processId).catch(() => undefined)),
+        );
+      }
+
+      this.registry.updateComposeAttachment({
+        ...attachment,
+        ports: recoveredPorts.map(dropComposeProcessId),
+      });
+    }
+  }
+
   /** Returns true when at least one persisted compose endpoint is absent from the daemon snapshot. */
   private hasMissingPersistedComposeRoutes(attachments: readonly ComposeAttachment[]): boolean {
     if (this.processService === undefined) {
@@ -2139,6 +2184,39 @@ function hasComposeRoute(
       route.host === port.actualHostAddress &&
       isListenRoute(route),
   );
+}
+
+function composePortsChanged(
+  currentPorts: readonly ComposePublishedPort[],
+  nextPorts: readonly ComposePublishedPort[],
+): boolean {
+  return (
+    currentPorts.length !== nextPorts.length ||
+    currentPorts.some((port, index) => {
+      const nextPort = nextPorts[index];
+      return (
+        nextPort === undefined ||
+        port.logicalPort !== nextPort.logicalPort ||
+        port.actualHostAddress !== nextPort.actualHostAddress ||
+        port.actualHostPort !== nextPort.actualHostPort ||
+        port.containerPort !== nextPort.containerPort ||
+        port.protocol !== nextPort.protocol ||
+        port.serviceName !== nextPort.serviceName
+      );
+    })
+  );
+}
+
+function dropComposeProcessId(port: ComposePublishedPort): ComposePublishedPort {
+  return {
+    serviceName: port.serviceName,
+    logicalPort: port.logicalPort,
+    actualHostAddress: port.actualHostAddress,
+    actualHostPort: port.actualHostPort,
+    containerPort: port.containerPort,
+    protocol: port.protocol,
+    ...(port.protocolName !== undefined ? { protocolName: port.protocolName } : {}),
+  };
 }
 
 /** Builds the daemon process row that owns one compose published-port route. */

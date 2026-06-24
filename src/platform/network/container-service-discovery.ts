@@ -36,7 +36,9 @@ export class ContainerServiceDiscoveryAdapter {
   async list(settings: ContainerRuntimeSettings): Promise<readonly ContainerServiceCandidate[]> {
     for (const executable of runtimeCandidates(settings.containerRuntime)) {
       try {
-        return parseContainerRows(executable, await this.listRuntimeRows(executable));
+        const runningRows = await this.listRuntimeRows(executable, false);
+        const contextRows = await this.listRuntimeRows(executable, true).catch(() => runningRows);
+        return parseContainerRows(executable, runningRows, contextRows);
       } catch {
         // Try the next configured runtime. UI refresh should not fail just
         // because Docker/Podman is absent or not running.
@@ -46,11 +48,45 @@ export class ContainerServiceDiscoveryAdapter {
     return [];
   }
 
+  /**
+   * Repairs logical ports for a Port Manager-generated compose clone.
+   *
+   * Older persisted attachments may have been created from the clone project
+   * itself, so their logical port equals Docker's hidden host port. Docker
+   * Desktop keeps the original project's published port labels on stopped
+   * containers; those labels let us restore the user-facing logical port while
+   * preserving the clone's current hidden actual port.
+   */
+  async recoverPortManagerClonePorts(
+    settings: ContainerRuntimeSettings,
+    composeFiles: readonly string[],
+    ports: readonly ComposePublishedPort[],
+  ): Promise<readonly ComposePublishedPort[]> {
+    if (!hasPortManagerOverrideFile(composeFiles)) {
+      return ports;
+    }
+
+    for (const executable of runtimeCandidates(settings.containerRuntime)) {
+      try {
+        const contextRows = await this.listRuntimeRows(executable, true);
+        const context = buildPortRecoveryContext(contextRows);
+        return recoverPortsFromContext(context, composeFiles, ports);
+      } catch {
+        // Try the next configured runtime.
+      }
+    }
+
+    return ports;
+  }
+
   /** Reads JSON rows from `docker container ls` or `podman container ls`. */
-  private async listRuntimeRows(executable: "docker" | "podman"): Promise<readonly RuntimeContainerRow[]> {
+  private async listRuntimeRows(
+    executable: "docker" | "podman",
+    includeStopped: boolean,
+  ): Promise<readonly RuntimeContainerRow[]> {
     const result = await this.runCommand(
       executable,
-      ["container", "ls", "--format", "{{json .}}"],
+      ["container", "ls", ...(includeStopped ? ["-a"] : []), "--format", "{{json .}}"],
       { timeoutMs: LIST_TIMEOUT_MS },
     );
 
@@ -78,15 +114,19 @@ export interface RuntimeContainerRow {
 export function parseContainerRows(
   runtime: "docker" | "podman",
   rows: readonly RuntimeContainerRow[],
+  contextRows: readonly RuntimeContainerRow[] = rows,
 ): readonly ContainerServiceCandidate[] {
+  const context = buildPortRecoveryContext(contextRows);
+
   return rows
-    .map((row) => toContainerServiceCandidate(runtime, row))
+    .map((row) => toContainerServiceCandidate(runtime, row, context))
     .filter((candidate): candidate is ContainerServiceCandidate => candidate !== undefined);
 }
 
 function toContainerServiceCandidate(
   runtime: "docker" | "podman",
   row: RuntimeContainerRow,
+  context: PortRecoveryContext,
 ): ContainerServiceCandidate | undefined {
   const containerId = readFirstString(row.ID, row.Id);
   const containerName = normalizeContainerName(readFirstString(row.Names, row.Name));
@@ -106,7 +146,11 @@ function toContainerServiceCandidate(
     readLabel(labels, "com.docker.compose.project.config_files", "io.podman.compose.project.config_files"),
   );
   const serviceName = composeService ?? containerName;
-  const ports = parsePublishedPorts(row.Ports ?? "", serviceName);
+  const logicalPortOverrides = mergePortOverrides(
+    readPortManagerLogicalPortLabels(labels),
+    findOriginalLogicalPortsForClone(context, composeConfigFiles, composeService),
+  );
+  const ports = parsePublishedPorts(row.Ports ?? "", serviceName, logicalPortOverrides);
 
   if (ports.length === 0) {
     return undefined;
@@ -128,11 +172,15 @@ function toContainerServiceCandidate(
 }
 
 /** Parses Docker/Podman `Ports` text into host-published TCP endpoints. */
-function parsePublishedPorts(portsText: string, serviceName: string): readonly ComposePublishedPort[] {
+function parsePublishedPorts(
+  portsText: string,
+  serviceName: string,
+  logicalPortOverrides: ReadonlyMap<string, number>,
+): readonly ComposePublishedPort[] {
   const portsByIdentity = new Map<string, ComposePublishedPort>();
 
   for (const token of portsText.split(",")) {
-    const parsedPort = parsePublishedPortToken(token.trim(), serviceName);
+    const parsedPort = parsePublishedPortToken(token.trim(), serviceName, logicalPortOverrides);
     if (parsedPort === undefined) {
       continue;
     }
@@ -146,7 +194,11 @@ function parsePublishedPorts(portsText: string, serviceName: string): readonly C
   return [...portsByIdentity.values()];
 }
 
-function parsePublishedPortToken(token: string, serviceName: string): ComposePublishedPort | undefined {
+function parsePublishedPortToken(
+  token: string,
+  serviceName: string,
+  logicalPortOverrides: ReadonlyMap<string, number>,
+): ComposePublishedPort | undefined {
   const arrowIndex = token.indexOf("->");
   if (arrowIndex < 0) {
     return undefined;
@@ -172,9 +224,7 @@ function parsePublishedPortToken(token: string, serviceName: string): ComposePub
 
   return {
     serviceName,
-    // UI attach flows let users override this. The discovered host port is the
-    // least surprising default because it is what compose currently exposes.
-    logicalPort: hostEndpoint.port,
+    logicalPort: logicalPortOverrides.get(buildPortOverrideKey(containerPort, protocol)) ?? hostEndpoint.port,
     actualHostAddress: normalizeHostAddress(hostEndpoint.host),
     actualHostPort: hostEndpoint.port,
     containerPort,
@@ -239,6 +289,162 @@ function parseLabels(value: string | undefined): ReadonlyMap<string, string> {
   }
 
   return labels;
+}
+
+interface PortRecoveryContext {
+  readonly originalPortsByComposeContext: ReadonlyMap<string, ReadonlyMap<string, number>>;
+}
+
+function buildPortRecoveryContext(rows: readonly RuntimeContainerRow[]): PortRecoveryContext {
+  const portsByContext = new Map<string, Map<string, number | undefined>>();
+
+  for (const row of rows) {
+    const labels = parseLabels(row.Labels);
+    const composeService = readLabel(labels, "com.docker.compose.service", "io.podman.compose.service");
+    const composeConfigFiles = parseComposeConfigFiles(
+      readLabel(labels, "com.docker.compose.project.config_files", "io.podman.compose.project.config_files"),
+    );
+
+    if (composeService === undefined || composeConfigFiles.length === 0 || hasPortManagerOverrideFile(composeConfigFiles)) {
+      continue;
+    }
+
+    const contextKey = buildOriginalPortContextKey(composeConfigFiles, composeService);
+    const ports = portsByContext.get(contextKey) ?? new Map<string, number | undefined>();
+    for (const [key, hostPort] of readDockerDesktopPublishedPortLabels(labels)) {
+      if (!ports.has(key)) {
+        ports.set(key, hostPort);
+        continue;
+      }
+
+      const existing = ports.get(key);
+      ports.set(key, existing === hostPort ? hostPort : undefined);
+    }
+    portsByContext.set(contextKey, ports);
+  }
+
+  const originalPortsByComposeContext = new Map<string, ReadonlyMap<string, number>>();
+  for (const [contextKey, ports] of portsByContext) {
+    const resolvedPorts = new Map<string, number>();
+    for (const [portKey, hostPort] of ports) {
+      if (hostPort !== undefined) {
+        resolvedPorts.set(portKey, hostPort);
+      }
+    }
+    if (resolvedPorts.size > 0) {
+      originalPortsByComposeContext.set(contextKey, resolvedPorts);
+    }
+  }
+
+  return { originalPortsByComposeContext };
+}
+
+function findOriginalLogicalPortsForClone(
+  context: PortRecoveryContext,
+  composeConfigFiles: readonly string[],
+  composeService: string | undefined,
+): ReadonlyMap<string, number> {
+  if (composeService === undefined || !hasPortManagerOverrideFile(composeConfigFiles)) {
+    return new Map();
+  }
+
+  const originalConfigFiles = composeConfigFiles.filter((file) => !isPortManagerOverrideFile(file));
+  if (originalConfigFiles.length === 0) {
+    return new Map();
+  }
+
+  return context.originalPortsByComposeContext.get(buildOriginalPortContextKey(originalConfigFiles, composeService)) ?? new Map();
+}
+
+function recoverPortsFromContext(
+  context: PortRecoveryContext,
+  composeFiles: readonly string[],
+  ports: readonly ComposePublishedPort[],
+): readonly ComposePublishedPort[] {
+  if (!hasPortManagerOverrideFile(composeFiles)) {
+    return ports;
+  }
+
+  return ports.map((port) => {
+    const overrides = findOriginalLogicalPortsForClone(context, composeFiles, port.serviceName);
+    const logicalPort = overrides.get(buildPortOverrideKey(port.containerPort, port.protocol));
+    return logicalPort === undefined ? port : { ...port, logicalPort };
+  });
+}
+
+function readPortManagerLogicalPortLabels(labels: ReadonlyMap<string, string>): ReadonlyMap<string, number> {
+  const ports = new Map<string, number>();
+  const prefix = "newdlops.portmanager.logical-port.";
+
+  for (const [label, value] of labels) {
+    if (!label.startsWith(prefix)) {
+      continue;
+    }
+
+    const parts = label.slice(prefix.length).split(".");
+    const containerPort = Number.parseInt(parts[0] ?? "", 10);
+    const protocol = parts[1] ?? "";
+    const logicalPort = Number.parseInt(value, 10);
+    if (isTcpPort(containerPort) && isTcpPort(logicalPort) && protocol === "tcp") {
+      ports.set(buildPortOverrideKey(containerPort, protocol), logicalPort);
+    }
+  }
+
+  return ports;
+}
+
+function readDockerDesktopPublishedPortLabels(labels: ReadonlyMap<string, string>): ReadonlyMap<string, number> {
+  const ports = new Map<string, number>();
+  const prefix = "desktop.docker.io/ports/";
+
+  for (const [label, value] of labels) {
+    if (!label.startsWith(prefix)) {
+      continue;
+    }
+
+    const parts = label.slice(prefix.length).split("/");
+    const containerPort = Number.parseInt(parts[0] ?? "", 10);
+    const protocol = parts[1] ?? "";
+    const hostPort = Number.parseInt(value.replace(/^.*:/, ""), 10);
+    if (isTcpPort(containerPort) && isTcpPort(hostPort) && protocol === "tcp") {
+      ports.set(buildPortOverrideKey(containerPort, protocol), hostPort);
+    }
+  }
+
+  return ports;
+}
+
+function mergePortOverrides(...maps: readonly ReadonlyMap<string, number>[]): ReadonlyMap<string, number> {
+  const merged = new Map<string, number>();
+
+  for (const map of maps) {
+    for (const [key, value] of map) {
+      merged.set(key, value);
+    }
+  }
+
+  return merged;
+}
+
+function buildOriginalPortContextKey(composeConfigFiles: readonly string[], composeService: string): string {
+  return `${composeConfigFiles.map(normalizeComposeFileKey).sort().join("\0")}\0${composeService}`;
+}
+
+function hasPortManagerOverrideFile(composeConfigFiles: readonly string[]): boolean {
+  return composeConfigFiles.some(isPortManagerOverrideFile);
+}
+
+function isPortManagerOverrideFile(file: string): boolean {
+  const normalized = file.replace(/\\/g, "/");
+  return normalized.includes("/compose-overrides/") && normalized.endsWith(".ports.override.yaml");
+}
+
+function normalizeComposeFileKey(file: string): string {
+  return file.trim().replace(/\\/g, "/");
+}
+
+function buildPortOverrideKey(containerPort: number, protocol: string): string {
+  return `${containerPort}/${protocol}`;
 }
 
 function parseComposeConfigFiles(value: string | undefined): readonly string[] {
