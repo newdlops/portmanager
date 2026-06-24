@@ -1665,6 +1665,58 @@ test("docker wrapper preserves container path suffixes from native container map
   }
 });
 
+test("docker wrapper preserves single quotes inside bash commands", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-container-command-quote-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const composeDir = path.join(projectDir, "docker");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "compose-project-routing-network-a.tsv");
+
+  fs.mkdirSync(composeDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(routingFile, createCaptainDbRoutingRows(composeDir, "pm-captain_db-network-a"), "utf8");
+  fs.writeFileSync(
+    path.join(binDir, "docker"),
+    "#!/bin/sh\ni=0\nfor arg in \"$@\"; do i=$((i + 1)); printf '%s=<%s>\\n' \"$i\" \"$arg\"; done\n",
+    {
+      encoding: "utf8",
+      mode: 0o700,
+    },
+  );
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          `docker exec -i captain_db bash -c "psql -U postgres dummy -c \\"SELECT 1 FROM pg_stat_activity WHERE datname = 'postgres'\\""`,
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(
+      output,
+      [
+        "1=<exec>",
+        "2=<-i>",
+        "3=<pm-captain_db-network-a>",
+        "4=<bash>",
+        "5=<-c>",
+        `6=<psql -U postgres dummy -c "SELECT 1 FROM pg_stat_activity WHERE datname = 'postgres'">`,
+        "",
+      ].join("\n"),
+    );
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("docker compose wrapper forces explicit project selections to the attached clone", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-routing-explicit-"));
   const projectDir = path.join(tempDir, "workspace", "app");

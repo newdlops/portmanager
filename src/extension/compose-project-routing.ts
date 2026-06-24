@@ -758,7 +758,7 @@ __port_manager_container_target_for_runtime() {
 
 __port_manager_shell_quote() {
   printf "'"
-  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+  printf '%s' "$1" | sed "s/'/'\\\\\\\\''/g"
   printf "'"
 }
 
