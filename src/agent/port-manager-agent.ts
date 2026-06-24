@@ -605,6 +605,7 @@ export class PortManagerAgent implements DisposableLike {
     this.removePendingRouteAllocationsForIdentity(process.requestedPort, normalizeNetworkId(process.networkId));
     this.missingListenerStateByProcessId.delete(process.id);
     this.writeRouteTable(this.buildCurrentLogicalRoutes());
+    this.queueSnapshotBroadcast();
 
     return process;
   }

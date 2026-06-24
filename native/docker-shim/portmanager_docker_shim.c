@@ -2344,6 +2344,84 @@ static char *pm_container_target_from_route_table(
   return strdup(target);
 }
 
+/** Docker references in cp args may include a container:path suffix that inspect cannot accept. */
+static void pm_container_reference_without_suffix(const char *reference, char *buffer, size_t size) {
+  const char *colon;
+  size_t length;
+
+  if (buffer == NULL || size == 0) {
+    return;
+  }
+
+  if (reference == NULL || reference[0] == '\0') {
+    buffer[0] = '\0';
+    return;
+  }
+
+  colon = strchr(reference, ':');
+  length = colon == NULL ? strlen(reference) : (size_t)(colon - reference);
+  if (length >= size) {
+    length = size - 1;
+  }
+
+  memcpy(buffer, reference, length);
+  buffer[length] = '\0';
+}
+
+/** Returns true only when Docker says the routed target is a currently running container. */
+static int pm_container_reference_is_running(const char *real_runtime_path, const char *target) {
+  char reference[PM_MAX_FIELD];
+  char output[256];
+  char *line;
+  char *argv[] = {
+    (char *)real_runtime_path,
+    "inspect",
+    "--format",
+    "{{.State.Running}}",
+    reference,
+    NULL,
+  };
+
+  pm_container_reference_without_suffix(target, reference, sizeof(reference));
+  if (reference[0] == '\0' ||
+      pm_run_capture(argv, output, sizeof(output)) != 0 ||
+      pm_first_nonempty_output_line(output, &line) != 0) {
+    return 0;
+  }
+
+  return strcmp(line, "true") == 0;
+}
+
+/**
+ * TSV mappings are cheap but can briefly point at a stopped clone after
+ * `docker compose up --force-recreate`. When that happens, fall back through
+ * the route table and Docker compose labels to locate the current clone.
+ */
+static char *pm_resolve_container_target_with_live_fallback(
+  const char *runtime,
+  const char *real_runtime_path,
+  const char *token,
+  const char *suffix,
+  const char *target
+) {
+  char *fallback;
+
+  if (target == NULL || target[0] == '\0') {
+    return NULL;
+  }
+
+  if (pm_container_reference_is_running(real_runtime_path, target)) {
+    return strdup(target);
+  }
+
+  fallback = pm_container_target_from_route_table(runtime, real_runtime_path, token, suffix);
+  if (fallback != NULL) {
+    return fallback;
+  }
+
+  return strdup(target);
+}
+
 /** Maps one container token, including cp's container:path suffix, when it is unambiguous. */
 static char *pm_container_target_for_token(
   const char *runtime,
@@ -2394,7 +2472,13 @@ static char *pm_container_target_for_token(
   pm_visit_scoped_compose_routing_files(file_path, pm_container_target_scan_file, &search, &scoped_file_count);
   if (scoped_file_count > 0 && search.context_files > 0) {
     if (search.matches == 1 && search.target[0] != '\0') {
-      return strdup(search.target);
+      return pm_resolve_container_target_with_live_fallback(
+        runtime,
+        real_runtime_path,
+        token_copy,
+        suffix,
+        search.target
+      );
     }
     return pm_container_target_from_route_table(runtime, real_runtime_path, token_copy, suffix);
   }
@@ -2419,7 +2503,13 @@ static char *pm_container_target_for_token(
   }
 
   if (search.matches == 1 && search.target[0] != '\0') {
-    return strdup(search.target);
+    return pm_resolve_container_target_with_live_fallback(
+      runtime,
+      real_runtime_path,
+      token_copy,
+      suffix,
+      search.target
+    );
   }
 
   return pm_container_target_from_route_table(runtime, real_runtime_path, token_copy, suffix);

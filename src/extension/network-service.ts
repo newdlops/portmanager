@@ -38,6 +38,7 @@ import {
 import { getProcessLookupHelperRelativePath } from "../platform/process/native-process-lookup";
 import { NodeProcessEnvironmentProvider } from "../platform/process/node-process-environment";
 import { NodeTerminalCandidateProvider } from "../platform/process/node-terminal-candidate-provider";
+import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
 import type {
   AgentDaemonStatus,
   ComposeAttachment,
@@ -111,6 +112,15 @@ export interface TerminalNetworkResetSummary {
   readonly terminalCount: number;
   /** Number of persisted attachment rows removed from the logical network state. */
   readonly removedAttachmentCount: number;
+}
+
+export interface RoutingFileCleanupSummary {
+  /** Existing Port Manager routing cache files removed from disk. */
+  readonly removedFileCount: number;
+  /** Files that could not be removed because the filesystem rejected cleanup. */
+  readonly failedFileCount: number;
+  /** Compose endpoint routes re-registered into the singleton daemon afterward. */
+  readonly restoredComposeRouteCount: number;
 }
 
 export interface VscodeWindowTerminalAttachSummary {
@@ -1141,6 +1151,44 @@ export class PortManagerNetworkService implements DisposableLike {
     };
   }
 
+  /**
+   * Removes generated routing cache files and immediately rehydrates durable
+   * attachment state. This is a recovery path for stale route JSON/TSV files;
+   * it intentionally does not mutate Docker containers, volumes, or overrides.
+   */
+  async clearRoutingFiles(): Promise<RoutingFileCleanupSummary> {
+    const cleanupPaths = await this.collectRoutingFileCleanupPaths();
+    let removedFileCount = 0;
+    let failedFileCount = 0;
+
+    await Promise.all(
+      [...cleanupPaths].map(async (filePath) => {
+        try {
+          await fs.rm(filePath, { force: true });
+          removedFileCount++;
+        } catch {
+          failedFileCount++;
+        }
+      }),
+    );
+
+    await this.writeHostAccessBindingsFile().catch(() => undefined);
+    await this.writeComposeProjectRoutingFile().catch(() => undefined);
+
+    const attachments = this.registry
+      .getSnapshot()
+      .composeAttachments.filter((attachment) => attachment.status === "attached" && attachment.ports.length > 0);
+    const restoredComposeRouteCount =
+      this.processService === undefined ? 0 : attachments.reduce((sum, attachment) => sum + attachment.ports.length, 0);
+    await this.restorePersistedComposeRoutes(attachments);
+
+    return {
+      removedFileCount,
+      failedFileCount,
+      restoredComposeRouteCount,
+    };
+  }
+
   /** Releases listeners and event subscriptions. */
   dispose(): void {
     if (this.composeAttachmentReconcileTimer !== undefined) {
@@ -2019,6 +2067,44 @@ export class PortManagerNetworkService implements DisposableLike {
     );
   }
 
+  /** Collects only generated routing cache files that can be recreated from durable state. */
+  private async collectRoutingFileCleanupPaths(): Promise<ReadonlySet<string>> {
+    const filePaths = new Set<string>();
+
+    await this.collectMatchingFiles(path.dirname(getDefaultRouteTablePath()), (entryName) =>
+      isGeneratedRouteTableFile(entryName, getDefaultRouteTablePath()),
+    ).then((paths) => paths.forEach((filePath) => filePaths.add(filePath)));
+
+    await this.collectMatchingFiles(path.dirname(getDefaultHostAccessBindingsPath()), (entryName) =>
+      isGeneratedHostAccessFile(entryName, getDefaultHostAccessBindingsPath()),
+    ).then((paths) => paths.forEach((filePath) => filePaths.add(filePath)));
+
+    await this.collectMatchingFiles(this.context.globalStorageUri.fsPath, (entryName) =>
+      entryName === COMPOSE_PROJECT_ROUTING_FILE_NAME ||
+      (entryName.startsWith(COMPOSE_PROJECT_ROUTING_FILE_PREFIX) && entryName.endsWith(".tsv")),
+    ).then((paths) => paths.forEach((filePath) => filePaths.add(filePath)));
+
+    return filePaths;
+  }
+
+  /** Lists generated files in one directory without letting cleanup fail on missing folders. */
+  private async collectMatchingFiles(
+    directoryPath: string,
+    matches: (entryName: string) => boolean,
+  ): Promise<readonly string[]> {
+    let entries: readonly Dirent[];
+
+    try {
+      entries = await fs.readdir(directoryPath, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+
+    return entries
+      .filter((entry) => entry.isFile() && matches(entry.name))
+      .map((entry) => path.join(directoryPath, entry.name));
+  }
+
   /**
    * Reconciles marker files written by manually pasted routing scripts with
    * the normal attachment registry. Custom terminal UIs can run the same shell
@@ -2213,6 +2299,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_FIXED_PROTOCOL_PORTS", settings.fixedProtocolPorts.join(",")),
       shellPrependLibrary(preloadVariable, hookLibraryPath),
     ];
+    commands.push(buildAgentDaemonEnsureShell(process.execPath));
 
     if (process.platform === "darwin" && shellEnvRestorePath !== undefined) {
       commands.push(
@@ -2365,13 +2452,13 @@ export interface ComposePublishMutationInput {
 export interface ComposePublishedPortInput {
   /** Compose service that owns the container-side listener. */
   readonly serviceName: string;
-  /** Discovered logical hint; containerPort becomes the network-local service port when present. */
+  /** Public/logical port that attached terminal clients should keep using. */
   readonly logicalPort: number;
   /** Docker-published host address reachable from the extension host. */
   readonly actualHostAddress: string;
   /** Docker-published host port, often allocated from a hidden range. */
   readonly actualHostPort: number;
-  /** Container-side service port; this is the port logical-network clients should use. */
+  /** Compose-internal service port that must stay unchanged in Docker networking. */
   readonly containerPort?: number;
   /** Optional named protocol label such as postgresql, mysql, redis, or http. */
   readonly protocolName?: string;
@@ -2457,10 +2544,10 @@ function normalizeComposePublishedPort(input: ComposePublishedPortInput): Compos
 
   return {
     serviceName: assertNonEmptyString(input.serviceName, "Compose service name"),
-    // Compose attachments are network-local service endpoints. Docker's host
-    // published port remains only the runtime target; it must not become the
-    // port seen by peers inside the logical network.
-    logicalPort: containerPort,
+    // Compose-internal ports are Docker service endpoints. The logical port is
+    // the public port attached terminals already call, and it routes to the
+    // hidden host publish created by the compose mutator.
+    logicalPort: input.logicalPort,
     actualHostAddress: assertNonEmptyString(input.actualHostAddress, "Compose published host address"),
     actualHostPort: input.actualHostPort,
     containerPort,
@@ -2598,6 +2685,20 @@ function dropComposeProcessId(port: ComposePublishedPort): ComposePublishedPort 
     protocol: port.protocol,
     ...(port.protocolName !== undefined ? { protocolName: port.protocolName } : {}),
   };
+}
+
+function isGeneratedRouteTableFile(entryName: string, baseRouteTablePath: string): boolean {
+  const parsedPath = path.parse(baseRouteTablePath);
+  const extension = parsedPath.ext.length > 0 ? parsedPath.ext : ".json";
+
+  return entryName === parsedPath.base || (entryName.startsWith(`${parsedPath.name}-`) && entryName.endsWith(extension));
+}
+
+function isGeneratedHostAccessFile(entryName: string, baseHostAccessPath: string): boolean {
+  const parsedPath = path.parse(baseHostAccessPath);
+  const extension = parsedPath.ext.length > 0 ? parsedPath.ext : ".json";
+
+  return entryName === parsedPath.base || (entryName.startsWith(`${parsedPath.name}-`) && entryName.endsWith(extension));
 }
 
 /** Builds the daemon process row that owns one compose published-port route. */
@@ -3225,6 +3326,45 @@ function shellExport(name: string, value: string): string {
 
 function shellPrependLibrary(name: string, libraryPath: string): string {
   return `export ${name}=${shellQuote(libraryPath)}\${${name}:+":$${name}"}`;
+}
+
+/**
+ * Native socket routing fails closed when the singleton daemon is unavailable.
+ * Terminal attach is often followed immediately by process startup, so the
+ * injected shell must both start the daemon when needed and wait until the
+ * socket accepts connections before returning control to the prompt.
+ */
+function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
+  const nodeRuntimePrefix = `${ELECTRON_RUN_AS_NODE}=1`;
+  const daemonRuntimePrefix = `PORT_MANAGER_HOOK_DISABLED=1 PORT_MANAGER_HOOK=0 DYLD_INSERT_LIBRARIES= LD_PRELOAD= ${nodeRuntimePrefix}`;
+  const nodeProbeScript =
+    'const net=require("node:net");const fs=require("node:fs");const socketPath=process.argv[1];const socket=net.createConnection(socketPath);const timer=setTimeout(()=>{socket.destroy();try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);},300);socket.once("connect",()=>{clearTimeout(timer);socket.end();process.exit(0);});socket.once("error",()=>{clearTimeout(timer);try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);});';
+  const probeCommand = `${daemonRuntimePrefix} ${shellQuote(nodeExecutablePath)} -e ${shellQuote(
+    nodeProbeScript,
+  )} "$PORT_MANAGER_AGENT_SOCKET"`;
+
+  return [
+    `__pm_agent_ready=0`,
+    `${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1`,
+    `if [ "$__pm_agent_ready" != "1" ]; then`,
+    `if [ -x "$PORT_MANAGER_AGENT_EXECUTABLE" ]; then`,
+    `${daemonRuntimePrefix} nohup "$PORT_MANAGER_AGENT_EXECUTABLE" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" --agent-main "$PORT_MANAGER_AGENT_MAIN" >/tmp/newdlops-portmanager-agent.log 2>&1 &`,
+    `else`,
+    `${daemonRuntimePrefix} nohup ${shellQuote(
+      nodeExecutablePath,
+    )} "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" >/tmp/newdlops-portmanager-agent.log 2>&1 &`,
+    `fi`,
+    `__pm_agent_wait_count=0`,
+    `while [ $__pm_agent_wait_count -lt 50 ]; do`,
+    `${probeCommand} >/dev/null 2>&1 && break`,
+    `__pm_agent_wait_count=$((__pm_agent_wait_count + 1))`,
+    `sleep 0.1`,
+    `done`,
+    `unset __pm_agent_wait_count`,
+    `fi`,
+    `unset __pm_agent_ready`,
+    `export PORT_MANAGER_HOOK_DAEMON_STARTED=1`,
+  ].join("\n");
 }
 
 function shellQuote(value: string): string {

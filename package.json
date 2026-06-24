@@ -67,6 +67,7 @@
     "onCommand:portManager.restartDaemon",
     "onCommand:portManager.stopDaemon",
     "onCommand:portManager.showDaemonStatus",
+    "onCommand:portManager.clearRoutingFiles",
     "onCommand:portManager.startManagedProcess",
     "onCommand:portManager.addExistingProcess",
     "onCommand:portManager.refresh",
@@ -274,6 +275,12 @@
         "title": "Port Manager: Daemon Status",
         "category": "Port Manager",
         "icon": "$(pulse)"
+      },
+      {
+        "command": "portManager.clearRoutingFiles",
+        "title": "Port Manager: Clear Routing Files",
+        "category": "Port Manager",
+        "icon": "$(clear-all)"
       },
       {
         "command": "portManager.startManagedProcess",
@@ -592,6 +599,11 @@
           "command": "portManager.showDaemonStatus",
           "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
           "group": "daemon@3"
+        },
+        {
+          "command": "portManager.clearRoutingFiles",
+          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
+          "group": "daemon@4"
         },
         {
           "command": "portManager.openRoutedUrl",

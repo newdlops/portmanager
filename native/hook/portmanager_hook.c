@@ -844,6 +844,54 @@ static const char *pm_find_json_key(const char *json, const char *key) {
   return strstr(json, pattern);
 }
 
+/*
+ * Route tables may be written by the Node daemon as pretty JSON or by the
+ * native daemon as compact JSON. Match numeric keys structurally enough for the
+ * hot-path route scan instead of depending on a specific colon/space layout.
+ */
+static char *pm_find_json_int_key(char *cursor, const char *key, int expected_value) {
+  char pattern[128];
+  size_t pattern_length;
+
+  snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+  pattern_length = strlen(pattern);
+
+  while (cursor != NULL && *cursor != '\0') {
+    char *match = strstr(cursor, pattern);
+    char *value_start;
+    char *value_end = NULL;
+    long parsed;
+
+    if (match == NULL) {
+      return NULL;
+    }
+
+    value_start = match + pattern_length;
+    while (*value_start != '\0' && isspace((unsigned char)*value_start)) {
+      value_start++;
+    }
+
+    if (*value_start != ':') {
+      cursor = value_start;
+      continue;
+    }
+
+    value_start++;
+    while (*value_start != '\0' && isspace((unsigned char)*value_start)) {
+      value_start++;
+    }
+
+    parsed = strtol(value_start, &value_end, 10);
+    if (value_end != value_start && parsed == expected_value) {
+      return match;
+    }
+
+    cursor = value_end != value_start ? value_end : value_start + 1;
+  }
+
+  return NULL;
+}
+
 static int pm_json_int(const char *json, const char *key, int fallback) {
   const char *cursor = pm_find_json_key(json, key);
 
@@ -1239,7 +1287,6 @@ static int pm_host_access_lookup(int logical_port, char *target_host, size_t tar
   int fd;
   struct stat stat_buffer;
   ssize_t read_count;
-  char needle[64];
   char *cursor;
 
   pm_default_host_access_path(path, sizeof(path));
@@ -1267,10 +1314,9 @@ static int pm_host_access_lookup(int logical_port, char *target_host, size_t tar
   }
 
   buffer[read_count] = '\0';
-  snprintf(needle, sizeof(needle), "\"logicalPort\": %d", logical_port);
   cursor = buffer;
 
-  while ((cursor = strstr(cursor, needle)) != NULL) {
+  while ((cursor = pm_find_json_int_key(cursor, "logicalPort", logical_port)) != NULL) {
     char *object_start = cursor;
     char *object_end = strchr(cursor, '}');
     int host_port;
@@ -1535,7 +1581,6 @@ static int pm_route_table_lookup_file(
   int fd;
   struct stat stat_buffer;
   ssize_t read_count;
-  char needle[64];
   char *cursor;
   int fallback_port = 0;
   int fallback_is_compose = 0;
@@ -1570,12 +1615,11 @@ static int pm_route_table_lookup_file(
   }
 
   buffer[read_count] = '\0';
-  snprintf(needle, sizeof(needle), "\"%s\": %d", source_is_actual ? "actualPort" : "logicalPort", source_port);
   cursor = buffer;
   fallback_host[0] = '\0';
   pm_cwd(current_cwd, sizeof(current_cwd));
 
-  while ((cursor = strstr(cursor, needle)) != NULL) {
+  while ((cursor = pm_find_json_int_key(cursor, source_is_actual ? "actualPort" : "logicalPort", source_port)) != NULL) {
     char *object_start = cursor;
     char *object_end = strchr(cursor, '}');
     char object_end_saved;
@@ -1673,7 +1717,6 @@ static int pm_compose_claim_blocks_port_by_key(int port, const char *port_key) {
   int fd;
   struct stat stat_buffer;
   ssize_t read_count;
-  char needle[64];
   char *cursor;
 
   pm_default_global_route_table_path(path, sizeof(path));
@@ -1701,10 +1744,9 @@ static int pm_compose_claim_blocks_port_by_key(int port, const char *port_key) {
   }
 
   buffer[read_count] = '\0';
-  snprintf(needle, sizeof(needle), "\"%s\": %d", port_key, port);
   cursor = buffer;
 
-  while ((cursor = strstr(cursor, needle)) != NULL) {
+  while ((cursor = pm_find_json_int_key(cursor, port_key, port)) != NULL) {
     char *object_start = cursor;
     char *object_end = strchr(cursor, '}');
     char object_end_saved;

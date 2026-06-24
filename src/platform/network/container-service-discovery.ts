@@ -304,9 +304,7 @@ function toContainerServiceCandidate(
   const serviceName = composeService ?? containerName;
   const logicalPortOverrides = readPortManagerLogicalPortLabels(labels);
   const parsedPorts = parsePublishedPorts(row.Ports ?? "", serviceName, logicalPortOverrides);
-  const ports = hasPortManagerOverrideFile(composeConfigFiles)
-    ? parsedPorts.map((port) => ({ ...port, logicalPort: port.containerPort }))
-    : parsedPorts;
+  const ports = recoverCloneLogicalPortsFromContext(context, composeConfigFiles, composeService, parsedPorts);
   const portManagerClone = buildPortManagerCloneCandidateMetadata(
     context,
     containerId,
@@ -611,7 +609,7 @@ function buildPortManagerCloneCandidateMetadata(
     const originalHostPort = originalPortOverrides.get(buildPortOverrideKey(port.containerPort, port.protocol));
     return {
       ...port,
-      logicalPort: port.containerPort,
+      logicalPort: originalHostPort ?? port.logicalPort,
       actualHostPort: originalHostPort ?? port.actualHostPort,
     };
   });
@@ -632,6 +630,39 @@ function buildPortManagerCloneCandidateMetadata(
       },
     ],
   };
+}
+
+/**
+ * Clone rows expose hidden host ports, but logical-network clients should keep
+ * calling the original public port. The Port Manager label normally carries
+ * that public port; stopped original containers are a fallback when labels are
+ * missing from an older clone.
+ */
+function recoverCloneLogicalPortsFromContext(
+  context: PortRecoveryContext,
+  composeConfigFiles: readonly string[],
+  composeService: string | undefined,
+  ports: readonly ComposePublishedPort[],
+): readonly ComposePublishedPort[] {
+  if (!hasPortManagerOverrideFile(composeConfigFiles) || composeService === undefined) {
+    return ports;
+  }
+
+  const sourceComposeFiles = composeConfigFiles.filter((file) => !isPortManagerOverrideFile(file));
+  if (sourceComposeFiles.length === 0) {
+    return ports;
+  }
+
+  const originalPortOverrides =
+    context.originalPortsByComposeContext.get(buildOriginalPortContextKey(sourceComposeFiles, composeService)) ?? new Map();
+  if (originalPortOverrides.size === 0) {
+    return ports;
+  }
+
+  return ports.map((port) => {
+    const originalHostPort = originalPortOverrides.get(buildPortOverrideKey(port.containerPort, port.protocol));
+    return originalHostPort === undefined ? port : { ...port, logicalPort: originalHostPort };
+  });
 }
 
 function findOriginalCloneSourceForClone(
@@ -658,8 +689,19 @@ function recoverPortsFromContext(
     return ports;
   }
 
-  void context;
-  return ports.map((port) => ({ ...port, logicalPort: port.containerPort }));
+  const sourceComposeFiles = composeFiles.filter((file) => !isPortManagerOverrideFile(file));
+  if (sourceComposeFiles.length === 0) {
+    return ports;
+  }
+
+  return ports.map((port) => {
+    const originalPortOverrides =
+      context.originalPortsByComposeContext.get(buildOriginalPortContextKey(sourceComposeFiles, port.serviceName)) ??
+      new Map();
+    const originalHostPort = originalPortOverrides.get(buildPortOverrideKey(port.containerPort, port.protocol));
+
+    return originalHostPort === undefined ? port : { ...port, logicalPort: originalHostPort };
+  });
 }
 
 function refreshPortsFromCandidates(

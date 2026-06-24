@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -224,6 +225,107 @@ static void pm_default_route_table_path(char *buffer, size_t size) {
   snprintf(buffer, size, "/tmp/newdlops-portmanager-routes-%ld.json", (long)getuid());
 }
 
+static int pm_has_suffix(const char *value, const char *suffix) {
+  size_t value_length;
+  size_t suffix_length;
+
+  if (value == NULL || suffix == NULL) {
+    return 0;
+  }
+
+  value_length = strlen(value);
+  suffix_length = strlen(suffix);
+  if (suffix_length > value_length) {
+    return 0;
+  }
+
+  return strcmp(value + value_length - suffix_length, suffix) == 0;
+}
+
+static void pm_clear_stale_scoped_route_files(const char *route_table_path) {
+  const char *slash;
+  const char *name;
+  const char *dot;
+  DIR *directory_handle;
+  struct dirent *entry;
+  char directory[PM_TEXT];
+  char stem[PM_TEXT];
+  char extension[PM_SMALL];
+  size_t stem_length;
+
+  if (pm_text_empty(route_table_path)) {
+    return;
+  }
+
+  slash = strrchr(route_table_path, '/');
+  name = slash == NULL ? route_table_path : slash + 1;
+  dot = strrchr(name, '.');
+
+  if (slash == NULL) {
+    pm_copy(directory, sizeof(directory), ".");
+  } else if (slash == route_table_path) {
+    pm_copy(directory, sizeof(directory), "/");
+  } else {
+    size_t directory_length = (size_t)(slash - route_table_path);
+    if (directory_length >= sizeof(directory)) {
+      directory_length = sizeof(directory) - 1;
+    }
+    memcpy(directory, route_table_path, directory_length);
+    directory[directory_length] = '\0';
+  }
+
+  if (dot == NULL) {
+    pm_copy(stem, sizeof(stem), name);
+    pm_copy(extension, sizeof(extension), ".json");
+  } else {
+    size_t prefix_length = (size_t)(dot - name);
+    if (prefix_length >= sizeof(stem)) {
+      prefix_length = sizeof(stem) - 1;
+    }
+    memcpy(stem, name, prefix_length);
+    stem[prefix_length] = '\0';
+    pm_copy(extension, sizeof(extension), dot);
+  }
+
+  if (stem[0] == '\0' || extension[0] == '\0') {
+    return;
+  }
+
+  directory_handle = opendir(directory);
+  if (directory_handle == NULL) {
+    return;
+  }
+
+  stem_length = strlen(stem);
+  while ((entry = readdir(directory_handle)) != NULL) {
+    char file_path[PM_TEXT];
+    int written;
+
+    if (strncmp(entry->d_name, stem, stem_length) != 0 || entry->d_name[stem_length] != '-' ||
+        !pm_has_suffix(entry->d_name, extension)) {
+      continue;
+    }
+
+    /*
+     * Scoped route tables and per-port endpoint files are generation-local.
+     * Removing them on daemon startup prevents hooks from reading stale
+     * pending routes after a restart or extension reinstall.
+     */
+    if (strcmp(directory, "/") == 0) {
+      written = snprintf(file_path, sizeof(file_path), "/%s", entry->d_name);
+    } else {
+      written = snprintf(file_path, sizeof(file_path), "%s/%s", directory, entry->d_name);
+    }
+    if (written < 0 || (size_t)written >= sizeof(file_path)) {
+      continue;
+    }
+
+    unlink(file_path);
+  }
+
+  closedir(directory_handle);
+}
+
 void pm_state_init(pm_agent_state *state, const char *route_table_path, const char *agent_main_path) {
   memset(state, 0, sizeof(*state));
   if (!pm_text_empty(route_table_path)) {
@@ -231,6 +333,7 @@ void pm_state_init(pm_agent_state *state, const char *route_table_path, const ch
   } else {
     pm_default_route_table_path(state->route_table_path, sizeof(state->route_table_path));
   }
+  pm_clear_stale_scoped_route_files(state->route_table_path);
   pm_copy(state->agent_main_path, sizeof(state->agent_main_path), agent_main_path);
   pm_iso_now(state->started_at, sizeof(state->started_at));
   state->next_process_id = 1;

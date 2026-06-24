@@ -880,20 +880,16 @@ __port_manager_rewrite_container_name_filter() {
 
   __pm_filter_prefix=""
   __pm_filter_suffix=""
-  case "\${__pm_filter_token}" in
-    ^/*)
-      __pm_filter_prefix="^/"
-      __pm_filter_token="\${__pm_filter_token#^/}"
-      ;;
-    ^*)
-      __pm_filter_prefix="^"
-      __pm_filter_token="\${__pm_filter_token#^}"
-      ;;
-    /*)
-      __pm_filter_prefix="/"
-      __pm_filter_token="\${__pm_filter_token#/}"
-      ;;
-  esac
+  if [ "\${__pm_filter_token#\\^/}" != "\${__pm_filter_token}" ]; then
+    __pm_filter_prefix="^/"
+    __pm_filter_token="\${__pm_filter_token#\\^/}"
+  elif [ "\${__pm_filter_token#\\^}" != "\${__pm_filter_token}" ]; then
+    __pm_filter_prefix="^"
+    __pm_filter_token="\${__pm_filter_token#\\^}"
+  elif [ "\${__pm_filter_token#/}" != "\${__pm_filter_token}" ]; then
+    __pm_filter_prefix="/"
+    __pm_filter_token="\${__pm_filter_token#/}"
+  fi
   case "\${__pm_filter_token}" in
     *'$')
       __pm_filter_suffix="$"

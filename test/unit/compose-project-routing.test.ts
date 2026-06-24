@@ -1054,6 +1054,46 @@ test("docker wrapper preserves anchored ps name filters while routing container 
 });
 
 test(
+  "zsh docker wrapper preserves anchored ps name filters while routing container names",
+  { skip: fs.existsSync("/bin/zsh") ? false : "zsh is not available" },
+  () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-zsh-container-anchored-ps-name-filter-"));
+    const projectDir = path.join(tempDir, "workspace", "app");
+    const binDir = path.join(tempDir, "bin");
+    const routingFile = path.join(tempDir, "routes.tsv");
+
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(routingFile, createContainerRoutingRows(projectDir), "utf8");
+    fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+      encoding: "utf8",
+      mode: 0o700,
+    });
+
+    try {
+      const output = execFileSync(
+        "/bin/zsh",
+        [
+          "-c",
+          [
+            buildComposeProjectRoutingShell(routingFile),
+            "export PORT_MANAGER_NETWORK_ID=network-a",
+            `export PATH=${shellQuote(binDir)}:$PATH`,
+            `cd ${shellQuote(projectDir)}`,
+            "docker ps --filter=name=^/workspace-postgres-1$",
+          ].join("\n"),
+        ],
+        { encoding: "utf8" },
+      );
+
+      assert.equal(output, "<ps>\n<--filter=name=^/network-a-app-postgres-1$>\n");
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   "native docker PATH shim rewrites ps name filters for cloned compose containers",
   { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
   () => {
@@ -2603,6 +2643,114 @@ test(
       });
 
       assert.equal(output, "<cp>\n<./db-snapshot/dump.gz>\n<clone-db-987654:dump.gz>\n");
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "native docker PATH shim rewrites stale stopped clone hashes to the current clone",
+  { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
+  () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-stale-clone-route-"));
+    const projectDir = path.join(tempDir, "workspace", "app");
+    const composeDir = path.join(projectDir, "docker");
+    const shimDir = path.join(tempDir, "shim");
+    const realBinDir = path.join(tempDir, "real-bin");
+    const routingFile = path.join(tempDir, "routes.tsv");
+    const routeTableFile = path.join(tempDir, "newdlops-portmanager-routes-501-network-a.json");
+
+    fs.mkdirSync(composeDir, { recursive: true });
+    fs.mkdirSync(shimDir, { recursive: true });
+    fs.mkdirSync(realBinDir, { recursive: true });
+    fs.writeFileSync(
+      routingFile,
+      serializeComposeProjectRoutingRows([
+        {
+          networkId: "network-a",
+          runtime: "docker",
+          workingDirectory: projectDir,
+          originalProjectName: "docker",
+          attachedProjectName: "network-a-app-1234",
+          containerMappings: [
+            {
+              serviceName: "db",
+              originalContainerId: "original-db-123456",
+              originalContainerName: "captain_db",
+              attachedContainerId: "stale-db-111111",
+              attachedContainerName: "stale-db-111111",
+            },
+          ],
+        },
+      ]),
+      "utf8",
+    );
+    fs.writeFileSync(
+      routeTableFile,
+      JSON.stringify({
+        updatedAt: "2026-06-24T00:00:00Z",
+        routes: [
+          {
+            logicalPort: 15432,
+            actualPort: 57001,
+            routeDirection: "listen",
+            host: "127.0.0.1",
+            cwd: composeDir,
+            networkId: "network-a",
+            processId: "managed-process-7",
+            processName: "network-a-app-1234:db/postgresql",
+            status: "running",
+            source: "compose",
+          },
+        ],
+      }),
+      "utf8",
+    );
+    fs.symlinkSync(getNativeDockerShimPath(), path.join(shimDir, "docker"));
+    fs.writeFileSync(
+      path.join(realBinDir, "docker"),
+      [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"inspect\" ] && [ \"$2\" = \"--format\" ] && [ \"$3\" = \"{{.State.Running}}\" ] && [ \"$4\" = \"stale-db-111111\" ]; then",
+        "  printf 'false\\n'",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = \"inspect\" ] && [ \"$2\" = \"--format\" ] && [ \"$4\" = \"stale-db-111111\" ]; then",
+        "  printf 'stale-db-111111\\t/stale-db-111111\\tnetwork-a-app-1234\\tdb\\n'",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = \"container\" ] && [ \"$2\" = \"ls\" ]; then",
+        "  printf 'current-db-222222\\n'",
+        "  exit 0",
+        "fi",
+        "for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done",
+        "",
+      ].join("\n"),
+      {
+        encoding: "utf8",
+        mode: 0o700,
+      },
+    );
+
+    try {
+      const output = execFileSync("docker", ["exec", "stale-db-111111", "psql"], {
+        cwd: projectDir,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${shimDir}${path.delimiter}${realBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          PORT_MANAGER_RUNTIME_SHIM_DIR: shimDir,
+          PORT_MANAGER_COMPOSE_ROUTING_FILE: routingFile,
+          PORT_MANAGER_ROUTES_FILE: routeTableFile,
+          PORT_MANAGER_NETWORK_ID: "",
+          PORT_MANAGER_BORROWED_NETWORK_ID: "",
+          NEWDLOPS_PM_NETWORK_ID: "",
+          NEWDLOPS_PM_BORROWED_NETWORK_ID: "",
+        },
+      });
+
+      assert.equal(output, "<exec>\n<current-db-222222>\n<psql>\n");
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }

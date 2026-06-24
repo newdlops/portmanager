@@ -566,9 +566,12 @@ export class ContainerPublishedPortTreeItem extends vscode.TreeItem {
     readonly candidate: ContainerServiceCandidate,
     readonly port: ContainerServiceCandidate["ports"][number],
   ) {
-    super(`${port.actualHostAddress}:${port.actualHostPort}`, vscode.TreeItemCollapsibleState.None);
+    super(formatComposePort(port), vscode.TreeItemCollapsibleState.None);
     this.id = `${candidate.id}:${port.actualHostAddress}:${port.actualHostPort}:${port.containerPort}`;
-    this.description = `container ${port.containerPort}${port.protocolName ? ` ${port.protocolName}` : ""}`;
+    this.description =
+      port.actualHostPort === port.logicalPort
+        ? `${port.protocolName ?? port.protocol}`
+        : `via ${port.actualHostAddress}:${port.actualHostPort}`;
     this.tooltip = buildContainerPortTooltip(candidate, port);
     this.iconPath = new vscode.ThemeIcon("plug");
   }
@@ -1019,8 +1022,11 @@ function buildComposeAttachmentTooltip(attachment: ComposeAttachment): vscode.Ma
 
   for (const port of attachment.ports) {
     tooltip.appendMarkdown(
-      `- ${escapeMarkdown(port.serviceName)}: \`${port.logicalPort} -> ${escapeMarkdown(port.actualHostAddress)}:${port.actualHostPort}\``,
+      `- ${escapeMarkdown(port.serviceName)}: \`${formatComposePort(port)}\``,
     );
+    if (port.actualHostPort !== port.logicalPort) {
+      tooltip.appendMarkdown(` transport \`${escapeMarkdown(port.actualHostAddress)}:${port.actualHostPort}\``);
+    }
     if (port.protocolName) {
       tooltip.appendMarkdown(` \`${escapeMarkdown(port.protocolName)}\``);
     }
@@ -1124,8 +1130,12 @@ function buildContainerServiceTooltip(candidate: ContainerServiceCandidate): vsc
 
   for (const port of candidate.ports) {
     tooltip.appendMarkdown(
-      `- ${escapeMarkdown(port.serviceName)}: \`${port.logicalPort} -> ${escapeMarkdown(port.actualHostAddress)}:${port.actualHostPort}\` container \`${port.containerPort}\`\n`,
+      `- ${escapeMarkdown(port.serviceName)}: \`${formatComposePort(port)}\``,
     );
+    if (port.actualHostPort !== port.logicalPort) {
+      tooltip.appendMarkdown(` transport \`${escapeMarkdown(port.actualHostAddress)}:${port.actualHostPort}\``);
+    }
+    tooltip.appendMarkdown("\n");
   }
 
   return tooltip;
@@ -1163,9 +1173,8 @@ function buildContainerPortTooltip(
   tooltip.appendMarkdown(`**Published Port**\n\n`);
   tooltip.appendMarkdown(`- Service: \`${escapeMarkdown(port.serviceName)}\`\n`);
   tooltip.appendMarkdown(`- Container: \`${escapeMarkdown(candidate.containerName)}\`\n`);
-  tooltip.appendMarkdown(`- Host: \`${escapeMarkdown(port.actualHostAddress)}:${port.actualHostPort}\`\n`);
-  tooltip.appendMarkdown(`- Container Port: \`${port.containerPort}\`\n`);
-  tooltip.appendMarkdown(`- Default Logical Port: \`${port.logicalPort}\`\n`);
+  tooltip.appendMarkdown(`- Logical Mapping: \`${formatComposePort(port)}\`\n`);
+  tooltip.appendMarkdown(`- Transport: \`${escapeMarkdown(port.actualHostAddress)}:${port.actualHostPort}\`\n`);
   tooltip.appendMarkdown(`- Protocol: \`${port.protocolName ?? port.protocol}\`\n`);
 
   return tooltip;
@@ -1210,10 +1219,10 @@ function buildHostAccessBindingTooltip(binding: HostAccessBinding): vscode.Markd
   return tooltip;
 }
 
-/** Formats one compose route as logical port to actual published endpoint. */
+/** Formats one compose endpoint as logical/public port to compose-internal port. */
 function formatComposePort(port: ComposeAttachment["ports"][number]): string {
   const protocol = port.protocolName === undefined ? "" : ` ${port.protocolName}`;
-  return `${port.logicalPort} -> ${port.actualHostPort}${protocol}`;
+  return `${port.logicalPort}:${port.containerPort}${protocol}`;
 }
 
 /** Labels compose services as project/service and raw containers by name. */

@@ -176,8 +176,7 @@ export class ComposePublishMutator {
     if (composeFiles.length === 0) {
       throw new Error("Compose attach needs the original compose files; generated Port Manager overrides cannot be used alone.");
     }
-    const inputPorts = input.ports.map(normalizeComposeNetworkPort);
-    const requestedServices = uniqueStrings(inputPorts.map((port) => port.serviceName));
+    const requestedServices = uniqueStrings(input.ports.map((port) => port.serviceName));
     const originalContext: ComposeCommandContext = {
       runtime: input.runtime,
       projectName: originalProjectName,
@@ -190,7 +189,7 @@ export class ComposePublishMutator {
     const overrideServices = mode === "clone" ? definedServices : services;
     const disabledOverrideServices =
       mode === "clone" ? definedServices.filter((service) => !services.includes(service)) : [];
-    const ports = inputPorts.filter((port) => services.includes(port.serviceName));
+    const ports = input.ports.filter((port) => services.includes(port.serviceName));
     const originalContainerList = await this.listComposeServiceContainers(input.runtime, originalProjectName, services);
     const originalContainers = originalContainerList.containers;
     const originalServiceMounts = await this.inspectServiceMounts(
@@ -716,10 +715,6 @@ function buildPortKey(port: ComposePublishedPort): string {
 
 function buildLogicalPortLabelKey(containerPort: number, protocol: string): string {
   return `newdlops.portmanager.logical-port.${containerPort}.${protocol}`;
-}
-
-function normalizeComposeNetworkPort(port: ComposePublishedPort): ComposePublishedPort {
-  return port.logicalPort === port.containerPort ? port : { ...port, logicalPort: port.containerPort };
 }
 
 function resolveHiddenPorts(

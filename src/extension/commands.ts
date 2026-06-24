@@ -147,6 +147,7 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.restartDaemon", () => this.restartDaemon());
     this.registerCommand(context, "portManager.stopDaemon", () => this.stopDaemon());
     this.registerCommand(context, "portManager.showDaemonStatus", () => this.showDaemonStatus());
+    this.registerCommand(context, "portManager.clearRoutingFiles", () => this.clearRoutingFiles());
     this.registerCommand(context, "portManager.startManagedProcess", () => this.startManagedProcess());
     this.registerCommand(context, "portManager.addExistingProcess", () => this.addExistingProcess());
     this.registerCommand(context, "portManager.refresh", () => this.refresh());
@@ -859,6 +860,29 @@ export class PortManagerCommandController implements DisposableLike {
     await vscode.window.showInformationMessage(
       `Daemon ${daemon.status}. PID: ${daemon.pid || "n/a"}. Listeners: ${daemon.listenerCount}. Routes: ${daemon.routeCount}.${version}${agentMainPath}${expectedAgentMainPath}${routeTablePath}${errorMessage}`,
       { modal: true },
+    );
+  }
+
+  /** Clears generated routing cache files and rehydrates durable compose routes. */
+  private async clearRoutingFiles(): Promise<void> {
+    const selection = await vscode.window.showWarningMessage(
+      "Clear Port Manager routing files? Current network, compose, container, and volume state is preserved, but attached terminals should be reattached if they still carry old environment variables.",
+      { modal: true },
+      "Clear Routing Files",
+    );
+
+    if (selection !== "Clear Routing Files") {
+      return;
+    }
+
+    const summary = await this.dependencies.networkService.clearRoutingFiles();
+    await this.dependencies.processService.refresh().catch(() => undefined);
+    this.dependencies.treeProvider.refresh();
+
+    const failureText =
+      summary.failedFileCount > 0 ? ` ${summary.failedFileCount} file(s) could not be removed.` : "";
+    await vscode.window.showInformationMessage(
+      `Cleared ${summary.removedFileCount} routing file(s) and restored ${summary.restoredComposeRouteCount} compose route(s).${failureText}`,
     );
   }
 
@@ -1927,8 +1951,14 @@ function inferProtocolName(port: number): string {
 }
 
 /** Formats one compose endpoint for Quick Pick details and notifications. */
-function formatComposePublishedPort(port: { readonly logicalPort: number; readonly actualHostAddress: string; readonly actualHostPort: number }): string {
-  return `${port.logicalPort} -> ${port.actualHostAddress}:${port.actualHostPort}`;
+function formatComposePublishedPort(port: {
+  readonly logicalPort: number;
+  readonly actualHostAddress: string;
+  readonly actualHostPort: number;
+  readonly containerPort: number;
+}): string {
+  const transport = port.actualHostPort === port.logicalPort ? "" : ` via ${port.actualHostAddress}:${port.actualHostPort}`;
+  return `${port.logicalPort}:${port.containerPort}${transport}`;
 }
 
 interface AttachTerminalCommandInput {
@@ -2286,17 +2316,24 @@ if [ -n "\${BASH_ENV:-}" ] && [ "\${BASH_ENV}" != "${escapedShellEnvRestorePath}
 fi
 export BASH_ENV="${escapedShellEnvRestorePath}"` : ""}
 
-if [ -z "$\{PORT_MANAGER_HOOK_DAEMON_STARTED:-}" ]; then
-  export PORT_MANAGER_HOOK_DAEMON_STARTED=1
-  ${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e 'const net=require("node:net");const fs=require("node:fs");const socketPath=process.argv[1];const socket=net.createConnection(socketPath);const timer=setTimeout(()=>{socket.destroy();try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);},500);socket.once("connect",()=>{clearTimeout(timer);socket.end();process.exit(0);});socket.once("error",()=>{clearTimeout(timer);try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);});' "$PORT_MANAGER_AGENT_SOCKET" >/dev/null 2>&1
-  if [ $? -ne 0 ]; then
-    if [ -x "$PORT_MANAGER_AGENT_EXECUTABLE" ]; then
-      ${daemonRuntimePrefix} nohup "$PORT_MANAGER_AGENT_EXECUTABLE" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" --agent-main "$PORT_MANAGER_AGENT_MAIN" >/tmp/newdlops-portmanager-agent.log 2>&1 &
-    else
-      ${daemonRuntimePrefix} nohup "${escapedNodeExecutablePath}" "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" >/tmp/newdlops-portmanager-agent.log 2>&1 &
-    fi
+__pm_agent_ready=0
+${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e 'const net=require("node:net");const fs=require("node:fs");const socketPath=process.argv[1];const socket=net.createConnection(socketPath);const timer=setTimeout(()=>{socket.destroy();try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);},300);socket.once("connect",()=>{clearTimeout(timer);socket.end();process.exit(0);});socket.once("error",()=>{clearTimeout(timer);try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);});' "$PORT_MANAGER_AGENT_SOCKET" >/dev/null 2>&1 && __pm_agent_ready=1
+if [ "$__pm_agent_ready" != "1" ]; then
+  if [ -x "$PORT_MANAGER_AGENT_EXECUTABLE" ]; then
+    ${daemonRuntimePrefix} nohup "$PORT_MANAGER_AGENT_EXECUTABLE" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" --agent-main "$PORT_MANAGER_AGENT_MAIN" >/tmp/newdlops-portmanager-agent.log 2>&1 &
+  else
+    ${daemonRuntimePrefix} nohup "${escapedNodeExecutablePath}" "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" >/tmp/newdlops-portmanager-agent.log 2>&1 &
   fi
+  __pm_agent_wait_count=0
+  while [ $__pm_agent_wait_count -lt 50 ]; do
+    ${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e 'const net=require("node:net");const fs=require("node:fs");const socketPath=process.argv[1];const socket=net.createConnection(socketPath);const timer=setTimeout(()=>{socket.destroy();try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);},300);socket.once("connect",()=>{clearTimeout(timer);socket.end();process.exit(0);});socket.once("error",()=>{clearTimeout(timer);try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);});' "$PORT_MANAGER_AGENT_SOCKET" >/dev/null 2>&1 && break
+    __pm_agent_wait_count=$((__pm_agent_wait_count + 1))
+    sleep 0.1
+  done
+  unset __pm_agent_wait_count
 fi
+unset __pm_agent_ready
+export PORT_MANAGER_HOOK_DAEMON_STARTED=1
 
 if [ -f "${escapedHookLibraryPath}" ]; then
   case "$(uname -s)" in
