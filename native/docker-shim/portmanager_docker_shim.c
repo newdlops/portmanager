@@ -1693,7 +1693,7 @@ static char **pm_copy_runtime_args(const char *real_runtime_path, int argc, char
 static int pm_runtime_command_may_reference_container(int argc, char **argv, int command_index) {
   const char *command;
   const char *container_commands =
-    "|attach|commit|cp|diff|exec|export|inspect|kill|logs|pause|port|rename|restart|rm|start|stats|stop|top|unpause|update|wait|";
+    "|attach|commit|cp|diff|exec|export|inspect|kill|logs|pause|port|ps|rename|restart|rm|start|stats|stop|top|unpause|update|wait|";
   char lookup[64];
 
   if (command_index < 0 || command_index >= argc) {
@@ -1713,6 +1713,50 @@ static int pm_runtime_command_may_reference_container(int argc, char **argv, int
 
   snprintf(lookup, sizeof(lookup), "|%s|", command);
   return strstr(container_commands, lookup) != NULL;
+}
+
+static int pm_runtime_command_uses_container_name_filters(int argc, char **argv, int command_index) {
+  const char *command;
+
+  if (command_index < 0 || command_index >= argc) {
+    return 0;
+  }
+
+  command = argv[command_index];
+  if (strcmp(command, "ps") == 0) {
+    return 1;
+  }
+
+  if (strcmp(command, "container") != 0) {
+    return 0;
+  }
+
+  for (int index = command_index + 1; index < argc; index++) {
+    if (argv[index][0] == '-') {
+      continue;
+    }
+
+    return strcmp(argv[index], "ls") == 0 || strcmp(argv[index], "list") == 0 || strcmp(argv[index], "ps") == 0;
+  }
+
+  return 0;
+}
+
+/** Docker allows combined short options like `-qf name=...`; `f` still consumes the next argv. */
+static int pm_is_container_name_filter_option(const char *arg) {
+  if (arg == NULL) {
+    return 0;
+  }
+
+  if (strcmp(arg, "--filter") == 0 || strcmp(arg, "-f") == 0) {
+    return 1;
+  }
+
+  if (arg[0] != '-' || arg[1] == '-' || strchr(arg, '=') != NULL) {
+    return 0;
+  }
+
+  return strchr(arg + 1, 'f') != NULL;
 }
 
 /** Prefix comparison supports Docker's short container hash input. */
@@ -2244,9 +2288,131 @@ static char *pm_container_target_for_token(
   return pm_container_target_from_route_table(runtime, real_runtime_path, token_copy, suffix);
 }
 
+static char *pm_rewrite_container_name_filter_value(
+  const char *runtime,
+  const char *real_runtime_path,
+  const char *filter,
+  int argc,
+  char **argv
+) {
+  const char *token;
+  char token_buffer[PM_MAX_FIELD];
+  const char *filter_prefix = "";
+  const char *filter_suffix = "";
+  size_t token_length;
+  char *target;
+  size_t prefix_length = strlen("name=");
+  size_t filter_prefix_length;
+  size_t filter_suffix_length;
+  size_t target_length;
+  char *rewritten;
+
+  if (filter == NULL || strncmp(filter, "name=", prefix_length) != 0) {
+    return NULL;
+  }
+
+  token = filter + prefix_length;
+  if (token[0] == '\0') {
+    return NULL;
+  }
+
+  /*
+   * Docker name filters are often exact-match regexes such as ^/captain_db$.
+   * Route lookup uses the logical container token, then restores the caller's
+   * anchoring so Docker still evaluates the filter with the same strictness.
+   */
+  if (token[0] == '^' && token[1] == '/') {
+    filter_prefix = "^/";
+    token += 2;
+  } else if (token[0] == '^') {
+    filter_prefix = "^";
+    token++;
+  } else if (token[0] == '/') {
+    filter_prefix = "/";
+    token++;
+  }
+
+  token_length = strlen(token);
+  if (token_length > 0 && token[token_length - 1] == '$') {
+    filter_suffix = "$";
+    token_length--;
+  }
+
+  if (token_length == 0 || token_length >= sizeof(token_buffer)) {
+    return NULL;
+  }
+
+  memcpy(token_buffer, token, token_length);
+  token_buffer[token_length] = '\0';
+
+  target = pm_container_target_for_token(runtime, real_runtime_path, token_buffer, argc, argv);
+  if (target == NULL) {
+    return NULL;
+  }
+
+  filter_prefix_length = strlen(filter_prefix);
+  filter_suffix_length = strlen(filter_suffix);
+  target_length = strlen(target);
+  rewritten = malloc(prefix_length + filter_prefix_length + target_length + filter_suffix_length + 1);
+  if (rewritten == NULL) {
+    free(target);
+    return NULL;
+  }
+
+  memcpy(rewritten, "name=", prefix_length);
+  memcpy(rewritten + prefix_length, filter_prefix, filter_prefix_length);
+  memcpy(rewritten + prefix_length + filter_prefix_length, target, target_length);
+  memcpy(rewritten + prefix_length + filter_prefix_length + target_length, filter_suffix, filter_suffix_length + 1);
+  free(target);
+  return rewritten;
+}
+
+static char *pm_rewrite_inline_container_name_filter(
+  const char *runtime,
+  const char *real_runtime_path,
+  const char *arg,
+  const char *prefix,
+  int argc,
+  char **argv
+) {
+  size_t prefix_length;
+  char *filter;
+  char *rewritten_filter;
+  char *rewritten_arg;
+
+  if (arg == NULL || prefix == NULL) {
+    return NULL;
+  }
+
+  prefix_length = strlen(prefix);
+  if (strncmp(arg, prefix, prefix_length) != 0) {
+    return NULL;
+  }
+
+  filter = pm_rewrite_container_name_filter_value(runtime, real_runtime_path, arg + prefix_length, argc, argv);
+  if (filter == NULL) {
+    return NULL;
+  }
+
+  rewritten_filter = filter;
+  rewritten_arg = malloc(prefix_length + strlen(rewritten_filter) + 1);
+  if (rewritten_arg == NULL) {
+    free(rewritten_filter);
+    return NULL;
+  }
+
+  memcpy(rewritten_arg, prefix, prefix_length);
+  strcpy(rewritten_arg + prefix_length, rewritten_filter);
+  free(rewritten_filter);
+  return rewritten_arg;
+}
+
 /** Creates argv for execv, rewriting only tokens that uniquely identify cloned containers. */
 static char **pm_rewrite_container_args(const char *runtime, const char *real_runtime_path, int argc, char **argv) {
   char **next_argv = calloc((size_t)argc + 1, sizeof(char *));
+  int command_index = pm_first_command_index(argc, argv);
+  int rewrite_name_filters = pm_runtime_command_uses_container_name_filters(argc, argv, command_index);
+  int rewrite_next_filter = 0;
 
   if (next_argv == NULL) {
     return NULL;
@@ -2254,7 +2420,32 @@ static char **pm_rewrite_container_args(const char *runtime, const char *real_ru
 
   next_argv[0] = (char *)real_runtime_path;
   for (int index = 1; index < argc; index++) {
-    char *target = pm_container_target_for_token(runtime, real_runtime_path, argv[index], argc, argv);
+    char *target = NULL;
+
+    if (rewrite_next_filter) {
+      rewrite_next_filter = 0;
+      target = pm_rewrite_container_name_filter_value(runtime, real_runtime_path, argv[index], argc, argv);
+      next_argv[index] = target == NULL ? argv[index] : target;
+      continue;
+    }
+
+    if (rewrite_name_filters && pm_is_container_name_filter_option(argv[index])) {
+      rewrite_next_filter = 1;
+      next_argv[index] = argv[index];
+      continue;
+    }
+
+    if (rewrite_name_filters) {
+      target = pm_rewrite_inline_container_name_filter(runtime, real_runtime_path, argv[index], "--filter=", argc, argv);
+      if (target == NULL) {
+        target = pm_rewrite_inline_container_name_filter(runtime, real_runtime_path, argv[index], "-f=", argc, argv);
+      }
+    }
+
+    if (target == NULL) {
+      target = pm_container_target_for_token(runtime, real_runtime_path, argv[index], argc, argv);
+    }
+
     next_argv[index] = target == NULL ? argv[index] : target;
   }
   next_argv[argc] = NULL;

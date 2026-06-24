@@ -810,11 +810,17 @@ __port_manager_runtime_command_may_reference_container() {
   __pm_first_command="$(__port_manager_runtime_first_command "$@")"
 
   case "\${__pm_first_command}" in
+    ps)
+      return 0
+      ;;
     attach|commit|cp|diff|exec|export|inspect|kill|logs|pause|port|rename|restart|rm|start|stats|stop|top|unpause|update|wait)
       return 0
       ;;
     container)
       case "$(__port_manager_runtime_container_subcommand "$@")" in
+        ls|list|ps)
+          return 0
+          ;;
         attach|commit|cp|diff|exec|export|inspect|kill|logs|pause|port|rename|restart|rm|start|stats|stop|top|unpause|update|wait)
           return 0
           ;;
@@ -825,16 +831,128 @@ __port_manager_runtime_command_may_reference_container() {
   return 1
 }
 
+__port_manager_runtime_command_uses_container_name_filters() {
+  __pm_first_command="$(__port_manager_runtime_first_command "$@")"
+
+  case "\${__pm_first_command}" in
+    ps)
+      return 0
+      ;;
+    container)
+      case "$(__port_manager_runtime_container_subcommand "$@")" in
+        ls|list|ps)
+          return 0
+          ;;
+      esac
+      ;;
+  esac
+
+  return 1
+}
+
+__port_manager_rewrite_container_name_filter() {
+  __pm_runtime="$1"
+  __pm_filter="$2"
+  shift 2
+
+  case "\${__pm_filter}" in
+    name=*)
+      __pm_filter_token="\${__pm_filter#name=}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  __pm_filter_prefix=""
+  __pm_filter_suffix=""
+  case "\${__pm_filter_token}" in
+    ^/*)
+      __pm_filter_prefix="^/"
+      __pm_filter_token="\${__pm_filter_token#^/}"
+      ;;
+    ^*)
+      __pm_filter_prefix="^"
+      __pm_filter_token="\${__pm_filter_token#^}"
+      ;;
+    /*)
+      __pm_filter_prefix="/"
+      __pm_filter_token="\${__pm_filter_token#/}"
+      ;;
+  esac
+  case "\${__pm_filter_token}" in
+    *'$')
+      __pm_filter_suffix="$"
+      __pm_filter_token="\${__pm_filter_token%$}"
+      ;;
+  esac
+
+  __pm_filter_mapped="$(__port_manager_container_target_for_runtime "\${__pm_runtime}" "\${__pm_filter_token}" "$@")"
+  if [ -z "\${__pm_filter_mapped}" ]; then
+    return 1
+  fi
+
+  printf 'name=%s%s%s\\n' "\${__pm_filter_prefix}" "\${__pm_filter_mapped}" "\${__pm_filter_suffix}"
+  return 0
+}
+
 __port_manager_run_runtime_with_container_routing() {
   __pm_runtime="$1"
   shift
   __pm_args=""
+  __pm_filter_next=0
+  __pm_rewrite_name_filters=0
+
+  if __port_manager_runtime_command_uses_container_name_filters "$@"; then
+    __pm_rewrite_name_filters=1
+  fi
 
   for __pm_arg in "$@"; do
-    __pm_mapped="$(__port_manager_container_target_for_runtime "\${__pm_runtime}" "\${__pm_arg}" "$@")"
-    if [ -n "\${__pm_mapped}" ]; then
-      __pm_arg="\${__pm_mapped}"
+    if [ "\${__pm_filter_next}" = "1" ]; then
+      __pm_filter_next=0
+      __pm_mapped="$(__port_manager_rewrite_container_name_filter "\${__pm_runtime}" "\${__pm_arg}" "$@")"
+      if [ -n "\${__pm_mapped}" ]; then
+        __pm_arg="\${__pm_mapped}"
+      fi
+      __pm_args="\${__pm_args} $(__port_manager_shell_quote "\${__pm_arg}")"
+      continue
     fi
+
+    if [ "\${__pm_rewrite_name_filters}" = "1" ]; then
+      case "\${__pm_arg}" in
+        --filter|-f|-*f)
+          __pm_filter_next=1
+          __pm_args="\${__pm_args} $(__port_manager_shell_quote "\${__pm_arg}")"
+          continue
+          ;;
+        --filter=name=*)
+          __pm_filter_value="name=\${__pm_arg#--filter=name=}"
+          __pm_mapped="$(__port_manager_rewrite_container_name_filter "\${__pm_runtime}" "\${__pm_filter_value}" "$@")"
+          if [ -n "\${__pm_mapped}" ]; then
+            __pm_arg="--filter=\${__pm_mapped}"
+          fi
+          ;;
+        -f=name=*)
+          __pm_filter_value="name=\${__pm_arg#-f=name=}"
+          __pm_mapped="$(__port_manager_rewrite_container_name_filter "\${__pm_runtime}" "\${__pm_filter_value}" "$@")"
+          if [ -n "\${__pm_mapped}" ]; then
+            __pm_arg="-f=\${__pm_mapped}"
+          fi
+          ;;
+        *)
+          __pm_mapped="$(__port_manager_container_target_for_runtime "\${__pm_runtime}" "\${__pm_arg}" "$@")"
+          if [ -n "\${__pm_mapped}" ]; then
+            __pm_arg="\${__pm_mapped}"
+          fi
+          ;;
+      esac
+    else
+      __pm_mapped="$(__port_manager_container_target_for_runtime "\${__pm_runtime}" "\${__pm_arg}" "$@")"
+      if [ -n "\${__pm_mapped}" ]; then
+        __pm_arg="\${__pm_mapped}"
+      fi
+    fi
+
     __pm_args="\${__pm_args} $(__port_manager_shell_quote "\${__pm_arg}")"
   done
 
