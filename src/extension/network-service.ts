@@ -189,7 +189,7 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Local TCP proxy runtime used for concrete host exposure support. */
   private readonly proxyManager: HostPortProxyManager;
 
-  /** Localhost logical-port router used for app-agnostic internal calls. */
+  /** Legacy localhost listener router kept only so active listeners can be closed. */
   private readonly logicalPortRouter: LogicalPortRouterManager;
 
   /** Resolves accepted TCP connection tuples back to client PIDs. */
@@ -1749,23 +1749,17 @@ export class PortManagerNetworkService implements DisposableLike {
     };
   }
 
-  /** Opens localhost routers for every active logical route currently known. */
+  /** Keeps the legacy localhost listener router closed. */
   private async syncLogicalPortRouters(): Promise<void> {
-    if (this.processService === undefined) {
-      return;
-    }
-
-    const logicalPorts = this.processService
-      .getSnapshot()
-      .routes.filter(
-        (route) =>
-          route.actualPort !== route.logicalPort &&
-          isListenRoute(route) &&
-          (route.status === "running" || route.status === "starting"),
-      )
-      .map((route) => route.logicalPort);
-
-    await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);
+    /*
+     * Port Manager must not occupy application-requested ports with a daemon or
+     * router process. Native hooks rewrite bind/connect to the selected actual
+     * ports; opening localhost listeners here races with app startup and can
+     * leave portmanager_tcp_router holding the requested port after a failed
+     * bind. Syncing an empty set also closes listeners created by older code in
+     * this extension host.
+     */
+    await this.logicalPortRouter.sync([]).catch(() => undefined);
   }
 
   /**
@@ -1796,8 +1790,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const candidates = snapshot.routes.filter(
       (route) =>
         route.logicalPort === logicalPort &&
-        isListenRoute(route) &&
-        (route.status === "running" || route.status === "starting"),
+        isLiveListenRoute(route),
     );
     const exactRoute = candidates.find((route) => route.networkId === networkId);
 
@@ -1836,8 +1829,7 @@ export class PortManagerNetworkService implements DisposableLike {
       (route) =>
         route.logicalPort === logicalPort &&
         route.actualPort !== route.logicalPort &&
-        isListenRoute(route) &&
-        (route.status === "running" || route.status === "starting"),
+        isLiveListenRoute(route),
     );
 
     /*
@@ -2934,12 +2926,22 @@ function findMatchingRoute(
     (route) =>
       route.networkId === networkId &&
       route.logicalPort === logicalPort &&
-      isListenRoute(route) &&
-      (route.status === "running" || route.status === "starting"),
+      isLiveListenRoute(route),
   );
 }
 
-/** Sender reservations are not live targets for host exposure or logical routers. */
+/**
+ * Only registered listeners are live routing targets.
+ *
+ * Pending native allocations are published as `starting` before the process has
+ * actually completed bind/register. Opening a logical router for that state can
+ * keep the requested port occupied after the real listener fails to start.
+ */
+function isLiveListenRoute(route: LogicalPortRoute): boolean {
+  return isListenRoute(route) && route.status === "running";
+}
+
+/** Sender reservations are not targets for host exposure or logical routers. */
 function isListenRoute(route: LogicalPortRoute): boolean {
   return route.routeDirection === undefined || route.routeDirection === "listen";
 }
@@ -3337,11 +3339,30 @@ function shellPrependLibrary(name: string, libraryPath: string): string {
 function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
   const nodeRuntimePrefix = `${ELECTRON_RUN_AS_NODE}=1`;
   const daemonRuntimePrefix = `PORT_MANAGER_HOOK_DISABLED=1 PORT_MANAGER_HOOK=0 DYLD_INSERT_LIBRARIES= LD_PRELOAD= ${nodeRuntimePrefix}`;
-  const nodeProbeScript =
-    'const net=require("node:net");const fs=require("node:fs");const socketPath=process.argv[1];const socket=net.createConnection(socketPath);const timer=setTimeout(()=>{socket.destroy();try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);},300);socket.once("connect",()=>{clearTimeout(timer);socket.end();process.exit(0);});socket.once("error",()=>{clearTimeout(timer);try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}process.exit(1);});';
+  const nodeProbeScript = [
+    'const net=require("node:net");',
+    'const fs=require("node:fs");',
+    'const path=require("node:path");',
+    'const socketPath=process.argv[1];',
+    'const expected=process.argv[2];',
+    'function removeSocket(){try{if(process.platform!=="win32")fs.unlinkSync(socketPath);}catch{}}',
+    'function normalize(value){if(!value)return "";try{return fs.realpathSync.native(value);}catch{return path.resolve(value);}}',
+    'function isOlder(startedAt,file){const started=Date.parse(startedAt||"");if(!Number.isFinite(started))return false;try{return started+1000<fs.statSync(file).mtimeMs;}catch{return false;}}',
+    'let timer;',
+    'let done=false;',
+    'const socket=net.createConnection(socketPath);',
+    'function finish(code,remove){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.destroy();}catch{}if(remove)removeSocket();process.exit(code);}',
+    'function shutdownStale(){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.end(JSON.stringify({id:"probe-shutdown",method:"shutdownDaemon"})+"\\n");}catch{}setTimeout(()=>process.exit(2),75);}',
+    'let buffer="";',
+    'timer=setTimeout(()=>finish(1,true),700);',
+    'socket.setEncoding("utf8");',
+    'socket.once("connect",()=>{socket.write(JSON.stringify({id:"probe",method:"listSnapshot"})+"\\n");});',
+    'socket.once("error",()=>finish(1,true));',
+    'socket.on("data",(chunk)=>{buffer+=chunk;const lineEnd=buffer.indexOf("\\n");if(lineEnd<0)return;try{const message=JSON.parse(buffer.slice(0,lineEnd));const daemon=message&&message.payload&&message.payload.daemon;const actual=normalize(daemon&&daemon.agentMainPath);const expectedPath=normalize(expected);if(!actual||actual!==expectedPath||isOlder(daemon&&daemon.startedAt,expected)){shutdownStale();return;}finish(0,false);}catch{finish(1,true);}});',
+  ].join("");
   const probeCommand = `${daemonRuntimePrefix} ${shellQuote(nodeExecutablePath)} -e ${shellQuote(
     nodeProbeScript,
-  )} "$PORT_MANAGER_AGENT_SOCKET"`;
+  )} "$PORT_MANAGER_AGENT_SOCKET" "$PORT_MANAGER_AGENT_MAIN"`;
 
   return [
     `__pm_agent_ready=0`,

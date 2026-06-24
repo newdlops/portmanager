@@ -27,7 +27,7 @@ export function findRoutesMatchingClientCwd(
       (route.routeDirection === undefined || route.routeDirection === "listen") &&
       route.source !== "compose" &&
       route.cwd !== undefined &&
-      (route.status === "running" || route.status === "starting"),
+      route.status === "running",
   );
   const exactMatches = candidates.filter((route) => {
     const routeCwd = normalizeComparablePath(route.cwd);

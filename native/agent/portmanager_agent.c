@@ -475,6 +475,14 @@ int main(int argc, char **argv) {
   signal(SIGTERM, pm_handle_signal);
   signal(SIGINT, pm_handle_signal);
   signal(SIGHUP, pm_handle_signal);
+  /*
+   * Hook clients open a short-lived socket, read the response frame, and close
+   * before the daemon broadcasts the follow-up snapshot. Ignore SIGPIPE so a
+   * closed request socket becomes a normal EPIPE write failure instead of
+   * terminating the routing daemon and causing later bind hooks to return
+   * EAGAIN.
+   */
+  signal(SIGPIPE, SIG_IGN);
 
   if (pm_parse_arguments(argc, argv, &arguments) != 0) {
     return 1;

@@ -10,8 +10,7 @@
 - 플랫폼별 명령으로 점유 프로세스 후보 조회
 - 단일 로컬 agent가 사용할 전체 listening TCP 포트 목록 조회
 - Host Port Exposure를 위한 TCP listener/proxy 실행
-- Logical Network 내부 호출을 위한 localhost logical-port router 실행
-- 가능한 환경에서는 native TCP router helper로 logical router의 데이터 plane 실행
+- 기존 localhost logical-port router listener 정리
 - Accepted TCP connection tuple에서 client PID 조회
 - 포트 조회 실패를 도메인에서 다룰 수 있는 결과로 변환
 
@@ -27,7 +26,6 @@
 
 - `net`
 - `child_process`
-- `media/native/portmanager_tcp_router`
 - `media/native/portmanager_host_exposure_proxy`
 - 운영체제별 포트 조회 명령
 
@@ -35,4 +33,4 @@
 
 명령 실행 실패는 확장 전체 실패가 아니라 세부 정보 누락으로 처리한다.
 `host-port-proxy.ts`는 Host Port Exposure를 위한 listener/proxy만 담당한다. 가능한 환경에서는 native helper로 accept/connect/byte-copy 데이터 plane을 실행하고, helper가 없거나 시작에 실패하면 Node.js stream proxy로 fallback한다. 이 proxy는 컨테이너 수준의 Logical Network 격리를 제공하지 않으며, 터미널 프로세스가 호스트 포트 namespace를 점유하지 않게 만드는 책임을 갖지 않는다.
-`logical-port-router.ts`는 라우팅 정책 판단을 TypeScript에 남기고, 패키지된 native helper가 있으면 accept/connect/byte copy 데이터 plane만 위임한다. helper를 사용할 수 없는 환경에서는 기존 Node.js stream router로 fallback한다.
+`logical-port-router.ts`는 과거 localhost logical-port listener 구현이다. 현재 extension 서비스는 애플리케이션 요청 포트를 직접 점유하지 않도록 이 router를 열지 않고, 기존 extension host에서 이미 열린 listener를 닫는 용도로만 빈 sync를 호출한다.

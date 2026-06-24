@@ -117,6 +117,9 @@ export class LocalAgentClient implements PortManagerProcessService {
   async start(): Promise<void> {
     await this.ensureConnected();
     await this.refresh();
+    if (this.snapshot.daemon.restartRequired) {
+      await this.restartDaemon();
+    }
   }
 
   /** Stops the singleton local agent and resets the extension-side snapshot. */

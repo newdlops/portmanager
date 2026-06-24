@@ -144,6 +144,20 @@ test("does not select compose routes through cwd fallback", () => {
   assert.deepEqual(matches, []);
 });
 
+test("does not select pending starting routes through cwd fallback", () => {
+  const routes: LogicalPortRoute[] = [
+    {
+      ...route("payroll-network", 8004, 58465, "/Users/lky/project/fix-payroll"),
+      status: "starting",
+      source: "allocated",
+    },
+  ];
+
+  const matches = findRoutesMatchingClientCwd(routes, 8004, "/Users/lky/project/fix-payroll");
+
+  assert.deepEqual(matches, []);
+});
+
 test("builds process ancestry from PID, PPID, PGID, and TTY only", () => {
   const rows = parsePosixProcessTable(`
     10 1 10 ttys001
