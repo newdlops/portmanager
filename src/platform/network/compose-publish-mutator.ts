@@ -167,16 +167,39 @@ export class ComposePublishMutator {
     }
 
     const mode = input.mode ?? "clone";
-    const originalProjectName = assertNonEmptyString(input.originalProjectName, "Compose project name");
+    const requestedProjectName = assertNonEmptyString(input.originalProjectName, "Compose project name");
+    const resolvedComposeFiles = await this.resolveComposeFiles(input.workingDirectory, input.composeFiles ?? []);
+    const existingClone =
+      mode === "clone"
+        ? this.resolveExistingAttachedClone(input.networkName, requestedProjectName, resolvedComposeFiles)
+        : undefined;
+    const originalProjectName = existingClone?.originalProjectName ?? requestedProjectName;
     const attachedProjectName =
-      mode === "clone" ? buildAttachedProjectName(input.networkName, originalProjectName) : originalProjectName;
-    const composeFiles = this.removeGeneratedOverrideFiles(
-      await this.resolveComposeFiles(input.workingDirectory, input.composeFiles ?? []),
-    );
+      existingClone?.attachedProjectName ??
+      (mode === "clone" ? buildAttachedProjectName(input.networkName, originalProjectName) : originalProjectName);
+    const composeFiles = this.removeGeneratedOverrideFiles(resolvedComposeFiles);
     if (composeFiles.length === 0) {
       throw new Error("Compose attach needs the original compose files; generated Port Manager overrides cannot be used alone.");
     }
     const requestedServices = uniqueStrings(input.ports.map((port) => port.serviceName));
+    if (existingClone !== undefined) {
+      return {
+        ports: input.ports.map(dropComposeProcessId),
+        state: {
+          mode: "clone",
+          runtime: input.runtime,
+          originalProjectName,
+          attachedProjectName,
+          ...(input.workingDirectory !== undefined ? { workingDirectory: input.workingDirectory } : {}),
+          composeFiles,
+          services: requestedServices,
+          overrideFile: existingClone.overrideFile,
+          originalPorts: input.ports.map(toBestEffortOriginalPort),
+          hiddenPorts: input.ports.map(dropComposeProcessId),
+        },
+      };
+    }
+
     const originalContext: ComposeCommandContext = {
       runtime: input.runtime,
       projectName: originalProjectName,
@@ -377,13 +400,51 @@ export class ComposePublishMutator {
 
     return composeFiles.filter((file) => {
       const normalizedFile = normalizeComparablePath(file);
-      return (
-        normalizedFile === undefined ||
-        storageDirectory === undefined ||
-        path.dirname(normalizedFile) !== storageDirectory ||
-        !path.basename(normalizedFile).endsWith(".ports.override.yaml")
-      );
+      return !isGeneratedOverridePath(normalizedFile, storageDirectory);
     });
+  }
+
+  /**
+   * Treats a discovered Port Manager clone as an existing runtime target.
+   *
+   * A clone's Docker labels include the generated override file. If the clone is
+   * selected again, rebuilding its project name from that already-scoped name
+   * would stack `network-network-project-hash-hash`. Returning existing mutation
+   * state keeps repeated attach/copy flows idempotent and avoids touching Docker.
+   */
+  private resolveExistingAttachedClone(
+    networkName: string,
+    projectName: string,
+    composeFiles: readonly string[],
+  ):
+    | {
+        readonly originalProjectName: string;
+        readonly attachedProjectName: string;
+        readonly overrideFile: string;
+      }
+    | undefined {
+    const originalProjectName = parseAttachedProjectSourceName(networkName, projectName);
+    if (originalProjectName === undefined) {
+      return undefined;
+    }
+
+    const overrideFile = this.findGeneratedOverrideFile(composeFiles);
+    if (overrideFile === undefined) {
+      return undefined;
+    }
+
+    return {
+      originalProjectName,
+      attachedProjectName: buildAttachedProjectName(networkName, originalProjectName),
+      overrideFile,
+    };
+  }
+
+  /** Returns the Port Manager override carried by Docker compose labels, if any. */
+  private findGeneratedOverrideFile(composeFiles: readonly string[]): string | undefined {
+    const storageDirectory = normalizeComparablePath(this.storageDirectory);
+
+    return composeFiles.find((file) => isGeneratedOverridePath(normalizeComparablePath(file), storageDirectory));
   }
 
   /** Writes a Compose override whose only job is to replace published ports. */
@@ -860,6 +921,41 @@ function buildAttachedProjectName(networkName: string, originalProjectName: stri
   return `${prefix}-${hash}`;
 }
 
+function parseAttachedProjectSourceName(networkName: string, projectName: string): string | undefined {
+  const networkSegment = sanitizeComposeProjectSegment(networkName) ?? "network";
+  const projectSegment = sanitizeComposeProjectSegment(projectName);
+  if (projectSegment === undefined || !projectSegment.startsWith(`${networkSegment}-`)) {
+    return undefined;
+  }
+
+  const scopedName = projectSegment.slice(networkSegment.length + 1);
+  const hashMatch = /^(.*)-([a-f0-9]{8})$/.exec(scopedName);
+  if (hashMatch === null) {
+    return undefined;
+  }
+
+  const sourceProjectName = hashMatch[1] ?? "";
+  const currentHash = hashMatch[2] ?? "";
+  if (sourceProjectName.length === 0) {
+    return undefined;
+  }
+
+  const expectedHash = createHash("sha1").update(`${networkName}\0${sourceProjectName}`).digest("hex").slice(0, 8);
+  return currentHash === expectedHash ? sourceProjectName : undefined;
+}
+
+function dropComposeProcessId(port: ComposePublishedPort): ComposePublishedPort {
+  const { processId: _processId, ...rest } = port;
+  return rest;
+}
+
+function toBestEffortOriginalPort(port: ComposePublishedPort): ComposePublishedPort {
+  return {
+    ...dropComposeProcessId(port),
+    actualHostPort: port.logicalPort,
+  };
+}
+
 function appendServiceMount(lines: string[], mount: ComposeServiceMount): void {
   switch (mount.type) {
     case "volume":
@@ -1239,6 +1335,15 @@ function trimProjectName(value: string, maxLength: number): string {
 
 function trimContainerName(value: string, maxLength: number): string {
   return value.slice(0, maxLength).replace(/[_.-]+$/g, "") || "pm-container";
+}
+
+function isGeneratedOverridePath(normalizedFile: string | undefined, storageDirectory: string | undefined): boolean {
+  return (
+    normalizedFile !== undefined &&
+    storageDirectory !== undefined &&
+    path.dirname(normalizedFile) === storageDirectory &&
+    path.basename(normalizedFile).endsWith(".ports.override.yaml")
+  );
 }
 
 function quoteYamlString(value: string): string {

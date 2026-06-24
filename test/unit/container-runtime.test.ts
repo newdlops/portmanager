@@ -873,6 +873,52 @@ test("mutates compose services into a hidden network-scoped project", async (con
   assert.equal(calls[3]?.cwd, tempDir);
 });
 
+test("reattaches an existing compose clone without stacking the network-scoped project name", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-mutator-existing-clone-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const overrideFile = path.join(tempDir, "a-app-workspace-bc74e5f2.ports.override.yaml");
+  fs.writeFileSync(composeFile, "services:\n  postgres:\n    image: postgres:16\n", "utf8");
+  fs.writeFileSync(overrideFile, "services: {}\n", "utf8");
+  const calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (executable, args) => {
+      calls.push({ executable, args });
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    runtime: "docker",
+    networkName: "A app",
+    originalProjectName: "a-app-workspace-bc74e5f2",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile, overrideFile],
+    ports: [
+      {
+        serviceName: "postgres",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 57001,
+        containerPort: 5432,
+        protocol: "tcp",
+        protocolName: "postgresql",
+      },
+    ],
+  });
+
+  assert.deepEqual(calls, []);
+  assert.equal(result.state.originalProjectName, "workspace");
+  assert.equal(result.state.attachedProjectName, "a-app-workspace-bc74e5f2");
+  assert.equal(result.state.overrideFile, overrideFile);
+  assert.deepEqual(result.state.composeFiles, [composeFile]);
+  assert.deepEqual(result.state.services, ["postgres"]);
+  assert.equal(result.state.originalPorts[0]?.actualHostPort, 15432);
+  assert.equal(result.state.hiddenPorts[0]?.actualHostPort, 57001);
+  assert.equal(result.ports[0]?.actualHostPort, 57001);
+});
+
 test("mutates compose clone container names by replacing the compose project prefix", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-name-prefix-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
