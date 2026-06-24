@@ -862,6 +862,9 @@ export class PortManagerNetworkService implements DisposableLike {
     if (input.ports.length === 0) {
       throw new Error("At least one compose published port is required.");
     }
+    if (input.composeMutation !== undefined && input.existingMutation !== undefined) {
+      throw new Error("Compose attach cannot both mutate a project and reattach an existing clone.");
+    }
 
     const attachment: ComposeAttachment = {
       id: createId("compose"),
@@ -894,6 +897,16 @@ export class PortManagerNetworkService implements DisposableLike {
           ...attachment,
           composeFiles: mutation.composeFiles,
           ports: mutationResult.ports,
+          mutation,
+        };
+      }
+      if (input.existingMutation !== undefined) {
+        mutation = input.existingMutation;
+        registeredAttachment = {
+          ...attachment,
+          projectName: mutation.originalProjectName,
+          composeFiles: mutation.composeFiles,
+          ports: mutation.hiddenPorts,
           mutation,
         };
       }
@@ -2330,6 +2343,8 @@ export interface ComposePublishedPortsInput {
   readonly composeFiles?: readonly string[];
   /** Optional mutating flow that releases the original Docker-published ports. */
   readonly composeMutation?: ComposePublishMutationInput;
+  /** Existing hidden clone state recovered from Port Manager clone discovery. */
+  readonly existingMutation?: ComposePortMutationState;
   /** Published service endpoints to register into this logical network. */
   readonly ports: readonly ComposePublishedPortInput[];
 }

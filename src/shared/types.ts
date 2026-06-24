@@ -318,6 +318,27 @@ export interface ComposeVolumeMutationMapping {
 }
 
 /**
+ * Discovery metadata for a Port Manager-created hidden clone that is still
+ * running after a non-destructive detach. Reattaching such a candidate should
+ * restore clone routing state instead of treating the clone as a plain host
+ * compose project.
+ */
+export interface PortManagerCloneCandidateMetadata {
+  /** Compose project that was stopped when the hidden clone was first attached. */
+  readonly originalProjectName: string;
+  /** Running hidden compose project currently exposing random host ports. */
+  readonly attachedProjectName: string;
+  /** Original compose files without Port Manager's generated override. */
+  readonly composeFiles: readonly string[];
+  /** Generated override file used by the existing hidden clone. */
+  readonly overrideFile: string;
+  /** Best-effort original published endpoints recovered from runtime labels. */
+  readonly originalPorts?: readonly ComposePublishedPort[];
+  /** Container id/name rewrites from the original compose service to its clone. */
+  readonly containerMappings?: readonly ComposeContainerMutationMapping[];
+}
+
+/**
  * A compose project attached to a logical network through host-published
  * service ports. These routes shadow same-number host ports while active and
  * disappear when the compose attachment is removed.
@@ -369,6 +390,8 @@ export interface ContainerServiceCandidate {
   readonly composeWorkingDirectory?: string;
   /** Compose file labels needed to recreate the project during attach. */
   readonly composeConfigFiles?: readonly string[];
+  /** Metadata present when this candidate is a Port Manager hidden clone. */
+  readonly portManagerClone?: PortManagerCloneCandidateMetadata;
   /** Host-published TCP service ports that can become logical routes. */
   readonly ports: readonly ComposePublishedPort[];
 }

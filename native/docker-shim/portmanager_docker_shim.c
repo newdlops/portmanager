@@ -759,30 +759,41 @@ static int pm_visit_scoped_compose_routing_files(
   return 0;
 }
 
-/** Cwd matching mirrors the shell shim's lexical PWD check plus physical path fallback. */
+static int pm_path_contains_or_equals(const char *candidate, const char *root);
+
+/** Cwd matching accepts either side as the more-specific project directory. */
 static int pm_cwd_matches_workdir(const char *workdir) {
   const char *pwd = getenv("PWD");
   char cwd[PM_MAX_PATH];
   char physical_workdir[PM_MAX_PATH];
-  size_t workdir_length;
 
   if (workdir == NULL || workdir[0] == '\0') {
     return 0;
   }
 
-  workdir_length = strlen(workdir);
-  if (pwd != NULL && strncmp(pwd, workdir, workdir_length) == 0 &&
-      (pwd[workdir_length] == '\0' || pwd[workdir_length] == '/')) {
+  /*
+   * Container-level commands such as `docker cp captain_db:dump.gz` do not
+   * carry compose -f arguments. When a script runs from the repo root while
+   * the compose attachment was recorded at repo/docker, both paths still
+   * describe the same project context and must select the scoped route file.
+   */
+  if (pwd != NULL && (pm_path_contains_or_equals(pwd, workdir) || pm_path_contains_or_equals(workdir, pwd))) {
     return 1;
   }
 
-  if (getcwd(cwd, sizeof(cwd)) == NULL || realpath(workdir, physical_workdir) == NULL) {
+  if (getcwd(cwd, sizeof(cwd)) == NULL) {
     return 0;
   }
 
-  workdir_length = strlen(physical_workdir);
-  return strncmp(cwd, physical_workdir, workdir_length) == 0 &&
-         (cwd[workdir_length] == '\0' || cwd[workdir_length] == '/');
+  if (pm_path_contains_or_equals(cwd, workdir) || pm_path_contains_or_equals(workdir, cwd)) {
+    return 1;
+  }
+
+  if (realpath(workdir, physical_workdir) == NULL) {
+    return 0;
+  }
+
+  return pm_path_contains_or_equals(cwd, physical_workdir) || pm_path_contains_or_equals(physical_workdir, cwd);
 }
 
 static int pm_path_contains_or_equals(const char *candidate, const char *root) {

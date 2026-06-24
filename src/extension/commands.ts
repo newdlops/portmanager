@@ -5,6 +5,7 @@ import * as vscode from "vscode";
 import { getAgentSocketPath } from "../agent/agent-socket";
 import { getDefaultHostAccessBindingsPath, getDefaultRouteTablePath } from "../agent/route-table";
 import { readPortManagerSettings, openPortManagerSettings } from "../config/vscode-settings";
+import { buildExistingCloneMutationFromCandidate } from "../platform/network/container-service-discovery";
 import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
 import type { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import {
@@ -381,7 +382,9 @@ export class PortManagerCommandController implements DisposableLike {
 
     const composeAttachMode =
       directInput?.composeAttachMode ??
-      (candidate.composeProject === undefined ? "as-is" : await promptForComposeAttachMode(candidate));
+      (candidate.composeProject === undefined || candidate.portManagerClone !== undefined
+        ? "as-is"
+        : await promptForComposeAttachMode(candidate));
     if (composeAttachMode === undefined) {
       return;
     }
@@ -391,6 +394,8 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
+    const existingCloneMutation =
+      composeAttachMode === "as-is" ? buildExistingCloneMutationFromCandidate(candidate) : undefined;
     const composeMutation =
       candidate.composeProject !== undefined && composeAttachMode === "clone"
         ? {
@@ -406,10 +411,11 @@ export class PortManagerCommandController implements DisposableLike {
 
     const attachment = await this.dependencies.networkService.attachComposePublishedPorts({
       networkId: network.id,
-      projectName: candidate.composeProject ?? candidate.containerName,
+      projectName: existingCloneMutation?.originalProjectName ?? candidate.composeProject ?? candidate.containerName,
       cwd: candidate.composeWorkingDirectory ?? getDefaultWorkspaceFolder() ?? process.cwd(),
-      composeFiles: candidate.composeConfigFiles,
+      composeFiles: existingCloneMutation?.composeFiles ?? candidate.composeConfigFiles,
       ...composeMutation,
+      ...(existingCloneMutation !== undefined ? { existingMutation: existingCloneMutation } : {}),
       ports: candidate.ports.map((port) => ({
         serviceName: port.serviceName,
         logicalPort: port.logicalPort,
@@ -1665,6 +1671,8 @@ function resolveLatestContainerServiceCandidate(
     return undefined;
   }
 
+  const portManagerClone = mergePortManagerCloneMetadata(group);
+
   return {
     id: candidate.id,
     runtime: candidate.runtime,
@@ -1677,7 +1685,38 @@ function resolveLatestContainerServiceCandidate(
     ...(group.flatMap((item) => [...(item.composeConfigFiles ?? [])]).length > 0
       ? { composeConfigFiles: uniqueStrings(group.flatMap((item) => [...(item.composeConfigFiles ?? [])])) }
       : {}),
+    ...(portManagerClone !== undefined ? { portManagerClone } : {}),
     ports: group.flatMap((item) => [...item.ports]),
+  };
+}
+
+function mergePortManagerCloneMetadata(
+  candidates: readonly ContainerServiceCandidate[],
+): ContainerServiceCandidate["portManagerClone"] | undefined {
+  const metadata = candidates.map((candidate) => candidate.portManagerClone);
+  if (metadata.length === 0 || metadata.some((item) => item === undefined)) {
+    return undefined;
+  }
+
+  const first = metadata[0]!;
+  if (
+    metadata.some(
+      (item) =>
+        item!.originalProjectName !== first.originalProjectName ||
+        item!.attachedProjectName !== first.attachedProjectName ||
+        item!.overrideFile !== first.overrideFile,
+    )
+  ) {
+    return undefined;
+  }
+
+  return {
+    originalProjectName: first.originalProjectName,
+    attachedProjectName: first.attachedProjectName,
+    composeFiles: uniqueStrings(metadata.flatMap((item) => [...item!.composeFiles])),
+    overrideFile: first.overrideFile,
+    originalPorts: metadata.flatMap((item) => [...(item!.originalPorts ?? [])]),
+    containerMappings: metadata.flatMap((item) => [...(item!.containerMappings ?? [])]),
   };
 }
 

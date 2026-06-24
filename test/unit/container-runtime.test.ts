@@ -10,6 +10,7 @@ import {
 } from "../../src/platform/network/container-runtime";
 import { ComposePublishMutator } from "../../src/platform/network/compose-publish-mutator";
 import {
+  buildExistingCloneMutationFromCandidate,
   ContainerServiceDiscoveryAdapter,
   parseContainerRows,
 } from "../../src/platform/network/container-service-discovery";
@@ -218,6 +219,52 @@ test("recovers Port Manager clone logical ports from stopped original Docker Des
 
   assert.equal(candidates[0]?.ports[0]?.logicalPort, 15432);
   assert.equal(candidates[0]?.ports[0]?.actualHostPort, 61421);
+});
+
+test("recovers existing Port Manager clone metadata for non-destructive reattach", () => {
+  const cloneRow = {
+    ID: "clone123",
+    Names: "network-workspace-postgres-1",
+    Image: "postgres:16",
+    Status: "Up 2 minutes",
+    Ports: "127.0.0.1:61421->5432/tcp",
+    Labels:
+      "com.docker.compose.project=network-workspace,com.docker.compose.service=postgres,com.docker.compose.project.working_dir=/workspace,com.docker.compose.project.config_files=/workspace/compose.yaml,/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml,newdlops.portmanager.compose-clone-service=1,newdlops.portmanager.logical-port.5432.tcp=15432",
+  };
+  const originalRow = {
+    ID: "original123",
+    Names: "workspace-postgres-1",
+    Image: "postgres:16",
+    Status: "Exited (0)",
+    Ports: "",
+    Labels:
+      "com.docker.compose.project=workspace,com.docker.compose.service=postgres,com.docker.compose.project.working_dir=/workspace,com.docker.compose.project.config_files=/workspace/compose.yaml,desktop.docker.io/ports.scheme=v2,desktop.docker.io/ports/5432/tcp=:15432",
+  };
+
+  const candidates = parseContainerRows("docker", [cloneRow], [cloneRow, originalRow]);
+  const mutation = buildExistingCloneMutationFromCandidate(candidates[0]!);
+
+  assert.equal(candidates[0]?.portManagerClone?.originalProjectName, "workspace");
+  assert.equal(candidates[0]?.portManagerClone?.attachedProjectName, "network-workspace");
+  assert.deepEqual(candidates[0]?.portManagerClone?.composeFiles, ["/workspace/compose.yaml"]);
+  assert.deepEqual(candidates[0]?.portManagerClone?.containerMappings, [
+    {
+      serviceName: "postgres",
+      originalContainerId: "original123",
+      originalContainerName: "workspace-postgres-1",
+      attachedContainerId: "clone123",
+      attachedContainerName: "network-workspace-postgres-1",
+    },
+  ]);
+  assert.equal(mutation?.mode, "clone");
+  assert.equal(mutation?.originalProjectName, "workspace");
+  assert.equal(mutation?.attachedProjectName, "network-workspace");
+  assert.deepEqual(mutation?.composeFiles, ["/workspace/compose.yaml"]);
+  assert.equal(mutation?.overrideFile, "/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml");
+  assert.deepEqual(mutation?.services, ["postgres"]);
+  assert.equal(mutation?.hiddenPorts[0]?.logicalPort, 15432);
+  assert.equal(mutation?.hiddenPorts[0]?.actualHostPort, 61421);
+  assert.equal(mutation?.originalPorts[0]?.actualHostPort, 15432);
 });
 
 test("discovers published port candidates through the configured runtime", async () => {

@@ -2,10 +2,12 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type {
   ComposeContainerMutationMapping,
+  ComposePortMutationState,
   ComposePublishedPort,
   ContainerRuntimePreference,
   ContainerRuntimeSettings,
   ContainerServiceCandidate,
+  PortManagerCloneCandidateMetadata,
 } from "../../shared/types";
 import type { ContainerCommandResult, ContainerCommandRunner } from "./container-runtime";
 
@@ -225,6 +227,45 @@ interface ComposeContainerIdentity {
   readonly composeConfigFiles: readonly string[];
 }
 
+interface OriginalCloneSource {
+  readonly id: string;
+  readonly name: string;
+  readonly composeProject: string;
+  readonly composeService: string;
+  readonly composeConfigFiles: readonly string[];
+}
+
+/** Converts an already-running Port Manager clone candidate back into durable attach state. */
+export function buildExistingCloneMutationFromCandidate(
+  candidate: ContainerServiceCandidate,
+): ComposePortMutationState | undefined {
+  const clone = candidate.portManagerClone;
+  if (clone === undefined || candidate.ports.length === 0) {
+    return undefined;
+  }
+
+  const services = uniqueStrings(candidate.ports.map((port) => port.serviceName));
+  if (services.length === 0) {
+    return undefined;
+  }
+
+  return {
+    mode: "clone",
+    runtime: candidate.runtime,
+    originalProjectName: clone.originalProjectName,
+    attachedProjectName: clone.attachedProjectName,
+    ...(candidate.composeWorkingDirectory !== undefined ? { workingDirectory: candidate.composeWorkingDirectory } : {}),
+    composeFiles: clone.composeFiles,
+    services,
+    overrideFile: clone.overrideFile,
+    originalPorts: clone.originalPorts ?? candidate.ports.map(toBestEffortOriginalPort),
+    hiddenPorts: candidate.ports.map(dropComposeProcessId),
+    ...(clone.containerMappings !== undefined && clone.containerMappings.length > 0
+      ? { containerMappings: clone.containerMappings }
+      : {}),
+  };
+}
+
 /** Converts runtime JSON rows into attachable service candidates. */
 export function parseContainerRows(
   runtime: "docker" | "podman",
@@ -266,6 +307,15 @@ function toContainerServiceCandidate(
     findOriginalLogicalPortsForClone(context, composeConfigFiles, composeService),
   );
   const ports = parsePublishedPorts(row.Ports ?? "", serviceName, logicalPortOverrides);
+  const portManagerClone = buildPortManagerCloneCandidateMetadata(
+    context,
+    containerId,
+    containerName,
+    composeProject,
+    composeService,
+    composeConfigFiles,
+    ports,
+  );
 
   if (ports.length === 0) {
     return undefined;
@@ -282,6 +332,7 @@ function toContainerServiceCandidate(
     ...(composeService ? { composeService } : {}),
     ...(composeWorkingDirectory ? { composeWorkingDirectory } : {}),
     ...(composeConfigFiles.length > 0 ? { composeConfigFiles } : {}),
+    ...(portManagerClone !== undefined ? { portManagerClone } : {}),
     ports,
   };
 }
@@ -464,13 +515,18 @@ function parseLabels(value: string | undefined): ReadonlyMap<string, string> {
 
 interface PortRecoveryContext {
   readonly originalPortsByComposeContext: ReadonlyMap<string, ReadonlyMap<string, number>>;
+  readonly originalCloneSourcesByComposeContext: ReadonlyMap<string, readonly OriginalCloneSource[]>;
 }
 
 function buildPortRecoveryContext(rows: readonly RuntimeContainerRow[]): PortRecoveryContext {
   const portsByContext = new Map<string, Map<string, number | undefined>>();
+  const originalCloneSourcesByComposeContext = new Map<string, OriginalCloneSource[]>();
 
   for (const row of rows) {
+    const containerId = readFirstString(row.ID, row.Id);
+    const containerName = normalizeContainerName(readFirstString(row.Names, row.Name));
     const labels = parseLabels(row.Labels);
+    const composeProject = readLabel(labels, "com.docker.compose.project", "io.podman.compose.project");
     const composeService = readLabel(labels, "com.docker.compose.service", "io.podman.compose.service");
     const composeConfigFiles = parseComposeConfigFiles(
       readLabel(labels, "com.docker.compose.project.config_files", "io.podman.compose.project.config_files"),
@@ -481,6 +537,20 @@ function buildPortRecoveryContext(rows: readonly RuntimeContainerRow[]): PortRec
     }
 
     const contextKey = buildOriginalPortContextKey(composeConfigFiles, composeService);
+    if (composeProject !== undefined && containerId !== undefined && containerName !== undefined) {
+      const source: OriginalCloneSource = {
+        id: containerId,
+        name: containerName,
+        composeProject,
+        composeService,
+        composeConfigFiles,
+      };
+      const existingSources = originalCloneSourcesByComposeContext.get(contextKey) ?? [];
+      if (!existingSources.some((item) => sameOriginalCloneSource(item, source))) {
+        originalCloneSourcesByComposeContext.set(contextKey, [...existingSources, source]);
+      }
+    }
+
     const ports = portsByContext.get(contextKey) ?? new Map<string, number | undefined>();
     for (const [key, hostPort] of readDockerDesktopPublishedPortLabels(labels)) {
       if (!ports.has(key)) {
@@ -507,7 +577,7 @@ function buildPortRecoveryContext(rows: readonly RuntimeContainerRow[]): PortRec
     }
   }
 
-  return { originalPortsByComposeContext };
+  return { originalPortsByComposeContext, originalCloneSourcesByComposeContext };
 }
 
 function findOriginalLogicalPortsForClone(
@@ -525,6 +595,74 @@ function findOriginalLogicalPortsForClone(
   }
 
   return context.originalPortsByComposeContext.get(buildOriginalPortContextKey(originalConfigFiles, composeService)) ?? new Map();
+}
+
+function buildPortManagerCloneCandidateMetadata(
+  context: PortRecoveryContext,
+  containerId: string,
+  containerName: string,
+  composeProject: string | undefined,
+  composeService: string | undefined,
+  composeConfigFiles: readonly string[],
+  ports: readonly ComposePublishedPort[],
+): PortManagerCloneCandidateMetadata | undefined {
+  const overrideFile = findPortManagerOverrideFile(composeConfigFiles);
+  if (
+    composeProject === undefined ||
+    composeService === undefined ||
+    overrideFile === undefined ||
+    ports.length === 0
+  ) {
+    return undefined;
+  }
+
+  const sourceComposeFiles = composeConfigFiles.filter((file) => !isPortManagerOverrideFile(file));
+  const originalSource = findOriginalCloneSourceForClone(context, sourceComposeFiles, composeService);
+  if (sourceComposeFiles.length === 0 || originalSource === undefined) {
+    return undefined;
+  }
+
+  const originalPortOverrides =
+    context.originalPortsByComposeContext.get(buildOriginalPortContextKey(sourceComposeFiles, composeService)) ?? new Map();
+  const originalPorts = ports.map((port) => {
+    const originalHostPort = originalPortOverrides.get(buildPortOverrideKey(port.containerPort, port.protocol));
+    return {
+      ...port,
+      actualHostPort: originalHostPort ?? port.logicalPort,
+    };
+  });
+
+  return {
+    originalProjectName: originalSource.composeProject,
+    attachedProjectName: composeProject,
+    composeFiles: sourceComposeFiles,
+    overrideFile,
+    originalPorts,
+    containerMappings: [
+      {
+        serviceName: composeService,
+        originalContainerId: originalSource.id,
+        originalContainerName: originalSource.name,
+        attachedContainerId: containerId,
+        attachedContainerName: containerName,
+      },
+    ],
+  };
+}
+
+function findOriginalCloneSourceForClone(
+  context: PortRecoveryContext,
+  sourceComposeFiles: readonly string[],
+  composeService: string,
+): OriginalCloneSource | undefined {
+  const sources = context.originalCloneSourcesByComposeContext.get(
+    buildOriginalPortContextKey(sourceComposeFiles, composeService),
+  );
+  if (sources === undefined || sources.length !== 1) {
+    return undefined;
+  }
+
+  return sources[0];
 }
 
 function recoverPortsFromContext(
@@ -839,6 +977,10 @@ function hasPortManagerOverrideFile(composeConfigFiles: readonly string[]): bool
   return composeConfigFiles.some(isPortManagerOverrideFile);
 }
 
+function findPortManagerOverrideFile(composeConfigFiles: readonly string[]): string | undefined {
+  return composeConfigFiles.find(isPortManagerOverrideFile);
+}
+
 function isPortManagerOverrideFile(file: string): boolean {
   const normalized = file.replace(/\\/g, "/");
   return normalized.includes("/compose-overrides/") && normalized.endsWith(".ports.override.yaml");
@@ -848,8 +990,32 @@ function normalizeComposeFileKey(file: string): string {
   return file.trim().replace(/\\/g, "/");
 }
 
+function sameOriginalCloneSource(left: OriginalCloneSource, right: OriginalCloneSource): boolean {
+  return (
+    left.id === right.id &&
+    left.name === right.name &&
+    left.composeProject === right.composeProject &&
+    left.composeService === right.composeService &&
+    composeCandidateMatchesFiles(left.composeConfigFiles, right.composeConfigFiles) &&
+    composeCandidateMatchesFiles(right.composeConfigFiles, left.composeConfigFiles)
+  );
+}
+
 function buildPortOverrideKey(containerPort: number, protocol: string): string {
   return `${containerPort}/${protocol}`;
+}
+
+function dropComposeProcessId(port: ComposePublishedPort): ComposePublishedPort {
+  const { processId: _processId, ...rest } = port;
+  return rest;
+}
+
+function toBestEffortOriginalPort(port: ComposePublishedPort): ComposePublishedPort {
+  const { processId: _processId, ...rest } = port;
+  return {
+    ...rest,
+    actualHostPort: port.logicalPort,
+  };
 }
 
 function buildComposeEndpointKey(port: ComposePublishedPort): string {

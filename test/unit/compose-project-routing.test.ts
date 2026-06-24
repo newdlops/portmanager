@@ -425,6 +425,56 @@ test("docker wrapper resolves duplicate service names from the cwd scoped compos
   }
 });
 
+test("docker wrapper resolves container paths from a parent project cwd", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-container-parent-cwd-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const composeDir = path.join(projectDir, "docker");
+  const otherProjectDir = path.join(tempDir, "workspace", "other");
+  const otherComposeDir = path.join(otherProjectDir, "docker");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "compose-project-routing-network-a.tsv");
+
+  fs.mkdirSync(composeDir, { recursive: true });
+  fs.mkdirSync(otherComposeDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(routingFile, "", "utf8");
+  fs.writeFileSync(
+    path.join(tempDir, "compose-project-routing-network-a.compose-app.tsv"),
+    createCaptainDbRoutingRows(composeDir, "pm-captain_db-network-a-app"),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(tempDir, "compose-project-routing-network-a.compose-other.tsv"),
+    createCaptainDbRoutingRows(otherComposeDir, "pm-captain_db-network-a-other"),
+    "utf8",
+  );
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker cp ./db-snapshot/dump.gz captain_db:dump.gz",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output, "<cp>\n<./db-snapshot/dump.gz>\n<pm-captain_db-network-a-app:dump.gz>\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("docker compose wrapper infers network from scoped route file when network env is missing", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-scoped-route-file-"));
   const projectDir = path.join(tempDir, "workspace", "app");
@@ -1872,6 +1922,67 @@ test(
 );
 
 test(
+  "native docker PATH shim resolves container paths from a parent project cwd",
+  { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
+  () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-container-parent-cwd-"));
+    const projectDir = path.join(tempDir, "workspace", "app");
+    const composeDir = path.join(projectDir, "docker");
+    const otherProjectDir = path.join(tempDir, "workspace", "other");
+    const otherComposeDir = path.join(otherProjectDir, "docker");
+    const shimDir = path.join(tempDir, "shim");
+    const realBinDir = path.join(tempDir, "real-bin");
+    const routingFile = path.join(tempDir, "compose-project-routing-network-a.tsv");
+
+    fs.mkdirSync(composeDir, { recursive: true });
+    fs.mkdirSync(otherComposeDir, { recursive: true });
+    fs.mkdirSync(shimDir, { recursive: true });
+    fs.mkdirSync(realBinDir, { recursive: true });
+    fs.writeFileSync(routingFile, "", "utf8");
+    fs.writeFileSync(
+      path.join(tempDir, "compose-project-routing-network-a.compose-app.tsv"),
+      createCaptainDbRoutingRows(composeDir, "pm-captain_db-network-a-app"),
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(tempDir, "compose-project-routing-network-a.compose-other.tsv"),
+      createCaptainDbRoutingRows(otherComposeDir, "pm-captain_db-network-a-other"),
+      "utf8",
+    );
+    fs.symlinkSync(getNativeDockerShimPath(), path.join(shimDir, "docker"));
+    fs.writeFileSync(
+      path.join(realBinDir, "docker"),
+      "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n",
+      {
+        encoding: "utf8",
+        mode: 0o700,
+      },
+    );
+
+    try {
+      const output = execFileSync("docker", ["cp", "./db-snapshot/dump.gz", "captain_db:dump.gz"], {
+        cwd: projectDir,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${shimDir}${path.delimiter}${realBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          PORT_MANAGER_RUNTIME_SHIM_DIR: shimDir,
+          PORT_MANAGER_COMPOSE_ROUTING_FILE: routingFile,
+          PORT_MANAGER_NETWORK_ID: "network-a",
+          PORT_MANAGER_BORROWED_NETWORK_ID: "",
+          NEWDLOPS_PM_NETWORK_ID: "",
+          NEWDLOPS_PM_BORROWED_NETWORK_ID: "",
+        },
+      });
+
+      assert.equal(output, "<cp>\n<./db-snapshot/dump.gz>\n<pm-captain_db-network-a-app:dump.gz>\n");
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   "native docker PATH shim detaches routed clone up commands",
   { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
   () => {
@@ -2333,6 +2444,26 @@ function createContainerRoutingRows(projectDir: string): string {
           originalContainerName: "workspace-postgres-1",
           attachedContainerId: "def9876543210000",
           attachedContainerName: "network-a-app-postgres-1",
+        },
+      ],
+    },
+  ]);
+}
+
+function createCaptainDbRoutingRows(workingDirectory: string, attachedContainerName: string): string {
+  return serializeComposeProjectRoutingRows([
+    {
+      networkId: "network-a",
+      runtime: "docker",
+      workingDirectory,
+      attachedProjectName: attachedContainerName.replace(/^pm-captain_db-/, ""),
+      containerMappings: [
+        {
+          serviceName: "db",
+          originalContainerId: "originalcaptain0001",
+          originalContainerName: "captain_db",
+          attachedContainerId: "attachedcaptain0001",
+          attachedContainerName,
         },
       ],
     },

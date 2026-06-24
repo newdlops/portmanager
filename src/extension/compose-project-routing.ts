@@ -536,6 +536,13 @@ __port_manager_cwd_matches_workdir() {
     "\${__pm_match_workdir}/"|"\${__pm_match_workdir}/"*)
       return 0
       ;;
+    *)
+      case "\${__pm_match_workdir}/" in
+        "\${PWD}/"|"\${PWD}/"*)
+          return 0
+          ;;
+      esac
+      ;;
   esac
 
   __pm_match_pwd_physical="$(pwd -P 2>/dev/null || pwd)"
@@ -544,6 +551,13 @@ __port_manager_cwd_matches_workdir() {
     case "\${__pm_match_pwd_physical}/" in
       "\${__pm_match_workdir_physical}/"|"\${__pm_match_workdir_physical}/"*)
         return 0
+        ;;
+      *)
+        case "\${__pm_match_workdir_physical}/" in
+          "\${__pm_match_pwd_physical}/"|"\${__pm_match_pwd_physical}/"*)
+            return 0
+            ;;
+        esac
         ;;
     esac
   fi

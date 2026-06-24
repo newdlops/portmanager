@@ -505,6 +505,7 @@ export class ComposeProjectCandidateTreeItem extends vscode.TreeItem {
     readonly candidates: readonly ContainerServiceCandidate[],
   ) {
     const ports = candidates.flatMap((candidate) => [...candidate.ports]);
+    const portManagerClone = mergePortManagerCloneMetadata(candidates);
 
     super(projectName, vscode.TreeItemCollapsibleState.Collapsed);
     this.aggregateCandidate = {
@@ -524,6 +525,7 @@ export class ComposeProjectCandidateTreeItem extends vscode.TreeItem {
       ...(candidates.flatMap((candidate) => [...(candidate.composeConfigFiles ?? [])]).length > 0
         ? { composeConfigFiles: uniqueStrings(candidates.flatMap((candidate) => [...(candidate.composeConfigFiles ?? [])])) }
         : {}),
+      ...(portManagerClone !== undefined ? { portManagerClone } : {}),
       ports,
     };
     this.id = this.aggregateCandidate.id;
@@ -1269,6 +1271,36 @@ function buildComposeProjectCandidateId(
   composeConfigFiles: readonly string[] = [],
 ): string {
   return `compose-project:${runtime}:${projectName}:${workingDirectory ?? ""}:${composeConfigFiles.join("|")}`;
+}
+
+function mergePortManagerCloneMetadata(
+  candidates: readonly ContainerServiceCandidate[],
+): ContainerServiceCandidate["portManagerClone"] | undefined {
+  const metadata = candidates.map((candidate) => candidate.portManagerClone);
+  if (metadata.length === 0 || metadata.some((item) => item === undefined)) {
+    return undefined;
+  }
+
+  const first = metadata[0]!;
+  if (
+    metadata.some(
+      (item) =>
+        item!.originalProjectName !== first.originalProjectName ||
+        item!.attachedProjectName !== first.attachedProjectName ||
+        item!.overrideFile !== first.overrideFile,
+    )
+  ) {
+    return undefined;
+  }
+
+  return {
+    originalProjectName: first.originalProjectName,
+    attachedProjectName: first.attachedProjectName,
+    composeFiles: uniqueStrings(metadata.flatMap((item) => [...item!.composeFiles])),
+    overrideFile: first.overrideFile,
+    originalPorts: metadata.flatMap((item) => [...(item!.originalPorts ?? [])]),
+    containerMappings: metadata.flatMap((item) => [...(item!.containerMappings ?? [])]),
+  };
 }
 
 function formatContainerSectionDescription(candidates: readonly ContainerServiceCandidate[]): string {
