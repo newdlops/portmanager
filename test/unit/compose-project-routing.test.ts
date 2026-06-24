@@ -723,6 +723,63 @@ test("docker wrapper rewrites compose container names without the project prefix
   }
 });
 
+test("docker wrapper rewrites hardcoded compose container names without replica index", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-container-unindexed-alias-routing-"));
+  const projectDir = path.join(tempDir, "workspace", "captain");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        originalProjectName: "captain",
+        attachedProjectName: "network-a-captain-1234",
+        containerMappings: [
+          {
+            serviceName: "db",
+            originalContainerId: "abc1234567890000",
+            originalContainerName: "captain_db_1",
+            attachedContainerId: "def9876543210000",
+            attachedContainerName: "pm_captain_db_1_network_a_1234",
+          },
+        ],
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker exec captain_db psql",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output, "<exec>\n<pm_captain_db_1_network_a_1234>\n<psql>\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("docker wrapper rewrites container hashes after Docker global options", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-container-global-option-routing-"));
   const projectDir = path.join(tempDir, "workspace", "app");
@@ -795,6 +852,46 @@ test("docker wrapper rewrites container hashes outside the compose working direc
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test(
+  "bash shell wrapper rewrites hardcoded absolute docker paths",
+  { skip: fs.existsSync("/bin/bash") ? false : "bash is not available" },
+  () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-container-absolute-path-routing-"));
+    const projectDir = path.join(tempDir, "workspace", "app");
+    const binDir = path.join(tempDir, "bin");
+    const routingFile = path.join(tempDir, "routes.tsv");
+
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(routingFile, createContainerRoutingRows(projectDir), "utf8");
+    fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+      encoding: "utf8",
+      mode: 0o700,
+    });
+
+    try {
+      const output = execFileSync(
+        "/bin/bash",
+        [
+          "-c",
+          [
+            buildComposeProjectRoutingShell(routingFile),
+            "export PORT_MANAGER_NETWORK_ID=network-a",
+            `export PATH=${shellQuote(binDir)}:$PATH`,
+            `cd ${shellQuote(projectDir)}`,
+            "/usr/local/bin/docker exec abc123 psql",
+          ].join("\n"),
+        ],
+        { encoding: "utf8" },
+      );
+
+      assert.equal(output, "<exec>\n<network-a-app-postgres-1>\n<psql>\n");
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("docker PATH shim rewrites child process docker invocations without shell functions", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-container-path-shim-"));

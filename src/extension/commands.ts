@@ -20,6 +20,7 @@ import {
 import type { PortManagerNetworkService } from "./network-service";
 import type { PortManagerProcessService } from "./process-service";
 import {
+  DOCKER_SHIM_PATH_ENV,
   prepareRuntimeShimLauncherDirectory,
   prepareShellEnvRestoreScript,
   RUNTIME_SHIM_DIRECTORY_ENV,
@@ -1112,7 +1113,9 @@ export class PortManagerCommandController implements DisposableLike {
       asdfShimLauncherPath,
       runtimeCommandShimPath,
     );
-    const shellEnvRestorePath = prepareShellEnvRestoreScript(hookDirectory, hookLibraryPath);
+    const shellEnvRestorePath = prepareShellEnvRestoreScript(hookDirectory, hookLibraryPath, {
+      dockerShimPath: runtimeCommandShimPath,
+    });
     await fs.writeFile(
       hookScriptPath,
       buildShellHookScript({
@@ -1120,6 +1123,7 @@ export class PortManagerCommandController implements DisposableLike {
         agentMainPath,
         nativeAgentPath,
         nativeContainerMapPath,
+        dockerShimPath: runtimeCommandShimPath,
         nodeExecutablePath: process.execPath,
         socketPath: getAgentSocketPath(),
         routeTablePath: getDefaultRouteTablePath(),
@@ -2182,6 +2186,8 @@ interface ShellHookScriptOptions {
   readonly nativeAgentPath: string;
   /** Native helper used by shell fallback wrappers for container token mapping. */
   readonly nativeContainerMapPath: string;
+  /** Native Docker/Podman shim used by the preload hook for hardcoded runtime paths. */
+  readonly dockerShimPath: string;
   /** Node or Electron executable used to run compiled extension JS in Node mode. */
   readonly nodeExecutablePath: string;
   /** Singleton agent socket path shared with VS Code windows. */
@@ -2204,6 +2210,7 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
   const escapedAgentMainPath = shellDoubleQuote(options.agentMainPath);
   const escapedNativeAgentPath = shellDoubleQuote(options.nativeAgentPath);
   const escapedNativeContainerMapPath = shellDoubleQuote(options.nativeContainerMapPath);
+  const escapedDockerShimPath = shellDoubleQuote(options.dockerShimPath);
   const escapedNodeExecutablePath = shellDoubleQuote(options.nodeExecutablePath);
   const escapedSocketPath = shellDoubleQuote(options.socketPath);
   const escapedRouteTablePath = shellDoubleQuote(options.routeTablePath);
@@ -2225,6 +2232,7 @@ export PORT_MANAGER_HOST_ACCESS_FILE="${escapedHostAccessFilePath}"
 export PORT_MANAGER_AGENT_MAIN="${escapedAgentMainPath}"
 export PORT_MANAGER_AGENT_EXECUTABLE="${escapedNativeAgentPath}"
 export PORT_MANAGER_CONTAINER_MAP_HELPER="${escapedNativeContainerMapPath}"
+export ${DOCKER_SHIM_PATH_ENV}="${escapedDockerShimPath}"
 export PORT_MANAGER_SCAN_RANGE="${options.settings.scanRange}"
 export PORT_MANAGER_ROUTING_MODE="${options.settings.routingMode}"
 export PORT_MANAGER_VIRTUAL_PORT_START="${options.settings.virtualPortRangeStart}"

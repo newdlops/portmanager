@@ -65,6 +65,7 @@ import type {
 } from "../shared/types";
 import {
   applyTerminalHookEnvironment,
+  DOCKER_SHIM_PATH_ENV,
   getAsdfShimLauncherRelativePath,
   getHookLibraryRelativePath,
   getRuntimeCommandShimRelativePath,
@@ -2171,6 +2172,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const shellEnvRestorePath = prepareShellEnvRestoreScript(this.context.globalStorageUri.fsPath, hookLibraryPath, {
       networkId,
       composeRoutingFilePath: this.getComposeProjectRoutingFilePath(networkId),
+      dockerShimPath: runtimeCommandShimPath,
     });
     const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
     const commands = [
@@ -2184,6 +2186,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_AGENT_MAIN", agentMainPath),
       shellExport("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath),
       shellExport("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath),
+      shellExport(DOCKER_SHIM_PATH_ENV, runtimeCommandShimPath),
       shellExport("PORT_MANAGER_ROUTES_FILE", getRouteTablePathForNetwork(networkId)),
       shellExport("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath()),
       shellExport("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath()),
@@ -2245,6 +2248,7 @@ export class PortManagerNetworkService implements DisposableLike {
       "PORT_MANAGER_AGENT_MAIN",
       "PORT_MANAGER_AGENT_EXECUTABLE",
       "PORT_MANAGER_CONTAINER_MAP_HELPER",
+      DOCKER_SHIM_PATH_ENV,
       "PORT_MANAGER_HOOK_DAEMON_STARTED",
       "PORT_MANAGER_ROUTES_FILE",
       "PORT_MANAGER_COMPOSE_ROUTING_FILE",
@@ -2276,7 +2280,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     commands.push(
-      "unset -f docker podman docker-compose podman-compose __port_manager_runtime_first_command __port_manager_runtime_container_subcommand __port_manager_network_id __port_manager_normalize_compose_file_path __port_manager_same_compose_file_path __port_manager_compose_args_reference_file __port_manager_compose_route_for_runtime __port_manager_cwd_matches_workdir __port_manager_container_target_for_runtime __port_manager_shell_quote __port_manager_runtime_command_may_reference_container __port_manager_run_runtime_with_container_routing __port_manager_run_compose_command_with_routing __port_manager_run_standalone_compose_with_routing 2>/dev/null || true",
+      "unset -f docker podman docker-compose podman-compose /usr/local/bin/docker /opt/homebrew/bin/docker /usr/bin/docker /bin/docker /Applications/Docker.app/Contents/Resources/bin/docker /usr/local/bin/podman /opt/homebrew/bin/podman /usr/bin/podman /bin/podman /usr/local/bin/docker-compose /opt/homebrew/bin/docker-compose /usr/bin/docker-compose /bin/docker-compose /Applications/Docker.app/Contents/Resources/bin/docker-compose /usr/local/bin/podman-compose /opt/homebrew/bin/podman-compose /usr/bin/podman-compose /bin/podman-compose __port_manager_runtime_first_command __port_manager_runtime_container_subcommand __port_manager_network_id __port_manager_normalize_compose_file_path __port_manager_same_compose_file_path __port_manager_compose_args_reference_file __port_manager_compose_route_for_runtime __port_manager_cwd_matches_workdir __port_manager_container_target_for_runtime __port_manager_shell_quote __port_manager_runtime_command_may_reference_container __port_manager_run_runtime_with_container_routing __port_manager_run_compose_command_with_routing __port_manager_run_standalone_compose_with_routing __port_manager_define_absolute_runtime_function 2>/dev/null || true",
     );
     commands.push(`printf '%s\\n' ${shellQuote("Port Manager routing detached from this shell.")}`);
 

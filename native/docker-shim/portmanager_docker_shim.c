@@ -29,6 +29,7 @@
 #define PM_COMPOSE_ROUTING_FILE_PREFIX "compose-project-routing-"
 #define PM_COMPOSE_ROUTING_FILE_SUFFIX ".tsv"
 #define PM_COMPOSE_ROUTING_COMPOSE_SEPARATOR ".compose-"
+#define PM_DOCKER_SHIM_BYPASS_ENV "PORT_MANAGER_DOCKER_SHIM_BYPASS"
 
 typedef struct {
   char kind[16];
@@ -223,6 +224,60 @@ next_path_entry:
 
   free(path_env);
   return -1;
+}
+
+static int pm_parent_directory(const char *path, char *buffer, size_t size) {
+  const char *slash;
+  size_t length;
+
+  if (path == NULL || buffer == NULL || size == 0) {
+    return -1;
+  }
+
+  slash = strrchr(path, '/');
+  if (slash == NULL) {
+    return -1;
+  }
+
+  length = slash == path ? 1 : (size_t)(slash - path);
+  if (length >= size) {
+    return -1;
+  }
+
+  memcpy(buffer, path, length);
+  buffer[length] = '\0';
+  return 0;
+}
+
+/**
+ * Native exec interception keeps the original absolute docker path in argv[0]
+ * while replacing the process image with this shim. Prefer that explicit path
+ * before searching PATH, but ignore the extension-owned shim directory to avoid
+ * recursing when the shim is entered through its PATH aliases.
+ */
+static int pm_find_runtime_from_invocation_path(const char *runtime, char **argv, char *buffer, size_t size) {
+  const char *invocation_path = argv != NULL && argv[0] != NULL ? argv[0] : NULL;
+  const char *shim_directory = getenv(PM_RUNTIME_SHIM_DIR_ENV);
+  char invocation_directory[PM_MAX_PATH];
+
+  if (runtime == NULL || invocation_path == NULL || strchr(invocation_path, '/') == NULL ||
+      strcmp(pm_basename(invocation_path), runtime) != 0) {
+    return -1;
+  }
+
+  if (pm_parent_directory(invocation_path, invocation_directory, sizeof(invocation_directory)) != 0) {
+    return -1;
+  }
+
+  if (shim_directory != NULL && shim_directory[0] != '\0' && pm_same_directory(invocation_directory, shim_directory)) {
+    return -1;
+  }
+
+  if (!pm_is_executable_file(invocation_path)) {
+    return -1;
+  }
+
+  return pm_realpath_or_copy(invocation_path, buffer, size);
 }
 
 /** Docker global options are ignored while locating the first semantic command. */
@@ -2259,7 +2314,8 @@ int main(int argc, char **argv) {
     return 127;
   }
 
-  if (pm_find_runtime_on_path(runtime_executable, real_runtime_path, sizeof(real_runtime_path)) != 0) {
+  if (pm_find_runtime_from_invocation_path(runtime_executable, argv, real_runtime_path, sizeof(real_runtime_path)) != 0 &&
+      pm_find_runtime_on_path(runtime_executable, real_runtime_path, sizeof(real_runtime_path)) != 0) {
     fprintf(stderr, "portmanager-docker-shim: could not resolve real %s on PATH\n", runtime_executable);
     return 127;
   }
@@ -2269,6 +2325,7 @@ int main(int argc, char **argv) {
     setenv("PATH", clean_path, 1);
     free(clean_path);
   }
+  setenv(PM_DOCKER_SHIM_BYPASS_ENV, "1", 1);
 
   command_index = pm_first_command_index(argc, argv);
   if (standalone_compose || (command_index >= 0 && strcmp(argv[command_index], "compose") == 0)) {

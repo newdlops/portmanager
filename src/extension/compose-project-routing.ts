@@ -975,7 +975,41 @@ podman() {
   fi
 
   command podman "$@"
-}`;
+}
+
+__port_manager_define_absolute_runtime_function() {
+  __pm_absolute_runtime_path="$1"
+  __pm_runtime_function="$2"
+  case "\${__pm_absolute_runtime_path}" in
+    /*)
+      eval "\${__pm_absolute_runtime_path}() { \${__pm_runtime_function} \\"\\$@\\"; }" 2>/dev/null || true
+      ;;
+  esac
+}
+
+if [ -n "\${ZSH_VERSION:-}" ] || { [ -n "\${BASH_VERSION:-}" ] && [ -z "\${POSIXLY_CORRECT:-}" ]; }; then
+  eval 'docker-compose() { __port_manager_run_standalone_compose_with_routing docker docker-compose "$@"; }'
+  eval 'podman-compose() { __port_manager_run_standalone_compose_with_routing podman podman-compose "$@"; }'
+  __port_manager_define_absolute_runtime_function /usr/local/bin/docker docker
+  __port_manager_define_absolute_runtime_function /opt/homebrew/bin/docker docker
+  __port_manager_define_absolute_runtime_function /usr/bin/docker docker
+  __port_manager_define_absolute_runtime_function /bin/docker docker
+  __port_manager_define_absolute_runtime_function /Applications/Docker.app/Contents/Resources/bin/docker docker
+  __port_manager_define_absolute_runtime_function /usr/local/bin/podman podman
+  __port_manager_define_absolute_runtime_function /opt/homebrew/bin/podman podman
+  __port_manager_define_absolute_runtime_function /usr/bin/podman podman
+  __port_manager_define_absolute_runtime_function /bin/podman podman
+  __port_manager_define_absolute_runtime_function /usr/local/bin/docker-compose docker-compose
+  __port_manager_define_absolute_runtime_function /opt/homebrew/bin/docker-compose docker-compose
+  __port_manager_define_absolute_runtime_function /usr/bin/docker-compose docker-compose
+  __port_manager_define_absolute_runtime_function /bin/docker-compose docker-compose
+  __port_manager_define_absolute_runtime_function /Applications/Docker.app/Contents/Resources/bin/docker-compose docker-compose
+  __port_manager_define_absolute_runtime_function /usr/local/bin/podman-compose podman-compose
+  __port_manager_define_absolute_runtime_function /opt/homebrew/bin/podman-compose podman-compose
+  __port_manager_define_absolute_runtime_function /usr/bin/podman-compose podman-compose
+  __port_manager_define_absolute_runtime_function /bin/podman-compose podman-compose
+fi
+`;
 }
 
 function shellExport(name: string, value: string): string {
@@ -1086,10 +1120,19 @@ function buildContainerNameAliases(
   ];
 
   for (const containerName of containerNames) {
+    const unindexedName = stripComposeReplicaIndex(containerName);
+    if (unindexedName !== undefined && unindexedName.length > 0 && !exactNames.has(unindexedName)) {
+      aliases.add(unindexedName);
+    }
+
     for (const projectName of projectNames) {
       const alias = stripComposeProjectPrefix(containerName, projectName);
       if (alias !== undefined && alias.length > 0 && !exactNames.has(alias)) {
         aliases.add(alias);
+      }
+      const unindexedAlias = alias === undefined ? undefined : stripComposeReplicaIndex(alias);
+      if (unindexedAlias !== undefined && unindexedAlias.length > 0 && !exactNames.has(unindexedAlias)) {
+        aliases.add(unindexedAlias);
       }
     }
   }
@@ -1110,6 +1153,11 @@ function buildProjectNameVariants(projectName: string | undefined): readonly str
     .replace(/[_.-]+$/g, "");
 
   return [...new Set([trimmed, sanitized].filter((value) => value.length > 0))];
+}
+
+function stripComposeReplicaIndex(containerName: string): string | undefined {
+  const stripped = containerName.replace(/[-_]\d+$/u, "");
+  return stripped === containerName ? undefined : stripped;
 }
 
 function stripComposeProjectPrefix(containerName: string, projectName: string): string | undefined {

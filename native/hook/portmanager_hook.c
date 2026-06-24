@@ -6,7 +6,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <spawn.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,6 +44,21 @@
 typedef int (*pm_bind_fn)(int, const struct sockaddr *, socklen_t);
 typedef int (*pm_connect_fn)(int, const struct sockaddr *, socklen_t);
 typedef int (*pm_getsockname_fn)(int, struct sockaddr *, socklen_t *);
+typedef int (*pm_execve_fn)(const char *, char *const [], char *const []);
+typedef int (*pm_posix_spawn_fn)(
+  pid_t *,
+  const char *,
+  const posix_spawn_file_actions_t *,
+  const posix_spawnattr_t *,
+  char *const [],
+  char *const []);
+typedef int (*pm_posix_spawnp_fn)(
+  pid_t *,
+  const char *,
+  const posix_spawn_file_actions_t *,
+  const posix_spawnattr_t *,
+  char *const [],
+  char *const []);
 
 typedef struct {
   int logical_port;
@@ -54,10 +71,16 @@ typedef struct {
 static pm_bind_fn pm_real_bind = bind;
 static pm_connect_fn pm_real_connect = connect;
 static pm_getsockname_fn pm_real_getsockname = getsockname;
+static pm_execve_fn pm_real_execve = execve;
+static pm_posix_spawn_fn pm_real_posix_spawn = posix_spawn;
+static pm_posix_spawnp_fn pm_real_posix_spawnp = posix_spawnp;
 #else
 static pm_bind_fn pm_real_bind = NULL;
 static pm_connect_fn pm_real_connect = NULL;
 static pm_getsockname_fn pm_real_getsockname = NULL;
+static pm_execve_fn pm_real_execve = NULL;
+static pm_posix_spawn_fn pm_real_posix_spawn = NULL;
+static pm_posix_spawnp_fn pm_real_posix_spawnp = NULL;
 #endif
 static __thread int pm_hook_depth = 0;
 static pm_route_mapping pm_routes[PM_MAX_ROUTES];
@@ -97,6 +120,110 @@ static void pm_debug(const char *format, ...) {
   fprintf(stderr, "\n");
 }
 
+static const char *pm_path_basename(const char *path) {
+  const char *slash;
+
+  if (path == NULL || path[0] == '\0') {
+    return NULL;
+  }
+
+  slash = strrchr(path, '/');
+  return slash == NULL ? path : slash + 1;
+}
+
+static int pm_env_flag_is_one(const char *name) {
+  const char *value = getenv(name);
+  return value != NULL && strcmp(value, "1") == 0;
+}
+
+static int pm_is_container_runtime_name(const char *name) {
+  return name != NULL &&
+    (strcmp(name, "docker") == 0 ||
+     strcmp(name, "podman") == 0 ||
+     strcmp(name, "docker-compose") == 0 ||
+     strcmp(name, "podman-compose") == 0);
+}
+
+/**
+ * PATH aliases do not see scripts that call /usr/local/bin/docker directly.
+ * Rewriting the exec target keeps hardcoded Docker/Podman CLI calls on the
+ * same compose/container route map as interactive shell commands.
+ */
+static const char *pm_runtime_exec_target(const char *path, char *const argv[]) {
+  const char *shim_path = getenv("PORT_MANAGER_DOCKER_SHIM");
+  const char *path_name = pm_path_basename(path);
+  const char *argv_name = argv != NULL && argv[0] != NULL ? pm_path_basename(argv[0]) : NULL;
+  const char *shim_name = pm_path_basename(shim_path);
+
+  if (!pm_hook_enabled() || pm_hook_depth > 0 || pm_env_flag_is_one("PORT_MANAGER_DOCKER_SHIM_BYPASS")) {
+    return path;
+  }
+
+  if (shim_path == NULL || shim_path[0] == '\0' ||
+      (path_name != NULL && shim_name != NULL && strcmp(path_name, shim_name) == 0)) {
+    return path;
+  }
+
+  if (pm_is_container_runtime_name(path_name) || pm_is_container_runtime_name(argv_name)) {
+    return shim_path;
+  }
+
+  return path;
+}
+
+static int pm_is_docker_socket_path(const char *path) {
+  const char *name = pm_path_basename(path);
+
+  return name != NULL && (strcmp(name, "docker.sock") == 0 || strcmp(name, "podman.sock") == 0);
+}
+
+static int pm_is_docker_socket_addr(const struct sockaddr *addr, socklen_t addrlen) {
+  const struct sockaddr_un *unix_addr;
+  size_t path_offset = offsetof(struct sockaddr_un, sun_path);
+  size_t path_length;
+  char socket_path[sizeof(unix_addr->sun_path) + 1];
+
+  if (addr == NULL || addr->sa_family != AF_UNIX || addrlen <= (socklen_t)path_offset) {
+    return 0;
+  }
+
+  unix_addr = (const struct sockaddr_un *)addr;
+  if (unix_addr->sun_path[0] == '\0') {
+    return 0;
+  }
+
+  path_length = strnlen(unix_addr->sun_path, sizeof(unix_addr->sun_path));
+  if (path_length == 0 || path_length >= sizeof(socket_path)) {
+    return 0;
+  }
+
+  memcpy(socket_path, unix_addr->sun_path, path_length);
+  socket_path[path_length] = '\0';
+  return pm_is_docker_socket_path(socket_path);
+}
+
+/**
+ * Direct Docker socket clients bypass CLI alias rewriting entirely. Until a
+ * Docker API proxy rewrites HTTP container ids/names, fail closed inside an
+ * attached network so those requests cannot mutate the host daemon by mistake.
+ */
+static int pm_should_block_docker_socket(const struct sockaddr *addr, socklen_t addrlen) {
+  const char *network_id;
+
+  if (!pm_hook_enabled() || pm_hook_depth > 0 ||
+      pm_env_flag_is_one("PORT_MANAGER_DOCKER_SHIM_BYPASS") ||
+      pm_env_flag_is_one("PORT_MANAGER_ALLOW_DOCKER_SOCKET")) {
+    return 0;
+  }
+
+  if (!pm_is_docker_socket_addr(addr, addrlen)) {
+    return 0;
+  }
+
+  network_id = pm_current_network_id();
+  return network_id != NULL && network_id[0] != '\0';
+}
+
 __attribute__((constructor)) static void pm_hook_loaded(void) {
   pm_debug("loaded");
 }
@@ -121,6 +248,18 @@ static void pm_ensure_symbols(void) {
 
   if (pm_real_getsockname == NULL) {
     pm_real_getsockname = (pm_getsockname_fn)pm_resolve_symbol("getsockname");
+  }
+
+  if (pm_real_execve == NULL) {
+    pm_real_execve = (pm_execve_fn)pm_resolve_symbol("execve");
+  }
+
+  if (pm_real_posix_spawn == NULL) {
+    pm_real_posix_spawn = (pm_posix_spawn_fn)pm_resolve_symbol("posix_spawn");
+  }
+
+  if (pm_real_posix_spawnp == NULL) {
+    pm_real_posix_spawnp = (pm_posix_spawnp_fn)pm_resolve_symbol("posix_spawnp");
   }
 }
 
@@ -1772,6 +1911,12 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
     return -1;
   }
 
+  if (pm_should_block_docker_socket(addr, addrlen)) {
+    pm_debug("blocked direct Docker socket access from attached network");
+    errno = EACCES;
+    return -1;
+  }
+
   if (!pm_hook_enabled() || pm_hook_depth > 0 || !pm_is_supported_sockaddr(addr, addrlen) || !pm_sockaddr_is_local(addr)) {
     return pm_real_connect(sockfd, addr, addrlen);
   }
@@ -1893,6 +2038,70 @@ static int pm_getsockname_hook(int sockfd, struct sockaddr *addr, socklen_t *add
   return result;
 }
 
+static int pm_execve_hook(const char *path, char *const argv[], char *const envp[]) {
+  const char *target;
+
+  pm_ensure_symbols();
+  if (pm_real_execve == NULL) {
+    errno = ENOSYS;
+    return -1;
+  }
+
+  target = pm_runtime_exec_target(path, argv);
+  if (target != path) {
+    pm_debug("runtime exec rewrite path=%s target=%s", path != NULL ? path : "(null)", target);
+  }
+
+  return pm_real_execve(target, argv, envp);
+}
+
+static int pm_posix_spawn_hook(
+  pid_t *pid,
+  const char *path,
+  const posix_spawn_file_actions_t *file_actions,
+  const posix_spawnattr_t *attrp,
+  char *const argv[],
+  char *const envp[]) {
+  const char *target;
+
+  pm_ensure_symbols();
+  if (pm_real_posix_spawn == NULL) {
+    errno = ENOSYS;
+    return ENOSYS;
+  }
+
+  target = pm_runtime_exec_target(path, argv);
+  if (target != path) {
+    pm_debug("runtime posix_spawn rewrite path=%s target=%s", path != NULL ? path : "(null)", target);
+  }
+
+  return pm_real_posix_spawn(pid, target, file_actions, attrp, argv, envp);
+}
+
+static int pm_posix_spawnp_hook(
+  pid_t *pid,
+  const char *file,
+  const posix_spawn_file_actions_t *file_actions,
+  const posix_spawnattr_t *attrp,
+  char *const argv[],
+  char *const envp[]) {
+  const char *target;
+
+  pm_ensure_symbols();
+  if (pm_real_posix_spawnp == NULL) {
+    errno = ENOSYS;
+    return ENOSYS;
+  }
+
+  target = pm_runtime_exec_target(file, argv);
+  if (target != file) {
+    pm_debug("runtime posix_spawnp rewrite file=%s target=%s", file != NULL ? file : "(null)", target);
+    return pm_real_posix_spawn(pid, target, file_actions, attrp, argv, envp);
+  }
+
+  return pm_real_posix_spawnp(pid, file, file_actions, attrp, argv, envp);
+}
+
 #if defined(__APPLE__)
 #define PM_DYLD_INTERPOSE(_replacement, _replacee) \
   __attribute__((used)) static struct { const void *replacement; const void *replacee; } \
@@ -1903,6 +2112,9 @@ static int pm_getsockname_hook(int sockfd, struct sockaddr *addr, socklen_t *add
 PM_DYLD_INTERPOSE(pm_bind_hook, bind);
 PM_DYLD_INTERPOSE(pm_connect_hook, connect);
 PM_DYLD_INTERPOSE(pm_getsockname_hook, getsockname);
+PM_DYLD_INTERPOSE(pm_execve_hook, execve);
+PM_DYLD_INTERPOSE(pm_posix_spawn_hook, posix_spawn);
+PM_DYLD_INTERPOSE(pm_posix_spawnp_hook, posix_spawnp);
 #else
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   return pm_bind_hook(sockfd, addr, addrlen);
@@ -1914,5 +2126,29 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
   return pm_getsockname_hook(sockfd, addr, addrlen);
+}
+
+int execve(const char *path, char *const argv[], char *const envp[]) {
+  return pm_execve_hook(path, argv, envp);
+}
+
+int posix_spawn(
+  pid_t *pid,
+  const char *path,
+  const posix_spawn_file_actions_t *file_actions,
+  const posix_spawnattr_t *attrp,
+  char *const argv[],
+  char *const envp[]) {
+  return pm_posix_spawn_hook(pid, path, file_actions, attrp, argv, envp);
+}
+
+int posix_spawnp(
+  pid_t *pid,
+  const char *file,
+  const posix_spawn_file_actions_t *file_actions,
+  const posix_spawnattr_t *attrp,
+  char *const argv[],
+  char *const envp[]) {
+  return pm_posix_spawnp_hook(pid, file, file_actions, attrp, argv, envp);
 }
 #endif
