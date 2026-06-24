@@ -2262,6 +2262,13 @@ export class PortManagerNetworkService implements DisposableLike {
     );
     const shellEnvRestorePath = prepareShellEnvRestoreScript(this.context.globalStorageUri.fsPath, hookLibraryPath, {
       networkId,
+      agentSocketPath: getAgentSocketPath(),
+      agentMainPath,
+      agentExecutablePath: nativeAgentPath,
+      containerMapHelperPath: nativeContainerMapPath,
+      globalRouteTablePath: getDefaultRouteTablePath(),
+      hostAccessFilePath: getDefaultHostAccessBindingsPath(),
+      settings,
       composeRoutingFilePath: this.getComposeProjectRoutingFilePath(networkId),
       dockerShimPath: runtimeCommandShimPath,
     });
@@ -2310,9 +2317,9 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     commands.push(
-      `printf '%s\\n' ${shellQuote(
+      `if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" = "1" ]; then printf '%s\\n' ${shellQuote(
         `Port Manager routing active for ${networkId}. Restart servers launched before attach.`,
-      )}`,
+      )}; fi`,
     );
 
     return commands.join("; ");
@@ -3377,14 +3384,20 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     `fi`,
     `__pm_agent_wait_count=0`,
     `while [ $__pm_agent_wait_count -lt 50 ]; do`,
-    `${probeCommand} >/dev/null 2>&1 && break`,
+    `${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1 && break`,
     `__pm_agent_wait_count=$((__pm_agent_wait_count + 1))`,
     `sleep 0.1`,
     `done`,
     `unset __pm_agent_wait_count`,
     `fi`,
-    `unset __pm_agent_ready`,
+    `if [ "$__pm_agent_ready" = "1" ]; then`,
     `export PORT_MANAGER_HOOK_DAEMON_STARTED=1`,
+    `else`,
+    `export PORT_MANAGER_HOOK=0`,
+    `export PORT_MANAGER_HOOK_DAEMON_STARTED=0`,
+    `printf '%s\\n' 'Port Manager routing unavailable: local daemon did not become ready.' >&2`,
+    `fi`,
+    `unset __pm_agent_ready`,
   ].join("\n");
 }
 

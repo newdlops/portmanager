@@ -39,6 +39,7 @@
 #define PM_DEFAULT_VIRTUAL_START 53000
 #define PM_DEFAULT_VIRTUAL_END 59999
 #define PM_DEFAULT_FIXED_PROTOCOL_PORTS "22,25,53,80,110,143,389,443,465,587,993,995,1433,1521,3306,33060,5432,5672,6379,9200,9300,11211,27017"
+#define PM_AGENT_ROUNDTRIP_TIMEOUT_MS 5000
 #define PM_BIND_ALLOCATION_ATTEMPTS 4
 
 typedef int (*pm_bind_fn)(int, const struct sockaddr *, socklen_t);
@@ -278,6 +279,21 @@ static int pm_parse_int_env(const char *name, int fallback) {
   }
 
   return (int)parsed;
+}
+
+static void pm_agent_roundtrip_timeout(struct timeval *timeout) {
+  int timeout_ms = pm_parse_int_env("PORT_MANAGER_AGENT_TIMEOUT_MS", PM_AGENT_ROUNDTRIP_TIMEOUT_MS);
+
+  if (timeout_ms < 100) {
+    timeout_ms = 100;
+  }
+
+  timeout->tv_sec = timeout_ms / 1000;
+  timeout->tv_usec = (timeout_ms % 1000) * 1000;
+}
+
+static int pm_is_response_frame(const char *line) {
+  return strstr(line, "\"type\":\"response\"") != NULL || strstr(line, "\"type\": \"response\"") != NULL;
 }
 
 static int pm_port_list_contains(const char *ports, int target_port) {
@@ -771,6 +787,7 @@ static int pm_agent_roundtrip(const char *request, char *response, size_t respon
   size_t request_len = strlen(request);
   ssize_t written;
   size_t total = 0;
+  size_t scan_offset = 0;
 
   pm_ensure_symbols();
   if (pm_real_connect == NULL) {
@@ -785,8 +802,7 @@ static int pm_agent_roundtrip(const char *request, char *response, size_t respon
 
   {
     struct timeval timeout;
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
+    pm_agent_roundtrip_timeout(&timeout);
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
   }
@@ -807,6 +823,9 @@ static int pm_agent_roundtrip(const char *request, char *response, size_t respon
 
   while (request_len > 0) {
     written = write(fd, request, request_len);
+    if (written < 0 && errno == EINTR) {
+      continue;
+    }
     if (written <= 0) {
       pm_debug("agent write failed socket=%s", socket_path);
       close(fd);
@@ -820,13 +839,45 @@ static int pm_agent_roundtrip(const char *request, char *response, size_t respon
   while (total + 1 < response_size) {
     ssize_t count = read(fd, response + total, response_size - total - 1);
 
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
     if (count <= 0) {
       break;
     }
 
     total += (size_t)count;
-    if (memchr(response, '\n', total) != NULL) {
-      break;
+    response[total] = '\0';
+
+    for (;;) {
+      char *newline = memchr(response + scan_offset, '\n', total - scan_offset);
+      size_t line_length;
+
+      if (newline == NULL) {
+        break;
+      }
+
+      line_length = (size_t)(newline - (response + scan_offset));
+      response[scan_offset + line_length] = '\0';
+      if (pm_is_response_frame(response + scan_offset)) {
+        if (scan_offset > 0) {
+          memmove(response, response + scan_offset, line_length + 1);
+        }
+        close(fd);
+        return 0;
+      }
+
+      scan_offset += line_length + 1;
+    }
+
+    if (scan_offset > 0) {
+      if (scan_offset < total) {
+        memmove(response, response + scan_offset, total - scan_offset);
+        total -= scan_offset;
+      } else {
+        total = 0;
+      }
+      scan_offset = 0;
     }
   }
 
@@ -834,8 +885,10 @@ static int pm_agent_roundtrip(const char *request, char *response, size_t respon
   response[total] = '\0';
   if (total == 0) {
     pm_debug("agent returned empty response socket=%s", socket_path);
+  } else {
+    pm_debug("agent returned no response frame socket=%s partial=%.160s", socket_path, response);
   }
-  return total > 0 ? 0 : -1;
+  return -1;
 }
 
 static const char *pm_find_json_key(const char *json, const char *key) {

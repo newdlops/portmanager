@@ -651,8 +651,9 @@ static int pm_route_hashed(pm_agent_state *state, const pm_allocate_input *input
   return 0;
 }
 
-static void pm_cleanup_pending(pm_agent_state *state) {
+static int pm_cleanup_pending(pm_agent_state *state) {
   time_t now = time(NULL);
+  size_t before = state->pending_count;
   size_t write_index = 0;
 
   for (size_t read_index = 0; read_index < state->pending_count; read_index++) {
@@ -665,6 +666,7 @@ static void pm_cleanup_pending(pm_agent_state *state) {
   }
 
   state->pending_count = write_index;
+  return before != state->pending_count;
 }
 
 static pm_route *pm_find_active_route(pm_agent_state *state, int logical_port, const char *network_id, pm_route *scratch) {
@@ -698,6 +700,20 @@ static pm_pending_route *pm_find_pending_endpoint(pm_agent_state *state, int log
   for (size_t index = 0; index < state->pending_count; index++) {
     pm_endpoint_identity(state->pending_routes[index].route.logical_port, state->pending_routes[index].route.network_id, candidate, sizeof(candidate));
     if (strcmp(endpoint, candidate) == 0) {
+      return &state->pending_routes[index];
+    }
+  }
+
+  return NULL;
+}
+
+static pm_pending_route *pm_find_pending_allocation(pm_agent_state *state, const char *allocation_id) {
+  if (allocation_id == NULL || allocation_id[0] == '\0') {
+    return NULL;
+  }
+
+  for (size_t index = 0; index < state->pending_count; index++) {
+    if (strcmp(state->pending_routes[index].id, allocation_id) == 0) {
       return &state->pending_routes[index];
     }
   }
@@ -828,7 +844,7 @@ static int pm_write_atomic(const char *file_path, const char *text) {
   char temp_path[PM_TEXT];
   int fd;
   size_t length = strlen(text);
-  ssize_t written;
+  size_t offset = 0;
 
   if (pm_mkdir_p_for_file(file_path) != 0) {
     return -1;
@@ -840,11 +856,22 @@ static int pm_write_atomic(const char *file_path, const char *text) {
     return -1;
   }
 
-  written = write(fd, text, length);
-  if (written < 0 || (size_t)written != length) {
-    close(fd);
-    unlink(temp_path);
-    return -1;
+  while (offset < length) {
+    ssize_t written = write(fd, text + offset, length - offset);
+    if (written < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      close(fd);
+      unlink(temp_path);
+      return -1;
+    }
+    if (written == 0) {
+      close(fd);
+      unlink(temp_path);
+      return -1;
+    }
+    offset += (size_t)written;
   }
 
   close(fd);
@@ -874,6 +901,36 @@ static int pm_write_route_table_file(const char *file_path, const pm_route *rout
   }
 
   pm_buffer_free(&buffer);
+  return result;
+}
+
+static int pm_write_route_entry_file(pm_agent_state *state, int logical_port, const char *network_id) {
+  pm_route_list routes;
+  pm_route_list endpoint_routes = {0};
+  char entry_path[PM_TEXT];
+  int result;
+
+  if (pm_build_routes(state, NULL, &routes) != 0) {
+    return -1;
+  }
+
+  for (size_t index = 0; index < routes.count; index++) {
+    if (
+      routes.items[index].logical_port == logical_port &&
+      strcmp(routes.items[index].network_id, network_id == NULL ? "" : network_id) == 0
+    ) {
+      if (pm_route_list_add_dedupe(&endpoint_routes, &routes.items[index]) != 0) {
+        free(routes.items);
+        free(endpoint_routes.items);
+        return -1;
+      }
+    }
+  }
+
+  pm_route_entry_path(state->route_table_path, logical_port, network_id == NULL ? "" : network_id, entry_path, sizeof(entry_path));
+  result = pm_write_route_table_file(entry_path, endpoint_routes.items, endpoint_routes.count);
+  free(routes.items);
+  free(endpoint_routes.items);
   return result;
 }
 
@@ -994,18 +1051,20 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
   int actual_port;
   pm_pending_route pending;
 
-  pm_cleanup_pending(state);
+  if (pm_cleanup_pending(state)) {
+    pm_write_route_tables(state);
+  }
   pm_normalize_network(input->network_id, network_id, sizeof(network_id));
 
   if (strcmp(input->route_direction, "send") == 0 && pm_find_active_route(state, input->requested_port, network_id, &active_route) != NULL) {
-    pm_write_route_tables(state);
+    pm_write_route_entry_file(state, input->requested_port, network_id);
     return pm_build_allocation_payload(state, "", input->requested_port, active_route.actual_port, active_route.host, network_id, time(NULL), payload);
   }
 
   reusable = pm_find_pending_endpoint(state, input->requested_port, network_id);
   if (reusable != NULL) {
     reusable->expires_at = time(NULL) + PM_ROUTE_TTL_SECONDS;
-    pm_write_route_tables(state);
+    pm_write_route_entry_file(state, input->requested_port, network_id);
     return pm_build_allocation_payload(state, reusable->id, input->requested_port, reusable->route.actual_port, reusable->route.host, network_id, reusable->expires_at, payload);
   }
 
@@ -1032,7 +1091,7 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
   }
 
   state->pending_routes[state->pending_count++] = pending;
-  pm_write_route_tables(state);
+  pm_write_route_entry_file(state, input->requested_port, network_id);
   return pm_build_allocation_payload(state, pending.id, input->requested_port, actual_port, input->host, network_id, pending.expires_at, payload);
 }
 
@@ -1101,10 +1160,15 @@ static const char *pm_normalized_source(const char *source) {
 int pm_state_register_process(pm_agent_state *state, const pm_register_input *input, pm_buffer *payload) {
   char network_id[PM_SMALL];
   char source[PM_SOURCE];
+  pm_pending_route *allocation;
   pm_process *process;
   char now[PM_TIME];
 
   pm_normalize_network(input->network_id, network_id, sizeof(network_id));
+  allocation = pm_find_pending_allocation(state, input->allocation_id);
+  if (network_id[0] == '\0' && allocation != NULL) {
+    pm_copy(network_id, sizeof(network_id), allocation->route.network_id);
+  }
   pm_copy(source, sizeof(source), pm_normalized_source(input->source));
   if (input->allocation_id[0] != '\0') {
     pm_remove_pending_allocation(state, input->allocation_id);
@@ -1293,7 +1357,7 @@ int pm_state_release_process_route(pm_agent_state *state, const pm_release_proce
         process->pid != input->pid ||
         process->requested_port != input->requested_port ||
         process->actual_port != input->actual_port ||
-        strcmp(process->network_id, network_id) != 0) {
+        (network_id[0] != '\0' && strcmp(process->network_id, network_id) != 0)) {
       continue;
     }
 
@@ -1706,7 +1770,9 @@ int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload) {
   char updated_at[PM_TIME];
 
   pm_iso_now(updated_at, sizeof(updated_at));
-  pm_cleanup_pending(state);
+  if (pm_cleanup_pending(state)) {
+    pm_write_route_tables(state);
+  }
   pm_scan_lsof(&listeners, updated_at);
   for (size_t index = 0; index < listeners.count; index++) {
     if (pm_listener_is_tracked(state, &listeners.items[index])) {
@@ -1790,6 +1856,9 @@ int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload) {
 }
 
 int pm_state_refresh_snapshot(pm_agent_state *state, pm_buffer *payload) {
+  if (pm_cleanup_pending(state)) {
+    pm_write_route_tables(state);
+  }
   pm_write_route_tables(state);
   return pm_state_snapshot(state, payload);
 }
