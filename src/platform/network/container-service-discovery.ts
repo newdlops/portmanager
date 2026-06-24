@@ -302,11 +302,11 @@ function toContainerServiceCandidate(
     readLabel(labels, "com.docker.compose.project.config_files", "io.podman.compose.project.config_files"),
   );
   const serviceName = composeService ?? containerName;
-  const logicalPortOverrides = mergePortOverrides(
-    readPortManagerLogicalPortLabels(labels),
-    findOriginalLogicalPortsForClone(context, composeConfigFiles, composeService),
-  );
-  const ports = parsePublishedPorts(row.Ports ?? "", serviceName, logicalPortOverrides);
+  const logicalPortOverrides = readPortManagerLogicalPortLabels(labels);
+  const parsedPorts = parsePublishedPorts(row.Ports ?? "", serviceName, logicalPortOverrides);
+  const ports = hasPortManagerOverrideFile(composeConfigFiles)
+    ? parsedPorts.map((port) => ({ ...port, logicalPort: port.containerPort }))
+    : parsedPorts;
   const portManagerClone = buildPortManagerCloneCandidateMetadata(
     context,
     containerId,
@@ -580,23 +580,6 @@ function buildPortRecoveryContext(rows: readonly RuntimeContainerRow[]): PortRec
   return { originalPortsByComposeContext, originalCloneSourcesByComposeContext };
 }
 
-function findOriginalLogicalPortsForClone(
-  context: PortRecoveryContext,
-  composeConfigFiles: readonly string[],
-  composeService: string | undefined,
-): ReadonlyMap<string, number> {
-  if (composeService === undefined || !hasPortManagerOverrideFile(composeConfigFiles)) {
-    return new Map();
-  }
-
-  const originalConfigFiles = composeConfigFiles.filter((file) => !isPortManagerOverrideFile(file));
-  if (originalConfigFiles.length === 0) {
-    return new Map();
-  }
-
-  return context.originalPortsByComposeContext.get(buildOriginalPortContextKey(originalConfigFiles, composeService)) ?? new Map();
-}
-
 function buildPortManagerCloneCandidateMetadata(
   context: PortRecoveryContext,
   containerId: string,
@@ -628,7 +611,8 @@ function buildPortManagerCloneCandidateMetadata(
     const originalHostPort = originalPortOverrides.get(buildPortOverrideKey(port.containerPort, port.protocol));
     return {
       ...port,
-      actualHostPort: originalHostPort ?? port.logicalPort,
+      logicalPort: port.containerPort,
+      actualHostPort: originalHostPort ?? port.actualHostPort,
     };
   });
 
@@ -674,11 +658,8 @@ function recoverPortsFromContext(
     return ports;
   }
 
-  return ports.map((port) => {
-    const overrides = findOriginalLogicalPortsForClone(context, composeFiles, port.serviceName);
-    const logicalPort = overrides.get(buildPortOverrideKey(port.containerPort, port.protocol));
-    return logicalPort === undefined ? port : { ...port, logicalPort };
-  });
+  void context;
+  return ports.map((port) => ({ ...port, logicalPort: port.containerPort }));
 }
 
 function refreshPortsFromCandidates(
@@ -955,18 +936,6 @@ function readDockerDesktopPublishedPortLabels(labels: ReadonlyMap<string, string
   }
 
   return ports;
-}
-
-function mergePortOverrides(...maps: readonly ReadonlyMap<string, number>[]): ReadonlyMap<string, number> {
-  const merged = new Map<string, number>();
-
-  for (const map of maps) {
-    for (const [key, value] of map) {
-      merged.set(key, value);
-    }
-  }
-
-  return merged;
 }
 
 function buildOriginalPortContextKey(composeConfigFiles: readonly string[], composeService: string): string {

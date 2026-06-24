@@ -187,11 +187,11 @@ test("parses Port Manager clone logical-port labels instead of hidden host ports
       Status: "Up 2 minutes",
       Ports: "127.0.0.1:61421->5432/tcp",
       Labels:
-        "com.docker.compose.project=network-workspace,com.docker.compose.service=postgres,com.docker.compose.project.config_files=/workspace/compose.yaml,/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml,newdlops.portmanager.compose-clone-service=1,newdlops.portmanager.logical-port.5432.tcp=15432",
+        "com.docker.compose.project=network-workspace,com.docker.compose.service=postgres,com.docker.compose.project.config_files=/workspace/compose.yaml,/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml,newdlops.portmanager.compose-clone-service=1,newdlops.portmanager.logical-port.5432.tcp=5432",
     },
   ]);
 
-  assert.equal(candidates[0]?.ports[0]?.logicalPort, 15432);
+  assert.equal(candidates[0]?.ports[0]?.logicalPort, 5432);
   assert.equal(candidates[0]?.ports[0]?.actualHostPort, 61421);
 });
 
@@ -217,7 +217,7 @@ test("recovers Port Manager clone logical ports from stopped original Docker Des
 
   const candidates = parseContainerRows("docker", [cloneRow], [cloneRow, originalRow]);
 
-  assert.equal(candidates[0]?.ports[0]?.logicalPort, 15432);
+  assert.equal(candidates[0]?.ports[0]?.logicalPort, 5432);
   assert.equal(candidates[0]?.ports[0]?.actualHostPort, 61421);
 });
 
@@ -229,7 +229,7 @@ test("recovers existing Port Manager clone metadata for non-destructive reattach
     Status: "Up 2 minutes",
     Ports: "127.0.0.1:61421->5432/tcp",
     Labels:
-      "com.docker.compose.project=network-workspace,com.docker.compose.service=postgres,com.docker.compose.project.working_dir=/workspace,com.docker.compose.project.config_files=/workspace/compose.yaml,/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml,newdlops.portmanager.compose-clone-service=1,newdlops.portmanager.logical-port.5432.tcp=15432",
+      "com.docker.compose.project=network-workspace,com.docker.compose.service=postgres,com.docker.compose.project.working_dir=/workspace,com.docker.compose.project.config_files=/workspace/compose.yaml,/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml,newdlops.portmanager.compose-clone-service=1,newdlops.portmanager.logical-port.5432.tcp=5432",
   };
   const originalRow = {
     ID: "original123",
@@ -262,8 +262,9 @@ test("recovers existing Port Manager clone metadata for non-destructive reattach
   assert.deepEqual(mutation?.composeFiles, ["/workspace/compose.yaml"]);
   assert.equal(mutation?.overrideFile, "/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml");
   assert.deepEqual(mutation?.services, ["postgres"]);
-  assert.equal(mutation?.hiddenPorts[0]?.logicalPort, 15432);
+  assert.equal(mutation?.hiddenPorts[0]?.logicalPort, 5432);
   assert.equal(mutation?.hiddenPorts[0]?.actualHostPort, 61421);
+  assert.equal(mutation?.originalPorts[0]?.logicalPort, 5432);
   assert.equal(mutation?.originalPorts[0]?.actualHostPort, 15432);
 });
 
@@ -340,7 +341,7 @@ test("recovers persisted clone attachment logical ports from original container 
     ],
   );
 
-  assert.equal(ports[0]?.logicalPort, 15432);
+  assert.equal(ports[0]?.logicalPort, 5432);
   assert.equal(ports[0]?.actualHostPort, 61421);
   assert.equal(ports[0]?.processId, "managed-process-2");
 });
@@ -393,7 +394,7 @@ test("refreshes clone hidden host ports after compose recreates containers", asy
     [
       {
         serviceName: "db",
-        logicalPort: 15432,
+        logicalPort: 5432,
         actualHostAddress: "127.0.0.1",
         actualHostPort: 63816,
         containerPort: 5432,
@@ -404,7 +405,7 @@ test("refreshes clone hidden host ports after compose recreates containers", asy
     ],
   );
 
-  assert.equal(ports[0]?.logicalPort, 15432);
+  assert.equal(ports[0]?.logicalPort, 5432);
   assert.equal(ports[0]?.actualHostAddress, "127.0.0.1");
   assert.equal(ports[0]?.actualHostPort, 51612);
   assert.equal(ports[0]?.processId, "managed-process-14");
@@ -805,7 +806,7 @@ test("mutates compose services into a hidden network-scoped project", async (con
       attachedContainerName: "a-app-workspace-bc74e5f2-postgres-1",
     },
   ]);
-  assert.equal(result.ports[0]?.logicalPort, 15432);
+  assert.equal(result.ports[0]?.logicalPort, 5432);
   assert.equal(result.ports[0]?.actualHostPort, 57001);
   assert.equal(result.state.clonedVolumes?.length, 2);
   const dataVolume = result.state.clonedVolumes?.find((volume) => volume.containerPath === "/var/lib/postgresql/data");
@@ -828,7 +829,7 @@ test("mutates compose services into a hidden network-scoped project", async (con
   assert.match(overrideText, /pm_isolated/);
   assert.match(overrideText, /ports: !override/);
   assert.match(overrideText, /newdlops\.portmanager\.compose-clone-service: '1'/);
-  assert.match(overrideText, /'?newdlops\.portmanager\.logical-port\.5432\.tcp'?: '15432'/);
+  assert.match(overrideText, /'?newdlops\.portmanager\.logical-port\.5432\.tcp'?: '5432'/);
   assert.match(overrideText, /127\.0\.0\.1::5432\/tcp/);
   assert.match(overrideText, /volumes: !override/);
   assert.match(overrideText, /target: '\/var\/lib\/postgresql\/data'/);
@@ -935,6 +936,7 @@ test("mutates compose clone container names by replacing the compose project pre
   });
 
   assert.equal(result.state.attachedProjectName, "a-app-captain-92c894fb");
+  assert.equal(result.ports[0]?.logicalPort, 5432);
   assert.deepEqual(result.state.containerMappings, [
     {
       serviceName: "db",
@@ -1015,7 +1017,7 @@ test("rejects compose mutation when Docker keeps the logical host port published
         },
       ],
     }),
-    /kept Docker-published host port equal to the logical port/,
+    /kept Docker-published host port on a visible logical\/original port/,
   );
 
   assert.deepEqual(
@@ -1166,6 +1168,7 @@ test("mutates compose services in-place without resetting container names", asyn
   const overrideText = fs.readFileSync(result.state.overrideFile, "utf8");
   assert.equal(result.state.mode, "in-place");
   assert.equal(result.state.attachedProjectName, "workspace");
+  assert.equal(result.ports[0]?.logicalPort, 5432);
   assert.equal(result.ports[0]?.actualHostPort, 57001);
   assert.equal(overrideText.includes("container_name: !reset null"), false);
   assert.equal(overrideText.includes("networks: !override"), false);

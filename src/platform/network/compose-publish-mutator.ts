@@ -176,7 +176,8 @@ export class ComposePublishMutator {
     if (composeFiles.length === 0) {
       throw new Error("Compose attach needs the original compose files; generated Port Manager overrides cannot be used alone.");
     }
-    const requestedServices = uniqueStrings(input.ports.map((port) => port.serviceName));
+    const inputPorts = input.ports.map(normalizeComposeNetworkPort);
+    const requestedServices = uniqueStrings(inputPorts.map((port) => port.serviceName));
     const originalContext: ComposeCommandContext = {
       runtime: input.runtime,
       projectName: originalProjectName,
@@ -189,7 +190,7 @@ export class ComposePublishMutator {
     const overrideServices = mode === "clone" ? definedServices : services;
     const disabledOverrideServices =
       mode === "clone" ? definedServices.filter((service) => !services.includes(service)) : [];
-    const ports = input.ports.filter((port) => services.includes(port.serviceName));
+    const ports = inputPorts.filter((port) => services.includes(port.serviceName));
     const originalContainerList = await this.listComposeServiceContainers(input.runtime, originalProjectName, services);
     const originalContainers = originalContainerList.containers;
     const originalServiceMounts = await this.inspectServiceMounts(
@@ -245,7 +246,7 @@ export class ComposePublishMutator {
       hiddenStarted = true;
       const hiddenCandidates = await this.discoverHiddenComposeCandidates(input.runtime, attachedProjectName);
       const hiddenPorts = resolveHiddenPorts(attachedProjectName, ports, hiddenCandidates);
-      assertHiddenPortsAreIsolated(hiddenPorts);
+      assertHiddenPortsAreIsolated(hiddenPorts, ports);
       const containerMappings =
         mode === "clone" ? buildContainerCloneMappings(originalContainers, hiddenCandidates) : [];
       const clonedVolumes = buildVolumeMutationMappings(volumeClonePlan.volumeMappings);
@@ -717,6 +718,10 @@ function buildLogicalPortLabelKey(containerPort: number, protocol: string): stri
   return `newdlops.portmanager.logical-port.${containerPort}.${protocol}`;
 }
 
+function normalizeComposeNetworkPort(port: ComposePublishedPort): ComposePublishedPort {
+  return port.logicalPort === port.containerPort ? port : { ...port, logicalPort: port.containerPort };
+}
+
 function resolveHiddenPorts(
   attachedProjectName: string,
   originalPorts: readonly ComposePublishedPort[],
@@ -740,6 +745,7 @@ function resolveHiddenPorts(
 
     return {
       ...originalPort,
+      logicalPort: originalPort.logicalPort,
       actualHostAddress: hiddenPort.actualHostAddress,
       actualHostPort: hiddenPort.actualHostPort,
     };
@@ -1057,17 +1063,26 @@ function findStatefulCloneServices(
   return [...riskyServices].sort();
 }
 
-function assertHiddenPortsAreIsolated(hiddenPorts: readonly ComposePublishedPort[]): void {
-  const leakedPorts = hiddenPorts.filter(
-    (port) => port.actualHostPort === port.logicalPort && isLocalHostAddress(port.actualHostAddress),
-  );
+function assertHiddenPortsAreIsolated(
+  hiddenPorts: readonly ComposePublishedPort[],
+  originalPorts: readonly ComposePublishedPort[],
+): void {
+  const originalPortsByKey = new Map(originalPorts.map((port) => [buildPortKey(port), port]));
+  const leakedPorts = hiddenPorts.filter((port) => {
+    if (!isLocalHostAddress(port.actualHostAddress)) {
+      return false;
+    }
+
+    const originalPort = originalPortsByKey.get(buildPortKey(port));
+    return port.actualHostPort === port.logicalPort || port.actualHostPort === originalPort?.actualHostPort;
+  });
 
   if (leakedPorts.length === 0) {
     return;
   }
 
   throw new Error(
-    `Compose hidden port mutation kept Docker-published host port${leakedPorts.length === 1 ? "" : "s"} equal to the logical port: ${leakedPorts.map(formatLeakedPort).join(", ")}. Attach would route to the host namespace, so the compose project was restored.`,
+    `Compose hidden port mutation kept Docker-published host port${leakedPorts.length === 1 ? "" : "s"} on a visible logical/original port: ${leakedPorts.map(formatLeakedPort).join(", ")}. Attach would route to the host namespace, so the compose project was restored.`,
   );
 }
 

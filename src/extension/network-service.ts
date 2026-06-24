@@ -2365,13 +2365,13 @@ export interface ComposePublishMutationInput {
 export interface ComposePublishedPortInput {
   /** Compose service that owns the container-side listener. */
   readonly serviceName: string;
-  /** Logical-network port used by clients, for example PostgreSQL 15432. */
+  /** Discovered logical hint; containerPort becomes the network-local service port when present. */
   readonly logicalPort: number;
   /** Docker-published host address reachable from the extension host. */
   readonly actualHostAddress: string;
   /** Docker-published host port, often allocated from a hidden range. */
   readonly actualHostPort: number;
-  /** Container-side port for diagnostics; defaults to logicalPort. */
+  /** Container-side service port; this is the port logical-network clients should use. */
   readonly containerPort?: number;
   /** Optional named protocol label such as postgresql, mysql, redis, or http. */
   readonly protocolName?: string;
@@ -2452,13 +2452,18 @@ function requireNetwork(network: LogicalNetwork | undefined, networkId: string):
 function normalizeComposePublishedPort(input: ComposePublishedPortInput): ComposePublishedPort {
   assertTcpPort(input.logicalPort, "Logical compose port");
   assertTcpPort(input.actualHostPort, "Actual compose host port");
+  const containerPort = input.containerPort ?? input.logicalPort;
+  assertTcpPort(containerPort, "Compose container port");
 
   return {
     serviceName: assertNonEmptyString(input.serviceName, "Compose service name"),
-    logicalPort: input.logicalPort,
+    // Compose attachments are network-local service endpoints. Docker's host
+    // published port remains only the runtime target; it must not become the
+    // port seen by peers inside the logical network.
+    logicalPort: containerPort,
     actualHostAddress: assertNonEmptyString(input.actualHostAddress, "Compose published host address"),
     actualHostPort: input.actualHostPort,
-    containerPort: input.containerPort ?? input.logicalPort,
+    containerPort,
     protocol: "tcp",
     ...(input.protocolName !== undefined && input.protocolName.trim().length > 0
       ? { protocolName: input.protocolName.trim() }

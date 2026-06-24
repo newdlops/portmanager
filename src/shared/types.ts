@@ -234,12 +234,12 @@ export interface HostAccessBinding {
 /**
  * One Docker Compose published port that is visible as a logical-network local
  * service. The container may publish to an arbitrary hidden host port, but
- * attached terminal clients keep using the named protocol's logical port.
+ * attached terminal clients keep using the compose service/container port.
  */
 export interface ComposePublishedPort {
   /** Compose service that owns the container-side listener. */
   readonly serviceName: string;
-  /** Port used by attached logical-network clients, for example PostgreSQL 15432. */
+  /** Port used by attached logical-network clients, usually the container-side service port. */
   readonly logicalPort: number;
   /** Host address where Docker published the service for Port Manager to reach. */
   readonly actualHostAddress: string;
