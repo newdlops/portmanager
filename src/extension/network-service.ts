@@ -932,7 +932,27 @@ export class PortManagerNetworkService implements DisposableLike {
     }
   }
 
-  /** Removes a compose route attachment and its daemon route rows. */
+  /**
+   * Detaches a compose attachment from Port Manager routing without mutating
+   * Docker/Podman state. Hidden clone projects and standalone containers keep
+   * running exactly as they are; only daemon route rows and registry state are
+   * released so the logical network no longer owns those ports.
+   */
+  async detachComposeAttachment(attachmentId: string): Promise<ComposeAttachment | undefined> {
+    const attachment = this.registry
+      .getSnapshot()
+      .composeAttachments.find((candidate) => candidate.id === attachmentId);
+
+    if (attachment === undefined) {
+      return undefined;
+    }
+
+    const removedAttachment = this.registry.removeComposeAttachment(attachmentId);
+    await this.removeComposeRouteProcesses(attachment, attachment.ports);
+    return removedAttachment;
+  }
+
+  /** Removes a compose route attachment and restores Docker/Podman state when Port Manager mutated it. */
   async removeComposeAttachment(attachmentId: string): Promise<ComposeAttachment | undefined> {
     const attachment = this.registry
       .getSnapshot()
@@ -955,13 +975,9 @@ export class PortManagerNetworkService implements DisposableLike {
       }
     }
 
-    for (const port of attachment.ports) {
-      if (port.processId !== undefined) {
-        await this.processService?.removeProcess(port.processId).catch(() => undefined);
-      }
-    }
-
-    return this.registry.removeComposeAttachment(attachmentId);
+    const removedAttachment = this.registry.removeComposeAttachment(attachmentId);
+    await this.removeComposeRouteProcesses(attachment, attachment.ports);
+    return removedAttachment;
   }
 
   /** Returns one compose attachment from the latest snapshot. */

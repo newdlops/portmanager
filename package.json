@@ -55,6 +55,7 @@
     "onCommand:portManager.addHostPortExposure",
     "onCommand:portManager.addHostAccessBinding",
     "onCommand:portManager.addComposePublishedPort",
+    "onCommand:portManager.detachComposeAttachment",
     "onCommand:portManager.removeComposeAttachment",
     "onCommand:portManager.saveBindingPreset",
     "onCommand:portManager.applyBindingPreset",
@@ -201,6 +202,12 @@
         "title": "Port Manager: Add Compose Published Port",
         "category": "Port Manager",
         "icon": "$(database)"
+      },
+      {
+        "command": "portManager.detachComposeAttachment",
+        "title": "Port Manager: Detach Service from Network",
+        "category": "Port Manager",
+        "icon": "$(debug-disconnect)"
       },
       {
         "command": "portManager.removeComposeAttachment",
@@ -562,9 +569,14 @@
           "group": "exposure@4"
         },
         {
-          "command": "portManager.removeComposeAttachment",
+          "command": "portManager.detachComposeAttachment",
           "when": "view == portManager.processes && viewItem == composeAttachment",
           "group": "exposure@5"
+        },
+        {
+          "command": "portManager.removeComposeAttachment",
+          "when": "view == portManager.processes && viewItem == composeAttachment",
+          "group": "exposure@6"
         },
         {
           "command": "portManager.restartDaemon",

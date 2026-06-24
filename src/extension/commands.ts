@@ -121,6 +121,9 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.addComposePublishedPort", (argument) =>
       this.addComposePublishedPort(argument),
     );
+    this.registerCommand(context, "portManager.detachComposeAttachment", (argument) =>
+      this.detachComposeAttachment(argument),
+    );
     this.registerCommand(context, "portManager.removeComposeAttachment", (argument) =>
       this.removeComposeAttachment(argument),
     );
@@ -640,7 +643,19 @@ export class PortManagerCommandController implements DisposableLike {
     await vscode.window.showInformationMessage(`Attached compose project "${attachment.projectName}".`);
   }
 
-  /** Removes compose route rows so same-number host ports become fallback again. */
+  /** Detaches compose route rows without changing the underlying Docker/Podman project. */
+  private async detachComposeAttachment(argument: unknown): Promise<void> {
+    const attachment = await this.resolveComposeAttachmentArgument(argument, "Detach Service from Network");
+    if (attachment === undefined) {
+      return;
+    }
+
+    await this.dependencies.networkService.detachComposeAttachment(attachment.id);
+    this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage(`Detached "${attachment.projectName}" from its network.`);
+  }
+
+  /** Removes compose route rows and restores any Docker/Podman mutation Port Manager created. */
   private async removeComposeAttachment(argument: unknown): Promise<void> {
     const attachment = await this.resolveComposeAttachmentArgument(argument, "Remove Compose Attachment");
     if (attachment === undefined) {
