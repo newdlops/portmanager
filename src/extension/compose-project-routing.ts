@@ -62,19 +62,7 @@ export function serializeComposeProjectRoutingRows(rows: readonly ComposeProject
         sanitizeField(row.originalProjectName ?? ""),
       ].join("\t"),
     );
-    const containerFields = (row.containerMappings ?? []).map((mapping) =>
-      [
-        "container",
-        sanitizeField(row.networkId),
-        row.runtime,
-        sanitizeField(trimTrailingSlashes(row.workingDirectory)),
-        sanitizeField(stripContainerNamePrefix(mapping.originalContainerId)),
-        sanitizeField(stripContainerNamePrefix(mapping.originalContainerName)),
-        sanitizeField(stripContainerNamePrefix(mapping.attachedContainerId)),
-        sanitizeField(stripContainerNamePrefix(mapping.attachedContainerName)),
-        sanitizeField(mapping.serviceName),
-      ].join("\t"),
-    );
+    const containerFields = buildContainerRoutingRows(row);
 
     return [baseFields, ...composeFileFields, ...containerFields];
   });
@@ -631,11 +619,17 @@ __port_manager_container_target_scan_file_for_runtime() {
     fi
 
     if [ "\${__pm_matched}" = "1" ]; then
-      __pm_matches=$((__pm_matches + 1))
       if [ -n "\${__pm_attached_name}" ]; then
-        __pm_target="\${__pm_attached_name}\${__pm_scan_suffix}"
+        __pm_next_target="\${__pm_attached_name}\${__pm_scan_suffix}"
       else
-        __pm_target="\${__pm_attached_id}\${__pm_scan_suffix}"
+        __pm_next_target="\${__pm_attached_id}\${__pm_scan_suffix}"
+      fi
+      if [ -z "\${__pm_target}" ]; then
+        __pm_target="\${__pm_next_target}"
+        __pm_matches=$((__pm_matches + 1))
+      elif [ "\${__pm_target}" != "\${__pm_next_target}" ]; then
+        __pm_target="\${__pm_next_target}"
+        __pm_matches=$((__pm_matches + 1))
       fi
     fi
   done < "\${__pm_scan_file}"
@@ -1003,4 +997,128 @@ function trimTrailingSlashes(value: string): string {
 
 function stripContainerNamePrefix(value: string): string {
   return value.startsWith("/") ? value.slice(1) : value;
+}
+
+function buildContainerRoutingRows(row: ComposeProjectRoutingRow): readonly string[] {
+  const lines: string[] = [];
+  const seen = new Set<string>();
+
+  for (const mapping of row.containerMappings ?? []) {
+    appendContainerRoutingRow(lines, seen, row, {
+      originalContainerId: stripContainerNamePrefix(mapping.originalContainerId),
+      originalContainerName: stripContainerNamePrefix(mapping.originalContainerName),
+      attachedContainerId: stripContainerNamePrefix(mapping.attachedContainerId),
+      attachedContainerName: stripContainerNamePrefix(mapping.attachedContainerName),
+      serviceName: mapping.serviceName,
+    });
+
+    for (const alias of buildContainerNameAliases(row, mapping)) {
+      appendContainerRoutingRow(lines, seen, row, {
+        // Alias rows should only match by exact name. Keep id fields out of Docker's
+        // short-hash prefix matching so names like "postgres-1" do not become broad prefixes.
+        originalContainerId: `__portmanager_alias__:${alias}`,
+        originalContainerName: alias,
+        attachedContainerId:
+          mapping.attachedContainerName.trim().length > 0
+            ? `__portmanager_alias_target__:${alias}`
+            : stripContainerNamePrefix(mapping.attachedContainerId),
+        attachedContainerName: stripContainerNamePrefix(mapping.attachedContainerName),
+        serviceName: "",
+      });
+    }
+  }
+
+  return lines;
+}
+
+function appendContainerRoutingRow(
+  lines: string[],
+  seen: Set<string>,
+  row: ComposeProjectRoutingRow,
+  fields: {
+    readonly originalContainerId: string;
+    readonly originalContainerName: string;
+    readonly attachedContainerId: string;
+    readonly attachedContainerName: string;
+    readonly serviceName: string;
+  },
+): void {
+  const line = [
+    "container",
+    sanitizeField(row.networkId),
+    row.runtime,
+    sanitizeField(trimTrailingSlashes(row.workingDirectory)),
+    sanitizeField(fields.originalContainerId),
+    sanitizeField(fields.originalContainerName),
+    sanitizeField(fields.attachedContainerId),
+    sanitizeField(fields.attachedContainerName),
+    sanitizeField(fields.serviceName),
+  ].join("\t");
+
+  if (seen.has(line)) {
+    return;
+  }
+
+  seen.add(line);
+  lines.push(line);
+}
+
+function buildContainerNameAliases(
+  row: ComposeProjectRoutingRow,
+  mapping: ComposeContainerRoutingMapping,
+): readonly string[] {
+  const aliases = new Set<string>();
+  const exactNames = new Set(
+    [
+      stripContainerNamePrefix(mapping.originalContainerId),
+      stripContainerNamePrefix(mapping.originalContainerName),
+      stripContainerNamePrefix(mapping.attachedContainerId),
+      stripContainerNamePrefix(mapping.attachedContainerName),
+      mapping.serviceName,
+    ].filter((value) => value.length > 0),
+  );
+  const projectNames = [row.originalProjectName, row.attachedProjectName].flatMap((projectName) =>
+    buildProjectNameVariants(projectName),
+  );
+  const containerNames = [
+    stripContainerNamePrefix(mapping.originalContainerName),
+    stripContainerNamePrefix(mapping.attachedContainerName),
+  ];
+
+  for (const containerName of containerNames) {
+    for (const projectName of projectNames) {
+      const alias = stripComposeProjectPrefix(containerName, projectName);
+      if (alias !== undefined && alias.length > 0 && !exactNames.has(alias)) {
+        aliases.add(alias);
+      }
+    }
+  }
+
+  return [...aliases];
+}
+
+function buildProjectNameVariants(projectName: string | undefined): readonly string[] {
+  const trimmed = projectName?.trim();
+  if (trimmed === undefined || trimmed.length === 0) {
+    return [];
+  }
+
+  const sanitized = trimmed
+    .replace(/^\/+/, "")
+    .replace(/[^A-Za-z0-9_.-]+/g, "-")
+    .replace(/^[^A-Za-z0-9]+/, "")
+    .replace(/[_.-]+$/g, "");
+
+  return [...new Set([trimmed, sanitized].filter((value) => value.length > 0))];
+}
+
+function stripComposeProjectPrefix(containerName: string, projectName: string): string | undefined {
+  for (const separator of ["-", "_"]) {
+    const prefix = `${projectName}${separator}`;
+    if (containerName.startsWith(prefix)) {
+      return containerName.slice(prefix.length);
+    }
+  }
+
+  return undefined;
 }

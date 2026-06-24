@@ -666,6 +666,63 @@ test("docker wrapper rewrites lifecycle commands for compose service names", () 
   }
 });
 
+test("docker wrapper rewrites compose container names without the project prefix", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-container-name-alias-routing-"));
+  const projectDir = path.join(tempDir, "workspace", "captain");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        originalProjectName: "captain",
+        attachedProjectName: "network-a-captain-1234",
+        containerMappings: [
+          {
+            serviceName: "db",
+            originalContainerId: "abc1234567890000",
+            originalContainerName: "captain_db-1",
+            attachedContainerId: "def9876543210000",
+            attachedContainerName: "network-a-captain-1234_db-1",
+          },
+        ],
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker logs db-1",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output, "<logs>\n<network-a-captain-1234_db-1>\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("docker wrapper rewrites container hashes after Docker global options", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-container-global-option-routing-"));
   const projectDir = path.join(tempDir, "workspace", "app");

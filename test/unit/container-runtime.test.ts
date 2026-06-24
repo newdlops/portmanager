@@ -532,33 +532,64 @@ test("mutates compose services with inspect container names when list rows omit 
       }
       if (args[0] === "container" && args[1] === "ls") {
         containerListCount += 1;
+        if (containerListCount === 1) {
+          return {
+            stdout: [
+              JSON.stringify({
+                ID: "original123",
+                Ports: "127.0.0.1:15432->5432/tcp",
+                Labels: "com.docker.compose.project=workspace,com.docker.compose.service=postgres",
+              }),
+              JSON.stringify({
+                ID: "stale456",
+                Ports: "",
+                Labels: "com.docker.compose.project=workspace,com.docker.compose.service=postgres",
+              }),
+            ].join("\n"),
+            stderr: "",
+          };
+        }
+
         return {
           stdout: JSON.stringify({
-            ID: containerListCount === 1 ? "original123" : "hidden123",
-            Ports: containerListCount === 1 ? "127.0.0.1:15432->5432/tcp" : "127.0.0.1:57001->5432/tcp",
-            Labels:
-              containerListCount === 1
-                ? "com.docker.compose.project=workspace,com.docker.compose.service=postgres"
-                : "com.docker.compose.project=a-app-workspace-bc74e5f2,com.docker.compose.service=postgres",
+            ID: "hidden123",
+            Ports: "127.0.0.1:57001->5432/tcp",
+            Labels: "com.docker.compose.project=a-app-workspace-bc74e5f2,com.docker.compose.service=postgres",
           }),
           stderr: "",
         };
       }
       if (args[0] === "container" && args[1] === "inspect") {
-        const id = args[2];
+        const ids = args.slice(2);
         return {
-          stdout: JSON.stringify([
-            {
+          stdout: JSON.stringify(
+            ids.map((id) => ({
               Id: id,
-              Name: id === "original123" ? "/captain_postgres" : "/a-app-workspace-postgres-1",
+              Name:
+                id === "original123"
+                  ? "/captain_postgres"
+                  : id === "hidden123"
+                    ? "/pm-captain_postgres-a-app-workspace-bc74e5f2-b8d428ea"
+                    : "/stale_workspace_postgres",
               Config: {
                 Labels: {
                   "com.docker.compose.service": "postgres",
                 },
               },
-              Mounts: [],
-            },
-          ]),
+              Mounts:
+                id === "stale456"
+                  ? [
+                      {
+                        Type: "volume",
+                        Name: "stale_pgdata",
+                        Source: "/var/lib/docker/volumes/stale_pgdata/_data",
+                        Destination: "/var/lib/postgresql/data",
+                        RW: true,
+                      },
+                    ]
+                  : [],
+            })),
+          ),
           stderr: "",
         };
       }
@@ -592,7 +623,7 @@ test("mutates compose services with inspect container names when list rows omit 
       originalContainerId: "original123",
       originalContainerName: "captain_postgres",
       attachedContainerId: "hidden123",
-      attachedContainerName: "a-app-workspace-postgres-1",
+      attachedContainerName: "pm-captain_postgres-a-app-workspace-bc74e5f2-b8d428ea",
     },
   ]);
 });
@@ -602,6 +633,9 @@ test("mutates compose services into a hidden network-scoped project", async (con
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
   const composeFile = path.join(tempDir, "compose.yaml");
   const staleOverrideFile = path.join(tempDir, "a-app-workspace-bc74e5f2.ports.override.yaml");
+  const initdbDir = path.join(tempDir, "initdb");
+  fs.mkdirSync(initdbDir, { recursive: true });
+  fs.writeFileSync(path.join(initdbDir, "restore.sql"), "select 1;\n", "utf8");
   fs.writeFileSync(
     composeFile,
     [
@@ -648,7 +682,7 @@ test("mutates compose services into a hidden network-scoped project", async (con
         return {
           stdout: JSON.stringify({
             ID: "hidden123",
-            Names: "a-app-workspace-postgres-1",
+            Names: "a-app-workspace-bc74e5f2-postgres-1",
             Ports: "127.0.0.1:57001->5432/tcp",
             Labels:
               "com.docker.compose.project=a-app-workspace-bc74e5f2,com.docker.compose.service=postgres",
@@ -676,7 +710,7 @@ test("mutates compose services into a hidden network-scoped project", async (con
                 },
                 {
                   Type: "bind",
-                  Source: path.join(tempDir, "initdb"),
+                  Source: initdbDir,
                   Destination: "/docker-entrypoint-initdb.d",
                   RW: false,
                 },
@@ -721,13 +755,27 @@ test("mutates compose services into a hidden network-scoped project", async (con
       originalContainerId: "original123",
       originalContainerName: "workspace-postgres-1",
       attachedContainerId: "hidden123",
-      attachedContainerName: "a-app-workspace-postgres-1",
+      attachedContainerName: "a-app-workspace-bc74e5f2-postgres-1",
     },
   ]);
   assert.equal(result.ports[0]?.logicalPort, 15432);
   assert.equal(result.ports[0]?.actualHostPort, 57001);
+  assert.equal(result.state.clonedVolumes?.length, 2);
+  const dataVolume = result.state.clonedVolumes?.find((volume) => volume.containerPath === "/var/lib/postgresql/data");
+  assert.equal(dataVolume?.serviceName, "postgres");
+  assert.equal(dataVolume?.sourceKind, "volume");
+  assert.equal(dataVolume?.sourceName, "workspace_pgdata");
+  assert.equal(dataVolume?.readOnly, false);
+  assert.match(dataVolume?.targetVolumeName ?? "", /^pm-a-app-workspace-bc74e5f2-[a-f0-9]{12}-[a-f0-9]{8}$/);
+  const restoreVolume = result.state.clonedVolumes?.find((volume) => volume.containerPath === "/docker-entrypoint-initdb.d");
+  assert.equal(restoreVolume?.serviceName, "postgres");
+  assert.equal(restoreVolume?.sourceKind, "bind");
+  assert.equal(restoreVolume?.sourceName, initdbDir);
+  assert.equal(restoreVolume?.readOnly, true);
+  assert.match(restoreVolume?.targetVolumeName ?? "", /^pm-a-app-workspace-bc74e5f2-[a-f0-9]{12}-[a-f0-9]{8}$/);
   const overrideText = fs.readFileSync(result.state.overrideFile, "utf8");
   assert.match(overrideText, /container_name: !reset null/);
+  assert.match(overrideText, /container_name: 'a-app-workspace-bc74e5f2-postgres-1'/);
   assert.match(overrideText, /network_mode: !reset null/);
   assert.match(overrideText, /networks: !override/);
   assert.match(overrideText, /pm_isolated/);
@@ -737,6 +785,8 @@ test("mutates compose services into a hidden network-scoped project", async (con
   assert.match(overrideText, /127\.0\.0\.1::5432\/tcp/);
   assert.match(overrideText, /volumes: !override/);
   assert.match(overrideText, /target: '\/var\/lib\/postgresql\/data'/);
+  assert.match(overrideText, /target: '\/docker-entrypoint-initdb\.d'/);
+  assert.doesNotMatch(overrideText, /type: bind/);
   assert.match(overrideText, /external: true/);
   assert.doesNotMatch(overrideText, /name: 'workspace_pgdata'/);
   assert.match(overrideText, /name: 'pm-a-app-workspace-bc74e5f2-[a-f0-9]{12}-[a-f0-9]{8}'/);
@@ -752,12 +802,14 @@ test("mutates compose services into a hidden network-scoped project", async (con
     "compose",
     "volume",
     "run",
+    "volume",
+    "run",
     "compose",
     "container",
     "container",
   ]);
   assert.deepEqual(calls[0]?.args, ["compose", "-p", "workspace", "-f", composeFile, "config", "--services"]);
-  assert.deepEqual(calls[6]?.args.slice(0, 8), [
+  assert.deepEqual(calls[8]?.args.slice(0, 8), [
     "compose",
     "-p",
     "a-app-workspace-bc74e5f2",
@@ -768,8 +820,87 @@ test("mutates compose services into a hidden network-scoped project", async (con
     "up",
   ]);
   assert.equal(calls[5]?.args.includes("workspace_pgdata:/from:ro"), true);
+  assert.equal(calls[7]?.args.includes(`${initdbDir}:/from:ro`), true);
   assert.equal(calls[0]?.cwd, tempDir);
   assert.equal(calls[3]?.cwd, tempDir);
+});
+
+test("mutates compose clone container names by replacing the compose project prefix", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-name-prefix-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  fs.writeFileSync(composeFile, "services:\n  db:\n    image: postgres:16\n", "utf8");
+  let containerListCount = 0;
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        containerListCount += 1;
+        return {
+          stdout: JSON.stringify({
+            ID: containerListCount === 1 ? "original123" : "hidden123",
+            Names: containerListCount === 1 ? "captain_db-1" : "a-app-captain-92c894fb_db-1",
+            Ports: containerListCount === 1 ? "127.0.0.1:15432->5432/tcp" : "127.0.0.1:57001->5432/tcp",
+            Labels:
+              containerListCount === 1
+                ? "com.docker.compose.project=captain,com.docker.compose.service=db"
+                : "com.docker.compose.project=a-app-captain-92c894fb,com.docker.compose.service=db",
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify([
+            {
+              Id: "original123",
+              Config: { Labels: { "com.docker.compose.service": "db" } },
+              Mounts: [],
+            },
+          ]),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    runtime: "docker",
+    networkName: "A app",
+    originalProjectName: "captain",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    ports: [
+      {
+        serviceName: "db",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 15432,
+        containerPort: 5432,
+        protocol: "tcp",
+      },
+    ],
+  });
+
+  assert.equal(result.state.attachedProjectName, "a-app-captain-92c894fb");
+  assert.deepEqual(result.state.containerMappings, [
+    {
+      serviceName: "db",
+      originalContainerId: "original123",
+      originalContainerName: "captain_db-1",
+      attachedContainerId: "hidden123",
+      attachedContainerName: "a-app-captain-92c894fb_db-1",
+    },
+  ]);
+  assert.match(
+    fs.readFileSync(result.state.overrideFile, "utf8"),
+    /container_name: 'a-app-captain-92c894fb_db-1'/,
+  );
 });
 
 test("rejects compose mutation when Docker keeps the logical host port published", async (context) => {
@@ -792,7 +923,7 @@ test("rejects compose mutation when Docker keeps the logical host port published
         return {
           stdout: JSON.stringify({
             ID: containerListCount === 1 ? "original123" : "hidden123",
-            Names: containerListCount === 1 ? "workspace-postgres-1" : "a-app-workspace-postgres-1",
+            Names: containerListCount === 1 ? "workspace-postgres-1" : "a-app-workspace-bc74e5f2-postgres-1",
             Ports: "127.0.0.1:15432->5432/tcp",
             Labels:
               containerListCount === 1
@@ -865,7 +996,7 @@ test("skips stale compose service labels while mutating current services", async
         return {
           stdout: JSON.stringify({
             ID: containerListCount === 1 ? "original123" : "hidden123",
-            Names: containerListCount === 1 ? "workspace-postgres-1" : "a-app-workspace-postgres-1",
+            Names: containerListCount === 1 ? "workspace-postgres-1" : "a-app-workspace-bc74e5f2-postgres-1",
             Ports: containerListCount === 1 ? "127.0.0.1:15432->5432/tcp" : "127.0.0.1:57001->5432/tcp",
             Labels:
               containerListCount === 1

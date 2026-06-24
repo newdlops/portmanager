@@ -2009,14 +2009,22 @@ static int pm_container_target_scan_file(const char *file_path, void *context) {
     }
 
     if (matched) {
-      search->matches++;
+      char next_target[PM_MAX_FIELD];
+
       snprintf(
-        search->target,
-        sizeof(search->target),
+        next_target,
+        sizeof(next_target),
         "%s%s",
         row.attached_name[0] == '\0' ? row.attached_id : row.attached_name,
         search->suffix == NULL ? "" : search->suffix
       );
+
+      if (search->target[0] != '\0' && strcmp(search->target, next_target) == 0) {
+        continue;
+      }
+
+      search->matches++;
+      pm_copy(search->target, sizeof(search->target), next_target);
     }
   }
 

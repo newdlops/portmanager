@@ -165,7 +165,14 @@ int main(int argc, char **argv) {
     }
 
     if (pm_token_matches_mapping(token, fields[4], fields[5], fields[6], fields[7], field_count >= 9 ? fields[8] : "")) {
-      char *next_target = strdup(pm_target_container_name(fields[6], fields[7]));
+      const char *target_name = pm_target_container_name(fields[6], fields[7]);
+      char *next_target;
+
+      if (target != NULL && strcmp(target, target_name) == 0) {
+        continue;
+      }
+
+      next_target = strdup(target_name);
       if (next_target == NULL) {
         free(target);
         free(line);

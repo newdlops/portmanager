@@ -1001,6 +1001,18 @@ function buildComposeAttachmentTooltip(attachment: ComposeAttachment): vscode.Ma
   if (attachment.mutation !== undefined) {
     tooltip.appendMarkdown(`- Original Project: \`${escapeMarkdown(attachment.mutation.originalProjectName)}\`\n`);
     tooltip.appendMarkdown(`- Hidden Project: \`${escapeMarkdown(attachment.mutation.attachedProjectName)}\`\n`);
+    if (attachment.mutation.clonedVolumes !== undefined && attachment.mutation.clonedVolumes.length > 0) {
+      tooltip.appendMarkdown("- Cloned Volumes:\n");
+      for (const volume of attachment.mutation.clonedVolumes) {
+        tooltip.appendMarkdown(
+          `  - ${escapeMarkdown(volume.serviceName)} \`${escapeMarkdown(volume.containerPath)}\`: ${volume.sourceKind} \`${escapeMarkdown(volume.sourceName)}\` -> \`${escapeMarkdown(volume.targetVolumeName)}\``,
+        );
+        if (volume.readOnly) {
+          tooltip.appendMarkdown(" `read-only`");
+        }
+        tooltip.appendMarkdown("\n");
+      }
+    }
   }
 
   for (const port of attachment.ports) {

@@ -285,6 +285,8 @@ export interface ComposePortMutationState {
   readonly containerMappings?: readonly ComposeContainerMutationMapping[];
   /** Docker volume copies created for clone mode; preserved on detach. */
   readonly clonedVolumeNames?: readonly string[];
+  /** Docker volume copies with the service and container mount path they protect. */
+  readonly clonedVolumes?: readonly ComposeVolumeMutationMapping[];
 }
 
 export interface ComposeContainerMutationMapping {
@@ -298,6 +300,21 @@ export interface ComposeContainerMutationMapping {
   readonly attachedContainerId: string;
   /** Attached clone container name shown by Docker/Podman. */
   readonly attachedContainerName: string;
+}
+
+export interface ComposeVolumeMutationMapping {
+  /** Compose service whose container mount was copied. */
+  readonly serviceName: string;
+  /** Original source type copied into the clone volume. */
+  readonly sourceKind: "volume" | "bind";
+  /** Original Docker volume name or host bind path copied into the clone volume. */
+  readonly sourceName: string;
+  /** New Docker volume name mounted into the hidden clone. */
+  readonly targetVolumeName: string;
+  /** Container-internal path where the cloned volume is mounted. */
+  readonly containerPath: string;
+  /** Whether the original mount was read-only. */
+  readonly readOnly: boolean;
 }
 
 /**

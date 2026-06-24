@@ -6,6 +6,7 @@ import type {
   ComposePortMutationMode,
   ComposePortMutationState,
   ComposePublishedPort,
+  ComposeVolumeMutationMapping,
   ContainerServiceCandidate,
 } from "../../shared/types";
 import type { ContainerCommandRunner } from "./container-runtime";
@@ -85,6 +86,7 @@ interface ComposeServiceContainerList {
 }
 
 interface RuntimeContainerInspectRow {
+  readonly ID?: string;
   readonly Id?: string;
   readonly Name?: string;
   readonly Config?: {
@@ -126,8 +128,18 @@ interface ComposeTmpfsMount {
 }
 
 interface VolumeClonePlan {
-  readonly sourceVolumeName: string;
+  readonly sourceKind: "volume" | "bind";
+  readonly sourceName: string;
   readonly targetVolumeName: string;
+}
+
+interface VolumeCloneMapping {
+  readonly serviceName: string;
+  readonly sourceKind: "volume" | "bind";
+  readonly sourceName: string;
+  readonly targetVolumeName: string;
+  readonly containerPath: string;
+  readonly readOnly: boolean;
 }
 
 /**
@@ -191,10 +203,15 @@ export class ComposePublishMutator {
         `Clone attach includes stateful service${statefulCloneServices.length === 1 ? "" : "s"} with persistent mounts: ${statefulCloneServices.join(", ")}. Confirm stateful clone explicitly or use Attach as-is.`,
       );
     }
+    const statefulServiceNames = new Set(statefulCloneServices);
     const volumeClonePlan =
       mode === "clone"
-        ? buildVolumeClonePlan(attachedProjectName, randomUUID().slice(0, 8), originalServiceMounts)
-        : { serviceMounts: originalServiceMounts, volumeClones: [] };
+        ? await buildVolumeClonePlan(attachedProjectName, randomUUID().slice(0, 8), originalServiceMounts, statefulServiceNames)
+        : { serviceMounts: originalServiceMounts, volumeClones: [], volumeMappings: [] };
+    const cloneContainerNames =
+      mode === "clone"
+        ? buildCloneContainerNames(originalProjectName, attachedProjectName, originalContainers)
+        : new Map<string, string>();
     const overrideFile = await this.writeHiddenPortsOverride(
       attachedProjectName,
       overrideServices,
@@ -202,6 +219,7 @@ export class ComposePublishMutator {
       volumeClonePlan.serviceMounts,
       {
         resetContainerName: mode === "clone",
+        cloneContainerNames,
         isolatedNetwork: mode === "clone" ? "pm_isolated" : undefined,
         disabledServices: disabledOverrideServices,
       },
@@ -230,6 +248,7 @@ export class ComposePublishMutator {
       assertHiddenPortsAreIsolated(hiddenPorts);
       const containerMappings =
         mode === "clone" ? buildContainerCloneMappings(originalContainers, hiddenCandidates) : [];
+      const clonedVolumes = buildVolumeMutationMappings(volumeClonePlan.volumeMappings);
 
       return {
         ports: hiddenPorts,
@@ -246,6 +265,7 @@ export class ComposePublishMutator {
           hiddenPorts,
           ...(containerMappings.length > 0 ? { containerMappings } : {}),
           clonedVolumeNames: volumeClonePlan.volumeClones.map((volume) => volume.targetVolumeName),
+          ...(clonedVolumes.length > 0 ? { clonedVolumes } : {}),
         },
       };
     } catch (error) {
@@ -374,6 +394,7 @@ export class ComposePublishMutator {
     serviceMounts: ReadonlyMap<string, readonly ComposeServiceMount[]>,
     options: {
       readonly resetContainerName: boolean;
+      readonly cloneContainerNames?: ReadonlyMap<string, string>;
       readonly isolatedNetwork?: string;
       readonly disabledServices?: readonly string[];
     },
@@ -388,7 +409,12 @@ export class ComposePublishMutator {
       const servicePorts = portsByService.get(serviceName) ?? [];
       lines.push(`  ${quoteYamlString(serviceName)}:`);
       if (options.resetContainerName) {
-        lines.push("    container_name: !reset null");
+        const cloneContainerName = options.cloneContainerNames?.get(serviceName);
+        if (cloneContainerName === undefined) {
+          lines.push("    container_name: !reset null");
+        } else {
+          lines.push(`    container_name: ${quoteYamlString(cloneContainerName)}`);
+        }
         lines.push("    network_mode: !reset null");
         lines.push("    links: !reset []");
         lines.push("    external_links: !reset []");
@@ -496,11 +522,15 @@ export class ComposePublishMutator {
       throw new Error("Container inspect did not return mount metadata for compose attach.");
     }
 
-    const serviceByContainerId = new Map(containers.map((container) => [container.id, container.serviceName]));
     const grouped = new Map<string, readonly ComposeServiceMount[]>();
 
     for (const row of inspected) {
-      const serviceName = findInspectServiceName(row) ?? serviceByContainerId.get(row.Id ?? "");
+      const selectedContainer = findInspectedServiceContainer(row, containers);
+      if (selectedContainer === undefined) {
+        continue;
+      }
+
+      const serviceName = findInspectServiceName(row) ?? selectedContainer.serviceName;
       if (serviceName === undefined) {
         continue;
       }
@@ -555,6 +585,7 @@ export class ComposePublishMutator {
   /** Copies Docker volumes after the source service has been stopped. */
   private async copyVolumes(runtime: "docker" | "podman", volumeClones: readonly VolumeClonePlan[]): Promise<void> {
     for (const volume of volumeClones) {
+      const sourceMount = volume.sourceKind === "volume" ? `${volume.sourceName}:/from:ro` : `${volume.sourceName}:/from:ro`;
       await this.runCommand(runtime, ["volume", "create", volume.targetVolumeName], {
         timeoutMs: LIST_TIMEOUT_MS,
       });
@@ -564,7 +595,7 @@ export class ComposePublishMutator {
           "run",
           "--rm",
           "-v",
-          `${volume.sourceVolumeName}:/from:ro`,
+          sourceMount,
           "-v",
           `${volume.targetVolumeName}:/to`,
           VOLUME_COPY_IMAGE,
@@ -744,6 +775,68 @@ function buildContainerCloneMappings(
   return mappings;
 }
 
+function buildCloneContainerNames(
+  originalProjectName: string,
+  attachedProjectName: string,
+  originalContainers: readonly ComposeServiceContainer[],
+): ReadonlyMap<string, string> {
+  const names = new Map<string, string>();
+  const originalByService = groupBy(originalContainers, (container) => container.serviceName);
+
+  for (const [serviceName, containers] of originalByService) {
+    if (containers.length !== 1) {
+      continue;
+    }
+
+    names.set(serviceName, buildCloneContainerName(originalProjectName, attachedProjectName, containers[0]!.name));
+  }
+
+  return names;
+}
+
+function buildCloneContainerName(
+  originalProjectName: string,
+  attachedProjectName: string,
+  originalContainerName: string,
+): string {
+  const projectReplacedName = replaceContainerProjectPrefix(
+    originalContainerName,
+    originalProjectName,
+    attachedProjectName,
+  );
+  if (projectReplacedName !== undefined) {
+    return trimContainerName(projectReplacedName, 120);
+  }
+
+  const originalSegment = sanitizeContainerNameSegment(originalContainerName) ?? "container";
+  const projectSegment = sanitizeContainerNameSegment(attachedProjectName) ?? "network";
+  const hash = createHash("sha1").update(`${attachedProjectName}\0${originalContainerName}`).digest("hex").slice(0, 8);
+
+  return trimContainerName(`pm-${originalSegment}-${projectSegment}-${hash}`, 120);
+}
+
+function replaceContainerProjectPrefix(
+  containerName: string,
+  originalProjectName: string,
+  attachedProjectName: string,
+): string | undefined {
+  const normalizedName = containerName.trim().replace(/^\/+/, "");
+  const originalProject = sanitizeContainerNameSegment(originalProjectName);
+  const attachedProject = sanitizeContainerNameSegment(attachedProjectName);
+  if (normalizedName.length === 0 || originalProject === undefined || attachedProject === undefined) {
+    return undefined;
+  }
+
+  for (const separator of ["-", "_"]) {
+    const prefix = `${originalProject}${separator}`;
+    if (normalizedName.startsWith(prefix)) {
+      return `${attachedProject}${separator}${normalizedName.slice(prefix.length)}`;
+    }
+  }
+
+  return undefined;
+}
+
 function groupBy<T>(values: readonly T[], keyForValue: (value: T) => string): Map<string, T[]> {
   const grouped = new Map<string, T[]>();
 
@@ -810,48 +903,131 @@ function collectVolumeNames(
   return volumeNames;
 }
 
-function buildVolumeClonePlan(
+async function buildVolumeClonePlan(
   attachedProjectName: string,
   cloneRunId: string,
   serviceMounts: ReadonlyMap<string, readonly ComposeServiceMount[]>,
-): {
+  statefulServiceNames: ReadonlySet<string>,
+): Promise<{
   readonly serviceMounts: ReadonlyMap<string, readonly ComposeServiceMount[]>;
   readonly volumeClones: readonly VolumeClonePlan[];
-} {
+  readonly volumeMappings: readonly VolumeCloneMapping[];
+}> {
   const clonedBySource = new Map<string, string>();
   const volumeClones: VolumeClonePlan[] = [];
+  const volumeMappings: VolumeCloneMapping[] = [];
   const clonedServiceMounts = new Map<string, readonly ComposeServiceMount[]>();
 
   for (const [serviceName, mounts] of serviceMounts) {
+    const shouldCloneBindMounts = statefulServiceNames.has(serviceName);
     clonedServiceMounts.set(
       serviceName,
-      mounts.map((mount) => {
-        if (mount.type !== "volume") {
+      await Promise.all(
+        mounts.map(async (mount) => {
+          if (mount.type === "volume") {
+            const clonedMount = cloneVolumeBackedMount(
+              attachedProjectName,
+              cloneRunId,
+              mount,
+              serviceName,
+              "volume",
+              mount.originalVolumeName,
+              clonedBySource,
+              volumeClones,
+              volumeMappings,
+            );
+
+            return clonedMount;
+          }
+
+          if (mount.type === "bind" && shouldCloneBindMounts) {
+            await assertCloneableBindMount(serviceName, mount);
+            return cloneVolumeBackedMount(
+              attachedProjectName,
+              cloneRunId,
+              {
+                type: "volume",
+                sourceKey: buildVolumeSourceKey(mount.source),
+                volumeName: mount.source,
+                originalVolumeName: mount.source,
+                target: mount.target,
+                readOnly: mount.readOnly,
+              },
+              serviceName,
+              "bind",
+              mount.source,
+              clonedBySource,
+              volumeClones,
+              volumeMappings,
+            );
+          }
+
           return mount;
-        }
-
-        let targetVolumeName = clonedBySource.get(mount.originalVolumeName);
-        if (targetVolumeName === undefined) {
-          targetVolumeName = buildClonedVolumeName(attachedProjectName, mount.originalVolumeName, cloneRunId);
-          clonedBySource.set(mount.originalVolumeName, targetVolumeName);
-          volumeClones.push({
-            sourceVolumeName: mount.originalVolumeName,
-            targetVolumeName,
-          });
-        }
-
-        return {
-          ...mount,
-          volumeName: targetVolumeName,
-        };
-      }),
+        }),
+      ),
     );
   }
 
   return {
     serviceMounts: clonedServiceMounts,
     volumeClones,
+    volumeMappings,
   };
+}
+
+function cloneVolumeBackedMount(
+  attachedProjectName: string,
+  cloneRunId: string,
+  mount: ComposeVolumeMount,
+  serviceName: string,
+  sourceKind: "volume" | "bind",
+  sourceName: string,
+  clonedBySource: Map<string, string>,
+  volumeClones: VolumeClonePlan[],
+  volumeMappings: VolumeCloneMapping[],
+): ComposeVolumeMount {
+  const sourceIdentity = `${sourceKind}:${sourceName}`;
+  let targetVolumeName = clonedBySource.get(sourceIdentity);
+  if (targetVolumeName === undefined) {
+    targetVolumeName = buildClonedVolumeName(attachedProjectName, sourceIdentity, cloneRunId);
+    clonedBySource.set(sourceIdentity, targetVolumeName);
+    volumeClones.push({
+      sourceKind,
+      sourceName,
+      targetVolumeName,
+    });
+  }
+
+  volumeMappings.push({
+    serviceName,
+    sourceKind,
+    sourceName,
+    targetVolumeName,
+    containerPath: mount.target,
+    readOnly: mount.readOnly,
+  });
+
+  return {
+    ...mount,
+    sourceKey: buildVolumeSourceKey(targetVolumeName),
+    volumeName: targetVolumeName,
+  };
+}
+
+async function assertCloneableBindMount(serviceName: string, mount: ComposeBindMount): Promise<void> {
+  const stat = await fs.stat(mount.source).catch(() => undefined);
+  if (stat === undefined) {
+    throw new Error(`Compose service ${serviceName} bind mount ${mount.source} does not exist and cannot be safely cloned.`);
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(
+      `Compose service ${serviceName} bind mount ${mount.source} targets ${mount.target}, but file bind mounts cannot be safely cloned into an isolated volume.`,
+    );
+  }
+}
+
+function buildVolumeMutationMappings(volumeMappings: readonly VolumeCloneMapping[]): readonly ComposeVolumeMutationMapping[] {
+  return volumeMappings.map((mapping) => ({ ...mapping }));
 }
 
 function buildClonedVolumeName(attachedProjectName: string, originalVolumeName: string, cloneRunId: string): string {
@@ -956,6 +1132,18 @@ function findInspectServiceName(row: RuntimeContainerInspectRow): string | undef
   return readObjectLabel(row.Config?.Labels, "com.docker.compose.service", "io.podman.compose.service");
 }
 
+function findInspectedServiceContainer(
+  row: RuntimeContainerInspectRow,
+  containers: readonly ComposeServiceContainer[],
+): ComposeServiceContainer | undefined {
+  const inspectedId = (row.Id ?? row.ID)?.trim();
+  if (inspectedId === undefined || inspectedId.length === 0) {
+    return undefined;
+  }
+
+  return containers.find((container) => sameContainerId(container.id, inspectedId));
+}
+
 function parseContainerMounts(
   serviceName: string,
   mounts: readonly RuntimeContainerMount[],
@@ -1024,8 +1212,23 @@ function sanitizeComposeProjectSegment(value: string): string | undefined {
   return sanitized.length === 0 ? undefined : sanitized;
 }
 
+function sanitizeContainerNameSegment(value: string): string | undefined {
+  const sanitized = value
+    .trim()
+    .replace(/^\/+/, "")
+    .replace(/[^A-Za-z0-9_.-]+/g, "-")
+    .replace(/^[^A-Za-z0-9]+/, "")
+    .replace(/[_.-]+$/g, "");
+
+  return sanitized.length === 0 ? undefined : sanitized;
+}
+
 function trimProjectName(value: string, maxLength: number): string {
   return value.slice(0, maxLength).replace(/[-_]+$/g, "") || "network";
+}
+
+function trimContainerName(value: string, maxLength: number): string {
+  return value.slice(0, maxLength).replace(/[_.-]+$/g, "") || "pm-container";
 }
 
 function quoteYamlString(value: string): string {
@@ -1035,6 +1238,10 @@ function quoteYamlString(value: string): string {
 function readRuntimeContainerId(row: RuntimeContainerRow): string | undefined {
   const id = (row.ID ?? row.Id)?.trim();
   return id === undefined || id.length === 0 ? undefined : id;
+}
+
+function sameContainerId(left: string, right: string): boolean {
+  return left === right || left.startsWith(right) || right.startsWith(left);
 }
 
 function uniqueStrings(values: readonly string[]): readonly string[] {
