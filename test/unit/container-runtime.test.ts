@@ -298,6 +298,71 @@ test("recovers persisted clone attachment logical ports from original container 
   assert.equal(ports[0]?.processId, "managed-process-2");
 });
 
+test("refreshes clone hidden host ports after compose recreates containers", async () => {
+  const adapter = new ContainerServiceDiscoveryAdapter({
+    runCommand: async (_executable, args) => {
+      if (args.includes("-a")) {
+        return {
+          stdout: [
+            JSON.stringify({
+              ID: "clone123",
+              Names: "network-workspace-postgres-1",
+              Ports: "127.0.0.1:51612->5432/tcp",
+              Labels:
+                "com.docker.compose.project=network-workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml,/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml",
+            }),
+            JSON.stringify({
+              ID: "original123",
+              Names: "workspace-postgres-1",
+              Ports: "",
+              Labels:
+                "com.docker.compose.project=workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml,desktop.docker.io/ports.scheme=v2,desktop.docker.io/ports/5432/tcp=:15432",
+            }),
+          ].join("\n"),
+          stderr: "",
+        };
+      }
+
+      return {
+        stdout: JSON.stringify({
+          ID: "clone123",
+          Names: "network-workspace-postgres-1",
+          Ports: "127.0.0.1:51612->5432/tcp",
+          Labels:
+            "com.docker.compose.project=network-workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml,/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml",
+        }),
+        stderr: "",
+      };
+    },
+  });
+
+  const ports = await adapter.refreshComposePublishedPorts(
+    { containerRuntime: "docker", containerImage: "alpine:3.20" },
+    "network-workspace",
+    [
+      "/workspace/compose.yaml",
+      "/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml",
+    ],
+    [
+      {
+        serviceName: "db",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 63816,
+        containerPort: 5432,
+        protocol: "tcp",
+        protocolName: "postgresql",
+        processId: "managed-process-14",
+      },
+    ],
+  );
+
+  assert.equal(ports[0]?.logicalPort, 15432);
+  assert.equal(ports[0]?.actualHostAddress, "127.0.0.1");
+  assert.equal(ports[0]?.actualHostPort, 51612);
+  assert.equal(ports[0]?.processId, "managed-process-14");
+});
+
 test("mutates compose services into a hidden network-scoped project", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-mutator-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));

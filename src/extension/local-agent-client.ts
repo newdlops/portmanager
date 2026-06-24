@@ -307,11 +307,11 @@ export class LocalAgentClient implements PortManagerProcessService {
     }
 
     const releaseStartupLock = await this.acquireAgentStartupLock();
-    if (this.socket && !this.socket.destroyed) {
-      releaseStartupLock();
-      return;
-    }
     try {
+      if (this.socket && !this.socket.destroyed) {
+        return;
+      }
+
       try {
         this.socket = await this.openSocket();
         this.attachSocketHandlers(this.socket);
@@ -319,26 +319,26 @@ export class LocalAgentClient implements PortManagerProcessService {
       } catch {
         this.startAgentProcess();
       }
+
+      const deadline = Date.now() + 5000;
+      let lastError: unknown;
+
+      while (Date.now() < deadline) {
+        await delay(150);
+
+        try {
+          this.socket = await this.openSocket();
+          this.attachSocketHandlers(this.socket);
+          return;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+
+      throw lastError instanceof Error ? lastError : new Error("Failed to connect to Port Manager agent.");
     } finally {
       releaseStartupLock();
     }
-
-    const deadline = Date.now() + 5000;
-    let lastError: unknown;
-
-    while (Date.now() < deadline) {
-      await delay(150);
-
-      try {
-        this.socket = await this.openSocket();
-        this.attachSocketHandlers(this.socket);
-        return;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-
-    throw lastError instanceof Error ? lastError : new Error("Failed to connect to Port Manager agent.");
   }
 
   /** Serializes daemon startup across extension hosts in different VS Code windows. */

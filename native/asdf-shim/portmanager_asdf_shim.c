@@ -167,6 +167,49 @@ static const char *pm_network_id_from_route_table_path(void) {
   return network_id_from_route_table;
 }
 
+static const char *pm_network_id_from_compose_routing_file(void) {
+  const char *routing_file = getenv("PORT_MANAGER_COMPOSE_ROUTING_FILE");
+  const char *base_name;
+  const char *compose_separator;
+  const char *prefix = "compose-project-routing-";
+  const char *suffix = ".tsv";
+  size_t prefix_length = strlen(prefix);
+  size_t suffix_length = strlen(suffix);
+  size_t base_length;
+  size_t scoped_length;
+  size_t network_length;
+  static char network_id_from_compose_file[PM_MAX_TEXT];
+
+  if (routing_file == NULL || routing_file[0] == '\0') {
+    return NULL;
+  }
+
+  base_name = strrchr(routing_file, '/');
+  base_name = base_name == NULL ? routing_file : base_name + 1;
+  base_length = strlen(base_name);
+
+  if (base_length <= prefix_length + suffix_length || strncmp(base_name, prefix, prefix_length) != 0) {
+    return NULL;
+  }
+
+  if (strcmp(base_name + base_length - suffix_length, suffix) != 0) {
+    return NULL;
+  }
+
+  scoped_length = base_length - prefix_length - suffix_length;
+  compose_separator = strstr(base_name + prefix_length, ".compose-");
+  network_length = compose_separator == NULL
+    ? scoped_length
+    : (size_t)(compose_separator - (base_name + prefix_length));
+  if (network_length == 0 || network_length >= sizeof(network_id_from_compose_file)) {
+    return NULL;
+  }
+
+  memcpy(network_id_from_compose_file, base_name + prefix_length, network_length);
+  network_id_from_compose_file[network_length] = '\0';
+  return network_id_from_compose_file;
+}
+
 static void pm_export_network_scope(const char *network_id) {
   if (network_id == NULL || network_id[0] == '\0') {
     return;
@@ -179,17 +222,10 @@ static void pm_export_network_scope(const char *network_id) {
 }
 
 static void pm_restore_network_scope(void) {
-  const char *network_id = pm_network_id_from_bash_env();
+  const char *network_id = getenv("PORT_MANAGER_NETWORK_ID");
   const char *borrowed_network_id = getenv("PORT_MANAGER_BORROWED_NETWORK_ID");
   const char *alias_network_id = getenv("NEWDLOPS_PM_NETWORK_ID");
   const char *alias_borrowed_network_id = getenv("NEWDLOPS_PM_BORROWED_NETWORK_ID");
-
-  if (network_id != NULL && network_id[0] != '\0') {
-    pm_export_network_scope(network_id);
-    return;
-  }
-
-  network_id = getenv("PORT_MANAGER_NETWORK_ID");
 
   if (network_id == NULL || network_id[0] == '\0') {
     network_id = borrowed_network_id;
@@ -201,6 +237,14 @@ static void pm_restore_network_scope(void) {
 
   if (network_id == NULL || network_id[0] == '\0') {
     network_id = alias_borrowed_network_id;
+  }
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    network_id = pm_network_id_from_bash_env();
+  }
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    network_id = pm_network_id_from_compose_routing_file();
   }
 
   if (network_id == NULL || network_id[0] == '\0') {

@@ -79,6 +79,38 @@ export class ContainerServiceDiscoveryAdapter {
     return ports;
   }
 
+  /**
+   * Refreshes Docker-assigned host ports for an attached compose project.
+   *
+   * Hidden clone projects publish container ports with an empty HostPort, so
+   * Docker can assign a different concrete localhost port every time compose
+   * recreates or starts a container. Persisted attachments keep the stable
+   * logical port and use this refresh to chase only the live actual endpoint.
+   */
+  async refreshComposePublishedPorts(
+    settings: ContainerRuntimeSettings,
+    projectName: string,
+    composeFiles: readonly string[],
+    ports: readonly ComposePublishedPort[],
+  ): Promise<readonly ComposePublishedPort[]> {
+    if (ports.length === 0 || projectName.trim().length === 0) {
+      return ports;
+    }
+
+    for (const executable of runtimeCandidates(settings.containerRuntime)) {
+      try {
+        const runningRows = await this.listRuntimeRows(executable, false);
+        const contextRows = await this.listRuntimeRows(executable, true).catch(() => runningRows);
+        const candidates = parseContainerRows(executable, runningRows, contextRows);
+        return refreshPortsFromCandidates(projectName, composeFiles, ports, candidates);
+      } catch {
+        // Try the next configured runtime.
+      }
+    }
+
+    return ports;
+  }
+
   /** Reads JSON rows from `docker container ls` or `podman container ls`. */
   private async listRuntimeRows(
     executable: "docker" | "podman",
@@ -372,6 +404,84 @@ function recoverPortsFromContext(
   });
 }
 
+function refreshPortsFromCandidates(
+  projectName: string,
+  composeFiles: readonly string[],
+  ports: readonly ComposePublishedPort[],
+  candidates: readonly ContainerServiceCandidate[],
+): readonly ComposePublishedPort[] {
+  const livePortsByKey = new Map<string, ComposePublishedPort | undefined>();
+
+  for (const candidate of candidates) {
+    if (
+      candidate.composeProject !== projectName ||
+      !composeCandidateMatchesFiles(candidate.composeConfigFiles ?? [], composeFiles)
+    ) {
+      continue;
+    }
+
+    for (const livePort of candidate.ports) {
+      const key = buildComposeEndpointKey(livePort);
+      const existingPort = livePortsByKey.get(key);
+      if (!livePortsByKey.has(key)) {
+        livePortsByKey.set(key, livePort);
+        continue;
+      }
+
+      livePortsByKey.set(key, samePublishedEndpoint(existingPort, livePort) ? existingPort : undefined);
+    }
+  }
+
+  return ports.map((port) => {
+    const livePort = livePortsByKey.get(buildComposeEndpointKey(port));
+    if (livePort === undefined) {
+      return port;
+    }
+
+    return {
+      ...port,
+      logicalPort: resolveRefreshedLogicalPort(port, livePort),
+      actualHostAddress: livePort.actualHostAddress,
+      actualHostPort: livePort.actualHostPort,
+      ...(port.protocolName === undefined && livePort.protocolName !== undefined
+        ? { protocolName: livePort.protocolName }
+        : {}),
+    };
+  });
+}
+
+function resolveRefreshedLogicalPort(storedPort: ComposePublishedPort, livePort: ComposePublishedPort): number {
+  if (livePort.logicalPort !== livePort.actualHostPort || storedPort.logicalPort === storedPort.actualHostPort) {
+    return livePort.logicalPort;
+  }
+
+  return storedPort.logicalPort;
+}
+
+function composeCandidateMatchesFiles(
+  candidateFiles: readonly string[],
+  expectedFiles: readonly string[],
+): boolean {
+  if (candidateFiles.length === 0 || expectedFiles.length === 0) {
+    return true;
+  }
+
+  const candidateFileSet = new Set(candidateFiles.map(normalizeComposeFileKey));
+  return expectedFiles.map(normalizeComposeFileKey).every((file) => candidateFileSet.has(file));
+}
+
+function samePublishedEndpoint(
+  left: ComposePublishedPort | undefined,
+  right: ComposePublishedPort,
+): left is ComposePublishedPort {
+  return (
+    left !== undefined &&
+    left.logicalPort === right.logicalPort &&
+    left.actualHostAddress === right.actualHostAddress &&
+    left.actualHostPort === right.actualHostPort
+  );
+}
+
 function readPortManagerLogicalPortLabels(labels: ReadonlyMap<string, string>): ReadonlyMap<string, number> {
   const ports = new Map<string, number>();
   const prefix = "newdlops.portmanager.logical-port.";
@@ -445,6 +555,10 @@ function normalizeComposeFileKey(file: string): string {
 
 function buildPortOverrideKey(containerPort: number, protocol: string): string {
   return `${containerPort}/${protocol}`;
+}
+
+function buildComposeEndpointKey(port: ComposePublishedPort): string {
+  return `${port.serviceName}:${port.containerPort}:${port.protocol}`;
 }
 
 function parseComposeConfigFiles(value: string | undefined): readonly string[] {

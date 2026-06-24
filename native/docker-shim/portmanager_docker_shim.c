@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <limits.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -25,6 +26,9 @@
 
 #define PM_RUNTIME_SHIM_DIR_ENV "PORT_MANAGER_RUNTIME_SHIM_DIR"
 #define PM_COMPOSE_ROUTING_FILE_ENV "PORT_MANAGER_COMPOSE_ROUTING_FILE"
+#define PM_COMPOSE_ROUTING_FILE_PREFIX "compose-project-routing-"
+#define PM_COMPOSE_ROUTING_FILE_SUFFIX ".tsv"
+#define PM_COMPOSE_ROUTING_COMPOSE_SEPARATOR ".compose-"
 
 typedef struct {
   char kind[16];
@@ -334,6 +338,96 @@ static const char *pm_network_id_from_route_table_path(void) {
   return network_id_from_route_table;
 }
 
+static const char *pm_network_id_from_compose_routing_file(void) {
+  const char *routing_file = getenv(PM_COMPOSE_ROUTING_FILE_ENV);
+  const char *base_name;
+  const char *compose_separator;
+  size_t prefix_length = strlen(PM_COMPOSE_ROUTING_FILE_PREFIX);
+  size_t suffix_length = strlen(PM_COMPOSE_ROUTING_FILE_SUFFIX);
+  size_t base_length;
+  size_t scoped_length;
+  size_t network_length;
+  static char network_id_from_compose_file[PM_MAX_FIELD];
+
+  /*
+   * Per-network Compose maps let child-process Docker calls recover scope even
+   * when launcher boundaries dropped the explicit network variables.
+   */
+  if (routing_file == NULL || routing_file[0] == '\0') {
+    return NULL;
+  }
+
+  base_name = strrchr(routing_file, '/');
+  base_name = base_name == NULL ? routing_file : base_name + 1;
+  base_length = strlen(base_name);
+
+  if (base_length <= prefix_length + suffix_length || strncmp(base_name, PM_COMPOSE_ROUTING_FILE_PREFIX, prefix_length) != 0) {
+    return NULL;
+  }
+
+  if (strcmp(base_name + base_length - suffix_length, PM_COMPOSE_ROUTING_FILE_SUFFIX) != 0) {
+    return NULL;
+  }
+
+  scoped_length = base_length - prefix_length - suffix_length;
+  compose_separator = strstr(base_name + prefix_length, PM_COMPOSE_ROUTING_COMPOSE_SEPARATOR);
+  network_length = compose_separator == NULL
+    ? scoped_length
+    : (size_t)(compose_separator - (base_name + prefix_length));
+  if (network_length == 0 || network_length >= sizeof(network_id_from_compose_file)) {
+    return NULL;
+  }
+
+  memcpy(network_id_from_compose_file, base_name + prefix_length, network_length);
+  network_id_from_compose_file[network_length] = '\0';
+  return network_id_from_compose_file;
+}
+
+/** Extracts the logical network suffix from a scoped route-table filename. */
+static int pm_route_table_path_network_id(const char *route_file, char *network_id, size_t size) {
+  const char *base_name;
+  const char *prefix = "newdlops-portmanager-routes-";
+  const char *suffix = ".json";
+  const char *scope_start;
+  size_t prefix_length = strlen(prefix);
+  size_t suffix_length = strlen(suffix);
+  size_t base_length;
+  size_t body_length;
+  size_t network_length;
+
+  if (route_file == NULL || route_file[0] == '\0' || network_id == NULL || size == 0) {
+    return -1;
+  }
+
+  base_name = strrchr(route_file, '/');
+  base_name = base_name == NULL ? route_file : base_name + 1;
+  base_length = strlen(base_name);
+
+  if (base_length <= prefix_length + suffix_length || strncmp(base_name, prefix, prefix_length) != 0) {
+    return -1;
+  }
+
+  if (strcmp(base_name + base_length - suffix_length, suffix) != 0) {
+    return -1;
+  }
+
+  body_length = base_length - prefix_length - suffix_length;
+  scope_start = memchr(base_name + prefix_length, '-', body_length);
+  if (scope_start == NULL) {
+    return -1;
+  }
+
+  scope_start++;
+  network_length = (size_t)((base_name + prefix_length + body_length) - scope_start);
+  if (network_length == 0 || network_length >= size) {
+    return -1;
+  }
+
+  memcpy(network_id, scope_start, network_length);
+  network_id[network_length] = '\0';
+  return 0;
+}
+
 /** Chooses the active logical network from the terminal hook environment. */
 static const char *pm_network_id(void) {
   const char *network_id = getenv("PORT_MANAGER_NETWORK_ID");
@@ -351,10 +445,123 @@ static const char *pm_network_id(void) {
   }
 
   if (network_id == NULL || network_id[0] == '\0') {
+    network_id = pm_network_id_from_compose_routing_file();
+  }
+
+  if (network_id == NULL || network_id[0] == '\0') {
     network_id = pm_network_id_from_route_table_path();
   }
 
   return network_id;
+}
+
+/** Returns the daemon's global route table used as the base for scoped tables. */
+static void pm_default_global_route_table_path(char *buffer, size_t size) {
+  const char *configured = getenv("PORT_MANAGER_GLOBAL_ROUTES_FILE");
+
+  if (buffer == NULL || size == 0) {
+    return;
+  }
+
+  if (configured != NULL && configured[0] != '\0') {
+    snprintf(buffer, size, "%s", configured);
+    return;
+  }
+
+  snprintf(buffer, size, "/tmp/newdlops-portmanager-routes-%ld.json", (long)getuid());
+}
+
+/** Mirrors route-table.ts scope sanitization for native fallback paths. */
+static void pm_sanitize_route_table_scope(const char *value, char *buffer, size_t size) {
+  size_t used = 0;
+
+  if (buffer == NULL || size == 0) {
+    return;
+  }
+
+  if (value == NULL) {
+    buffer[0] = '\0';
+    return;
+  }
+
+  for (size_t index = 0; value[index] != '\0' && used + 1 < size && used < 120; index++) {
+    unsigned char ch = (unsigned char)value[index];
+    buffer[used++] = (isalnum(ch) || ch == '_' || ch == '.' || ch == '-') ? (char)ch : '_';
+  }
+
+  if (used == 0 && size > 1) {
+    snprintf(buffer, size, "network");
+    return;
+  }
+
+  buffer[used] = '\0';
+}
+
+/** Builds the network-scoped route table path for the current logical network. */
+static int pm_scoped_route_table_path(const char *base_route_table_path, const char *network_id, char *buffer, size_t size) {
+  const char *slash;
+  const char *file_name;
+  const char *extension;
+  size_t directory_length;
+  size_t stem_length;
+  char scope[PM_MAX_FIELD];
+
+  if (base_route_table_path == NULL || base_route_table_path[0] == '\0' || network_id == NULL || network_id[0] == '\0' ||
+      buffer == NULL || size == 0) {
+    return -1;
+  }
+
+  pm_sanitize_route_table_scope(network_id, scope, sizeof(scope));
+  slash = strrchr(base_route_table_path, '/');
+  directory_length = slash == NULL ? 0 : (size_t)(slash - base_route_table_path);
+  file_name = slash == NULL ? base_route_table_path : slash + 1;
+  extension = strrchr(file_name, '.');
+  if (extension == NULL) {
+    extension = ".json";
+    stem_length = strlen(file_name);
+  } else {
+    stem_length = (size_t)(extension - file_name);
+  }
+
+  if (directory_length > 0) {
+    snprintf(buffer, size, "%.*s/%.*s-%s%s", (int)directory_length, base_route_table_path, (int)stem_length, file_name, scope, extension);
+  } else {
+    snprintf(buffer, size, "%.*s-%s%s", (int)stem_length, file_name, scope, extension);
+  }
+
+  return buffer[0] == '\0' ? -1 : 0;
+}
+
+/**
+ * Reads fallback compose routes from the current network table, not from a
+ * stale route-table env inherited from another attached terminal.
+ */
+static const char *pm_effective_route_table_path(void) {
+  const char *network_id = pm_network_id();
+  const char *configured = getenv("PORT_MANAGER_ROUTES_FILE");
+  char configured_network[PM_MAX_FIELD];
+  static char route_table_path[PM_MAX_PATH];
+  char base_route_table_path[PM_MAX_PATH];
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    return configured;
+  }
+
+  if (
+    configured != NULL &&
+    configured[0] != '\0' &&
+    pm_route_table_path_network_id(configured, configured_network, sizeof(configured_network)) == 0 &&
+    strcmp(configured_network, network_id) == 0
+  ) {
+    return configured;
+  }
+
+  pm_default_global_route_table_path(base_route_table_path, sizeof(base_route_table_path));
+  if (pm_scoped_route_table_path(base_route_table_path, network_id, route_table_path, sizeof(route_table_path)) == 0) {
+    return route_table_path;
+  }
+
+  return configured;
 }
 
 /** Splits one tab-separated route row written by serializeComposeProjectRoutingRows. */
@@ -401,6 +608,100 @@ static int pm_parse_route_row(char *line, pm_route_row *row) {
   pm_trim_line_end(row->service_name);
 
   return row->kind[0] != '\0';
+}
+
+typedef int (*pm_compose_routing_file_callback)(const char *file_path, void *context);
+
+/**
+ * Visits per-compose route maps next to a per-network anchor file.
+ * The anchor preserves network identity in inherited environments, while the
+ * compose-specific files avoid row-order matching across unrelated projects.
+ */
+static int pm_visit_scoped_compose_routing_files(
+  const char *anchor_file_path,
+  pm_compose_routing_file_callback callback,
+  void *context,
+  int *visited_count
+) {
+  const char *base_name;
+  const char *slash;
+  size_t directory_length;
+  size_t base_length;
+  size_t suffix_length = strlen(PM_COMPOSE_ROUTING_FILE_SUFFIX);
+  size_t stem_length;
+  char directory_path[PM_MAX_PATH];
+  char file_name_prefix[PM_MAX_PATH];
+  DIR *directory;
+  struct dirent *entry;
+
+  if (visited_count != NULL) {
+    *visited_count = 0;
+  }
+
+  if (anchor_file_path == NULL || anchor_file_path[0] == '\0' || callback == NULL) {
+    return -1;
+  }
+
+  slash = strrchr(anchor_file_path, '/');
+  base_name = slash == NULL ? anchor_file_path : slash + 1;
+  directory_length = slash == NULL ? 1 : (size_t)(slash - anchor_file_path);
+  base_length = strlen(base_name);
+
+  if (base_length <= suffix_length ||
+      strncmp(base_name, PM_COMPOSE_ROUTING_FILE_PREFIX, strlen(PM_COMPOSE_ROUTING_FILE_PREFIX)) != 0 ||
+      strcmp(base_name + base_length - suffix_length, PM_COMPOSE_ROUTING_FILE_SUFFIX) != 0) {
+    return -1;
+  }
+
+  if (strstr(base_name, PM_COMPOSE_ROUTING_COMPOSE_SEPARATOR) != NULL) {
+    return -1;
+  }
+
+  if (slash == NULL) {
+    snprintf(directory_path, sizeof(directory_path), ".");
+  } else if (directory_length >= sizeof(directory_path)) {
+    return -1;
+  } else {
+    memcpy(directory_path, anchor_file_path, directory_length);
+    directory_path[directory_length] = '\0';
+  }
+
+  stem_length = base_length - suffix_length;
+  if (stem_length + strlen(PM_COMPOSE_ROUTING_COMPOSE_SEPARATOR) >= sizeof(file_name_prefix)) {
+    return -1;
+  }
+
+  memcpy(file_name_prefix, base_name, stem_length);
+  file_name_prefix[stem_length] = '\0';
+  strncat(file_name_prefix, PM_COMPOSE_ROUTING_COMPOSE_SEPARATOR, sizeof(file_name_prefix) - strlen(file_name_prefix) - 1);
+
+  directory = opendir(directory_path);
+  if (directory == NULL) {
+    return -1;
+  }
+
+  while ((entry = readdir(directory)) != NULL) {
+    char scoped_file_path[PM_MAX_PATH];
+    size_t entry_length = strlen(entry->d_name);
+
+    if (entry_length <= suffix_length ||
+        strncmp(entry->d_name, file_name_prefix, strlen(file_name_prefix)) != 0 ||
+        strcmp(entry->d_name + entry_length - suffix_length, PM_COMPOSE_ROUTING_FILE_SUFFIX) != 0) {
+      continue;
+    }
+
+    if (snprintf(scoped_file_path, sizeof(scoped_file_path), "%s/%s", directory_path, entry->d_name) >= (int)sizeof(scoped_file_path)) {
+      continue;
+    }
+
+    if (visited_count != NULL) {
+      (*visited_count)++;
+    }
+    callback(scoped_file_path, context);
+  }
+
+  closedir(directory);
+  return 0;
 }
 
 /** Cwd matching mirrors the shell shim's lexical PWD check plus physical path fallback. */
@@ -551,6 +852,176 @@ static int pm_argv_references_compose_file(int argc, char **argv, const char *ex
   }
 
   return 0;
+}
+
+/** Copies the last path component after trimming trailing slashes. */
+static int pm_path_basename_component(const char *path_value, char *buffer, size_t size) {
+  const char *end;
+  const char *start;
+  size_t length;
+
+  if (path_value == NULL || path_value[0] == '\0' || buffer == NULL || size == 0) {
+    return -1;
+  }
+
+  end = path_value + strlen(path_value);
+  while (end > path_value + 1 && end[-1] == '/') {
+    end--;
+  }
+
+  start = end;
+  while (start > path_value && start[-1] != '/') {
+    start--;
+  }
+
+  length = (size_t)(end - start);
+  if (length == 0 || length >= size) {
+    return -1;
+  }
+
+  memcpy(buffer, start, length);
+  buffer[length] = '\0';
+  return 0;
+}
+
+/** Infers Compose's default project name from a directory path when no -p is present. */
+static int pm_compose_project_name_from_directory(const char *directory, char *buffer, size_t size) {
+  char combined[PM_MAX_PATH];
+  char resolved[PM_MAX_PATH];
+  const char *source = directory;
+
+  if (directory == NULL || directory[0] == '\0' || buffer == NULL || size == 0) {
+    return -1;
+  }
+
+  if (directory[0] != '/') {
+    char cwd[PM_MAX_PATH];
+    if (getcwd(cwd, sizeof(cwd)) != NULL) {
+      snprintf(combined, sizeof(combined), "%s/%s", cwd, directory);
+      source = combined;
+    }
+  }
+
+  if (realpath(source, resolved) != NULL) {
+    source = resolved;
+  }
+
+  return pm_path_basename_component(source, buffer, size);
+}
+
+/** Infers Compose's default project name from the first -f/--file argument. */
+static int pm_compose_project_name_from_file(const char *file_path, char *buffer, size_t size) {
+  char normalized[PM_MAX_PATH];
+  char *slash;
+
+  if (pm_normalize_compose_file_path(file_path, normalized, sizeof(normalized)) != 0) {
+    return -1;
+  }
+
+  slash = strrchr(normalized, '/');
+  if (slash == NULL) {
+    return -1;
+  }
+
+  *slash = '\0';
+  return pm_compose_project_name_from_directory(normalized, buffer, size);
+}
+
+/**
+ * Returns the project name this compose invocation is expected to target.
+ * This intentionally mirrors the common Compose precedence enough for routing:
+ * explicit -p, COMPOSE_PROJECT_NAME, --project-directory, first -f, then cwd.
+ */
+static int pm_compose_requested_project_name(int argc, char **argv, char *buffer, size_t size) {
+  int next_is_project = 0;
+  int next_is_file = 0;
+  int next_is_project_directory = 0;
+  char first_file[PM_MAX_PATH] = "";
+  char project_directory[PM_MAX_PATH] = "";
+  const char *env_project = getenv("COMPOSE_PROJECT_NAME");
+
+  if (buffer == NULL || size == 0) {
+    return -1;
+  }
+  buffer[0] = '\0';
+
+  for (int index = 1; index < argc; index++) {
+    const char *arg = argv[index];
+
+    if (next_is_project) {
+      pm_copy(buffer, size, arg);
+      return buffer[0] == '\0' ? -1 : 0;
+    }
+
+    if (next_is_file) {
+      next_is_file = 0;
+      if (first_file[0] == '\0') {
+        pm_copy(first_file, sizeof(first_file), arg);
+      }
+      continue;
+    }
+
+    if (next_is_project_directory) {
+      next_is_project_directory = 0;
+      pm_copy(project_directory, sizeof(project_directory), arg);
+      continue;
+    }
+
+    if (strcmp(arg, "-p") == 0 || strcmp(arg, "--project-name") == 0) {
+      next_is_project = 1;
+      continue;
+    }
+
+    if (strncmp(arg, "--project-name=", 15) == 0) {
+      pm_copy(buffer, size, arg + 15);
+      return buffer[0] == '\0' ? -1 : 0;
+    }
+
+    if (strncmp(arg, "-p", 2) == 0 && arg[2] != '\0') {
+      pm_copy(buffer, size, arg + 2);
+      return buffer[0] == '\0' ? -1 : 0;
+    }
+
+    if (strcmp(arg, "-f") == 0 || strcmp(arg, "--file") == 0) {
+      next_is_file = 1;
+      continue;
+    }
+
+    if (strncmp(arg, "--file=", 7) == 0 && first_file[0] == '\0') {
+      pm_copy(first_file, sizeof(first_file), arg + 7);
+      continue;
+    }
+
+    if (strncmp(arg, "-f", 2) == 0 && arg[2] != '\0' && first_file[0] == '\0') {
+      pm_copy(first_file, sizeof(first_file), arg + 2);
+      continue;
+    }
+
+    if (strcmp(arg, "--project-directory") == 0) {
+      next_is_project_directory = 1;
+      continue;
+    }
+
+    if (strncmp(arg, "--project-directory=", 20) == 0) {
+      pm_copy(project_directory, sizeof(project_directory), arg + 20);
+      continue;
+    }
+  }
+
+  if (env_project != NULL && env_project[0] != '\0') {
+    pm_copy(buffer, size, env_project);
+    return 0;
+  }
+
+  if (project_directory[0] != '\0' && pm_compose_project_name_from_directory(project_directory, buffer, size) == 0) {
+    return 0;
+  }
+
+  if (first_file[0] != '\0' && pm_compose_project_name_from_file(first_file, buffer, size) == 0) {
+    return 0;
+  }
+
+  return pm_compose_project_name_from_directory(".", buffer, size);
 }
 
 static int pm_compose_override_for_project(const char *attached_project, char *buffer, size_t size) {
@@ -819,7 +1290,7 @@ static int pm_find_compose_route_from_route_table(
   char *original_project,
   size_t original_size
 ) {
-  const char *route_file = getenv("PORT_MANAGER_ROUTES_FILE");
+  const char *route_file = pm_effective_route_table_path();
   const char *network_id = pm_network_id();
   char *buffer;
   char *cursor;
@@ -887,23 +1358,38 @@ static int pm_find_compose_route_from_route_table(
   return 0;
 }
 
-/** Finds the most-specific attached compose project for cwd, compose file, runtime, and network. */
-static int pm_find_compose_route(const char *runtime, int argc, char **argv, char *attached_project, size_t attached_size, char *original_project, size_t original_size) {
-  const char *file_path = getenv(PM_COMPOSE_ROUTING_FILE_ENV);
-  const char *network_id = pm_network_id();
+typedef struct {
+  const char *runtime;
+  const char *network_id;
+  char requested_project[PM_MAX_FIELD];
+  int argc;
+  char **argv;
+  char *attached_project;
+  size_t attached_size;
+  char *original_project;
+  size_t original_size;
+  size_t best_length;
+  int context_found;
+  int project_match_count;
+  char project_attached[PM_MAX_FIELD];
+  char project_original[PM_MAX_FIELD];
+  int found;
+} pm_compose_route_search;
+
+/** Scans one compose-specific TSV and updates the best cwd/file match. */
+static int pm_find_compose_route_in_file(const char *file_path, void *context) {
+  pm_compose_route_search *search = (pm_compose_route_search *)context;
   FILE *file;
   char *line = NULL;
   size_t line_capacity = 0;
-  size_t best_length = 0;
-  int found = 0;
 
-  if (file_path == NULL || file_path[0] == '\0' || network_id == NULL || network_id[0] == '\0') {
-    return pm_find_compose_route_from_route_table(runtime, attached_project, attached_size, original_project, original_size);
+  if (file_path == NULL || file_path[0] == '\0' || search == NULL) {
+    return -1;
   }
 
   file = fopen(file_path, "r");
   if (file == NULL) {
-    return pm_find_compose_route_from_route_table(runtime, attached_project, attached_size, original_project, original_size);
+    return -1;
   }
 
   while (getline(&line, &line_capacity, file) >= 0) {
@@ -915,28 +1401,72 @@ static int pm_find_compose_route(const char *runtime, int argc, char **argv, cha
       continue;
     }
 
-    if (strcmp(row.network_id, network_id) != 0 || strcmp(row.runtime, runtime) != 0) {
+    if (strcmp(row.network_id, search->network_id) != 0 || strcmp(row.runtime, search->runtime) != 0) {
       continue;
     }
 
     workdir_length = strlen(row.workdir);
     if (strcmp(row.kind, "project") == 0 && pm_cwd_matches_workdir(row.workdir)) {
       row_matches = 1;
-    } else if (strcmp(row.kind, "file") == 0 && pm_argv_references_compose_file(argc, argv, row.workdir)) {
+    } else if (strcmp(row.kind, "file") == 0 && pm_argv_references_compose_file(search->argc, search->argv, row.workdir)) {
       row_matches = 1;
     }
 
-    if (row_matches && workdir_length >= best_length) {
-      best_length = workdir_length;
-      pm_copy(attached_project, attached_size, row.project_or_original_id);
-      pm_copy(original_project, original_size, row.original_name);
-      found = attached_project[0] != '\0';
+    if (row_matches && workdir_length >= search->best_length) {
+      search->best_length = workdir_length;
+      pm_copy(search->attached_project, search->attached_size, row.project_or_original_id);
+      pm_copy(search->original_project, search->original_size, row.original_name);
+      search->context_found = 1;
+      search->found = search->attached_project[0] != '\0';
+    } else if (strcmp(row.kind, "project") == 0 &&
+               search->requested_project[0] != '\0' &&
+               (strcmp(search->requested_project, row.original_name) == 0 ||
+                strcmp(search->requested_project, row.project_or_original_id) == 0)) {
+      search->project_match_count++;
+      pm_copy(search->project_attached, sizeof(search->project_attached), row.project_or_original_id);
+      pm_copy(search->project_original, sizeof(search->project_original), row.original_name);
     }
   }
 
   free(line);
   fclose(file);
-  return found ? 0 : pm_find_compose_route_from_route_table(runtime, attached_project, attached_size, original_project, original_size);
+  return 0;
+}
+
+/** Finds the most-specific attached compose project for cwd, compose file, runtime, and network. */
+static int pm_find_compose_route(const char *runtime, int argc, char **argv, char *attached_project, size_t attached_size, char *original_project, size_t original_size) {
+  const char *file_path = getenv(PM_COMPOSE_ROUTING_FILE_ENV);
+  const char *network_id = pm_network_id();
+  pm_compose_route_search search;
+  int scoped_file_count = 0;
+
+  if (file_path == NULL || file_path[0] == '\0' || network_id == NULL || network_id[0] == '\0') {
+    return pm_find_compose_route_from_route_table(runtime, attached_project, attached_size, original_project, original_size);
+  }
+
+  memset(&search, 0, sizeof(search));
+  search.runtime = runtime;
+  search.network_id = network_id;
+  (void)pm_compose_requested_project_name(argc, argv, search.requested_project, sizeof(search.requested_project));
+  search.argc = argc;
+  search.argv = argv;
+  search.attached_project = attached_project;
+  search.attached_size = attached_size;
+  search.original_project = original_project;
+  search.original_size = original_size;
+
+  pm_visit_scoped_compose_routing_files(file_path, pm_find_compose_route_in_file, &search, &scoped_file_count);
+  if (scoped_file_count == 0) {
+    pm_find_compose_route_in_file(file_path, &search);
+  }
+
+  if (!search.context_found && search.project_match_count == 1 && search.project_attached[0] != '\0') {
+    pm_copy(attached_project, attached_size, search.project_attached);
+    pm_copy(original_project, original_size, search.project_original);
+    return 0;
+  }
+
+  return search.found ? 0 : pm_find_compose_route_from_route_table(runtime, attached_project, attached_size, original_project, original_size);
 }
 
 /** Allocates one rewritten compose project option argument. */
@@ -1250,7 +1780,7 @@ static int pm_find_compose_project_for_service_from_route_table(
   char *attached_project,
   size_t attached_size
 ) {
-  const char *route_file = getenv("PORT_MANAGER_ROUTES_FILE");
+  const char *route_file = pm_effective_route_table_path();
   const char *network_id = pm_network_id();
   char *buffer;
   char *cursor;
@@ -1313,6 +1843,134 @@ static int pm_find_compose_project_for_service_from_route_table(
   }
 
   pm_copy(attached_project, attached_size, selected_project);
+  return 0;
+}
+
+/** True when a compose-specific TSV belongs to the current cwd or compose-file args. */
+static int pm_compose_routing_file_matches_context(
+  const char *file_path,
+  const char *runtime,
+  const char *network_id,
+  int argc,
+  char **argv
+) {
+  FILE *file;
+  char *line = NULL;
+  size_t line_capacity = 0;
+  char requested_project[PM_MAX_FIELD] = "";
+  int matches = 0;
+
+  if (file_path == NULL || runtime == NULL || network_id == NULL) {
+    return 0;
+  }
+
+  (void)pm_compose_requested_project_name(argc, argv, requested_project, sizeof(requested_project));
+
+  file = fopen(file_path, "r");
+  if (file == NULL) {
+    return 0;
+  }
+
+  while (getline(&line, &line_capacity, file) >= 0) {
+    pm_route_row row;
+
+    if (!pm_parse_route_row(line, &row) ||
+        strcmp(row.network_id, network_id) != 0 ||
+        strcmp(row.runtime, runtime) != 0) {
+      continue;
+    }
+
+    if ((strcmp(row.kind, "project") == 0 && pm_cwd_matches_workdir(row.workdir)) ||
+        (strcmp(row.kind, "file") == 0 && pm_argv_references_compose_file(argc, argv, row.workdir))) {
+      matches = 1;
+      break;
+    }
+
+    if (strcmp(row.kind, "project") == 0 &&
+        requested_project[0] != '\0' &&
+        (strcmp(requested_project, row.original_name) == 0 ||
+         strcmp(requested_project, row.project_or_original_id) == 0)) {
+      matches = 1;
+      break;
+    }
+  }
+
+  free(line);
+  fclose(file);
+  return matches;
+}
+
+typedef struct {
+  const char *runtime;
+  const char *network_id;
+  const char *token;
+  const char *suffix;
+  size_t token_length;
+  int argc;
+  char **argv;
+  int require_context;
+  int context_files;
+  int matches;
+  char target[PM_MAX_FIELD];
+} pm_container_target_search;
+
+/** Scans one compose-specific TSV for a unique container token rewrite. */
+static int pm_container_target_scan_file(const char *file_path, void *context) {
+  pm_container_target_search *search = (pm_container_target_search *)context;
+  FILE *file;
+  char *line = NULL;
+  size_t line_capacity = 0;
+
+  if (file_path == NULL || search == NULL) {
+    return -1;
+  }
+
+  if (search->require_context &&
+      !pm_compose_routing_file_matches_context(file_path, search->runtime, search->network_id, search->argc, search->argv)) {
+    return 0;
+  }
+
+  if (search->require_context) {
+    search->context_files++;
+  }
+
+  file = fopen(file_path, "r");
+  if (file == NULL) {
+    return -1;
+  }
+
+  while (getline(&line, &line_capacity, file) >= 0) {
+    pm_route_row row;
+    int matched = 0;
+
+    if (!pm_parse_route_row(line, &row) || strcmp(row.kind, "container") != 0) {
+      continue;
+    }
+
+    if (strcmp(row.network_id, search->network_id) != 0 || strcmp(row.runtime, search->runtime) != 0) {
+      continue;
+    }
+
+    if (strcmp(search->token, row.original_name) == 0 ||
+        strcmp(search->token, row.attached_name) == 0 ||
+        strcmp(search->token, row.service_name) == 0) {
+      matched = 1;
+    } else if (search->token_length >= 4 &&
+               (pm_has_prefix(row.project_or_original_id, search->token) ||
+                pm_has_prefix(search->token, row.project_or_original_id) ||
+                pm_has_prefix(row.attached_id, search->token) ||
+                pm_has_prefix(search->token, row.attached_id))) {
+      matched = 1;
+    }
+
+    if (matched) {
+      search->matches++;
+      snprintf(search->target, sizeof(search->target), "%s%s", row.attached_id, search->suffix == NULL ? "" : search->suffix);
+    }
+  }
+
+  free(line);
+  fclose(file);
   return 0;
 }
 
@@ -1392,18 +2050,21 @@ static char *pm_container_target_from_route_table(
 }
 
 /** Maps one container token, including cp's container:path suffix, when it is unambiguous. */
-static char *pm_container_target_for_token(const char *runtime, const char *real_runtime_path, const char *token) {
+static char *pm_container_target_for_token(
+  const char *runtime,
+  const char *real_runtime_path,
+  const char *token,
+  int argc,
+  char **argv
+) {
   const char *file_path = getenv(PM_COMPOSE_ROUTING_FILE_ENV);
   const char *network_id = pm_network_id();
   char token_copy[PM_MAX_FIELD];
   char suffix[PM_MAX_FIELD] = "";
-  char target[PM_MAX_FIELD] = "";
   char *colon;
-  FILE *file;
-  char *line = NULL;
-  size_t line_capacity = 0;
   size_t token_length;
-  int matches = 0;
+  pm_container_target_search search;
+  int scoped_file_count = 0;
 
   if (token == NULL || token[0] == '\0') {
     return NULL;
@@ -1425,46 +2086,45 @@ static char *pm_container_target_for_token(const char *runtime, const char *real
     return pm_container_target_from_route_table(runtime, real_runtime_path, token_copy, suffix);
   }
 
-  file = fopen(file_path, "r");
-  if (file == NULL) {
+  memset(&search, 0, sizeof(search));
+  search.runtime = runtime;
+  search.network_id = network_id;
+  search.token = token_copy;
+  search.suffix = suffix;
+  search.token_length = token_length;
+  search.argc = argc;
+  search.argv = argv;
+  search.require_context = 1;
+
+  pm_visit_scoped_compose_routing_files(file_path, pm_container_target_scan_file, &search, &scoped_file_count);
+  if (scoped_file_count > 0 && search.context_files > 0) {
+    if (search.matches == 1 && search.target[0] != '\0') {
+      return strdup(search.target);
+    }
     return pm_container_target_from_route_table(runtime, real_runtime_path, token_copy, suffix);
   }
 
-  while (getline(&line, &line_capacity, file) >= 0) {
-    pm_route_row row;
-    int matched = 0;
-
-    if (!pm_parse_route_row(line, &row) || strcmp(row.kind, "container") != 0) {
-      continue;
-    }
-
-    if (strcmp(row.network_id, network_id) != 0 || strcmp(row.runtime, runtime) != 0) {
-      continue;
-    }
-
-    if (strcmp(token_copy, row.original_name) == 0 ||
-        strcmp(token_copy, row.attached_name) == 0 ||
-        strcmp(token_copy, row.service_name) == 0) {
-      matched = 1;
-    } else if (token_length >= 4 &&
-               (pm_has_prefix(row.project_or_original_id, token_copy) ||
-                pm_has_prefix(token_copy, row.project_or_original_id) ||
-                pm_has_prefix(row.attached_id, token_copy) ||
-                pm_has_prefix(token_copy, row.attached_id))) {
-      matched = 1;
-    }
-
-    if (matched) {
-      matches++;
-      snprintf(target, sizeof(target), "%s%s", row.attached_id, suffix);
-    }
+  if (scoped_file_count > 0) {
+    memset(&search, 0, sizeof(search));
+    search.runtime = runtime;
+    search.network_id = network_id;
+    search.token = token_copy;
+    search.suffix = suffix;
+    search.token_length = token_length;
+    search.argc = argc;
+    search.argv = argv;
+    search.require_context = 0;
+    pm_visit_scoped_compose_routing_files(file_path, pm_container_target_scan_file, &search, NULL);
+  } else {
+    search.require_context = 0;
+    search.context_files = 0;
+    search.matches = 0;
+    search.target[0] = '\0';
+    pm_container_target_scan_file(file_path, &search);
   }
 
-  free(line);
-  fclose(file);
-
-  if (matches == 1 && target[0] != '\0') {
-    return strdup(target);
+  if (search.matches == 1 && search.target[0] != '\0') {
+    return strdup(search.target);
   }
 
   return pm_container_target_from_route_table(runtime, real_runtime_path, token_copy, suffix);
@@ -1480,7 +2140,7 @@ static char **pm_rewrite_container_args(const char *runtime, const char *real_ru
 
   next_argv[0] = (char *)real_runtime_path;
   for (int index = 1; index < argc; index++) {
-    char *target = pm_container_target_for_token(runtime, real_runtime_path, argv[index]);
+    char *target = pm_container_target_for_token(runtime, real_runtime_path, argv[index], argc, argv);
     next_argv[index] = target == NULL ? argv[index] : target;
   }
   next_argv[argc] = NULL;

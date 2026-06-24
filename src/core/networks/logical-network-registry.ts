@@ -107,6 +107,43 @@ export class LogicalNetworkRegistry implements DisposableLike {
     };
   }
 
+  /**
+   * Replaces only durable state loaded from the cross-window shared store.
+   *
+   * Runtime descriptors and discovery candidates are intentionally left intact
+   * because each VS Code window observes its own terminals and platform tools,
+   * while networks, bindings, and compose routes must be host-global.
+   */
+  replacePersistedState(state: LogicalNetworkRegistryState): void {
+    this.networks.clear();
+    this.attachments.clear();
+    this.exposures.clear();
+    this.hostAccessBindings.clear();
+    this.composeAttachments.clear();
+
+    for (const network of state.networks) {
+      this.networks.set(network.id, network);
+    }
+
+    for (const attachment of state.attachments) {
+      this.attachments.set(attachment.id, attachment);
+    }
+
+    for (const exposure of state.exposures) {
+      this.exposures.set(exposure.id, exposure);
+    }
+
+    for (const binding of state.hostAccessBindings ?? []) {
+      this.hostAccessBindings.set(binding.id, binding);
+    }
+
+    for (const attachment of state.composeAttachments ?? []) {
+      this.composeAttachments.set(attachment.id, attachment);
+    }
+
+    this.emitChange();
+  }
+
   /** Replaces runtime descriptors after platform capability checks. */
   setRuntimes(runtimes: readonly NetworkRuntimeDescriptor[]): void {
     this.runtimes = [...runtimes];

@@ -241,6 +241,22 @@ __port_manager_network_id() {
       ;;
   esac
 
+  __pm_compose_routes_path="\${PORT_MANAGER_COMPOSE_ROUTING_FILE:-}"
+  __pm_compose_routes_base="\${__pm_compose_routes_path##*/}"
+  __pm_compose_routes_base="\${__pm_compose_routes_base%.tsv}"
+  case "\${__pm_compose_routes_base}" in
+    compose-project-routing-*)
+      __pm_compose_routes_network="\${__pm_compose_routes_base#compose-project-routing-}"
+      case "\${__pm_compose_routes_network}" in
+        *.compose-*) __pm_compose_routes_network="\${__pm_compose_routes_network%%.compose-*}" ;;
+      esac
+      if [ -n "\${__pm_compose_routes_network}" ]; then
+        printf '%s\\n' "\${__pm_compose_routes_network}"
+        return 0
+      fi
+      ;;
+  esac
+
   __pm_routes_path="\${PORT_MANAGER_ROUTES_FILE:-}"
   __pm_routes_base="\${__pm_routes_path##*/}"
   __pm_routes_base="\${__pm_routes_base%.json}"
@@ -320,21 +336,130 @@ __port_manager_compose_args_reference_file() {
   return 1
 }
 
-__port_manager_compose_route_for_runtime() {
-  __pm_runtime="$1"
-  shift
-  __pm_file="\${PORT_MANAGER_COMPOSE_ROUTING_FILE:-}"
-  __pm_network="$(__port_manager_network_id)"
-  __pm_best_attached_project=""
-  __pm_best_original_project=""
-  __pm_best_length=0
+__port_manager_path_basename() {
+  __pm_path_value="$1"
+  while [ "\${__pm_path_value}" != "/" ]; do
+    case "\${__pm_path_value}" in
+      */) __pm_path_value="\${__pm_path_value%/}" ;;
+      *) break ;;
+    esac
+  done
 
-  if [ -z "\${__pm_file}" ] || [ -z "\${__pm_network}" ] || [ ! -r "\${__pm_file}" ]; then
-    return 1
+  __pm_path_value="\${__pm_path_value##*/}"
+  if [ -n "\${__pm_path_value}" ]; then
+    printf '%s\\n' "\${__pm_path_value}"
+    return 0
   fi
 
+  return 1
+}
+
+__port_manager_compose_project_name_from_directory() {
+  __pm_project_dir="$1"
+  case "\${__pm_project_dir}" in
+    /*) ;;
+    *) __pm_project_dir="\${PWD}/\${__pm_project_dir}" ;;
+  esac
+
+  __pm_project_dir_physical="$(CDPATH= cd "\${__pm_project_dir}" 2>/dev/null && pwd -P)"
+  __port_manager_path_basename "\${__pm_project_dir_physical:-\${__pm_project_dir}}"
+}
+
+__port_manager_compose_project_name_from_file() {
+  __pm_project_file="$(__port_manager_normalize_compose_file_path "$1")"
+  __pm_project_file_dir="\${__pm_project_file%/*}"
+  __port_manager_compose_project_name_from_directory "\${__pm_project_file_dir}"
+}
+
+__port_manager_compose_requested_project_name() {
+  __pm_next_is_project=0
+  __pm_next_is_file=0
+  __pm_next_is_project_dir=0
+  __pm_first_file=""
+  __pm_project_dir=""
+
+  for __pm_arg in "$@"; do
+    if [ "\${__pm_next_is_project}" = "1" ]; then
+      printf '%s\\n' "\${__pm_arg}"
+      return 0
+    fi
+
+    if [ "\${__pm_next_is_file}" = "1" ]; then
+      __pm_next_is_file=0
+      if [ -z "\${__pm_first_file}" ]; then
+        __pm_first_file="\${__pm_arg}"
+      fi
+      continue
+    fi
+
+    if [ "\${__pm_next_is_project_dir}" = "1" ]; then
+      __pm_next_is_project_dir=0
+      __pm_project_dir="\${__pm_arg}"
+      continue
+    fi
+
+    case "\${__pm_arg}" in
+      -p|--project-name)
+        __pm_next_is_project=1
+        continue
+        ;;
+      --project-name=*)
+        printf '%s\\n' "\${__pm_arg#--project-name=}"
+        return 0
+        ;;
+      -p?*)
+        printf '%s\\n' "\${__pm_arg#-p}"
+        return 0
+        ;;
+      -f|--file)
+        __pm_next_is_file=1
+        continue
+        ;;
+      --file=*)
+        if [ -z "\${__pm_first_file}" ]; then
+          __pm_first_file="\${__pm_arg#--file=}"
+        fi
+        ;;
+      -f?*)
+        if [ -z "\${__pm_first_file}" ]; then
+          __pm_first_file="\${__pm_arg#-f}"
+        fi
+        ;;
+      --project-directory)
+        __pm_next_is_project_dir=1
+        continue
+        ;;
+      --project-directory=*)
+        __pm_project_dir="\${__pm_arg#--project-directory=}"
+        ;;
+    esac
+  done
+
+  if [ -n "\${COMPOSE_PROJECT_NAME:-}" ]; then
+    printf '%s\\n' "\${COMPOSE_PROJECT_NAME}"
+    return 0
+  fi
+
+  if [ -n "\${__pm_project_dir}" ]; then
+    __port_manager_compose_project_name_from_directory "\${__pm_project_dir}" && return 0
+  fi
+
+  if [ -n "\${__pm_first_file}" ]; then
+    __port_manager_compose_project_name_from_file "\${__pm_first_file}" && return 0
+  fi
+
+  __port_manager_compose_project_name_from_directory "\${PWD}"
+}
+
+__port_manager_compose_route_scan_file_for_runtime() {
+  __pm_scan_file="$1"
+  __pm_scan_runtime="$2"
+  __pm_scan_network="$3"
+  shift 3
+
+  [ -r "\${__pm_scan_file}" ] || return 1
   while IFS="$(printf '\\t')" read -r __pm_row_kind __pm_row_network __pm_row_runtime __pm_workdir __pm_attached_project __pm_original_project __pm_rest; do
-    if [ "\${__pm_row_network}" != "\${__pm_network}" ] || [ "\${__pm_row_runtime}" != "\${__pm_runtime}" ]; then
+    if [ "\${__pm_row_network}" != "\${__pm_scan_network}" ] || [ "\${__pm_row_runtime}" != "\${__pm_scan_runtime}" ]; then
       continue
     fi
 
@@ -352,11 +477,64 @@ __port_manager_compose_route_for_runtime() {
         __pm_best_attached_project="\${__pm_attached_project}"
         __pm_best_original_project="\${__pm_original_project}"
       fi
+    elif [ "\${__pm_row_kind}" = "project" ] && [ -n "\${__pm_requested_project}" ]; then
+      if [ "\${__pm_requested_project}" = "\${__pm_original_project}" ] || [ "\${__pm_requested_project}" = "\${__pm_attached_project}" ]; then
+        __pm_project_match_count=$((__pm_project_match_count + 1))
+        __pm_project_attached_project="\${__pm_attached_project}"
+        __pm_project_original_project="\${__pm_original_project}"
+      fi
     fi
-  done < "\${__pm_file}"
+  done < "\${__pm_scan_file}"
+
+  return 0
+}
+
+__port_manager_compose_route_for_runtime() {
+  __pm_runtime="$1"
+  shift
+  __pm_file="\${PORT_MANAGER_COMPOSE_ROUTING_FILE:-}"
+  __pm_network="$(__port_manager_network_id)"
+  __pm_best_attached_project=""
+  __pm_best_original_project=""
+  __pm_best_length=0
+  __pm_requested_project="$(__port_manager_compose_requested_project_name "$@" 2>/dev/null || true)"
+  __pm_project_match_count=0
+  __pm_project_attached_project=""
+  __pm_project_original_project=""
+
+  if [ -z "\${__pm_file}" ] || [ -z "\${__pm_network}" ]; then
+    return 1
+  fi
+
+  case "\${__pm_file}" in
+    */*) __pm_file_dir="\${__pm_file%/*}" ;;
+    *) __pm_file_dir="." ;;
+  esac
+  __pm_file_base="\${__pm_file##*/}"
+  __pm_file_stem="\${__pm_file_base%.tsv}"
+  __pm_scoped_files=0
+
+  case "\${__pm_file_base}" in
+    compose-project-routing-*.tsv)
+      for __pm_scoped_file in "\${__pm_file_dir}/\${__pm_file_stem}.compose-"*.tsv; do
+        [ -r "\${__pm_scoped_file}" ] || continue
+        __pm_scoped_files=1
+        __port_manager_compose_route_scan_file_for_runtime "\${__pm_scoped_file}" "\${__pm_runtime}" "\${__pm_network}" "$@"
+      done
+      ;;
+  esac
+
+  if [ "\${__pm_scoped_files}" != "1" ]; then
+    __port_manager_compose_route_scan_file_for_runtime "\${__pm_file}" "\${__pm_runtime}" "\${__pm_network}" "$@" || return 1
+  fi
 
   if [ -n "\${__pm_best_attached_project}" ]; then
     printf '%s\\t%s\\n' "\${__pm_best_attached_project}" "\${__pm_best_original_project}"
+    return 0
+  fi
+
+  if [ "\${__pm_project_match_count}" = "1" ] && [ -n "\${__pm_project_attached_project}" ]; then
+    printf '%s\\t%s\\n' "\${__pm_project_attached_project}" "\${__pm_project_original_project}"
     return 0
   fi
 
@@ -385,28 +563,113 @@ __port_manager_cwd_matches_workdir() {
   return 1
 }
 
+__port_manager_compose_routing_file_matches_context() {
+  __pm_context_file="$1"
+  __pm_context_runtime="$2"
+  __pm_context_network="$3"
+  shift 3
+
+  [ -r "\${__pm_context_file}" ] || return 1
+  __pm_context_project="$(__port_manager_compose_requested_project_name "$@" 2>/dev/null || true)"
+  while IFS="$(printf '\\t')" read -r __pm_row_kind __pm_row_network __pm_row_runtime __pm_workdir __pm_context_attached __pm_context_original __pm_context_rest; do
+    if [ "\${__pm_row_network}" != "\${__pm_context_network}" ] || [ "\${__pm_row_runtime}" != "\${__pm_context_runtime}" ]; then
+      continue
+    fi
+
+    if [ "\${__pm_row_kind}" = "project" ] && __port_manager_cwd_matches_workdir "\${__pm_workdir}"; then
+      return 0
+    fi
+
+    if [ "\${__pm_row_kind}" = "project" ] && [ -n "\${__pm_context_project}" ]; then
+      if [ "\${__pm_context_project}" = "\${__pm_context_original}" ] || [ "\${__pm_context_project}" = "\${__pm_context_attached}" ]; then
+        return 0
+      fi
+    fi
+
+    if [ "\${__pm_row_kind}" = "file" ] && __port_manager_compose_args_reference_file "\${__pm_workdir}" "$@"; then
+      return 0
+    fi
+  done < "\${__pm_context_file}"
+
+  return 1
+}
+
+__port_manager_container_target_scan_file_for_runtime() {
+  __pm_scan_file="$1"
+  __pm_scan_runtime="$2"
+  __pm_scan_network="$3"
+  __pm_scan_token="$4"
+  __pm_scan_token_length="$5"
+  __pm_scan_suffix="$6"
+
+  [ -r "\${__pm_scan_file}" ] || return 1
+  while IFS="$(printf '\\t')" read -r __pm_row_kind __pm_row_network __pm_row_runtime __pm_workdir __pm_project __pm_original_name __pm_attached_id __pm_attached_name __pm_service_name; do
+    if [ "\${__pm_row_kind}" != "container" ]; then
+      continue
+    fi
+
+    if [ "\${__pm_row_network}" != "\${__pm_scan_network}" ] || [ "\${__pm_row_runtime}" != "\${__pm_scan_runtime}" ]; then
+      continue
+    fi
+
+    __pm_matched=0
+    if [ "\${__pm_scan_token}" = "\${__pm_original_name}" ] || [ "\${__pm_scan_token}" = "\${__pm_attached_name}" ] || [ "\${__pm_scan_token}" = "\${__pm_service_name}" ]; then
+      __pm_matched=1
+    elif [ "\${__pm_scan_token_length}" -ge 4 ]; then
+      case "\${__pm_project}" in
+        "\${__pm_scan_token}"*) __pm_matched=1 ;;
+      esac
+      case "\${__pm_scan_token}" in
+        "\${__pm_project}"*) __pm_matched=1 ;;
+      esac
+      case "\${__pm_attached_id}" in
+        "\${__pm_scan_token}"*) __pm_matched=1 ;;
+      esac
+      case "\${__pm_scan_token}" in
+        "\${__pm_attached_id}"*) __pm_matched=1 ;;
+      esac
+    fi
+
+    if [ "\${__pm_matched}" = "1" ]; then
+      __pm_matches=$((__pm_matches + 1))
+      __pm_target="\${__pm_attached_id}\${__pm_scan_suffix}"
+    fi
+  done < "\${__pm_scan_file}"
+
+  return 0
+}
+
+__port_manager_container_target_helper_scan_file_for_runtime() {
+  __pm_scan_file="$1"
+  __pm_scan_runtime="$2"
+  __pm_scan_network="$3"
+  __pm_scan_token="$4"
+
+  [ -n "\${__pm_helper}" ] && [ -x "\${__pm_helper}" ] && [ -r "\${__pm_scan_file}" ] || return 1
+  __pm_mapped="$("\${__pm_helper}" "\${__pm_scan_file}" "\${__pm_scan_network}" "\${__pm_scan_runtime}" "\${__pm_scan_token}" 2>/dev/null || true)"
+  if [ -n "\${__pm_mapped}" ]; then
+    __pm_helper_matches=$((__pm_helper_matches + 1))
+    __pm_helper_target="\${__pm_mapped}"
+  fi
+
+  return 0
+}
+
 __port_manager_container_target_for_runtime() {
   __pm_runtime="$1"
   __pm_token="$2"
+  shift 2
   __pm_file="\${PORT_MANAGER_COMPOSE_ROUTING_FILE:-}"
   __pm_network="$(__port_manager_network_id)"
   __pm_matches=0
   __pm_target=""
   __pm_token_length=\${#__pm_token}
 
-  if [ -z "\${__pm_file}" ] || [ -z "\${__pm_network}" ] || [ -z "\${__pm_token}" ] || [ ! -r "\${__pm_file}" ]; then
+  if [ -z "\${__pm_file}" ] || [ -z "\${__pm_network}" ] || [ -z "\${__pm_token}" ]; then
     return 1
   fi
 
   __pm_helper="\${PORT_MANAGER_CONTAINER_MAP_HELPER:-}"
-  if [ -n "\${__pm_helper}" ] && [ -x "\${__pm_helper}" ]; then
-    __pm_mapped="$("\${__pm_helper}" "\${__pm_file}" "\${__pm_network}" "\${__pm_runtime}" "\${__pm_token}" 2>/dev/null || true)"
-    if [ -n "\${__pm_mapped}" ]; then
-      printf '%s\\n' "\${__pm_mapped}"
-      return 0
-    fi
-  fi
-
   __pm_token_suffix=""
   case "\${__pm_token}" in
     *:*)
@@ -416,38 +679,62 @@ __port_manager_container_target_for_runtime() {
       ;;
   esac
 
-  while IFS="$(printf '\\t')" read -r __pm_row_kind __pm_row_network __pm_row_runtime __pm_workdir __pm_project __pm_original_name __pm_attached_id __pm_attached_name __pm_service_name; do
-    if [ "\${__pm_row_kind}" != "container" ]; then
-      continue
-    fi
+  case "\${__pm_file}" in
+    */*) __pm_file_dir="\${__pm_file%/*}" ;;
+    *) __pm_file_dir="." ;;
+  esac
+  __pm_file_base="\${__pm_file##*/}"
+  __pm_file_stem="\${__pm_file_base%.tsv}"
+  __pm_scoped_files=0
+  __pm_context_files=0
+  __pm_helper_matches=0
+  __pm_helper_target=""
 
-    if [ "\${__pm_row_network}" != "\${__pm_network}" ] || [ "\${__pm_row_runtime}" != "\${__pm_runtime}" ]; then
-      continue
-    fi
+  case "\${__pm_file_base}" in
+    compose-project-routing-*.tsv)
+      for __pm_scoped_file in "\${__pm_file_dir}/\${__pm_file_stem}.compose-"*.tsv; do
+        [ -r "\${__pm_scoped_file}" ] || continue
+        __pm_scoped_files=1
+        if __port_manager_compose_routing_file_matches_context "\${__pm_scoped_file}" "\${__pm_runtime}" "\${__pm_network}" "$@"; then
+          __pm_context_files=$((__pm_context_files + 1))
+          __port_manager_container_target_helper_scan_file_for_runtime "\${__pm_scoped_file}" "\${__pm_runtime}" "\${__pm_network}" "\${__pm_token}"
+          __port_manager_container_target_scan_file_for_runtime "\${__pm_scoped_file}" "\${__pm_runtime}" "\${__pm_network}" "\${__pm_token}" "\${__pm_token_length}" "\${__pm_token_suffix}"
+        fi
+      done
+      ;;
+  esac
 
-    __pm_matched=0
-    if [ "\${__pm_token}" = "\${__pm_original_name}" ] || [ "\${__pm_token}" = "\${__pm_attached_name}" ] || [ "\${__pm_token}" = "\${__pm_service_name}" ]; then
-      __pm_matched=1
-    elif [ "\${__pm_token_length}" -ge 4 ]; then
-      case "\${__pm_project}" in
-        "\${__pm_token}"*) __pm_matched=1 ;;
-      esac
-      case "\${__pm_token}" in
-        "\${__pm_project}"*) __pm_matched=1 ;;
-      esac
-      case "\${__pm_attached_id}" in
-        "\${__pm_token}"*) __pm_matched=1 ;;
-      esac
-      case "\${__pm_token}" in
-        "\${__pm_attached_id}"*) __pm_matched=1 ;;
-      esac
+  if [ "\${__pm_context_files}" != "0" ]; then
+    if [ "\${__pm_helper_matches}" = "1" ] && [ -n "\${__pm_helper_target}" ]; then
+      printf '%s\\n' "\${__pm_helper_target}"
+      return 0
     fi
+    if [ "\${__pm_matches}" = "1" ] && [ -n "\${__pm_target}" ]; then
+      printf '%s\\n' "\${__pm_target}"
+      return 0
+    fi
+    return 1
+  fi
 
-    if [ "\${__pm_matched}" = "1" ]; then
-      __pm_matches=$((__pm_matches + 1))
-      __pm_target="\${__pm_attached_id}\${__pm_token_suffix}"
-    fi
-  done < "\${__pm_file}"
+  if [ "\${__pm_scoped_files}" = "1" ]; then
+    __pm_matches=0
+    __pm_target=""
+    __pm_helper_matches=0
+    __pm_helper_target=""
+    for __pm_scoped_file in "\${__pm_file_dir}/\${__pm_file_stem}.compose-"*.tsv; do
+      [ -r "\${__pm_scoped_file}" ] || continue
+      __port_manager_container_target_helper_scan_file_for_runtime "\${__pm_scoped_file}" "\${__pm_runtime}" "\${__pm_network}" "\${__pm_token}"
+      __port_manager_container_target_scan_file_for_runtime "\${__pm_scoped_file}" "\${__pm_runtime}" "\${__pm_network}" "\${__pm_token}" "\${__pm_token_length}" "\${__pm_token_suffix}"
+    done
+  else
+    __port_manager_container_target_helper_scan_file_for_runtime "\${__pm_file}" "\${__pm_runtime}" "\${__pm_network}" "\${__pm_token}"
+    __port_manager_container_target_scan_file_for_runtime "\${__pm_file}" "\${__pm_runtime}" "\${__pm_network}" "\${__pm_token}" "\${__pm_token_length}" "\${__pm_token_suffix}" || return 1
+  fi
+
+  if [ "\${__pm_helper_matches}" = "1" ] && [ -n "\${__pm_helper_target}" ]; then
+    printf '%s\\n' "\${__pm_helper_target}"
+    return 0
+  fi
 
   if [ "\${__pm_matches}" = "1" ] && [ -n "\${__pm_target}" ]; then
     printf '%s\\n' "\${__pm_target}"
@@ -488,7 +775,7 @@ __port_manager_run_runtime_with_container_routing() {
   __pm_args=""
 
   for __pm_arg in "$@"; do
-    __pm_mapped="$(__port_manager_container_target_for_runtime "\${__pm_runtime}" "\${__pm_arg}")"
+    __pm_mapped="$(__port_manager_container_target_for_runtime "\${__pm_runtime}" "\${__pm_arg}" "$@")"
     if [ -n "\${__pm_mapped}" ]; then
       __pm_arg="\${__pm_mapped}"
     fi

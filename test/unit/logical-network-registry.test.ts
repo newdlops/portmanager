@@ -329,3 +329,49 @@ test("persisted state excludes transient terminal candidates", () => {
   assert.equal("terminalCandidates" in persisted, false);
   assert.equal("containerServiceCandidates" in persisted, false);
 });
+
+test("replaces persisted state while keeping transient discovery rows", () => {
+  const registry = new LogicalNetworkRegistry([runtime], {
+    networks: [createNetwork()],
+    attachments: [],
+    exposures: [createExposure()],
+    hostAccessBindings: [],
+    composeAttachments: [],
+  });
+  registry.setTerminalCandidates([
+    {
+      pid: 202,
+      name: "bash",
+      vscodeTerminal: true,
+    },
+  ]);
+  registry.setContainerServiceCandidates([createContainerServiceCandidate()]);
+
+  registry.replacePersistedState({
+    networks: [createNetwork({ id: "network-2", name: "B app" })],
+    attachments: [],
+    exposures: [],
+    hostAccessBindings: [createHostAccessBinding({ id: "host-access-2", networkId: "network-2" })],
+    composeAttachments: [],
+  });
+
+  const snapshot = registry.getSnapshot();
+
+  assert.deepEqual(
+    snapshot.networks.map((network) => network.id),
+    ["network-2"],
+  );
+  assert.deepEqual(snapshot.exposures, []);
+  assert.deepEqual(
+    snapshot.hostAccessBindings.map((binding) => binding.id),
+    ["host-access-2"],
+  );
+  assert.deepEqual(
+    snapshot.terminalCandidates.map((candidate) => candidate.pid),
+    [202],
+  );
+  assert.deepEqual(
+    snapshot.containerServiceCandidates.map((candidate) => candidate.id),
+    ["docker:abc123"],
+  );
+});

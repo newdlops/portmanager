@@ -65,6 +65,7 @@ static int pm_route_count = 0;
 static unsigned long pm_request_sequence = 1;
 
 static void pm_release_process_routes(void);
+static const char *pm_current_network_id(void);
 
 static int pm_hook_enabled(void) {
   const char *disabled = getenv("PORT_MANAGER_HOOK_DISABLED");
@@ -222,6 +223,159 @@ static void pm_default_global_route_table_path(char *buffer, size_t size) {
   }
 
   snprintf(buffer, size, "/tmp/newdlops-portmanager-routes-%ld.json", (long)getuid());
+}
+
+/** Extracts the logical network suffix from a scoped route-table filename. */
+static int pm_route_table_path_network_id(const char *route_file, char *network_id, size_t size) {
+  const char *base_name;
+  const char *prefix = "newdlops-portmanager-routes-";
+  const char *suffix = ".json";
+  const char *scope_start;
+  size_t prefix_length = strlen(prefix);
+  size_t suffix_length = strlen(suffix);
+  size_t base_length;
+  size_t body_length;
+  size_t network_length;
+
+  if (route_file == NULL || route_file[0] == '\0' || network_id == NULL || size == 0) {
+    return -1;
+  }
+
+  base_name = strrchr(route_file, '/');
+  base_name = base_name == NULL ? route_file : base_name + 1;
+  base_length = strlen(base_name);
+
+  if (base_length <= prefix_length + suffix_length || strncmp(base_name, prefix, prefix_length) != 0) {
+    return -1;
+  }
+
+  if (strcmp(base_name + base_length - suffix_length, suffix) != 0) {
+    return -1;
+  }
+
+  body_length = base_length - prefix_length - suffix_length;
+  scope_start = memchr(base_name + prefix_length, '-', body_length);
+  if (scope_start == NULL) {
+    return -1;
+  }
+
+  scope_start++;
+  network_length = (size_t)((base_name + prefix_length + body_length) - scope_start);
+  if (network_length == 0 || network_length >= size) {
+    return -1;
+  }
+
+  memcpy(network_id, scope_start, network_length);
+  network_id[network_length] = '\0';
+  return 0;
+}
+
+/** Recovers the global route-table path from a scoped route-table path. */
+static void pm_route_table_path_without_network_scope(const char *route_file, char *buffer, size_t size) {
+  const char *base_name;
+  const char *prefix = "newdlops-portmanager-routes-";
+  const char *suffix = ".json";
+  const char *scope_start;
+  size_t directory_length;
+  size_t prefix_length = strlen(prefix);
+  size_t suffix_length = strlen(suffix);
+  size_t base_length;
+  size_t body_length;
+  size_t user_scope_length;
+
+  if (buffer == NULL || size == 0) {
+    return;
+  }
+
+  buffer[0] = '\0';
+  if (route_file == NULL || route_file[0] == '\0') {
+    return;
+  }
+
+  base_name = strrchr(route_file, '/');
+  directory_length = base_name == NULL ? 0 : (size_t)(base_name - route_file);
+  base_name = base_name == NULL ? route_file : base_name + 1;
+  base_length = strlen(base_name);
+
+  if (base_length <= prefix_length + suffix_length || strncmp(base_name, prefix, prefix_length) != 0 ||
+      strcmp(base_name + base_length - suffix_length, suffix) != 0) {
+    return;
+  }
+
+  body_length = base_length - prefix_length - suffix_length;
+  scope_start = memchr(base_name + prefix_length, '-', body_length);
+  if (scope_start == NULL) {
+    snprintf(buffer, size, "%s", route_file);
+    return;
+  }
+
+  user_scope_length = (size_t)(scope_start - (base_name + prefix_length));
+  if (directory_length > 0) {
+    snprintf(buffer, size, "%.*s/%s%.*s%s", (int)directory_length, route_file, prefix, (int)user_scope_length, base_name + prefix_length, suffix);
+  } else {
+    snprintf(buffer, size, "%s%.*s%s", prefix, (int)user_scope_length, base_name + prefix_length, suffix);
+  }
+}
+
+/** Mirrors route-table.ts scope sanitization for native fallback paths. */
+static void pm_sanitize_route_table_scope(const char *value, char *buffer, size_t size) {
+  size_t used = 0;
+
+  if (buffer == NULL || size == 0) {
+    return;
+  }
+
+  if (value == NULL) {
+    buffer[0] = '\0';
+    return;
+  }
+
+  for (size_t index = 0; value[index] != '\0' && used + 1 < size && used < 120; index++) {
+    unsigned char ch = (unsigned char)value[index];
+    buffer[used++] = (isalnum(ch) || ch == '_' || ch == '.' || ch == '-') ? (char)ch : '_';
+  }
+
+  if (used == 0 && size > 1) {
+    snprintf(buffer, size, "network");
+    return;
+  }
+
+  buffer[used] = '\0';
+}
+
+/** Builds the network-scoped route table path for the current logical network. */
+static int pm_scoped_route_table_path(const char *base_route_table_path, const char *network_id, char *buffer, size_t size) {
+  const char *slash;
+  const char *file_name;
+  const char *extension;
+  size_t directory_length;
+  size_t stem_length;
+  char scope[PM_MAX_TEXT];
+
+  if (base_route_table_path == NULL || base_route_table_path[0] == '\0' || network_id == NULL || network_id[0] == '\0' ||
+      buffer == NULL || size == 0) {
+    return -1;
+  }
+
+  pm_sanitize_route_table_scope(network_id, scope, sizeof(scope));
+  slash = strrchr(base_route_table_path, '/');
+  directory_length = slash == NULL ? 0 : (size_t)(slash - base_route_table_path);
+  file_name = slash == NULL ? base_route_table_path : slash + 1;
+  extension = strrchr(file_name, '.');
+  if (extension == NULL) {
+    extension = ".json";
+    stem_length = strlen(file_name);
+  } else {
+    stem_length = (size_t)(extension - file_name);
+  }
+
+  if (directory_length > 0) {
+    snprintf(buffer, size, "%.*s/%.*s-%s%s", (int)directory_length, base_route_table_path, (int)stem_length, file_name, scope, extension);
+  } else {
+    snprintf(buffer, size, "%.*s-%s%s", (int)stem_length, file_name, scope, extension);
+  }
+
+  return buffer[0] == '\0' ? -1 : 0;
 }
 
 static void pm_route_entry_path(const char *route_table_path, int logical_port, char *buffer, size_t size) {
@@ -729,14 +883,55 @@ static const char *pm_network_id_from_route_table_path(void) {
   return network_id_from_route_table;
 }
 
-static const char *pm_current_network_id(void) {
-  const char *network_id = pm_network_id_from_bash_env();
+static const char *pm_network_id_from_compose_routing_file(void) {
+  const char *routing_file = getenv("PORT_MANAGER_COMPOSE_ROUTING_FILE");
+  const char *base_name;
+  const char *compose_separator;
+  const char *prefix = "compose-project-routing-";
+  const char *suffix = ".tsv";
+  size_t prefix_length = strlen(prefix);
+  size_t suffix_length = strlen(suffix);
+  size_t base_length;
+  size_t scoped_length;
+  size_t network_length;
+  static char network_id_from_compose_file[PM_MAX_TEXT];
 
-  if (network_id != NULL && network_id[0] != '\0') {
-    return network_id;
+  /*
+   * The Compose routing file is scoped per logical network. It is a useful
+   * fallback when protected launchers preserve file env but drop network env.
+   */
+  if (routing_file == NULL || routing_file[0] == '\0') {
+    return NULL;
   }
 
-  network_id = getenv("PORT_MANAGER_NETWORK_ID");
+  base_name = strrchr(routing_file, '/');
+  base_name = base_name == NULL ? routing_file : base_name + 1;
+  base_length = strlen(base_name);
+
+  if (base_length <= prefix_length + suffix_length || strncmp(base_name, prefix, prefix_length) != 0) {
+    return NULL;
+  }
+
+  if (strcmp(base_name + base_length - suffix_length, suffix) != 0) {
+    return NULL;
+  }
+
+  scoped_length = base_length - prefix_length - suffix_length;
+  compose_separator = strstr(base_name + prefix_length, ".compose-");
+  network_length = compose_separator == NULL
+    ? scoped_length
+    : (size_t)(compose_separator - (base_name + prefix_length));
+  if (network_length == 0 || network_length >= sizeof(network_id_from_compose_file)) {
+    return NULL;
+  }
+
+  memcpy(network_id_from_compose_file, base_name + prefix_length, network_length);
+  network_id_from_compose_file[network_length] = '\0';
+  return network_id_from_compose_file;
+}
+
+static const char *pm_current_network_id(void) {
+  const char *network_id = getenv("PORT_MANAGER_NETWORK_ID");
 
   if (network_id == NULL || network_id[0] == '\0') {
     network_id = getenv("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID");
@@ -755,10 +950,60 @@ static const char *pm_current_network_id(void) {
   }
 
   if (network_id == NULL || network_id[0] == '\0') {
+    network_id = pm_network_id_from_bash_env();
+  }
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    network_id = pm_network_id_from_compose_routing_file();
+  }
+
+  if (network_id == NULL || network_id[0] == '\0') {
     network_id = pm_network_id_from_route_table_path();
   }
 
   return network_id;
+}
+
+/**
+ * Chooses a route table that matches the active network even when a child
+ * process inherited a stale PORT_MANAGER_ROUTES_FILE from another terminal.
+ */
+static void pm_effective_route_table_path(char *buffer, size_t size) {
+  const char *network_id = pm_current_network_id();
+  const char *configured = getenv("PORT_MANAGER_ROUTES_FILE");
+  char configured_network[PM_MAX_TEXT];
+  char base_route_table_path[PM_MAX_PATH];
+
+  if (buffer == NULL || size == 0) {
+    return;
+  }
+
+  buffer[0] = '\0';
+  if (network_id == NULL || network_id[0] == '\0') {
+    pm_default_route_table_path(buffer, size);
+    return;
+  }
+
+  if (
+    configured != NULL &&
+    configured[0] != '\0' &&
+    pm_route_table_path_network_id(configured, configured_network, sizeof(configured_network)) == 0 &&
+    strcmp(configured_network, network_id) == 0
+  ) {
+    snprintf(buffer, size, "%s", configured);
+    return;
+  }
+
+  pm_default_global_route_table_path(base_route_table_path, sizeof(base_route_table_path));
+  if (base_route_table_path[0] == '\0' && configured != NULL && configured[0] != '\0') {
+    pm_route_table_path_without_network_scope(configured, base_route_table_path, sizeof(base_route_table_path));
+  }
+
+  if (pm_scoped_route_table_path(base_route_table_path, network_id, buffer, size) == 0) {
+    return;
+  }
+
+  pm_default_route_table_path(buffer, size);
 }
 
 static void pm_network_scope_payload(char *buffer, size_t size) {
@@ -1384,7 +1629,7 @@ static int pm_route_table_lookup(
     *is_compose_route = 0;
   }
 
-  pm_default_route_table_path(path, sizeof(path));
+  pm_effective_route_table_path(path, sizeof(path));
   if (!source_is_actual) {
     /*
      * Sender polling can hammer several logical ports at once. Try the
