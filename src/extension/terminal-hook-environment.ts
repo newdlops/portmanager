@@ -118,6 +118,7 @@ export function applyTerminalHookEnvironment(
   const runtimeCommandShimPath = context.asAbsolutePath(getRuntimeCommandShimRelativePath());
   const shellEnvRestorePath = prepareShellEnvRestoreScript(context.globalStorageUri.fsPath, hookLibraryPath, {
     networkId: scope.networkId,
+    composeRoutingFilePath: scope.composeRoutingFilePath,
   });
   const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
 
@@ -199,7 +200,7 @@ export function prepareRuntimeShimLauncherDirectory(
   }
 
   for (const runtimeName of PRELOAD_RUNTIME_LAUNCHER_NAMES) {
-    ensureSymlink(path.join(targetDirectory, runtimeName), launcherPath);
+    ensureExecutableAlias(path.join(targetDirectory, runtimeName), launcherPath);
   }
 
   if (sourceShimDirectory !== undefined) {
@@ -208,7 +209,7 @@ export function prepareRuntimeShimLauncherDirectory(
         continue;
       }
 
-      ensureSymlink(path.join(targetDirectory, entry.name), launcherPath);
+      ensureExecutableAlias(path.join(targetDirectory, entry.name), launcherPath);
     }
   }
 
@@ -231,6 +232,8 @@ export function prepareAsdfShimLauncherDirectory(
 export interface ShellEnvRestoreScope {
   /** Logical network scope that must survive protected shebang and bash boundaries. */
   readonly networkId?: string;
+  /** Compose/container routing map needed by Docker/Podman shims in child scripts. */
+  readonly composeRoutingFilePath?: string;
 }
 
 export function prepareShellEnvRestoreScript(
@@ -295,6 +298,37 @@ function getAsdfShimDirectory(): string | undefined {
   return fs.existsSync(shimDirectory) ? shimDirectory : undefined;
 }
 
+/**
+ * Creates an executable alias that preserves argv[0] even when child launchers
+ * resolve PATH entries through realpath before exec. A symlink loses the tool
+ * name in that flow, while a hard link keeps the invoked basename.
+ */
+function ensureExecutableAlias(linkPath: string, targetPath: string): void {
+  try {
+    const targetStat = fs.statSync(targetPath);
+    const existingPath = fs.lstatSync(linkPath);
+    if (existingPath.isDirectory() && !existingPath.isSymbolicLink()) {
+      return;
+    }
+
+    if (!existingPath.isSymbolicLink()) {
+      const existingStat = fs.statSync(linkPath);
+      if (existingStat.dev === targetStat.dev && existingStat.ino === targetStat.ino) {
+        return;
+      }
+    }
+  } catch {
+    // Missing aliases and inaccessible stale entries are replaced below.
+  }
+
+  fs.rmSync(linkPath, { force: true });
+  try {
+    fs.linkSync(targetPath, linkPath);
+  } catch {
+    fs.symlinkSync(targetPath, linkPath);
+  }
+}
+
 /** Replaces stale extension-owned symlinks while leaving matching links alone. */
 function ensureSymlink(linkPath: string, targetPath: string): void {
   try {
@@ -320,10 +354,10 @@ function ensureSymlink(linkPath: string, targetPath: string): void {
 
 function writeRuntimeCommandShims(targetDirectory: string, runtimeCommandShimPath: string | undefined): void {
   if (runtimeCommandShimPath !== undefined && fs.existsSync(runtimeCommandShimPath)) {
-    ensureSymlink(path.join(targetDirectory, "docker"), runtimeCommandShimPath);
-    ensureSymlink(path.join(targetDirectory, "podman"), runtimeCommandShimPath);
-    ensureSymlink(path.join(targetDirectory, "docker-compose"), runtimeCommandShimPath);
-    ensureSymlink(path.join(targetDirectory, "podman-compose"), runtimeCommandShimPath);
+    ensureExecutableAlias(path.join(targetDirectory, "docker"), runtimeCommandShimPath);
+    ensureExecutableAlias(path.join(targetDirectory, "podman"), runtimeCommandShimPath);
+    ensureExecutableAlias(path.join(targetDirectory, "docker-compose"), runtimeCommandShimPath);
+    ensureExecutableAlias(path.join(targetDirectory, "podman-compose"), runtimeCommandShimPath);
     return;
   }
 
@@ -362,6 +396,16 @@ function sanitizeFileNamePart(value: string): string {
 }
 
 function buildShellEnvRestoreScript(scope: ShellEnvRestoreScope, scriptPath: string): string {
+  const routeTableExports =
+    scope.networkId === undefined
+      ? `if [ -z "\${PORT_MANAGER_ROUTES_FILE:-}" ]; then
+  export PORT_MANAGER_ROUTES_FILE=${shellQuote(getDefaultRouteTablePath())}
+fi
+if [ -z "\${PORT_MANAGER_GLOBAL_ROUTES_FILE:-}" ]; then
+  export PORT_MANAGER_GLOBAL_ROUTES_FILE=${shellQuote(getDefaultRouteTablePath())}
+fi`
+      : `export PORT_MANAGER_ROUTES_FILE=${shellQuote(getRouteTablePathForNetwork(scope.networkId))}
+export PORT_MANAGER_GLOBAL_ROUTES_FILE=${shellQuote(getDefaultRouteTablePath())}`;
   const networkScope =
     scope.networkId === undefined
       ? `if [ -z "\${PORT_MANAGER_NETWORK_ID:-}" ] && [ -n "\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-}" ]; then
@@ -382,9 +426,13 @@ fi`
       : `export PORT_MANAGER_HOOK=1
 export PORT_MANAGER_NETWORK_ID=${shellQuote(scope.networkId)}
 export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID=${shellQuote(scope.networkId)}
-export PORT_MANAGER_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}
-export NEWDLOPS_PM_NETWORK_ID=${shellQuote(scope.networkId)}
-export NEWDLOPS_PM_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}`;
+	export PORT_MANAGER_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}
+	export NEWDLOPS_PM_NETWORK_ID=${shellQuote(scope.networkId)}
+	export NEWDLOPS_PM_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}`;
+  const composeRoutingExport =
+    scope.composeRoutingFilePath === undefined
+      ? ""
+      : `export PORT_MANAGER_COMPOSE_ROUTING_FILE=${shellQuote(scope.composeRoutingFilePath)}`;
 
   return `# Generated by Port Manager. Sourced by non-interactive bash shells.
 if [ -n "\${PORT_MANAGER_PREV_BASH_ENV:-}" ] && [ "\${PORT_MANAGER_PREV_BASH_ENV}" != ${shellQuote(
@@ -394,6 +442,12 @@ if [ -n "\${PORT_MANAGER_PREV_BASH_ENV:-}" ] && [ "\${PORT_MANAGER_PREV_BASH_ENV
 fi
 
 ${networkScope}
+${routeTableExports}
+${composeRoutingExport}
+
+if [ -z "\${PORT_MANAGER_HOST_ACCESS_FILE:-}" ]; then
+  export PORT_MANAGER_HOST_ACCESS_FILE=${shellQuote(getDefaultHostAccessBindingsPath())}
+fi
 
 if [ -n "\${PORT_MANAGER_DYLD_INSERT_LIBRARIES:-}" ]; then
   case ":\${DYLD_INSERT_LIBRARIES:-}:" in

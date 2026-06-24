@@ -46,10 +46,17 @@ static int pm_starts_with(const char *value, const char *prefix) {
   return strncmp(value, prefix, prefix_length) == 0;
 }
 
-static int pm_token_matches_mapping(const char *token, const char *original_id, const char *original_name) {
+static int pm_token_matches_mapping(
+  const char *token,
+  const char *original_id,
+  const char *original_name,
+  const char *attached_id,
+  const char *attached_name,
+  const char *service_name
+) {
   size_t token_length = strlen(token);
 
-  if (strcmp(token, original_name) == 0) {
+  if (strcmp(token, original_name) == 0 || strcmp(token, attached_name) == 0 || strcmp(token, service_name) == 0) {
     return 1;
   }
 
@@ -58,7 +65,15 @@ static int pm_token_matches_mapping(const char *token, const char *original_id, 
    * a short hash. Accept both token-prefix and row-prefix matches after four
    * chars, then require the final lookup to be unique.
    */
-  if (token_length >= 4 && (pm_starts_with(original_id, token) || pm_starts_with(token, original_id))) {
+  if (
+    token_length >= 4 &&
+    (
+      pm_starts_with(original_id, token) ||
+      pm_starts_with(token, original_id) ||
+      pm_starts_with(attached_id, token) ||
+      pm_starts_with(token, attached_id)
+    )
+  ) {
     return 1;
   }
 
@@ -126,12 +141,12 @@ int main(int argc, char **argv) {
   }
 
   while ((line_length = getline(&line, &line_capacity, file)) >= 0) {
-    char *fields[8];
+    char *fields[9];
     int field_count;
 
     (void)line_length;
     pm_trim_line(line);
-    field_count = pm_split_tsv(line, fields, 8);
+    field_count = pm_split_tsv(line, fields, 9);
 
     if (field_count < 8) {
       continue;
@@ -145,7 +160,7 @@ int main(int argc, char **argv) {
       continue;
     }
 
-    if (pm_token_matches_mapping(token, fields[4], fields[5])) {
+    if (pm_token_matches_mapping(token, fields[4], fields[5], fields[6], fields[7], field_count >= 9 ? fields[8] : "")) {
       char *next_target = strdup(fields[6]);
       if (next_target == NULL) {
         free(target);

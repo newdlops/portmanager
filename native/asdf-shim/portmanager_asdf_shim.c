@@ -121,6 +121,52 @@ static const char *pm_network_id_from_bash_env(void) {
   return network_id_from_bash_env;
 }
 
+static const char *pm_network_id_from_route_table_path(void) {
+  const char *route_file = getenv("PORT_MANAGER_ROUTES_FILE");
+  const char *base_name;
+  const char *prefix = "newdlops-portmanager-routes-";
+  const char *suffix = ".json";
+  const char *scope_start;
+  size_t prefix_length = strlen(prefix);
+  size_t suffix_length = strlen(suffix);
+  size_t base_length;
+  size_t body_length;
+  size_t network_length;
+  static char network_id_from_route_table[PM_MAX_TEXT];
+
+  if (route_file == NULL || route_file[0] == '\0') {
+    return NULL;
+  }
+
+  base_name = strrchr(route_file, '/');
+  base_name = base_name == NULL ? route_file : base_name + 1;
+  base_length = strlen(base_name);
+
+  if (base_length <= prefix_length + suffix_length || strncmp(base_name, prefix, prefix_length) != 0) {
+    return NULL;
+  }
+
+  if (strcmp(base_name + base_length - suffix_length, suffix) != 0) {
+    return NULL;
+  }
+
+  body_length = base_length - prefix_length - suffix_length;
+  scope_start = memchr(base_name + prefix_length, '-', body_length);
+  if (scope_start == NULL) {
+    return NULL;
+  }
+
+  scope_start++;
+  network_length = (size_t)((base_name + prefix_length + body_length) - scope_start);
+  if (network_length == 0 || network_length >= sizeof(network_id_from_route_table)) {
+    return NULL;
+  }
+
+  memcpy(network_id_from_route_table, scope_start, network_length);
+  network_id_from_route_table[network_length] = '\0';
+  return network_id_from_route_table;
+}
+
 static void pm_export_network_scope(const char *network_id) {
   if (network_id == NULL || network_id[0] == '\0') {
     return;
@@ -155,6 +201,10 @@ static void pm_restore_network_scope(void) {
 
   if (network_id == NULL || network_id[0] == '\0') {
     network_id = alias_borrowed_network_id;
+  }
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    network_id = pm_network_id_from_route_table_path();
   }
 
   pm_export_network_scope(network_id);
@@ -412,6 +462,7 @@ static int pm_exec_env_script(const char *script_path, int argc, char **argv) {
 
 int main(int argc, char **argv) {
   const char *tool_name = pm_basename(argv[0]);
+  const char *environment_tool_name = getenv("PORT_MANAGER_ASDF_TOOL_NAME");
   char executable_path[PM_MAX_PATH];
   char **next_argv;
 
@@ -421,8 +472,17 @@ int main(int argc, char **argv) {
   }
 
   if (strcmp(tool_name, "portmanager_asdf_shim") == 0) {
-    fprintf(stderr, "portmanager-asdf-shim: must be invoked through an asdf tool symlink\n");
-    return 127;
+    /*
+     * Some process launchers resolve PATH aliases before exec. The hard-link
+     * aliases normally preserve argv[0], but wrapper scripts can still pass an
+     * explicit tool name through this env var when direct invocation is
+     * unavoidable.
+     */
+    if (environment_tool_name == NULL || environment_tool_name[0] == '\0' || strchr(environment_tool_name, '/') != NULL) {
+      fprintf(stderr, "portmanager-asdf-shim: must be invoked through an asdf tool symlink\n");
+      return 127;
+    }
+    tool_name = environment_tool_name;
   }
 
   if (pm_resolve_tool(tool_name, executable_path, sizeof(executable_path)) != 0) {

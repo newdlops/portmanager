@@ -15,6 +15,8 @@ export interface ComposeProjectRoutingRow {
   readonly runtime: "docker" | "podman";
   /** Original compose working directory used by the user's shell. */
   readonly workingDirectory: string;
+  /** Compose files that identify the project even when scripts run from another cwd. */
+  readonly composeFiles?: readonly string[];
   /** Compose project name that the host shell or scripts would normally target. */
   readonly originalProjectName?: string;
   /** Network-scoped compose project name created by clone attach. */
@@ -24,6 +26,8 @@ export interface ComposeProjectRoutingRow {
 }
 
 export interface ComposeContainerRoutingMapping {
+  /** Compose service name used by lifecycle scripts as a shorthand target. */
+  readonly serviceName: string;
   /** Full original container id before clone attach stopped it. */
   readonly originalContainerId: string;
   /** Original container name shown by Docker/Podman. */
@@ -48,6 +52,16 @@ export function serializeComposeProjectRoutingRows(rows: readonly ComposeProject
       projectFields.push(sanitizeField(row.originalProjectName));
     }
     const baseFields = projectFields.join("\t");
+    const composeFileFields = (row.composeFiles ?? []).map((composeFile) =>
+      [
+        "file",
+        sanitizeField(row.networkId),
+        row.runtime,
+        sanitizeField(composeFile.trim()),
+        sanitizeField(row.attachedProjectName),
+        sanitizeField(row.originalProjectName ?? ""),
+      ].join("\t"),
+    );
     const containerFields = (row.containerMappings ?? []).map((mapping) =>
       [
         "container",
@@ -58,10 +72,11 @@ export function serializeComposeProjectRoutingRows(rows: readonly ComposeProject
         sanitizeField(stripContainerNamePrefix(mapping.originalContainerName)),
         sanitizeField(stripContainerNamePrefix(mapping.attachedContainerId)),
         sanitizeField(stripContainerNamePrefix(mapping.attachedContainerName)),
+        sanitizeField(mapping.serviceName),
       ].join("\t"),
     );
 
-    return [baseFields, ...containerFields];
+    return [baseFields, ...composeFileFields, ...containerFields];
   });
 
   return `${lines.join("\n")}${lines.length > 0 ? "\n" : ""}`;
@@ -191,10 +206,125 @@ __port_manager_runtime_container_subcommand() {
   return 1
 }
 
+__port_manager_network_id() {
+  if [ -n "\${PORT_MANAGER_NETWORK_ID:-}" ]; then
+    printf '%s\\n' "\${PORT_MANAGER_NETWORK_ID}"
+    return 0
+  fi
+  if [ -n "\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-}" ]; then
+    printf '%s\\n' "\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID}"
+    return 0
+  fi
+  if [ -n "\${PORT_MANAGER_BORROWED_NETWORK_ID:-}" ]; then
+    printf '%s\\n' "\${PORT_MANAGER_BORROWED_NETWORK_ID}"
+    return 0
+  fi
+  if [ -n "\${NEWDLOPS_PM_NETWORK_ID:-}" ]; then
+    printf '%s\\n' "\${NEWDLOPS_PM_NETWORK_ID}"
+    return 0
+  fi
+  if [ -n "\${NEWDLOPS_PM_BORROWED_NETWORK_ID:-}" ]; then
+    printf '%s\\n' "\${NEWDLOPS_PM_BORROWED_NETWORK_ID}"
+    return 0
+  fi
+
+  __pm_bash_env_path="\${BASH_ENV:-}"
+  __pm_bash_env_base="\${__pm_bash_env_path##*/}"
+  case "\${__pm_bash_env_base}" in
+    portmanager-bash-env-*.sh)
+      __pm_bash_network="\${__pm_bash_env_base#portmanager-bash-env-}"
+      __pm_bash_network="\${__pm_bash_network%.sh}"
+      if [ -n "\${__pm_bash_network}" ]; then
+        printf '%s\\n' "\${__pm_bash_network}"
+        return 0
+      fi
+      ;;
+  esac
+
+  __pm_routes_path="\${PORT_MANAGER_ROUTES_FILE:-}"
+  __pm_routes_base="\${__pm_routes_path##*/}"
+  __pm_routes_base="\${__pm_routes_base%.json}"
+  case "\${__pm_routes_base}" in
+    newdlops-portmanager-routes-*-*)
+      __pm_routes_network="\${__pm_routes_base#newdlops-portmanager-routes-}"
+      __pm_routes_network="\${__pm_routes_network#*-}"
+      if [ -n "\${__pm_routes_network}" ]; then
+        printf '%s\\n' "\${__pm_routes_network}"
+        return 0
+      fi
+      ;;
+  esac
+
+  return 1
+}
+
+__port_manager_normalize_compose_file_path() {
+  __pm_file_path="$1"
+  case "\${__pm_file_path}" in
+    /*)
+      ;;
+    *)
+      __pm_file_path="\${PWD}/\${__pm_file_path}"
+      ;;
+  esac
+
+  __pm_file_dir="\${__pm_file_path%/*}"
+  __pm_file_base="\${__pm_file_path##*/}"
+  __pm_physical_dir="$(CDPATH= cd "\${__pm_file_dir}" 2>/dev/null && pwd -P)"
+  if [ -n "\${__pm_physical_dir}" ]; then
+    printf '%s/%s\\n' "\${__pm_physical_dir}" "\${__pm_file_base}"
+    return 0
+  fi
+
+  printf '%s\\n' "\${__pm_file_path}"
+}
+
+__port_manager_same_compose_file_path() {
+  __pm_left="$(__port_manager_normalize_compose_file_path "$1")"
+  __pm_right="$(__port_manager_normalize_compose_file_path "$2")"
+  [ "\${__pm_left}" = "\${__pm_right}" ]
+}
+
+__port_manager_compose_args_reference_file() {
+  __pm_expected_file="$1"
+  shift
+  __pm_next_is_file=0
+
+  for __pm_arg in "$@"; do
+    if [ "\${__pm_next_is_file}" = "1" ]; then
+      __pm_next_is_file=0
+      if __port_manager_same_compose_file_path "\${__pm_expected_file}" "\${__pm_arg}"; then
+        return 0
+      fi
+      continue
+    fi
+
+    case "\${__pm_arg}" in
+      -f|--file)
+        __pm_next_is_file=1
+        continue
+        ;;
+      --file=*)
+        if __port_manager_same_compose_file_path "\${__pm_expected_file}" "\${__pm_arg#--file=}"; then
+          return 0
+        fi
+        ;;
+      -f?*)
+        if __port_manager_same_compose_file_path "\${__pm_expected_file}" "\${__pm_arg#-f}"; then
+          return 0
+        fi
+        ;;
+    esac
+  done
+
+  return 1
+}
+
 __port_manager_compose_route_for_runtime() {
   __pm_runtime="$1"
+  shift
   __pm_file="\${PORT_MANAGER_COMPOSE_ROUTING_FILE:-}"
-  __pm_network="\${PORT_MANAGER_NETWORK_ID:-\${NEWDLOPS_PM_NETWORK_ID:-}}"
+  __pm_network="$(__port_manager_network_id)"
   __pm_best_attached_project=""
   __pm_best_original_project=""
   __pm_best_length=0
@@ -204,15 +334,18 @@ __port_manager_compose_route_for_runtime() {
   fi
 
   while IFS="$(printf '\\t')" read -r __pm_row_kind __pm_row_network __pm_row_runtime __pm_workdir __pm_attached_project __pm_original_project __pm_rest; do
-    if [ "\${__pm_row_kind}" != "project" ]; then
-      continue
-    fi
-
     if [ "\${__pm_row_network}" != "\${__pm_network}" ] || [ "\${__pm_row_runtime}" != "\${__pm_runtime}" ]; then
       continue
     fi
 
-    if __port_manager_cwd_matches_workdir "\${__pm_workdir}"; then
+    __pm_row_matches=0
+    if [ "\${__pm_row_kind}" = "project" ] && __port_manager_cwd_matches_workdir "\${__pm_workdir}"; then
+      __pm_row_matches=1
+    elif [ "\${__pm_row_kind}" = "file" ] && __port_manager_compose_args_reference_file "\${__pm_workdir}" "$@"; then
+      __pm_row_matches=1
+    fi
+
+    if [ "\${__pm_row_matches}" = "1" ]; then
       __pm_length=\${#__pm_workdir}
       if [ "\${__pm_length}" -ge "\${__pm_best_length}" ]; then
         __pm_best_length="\${__pm_length}"
@@ -226,22 +359,6 @@ __port_manager_compose_route_for_runtime() {
     printf '%s\\t%s\\n' "\${__pm_best_attached_project}" "\${__pm_best_original_project}"
     return 0
   fi
-
-  return 1
-}
-
-__port_manager_compose_args_have_project() {
-  if [ -n "\${COMPOSE_PROJECT_NAME:-}" ]; then
-    return 0
-  fi
-
-  for __pm_arg in "$@"; do
-    case "\${__pm_arg}" in
-      -p|--project-name|-p*|--project-name=*)
-        return 0
-        ;;
-    esac
-  done
 
   return 1
 }
@@ -272,7 +389,7 @@ __port_manager_container_target_for_runtime() {
   __pm_runtime="$1"
   __pm_token="$2"
   __pm_file="\${PORT_MANAGER_COMPOSE_ROUTING_FILE:-}"
-  __pm_network="\${PORT_MANAGER_NETWORK_ID:-\${NEWDLOPS_PM_NETWORK_ID:-}}"
+  __pm_network="$(__port_manager_network_id)"
   __pm_matches=0
   __pm_target=""
   __pm_token_length=\${#__pm_token}
@@ -299,7 +416,7 @@ __port_manager_container_target_for_runtime() {
       ;;
   esac
 
-  while IFS="$(printf '\\t')" read -r __pm_row_kind __pm_row_network __pm_row_runtime __pm_workdir __pm_project __pm_original_name __pm_attached_id __pm_attached_name; do
+  while IFS="$(printf '\\t')" read -r __pm_row_kind __pm_row_network __pm_row_runtime __pm_workdir __pm_project __pm_original_name __pm_attached_id __pm_attached_name __pm_service_name; do
     if [ "\${__pm_row_kind}" != "container" ]; then
       continue
     fi
@@ -309,7 +426,7 @@ __port_manager_container_target_for_runtime() {
     fi
 
     __pm_matched=0
-    if [ "\${__pm_token}" = "\${__pm_original_name}" ]; then
+    if [ "\${__pm_token}" = "\${__pm_original_name}" ] || [ "\${__pm_token}" = "\${__pm_attached_name}" ] || [ "\${__pm_token}" = "\${__pm_service_name}" ]; then
       __pm_matched=1
     elif [ "\${__pm_token_length}" -ge 4 ]; then
       case "\${__pm_project}" in
@@ -317,6 +434,12 @@ __port_manager_container_target_for_runtime() {
       esac
       case "\${__pm_token}" in
         "\${__pm_project}"*) __pm_matched=1 ;;
+      esac
+      case "\${__pm_attached_id}" in
+        "\${__pm_token}"*) __pm_matched=1 ;;
+      esac
+      case "\${__pm_token}" in
+        "\${__pm_attached_id}"*) __pm_matched=1 ;;
       esac
     fi
 
@@ -378,8 +501,9 @@ __port_manager_run_runtime_with_container_routing() {
 __port_manager_run_compose_command_with_routing() {
   __pm_route_runtime="$1"
   __pm_command="$2"
-  shift 2
-  __pm_route="$(__port_manager_compose_route_for_runtime "\${__pm_route_runtime}")"
+  __pm_standalone_compose="$3"
+  shift 3
+  __pm_route="$(__port_manager_compose_route_for_runtime "\${__pm_route_runtime}" "$@")"
   if [ -z "\${__pm_route}" ]; then
     command "\${__pm_command}" "$@"
     return $?
@@ -387,18 +511,12 @@ __port_manager_run_compose_command_with_routing() {
 
   __pm_tab="$(printf '\\t')"
   __pm_attached_project="\${__pm_route%%\${__pm_tab}*}"
-  __pm_original_project="\${__pm_route#*\${__pm_tab}}"
-  __pm_env_project="\${COMPOSE_PROJECT_NAME:-}"
   __pm_args=""
   __pm_rewrite_next=0
-  __pm_rewrote_project=0
 
   for __pm_arg in "$@"; do
     if [ "\${__pm_rewrite_next}" = "1" ]; then
-      if [ -n "\${__pm_original_project}" ] && [ "\${__pm_arg}" = "\${__pm_original_project}" ]; then
-        __pm_arg="\${__pm_attached_project}"
-        __pm_rewrote_project=1
-      fi
+      __pm_arg="\${__pm_attached_project}"
       __pm_rewrite_next=0
       __pm_args="\${__pm_args} $(__port_manager_shell_quote "\${__pm_arg}")"
       continue
@@ -411,48 +529,30 @@ __port_manager_run_compose_command_with_routing() {
         continue
         ;;
       --project-name=*)
-        __pm_value="\${__pm_arg#--project-name=}"
-        if [ -n "\${__pm_original_project}" ] && [ "\${__pm_value}" = "\${__pm_original_project}" ]; then
-          __pm_arg="--project-name=\${__pm_attached_project}"
-          __pm_rewrote_project=1
-        fi
+        __pm_arg="--project-name=\${__pm_attached_project}"
         ;;
       -p?*)
-        __pm_value="\${__pm_arg#-p}"
-        if [ -n "\${__pm_original_project}" ] && [ "\${__pm_value}" = "\${__pm_original_project}" ]; then
-          __pm_arg="-p\${__pm_attached_project}"
-          __pm_rewrote_project=1
-        fi
+        __pm_arg="-p\${__pm_attached_project}"
         ;;
     esac
 
     __pm_args="\${__pm_args} $(__port_manager_shell_quote "\${__pm_arg}")"
   done
 
-  if ! __port_manager_compose_args_have_project "$@"; then
-    (COMPOSE_PROJECT_NAME="\${__pm_attached_project}"; export COMPOSE_PROJECT_NAME; eval "command \${__pm_command}\${__pm_args}")
-    return $?
-  fi
-
-  if [ -n "\${__pm_original_project}" ] && [ "\${__pm_env_project}" = "\${__pm_original_project}" ]; then
-    (COMPOSE_PROJECT_NAME="\${__pm_attached_project}"; export COMPOSE_PROJECT_NAME; eval "command \${__pm_command}\${__pm_args}")
-    return $?
-  fi
-
-  eval "command \${__pm_command}\${__pm_args}"
+  (COMPOSE_PROJECT_NAME="\${__pm_attached_project}"; export COMPOSE_PROJECT_NAME; eval "command \${__pm_command}\${__pm_args}")
 }
 
 __port_manager_run_runtime_with_compose_routing() {
   __pm_runtime="$1"
   shift
-  __port_manager_run_compose_command_with_routing "\${__pm_runtime}" "\${__pm_runtime}" "$@"
+  __port_manager_run_compose_command_with_routing "\${__pm_runtime}" "\${__pm_runtime}" 0 "$@"
 }
 
 __port_manager_run_standalone_compose_with_routing() {
   __pm_route_runtime="$1"
   __pm_command="$2"
   shift 2
-  __port_manager_run_compose_command_with_routing "\${__pm_route_runtime}" "\${__pm_command}" "$@"
+  __port_manager_run_compose_command_with_routing "\${__pm_route_runtime}" "\${__pm_command}" 1 "$@"
 }
 
 docker() {

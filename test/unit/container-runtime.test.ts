@@ -212,7 +212,21 @@ test("mutates compose services into a hidden network-scoped project", async (con
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
   const composeFile = path.join(tempDir, "compose.yaml");
   const staleOverrideFile = path.join(tempDir, "a-app-workspace-bc74e5f2.ports.override.yaml");
-  fs.writeFileSync(composeFile, "services:\n  postgres:\n    image: postgres:16\n", "utf8");
+  fs.writeFileSync(
+    composeFile,
+    [
+      "services:",
+      "  postgres:",
+      "    image: postgres:16",
+      "  langgraph_server:",
+      "    image: langgraph:latest",
+      "    container_name: captain_langgraph_server",
+      "    ports:",
+      "      - 9002:9002",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
 
   const calls: Array<{
     readonly executable: string;
@@ -225,7 +239,7 @@ test("mutates compose services into a hidden network-scoped project", async (con
     runCommand: async (executable, args, options) => {
       calls.push({ executable, args, ...(options?.cwd !== undefined ? { cwd: options.cwd } : {}) });
       if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
-        return { stdout: "postgres\n", stderr: "" };
+        return { stdout: "postgres\nlanggraph_server\n", stderr: "" };
       }
       if (args[0] === "container" && args[1] === "ls") {
         containerListCount += 1;
@@ -335,6 +349,9 @@ test("mutates compose services into a hidden network-scoped project", async (con
   assert.doesNotMatch(overrideText, /name: 'workspace_pgdata'/);
   assert.match(overrideText, /name: 'pm-a-app-workspace-bc74e5f2-[a-f0-9]{12}-[a-f0-9]{8}'/);
   assert.match(overrideText, /read_only: true/);
+  assert.match(overrideText, /'langgraph_server':/);
+  assert.match(overrideText, /profiles: !override\n      - 'pm_unattached'/);
+  assert.match(overrideText, /ports: !override \[\]/);
 
   assert.deepEqual(calls.map((call) => call.args[0]), [
     "compose",

@@ -1809,6 +1809,7 @@ export class PortManagerNetworkService implements DisposableLike {
     );
     const shellEnvRestorePath = prepareShellEnvRestoreScript(this.context.globalStorageUri.fsPath, hookLibraryPath, {
       networkId,
+      composeRoutingFilePath: this.getComposeProjectRoutingFilePath(),
     });
     const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
     const commands = [
@@ -1914,7 +1915,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     commands.push(
-      "unset -f docker podman docker-compose podman-compose __port_manager_compose_args_have_project __port_manager_runtime_first_command __port_manager_runtime_container_subcommand __port_manager_compose_route_for_runtime __port_manager_cwd_matches_workdir __port_manager_container_target_for_runtime __port_manager_shell_quote __port_manager_runtime_command_may_reference_container __port_manager_run_runtime_with_container_routing __port_manager_run_compose_command_with_routing __port_manager_run_standalone_compose_with_routing 2>/dev/null || true",
+      "unset -f docker podman docker-compose podman-compose __port_manager_runtime_first_command __port_manager_runtime_container_subcommand __port_manager_network_id __port_manager_normalize_compose_file_path __port_manager_same_compose_file_path __port_manager_compose_args_reference_file __port_manager_compose_route_for_runtime __port_manager_cwd_matches_workdir __port_manager_container_target_for_runtime __port_manager_shell_quote __port_manager_runtime_command_may_reference_container __port_manager_run_runtime_with_container_routing __port_manager_run_compose_command_with_routing __port_manager_run_standalone_compose_with_routing 2>/dev/null || true",
     );
     commands.push(`printf '%s\\n' ${shellQuote("Port Manager routing detached from this shell.")}`);
 
@@ -2109,6 +2110,7 @@ function buildComposeProjectRoutingRows(
         networkId: attachment.networkId,
         runtime: mutation.runtime,
         workingDirectory,
+        composeFiles: mutation.composeFiles,
         originalProjectName: mutation.originalProjectName,
         attachedProjectName: mutation.attachedProjectName,
         containerMappings: mutation.containerMappings,

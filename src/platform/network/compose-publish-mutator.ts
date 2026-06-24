@@ -166,7 +166,11 @@ export class ComposePublishMutator {
       composeFiles,
     };
 
-    const services = await this.filterDefinedComposeServices(originalContext, requestedServices);
+    const definedServices = await this.listDefinedComposeServices(originalContext);
+    const services = this.filterDefinedComposeServices(originalContext.projectName, requestedServices, definedServices);
+    const overrideServices = mode === "clone" ? definedServices : services;
+    const disabledOverrideServices =
+      mode === "clone" ? definedServices.filter((service) => !services.includes(service)) : [];
     const ports = input.ports.filter((port) => services.includes(port.serviceName));
     const originalContainers = await this.listComposeServiceContainers(input.runtime, originalProjectName, services);
     const originalServiceMounts = await this.inspectServiceMounts(input.runtime, originalContainers);
@@ -180,10 +184,17 @@ export class ComposePublishMutator {
       mode === "clone"
         ? buildVolumeClonePlan(attachedProjectName, randomUUID().slice(0, 8), originalServiceMounts)
         : { serviceMounts: originalServiceMounts, volumeClones: [] };
-    const overrideFile = await this.writeHiddenPortsOverride(attachedProjectName, ports, volumeClonePlan.serviceMounts, {
-      resetContainerName: mode === "clone",
-      isolatedNetwork: mode === "clone" ? "pm_isolated" : undefined,
-    });
+    const overrideFile = await this.writeHiddenPortsOverride(
+      attachedProjectName,
+      overrideServices,
+      ports,
+      volumeClonePlan.serviceMounts,
+      {
+        resetContainerName: mode === "clone",
+        isolatedNetwork: mode === "clone" ? "pm_isolated" : undefined,
+        disabledServices: disabledOverrideServices,
+      },
+    );
     const hiddenContext: ComposeCommandContext = {
       runtime: input.runtime,
       projectName: attachedProjectName,
@@ -347,16 +358,23 @@ export class ComposePublishMutator {
   /** Writes a Compose override whose only job is to replace published ports. */
   private async writeHiddenPortsOverride(
     attachedProjectName: string,
+    services: readonly string[],
     ports: readonly ComposePublishedPort[],
     serviceMounts: ReadonlyMap<string, readonly ComposeServiceMount[]>,
-    options: { readonly resetContainerName: boolean; readonly isolatedNetwork?: string },
+    options: {
+      readonly resetContainerName: boolean;
+      readonly isolatedNetwork?: string;
+      readonly disabledServices?: readonly string[];
+    },
   ): Promise<string> {
     await fs.mkdir(this.storageDirectory, { recursive: true });
     const overrideFile = path.join(this.storageDirectory, `${attachedProjectName}.ports.override.yaml`);
     const portsByService = groupPortsByService(ports);
+    const disabledServices = new Set(options.disabledServices ?? []);
     const lines = ["services:"];
 
-    for (const [serviceName, servicePorts] of portsByService) {
+    for (const serviceName of uniqueStrings(services)) {
+      const servicePorts = portsByService.get(serviceName) ?? [];
       lines.push(`  ${quoteYamlString(serviceName)}:`);
       if (options.resetContainerName) {
         lines.push("    container_name: !reset null");
@@ -364,13 +382,21 @@ export class ComposePublishMutator {
         lines.push("    links: !reset []");
         lines.push("    external_links: !reset []");
       }
+      if (disabledServices.has(serviceName)) {
+        lines.push("    profiles: !override");
+        lines.push("      - 'pm_unattached'");
+      }
       if (options.isolatedNetwork !== undefined) {
         lines.push("    networks: !override");
         lines.push(`      - ${quoteYamlString(options.isolatedNetwork)}`);
       }
-      lines.push("    ports: !override");
-      for (const port of servicePorts) {
-        lines.push(`      - ${quoteYamlString(`127.0.0.1::${port.containerPort}/${port.protocol}`)}`);
+      if (servicePorts.length === 0) {
+        lines.push("    ports: !override []");
+      } else {
+        lines.push("    ports: !override");
+        for (const port of servicePorts) {
+          lines.push(`      - ${quoteYamlString(`127.0.0.1::${port.containerPort}/${port.protocol}`)}`);
+        }
       }
 
       const mounts = serviceMounts.get(serviceName) ?? [];
@@ -471,27 +497,35 @@ export class ComposePublishMutator {
     return grouped;
   }
 
-  /** Drops stale runtime-label services before mutating current compose services. */
-  private async filterDefinedComposeServices(
+  /** Lists services from the current compose file set before mutating runtime containers. */
+  private async listDefinedComposeServices(
     context: ComposeCommandContext,
-    services: readonly string[],
   ): Promise<readonly string[]> {
     const result = await this.runCommand(context.runtime, this.buildComposeArgs(context, ["config", "--services"]), {
       timeoutMs: COMPOSE_TIMEOUT_MS,
       ...(context.workingDirectory !== undefined ? { cwd: context.workingDirectory } : {}),
     });
-    const definedServices = new Set(
+    return uniqueStrings(
       result.stdout
         .split(/\r?\n/)
         .map((line) => line.trim())
         .filter((line) => line.length > 0),
     );
+  }
+
+  /** Drops stale runtime-label services before mutating current compose services. */
+  private filterDefinedComposeServices(
+    projectName: string,
+    services: readonly string[],
+    definedServicesList: readonly string[],
+  ): readonly string[] {
+    const definedServices = new Set(definedServicesList);
     const missingServices = services.filter((service) => !definedServices.has(service));
     const matchedServices = services.filter((service) => definedServices.has(service));
 
     if (matchedServices.length === 0) {
       throw new Error(
-        `Compose file set for project ${context.projectName} does not define any selected service. Missing service${missingServices.length === 1 ? "" : "s"}: ${missingServices.join(", ")}.`,
+        `Compose file set for project ${projectName} does not define any selected service. Missing service${missingServices.length === 1 ? "" : "s"}: ${missingServices.join(", ")}.`,
       );
     }
 
