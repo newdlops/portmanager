@@ -22,6 +22,7 @@
 
 #define PM_MAX_PATH 4096
 #define PM_MAX_LINE 4096
+#define PM_MAX_SCRIPT 16384
 #define PM_MAX_TEXT 512
 #define PM_RUNTIME_SHIM_DIR_ENV "PORT_MANAGER_RUNTIME_SHIM_DIR"
 
@@ -447,6 +448,26 @@ static char *pm_trim(char *value) {
   return value;
 }
 
+static int pm_shebang_uses_shell(const char *script_path) {
+  char line[PM_MAX_LINE];
+  char *cursor;
+  char *name;
+
+  if (pm_read_shebang(script_path, line, sizeof(line)) != 0) {
+    return 0;
+  }
+
+  cursor = pm_trim(line + 2);
+  name = strrchr(cursor, '/');
+  name = name == NULL ? cursor : name + 1;
+  return strcmp(name, "sh") == 0 ||
+    strcmp(name, "bash") == 0 ||
+    strcmp(name, "zsh") == 0 ||
+    strcmp(name, "env sh") == 0 ||
+    strcmp(name, "env bash") == 0 ||
+    strcmp(name, "env zsh") == 0;
+}
+
 static int pm_exec_env_script(const char *script_path, int argc, char **argv) {
   char line[PM_MAX_LINE];
   char *cursor;
@@ -504,6 +525,137 @@ static int pm_exec_env_script(const char *script_path, int argc, char **argv) {
   return -1;
 }
 
+static int pm_exec_resolved_target(const char *target_path, int argc, char **argv) {
+  char **next_argv;
+
+  if (pm_exec_env_script(target_path, argc, argv) == 0) {
+    return 0;
+  }
+
+  next_argv = calloc((size_t)argc + 1, sizeof(char *));
+  if (next_argv == NULL) {
+    return -1;
+  }
+
+  next_argv[0] = (char *)target_path;
+  for (int index = 1; index < argc; index++) {
+    next_argv[index] = argv[index];
+  }
+
+  pm_restore_network_scope();
+  pm_restore_dyld();
+  execv(target_path, next_argv);
+  return -1;
+}
+
+static int pm_read_script_prefix(const char *script_path, char *buffer, size_t size) {
+  int fd;
+  ssize_t count;
+  size_t used = 0;
+
+  if (buffer == NULL || size == 0) {
+    return -1;
+  }
+
+  fd = open(script_path, O_RDONLY);
+  if (fd < 0) {
+    return -1;
+  }
+
+  while (used + 1 < size && (count = read(fd, buffer + used, size - used - 1)) > 0) {
+    used += (size_t)count;
+  }
+  close(fd);
+  buffer[used] = '\0';
+  return used > 0 ? 0 : -1;
+}
+
+static void pm_apply_simple_prefix_assignment(const char *line, const char *exec_position) {
+  const char *prefix = strstr(line, "PREFIX=\"");
+  const char *value_start;
+  const char *value_end;
+  char value[PM_MAX_PATH];
+  size_t length;
+
+  if (prefix == NULL || (exec_position != NULL && prefix > exec_position)) {
+    return;
+  }
+
+  value_start = prefix + strlen("PREFIX=\"");
+  value_end = strchr(value_start, '"');
+  if (value_end == NULL) {
+    return;
+  }
+
+  length = (size_t)(value_end - value_start);
+  if (length == 0 || length >= sizeof(value)) {
+    return;
+  }
+
+  memcpy(value, value_start, length);
+  value[length] = '\0';
+  setenv("PREFIX", value, 1);
+}
+
+static int pm_exec_simple_shell_exec_wrapper(const char *script_path, int argc, char **argv) {
+  char script[PM_MAX_SCRIPT];
+  char *line;
+  char *save = NULL;
+
+  /*
+   * Homebrew runtime commands such as yarn are shell wrappers that immediately
+   * exec the real JS entrypoint. Passing through /bin/bash strips DYLD again,
+   * so unwrap the simple "exec \"/absolute/script\" \"$@\"" form and launch
+   * the target directly with the restored preload environment.
+   */
+  if (!pm_shebang_uses_shell(script_path) || pm_read_script_prefix(script_path, script, sizeof(script)) != 0) {
+    return -1;
+  }
+
+  line = strtok_r(script, "\n", &save);
+  while (line != NULL) {
+    char *trimmed = pm_trim(line);
+    char *exec_position = strstr(trimmed, "exec \"");
+    char *target_start;
+    char *target_end;
+    char target_path[PM_MAX_PATH];
+    size_t target_length;
+
+    if (exec_position == NULL) {
+      line = strtok_r(NULL, "\n", &save);
+      continue;
+    }
+
+    target_start = exec_position + strlen("exec \"");
+    if (target_start[0] != '/') {
+      line = strtok_r(NULL, "\n", &save);
+      continue;
+    }
+
+    target_end = strchr(target_start, '"');
+    if (target_end == NULL || strstr(target_end + 1, "\"$@\"") == NULL) {
+      line = strtok_r(NULL, "\n", &save);
+      continue;
+    }
+
+    target_length = (size_t)(target_end - target_start);
+    if (target_length == 0 || target_length >= sizeof(target_path)) {
+      return -1;
+    }
+
+    memcpy(target_path, target_start, target_length);
+    target_path[target_length] = '\0';
+    if (!pm_is_executable_file(target_path)) {
+      return -1;
+    }
+
+    pm_apply_simple_prefix_assignment(trimmed, exec_position);
+    return pm_exec_resolved_target(target_path, argc, argv);
+  }
+
+  return -1;
+}
+
 int main(int argc, char **argv) {
   const char *tool_name = pm_basename(argv[0]);
   const char *environment_tool_name = getenv("PORT_MANAGER_ASDF_TOOL_NAME");
@@ -534,7 +686,8 @@ int main(int argc, char **argv) {
     return 127;
   }
 
-  if (pm_exec_env_script(executable_path, argc, argv) == 0) {
+  if (pm_exec_env_script(executable_path, argc, argv) == 0 ||
+      pm_exec_simple_shell_exec_wrapper(executable_path, argc, argv) == 0) {
     return 0;
   }
 

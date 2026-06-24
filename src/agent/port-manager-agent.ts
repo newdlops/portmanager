@@ -400,6 +400,25 @@ export class PortManagerAgent implements DisposableLike {
         };
       }
 
+      const samePortListener =
+        routeDirection === "send" ? await this.findSamePortExternalListener(input.requestedPort) : undefined;
+      if (samePortListener !== undefined) {
+        const logicalRoutes = this.buildCurrentLogicalRoutes();
+        this.writeRouteTable(logicalRoutes);
+        this.queueSnapshotBroadcast();
+
+        return {
+          allocationId: "",
+          requestedPort: input.requestedPort,
+          actualPort: input.requestedPort,
+          host: normalizeListenerHost(samePortListener.localAddress, input.host),
+          routed: false,
+          logicalRoutes,
+          logicalRoutesFile: getRouteTablePathForNetwork(networkRouteScope, this.routeTablePath),
+          expiresAt: this.now().toISOString(),
+        };
+      }
+
       const decision = await this.routingService.route({
         requestedPort: input.requestedPort,
         host: input.host,
@@ -1189,6 +1208,22 @@ export class PortManagerAgent implements DisposableLike {
       return listeners.find((listener) => listener.port === actualPort);
     } catch {
       // If listener scans fail, fall back to the explicit lifecycle signal.
+      return undefined;
+    }
+  }
+
+  /**
+   * Sender-side tools can start after a server that was launched before attach
+   * or after a protected launcher dropped the native hook. In that case there
+   * is no route row yet, but the OS already has the requested localhost port.
+   * Prefer that same-port listener over creating a shadow 5xxxx reservation.
+   */
+  private async findSamePortExternalListener(logicalPort: number): Promise<ListeningPort | undefined> {
+    try {
+      const listeners = await this.listeningPortProvider.list();
+      this.updateReservedListeningPorts(listeners);
+      return listeners.find((listener) => listener.port === logicalPort);
+    } catch {
       return undefined;
     }
   }

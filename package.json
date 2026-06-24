@@ -671,6 +671,11 @@
           ],
           "description": "Routing policy. Hashed keeps logical ports unoccupied and assigns actual ports from the virtual range."
         },
+        "portManager.enableLoopbackAddressRouting": {
+          "type": "boolean",
+          "default": true,
+          "description": "Prefer per-network loopback IP addresses for terminal socket routing when the required loopback alias is available."
+        },
         "portManager.virtualPortRangeStart": {
           "type": "number",
           "default": 53000,
@@ -730,6 +735,14 @@
             "type": "number"
           },
           "description": "TCP ports that the native terminal hook leaves untouched because the port number itself identifies a fixed protocol such as SSH, MySQL, or PostgreSQL."
+        },
+        "portManager.preservedListenPorts": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "number"
+          },
+          "description": "Host-visible listener ports that terminal hooks should keep on the requested port. Browser dev servers are auto-detected; this list is an override."
         },
         "portManager.containerRuntime": {
           "type": "string",

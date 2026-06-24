@@ -2338,6 +2338,7 @@ export PORT_MANAGER_ROUTING_MODE="${options.settings.routingMode}"
 export PORT_MANAGER_VIRTUAL_PORT_START="${options.settings.virtualPortRangeStart}"
 export PORT_MANAGER_VIRTUAL_PORT_END="${options.settings.virtualPortRangeEnd}"
 export PORT_MANAGER_FIXED_PROTOCOL_PORTS="${options.settings.fixedProtocolPorts.join(",")}"
+export PORT_MANAGER_PRESERVE_LISTEN_PORTS="${options.settings.preservedListenPorts.join(",")}"
 	${escapedRuntimeShimDirectory !== undefined ? `export ${RUNTIME_SHIM_DIRECTORY_ENV}="${escapedRuntimeShimDirectory}"
 	export PATH="${escapedRuntimeShimDirectory}:$PATH"
 	hash -r 2>/dev/null || true` : ""}

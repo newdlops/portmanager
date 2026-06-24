@@ -30,6 +30,10 @@ typedef struct {
   size_t capacity;
 } pm_listener_list;
 
+static int pm_scan_lsof(pm_listener_list *listeners, const char *updated_at);
+static int pm_find_listener_for_port(int port, pm_listener *out);
+static const char *pm_listener_route_host(const pm_listener *listener, const char *fallback_host, char *buffer, size_t size);
+
 static void pm_copy(char *target, size_t size, const char *value) {
   if (size == 0) {
     return;
@@ -651,13 +655,164 @@ static int pm_route_hashed(pm_agent_state *state, const pm_allocate_input *input
   return 0;
 }
 
+static int pm_listener_list_has_port(const pm_listener_list *listeners, int port) {
+  for (size_t index = 0; listeners != NULL && index < listeners->count; index++) {
+    if (listeners->items[index].port == port) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int pm_process_is_external_listener_owned(const pm_process *process) {
+  return process != NULL &&
+    (strcmp(process->source, "registered") == 0 ||
+     strcmp(process->source, "hooked") == 0 ||
+     strcmp(process->source, "compose") == 0);
+}
+
+static const pm_listener *pm_find_listener_by_pid_port(const pm_listener_list *listeners, pid_t pid, int port) {
+  for (size_t index = 0; listeners != NULL && index < listeners->count; index++) {
+    if (listeners->items[index].pid == pid && listeners->items[index].port == port) {
+      return &listeners->items[index];
+    }
+  }
+
+  return NULL;
+}
+
+static const pm_listener *pm_find_listener_by_port(const pm_listener_list *listeners, int port) {
+  const pm_listener *fallback = NULL;
+
+  for (size_t index = 0; listeners != NULL && index < listeners->count; index++) {
+    if (listeners->items[index].port != port) {
+      continue;
+    }
+
+    if (listeners->items[index].pid > 0) {
+      return &listeners->items[index];
+    }
+
+    fallback = &listeners->items[index];
+  }
+
+  return fallback;
+}
+
+static void pm_clear_missing_listener_state(pm_process *process) {
+  process->missing_listener_since = 0;
+  process->missing_listener_count = 0;
+}
+
+static int pm_adopt_listener_owner(pm_process *process, const pm_listener *listener) {
+  int changed = 0;
+
+  if (listener == NULL) {
+    return 0;
+  }
+
+  if (listener->pid > 0 && process->pid != listener->pid) {
+    process->pid = listener->pid;
+    changed = 1;
+  }
+  if (listener->process_name[0] != '\0' && strcmp(process->name, listener->process_name) != 0) {
+    pm_copy(process->name, sizeof(process->name), listener->process_name);
+    changed = 1;
+  }
+  if (listener->command[0] != '\0' && strcmp(process->command, listener->command) != 0) {
+    pm_copy(process->command, sizeof(process->command), listener->command);
+    changed = 1;
+  }
+
+  pm_clear_missing_listener_state(process);
+  return changed;
+}
+
+static int pm_reconcile_external_processes_with_listeners(
+  pm_agent_state *state,
+  const pm_listener_list *listeners,
+  const char *updated_at) {
+  int changed = 0;
+  time_t now = time(NULL);
+
+  for (size_t index = 0; index < state->process_count; index++) {
+    pm_process *process = &state->processes[index];
+    const pm_listener *listener;
+
+    if (strcmp(process->status, "running") != 0 || !pm_process_is_external_listener_owned(process)) {
+      pm_clear_missing_listener_state(process);
+      continue;
+    }
+
+    listener = pm_find_listener_by_pid_port(listeners, process->pid, process->actual_port);
+    if (listener != NULL) {
+      pm_clear_missing_listener_state(process);
+      continue;
+    }
+
+    listener = pm_find_listener_by_port(listeners, process->actual_port);
+    if (listener != NULL) {
+      changed = pm_adopt_listener_owner(process, listener) || changed;
+      continue;
+    }
+
+    /*
+     * Hooked servers are owned by their OS listener, not by a child handle in
+     * the daemon. Require two missed scans and a short grace window so Daphne
+     * autoreload handoffs do not erase routes, while dead routes stop blocking
+     * the next listen/send allocation.
+     */
+    if (process->missing_listener_since == 0) {
+      process->missing_listener_since = now;
+    }
+    process->missing_listener_count++;
+
+    if (now - process->missing_listener_since >= PM_EXTERNAL_LISTENER_GRACE_SECONDS &&
+        process->missing_listener_count >= PM_EXTERNAL_LISTENER_MISSING_SCAN_THRESHOLD) {
+      pm_copy(process->status, sizeof(process->status), "stopped");
+      pm_copy(process->stopped_at, sizeof(process->stopped_at), updated_at);
+      process->url[0] = '\0';
+      pm_clear_missing_listener_state(process);
+      changed = 1;
+    }
+  }
+
+  return changed;
+}
+
 static int pm_cleanup_pending(pm_agent_state *state) {
   time_t now = time(NULL);
   size_t before = state->pending_count;
   size_t write_index = 0;
+  pm_listener_list listeners = {0};
+  int listener_scan_attempted = 0;
+  int listener_scan_ok = 0;
 
   for (size_t read_index = 0; read_index < state->pending_count; read_index++) {
-    if (state->pending_routes[read_index].expires_at > now) {
+    int keep_route = state->pending_routes[read_index].expires_at > now;
+
+    if (!keep_route) {
+      /*
+       * A listener can outlive its short-lived allocation while a hook process
+       * is still coming up. Match the TypeScript daemon contract: if the actual
+       * routed port is already listening, refresh the pending endpoint instead
+       * of deleting the route that clients may need to reach it.
+       */
+      if (!listener_scan_attempted) {
+        char updated_at[PM_TIME];
+        pm_iso_now(updated_at, sizeof(updated_at));
+        listener_scan_ok = pm_scan_lsof(&listeners, updated_at) == 0;
+        listener_scan_attempted = 1;
+      }
+
+      if (listener_scan_ok && pm_listener_list_has_port(&listeners, state->pending_routes[read_index].route.actual_port)) {
+        state->pending_routes[read_index].expires_at = now + PM_ROUTE_TTL_SECONDS;
+        keep_route = 1;
+      }
+    }
+
+    if (keep_route) {
       if (write_index != read_index) {
         state->pending_routes[write_index] = state->pending_routes[read_index];
       }
@@ -666,6 +821,7 @@ static int pm_cleanup_pending(pm_agent_state *state) {
   }
 
   state->pending_count = write_index;
+  free(listeners.items);
   return before != state->pending_count;
 }
 
@@ -904,6 +1060,28 @@ static int pm_write_route_table_file(const char *file_path, const pm_route *rout
   return result;
 }
 
+static int pm_route_matches_endpoint(const pm_route *route, int logical_port, const char *network_id) {
+  return route->logical_port == logical_port &&
+    strcmp(route->network_id, network_id == NULL ? "" : network_id) == 0;
+}
+
+static int pm_collect_endpoint_routes(
+  const pm_route_list *routes,
+  int logical_port,
+  const char *network_id,
+  pm_route_list *endpoint_routes) {
+  memset(endpoint_routes, 0, sizeof(*endpoint_routes));
+
+  for (size_t index = 0; routes != NULL && index < routes->count; index++) {
+    if (pm_route_matches_endpoint(&routes->items[index], logical_port, network_id) &&
+        pm_route_list_add_dedupe(endpoint_routes, &routes->items[index]) != 0) {
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
 static int pm_write_route_entry_file(pm_agent_state *state, int logical_port, const char *network_id) {
   pm_route_list routes;
   pm_route_list endpoint_routes = {0};
@@ -914,21 +1092,22 @@ static int pm_write_route_entry_file(pm_agent_state *state, int logical_port, co
     return -1;
   }
 
-  for (size_t index = 0; index < routes.count; index++) {
-    if (
-      routes.items[index].logical_port == logical_port &&
-      strcmp(routes.items[index].network_id, network_id == NULL ? "" : network_id) == 0
-    ) {
-      if (pm_route_list_add_dedupe(&endpoint_routes, &routes.items[index]) != 0) {
-        free(routes.items);
-        free(endpoint_routes.items);
-        return -1;
-      }
+  pm_route_entry_path(state->route_table_path, logical_port, network_id == NULL ? "" : network_id, entry_path, sizeof(entry_path));
+  if (pm_collect_endpoint_routes(&routes, logical_port, network_id, &endpoint_routes) != 0) {
+    result = -1;
+  } else if (endpoint_routes.count == 0) {
+    result = (unlink(entry_path) == 0 || errno == ENOENT) ? 0 : -1;
+  } else {
+    result = pm_write_route_table_file(entry_path, endpoint_routes.items, endpoint_routes.count);
+    if (result == 0) {
+      result = pm_string_array_add(
+        &state->written_entry_paths,
+        &state->written_entry_count,
+        &state->written_entry_capacity,
+        entry_path);
     }
   }
 
-  pm_route_entry_path(state->route_table_path, logical_port, network_id == NULL ? "" : network_id, entry_path, sizeof(entry_path));
-  result = pm_write_route_table_file(entry_path, endpoint_routes.items, endpoint_routes.count);
   free(routes.items);
   free(endpoint_routes.items);
   return result;
@@ -951,15 +1130,23 @@ static int pm_write_route_tables(pm_agent_state *state) {
   for (size_t index = 0; index < routes.count; index++) {
     char entry_path[PM_TEXT];
     pm_route_entry_path(state->route_table_path, routes.items[index].logical_port, routes.items[index].network_id, entry_path, sizeof(entry_path));
-    if (pm_write_route_table_file(entry_path, &routes.items[index], 1) == 0) {
-      pm_string_array_add(&current_entries, &current_entry_count, &current_entry_capacity, entry_path);
+    if (!pm_string_array_contains(current_entries, current_entry_count, entry_path)) {
+      pm_route_list endpoint_routes = {0};
+      if (pm_collect_endpoint_routes(&routes, routes.items[index].logical_port, routes.items[index].network_id, &endpoint_routes) != 0 ||
+          pm_write_route_table_file(entry_path, endpoint_routes.items, endpoint_routes.count) != 0 ||
+          pm_string_array_add(&current_entries, &current_entry_count, &current_entry_capacity, entry_path) != 0) {
+        result = -1;
+      }
+      free(endpoint_routes.items);
     }
     if (routes.items[index].network_id[0] != '\0') {
       pm_string_array_add(&current_networks, &current_network_count, &current_network_capacity, routes.items[index].network_id);
     }
   }
 
-  result = pm_write_route_table_file(state->route_table_path, routes.items, routes.count);
+  if (pm_write_route_table_file(state->route_table_path, routes.items, routes.count) != 0) {
+    result = -1;
+  }
 
   for (size_t network_index = 0; network_index < current_network_count; network_index++) {
     char network_path[PM_TEXT];
@@ -1050,6 +1237,16 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
   pm_pending_route *reusable;
   int actual_port;
   pm_pending_route pending;
+  pm_listener_list listeners = {0};
+  char updated_at[PM_TIME];
+
+  pm_iso_now(updated_at, sizeof(updated_at));
+  if (pm_scan_lsof(&listeners, updated_at) == 0) {
+    if (pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
+      pm_write_route_tables(state);
+    }
+  }
+  free(listeners.items);
 
   if (pm_cleanup_pending(state)) {
     pm_write_route_tables(state);
@@ -1066,6 +1263,29 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
     reusable->expires_at = time(NULL) + PM_ROUTE_TTL_SECONDS;
     pm_write_route_entry_file(state, input->requested_port, network_id);
     return pm_build_allocation_payload(state, reusable->id, input->requested_port, reusable->route.actual_port, reusable->route.host, network_id, reusable->expires_at, payload);
+  }
+
+  if (strcmp(input->route_direction, "send") == 0) {
+    pm_listener same_port_listener;
+    char same_port_host[PM_SMALL];
+
+    /*
+     * A sender can start after a server that was launched before terminal
+     * attach, or after a protected launcher dropped the hook. In that state
+     * the OS has the requested listener but no route row exists yet, so a new
+     * 5xxxx reservation would shadow the real server and make wait-on hang.
+     */
+    if (pm_find_listener_for_port(input->requested_port, &same_port_listener)) {
+      return pm_build_allocation_payload(
+        state,
+        "",
+        input->requested_port,
+        input->requested_port,
+        pm_listener_route_host(&same_port_listener, input->host, same_port_host, sizeof(same_port_host)),
+        network_id,
+        time(NULL),
+        payload);
+    }
   }
 
   actual_port = strcmp(input->routing_mode, "hashed") == 0 ? pm_route_hashed(state, input) : pm_route_nearest(state, input);
@@ -1139,6 +1359,54 @@ static pm_process *pm_find_registered_route(pm_agent_state *state, const pm_regi
   return NULL;
 }
 
+static int pm_listener_address_is_wildcard(const char *address) {
+  return address == NULL ||
+    address[0] == '\0' ||
+    strcmp(address, "*") == 0 ||
+    strcmp(address, "0.0.0.0") == 0 ||
+    strcmp(address, "::") == 0 ||
+    strcmp(address, "[::]") == 0;
+}
+
+static int pm_listener_address_is_routeable(const char *address) {
+  char normalized[PM_SMALL];
+  struct in_addr v4;
+  struct in6_addr v6;
+  size_t length;
+
+  if (pm_listener_address_is_wildcard(address)) {
+    return 0;
+  }
+
+  if (strcmp(address, "localhost") == 0) {
+    return 1;
+  }
+
+  pm_copy(normalized, sizeof(normalized), address);
+  length = strlen(normalized);
+  if (length > 2 && normalized[0] == '[' && normalized[length - 1] == ']') {
+    memmove(normalized, normalized + 1, length - 2);
+    normalized[length - 2] = '\0';
+  }
+
+  return inet_pton(AF_INET, normalized, &v4) == 1 ||
+    inet_pton(AF_INET6, normalized, &v6) == 1;
+}
+
+static const char *pm_listener_route_host(const pm_listener *listener, const char *fallback_host, char *buffer, size_t size) {
+  if (buffer == NULL || size == 0) {
+    return fallback_host;
+  }
+
+  if (listener != NULL && pm_listener_address_is_routeable(listener->local_address)) {
+    pm_copy(buffer, size, listener->local_address);
+  } else {
+    pm_copy(buffer, size, fallback_host);
+  }
+
+  return buffer;
+}
+
 static pm_process *pm_find_process(pm_agent_state *state, const char *id) {
   for (size_t index = 0; index < state->process_count; index++) {
     if (strcmp(state->processes[index].id, id) == 0) {
@@ -1201,6 +1469,7 @@ int pm_state_register_process(pm_agent_state *state, const pm_register_input *in
   process->error_message[0] = '\0';
   pm_copy(process->source, sizeof(process->source), source);
   process->child_owned = 0;
+  pm_clear_missing_listener_state(process);
 
   pm_remove_pending_endpoint(state, process->requested_port, network_id);
   pm_write_route_tables(state);
@@ -1367,6 +1636,7 @@ int pm_state_release_process_route(pm_agent_state *state, const pm_release_proce
         pm_copy(process->name, sizeof(process->name), active_listener.process_name);
         pm_copy(process->command, sizeof(process->command), active_listener.command);
       }
+      pm_clear_missing_listener_state(process);
       retained = 1;
       continue;
     }
@@ -1374,6 +1644,7 @@ int pm_state_release_process_route(pm_agent_state *state, const pm_release_proce
     pm_copy(process->status, sizeof(process->status), "stopped");
     pm_iso_now(process->stopped_at, sizeof(process->stopped_at));
     process->url[0] = '\0';
+    pm_clear_missing_listener_state(process);
     released = 1;
   }
 
@@ -1543,6 +1814,7 @@ static int pm_start_process_with_actual(pm_agent_state *state, const pm_start_in
   process->error_message[0] = '\0';
   pm_copy(process->source, sizeof(process->source), "managed");
   process->child_owned = 1;
+  pm_clear_missing_listener_state(process);
   pm_copy(process->injection_mode, sizeof(process->injection_mode), input->injection_mode);
   process->scan_range = input->scan_range;
   pm_copy(process->scan_direction, sizeof(process->scan_direction), input->scan_direction);
@@ -1614,6 +1886,7 @@ int pm_state_stop_process(pm_agent_state *state, const char *id, const char *sig
   pm_copy(process->status, sizeof(process->status), "stopped");
   pm_iso_now(process->stopped_at, sizeof(process->stopped_at));
   process->url[0] = '\0';
+  pm_clear_missing_listener_state(process);
   pm_write_route_tables(state);
   return pm_append_process_json(payload, process);
 }
@@ -1649,6 +1922,8 @@ int pm_state_restart_process(pm_agent_state *state, const char *id, const char *
     kill(process->pid, pm_signal_number(signal_name));
     pm_copy(process->status, sizeof(process->status), "stopped");
     pm_iso_now(process->stopped_at, sizeof(process->stopped_at));
+    process->url[0] = '\0';
+    pm_clear_missing_listener_state(process);
   }
 
   memset(&allocation_input, 0, sizeof(allocation_input));
@@ -1773,7 +2048,10 @@ int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload) {
   if (pm_cleanup_pending(state)) {
     pm_write_route_tables(state);
   }
-  pm_scan_lsof(&listeners, updated_at);
+  if (pm_scan_lsof(&listeners, updated_at) == 0 &&
+      pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
+    pm_write_route_tables(state);
+  }
   for (size_t index = 0; index < listeners.count; index++) {
     if (pm_listener_is_tracked(state, &listeners.items[index])) {
       pm_copy(listeners.items[index].source, sizeof(listeners.items[index].source), "managed");
@@ -1879,6 +2157,7 @@ int pm_state_reap_children(pm_agent_state *state) {
         pm_copy(process->status, sizeof(process->status), "stopped");
         pm_iso_now(process->stopped_at, sizeof(process->stopped_at));
         process->url[0] = '\0';
+        pm_clear_missing_listener_state(process);
         changed = 1;
       }
     }
@@ -1895,10 +2174,12 @@ int pm_state_listener_signature(pm_agent_state *state, pm_buffer *signature) {
   pm_listener_list listeners = {0};
   char updated_at[PM_TIME];
 
-  (void)state;
   pm_iso_now(updated_at, sizeof(updated_at));
   if (pm_scan_lsof(&listeners, updated_at) != 0) {
     return -1;
+  }
+  if (pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
+    pm_write_route_tables(state);
   }
 
   for (size_t index = 0; index < listeners.count; index++) {

@@ -16,6 +16,8 @@
 #define PM_DEFAULT_VIRTUAL_START 53000
 #define PM_DEFAULT_VIRTUAL_END 59999
 #define PM_ROUTE_TTL_SECONDS 30
+#define PM_EXTERNAL_LISTENER_GRACE_SECONDS 2
+#define PM_EXTERNAL_LISTENER_MISSING_SCAN_THRESHOLD 2
 
 typedef struct {
   char *data;
@@ -53,6 +55,8 @@ typedef struct {
   char error_message[PM_TEXT];
   char source[PM_SOURCE];
   int child_owned;
+  time_t missing_listener_since;
+  int missing_listener_count;
   char injection_mode[PM_SMALL];
   int scan_range;
   char scan_direction[PM_SMALL];

@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import * as syncFs from "node:fs";
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -13,6 +14,11 @@ import {
 } from "../agent/route-table";
 import { readContainerRuntimeSettings, readPortManagerSettings } from "../config/vscode-settings";
 import { LogicalNetworkRegistry, type LogicalNetworkRegistryState } from "../core/networks/logical-network-registry";
+import {
+  isLoopbackAddressRoutingEnabled,
+  loopbackAddressForNetwork,
+  NETWORK_LOOPBACK_HOST_ENV,
+} from "../core/networks/loopback-address";
 import { findRoutesMatchingClientCwd } from "../core/networks/logical-route-selection";
 import { SimpleEventEmitter } from "../shared/events";
 import {
@@ -89,6 +95,7 @@ const COMPOSE_PROJECT_ROUTING_FILE_NAME = "compose-project-routing.tsv";
 const COMPOSE_PROJECT_ROUTING_FILE_PREFIX = "compose-project-routing-";
 const COMPOSE_PROJECT_ROUTING_COMPOSE_SEPARATOR = ".compose-";
 const TERMINAL_ATTACHMENT_MARKER_DIRECTORY_NAME = "terminal-attachments";
+const TERMINAL_HOOK_SCRIPT_DIRECTORY_NAME = "terminal-hook-scripts";
 const MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX = "manual-terminal:";
 const PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX = "process-terminal:";
 const COMPOSE_ATTACHMENT_RECONCILE_INTERVAL_MS = 3_000;
@@ -2247,8 +2254,38 @@ export class PortManagerNetworkService implements DisposableLike {
     return path.join(this.context.globalStorageUri.fsPath, TERMINAL_ATTACHMENT_MARKER_DIRECTORY_NAME);
   }
 
-  /** Builds the shell commands that make later child processes join one logical network scope. */
+  /** Directory for generated shell bodies sourced by the one-line terminal injection command. */
+  private getTerminalHookScriptDirectoryPath(): string {
+    return path.join(this.context.globalStorageUri.fsPath, TERMINAL_HOOK_SCRIPT_DIRECTORY_NAME);
+  }
+
+  /**
+   * Writes a generated terminal script body and returns the stable path to source.
+   * Terminal input must stay short because some PTY paste paths truncate very long
+   * one-line snippets, while the sourced file can keep the readable full bootstrap.
+   */
+  private writeTerminalHookScript(fileName: string, contents: string): string {
+    const directoryPath = this.getTerminalHookScriptDirectoryPath();
+    const scriptPath = path.join(directoryPath, fileName);
+
+    syncFs.mkdirSync(directoryPath, { recursive: true });
+    syncFs.writeFileSync(scriptPath, `${contents.trimEnd()}\n`, { encoding: "utf8", mode: 0o700 });
+    syncFs.chmodSync(scriptPath, 0o700);
+    return scriptPath;
+  }
+
+  /** Builds a one-line command that makes later child processes join one logical network scope. */
   private buildTerminalRoutingScript(networkId: string, settings: PortManagerSettings): string {
+    const scriptPath = this.writeTerminalHookScript(
+      `attach-${sanitizeRouteFileScope(networkId)}.sh`,
+      this.buildTerminalRoutingScriptBody(networkId, settings),
+    );
+
+    return `. ${shellQuote(scriptPath)}`;
+  }
+
+  /** Builds the full attach bootstrap stored in globalStorage and sourced by the shell. */
+  private buildTerminalRoutingScriptBody(networkId: string, settings: PortManagerSettings): string {
     const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
     const agentMainPath = this.context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
     const nativeAgentPath = this.context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
@@ -2296,8 +2333,12 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_VIRTUAL_PORT_START", String(settings.virtualPortRangeStart)),
       shellExport("PORT_MANAGER_VIRTUAL_PORT_END", String(settings.virtualPortRangeEnd)),
       shellExport("PORT_MANAGER_FIXED_PROTOCOL_PORTS", settings.fixedProtocolPorts.join(",")),
+      shellExport("PORT_MANAGER_PRESERVE_LISTEN_PORTS", settings.preservedListenPorts.join(",")),
       shellPrependLibrary(preloadVariable, hookLibraryPath),
     ];
+    if (isLoopbackAddressRoutingEnabled(settings)) {
+      commands.push(buildLoopbackAddressRoutingShell(loopbackAddressForNetwork(networkId)));
+    }
     commands.push(buildAgentDaemonEnsureShell(process.execPath));
 
     if (process.platform === "darwin" && shellEnvRestorePath !== undefined) {
@@ -2322,11 +2363,17 @@ export class PortManagerNetworkService implements DisposableLike {
       )}; fi`,
     );
 
-    return commands.join("; ");
+    return commands.join("\n");
   }
 
-  /** Builds a shell snippet that removes native routing variables from the current shell. */
+  /** Builds a one-line shell command that removes native routing variables from the current shell. */
   private buildTerminalDetachScript(): string {
+    const scriptPath = this.writeTerminalHookScript("detach.sh", this.buildTerminalDetachScriptBody());
+    return `. ${shellQuote(scriptPath)}`;
+  }
+
+  /** Builds the full detach bootstrap stored in globalStorage and sourced by the shell. */
+  private buildTerminalDetachScriptBody(): string {
     const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
     const asdfShimLauncherPath = this.context.asAbsolutePath(getAsdfShimLauncherRelativePath());
     const runtimeCommandShimPath = this.context.asAbsolutePath(getRuntimeCommandShimRelativePath());
@@ -2358,6 +2405,8 @@ export class PortManagerNetworkService implements DisposableLike {
       "PORT_MANAGER_VIRTUAL_PORT_START",
       "PORT_MANAGER_VIRTUAL_PORT_END",
       "PORT_MANAGER_FIXED_PROTOCOL_PORTS",
+      "PORT_MANAGER_PRESERVE_LISTEN_PORTS",
+      NETWORK_LOOPBACK_HOST_ENV,
       "PORT_MANAGER_DYLD_INSERT_LIBRARIES",
       RUNTIME_SHIM_DIRECTORY_ENV,
     ];
@@ -2383,7 +2432,7 @@ export class PortManagerNetworkService implements DisposableLike {
     );
     commands.push(`printf '%s\\n' ${shellQuote("Port Manager routing detached from this shell.")}`);
 
-    return commands.join("; ");
+    return commands.join("\n");
   }
 }
 
@@ -3335,6 +3384,32 @@ function shellExport(name: string, value: string): string {
 
 function shellPrependLibrary(name: string, libraryPath: string): string {
   return `export ${name}=${shellQuote(libraryPath)}\${${name}:+":$${name}"}`;
+}
+
+/**
+ * Enables loopback-address routing only after the OS can bind the generated
+ * address. macOS needs an lo0 alias, so sudo is attempted in non-interactive
+ * mode and failure falls back to high-port routing without blocking startup.
+ */
+function buildLoopbackAddressRoutingShell(host: string): string {
+  const quotedHost = shellQuote(host);
+
+  if (process.platform !== "darwin") {
+    return `export ${NETWORK_LOOPBACK_HOST_ENV}=${quotedHost}`;
+  }
+
+  return [
+    `__pm_loopback_host=${quotedHost}`,
+    `if ifconfig lo0 2>/dev/null | grep -E "inet[[:space:]]+$__pm_loopback_host([[:space:]]|$)" >/dev/null 2>&1; then`,
+    `export ${NETWORK_LOOPBACK_HOST_ENV}="$__pm_loopback_host"`,
+    `elif ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1 || sudo -n ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1; then`,
+    `export ${NETWORK_LOOPBACK_HOST_ENV}="$__pm_loopback_host"`,
+    `else`,
+    `unset ${NETWORK_LOOPBACK_HOST_ENV}`,
+    `printf '%s\\n' 'Port Manager loopback IP routing unavailable; using high-port routing fallback.' >&2`,
+    `fi`,
+    `unset __pm_loopback_host`,
+  ].join("\n");
 }
 
 /**

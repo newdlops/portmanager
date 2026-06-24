@@ -46,6 +46,10 @@ export function readPortManagerSettings(): PortManagerSettings {
       config.get<ScanDirection>("scanDirection", DEFAULT_SETTINGS.scanDirection),
     ),
     routingMode: normalizeRoutingMode(config.get<PortRoutingMode>("routingMode", DEFAULT_SETTINGS.routingMode)),
+    enableLoopbackAddressRouting: config.get<boolean>(
+      "enableLoopbackAddressRouting",
+      DEFAULT_SETTINGS.enableLoopbackAddressRouting ?? true,
+    ),
     virtualPortRangeStart: virtualPortRange.start,
     virtualPortRangeEnd: virtualPortRange.end,
     preferredPorts: normalizePreferredPorts(
@@ -54,6 +58,11 @@ export function readPortManagerSettings(): PortManagerSettings {
     fixedProtocolPorts: normalizePortList(
       config.get<readonly number[]>("fixedProtocolPorts", DEFAULT_SETTINGS.fixedProtocolPorts),
       DEFAULT_SETTINGS.fixedProtocolPorts,
+      { allowEmpty: true },
+    ),
+    preservedListenPorts: normalizePortList(
+      config.get<readonly number[]>("preservedListenPorts", DEFAULT_SETTINGS.preservedListenPorts),
+      DEFAULT_SETTINGS.preservedListenPorts,
       { allowEmpty: true },
     ),
     autoOpenBrowser: config.get<boolean>("autoOpenBrowser", DEFAULT_SETTINGS.autoOpenBrowser),

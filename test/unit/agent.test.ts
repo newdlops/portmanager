@@ -670,6 +670,55 @@ test("reuses pending route allocations for sender-first and receiver-first order
   assert.equal(laterSenderAllocation.actualPort, firstReceiverAllocation.actualPort);
 });
 
+test("uses same-port OS listeners for sender requests before creating a shadow route", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const listeners: readonly ListeningPort[] = [
+    createListener({
+      port: 8004,
+      localAddress: "127.0.0.1",
+      pid: 4321,
+      processName: "python3",
+      command: "python manage.py runserver 8004",
+    }),
+  ];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: {
+      check: async () => {
+        throw new Error("same-port listener fallback should skip route allocation");
+      },
+    },
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const allocation = await agent.allocateRoute({
+    name: "wait-on",
+    command: "wait-on http-get://localhost:8004/healthz",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    routeDirection: "send",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+
+  assert.equal(allocation.allocationId, "");
+  assert.equal(allocation.actualPort, 8004);
+  assert.equal(allocation.host, "127.0.0.1");
+  assert.equal(allocation.routed, false);
+  assert.deepEqual(allocation.logicalRoutes, []);
+});
+
 test("promotes sender-first reservations into listener routes", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const agent = new PortManagerAgent({

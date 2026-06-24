@@ -441,6 +441,8 @@ export interface PortManagerSettings {
   readonly scanDirection: ScanDirection;
   /** Routing policy used to choose the actual bind port. */
   readonly routingMode: PortRoutingMode;
+  /** Whether terminal hooks should prefer per-network loopback IPs over high-port remapping. */
+  readonly enableLoopbackAddressRouting?: boolean;
   /** First TCP port in the deterministic hashed actual-port range. */
   readonly virtualPortRangeStart: number;
   /** Last TCP port in the deterministic hashed actual-port range. */
@@ -449,6 +451,8 @@ export interface PortManagerSettings {
   readonly preferredPorts: readonly number[];
   /** Ports whose protocol identity should not be auto-remapped by terminal hooks. */
   readonly fixedProtocolPorts: readonly number[];
+  /** Host-visible listener ports that should stay bound to their logical port. */
+  readonly preservedListenPorts: readonly number[];
   /** Whether a newly launched routed URL should be opened automatically. */
   readonly autoOpenBrowser: boolean;
   /** Whether conflict routing should show an informational notification. */

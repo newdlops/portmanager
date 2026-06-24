@@ -34,6 +34,8 @@
 #define PM_MAX_REQUEST 8192
 #define PM_MAX_TEXT 512
 #define PM_MAX_PATH 1024
+#define PM_MAX_SHEBANG 4096
+#define PM_MAX_SCRIPT_LINE 4096
 #define PM_MAX_ROUTES 128
 #define PM_DEFAULT_SCAN_RANGE 20
 #define PM_DEFAULT_VIRTUAL_START 53000
@@ -41,11 +43,14 @@
 #define PM_DEFAULT_FIXED_PROTOCOL_PORTS "22,25,53,80,110,143,389,443,465,587,993,995,1433,1521,3306,33060,5432,5672,6379,9200,9300,11211,27017"
 #define PM_AGENT_ROUNDTRIP_TIMEOUT_MS 5000
 #define PM_BIND_ALLOCATION_ATTEMPTS 4
+#define PM_NETWORK_LOOPBACK_HOST_ENV "PORT_MANAGER_NETWORK_LOOPBACK_HOST"
 
 typedef int (*pm_bind_fn)(int, const struct sockaddr *, socklen_t);
 typedef int (*pm_connect_fn)(int, const struct sockaddr *, socklen_t);
 typedef int (*pm_getsockname_fn)(int, struct sockaddr *, socklen_t *);
 typedef int (*pm_execve_fn)(const char *, char *const [], char *const []);
+typedef int (*pm_execv_fn)(const char *, char *const []);
+typedef int (*pm_execvp_fn)(const char *, char *const []);
 typedef int (*pm_posix_spawn_fn)(
   pid_t *,
   const char *,
@@ -73,6 +78,8 @@ static pm_bind_fn pm_real_bind = bind;
 static pm_connect_fn pm_real_connect = connect;
 static pm_getsockname_fn pm_real_getsockname = getsockname;
 static pm_execve_fn pm_real_execve = execve;
+static pm_execv_fn pm_real_execv = execv;
+static pm_execvp_fn pm_real_execvp = execvp;
 static pm_posix_spawn_fn pm_real_posix_spawn = posix_spawn;
 static pm_posix_spawnp_fn pm_real_posix_spawnp = posix_spawnp;
 #else
@@ -80,6 +87,8 @@ static pm_bind_fn pm_real_bind = NULL;
 static pm_connect_fn pm_real_connect = NULL;
 static pm_getsockname_fn pm_real_getsockname = NULL;
 static pm_execve_fn pm_real_execve = NULL;
+static pm_execv_fn pm_real_execv = NULL;
+static pm_execvp_fn pm_real_execvp = NULL;
 static pm_posix_spawn_fn pm_real_posix_spawn = NULL;
 static pm_posix_spawnp_fn pm_real_posix_spawnp = NULL;
 #endif
@@ -90,6 +99,7 @@ static unsigned long pm_request_sequence = 1;
 
 static void pm_release_process_routes(void);
 static const char *pm_current_network_id(void);
+extern char **environ;
 
 static int pm_hook_enabled(void) {
   const char *disabled = getenv("PORT_MANAGER_HOOK_DISABLED");
@@ -132,9 +142,1031 @@ static const char *pm_path_basename(const char *path) {
   return slash == NULL ? path : slash + 1;
 }
 
+static int pm_basename_is_one_of(const char *path, const char *const names[]) {
+  const char *base_name = pm_path_basename(path);
+
+  if (base_name == NULL) {
+    return 0;
+  }
+
+  for (size_t index = 0; names[index] != NULL; index++) {
+    if (strcmp(base_name, names[index]) == 0) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int pm_text_contains_any(const char *value, const char *const needles[]) {
+  if (value == NULL || value[0] == '\0') {
+    return 0;
+  }
+
+  for (size_t index = 0; needles[index] != NULL; index++) {
+    if (strstr(value, needles[index]) != NULL) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int pm_current_process_looks_like_browser_dev_server(void) {
+  static const char *const executable_names[] = {
+    "vite",
+    "vite.js",
+    "next",
+    "astro",
+    "storybook",
+    "webpack-dev-server",
+    NULL,
+  };
+  static const char *const lifecycle_markers[] = {
+    "vite",
+    "storybook",
+    "next dev",
+    "astro dev",
+    "webpack-dev-server",
+    NULL,
+  };
+  const char *underscore = getenv("_");
+
+  /*
+   * Browser dev servers are host entrypoints, not service-to-service endpoints.
+   * Package managers usually preserve either "_" or npm lifecycle metadata, so
+   * use those stable hints instead of guessing from the numeric port alone.
+   */
+  return pm_basename_is_one_of(underscore, executable_names) ||
+    pm_text_contains_any(getenv("npm_lifecycle_event"), lifecycle_markers) ||
+    pm_text_contains_any(getenv("npm_lifecycle_script"), lifecycle_markers) ||
+    getenv("VITE_PROXY_TARGET_HOST") != NULL ||
+    getenv("VITE_ZUZU_SERVICE") != NULL;
+}
+
 static int pm_env_flag_is_one(const char *name) {
   const char *value = getenv(name);
   return value != NULL && strcmp(value, "1") == 0;
+}
+
+#if defined(__APPLE__)
+#define PM_PRELOAD_ENV "DYLD_INSERT_LIBRARIES"
+#define PM_PRELOAD_HINT_ENV "PORT_MANAGER_DYLD_INSERT_LIBRARIES"
+#else
+#define PM_PRELOAD_ENV "LD_PRELOAD"
+#define PM_PRELOAD_HINT_ENV "PORT_MANAGER_LD_PRELOAD"
+#endif
+
+typedef struct {
+  char **envp;
+  char *preload_assignment;
+} pm_child_environment;
+
+typedef struct {
+  const char *target;
+  char **argv;
+  char *resolved_script_path;
+  char *interpreter_path;
+  char *argv_storage;
+  char **envp;
+  char **envp_storage;
+} pm_child_exec_plan;
+
+static const char *pm_envp_value(char *const envp[], const char *name) {
+  size_t name_length;
+
+  if (envp == NULL || name == NULL) {
+    return NULL;
+  }
+
+  name_length = strlen(name);
+  for (size_t index = 0; envp[index] != NULL; index++) {
+    if (strncmp(envp[index], name, name_length) == 0 && envp[index][name_length] == '=') {
+      return envp[index] + name_length + 1;
+    }
+  }
+
+  return NULL;
+}
+
+static int pm_envp_value_is(char *const envp[], const char *name, const char *expected) {
+  const char *value = pm_envp_value(envp, name);
+  return value != NULL && strcmp(value, expected) == 0;
+}
+
+static int pm_colon_list_contains(const char *list, const char *entry) {
+  size_t entry_length;
+  const char *cursor;
+
+  if (list == NULL || entry == NULL || entry[0] == '\0') {
+    return 0;
+  }
+
+  entry_length = strlen(entry);
+  cursor = list;
+  while (*cursor != '\0') {
+    const char *end = strchr(cursor, ':');
+    size_t segment_length = end == NULL ? strlen(cursor) : (size_t)(end - cursor);
+
+    if (segment_length == entry_length && strncmp(cursor, entry, segment_length) == 0) {
+      return 1;
+    }
+
+    if (end == NULL) {
+      break;
+    }
+
+    cursor = end + 1;
+  }
+
+  return 0;
+}
+
+static char *pm_make_preload_assignment(const char *hook_path, const char *current_value) {
+  char *assignment;
+  size_t size;
+
+  if (hook_path == NULL || hook_path[0] == '\0') {
+    return NULL;
+  }
+
+  if (current_value == NULL || current_value[0] == '\0') {
+    size = strlen(PM_PRELOAD_ENV) + strlen(hook_path) + 2;
+    assignment = malloc(size);
+    if (assignment == NULL) {
+      return NULL;
+    }
+
+    snprintf(assignment, size, "%s=%s", PM_PRELOAD_ENV, hook_path);
+    return assignment;
+  }
+
+  size = strlen(PM_PRELOAD_ENV) + strlen(hook_path) + strlen(current_value) + 3;
+  assignment = malloc(size);
+  if (assignment == NULL) {
+    return NULL;
+  }
+
+  snprintf(assignment, size, "%s=%s:%s", PM_PRELOAD_ENV, hook_path, current_value);
+  return assignment;
+}
+
+static pm_child_environment pm_prepare_child_environment(char *const envp[]) {
+  pm_child_environment prepared = { (char **)envp, NULL };
+  const char *hook_path;
+  const char *current_preload;
+  char *assignment;
+  char **updated_envp;
+  size_t count = 0;
+  size_t preload_index = (size_t)-1;
+  size_t name_length = strlen(PM_PRELOAD_ENV);
+
+  /*
+   * Package managers can remove DYLD_INSERT_LIBRARIES while preserving the
+   * Port Manager hint variable. Repair the child environment at exec time so
+   * client-side tools such as wait-on keep the same routing view as servers.
+   */
+  if (!pm_hook_enabled() || pm_hook_depth > 0 || envp == NULL ||
+      pm_envp_value_is(envp, "PORT_MANAGER_HOOK_DISABLED", "1") ||
+      pm_envp_value_is(envp, "PORT_MANAGER_HOOK", "0")) {
+    return prepared;
+  }
+
+  hook_path = pm_envp_value(envp, PM_PRELOAD_HINT_ENV);
+  current_preload = pm_envp_value(envp, PM_PRELOAD_ENV);
+  if (hook_path == NULL || hook_path[0] == '\0' || pm_colon_list_contains(current_preload, hook_path)) {
+    return prepared;
+  }
+
+  while (envp[count] != NULL) {
+    if (strncmp(envp[count], PM_PRELOAD_ENV, name_length) == 0 && envp[count][name_length] == '=') {
+      preload_index = count;
+    }
+    count++;
+  }
+
+  assignment = pm_make_preload_assignment(hook_path, current_preload);
+  if (assignment == NULL) {
+    return prepared;
+  }
+
+  updated_envp = malloc(sizeof(char *) * (count + (preload_index == (size_t)-1 ? 2 : 1)));
+  if (updated_envp == NULL) {
+    free(assignment);
+    return prepared;
+  }
+
+  for (size_t index = 0; index < count; index++) {
+    updated_envp[index] = preload_index == index ? assignment : envp[index];
+  }
+
+  if (preload_index == (size_t)-1) {
+    updated_envp[count] = assignment;
+    updated_envp[count + 1] = NULL;
+  } else {
+    updated_envp[count] = NULL;
+  }
+
+  prepared.envp = updated_envp;
+  prepared.preload_assignment = assignment;
+  pm_debug("child preload restored variable=%s", PM_PRELOAD_ENV);
+  return prepared;
+}
+
+static void pm_release_child_environment(pm_child_environment *prepared) {
+  if (prepared == NULL || prepared->preload_assignment == NULL) {
+    return;
+  }
+
+  free(prepared->envp);
+  free(prepared->preload_assignment);
+  prepared->envp = NULL;
+  prepared->preload_assignment = NULL;
+}
+
+static int pm_is_executable_file(const char *path) {
+  struct stat stat_buffer;
+
+  return path != NULL &&
+    path[0] != '\0' &&
+    stat(path, &stat_buffer) == 0 &&
+    S_ISREG(stat_buffer.st_mode) &&
+    access(path, X_OK) == 0;
+}
+
+static int pm_same_path_text(const char *left, const char *right) {
+  char left_resolved[PM_MAX_PATH];
+  char right_resolved[PM_MAX_PATH];
+
+  if (left == NULL || right == NULL) {
+    return 0;
+  }
+
+  if (realpath(left, left_resolved) == NULL) {
+    snprintf(left_resolved, sizeof(left_resolved), "%s", left);
+  }
+
+  if (realpath(right, right_resolved) == NULL) {
+    snprintf(right_resolved, sizeof(right_resolved), "%s", right);
+  }
+
+  return strcmp(left_resolved, right_resolved) == 0;
+}
+
+static int pm_is_node_package_binary_path(const char *path) {
+  return path != NULL &&
+    (strstr(path, "/node_modules/.bin/") != NULL ||
+     strncmp(path, "node_modules/.bin/", 18) == 0);
+}
+
+static int pm_find_executable_on_env_path(
+  const char *tool_name,
+  char *const envp[],
+  char *buffer,
+  size_t size,
+  int allow_runtime_shim) {
+  const char *path_env = pm_envp_value(envp, "PATH");
+  const char *shim_directory = pm_envp_value(envp, "PORT_MANAGER_RUNTIME_SHIM_DIR");
+  const char *cursor;
+
+  if (tool_name == NULL || tool_name[0] == '\0' || strchr(tool_name, '/') != NULL ||
+      path_env == NULL || path_env[0] == '\0' || buffer == NULL || size == 0) {
+    return -1;
+  }
+
+  cursor = path_env;
+  while (cursor != NULL) {
+    const char *separator = strchr(cursor, ':');
+    size_t directory_length = separator == NULL ? strlen(cursor) : (size_t)(separator - cursor);
+    char directory[PM_MAX_PATH];
+    char candidate[PM_MAX_PATH];
+
+    if (directory_length == 0) {
+      snprintf(directory, sizeof(directory), ".");
+    } else if (directory_length >= sizeof(directory)) {
+      goto next_path_entry;
+    } else {
+      memcpy(directory, cursor, directory_length);
+      directory[directory_length] = '\0';
+    }
+
+    if (!allow_runtime_shim && shim_directory != NULL && shim_directory[0] != '\0' &&
+        pm_same_path_text(directory, shim_directory)) {
+      goto next_path_entry;
+    }
+
+    snprintf(candidate, sizeof(candidate), "%s/%s", directory, tool_name);
+    if (pm_is_executable_file(candidate)) {
+      snprintf(buffer, size, "%s", candidate);
+      return 0;
+    }
+
+next_path_entry:
+    if (separator == NULL) {
+      break;
+    }
+    cursor = separator + 1;
+  }
+
+  return -1;
+}
+
+static int pm_resolve_exec_path(
+  const char *path,
+  char *const envp[],
+  int allow_path_lookup,
+  char *buffer,
+  size_t size) {
+  if (path == NULL || path[0] == '\0' || buffer == NULL || size == 0) {
+    return -1;
+  }
+
+  if (strchr(path, '/') != NULL) {
+    if (!pm_is_executable_file(path)) {
+      return -1;
+    }
+    snprintf(buffer, size, "%s", path);
+    return 0;
+  }
+
+  if (!allow_path_lookup) {
+    return -1;
+  }
+
+  return pm_find_executable_on_env_path(path, envp, buffer, size, 1);
+}
+
+static int pm_read_shebang(const char *path, char *buffer, size_t size) {
+  FILE *file;
+
+  if (path == NULL || buffer == NULL || size == 0) {
+    return -1;
+  }
+
+  file = fopen(path, "r");
+  if (file == NULL) {
+    return -1;
+  }
+
+  if (fgets(buffer, (int)size, file) == NULL) {
+    fclose(file);
+    return -1;
+  }
+  fclose(file);
+
+  return strncmp(buffer, "#!", 2) == 0 ? 0 : -1;
+}
+
+static char *pm_trim_text(char *value) {
+  char *end;
+
+  while (value != NULL && (*value == ' ' || *value == '\t')) {
+    value++;
+  }
+
+  if (value == NULL) {
+    return NULL;
+  }
+
+  end = value + strlen(value);
+  while (end > value && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) {
+    *--end = '\0';
+  }
+
+  return value;
+}
+
+static char *pm_duplicate_text(const char *value) {
+  size_t size;
+  char *copy;
+
+  if (value == NULL) {
+    return NULL;
+  }
+
+  size = strlen(value) + 1;
+  copy = malloc(size);
+  if (copy == NULL) {
+    return NULL;
+  }
+
+  memcpy(copy, value, size);
+  return copy;
+}
+
+static int pm_shebang_env_tool(const char *script_path, char *tool_name, size_t tool_name_size) {
+  char line[PM_MAX_SHEBANG];
+  char *cursor;
+  char *tool_start;
+  size_t tool_length;
+
+  if (tool_name == NULL || tool_name_size == 0) {
+    return -1;
+  }
+
+  tool_name[0] = '\0';
+  if (pm_read_shebang(script_path, line, sizeof(line)) != 0) {
+    return -1;
+  }
+
+  cursor = pm_trim_text(line + 2);
+  if (cursor == NULL ||
+      strncmp(cursor, "/usr/bin/env", 12) != 0 ||
+      (cursor[12] != '\0' && cursor[12] != ' ' && cursor[12] != '\t')) {
+    return -1;
+  }
+
+  cursor += 12;
+  while (*cursor == ' ' || *cursor == '\t') {
+    cursor++;
+  }
+
+  tool_start = cursor;
+  while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
+    cursor++;
+  }
+
+  tool_length = (size_t)(cursor - tool_start);
+  if (tool_length == 0 || tool_length >= tool_name_size) {
+    return -1;
+  }
+
+  while (*cursor == ' ' || *cursor == '\t') {
+    cursor++;
+  }
+  if (*cursor != '\0') {
+    return -1;
+  }
+
+  memcpy(tool_name, tool_start, tool_length);
+  tool_name[tool_length] = '\0';
+  return 0;
+}
+
+static int pm_is_regular_file(const char *path) {
+  struct stat stat_buffer;
+
+  return path != NULL &&
+    path[0] != '\0' &&
+    stat(path, &stat_buffer) == 0 &&
+    S_ISREG(stat_buffer.st_mode);
+}
+
+static int pm_shell_script_uses_shell(const char *script_path) {
+  char line[PM_MAX_SHEBANG];
+  char *cursor;
+
+  if (pm_read_shebang(script_path, line, sizeof(line)) != 0) {
+    return 0;
+  }
+
+  cursor = pm_trim_text(line + 2);
+  if (cursor == NULL) {
+    return 0;
+  }
+
+  return strcmp(cursor, "/bin/sh") == 0 ||
+    strcmp(cursor, "/bin/bash") == 0 ||
+    strcmp(cursor, "/bin/zsh") == 0 ||
+    strcmp(cursor, "/usr/bin/env sh") == 0 ||
+    strcmp(cursor, "/usr/bin/env bash") == 0 ||
+    strcmp(cursor, "/usr/bin/env zsh") == 0;
+}
+
+static int pm_shell_script_node_exec_target(
+  const char *script_path,
+  char *interpreter_path,
+  size_t interpreter_size,
+  char *node_script_path,
+  size_t node_script_size) {
+  FILE *file;
+  char line[PM_MAX_SCRIPT_LINE];
+
+  if (!pm_shell_script_uses_shell(script_path) ||
+      interpreter_path == NULL ||
+      interpreter_size == 0 ||
+      node_script_path == NULL ||
+      node_script_size == 0) {
+    return -1;
+  }
+
+  file = fopen(script_path, "r");
+  if (file == NULL) {
+    return -1;
+  }
+
+  while (fgets(line, sizeof(line), file) != NULL) {
+    char *trimmed = pm_trim_text(line);
+    char *exec_position;
+    char *target_start;
+    char *target_end;
+    char *script_start;
+    char *script_end;
+    const char *target_name;
+    size_t target_length;
+    size_t script_length;
+
+    if (trimmed == NULL) {
+      continue;
+    }
+
+    exec_position = strstr(trimmed, "exec \"");
+    if (exec_position == NULL) {
+      continue;
+    }
+
+    target_start = exec_position + strlen("exec \"");
+    target_end = strchr(target_start, '"');
+    if (target_start[0] != '/' || target_end == NULL) {
+      continue;
+    }
+
+    script_start = target_end + 1;
+    while (*script_start == ' ' || *script_start == '\t') {
+      script_start++;
+    }
+    if (*script_start != '"') {
+      continue;
+    }
+    script_start++;
+    script_end = strchr(script_start, '"');
+    if (script_start[0] != '/' || script_end == NULL || strstr(script_end + 1, "\"$@\"") == NULL) {
+      continue;
+    }
+
+    target_length = (size_t)(target_end - target_start);
+    script_length = (size_t)(script_end - script_start);
+    if (target_length == 0 ||
+        target_length >= interpreter_size ||
+        script_length == 0 ||
+        script_length >= node_script_size) {
+      fclose(file);
+      return -1;
+    }
+
+    memcpy(interpreter_path, target_start, target_length);
+    interpreter_path[target_length] = '\0';
+    memcpy(node_script_path, script_start, script_length);
+    node_script_path[script_length] = '\0';
+    target_name = pm_path_basename(interpreter_path);
+    if ((target_name == NULL || (strcmp(target_name, "node") != 0 && strcmp(target_name, "nodejs") != 0)) ||
+        !pm_is_executable_file(interpreter_path) ||
+        !pm_is_regular_file(node_script_path)) {
+      continue;
+    }
+
+    fclose(file);
+    return 0;
+  }
+
+  fclose(file);
+  return -1;
+}
+
+static int pm_resolve_shebang_interpreter(
+  const char *tool_name,
+  char *const envp[],
+  char *buffer,
+  size_t size) {
+  const char *node_env;
+
+  if (strcmp(tool_name, "node") != 0) {
+    return -1;
+  }
+
+  node_env = pm_envp_value(envp, "NODE");
+  if (pm_is_executable_file(node_env)) {
+    snprintf(buffer, size, "%s", node_env);
+    return 0;
+  }
+
+  return pm_find_executable_on_env_path(tool_name, envp, buffer, size, 1);
+}
+
+static int pm_is_shell_name(const char *target) {
+  const char *name = pm_path_basename(target);
+
+  return name != NULL &&
+    (strcmp(name, "sh") == 0 ||
+     strcmp(name, "bash") == 0 ||
+     strcmp(name, "zsh") == 0);
+}
+
+static const char *pm_shell_command_arg(char *const argv[]) {
+  for (size_t index = 1; argv != NULL && argv[index] != NULL; index++) {
+    if (strcmp(argv[index], "-c") == 0) {
+      return argv[index + 1];
+    }
+  }
+
+  return NULL;
+}
+
+static int pm_shell_meta_character(char value) {
+  return value == '|' ||
+    value == '&' ||
+    value == ';' ||
+    value == '<' ||
+    value == '>' ||
+    value == '(' ||
+    value == ')' ||
+    value == '`' ||
+    value == '$' ||
+    value == '\\' ||
+    value == '\n' ||
+    value == '\r';
+}
+
+static int pm_tokenize_simple_shell_command(char *command, char **tokens, size_t max_tokens, size_t *token_count) {
+  char *cursor = command;
+  size_t count = 0;
+
+  if (command == NULL || tokens == NULL || token_count == NULL || max_tokens == 0) {
+    return -1;
+  }
+
+  while (*cursor != '\0') {
+    char quote = '\0';
+    char *start;
+
+    while (*cursor == ' ' || *cursor == '\t') {
+      cursor++;
+    }
+    if (*cursor == '\0') {
+      break;
+    }
+    if (pm_shell_meta_character(*cursor)) {
+      return -1;
+    }
+    if (count >= max_tokens) {
+      return -1;
+    }
+
+    if (*cursor == '\'' || *cursor == '"') {
+      quote = *cursor;
+      start = ++cursor;
+      while (*cursor != '\0' && *cursor != quote) {
+        if (pm_shell_meta_character(*cursor)) {
+          return -1;
+        }
+        cursor++;
+      }
+      if (*cursor != quote) {
+        return -1;
+      }
+      *cursor++ = '\0';
+      if (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
+        return -1;
+      }
+    } else {
+      start = cursor;
+      while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
+        if (pm_shell_meta_character(*cursor)) {
+          return -1;
+        }
+        cursor++;
+      }
+      if (*cursor != '\0') {
+        *cursor++ = '\0';
+      }
+    }
+
+    if (start[0] == '\0') {
+      return -1;
+    }
+    tokens[count++] = start;
+  }
+
+  *token_count = count;
+  return count > 0 ? 0 : -1;
+}
+
+static int pm_is_shell_env_assignment_token(const char *token) {
+  if (token == NULL || token[0] == '\0' || !(isalpha((unsigned char)token[0]) || token[0] == '_')) {
+    return 0;
+  }
+
+  for (size_t index = 1; token[index] != '\0'; index++) {
+    unsigned char ch = (unsigned char)token[index];
+    if (token[index] == '=') {
+      return 1;
+    }
+    if (!(isalnum(ch) || ch == '_')) {
+      return 0;
+    }
+  }
+
+  return 0;
+}
+
+static size_t pm_shell_env_assignment_prefix_count(char **tokens, size_t token_count) {
+  size_t count = 0;
+
+  while (count < token_count && pm_is_shell_env_assignment_token(tokens[count])) {
+    count++;
+  }
+
+  return count;
+}
+
+static size_t pm_env_assignment_name_length(const char *assignment) {
+  const char *equals = assignment == NULL ? NULL : strchr(assignment, '=');
+  return equals == NULL ? 0 : (size_t)(equals - assignment);
+}
+
+static int pm_env_entry_matches_assignment(const char *entry, const char *assignment) {
+  size_t name_length = pm_env_assignment_name_length(assignment);
+
+  return entry != NULL &&
+    name_length > 0 &&
+    strncmp(entry, assignment, name_length) == 0 &&
+    entry[name_length] == '=';
+}
+
+static char **pm_envp_with_shell_assignments(char *const envp[], char **assignments, size_t assignment_count) {
+  char **updated_envp;
+  size_t env_count = 0;
+  size_t used = 0;
+
+  if (assignment_count == 0) {
+    return NULL;
+  }
+
+  while (envp != NULL && envp[env_count] != NULL) {
+    env_count++;
+  }
+
+  updated_envp = calloc(env_count + assignment_count + 1, sizeof(char *));
+  if (updated_envp == NULL) {
+    return NULL;
+  }
+
+  for (size_t env_index = 0; env_index < env_count; env_index++) {
+    int replaced = 0;
+
+    for (size_t assignment_index = 0; assignment_index < assignment_count; assignment_index++) {
+      if (pm_env_entry_matches_assignment(envp[env_index], assignments[assignment_index])) {
+        replaced = 1;
+        break;
+      }
+    }
+
+    if (!replaced) {
+      updated_envp[used++] = envp[env_index];
+    }
+  }
+
+  for (size_t assignment_index = 0; assignment_index < assignment_count; assignment_index++) {
+    updated_envp[used++] = assignments[assignment_index];
+  }
+
+  updated_envp[used] = NULL;
+  return updated_envp;
+}
+
+static pm_child_exec_plan pm_prepare_shell_node_package_exec_plan(
+  const char *target,
+  char *const argv[],
+  char *const envp[]) {
+  pm_child_exec_plan plan = { target, (char **)argv, NULL, NULL, NULL, NULL, NULL };
+  const char *command = pm_shell_command_arg(argv);
+  char script_path[PM_MAX_PATH];
+  char interpreter_path[PM_MAX_PATH];
+  char tool_name[64];
+  char *tokens[64];
+  size_t token_count = 0;
+  size_t assignment_count = 0;
+  size_t command_index = 0;
+  size_t command_token_count = 0;
+  char **next_argv;
+
+  /*
+   * Yarn classic runs package binaries through "/bin/sh -c". That protected
+   * shell drops DYLD before the .bin shebang can be rewritten. For the narrow
+   * case of a simple node_modules/.bin command, skip the shell and launch the
+   * Node script directly with the repaired child environment.
+   */
+  if (!pm_is_shell_name(target) ||
+      command == NULL ||
+      (plan.argv_storage = pm_duplicate_text(command)) == NULL ||
+      pm_tokenize_simple_shell_command(plan.argv_storage, tokens, sizeof(tokens) / sizeof(tokens[0]), &token_count) != 0 ||
+      (assignment_count = pm_shell_env_assignment_prefix_count(tokens, token_count)) >= token_count ||
+      pm_resolve_exec_path(tokens[assignment_count], envp, 1, script_path, sizeof(script_path)) != 0 ||
+      !pm_is_node_package_binary_path(script_path) ||
+      pm_shebang_env_tool(script_path, tool_name, sizeof(tool_name)) != 0 ||
+      pm_resolve_shebang_interpreter(tool_name, envp, interpreter_path, sizeof(interpreter_path)) != 0) {
+    free(plan.argv_storage);
+    plan.argv_storage = NULL;
+    return plan;
+  }
+
+  command_index = assignment_count;
+  command_token_count = token_count - command_index;
+  next_argv = calloc(command_token_count + 2, sizeof(char *));
+  if (next_argv == NULL) {
+    free(plan.argv_storage);
+    plan.argv_storage = NULL;
+    return plan;
+  }
+
+  plan.resolved_script_path = pm_duplicate_text(script_path);
+  plan.interpreter_path = pm_duplicate_text(interpreter_path);
+  if (plan.resolved_script_path == NULL || plan.interpreter_path == NULL) {
+    free(next_argv);
+    free(plan.argv_storage);
+    free(plan.resolved_script_path);
+    free(plan.interpreter_path);
+    plan.argv_storage = NULL;
+    plan.resolved_script_path = NULL;
+    plan.interpreter_path = NULL;
+    return plan;
+  }
+
+  if (assignment_count > 0) {
+    plan.envp_storage = pm_envp_with_shell_assignments(envp, tokens, assignment_count);
+    if (plan.envp_storage == NULL) {
+      free(next_argv);
+      free(plan.argv_storage);
+      free(plan.resolved_script_path);
+      free(plan.interpreter_path);
+      plan.argv_storage = NULL;
+      plan.resolved_script_path = NULL;
+      plan.interpreter_path = NULL;
+      return plan;
+    }
+    plan.envp = plan.envp_storage;
+  }
+
+  next_argv[0] = plan.interpreter_path;
+  next_argv[1] = plan.resolved_script_path;
+  for (size_t index = command_index + 1; index < token_count; index++) {
+    next_argv[index - command_index + 1] = tokens[index];
+  }
+
+  plan.target = plan.interpreter_path;
+  plan.argv = next_argv;
+  pm_debug(
+    "shell package-bin rewrite command=%s script=%s interpreter=%s assignments=%zu",
+    command,
+    plan.resolved_script_path,
+    plan.interpreter_path,
+    assignment_count);
+  return plan;
+}
+
+static pm_child_exec_plan pm_prepare_simple_node_wrapper_exec_plan(
+  const char *target,
+  char *const argv[],
+  char *const envp[],
+  int allow_path_lookup) {
+  pm_child_exec_plan plan = { target, (char **)argv, NULL, NULL, NULL, NULL, NULL };
+  char wrapper_path[PM_MAX_PATH];
+  char interpreter_path[PM_MAX_PATH];
+  char node_script_path[PM_MAX_PATH];
+  size_t argc = 0;
+  char **next_argv;
+
+  /*
+   * Yarn creates temporary shell wrappers that execute
+   *   exec "/path/to/node" "/path/to/yarn.js" "$@"
+   * and puts them before extension-owned shims in PATH. If a hooked process
+   * launches that wrapper directly, macOS strips DYLD at the /bin/sh boundary.
+   * Skip the wrapper and exec the Node entrypoint while the repaired envp is
+   * still intact.
+   */
+  if (pm_resolve_exec_path(target, envp, allow_path_lookup, wrapper_path, sizeof(wrapper_path)) != 0 ||
+      pm_shell_script_node_exec_target(
+        wrapper_path,
+        interpreter_path,
+        sizeof(interpreter_path),
+        node_script_path,
+        sizeof(node_script_path)) != 0) {
+    return plan;
+  }
+
+  while (argv != NULL && argv[argc] != NULL) {
+    argc++;
+  }
+
+  next_argv = calloc(argc + 2, sizeof(char *));
+  if (next_argv == NULL) {
+    return plan;
+  }
+
+  plan.interpreter_path = pm_duplicate_text(interpreter_path);
+  plan.resolved_script_path = pm_duplicate_text(node_script_path);
+  if (plan.interpreter_path == NULL || plan.resolved_script_path == NULL) {
+    free(next_argv);
+    free(plan.interpreter_path);
+    free(plan.resolved_script_path);
+    plan.interpreter_path = NULL;
+    plan.resolved_script_path = NULL;
+    return plan;
+  }
+
+  next_argv[0] = plan.interpreter_path;
+  next_argv[1] = plan.resolved_script_path;
+  for (size_t index = 1; index < argc; index++) {
+    next_argv[index + 1] = argv[index];
+  }
+
+  plan.target = plan.interpreter_path;
+  plan.argv = next_argv;
+  pm_debug("shell node-wrapper rewrite wrapper=%s script=%s interpreter=%s", wrapper_path, plan.resolved_script_path, plan.interpreter_path);
+  return plan;
+}
+
+static pm_child_exec_plan pm_prepare_child_exec_plan(
+  const char *target,
+  char *const argv[],
+  char *const envp[],
+  int allow_path_lookup) {
+  pm_child_exec_plan plan = { target, (char **)argv, NULL, NULL, NULL, NULL, NULL };
+  char script_path[PM_MAX_PATH];
+  char interpreter_path[PM_MAX_PATH];
+  char tool_name[64];
+  size_t argc = 0;
+  char **next_argv;
+
+  /*
+   * Node package binaries usually have "#!/usr/bin/env node". On macOS that
+   * protected /usr/bin/env boundary can drop DYLD_INSERT_LIBRARIES even when
+   * the spawning package manager is already hooked. Rewrite only package-bin
+   * scripts with the simple env-node shebang so CLI tools such as wait-on keep
+   * the repaired envp without changing arbitrary script shebang semantics.
+   */
+  if (!pm_hook_enabled() || pm_hook_depth > 0 || envp == NULL ||
+      pm_envp_value_is(envp, "PORT_MANAGER_HOOK_DISABLED", "1") ||
+      pm_envp_value_is(envp, "PORT_MANAGER_HOOK", "0")) {
+    return plan;
+  }
+
+  plan = pm_prepare_shell_node_package_exec_plan(target, argv, envp);
+  if (plan.interpreter_path != NULL) {
+    return plan;
+  }
+
+  plan = pm_prepare_simple_node_wrapper_exec_plan(target, argv, envp, allow_path_lookup);
+  if (plan.interpreter_path != NULL) {
+    return plan;
+  }
+
+  if (pm_resolve_exec_path(target, envp, allow_path_lookup, script_path, sizeof(script_path)) != 0 ||
+      !pm_is_node_package_binary_path(script_path) ||
+      pm_shebang_env_tool(script_path, tool_name, sizeof(tool_name)) != 0 ||
+      pm_resolve_shebang_interpreter(tool_name, envp, interpreter_path, sizeof(interpreter_path)) != 0) {
+    return plan;
+  }
+
+  while (argv != NULL && argv[argc] != NULL) {
+    argc++;
+  }
+
+  next_argv = calloc(argc + 2, sizeof(char *));
+  if (next_argv == NULL) {
+    return plan;
+  }
+
+  plan.resolved_script_path = pm_duplicate_text(script_path);
+  plan.interpreter_path = pm_duplicate_text(interpreter_path);
+  if (plan.resolved_script_path == NULL || plan.interpreter_path == NULL) {
+    free(next_argv);
+    free(plan.resolved_script_path);
+    free(plan.interpreter_path);
+    plan.resolved_script_path = NULL;
+    plan.interpreter_path = NULL;
+    return plan;
+  }
+
+  next_argv[0] = plan.interpreter_path;
+  next_argv[1] = plan.resolved_script_path;
+  for (size_t index = 1; index < argc; index++) {
+    next_argv[index + 1] = argv[index];
+  }
+
+  plan.target = plan.interpreter_path;
+  plan.argv = next_argv;
+  pm_debug("shebang rewrite script=%s interpreter=%s", plan.resolved_script_path, plan.interpreter_path);
+  return plan;
+}
+
+static void pm_release_child_exec_plan(pm_child_exec_plan *plan) {
+  if (plan == NULL || plan->interpreter_path == NULL) {
+    return;
+  }
+
+  free(plan->argv);
+  free(plan->resolved_script_path);
+  free(plan->interpreter_path);
+  free(plan->argv_storage);
+  free(plan->envp_storage);
+  plan->target = NULL;
+  plan->argv = NULL;
+  plan->resolved_script_path = NULL;
+  plan->interpreter_path = NULL;
+  plan->argv_storage = NULL;
+  plan->envp = NULL;
+  plan->envp_storage = NULL;
 }
 
 static int pm_is_container_runtime_name(const char *name) {
@@ -255,6 +1287,14 @@ static void pm_ensure_symbols(void) {
     pm_real_execve = (pm_execve_fn)pm_resolve_symbol("execve");
   }
 
+  if (pm_real_execv == NULL) {
+    pm_real_execv = (pm_execv_fn)pm_resolve_symbol("execv");
+  }
+
+  if (pm_real_execvp == NULL) {
+    pm_real_execvp = (pm_execvp_fn)pm_resolve_symbol("execvp");
+  }
+
   if (pm_real_posix_spawn == NULL) {
     pm_real_posix_spawn = (pm_posix_spawn_fn)pm_resolve_symbol("posix_spawn");
   }
@@ -335,6 +1375,21 @@ static int pm_is_fixed_protocol_port(int port) {
   }
 
   return pm_port_list_contains(ports, port);
+}
+
+static int pm_is_preserved_listen_port(int port) {
+  const char *ports = getenv("PORT_MANAGER_PRESERVE_LISTEN_PORTS");
+
+  if (ports == NULL || ports[0] == '\0') {
+    return 0;
+  }
+
+  return pm_port_list_contains(ports, port);
+}
+
+static int pm_should_preserve_listen_bind(int logical_port) {
+  return pm_is_preserved_listen_port(logical_port) ||
+    pm_current_process_looks_like_browser_dev_server();
 }
 
 static const char *pm_routing_mode(void) {
@@ -664,6 +1719,34 @@ static int pm_sockaddr_is_local(const struct sockaddr *addr) {
   }
 
   return 0;
+}
+
+static int pm_route_host_is_wildcard_text(const char *host) {
+  return host != NULL &&
+    (strcmp(host, "::") == 0 ||
+     strcmp(host, "0.0.0.0") == 0 ||
+     strcmp(host, "*") == 0);
+}
+
+static const char *pm_network_loopback_host(void) {
+  const char *host = getenv(PM_NETWORK_LOOPBACK_HOST_ENV);
+  struct in_addr address;
+  uint32_t ip;
+
+  if (host == NULL || host[0] == '\0') {
+    return NULL;
+  }
+
+  if (inet_pton(AF_INET, host, &address) != 1) {
+    return NULL;
+  }
+
+  ip = ntohl(address.s_addr);
+  if ((ip >> 24) != 127 || ip == 0x7f000001u) {
+    return NULL;
+  }
+
+  return host;
 }
 
 static void pm_sockaddr_host(const struct sockaddr *addr, char *buffer, size_t size) {
@@ -1875,6 +2958,7 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
   struct sockaddr_storage rewritten;
   char host[128];
   char allocation_id[PM_MAX_TEXT];
+  const char *loopback_host;
   int logical_port;
   int actual_port;
   int result;
@@ -1900,6 +2984,51 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
   }
 
   pm_sockaddr_host(addr, host, sizeof(host));
+  if (pm_should_preserve_listen_bind(logical_port)) {
+    result = pm_real_bind(sockfd, addr, addrlen);
+    if (result == 0) {
+      char logical_text[16];
+
+      pm_remember_route(logical_port, logical_port, host, "");
+      snprintf(logical_text, sizeof(logical_text), "%d", logical_port);
+      setenv("PORT_MANAGER_LOGICAL_PORT", logical_text, 1);
+      setenv("PORT_MANAGER_ACTUAL_PORT", logical_text, 1);
+      pm_register_process(logical_port, logical_port, host, "");
+      pm_debug("preserving browser-visible bind logical=%d host=%s", logical_port, host);
+    }
+    return result;
+  }
+
+  loopback_host = pm_network_loopback_host();
+  if (loopback_host != NULL) {
+    int saved_errno;
+
+    memcpy(&rewritten, addr, addrlen);
+    pm_set_sockaddr_host((struct sockaddr *)&rewritten, loopback_host);
+    pm_set_sockaddr_port((struct sockaddr *)&rewritten, logical_port);
+
+    result = pm_real_bind(sockfd, (struct sockaddr *)&rewritten, addrlen);
+    if (result == 0) {
+      char logical_text[16];
+
+      pm_remember_route(logical_port, logical_port, loopback_host, "");
+      snprintf(logical_text, sizeof(logical_text), "%d", logical_port);
+      setenv("PORT_MANAGER_LOGICAL_PORT", logical_text, 1);
+      setenv("PORT_MANAGER_ACTUAL_PORT", logical_text, 1);
+      pm_register_process(logical_port, logical_port, loopback_host, "");
+      pm_debug("bind loopback-network logical=%d host=%s", logical_port, loopback_host);
+      return 0;
+    }
+
+    saved_errno = errno;
+    if (saved_errno != EADDRNOTAVAIL && saved_errno != EAFNOSUPPORT && saved_errno != EACCES) {
+      errno = saved_errno;
+      return -1;
+    }
+
+    pm_debug("bind loopback-network unavailable logical=%d host=%s error=%s", logical_port, loopback_host, strerror(saved_errno));
+    errno = saved_errno;
+  }
   allocation_id[0] = '\0';
   /*
    * Sender-first reservations can be created by clients that resolve localhost
@@ -1978,6 +3107,7 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
 static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   struct sockaddr_storage rewritten;
   char target_host[128];
+  const char *loopback_host;
   int route_is_compose;
   int logical_port;
   int actual_port;
@@ -2023,6 +3153,15 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
     }
   }
 
+  loopback_host = pm_network_loopback_host();
+  if (actual_port == 0 && loopback_host != NULL && !pm_is_fixed_protocol_port(logical_port)) {
+    memcpy(&rewritten, addr, addrlen);
+    pm_set_sockaddr_port((struct sockaddr *)&rewritten, logical_port);
+    pm_set_sockaddr_host((struct sockaddr *)&rewritten, loopback_host);
+    pm_debug("connect loopback-network logical=%d host=%s", logical_port, loopback_host);
+    return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
+  }
+
   if (actual_port == 0 && !pm_is_fixed_protocol_port(logical_port)) {
     char allocation_id[PM_MAX_TEXT];
 
@@ -2058,7 +3197,7 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
      * Same-port routes still need host correction. An IPv6 localhost client
      * cannot reach a server that actually bound only 127.0.0.1.
      */
-    if (target_host[0] != '\0' && strcmp(original_host, target_host) != 0) {
+    if (target_host[0] != '\0' && !pm_route_host_is_wildcard_text(target_host) && strcmp(original_host, target_host) != 0) {
       memcpy(&rewritten, addr, addrlen);
       pm_set_sockaddr_host((struct sockaddr *)&rewritten, target_host);
       pm_debug("connect route-host logical=%d actual=%d host=%s", logical_port, actual_port, target_host);
@@ -2119,8 +3258,19 @@ static int pm_getsockname_hook(int sockfd, struct sockaddr *addr, socklen_t *add
   return result;
 }
 
-static int pm_execve_hook(const char *path, char *const argv[], char *const envp[]) {
+static int pm_exec_with_prepared_child(
+  const char *path,
+  char *const argv[],
+  char *const envp[],
+  int allow_path_lookup) {
   const char *target;
+  const char *exec_target;
+  char **exec_envp;
+  char resolved_target[PM_MAX_PATH];
+  pm_child_environment child_environment;
+  pm_child_exec_plan exec_plan;
+  int result;
+  int saved_errno;
 
   pm_ensure_symbols();
   if (pm_real_execve == NULL) {
@@ -2131,9 +3281,42 @@ static int pm_execve_hook(const char *path, char *const argv[], char *const envp
   target = pm_runtime_exec_target(path, argv);
   if (target != path) {
     pm_debug("runtime exec rewrite path=%s target=%s", path != NULL ? path : "(null)", target);
+    allow_path_lookup = 0;
   }
 
-  return pm_real_execve(target, argv, envp);
+  child_environment = pm_prepare_child_environment(envp);
+  exec_plan = pm_prepare_child_exec_plan(target, argv, child_environment.envp, allow_path_lookup);
+  exec_target = exec_plan.target;
+  exec_envp = exec_plan.envp != NULL ? exec_plan.envp : child_environment.envp;
+
+  /*
+   * execvp searches PATH before execve. When no shebang rewrite is needed we
+   * still call execve so the repaired child environment is used.
+   */
+  if (exec_plan.target == target && allow_path_lookup && target != NULL && strchr(target, '/') == NULL) {
+    if (pm_resolve_exec_path(target, exec_envp, 1, resolved_target, sizeof(resolved_target)) == 0) {
+      exec_target = resolved_target;
+    }
+  }
+
+  result = pm_real_execve(exec_target, exec_plan.argv, exec_envp);
+  saved_errno = errno;
+  pm_release_child_exec_plan(&exec_plan);
+  pm_release_child_environment(&child_environment);
+  errno = saved_errno;
+  return result;
+}
+
+static int pm_execve_hook(const char *path, char *const argv[], char *const envp[]) {
+  return pm_exec_with_prepared_child(path, argv, envp, 0);
+}
+
+static int pm_execv_hook(const char *path, char *const argv[]) {
+  return pm_exec_with_prepared_child(path, argv, environ, 0);
+}
+
+static int pm_execvp_hook(const char *file, char *const argv[]) {
+  return pm_exec_with_prepared_child(file, argv, environ, 1);
 }
 
 static int pm_posix_spawn_hook(
@@ -2144,6 +3327,9 @@ static int pm_posix_spawn_hook(
   char *const argv[],
   char *const envp[]) {
   const char *target;
+  pm_child_environment child_environment;
+  pm_child_exec_plan exec_plan;
+  int result;
 
   pm_ensure_symbols();
   if (pm_real_posix_spawn == NULL) {
@@ -2156,7 +3342,18 @@ static int pm_posix_spawn_hook(
     pm_debug("runtime posix_spawn rewrite path=%s target=%s", path != NULL ? path : "(null)", target);
   }
 
-  return pm_real_posix_spawn(pid, target, file_actions, attrp, argv, envp);
+  child_environment = pm_prepare_child_environment(envp);
+  exec_plan = pm_prepare_child_exec_plan(target, argv, child_environment.envp, 0);
+  result = pm_real_posix_spawn(
+    pid,
+    exec_plan.target,
+    file_actions,
+    attrp,
+    exec_plan.argv,
+    exec_plan.envp != NULL ? exec_plan.envp : child_environment.envp);
+  pm_release_child_exec_plan(&exec_plan);
+  pm_release_child_environment(&child_environment);
+  return result;
 }
 
 static int pm_posix_spawnp_hook(
@@ -2167,6 +3364,9 @@ static int pm_posix_spawnp_hook(
   char *const argv[],
   char *const envp[]) {
   const char *target;
+  pm_child_environment child_environment;
+  pm_child_exec_plan exec_plan;
+  int result;
 
   pm_ensure_symbols();
   if (pm_real_posix_spawnp == NULL) {
@@ -2177,10 +3377,36 @@ static int pm_posix_spawnp_hook(
   target = pm_runtime_exec_target(file, argv);
   if (target != file) {
     pm_debug("runtime posix_spawnp rewrite file=%s target=%s", file != NULL ? file : "(null)", target);
-    return pm_real_posix_spawn(pid, target, file_actions, attrp, argv, envp);
+    child_environment = pm_prepare_child_environment(envp);
+    exec_plan = pm_prepare_child_exec_plan(target, argv, child_environment.envp, 0);
+    result = pm_real_posix_spawn(
+      pid,
+      exec_plan.target,
+      file_actions,
+      attrp,
+      exec_plan.argv,
+      exec_plan.envp != NULL ? exec_plan.envp : child_environment.envp);
+    pm_release_child_exec_plan(&exec_plan);
+    pm_release_child_environment(&child_environment);
+    return result;
   }
 
-  return pm_real_posix_spawnp(pid, file, file_actions, attrp, argv, envp);
+  child_environment = pm_prepare_child_environment(envp);
+  exec_plan = pm_prepare_child_exec_plan(file, argv, child_environment.envp, 1);
+  if (exec_plan.target != file) {
+    result = pm_real_posix_spawn(
+      pid,
+      exec_plan.target,
+      file_actions,
+      attrp,
+      exec_plan.argv,
+      exec_plan.envp != NULL ? exec_plan.envp : child_environment.envp);
+  } else {
+    result = pm_real_posix_spawnp(pid, file, file_actions, attrp, argv, child_environment.envp);
+  }
+  pm_release_child_exec_plan(&exec_plan);
+  pm_release_child_environment(&child_environment);
+  return result;
 }
 
 #if defined(__APPLE__)
@@ -2194,6 +3420,8 @@ PM_DYLD_INTERPOSE(pm_bind_hook, bind);
 PM_DYLD_INTERPOSE(pm_connect_hook, connect);
 PM_DYLD_INTERPOSE(pm_getsockname_hook, getsockname);
 PM_DYLD_INTERPOSE(pm_execve_hook, execve);
+PM_DYLD_INTERPOSE(pm_execv_hook, execv);
+PM_DYLD_INTERPOSE(pm_execvp_hook, execvp);
 PM_DYLD_INTERPOSE(pm_posix_spawn_hook, posix_spawn);
 PM_DYLD_INTERPOSE(pm_posix_spawnp_hook, posix_spawnp);
 #else
@@ -2211,6 +3439,14 @@ int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
 
 int execve(const char *path, char *const argv[], char *const envp[]) {
   return pm_execve_hook(path, argv, envp);
+}
+
+int execv(const char *path, char *const argv[]) {
+  return pm_execv_hook(path, argv);
+}
+
+int execvp(const char *file, char *const argv[]) {
+  return pm_execvp_hook(file, argv);
 }
 
 int posix_spawn(
