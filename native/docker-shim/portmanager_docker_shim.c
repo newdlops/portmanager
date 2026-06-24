@@ -2001,6 +2001,125 @@ static int pm_find_compose_project_for_service_from_route_table(
   return 0;
 }
 
+static int pm_char_is_name_boundary(char value) {
+  return value == '\0' || value == '-' || value == '_' || value == '.';
+}
+
+static int pm_token_matches_compose_service_name(const char *token, const char *service) {
+  size_t token_length;
+  size_t service_length;
+
+  if (token == NULL || service == NULL || token[0] == '\0' || service[0] == '\0') {
+    return 0;
+  }
+
+  token_length = strlen(token);
+  service_length = strlen(service);
+  if (token_length < service_length) {
+    return 0;
+  }
+
+  if (strcmp(token, service) == 0) {
+    return 1;
+  }
+
+  /*
+   * Scripts often hardcode compose container names such as captain_db,
+   * docker-rabbitmq-1, or rabbitmq-1. When the compose TSV env is missing,
+   * route-table fallback can still infer the service if the service token is
+   * bounded by common compose/container name delimiters.
+   */
+  for (size_t index = 0; index + service_length <= token_length; index++) {
+    if (strncmp(token + index, service, service_length) != 0) {
+      continue;
+    }
+
+    if ((index == 0 || pm_char_is_name_boundary(token[index - 1])) &&
+        pm_char_is_name_boundary(token[index + service_length])) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int pm_find_compose_project_and_service_for_token_from_route_table(
+  const char *token,
+  char *attached_project,
+  size_t attached_size,
+  char *service,
+  size_t service_size
+) {
+  const char *route_file = pm_effective_route_table_path();
+  const char *network_id = pm_network_id();
+  char *buffer;
+  char *cursor;
+  char selected_project[PM_MAX_FIELD] = "";
+  char selected_service[PM_MAX_FIELD] = "";
+  int found = 0;
+
+  if (token == NULL || token[0] == '\0' || pm_read_file_limited(route_file, &buffer) != 0) {
+    return -1;
+  }
+
+  cursor = buffer;
+  while ((cursor = strstr(cursor, "\"source\"")) != NULL) {
+    char *object_start = cursor;
+    char *object_end = strchr(cursor, '}');
+    char object_end_saved;
+    char source[64];
+    char route_cwd[PM_MAX_PATH];
+    char process_name[PM_MAX_FIELD];
+    char project_name[PM_MAX_FIELD];
+    char service_name[PM_MAX_FIELD];
+
+    while (object_start > buffer && *object_start != '{') {
+      object_start--;
+    }
+
+    if (object_end == NULL) {
+      break;
+    }
+
+    object_end_saved = *object_end;
+    *object_end = '\0';
+
+    if (
+      pm_json_string(object_start, "source", source, sizeof(source)) == 0 &&
+      strcmp(source, "compose") == 0 &&
+      pm_route_network_matches(object_start, network_id) &&
+      pm_json_string(object_start, "cwd", route_cwd, sizeof(route_cwd)) == 0 &&
+      pm_current_cwd_matches_route_cwd(route_cwd) &&
+      pm_json_string(object_start, "processName", process_name, sizeof(process_name)) == 0 &&
+      pm_extract_project_service_from_process_name(process_name, project_name, sizeof(project_name), service_name, sizeof(service_name)) == 0 &&
+      pm_token_matches_compose_service_name(token, service_name)
+    ) {
+      if ((selected_project[0] != '\0' && strcmp(selected_project, project_name) != 0) ||
+          (selected_service[0] != '\0' && strcmp(selected_service, service_name) != 0)) {
+        *object_end = object_end_saved;
+        free(buffer);
+        return -1;
+      }
+
+      pm_copy(selected_project, sizeof(selected_project), project_name);
+      pm_copy(selected_service, sizeof(selected_service), service_name);
+      found = 1;
+    }
+
+    *object_end = object_end_saved;
+    cursor = object_end + 1;
+  }
+
+  free(buffer);
+  if (!found || selected_project[0] == '\0' || selected_service[0] == '\0') {
+    return -1;
+  }
+
+  pm_copy(attached_project, attached_size, selected_project);
+  pm_copy(service, service_size, selected_service);
+  return 0;
+}
+
 /** True when a compose-specific TSV belongs to the current cwd or compose-file args. */
 static int pm_compose_routing_file_matches_context(
   const char *file_path,
@@ -2207,8 +2326,15 @@ static char *pm_container_target_from_route_table(
   char target[PM_MAX_FIELD];
 
   (void)runtime;
-  if (pm_inspect_compose_container_service(real_runtime_path, token, service, sizeof(service)) != 0 ||
-      pm_find_compose_project_for_service_from_route_table(service, attached_project, sizeof(attached_project)) != 0 ||
+  if ((pm_inspect_compose_container_service(real_runtime_path, token, service, sizeof(service)) != 0
+        ? pm_find_compose_project_and_service_for_token_from_route_table(
+            token,
+            attached_project,
+            sizeof(attached_project),
+            service,
+            sizeof(service)
+          )
+        : pm_find_compose_project_for_service_from_route_table(service, attached_project, sizeof(attached_project))) != 0 ||
       (pm_lookup_single_compose_container(real_runtime_path, attached_project, service, 0, attached_id, sizeof(attached_id)) != 0 &&
        pm_lookup_single_compose_container(real_runtime_path, attached_project, service, 1, attached_id, sizeof(attached_id)) != 0)) {
     return NULL;

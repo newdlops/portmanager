@@ -718,7 +718,7 @@ __port_manager_container_target_for_runtime() {
 
   if [ "\${__pm_context_files}" != "0" ]; then
     if [ "\${__pm_helper_matches}" = "1" ] && [ -n "\${__pm_helper_target}" ]; then
-      printf '%s\\n' "\${__pm_helper_target}"
+      printf '%s%s\\n' "\${__pm_helper_target}" "\${__pm_token_suffix}"
       return 0
     fi
     if [ "\${__pm_matches}" = "1" ] && [ -n "\${__pm_target}" ]; then
@@ -744,7 +744,7 @@ __port_manager_container_target_for_runtime() {
   fi
 
   if [ "\${__pm_helper_matches}" = "1" ] && [ -n "\${__pm_helper_target}" ]; then
-    printf '%s\\n' "\${__pm_helper_target}"
+    printf '%s%s\\n' "\${__pm_helper_target}" "\${__pm_token_suffix}"
     return 0
   fi
 

@@ -1620,6 +1620,51 @@ test("docker wrapper prefers native container mapper when available", () => {
   }
 });
 
+test("docker wrapper preserves container path suffixes from native container mapper", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-container-map-suffix-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+  const helperPath = path.join(tempDir, "portmanager_container_map");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(routingFile, "", "utf8");
+  fs.writeFileSync(
+    helperPath,
+    "#!/bin/sh\nif [ \"$4\" = \"captain_db\" ]; then printf '%s\\n' pm-captain_db-network-a; exit 0; fi\nexit 1\n",
+    {
+      encoding: "utf8",
+      mode: 0o700,
+    },
+  );
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile, helperPath),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker cp ./db-snapshot/dump.gz captain_db:dump.gz",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output, "<cp>\n<./db-snapshot/dump.gz>\n<pm-captain_db-network-a:dump.gz>\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("docker compose wrapper forces explicit project selections to the attached clone", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-routing-explicit-"));
   const projectDir = path.join(tempDir, "workspace", "app");
@@ -2424,6 +2469,88 @@ test(
       });
 
       assert.equal(output, "<exec>\n<clone-db-987654>\n<psql>\n");
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "native docker PATH shim recovers hardcoded container names from route table when inspect cannot resolve the original",
+  { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
+  () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-container-name-route-fallback-"));
+    const projectDir = path.join(tempDir, "workspace", "app");
+    const composeDir = path.join(projectDir, "docker");
+    const shimDir = path.join(tempDir, "shim");
+    const realBinDir = path.join(tempDir, "real-bin");
+    const routingFile = path.join(tempDir, "routes.tsv");
+    const routeTableFile = path.join(tempDir, "newdlops-portmanager-routes-501-network-a.json");
+
+    fs.mkdirSync(composeDir, { recursive: true });
+    fs.mkdirSync(shimDir, { recursive: true });
+    fs.mkdirSync(realBinDir, { recursive: true });
+    fs.writeFileSync(routingFile, "", "utf8");
+    fs.writeFileSync(
+      routeTableFile,
+      JSON.stringify({
+        updatedAt: "2026-06-24T00:00:00Z",
+        routes: [
+          {
+            logicalPort: 15432,
+            actualPort: 57001,
+            routeDirection: "listen",
+            host: "127.0.0.1",
+            cwd: composeDir,
+            networkId: "network-a",
+            processId: "managed-process-7",
+            processName: "c1-docker-691afbc8:db/postgresql",
+            status: "running",
+            source: "compose",
+          },
+        ],
+      }),
+      "utf8",
+    );
+    fs.symlinkSync(getNativeDockerShimPath(), path.join(shimDir, "docker"));
+    fs.writeFileSync(
+      path.join(realBinDir, "docker"),
+      [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"inspect\" ]; then",
+        "  exit 1",
+        "fi",
+        "if [ \"$1\" = \"container\" ] && [ \"$2\" = \"ls\" ]; then",
+        "  printf 'clone-db-987654\\n'",
+        "  exit 0",
+        "fi",
+        "for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done",
+        "",
+      ].join("\n"),
+      {
+        encoding: "utf8",
+        mode: 0o700,
+      },
+    );
+
+    try {
+      const output = execFileSync("docker", ["cp", "./db-snapshot/dump.gz", "captain_db:dump.gz"], {
+        cwd: projectDir,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${shimDir}${path.delimiter}${realBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          PORT_MANAGER_RUNTIME_SHIM_DIR: shimDir,
+          PORT_MANAGER_COMPOSE_ROUTING_FILE: routingFile,
+          PORT_MANAGER_ROUTES_FILE: routeTableFile,
+          PORT_MANAGER_NETWORK_ID: "",
+          PORT_MANAGER_BORROWED_NETWORK_ID: "",
+          NEWDLOPS_PM_NETWORK_ID: "",
+          NEWDLOPS_PM_BORROWED_NETWORK_ID: "",
+        },
+      });
+
+      assert.equal(output, "<cp>\n<./db-snapshot/dump.gz>\n<clone-db-987654:dump.gz>\n");
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }

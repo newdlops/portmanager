@@ -2602,12 +2602,16 @@ function buildComposeRegisteredProcessInput(
   cwd: string | undefined,
 ): RegisteredProcessInput {
   const protocolLabel = port.protocolName === undefined ? "" : `/${port.protocolName}`;
+  // The daemon route table is also the fallback source for native docker shims.
+  // It must name the runtime project, not the original compose project, so
+  // child processes that lose the compose TSV env still target the clone.
+  const runtimeProjectName = composeRuntimeProjectName(attachment);
 
   return {
     // Docker may hide the concrete owner PID behind a VM or proxy. A later OS
     // listener scan can adopt the real PID when the platform exposes it.
     pid: 0,
-    name: `${attachment.projectName}:${port.serviceName}${protocolLabel}`,
+    name: `${runtimeProjectName}:${port.serviceName}${protocolLabel}`,
     command: `docker compose service ${attachment.projectName}/${port.serviceName}`,
     cwd: cwd ?? attachment.composeFiles[0] ?? process.cwd(),
     requestedPort: port.logicalPort,
