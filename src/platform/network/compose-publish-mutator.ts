@@ -824,7 +824,10 @@ function buildCloneContainerNames(
       continue;
     }
 
-    names.set(serviceName, buildCloneContainerName(originalProjectName, attachedProjectName, containers[0]!.name));
+    const cloneContainerName = buildCloneContainerName(originalProjectName, attachedProjectName, containers[0]!.name);
+    if (cloneContainerName !== undefined) {
+      names.set(serviceName, cloneContainerName);
+    }
   }
 
   return names;
@@ -834,8 +837,8 @@ function buildCloneContainerName(
   originalProjectName: string,
   attachedProjectName: string,
   originalContainerName: string,
-): string {
-  const projectReplacedName = replaceContainerProjectPrefix(
+): string | undefined {
+  const projectReplacedName = replaceGeneratedContainerProjectPrefix(
     originalContainerName,
     originalProjectName,
     attachedProjectName,
@@ -844,14 +847,10 @@ function buildCloneContainerName(
     return trimContainerName(projectReplacedName, 120);
   }
 
-  const originalSegment = sanitizeContainerNameSegment(originalContainerName) ?? "container";
-  const projectSegment = sanitizeContainerNameSegment(attachedProjectName) ?? "network";
-  const hash = createHash("sha1").update(`${attachedProjectName}\0${originalContainerName}`).digest("hex").slice(0, 8);
-
-  return trimContainerName(`pm-${originalSegment}-${projectSegment}-${hash}`, 120);
+  return buildExplicitCloneContainerName(originalContainerName, attachedProjectName);
 }
 
-function replaceContainerProjectPrefix(
+function replaceGeneratedContainerProjectPrefix(
   containerName: string,
   originalProjectName: string,
   attachedProjectName: string,
@@ -866,11 +865,35 @@ function replaceContainerProjectPrefix(
   for (const separator of ["-", "_"]) {
     const prefix = `${originalProject}${separator}`;
     if (normalizedName.startsWith(prefix)) {
-      return `${attachedProject}${separator}${normalizedName.slice(prefix.length)}`;
+      const generatedSuffix = normalizedName.slice(prefix.length);
+      if (isComposeGeneratedContainerSuffix(generatedSuffix)) {
+        return `${attachedProject}${separator}${generatedSuffix}`;
+      }
     }
   }
 
   return undefined;
+}
+
+function isComposeGeneratedContainerSuffix(value: string): boolean {
+  const hyphenReplicaSeparatorIndex = value.lastIndexOf("-");
+  const underscoreReplicaSeparatorIndex = value.lastIndexOf("_");
+  const replicaSeparatorIndex = Math.max(hyphenReplicaSeparatorIndex, underscoreReplicaSeparatorIndex);
+  if (replicaSeparatorIndex <= 0) {
+    return false;
+  }
+
+  return /^[1-9][0-9]*$/.test(value.slice(replicaSeparatorIndex + 1));
+}
+
+function buildExplicitCloneContainerName(originalContainerName: string, attachedProjectName: string): string | undefined {
+  const originalSegment = sanitizeContainerNameSegment(originalContainerName);
+  const projectSegment = sanitizeContainerNameSegment(attachedProjectName);
+  if (originalSegment === undefined || projectSegment === undefined) {
+    return undefined;
+  }
+
+  return trimContainerName(`${originalSegment}-${projectSegment}`, 120);
 }
 
 function groupBy<T>(values: readonly T[], keyForValue: (value: T) => string): Map<string, T[]> {
