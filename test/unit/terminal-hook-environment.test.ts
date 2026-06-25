@@ -101,7 +101,35 @@ test("background routing refresh polls terminals and containers", () => {
   assert.equal(source.includes("private startRoutingSignalRefreshLoop(): void"), true);
   assert.equal(source.includes("this.refreshTerminals().catch(() => [])"), true);
   assert.equal(source.includes("this.refreshContainerServices().catch(() => [])"), true);
+  assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts().catch(() => undefined);"), true);
+  assert.equal(source.includes("await this.restorePersistedComposeRoutesIfMissing().catch(() => undefined);"), true);
   assert.equal(source.includes("ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 3_000"), true);
+});
+
+test("compose route rehydration retries recoverable error attachments after restart", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const restoreStart = source.indexOf("private async restorePersistedComposeRoutesIfMissing");
+  const restoreEnd = source.indexOf("private async repairPersistedPortManagerCloneComposeAttachments", restoreStart);
+  const restoreBody = source.slice(restoreStart, restoreEnd);
+  const reconcileStart = source.indexOf("private async reconcileComposeAttachmentPublishedPortsExclusive");
+  const reconcileEnd = source.indexOf("private async refreshComposeContainerMappings", reconcileStart);
+  const reconcileBody = source.slice(reconcileStart, reconcileEnd);
+
+  assert.equal(source.includes("function isRestorableComposeAttachment"), true);
+  assert.equal(source.includes('attachment.status === "attached" || attachment.status === "error"'), true);
+  assert.equal(restoreBody.includes("await this.composeAttachmentReconcileInFlight.catch(() => undefined);"), true);
+  assert.equal(
+    /if \(this\.composeAttachmentReconcileInFlight !== undefined\) \{\s*return;\s*\}/.test(restoreBody),
+    false,
+    "in-flight compose refresh must not permanently skip route restore",
+  );
+  assert.equal(reconcileBody.includes(".composeAttachments.filter(isRestorableComposeAttachment)"), true);
+  assert.equal(
+    reconcileBody.includes("await this.restorePersistedComposeRoutesIfMissing({ allowDuringComposeReconcile: true });"),
+    true,
+  );
+  assert.equal(source.includes("attachment.errorMessage !== undefined"), true);
 });
 
 test("terminal attach script enables loopback routing only after alias readiness", () => {

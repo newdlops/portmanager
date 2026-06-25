@@ -187,6 +187,15 @@ interface TerminalAttachmentMarker {
   readonly filePath: string;
 }
 
+interface ComposeRouteRestoreOptions {
+  /**
+   * Reconcile calls this after it has refreshed Docker-published endpoints. The
+   * normal path waits for an in-flight reconcile first so stale port snapshots
+   * cannot overwrite fresher Docker state.
+   */
+  readonly allowDuringComposeReconcile?: boolean;
+}
+
 /**
  * Extension-side application service for the Logical Network mode.
  *
@@ -1249,7 +1258,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const summary = await removeRoutingFilePaths(cleanupPaths);
     const attachments = this.registry
       .getSnapshot()
-      .composeAttachments.filter((attachment) => attachment.status === "attached" && attachment.ports.length > 0);
+      .composeAttachments.filter(isRestorableComposeAttachment);
 
     return this.rehydrateRoutingFiles(summary, attachments);
   }
@@ -1279,8 +1288,7 @@ export class PortManagerNetworkService implements DisposableLike {
       this.registry
         .getSnapshot()
         .composeAttachments.filter(
-          (attachment) =>
-            attachment.networkId === network.id && attachment.status === "attached" && attachment.ports.length > 0,
+          (attachment) => attachment.networkId === network.id && isRestorableComposeAttachment(attachment),
         ),
     );
   }
@@ -1361,9 +1369,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
+    await this.reconcileComposeAttachmentPublishedPorts();
     await this.writeComposeProjectRoutingFile();
     await this.restorePersistedComposeRoutesIfMissing();
-    await this.reconcileComposeAttachmentPublishedPorts();
     await this.syncLogicalPortRouters();
   }
 
@@ -1504,9 +1512,9 @@ export class PortManagerNetworkService implements DisposableLike {
    * idempotent because the daemon upserts compose routes by network/logical/actual
    * port identity.
    */
-  private async restorePersistedComposeRoutesIfMissing(): Promise<void> {
-    if (this.composeAttachmentReconcileInFlight !== undefined) {
-      return;
+  private async restorePersistedComposeRoutesIfMissing(options: ComposeRouteRestoreOptions = {}): Promise<void> {
+    if (!options.allowDuringComposeReconcile && this.composeAttachmentReconcileInFlight !== undefined) {
+      await this.composeAttachmentReconcileInFlight.catch(() => undefined);
     }
 
     if (this.composeRouteRestoreInFlight !== undefined) {
@@ -1515,8 +1523,12 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const attachments = this.registry
       .getSnapshot()
-      .composeAttachments.filter((attachment) => attachment.status === "attached" && attachment.ports.length > 0);
-    if (attachments.length === 0 || this.processService === undefined || !this.hasMissingPersistedComposeRoutes(attachments)) {
+      .composeAttachments.filter(isRestorableComposeAttachment);
+    if (
+      attachments.length === 0 ||
+      this.processService === undefined ||
+      !this.hasMissingPersistedComposeRoutes(attachments)
+    ) {
       return;
     }
 
@@ -1538,7 +1550,9 @@ export class PortManagerNetworkService implements DisposableLike {
   private async repairPersistedPortManagerCloneComposeAttachments(): Promise<void> {
     const attachments = this.registry
       .getSnapshot()
-      .composeAttachments.filter((attachment) => attachment.status === "attached" && attachment.mutation === undefined);
+      .composeAttachments.filter(
+        (attachment) => isRestorableComposeAttachment(attachment) && attachment.mutation === undefined,
+      );
 
     if (attachments.length === 0) {
       return;
@@ -1607,10 +1621,17 @@ export class PortManagerNetworkService implements DisposableLike {
       this.refreshTerminals().catch(() => []),
       this.refreshContainerServices().catch(() => []),
     ]);
+    await this.reconcileComposeAttachmentPublishedPorts().catch(() => undefined);
+    await this.restorePersistedComposeRoutesIfMissing().catch(() => undefined);
+    await this.syncLogicalPortRouters();
   }
 
   /** Rewrites compose route rows when Docker changed a running container's host port. */
   private async reconcileComposeAttachmentPublishedPorts(): Promise<void> {
+    if (this.composeRouteRestoreInFlight !== undefined) {
+      await this.composeRouteRestoreInFlight.catch(() => undefined);
+    }
+
     if (this.composeAttachmentReconcileInFlight !== undefined) {
       return this.composeAttachmentReconcileInFlight;
     }
@@ -1630,7 +1651,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const attachments = this.registry
       .getSnapshot()
-      .composeAttachments.filter((attachment) => attachment.status === "attached" && attachment.ports.length > 0);
+      .composeAttachments.filter(isRestorableComposeAttachment);
     if (attachments.length === 0) {
       return;
     }
@@ -1676,8 +1697,10 @@ export class PortManagerNetworkService implements DisposableLike {
 
     if (restoredAttachments.length > 0) {
       await this.restorePersistedComposeRoutes(restoredAttachments);
-      void this.syncLogicalPortRouters();
     }
+
+    await this.restorePersistedComposeRoutesIfMissing({ allowDuringComposeReconcile: true });
+    void this.syncLogicalPortRouters();
   }
 
   /** Refreshes clone container id rewrites without changing attach policy state. */
@@ -1748,6 +1771,8 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const routes = this.processService.getSnapshot().routes;
     return attachments.some((attachment) =>
+      attachment.status !== "attached" ||
+      attachment.errorMessage !== undefined ||
       attachment.ports.some((port) => !hasComposeRoute(routes, attachment.networkId, port)),
     );
   }
@@ -2760,7 +2785,7 @@ function findEquivalentComposeAttachment(
 ): ComposeAttachment | undefined {
   return attachments.find(
     (attachment) =>
-      attachment.status === "attached" &&
+      isRestorableComposeAttachment(attachment) &&
       attachment.networkId === requested.networkId &&
       composeAttachmentMatchesInput(attachment, requested, input) &&
       requestedComposePortsAreAlreadyAttached(attachment.ports, requested.ports),
@@ -2934,6 +2959,14 @@ function composeWorkingDirectoryFromFiles(composeFiles: readonly string[]): stri
 
 function stringifyPersistedNetworkState(state: LogicalNetworkRegistryState): string {
   return JSON.stringify(state);
+}
+
+/** True when a persisted compose row should keep participating in route recovery. */
+function isRestorableComposeAttachment(attachment: ComposeAttachment): boolean {
+  return (
+    (attachment.status === "attached" || attachment.status === "error") &&
+    attachment.ports.length > 0
+  );
 }
 
 /** Checks whether the daemon already owns the persisted compose endpoint route. */
