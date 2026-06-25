@@ -39,10 +39,14 @@ export interface ComposePublishMutationInput {
   readonly mode?: ComposePortMutationMode;
   /** Explicit operator confirmation for cloning services that look stateful. */
   readonly allowStatefulClone?: boolean;
+  /** Optional exact Compose project name for the hidden clone. */
+  readonly attachedProjectName?: string;
   /** Runtime CLI that owns the source compose project. */
   readonly runtime: "docker" | "podman";
   /** Logical network name used as the leading segment of the hidden project. */
   readonly networkName: string;
+  /** Stable logical network identity used to separate copied networks with the same display name. */
+  readonly networkId?: string;
   /** Compose project that currently publishes the host ports. */
   readonly originalProjectName: string;
   /** Directory where compose should resolve relative paths and defaults. */
@@ -167,7 +171,12 @@ export class ComposePublishMutator {
     }
 
     const mode = input.mode ?? "clone";
+    if (mode !== "clone" && input.attachedProjectName !== undefined && input.attachedProjectName.trim().length > 0) {
+      throw new Error("Custom Compose project names are only supported for clone attach.");
+    }
     const requestedProjectName = assertNonEmptyString(input.originalProjectName, "Compose project name");
+    const requestedAttachedProjectName =
+      mode === "clone" ? parseRequestedComposeProjectName(input.attachedProjectName) : undefined;
     const resolvedComposeFiles = await this.resolveComposeFiles(input.workingDirectory, input.composeFiles ?? []);
     const originalProjectName = requestedProjectName;
     const composeFiles = this.removeGeneratedOverrideFiles(resolvedComposeFiles);
@@ -179,7 +188,9 @@ export class ComposePublishMutator {
         ? await this.resolveAttachedProjectSourceName(requestedProjectName, input.workingDirectory, composeFiles)
         : originalProjectName;
     const attachedProjectName =
-      mode === "clone" ? buildAttachedProjectName(input.networkName, attachedProjectSourceName) : originalProjectName;
+      mode === "clone"
+        ? requestedAttachedProjectName ?? buildAttachedProjectName(input.networkName, attachedProjectSourceName, input.networkId)
+        : originalProjectName;
     const requestedServices = uniqueStrings(input.ports.map((port) => port.serviceName));
 
     const originalContext: ComposeCommandContext = {
@@ -202,6 +213,8 @@ export class ComposePublishMutator {
       originalContainers,
       originalContainerList.inspectedRows,
     );
+    const serviceContainerNameSot =
+      mode === "clone" ? await readComposeServiceContainerNames(composeFiles) : new Map<string, string>();
     const statefulCloneServices = findStatefulCloneServices(ports, originalServiceMounts);
     if (mode === "clone" && statefulCloneServices.length > 0 && input.allowStatefulClone !== true) {
       throw new Error(
@@ -213,9 +226,19 @@ export class ComposePublishMutator {
       mode === "clone"
         ? await buildVolumeClonePlan(attachedProjectName, randomUUID().slice(0, 8), originalServiceMounts, statefulServiceNames)
         : { serviceMounts: originalServiceMounts, volumeClones: [], volumeMappings: [] };
+    const occupiedContainerNames =
+      mode === "clone"
+        ? await this.findOccupiedCloneContainerNames(input.runtime, originalContainers, serviceContainerNameSot)
+        : new Set<string>();
     const cloneContainerNames =
       mode === "clone"
-        ? buildCloneContainerNames(originalProjectName, attachedProjectName, originalContainers)
+        ? buildCloneContainerNames(
+            originalProjectName,
+            attachedProjectName,
+            originalContainers,
+            serviceContainerNameSot,
+            occupiedContainerNames,
+          )
         : new Map<string, string>();
     const overrideFile = await this.writeHiddenPortsOverride(
       attachedProjectName,
@@ -339,6 +362,120 @@ export class ComposePublishMutator {
       if (hiddenStopped) {
         await this.runCompose(hiddenContext, ["start", ...state.services]).catch(() => undefined);
       }
+      throw error;
+    }
+  }
+
+  /**
+   * Recreates an existing hidden clone under a new Compose project name.
+   *
+   * Compose project names are runtime identity, not a mutable label, so rename
+   * is implemented as stop-old, start-new, refresh route state, then best-effort
+   * cleanup of the previous hidden project. Volume mounts are inspected from
+   * the running clone so stateful cloned volumes are reused rather than copied
+   * again.
+   */
+  async renameAttachedProject(
+    state: ComposePortMutationState,
+    nextAttachedProjectName: string,
+  ): Promise<ComposePublishMutationResult> {
+    if (state.mode !== "clone") {
+      throw new Error("Only cloned Compose attachments can change the hidden project name.");
+    }
+
+    const attachedProjectName = requireComposeProjectName(nextAttachedProjectName);
+    if (attachedProjectName === state.attachedProjectName) {
+      return {
+        ports: state.hiddenPorts,
+        state,
+      };
+    }
+
+    const currentHiddenContext: ComposeCommandContext = {
+      runtime: state.runtime,
+      projectName: state.attachedProjectName,
+      workingDirectory: state.workingDirectory,
+      composeFiles: appendUniqueComposeFile([...state.composeFiles], state.overrideFile),
+    };
+    const sourceContext: ComposeCommandContext = {
+      runtime: state.runtime,
+      projectName: state.originalProjectName,
+      workingDirectory: state.workingDirectory,
+      composeFiles: state.composeFiles,
+    };
+    const currentContainerList = await this.listComposeServiceContainers(
+      state.runtime,
+      state.attachedProjectName,
+      state.services,
+    );
+    const currentServiceMounts = await this.inspectServiceMounts(
+      state.runtime,
+      currentContainerList.containers,
+      currentContainerList.inspectedRows,
+    );
+    const serviceContainerNameSot = await readComposeServiceContainerNames(state.composeFiles);
+    const originalContainerSources = buildRenameContainerNameSources(state, currentContainerList.containers);
+    const definedServices = await this.listDefinedComposeServices(sourceContext);
+    const overrideServices = definedServices.length > 0 ? definedServices : state.services;
+    const disabledOverrideServices = overrideServices.filter((service) => !state.services.includes(service));
+    const occupiedContainerNames = await this.findOccupiedCloneContainerNames(
+      state.runtime,
+      originalContainerSources,
+      serviceContainerNameSot,
+    );
+    const cloneContainerNames = buildCloneContainerNames(
+      state.originalProjectName,
+      attachedProjectName,
+      originalContainerSources,
+      serviceContainerNameSot,
+      occupiedContainerNames,
+    );
+    const overrideFile = await this.writeHiddenPortsOverride(
+      attachedProjectName,
+      overrideServices,
+      state.originalPorts,
+      currentServiceMounts,
+      {
+        resetContainerName: true,
+        cloneContainerNames,
+        isolatedNetwork: "pm_isolated",
+        disabledServices: disabledOverrideServices,
+      },
+    );
+    const nextHiddenContext: ComposeCommandContext = {
+      runtime: state.runtime,
+      projectName: attachedProjectName,
+      workingDirectory: state.workingDirectory,
+      composeFiles: appendUniqueComposeFile([...state.composeFiles], overrideFile),
+    };
+    let currentStopped = false;
+    let nextStarted = false;
+
+    try {
+      await this.runCompose(currentHiddenContext, ["stop", ...state.services]);
+      currentStopped = true;
+      await this.runCompose(nextHiddenContext, ["up", "-d", "--force-recreate", "--no-deps", ...state.services]);
+      nextStarted = true;
+      const hiddenCandidates = await this.discoverHiddenComposeCandidates(state.runtime, attachedProjectName);
+      const hiddenPorts = resolveHiddenPorts(attachedProjectName, state.originalPorts, hiddenCandidates);
+      assertHiddenPortsAreIsolated(hiddenPorts, state.originalPorts);
+      const containerMappings = buildContainerCloneMappings(originalContainerSources, hiddenCandidates);
+
+      await this.runCompose(currentHiddenContext, ["down", "--remove-orphans"]).catch(() => undefined);
+      await fs.rm(state.overrideFile, { force: true }).catch(() => undefined);
+
+      return {
+        ports: hiddenPorts,
+        state: buildRenamedMutationState(state, attachedProjectName, overrideFile, hiddenPorts, containerMappings),
+      };
+    } catch (error) {
+      if (nextStarted) {
+        await this.runCompose(nextHiddenContext, ["down", "--remove-orphans"]).catch(() => undefined);
+      }
+      if (currentStopped) {
+        await this.runCompose(currentHiddenContext, ["start", ...state.services]).catch(() => undefined);
+      }
+      await fs.rm(overrideFile, { force: true }).catch(() => undefined);
       throw error;
     }
   }
@@ -662,6 +799,49 @@ export class ComposePublishMutator {
   }
 
   /**
+   * Finds selected service container names that Docker already reserves.
+   *
+   * Compose `container_name` is global, not project-scoped. A stopped original
+   * container can still block a clone, so explicit SOT names are checked by
+   * container name before the hidden override is written.
+   */
+  private async findOccupiedCloneContainerNames(
+    runtime: "docker" | "podman",
+    sourceContainers: readonly ComposeServiceContainer[],
+    serviceContainerNameSot: ReadonlyMap<string, string>,
+  ): Promise<ReadonlySet<string>> {
+    const occupiedNames = new Set(
+      sourceContainers
+        .map((container) => normalizeContainerNameText(container.name))
+        .filter((name) => name.length > 0),
+    );
+    const sourceServices = new Set(sourceContainers.map((container) => container.serviceName));
+    const sotNames = uniqueStrings(
+      [...serviceContainerNameSot]
+        .filter(([serviceName]) => sourceServices.has(serviceName))
+        .map(([, containerName]) => normalizeContainerNameText(containerName))
+        .filter((name) => name.length > 0),
+    );
+
+    for (const containerName of sotNames) {
+      if (occupiedNames.has(containerName)) {
+        continue;
+      }
+
+      try {
+        await this.runCommand(runtime, ["container", "inspect", containerName], {
+          timeoutMs: LIST_TIMEOUT_MS,
+        });
+        occupiedNames.add(containerName);
+      } catch {
+        // Missing names are the normal path; the clone can keep the SOT exactly.
+      }
+    }
+
+    return occupiedNames;
+  }
+
+  /**
    * Reads runtime list rows and repairs container names from inspect.
    *
    * Docker/Podman summary rows are optimized for display and can omit names in
@@ -722,6 +902,7 @@ export class ComposePublishMutator {
       ...args,
     ];
   }
+
 }
 
 function groupPortsByService(
@@ -811,12 +992,66 @@ function buildContainerCloneMappings(
   return mappings;
 }
 
+function buildRenameContainerNameSources(
+  state: ComposePortMutationState,
+  currentContainers: readonly ComposeServiceContainer[],
+): readonly ComposeServiceContainer[] {
+  const serviceSet = new Set(state.services);
+  const mappingSources =
+    state.containerMappings
+      ?.filter(
+        (mapping) =>
+          serviceSet.has(mapping.serviceName) &&
+          !mapping.serviceName.startsWith("__portmanager_alias__:") &&
+          mapping.originalContainerId.trim().length > 0 &&
+          mapping.originalContainerName.trim().length > 0,
+      )
+      .map((mapping) => ({
+        id: mapping.originalContainerId,
+        name: mapping.originalContainerName,
+        serviceName: mapping.serviceName,
+      })) ?? [];
+
+  return mappingSources.length > 0 ? mappingSources : currentContainers;
+}
+
+function buildRenamedMutationState(
+  state: ComposePortMutationState,
+  attachedProjectName: string,
+  overrideFile: string,
+  hiddenPorts: readonly ComposePublishedPort[],
+  containerMappings: readonly ComposeContainerMutationMapping[],
+): ComposePortMutationState {
+  return {
+    mode: state.mode,
+    runtime: state.runtime,
+    originalProjectName: state.originalProjectName,
+    attachedProjectName,
+    ...(state.workingDirectory !== undefined ? { workingDirectory: state.workingDirectory } : {}),
+    composeFiles: state.composeFiles,
+    services: state.services,
+    overrideFile,
+    originalPorts: state.originalPorts,
+    hiddenPorts,
+    ...(containerMappings.length > 0 ? { containerMappings } : {}),
+    ...(state.clonedVolumeNames !== undefined ? { clonedVolumeNames: state.clonedVolumeNames } : {}),
+    ...(state.clonedVolumes !== undefined ? { clonedVolumes: state.clonedVolumes } : {}),
+  };
+}
+
 function buildCloneContainerNames(
   originalProjectName: string,
   attachedProjectName: string,
   originalContainers: readonly ComposeServiceContainer[],
+  serviceContainerNameSot: ReadonlyMap<string, string>,
+  occupiedContainerNames: ReadonlySet<string>,
 ): ReadonlyMap<string, string> {
-  const names = new Map<string, string>();
+  const names = new Map(serviceContainerNameSot);
+  const reservedNames = new Set(
+    [...occupiedContainerNames]
+      .map((name) => normalizeContainerNameText(name))
+      .filter((name) => name.length > 0),
+  );
   const originalByService = groupBy(originalContainers, (container) => container.serviceName);
 
   for (const [serviceName, containers] of originalByService) {
@@ -824,9 +1059,16 @@ function buildCloneContainerNames(
       continue;
     }
 
-    const cloneContainerName = buildCloneContainerName(originalProjectName, attachedProjectName, containers[0]!.name);
+    const cloneContainerName = buildCloneContainerName(
+      originalProjectName,
+      attachedProjectName,
+      containers[0]!.name,
+      serviceContainerNameSot.get(serviceName),
+      reservedNames,
+    );
     if (cloneContainerName !== undefined) {
       names.set(serviceName, cloneContainerName);
+      reservedNames.add(normalizeContainerNameText(cloneContainerName));
     }
   }
 
@@ -837,29 +1079,40 @@ function buildCloneContainerName(
   originalProjectName: string,
   attachedProjectName: string,
   originalContainerName: string,
+  serviceContainerNameSot: string | undefined,
+  occupiedContainerNames: ReadonlySet<string>,
 ): string | undefined {
-  const projectReplacedName = replaceGeneratedContainerProjectPrefix(
-    originalContainerName,
-    originalProjectName,
-    attachedProjectName,
-  );
-  if (projectReplacedName !== undefined) {
-    return trimContainerName(projectReplacedName, 120);
+  const normalizedOriginalName = normalizeContainerNameText(originalContainerName);
+  if (serviceContainerNameSot !== undefined) {
+    const normalizedSotName = normalizeContainerNameText(serviceContainerNameSot);
+    if (normalizedSotName.length === 0) {
+      return undefined;
+    }
+
+    return occupiedContainerNames.has(normalizedSotName)
+      ? buildAvailableConflictingCloneContainerName(normalizedSotName, attachedProjectName, occupiedContainerNames)
+      : normalizedSotName;
   }
 
-  return buildExplicitCloneContainerName(originalContainerName, attachedProjectName);
+  if (normalizedOriginalName.length === 0 || isGeneratedComposeContainerName(normalizedOriginalName, originalProjectName)) {
+    return undefined;
+  }
+
+  // If runtime labels did not include readable compose files, a non-generated
+  // container name is the best available SOT. Docker reserves stopped container
+  // names globally, so the hidden clone receives a compose-project suffix only
+  // when it would otherwise collide with the source container.
+  return buildAvailableConflictingCloneContainerName(normalizedOriginalName, attachedProjectName, occupiedContainerNames);
 }
 
-function replaceGeneratedContainerProjectPrefix(
+function isGeneratedComposeContainerName(
   containerName: string,
   originalProjectName: string,
-  attachedProjectName: string,
-): string | undefined {
+): boolean {
   const normalizedName = containerName.trim().replace(/^\/+/, "");
   const originalProject = sanitizeContainerNameSegment(originalProjectName);
-  const attachedProject = sanitizeContainerNameSegment(attachedProjectName);
-  if (normalizedName.length === 0 || originalProject === undefined || attachedProject === undefined) {
-    return undefined;
+  if (normalizedName.length === 0 || originalProject === undefined) {
+    return false;
   }
 
   for (const separator of ["-", "_"]) {
@@ -867,12 +1120,62 @@ function replaceGeneratedContainerProjectPrefix(
     if (normalizedName.startsWith(prefix)) {
       const generatedSuffix = normalizedName.slice(prefix.length);
       if (isComposeGeneratedContainerSuffix(generatedSuffix)) {
-        return `${attachedProject}${separator}${generatedSuffix}`;
+        return true;
       }
     }
   }
 
-  return undefined;
+  return false;
+}
+
+function normalizeContainerNameText(value: string): string {
+  return value.trim().replace(/^\/+/, "");
+}
+
+function buildConflictingCloneContainerName(containerName: string, attachedProjectName: string): string {
+  const suffixSegment = sanitizeContainerNameSegment(attachedProjectName) ?? "compose";
+  const suffix = `-${suffixSegment}`;
+  const maxLength = 120;
+  const baseLength = Math.max(1, maxLength - suffix.length);
+  const baseName = trimContainerName(containerName, baseLength).replace(/[_.-]+$/g, "") || "compose-container";
+
+  return trimContainerName(`${baseName}${suffix}`, maxLength);
+}
+
+function buildAvailableConflictingCloneContainerName(
+  containerName: string,
+  attachedProjectName: string,
+  occupiedContainerNames: ReadonlySet<string>,
+): string {
+  const candidate = buildConflictingCloneContainerName(containerName, attachedProjectName);
+  if (!occupiedContainerNames.has(candidate)) {
+    return candidate;
+  }
+
+  // The network/project suffix can collide when a cloned project is copied to a
+  // second network with the same attached project name. Keep the readable base
+  // and add the smallest deterministic ordinal that Docker has not reserved.
+  for (let ordinal = 2; ordinal < 1000; ordinal += 1) {
+    const ordinalCandidate = appendContainerNameCollisionOrdinal(candidate, ordinal);
+    if (!occupiedContainerNames.has(ordinalCandidate)) {
+      return ordinalCandidate;
+    }
+  }
+
+  const fallbackOrdinal = createHash("sha1")
+    .update(`${containerName}\0${attachedProjectName}\0${[...occupiedContainerNames].sort().join("\0")}`)
+    .digest("hex")
+    .slice(0, 8);
+  return appendContainerNameCollisionOrdinal(candidate, fallbackOrdinal);
+}
+
+function appendContainerNameCollisionOrdinal(containerName: string, ordinal: number | string): string {
+  const suffix = `-${ordinal}`;
+  const maxLength = 120;
+  const baseLength = Math.max(1, maxLength - suffix.length);
+  const baseName = trimContainerName(containerName, baseLength).replace(/[_.-]+$/g, "") || "compose-container";
+
+  return trimContainerName(`${baseName}${suffix}`, maxLength);
 }
 
 function isComposeGeneratedContainerSuffix(value: string): boolean {
@@ -886,16 +1189,6 @@ function isComposeGeneratedContainerSuffix(value: string): boolean {
   return /^[1-9][0-9]*$/.test(value.slice(replicaSeparatorIndex + 1));
 }
 
-function buildExplicitCloneContainerName(originalContainerName: string, attachedProjectName: string): string | undefined {
-  const originalSegment = sanitizeContainerNameSegment(originalContainerName);
-  const projectSegment = sanitizeContainerNameSegment(attachedProjectName);
-  if (originalSegment === undefined || projectSegment === undefined) {
-    return undefined;
-  }
-
-  return trimContainerName(`${originalSegment}-${projectSegment}`, 120);
-}
-
 function groupBy<T>(values: readonly T[], keyForValue: (value: T) => string): Map<string, T[]> {
   const grouped = new Map<string, T[]>();
 
@@ -907,14 +1200,19 @@ function groupBy<T>(values: readonly T[], keyForValue: (value: T) => string): Ma
   return grouped;
 }
 
-function buildAttachedProjectName(networkName: string, originalProjectName: string): string {
+function buildAttachedProjectName(
+  networkName: string,
+  originalProjectName: string,
+  networkIdentity?: string,
+): string {
   const networkSegment = sanitizeComposeProjectSegment(networkName) ?? "network";
   const originalSegment = sanitizeComposeProjectSegment(originalProjectName) ?? "compose";
-  const hash = createHash("sha1").update(`${networkName}\0${originalProjectName}`).digest("hex").slice(0, 8);
+  const hashSource = networkIdentity === undefined ? networkName : `${networkName}\0${networkIdentity}`;
+  const hash = createHash("sha1").update(`${hashSource}\0${originalProjectName}`).digest("hex").slice(0, 8);
   const prefix = trimProjectName(`${networkSegment}-${originalSegment}`, 52);
 
   // Network name stays first for Docker UI discoverability; the hash prevents
-  // two original projects attached to the same network from sharing a project.
+  // copied networks and duplicate source projects from sharing a project.
   return `${prefix}-${hash}`;
 }
 
@@ -925,6 +1223,30 @@ async function readComposeConfiguredProjectName(composeFile: string): Promise<st
   }
 
   return parseComposeConfiguredProjectName(text);
+}
+
+async function readComposeServiceContainerNames(
+  composeFiles: readonly string[],
+): Promise<ReadonlyMap<string, string>> {
+  const names = new Map<string, string>();
+
+  for (const composeFile of composeFiles) {
+    const text = await fs.readFile(composeFile, "utf8").catch(() => undefined);
+    if (text === undefined) {
+      continue;
+    }
+
+    for (const [serviceName, containerName] of parseComposeServiceContainerNames(text)) {
+      if (containerName === undefined) {
+        names.delete(serviceName);
+        continue;
+      }
+
+      names.set(serviceName, containerName);
+    }
+  }
+
+  return names;
 }
 
 function parseComposeConfiguredProjectName(text: string): string | undefined {
@@ -942,6 +1264,60 @@ function parseComposeConfiguredProjectName(text: string): string | undefined {
   }
 
   return undefined;
+}
+
+function parseComposeServiceContainerNames(text: string): ReadonlyMap<string, string | undefined> {
+  const names = new Map<string, string | undefined>();
+  let inServices = false;
+  let serviceIndent: number | undefined;
+  let currentService: string | undefined;
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    if (/^\s*(?:#.*)?$/.test(rawLine)) {
+      continue;
+    }
+
+    const indent = rawLine.length - rawLine.trimStart().length;
+    const trimmed = rawLine.trim();
+    if (indent === 0) {
+      inServices = /^services\s*:\s*(?:#.*)?$/.test(trimmed);
+      serviceIndent = undefined;
+      currentService = undefined;
+      continue;
+    }
+    if (!inServices) {
+      continue;
+    }
+
+    const separatorIndex = rawLine.indexOf(":", indent);
+    if (separatorIndex < 0) {
+      continue;
+    }
+
+    if (serviceIndent === undefined) {
+      serviceIndent = indent;
+    }
+    if (indent === serviceIndent) {
+      currentService = parseYamlMapKey(rawLine.slice(indent, separatorIndex));
+      continue;
+    }
+    if (currentService === undefined || indent <= serviceIndent) {
+      continue;
+    }
+
+    const key = parseYamlMapKey(rawLine.slice(indent, separatorIndex));
+    if (key !== "container_name") {
+      continue;
+    }
+
+    names.set(currentService, parseYamlScalarString(rawLine.slice(separatorIndex + 1)));
+  }
+
+  return names;
+}
+
+function parseYamlMapKey(value: string): string | undefined {
+  return parseYamlScalarString(value);
 }
 
 function parseYamlScalarString(value: string): string | undefined {
@@ -1357,6 +1733,30 @@ function readObjectLabel(labels: Record<string, string> | undefined, ...keys: re
   }
 
   return undefined;
+}
+
+export function isValidComposeProjectName(value: string): boolean {
+  const trimmed = value.trim();
+  return trimmed.length > 0 && trimmed.length <= 120 && /^[a-z0-9][a-z0-9_-]*$/.test(trimmed);
+}
+
+function parseRequestedComposeProjectName(value: string | undefined): string | undefined {
+  if (value === undefined || value.trim().length === 0) {
+    return undefined;
+  }
+
+  return requireComposeProjectName(value);
+}
+
+function requireComposeProjectName(value: string): string {
+  const trimmed = value.trim();
+  if (!isValidComposeProjectName(trimmed)) {
+    throw new Error(
+      "Compose project name must be 1-120 characters, use lowercase letters, digits, dashes, or underscores, and start with a letter or digit.",
+    );
+  }
+
+  return trimmed;
 }
 
 function sanitizeComposeProjectSegment(value: string): string | undefined {

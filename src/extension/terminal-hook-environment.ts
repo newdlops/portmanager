@@ -56,9 +56,13 @@ const PRELOAD_RUNTIME_LAUNCHER_NAMES = [
 // These names are package-manager or project-bin commands. A shell wrapper
 // finds the next PATH entry and reruns it without the protected shebang hop.
 const PRELOAD_PACKAGE_COMMAND_NAMES = [
+  "celery",
   "yarn",
   "yarnpkg",
   "vite",
+  "uvicorn",
+  "gunicorn",
+  "daphne",
   "concurrently",
   "dotenv",
   "wait-on",

@@ -457,9 +457,12 @@ export class ComposeAttachmentTreeItem extends vscode.TreeItem {
   readonly contextValue = "composeAttachment";
 
   constructor(readonly attachment: ComposeAttachment) {
-    super(attachment.projectName, vscode.TreeItemCollapsibleState.None);
+    super(attachment.mutation?.attachedProjectName ?? attachment.projectName, vscode.TreeItemCollapsibleState.None);
     this.id = attachment.id;
-    this.description = attachment.ports.map(formatComposePort).join(", ");
+    this.description =
+      attachment.mutation === undefined
+        ? attachment.ports.map(formatComposePort).join(", ")
+        : `${attachment.mutation.originalProjectName} ${attachment.ports.map(formatComposePort).join(", ")}`;
     this.tooltip = buildComposeAttachmentTooltip(attachment);
     this.iconPath = new vscode.ThemeIcon(
       attachment.status === "attached" ? "database" : "warning",

@@ -6,6 +6,7 @@ import { getAgentSocketPath } from "../agent/agent-socket";
 import { getDefaultHostAccessBindingsPath, getDefaultRouteTablePath } from "../agent/route-table";
 import { readPortManagerSettings, openPortManagerSettings } from "../config/vscode-settings";
 import { buildExistingCloneMutationFromCandidate } from "../platform/network/container-service-discovery";
+import { isValidComposeProjectName } from "../platform/network/compose-publish-mutator";
 import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
 import type { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import {
@@ -125,6 +126,9 @@ export class PortManagerCommandController implements DisposableLike {
     );
     this.registerCommand(context, "portManager.detachComposeAttachment", (argument) =>
       this.detachComposeAttachment(argument),
+    );
+    this.registerCommand(context, "portManager.renameComposeAttachment", (argument) =>
+      this.renameComposeAttachment(argument),
     );
     this.registerCommand(context, "portManager.removeComposeAttachment", (argument) =>
       this.removeComposeAttachment(argument),
@@ -383,26 +387,35 @@ export class PortManagerCommandController implements DisposableLike {
 
     const composeAttachMode =
       directInput?.composeAttachMode ??
-      (candidate.composeProject === undefined || candidate.portManagerClone !== undefined
+      (candidate.composeProject === undefined
         ? "as-is"
         : await promptForComposeAttachMode(candidate));
     if (composeAttachMode === undefined) {
       return;
     }
     const allowStatefulClone =
-      composeAttachMode === "clone" ? await confirmStatefulComposeClone(candidate) : false;
+      isComposeCloneAttachMode(composeAttachMode) ? await confirmStatefulComposeClone(candidate) : false;
     if (allowStatefulClone === undefined) {
+      return;
+    }
+    const attachedProjectName =
+      directInput?.attachedProjectName ??
+      (composeAttachMode === "clone-custom"
+        ? await promptForComposeProjectName("Clone Compose Project Name")
+        : undefined);
+    if (composeAttachMode === "clone-custom" && attachedProjectName === undefined) {
       return;
     }
 
     const existingCloneMutation =
       composeAttachMode === "as-is" ? buildExistingCloneMutationFromCandidate(candidate) : undefined;
     const composeMutation =
-      candidate.composeProject !== undefined && composeAttachMode === "clone"
+      candidate.composeProject !== undefined && isComposeCloneAttachMode(composeAttachMode)
         ? {
             composeMutation: {
               mode: "clone" as const,
               allowStatefulClone,
+              ...(attachedProjectName !== undefined ? { attachedProjectName } : {}),
               runtime: candidate.runtime,
               workingDirectory: candidate.composeWorkingDirectory ?? getDefaultWorkspaceFolder() ?? process.cwd(),
               composeFiles: candidate.composeConfigFiles,
@@ -661,6 +674,28 @@ export class PortManagerCommandController implements DisposableLike {
     await this.dependencies.networkService.detachComposeAttachment(attachment.id);
     this.dependencies.treeProvider.refresh();
     await vscode.window.showInformationMessage(`Detached "${attachment.projectName}" from its network.`);
+  }
+
+  /** Renames the hidden Docker/Podman Compose project created by clone attach. */
+  private async renameComposeAttachment(argument: unknown): Promise<void> {
+    const attachment = await this.resolveComposeAttachmentArgument(argument, "Rename Compose Project");
+    if (attachment === undefined) {
+      return;
+    }
+
+    const projectName = await promptForComposeProjectName(
+      "Rename Compose Project",
+      attachment.mutation?.attachedProjectName ?? attachment.projectName,
+    );
+    if (projectName === undefined) {
+      return;
+    }
+
+    const renamed = await this.dependencies.networkService.renameComposeAttachment(attachment.id, projectName);
+    this.dependencies.treeProvider.refresh();
+    if (renamed !== undefined) {
+      await vscode.window.showInformationMessage(`Renamed compose project to "${projectName}".`);
+    }
   }
 
   /** Removes compose route rows and restores any Docker/Podman mutation Port Manager created. */
@@ -1769,7 +1804,7 @@ function sameComposeContext(candidate: ContainerServiceCandidate, reference: Con
   return referenceFiles.length === candidateFiles.length && referenceFiles.every((file, index) => candidateFiles[index] === file);
 }
 
-type ComposeAttachMode = "clone" | "as-is";
+type ComposeAttachMode = "clone" | "clone-custom" | "as-is";
 
 async function promptForComposeAttachMode(
   candidate: ContainerServiceCandidate,
@@ -1781,6 +1816,12 @@ async function promptForComposeAttachMode(
         description: "Recreate services under a network-scoped Compose project",
         detail: "Frees original host ports so the original Compose project can be started again.",
         mode: "clone" as const,
+      },
+      {
+        label: "Clone with custom Compose name",
+        description: "Choose the hidden Compose project name before recreating services",
+        detail: "Use this when copying an existing clone or when the generated project name would collide.",
+        mode: "clone-custom" as const,
       },
       {
         label: "Attach as-is",
@@ -1796,6 +1837,29 @@ async function promptForComposeAttachMode(
   );
 
   return selected?.mode;
+}
+
+function isComposeCloneAttachMode(mode: ComposeAttachMode): boolean {
+  return mode === "clone" || mode === "clone-custom";
+}
+
+async function promptForComposeProjectName(
+  title: string,
+  value?: string,
+): Promise<string | undefined> {
+  const projectName = await vscode.window.showInputBox({
+    title,
+    prompt: "Compose project name (-p)",
+    value,
+    placeHolder: "my-copy",
+    ignoreFocusOut: true,
+    validateInput: (rawValue) =>
+      isValidComposeProjectName(rawValue)
+        ? undefined
+        : "Use 1-120 lowercase letters, digits, dashes, or underscores; start with a letter or digit.",
+  });
+
+  return projectName === undefined ? undefined : projectName.trim();
 }
 
 async function confirmStatefulComposeClone(
@@ -1989,6 +2053,7 @@ interface AttachContainerCommandInput {
   readonly containerService?: ContainerServiceCandidate;
   readonly network?: LogicalNetwork;
   readonly composeAttachMode?: ComposeAttachMode;
+  readonly attachedProjectName?: string;
 }
 
 function getAttachTerminalInput(argument: unknown): AttachTerminalCommandInput | undefined {
@@ -2132,6 +2197,7 @@ function getAttachContainerInput(argument: unknown): AttachContainerCommandInput
     containerService: candidate.containerService,
     network: candidate.network,
     composeAttachMode: candidate.composeAttachMode,
+    attachedProjectName: candidate.attachedProjectName,
   };
 }
 

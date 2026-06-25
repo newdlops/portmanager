@@ -38,7 +38,7 @@ test("package command shims rerun client tools without native runtime alias sema
   const launcherList = /const PRELOAD_RUNTIME_LAUNCHER_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
   const packageCommandList = /const PRELOAD_PACKAGE_COMMAND_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
 
-  for (const packageBinary of ["yarn", "concurrently", "wait-on", "retry", "vite", "dotenv"]) {
+  for (const packageBinary of ["yarn", "concurrently", "wait-on", "retry", "vite", "dotenv", "celery", "uvicorn", "gunicorn", "daphne"]) {
     assert.equal(
       launcherList.includes(`"${packageBinary}"`),
       false,
@@ -87,4 +87,18 @@ test("terminal attach script enables loopback routing only after alias readiness
   assert.equal(source.includes("sudo -n ifconfig lo0 alias"), true);
   assert.equal(source.includes("Port Manager loopback IP routing unavailable; using high-port routing fallback."), true);
   assert.equal(source.includes("NETWORK_LOOPBACK_HOST_ENV"), true);
+});
+
+test("logical routers are opened for compose clone endpoints only", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+
+  assert.equal(source.includes("collectComposeLogicalRouterPorts(this.processService?.getSnapshot().routes ?? [])"), true);
+  assert.equal(source.includes('route.source === "compose"'), true);
+  assert.equal(source.includes("route.actualPort !== route.logicalPort"), true);
+  assert.equal(
+    source.includes("await this.logicalPortRouter.sync([]).catch(() => undefined);"),
+    false,
+    "compose dependency clients such as Celery need a localhost TCP router fallback",
+  );
 });

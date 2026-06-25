@@ -56,6 +56,7 @@
     "onCommand:portManager.addHostAccessBinding",
     "onCommand:portManager.addComposePublishedPort",
     "onCommand:portManager.detachComposeAttachment",
+    "onCommand:portManager.renameComposeAttachment",
     "onCommand:portManager.removeComposeAttachment",
     "onCommand:portManager.saveBindingPreset",
     "onCommand:portManager.applyBindingPreset",
@@ -209,6 +210,12 @@
         "title": "Port Manager: Detach Service from Network",
         "category": "Port Manager",
         "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "portManager.renameComposeAttachment",
+        "title": "Port Manager: Rename Compose Project",
+        "category": "Port Manager",
+        "icon": "$(edit)"
       },
       {
         "command": "portManager.removeComposeAttachment",
@@ -582,6 +589,11 @@
         },
         {
           "command": "portManager.removeComposeAttachment",
+          "when": "view == portManager.processes && viewItem == composeAttachment",
+          "group": "exposure@7"
+        },
+        {
+          "command": "portManager.renameComposeAttachment",
           "when": "view == portManager.processes && viewItem == composeAttachment",
           "group": "exposure@6"
         },

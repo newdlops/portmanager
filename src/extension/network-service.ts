@@ -892,6 +892,18 @@ export class PortManagerNetworkService implements DisposableLike {
       status: "attached",
       attachedAt: new Date().toISOString(),
     };
+    const existingAttachments = this.registry.getSnapshot().composeAttachments;
+    const equivalentAttachment = findEquivalentComposeAttachment(existingAttachments, attachment, input);
+    if (equivalentAttachment !== undefined) {
+      await this.restorePersistedComposeRoutes([equivalentAttachment]);
+      return this.getComposeAttachment(equivalentAttachment.id) ?? equivalentAttachment;
+    }
+
+    const conflict = findComposeRouteConflict(existingAttachments, attachment);
+    if (conflict !== undefined) {
+      throw new Error(formatComposeRouteConflictMessage(network, attachment, conflict));
+    }
+
     const registeredProcessIds: string[] = [];
     let registeredAttachment = attachment;
     let mutation: ComposePortMutationState | undefined;
@@ -901,8 +913,10 @@ export class PortManagerNetworkService implements DisposableLike {
         const mutationResult = await this.composePublishMutator.hidePublishedPorts({
           mode: input.composeMutation.mode,
           allowStatefulClone: input.composeMutation.allowStatefulClone,
+          attachedProjectName: input.composeMutation.attachedProjectName,
           runtime: input.composeMutation.runtime,
           networkName: network.name,
+          networkId: network.id,
           originalProjectName: attachment.projectName,
           workingDirectory: input.composeMutation.workingDirectory ?? input.cwd,
           composeFiles: input.composeMutation.composeFiles ?? input.composeFiles ?? [],
@@ -1015,6 +1029,56 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Returns one compose attachment from the latest snapshot. */
   getComposeAttachment(attachmentId: string): ComposeAttachment | undefined {
     return this.registry.getSnapshot().composeAttachments.find((attachment) => attachment.id === attachmentId);
+  }
+
+  /** Renames the real hidden Compose project backing a cloned attachment. */
+  async renameComposeAttachment(
+    attachmentId: string,
+    attachedProjectName: string,
+  ): Promise<ComposeAttachment | undefined> {
+    if (this.processService === undefined) {
+      throw new Error("Compose project rename requires the Port Manager daemon.");
+    }
+
+    const attachment = this.getComposeAttachment(attachmentId);
+    if (attachment === undefined) {
+      return undefined;
+    }
+
+    const mutation = attachment.mutation;
+    if (mutation === undefined || mutation.mode !== "clone") {
+      throw new Error("Only cloned Compose attachments can change the Compose project name.");
+    }
+
+    try {
+      const mutationResult = await this.composePublishMutator.renameAttachedProject(
+        mutation,
+        attachedProjectName,
+      );
+      await this.processService.start();
+      await this.removeComposeRouteProcesses(attachment, attachment.ports);
+      const updatedAttachment = this.registry.updateComposeAttachment({
+        ...attachment,
+        projectName: mutationResult.state.attachedProjectName,
+        composeFiles: mutationResult.state.composeFiles,
+        ports: mutationResult.ports.map(dropComposeProcessId),
+        mutation: mutationResult.state,
+        status: "attached",
+        errorMessage: undefined,
+      });
+
+      await this.restorePersistedComposeRoutes([updatedAttachment]);
+      void this.syncLogicalPortRouters();
+
+      return this.getComposeAttachment(attachmentId) ?? updatedAttachment;
+    } catch (error) {
+      this.registry.updateComposeAttachment({
+        ...attachment,
+        status: "error",
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
   }
 
   /** Captures the selected network's bindings as a reusable preset. */
@@ -1756,17 +1820,21 @@ export class PortManagerNetworkService implements DisposableLike {
     };
   }
 
-  /** Keeps the legacy localhost listener router closed. */
+  /** Opens localhost routers only for network-scoped compose endpoints. */
   private async syncLogicalPortRouters(): Promise<void> {
     /*
-     * Port Manager must not occupy application-requested ports with a daemon or
-     * router process. Native hooks rewrite bind/connect to the selected actual
-     * ports; opening localhost listeners here races with app startup and can
-     * leave portmanager_tcp_router holding the requested port after a failed
-     * bind. Syncing an empty set also closes listeners created by older code in
-     * this extension host.
+     * Native hooks normally rewrite connect() directly. Some package launchers
+     * can still lose the preload hook before opening client sockets, especially
+     * for dependency clients such as Celery. Compose clone routes have already
+     * freed their logical host ports, so a localhost router can safely accept
+     * those unhooked clients and resolve the target by terminal/network context.
+     *
+     * Do not open routers for hooked app listeners: those logical ports may be
+     * requested by the app itself, and a router would race the real bind.
      */
-    await this.logicalPortRouter.sync([]).catch(() => undefined);
+    await this.logicalPortRouter.sync(collectComposeLogicalRouterPorts(this.processService?.getSnapshot().routes ?? [])).catch(
+      () => undefined,
+    );
   }
 
   /**
@@ -2489,6 +2557,8 @@ export interface ComposePublishMutationInput {
   readonly mode?: ComposePortMutationMode;
   /** Explicit confirmation for clone attach of stateful services with persistent mounts. */
   readonly allowStatefulClone?: boolean;
+  /** Optional exact Compose project name for the hidden clone. */
+  readonly attachedProjectName?: string;
   /** Runtime CLI that owns the discovered compose services. */
   readonly runtime: "docker" | "podman";
   /** Directory where compose commands should resolve relative files. */
@@ -2604,6 +2674,113 @@ function normalizeComposePublishedPort(input: ComposePublishedPortInput): Compos
       ? { protocolName: input.protocolName.trim() }
       : {}),
   };
+}
+
+interface ComposeRouteConflict {
+  readonly attachment: ComposeAttachment;
+  readonly existingPort: ComposePublishedPort;
+  readonly requestedPort: ComposePublishedPort;
+}
+
+function findEquivalentComposeAttachment(
+  attachments: readonly ComposeAttachment[],
+  requested: ComposeAttachment,
+  input: ComposePublishedPortsInput,
+): ComposeAttachment | undefined {
+  return attachments.find(
+    (attachment) =>
+      attachment.status === "attached" &&
+      attachment.networkId === requested.networkId &&
+      composeAttachmentMatchesInput(attachment, requested, input) &&
+      requestedComposePortsAreAlreadyAttached(attachment.ports, requested.ports),
+  );
+}
+
+function composeAttachmentMatchesInput(
+  attachment: ComposeAttachment,
+  requested: ComposeAttachment,
+  input: ComposePublishedPortsInput,
+): boolean {
+  if (input.existingMutation !== undefined) {
+    const mutation = attachment.mutation;
+    return (
+      mutation !== undefined &&
+      mutation.originalProjectName === input.existingMutation.originalProjectName &&
+      mutation.attachedProjectName === input.existingMutation.attachedProjectName &&
+      sameStringList(mutation.composeFiles, input.existingMutation.composeFiles)
+    );
+  }
+
+  if (input.composeMutation !== undefined) {
+    const mutation = attachment.mutation;
+    const requestedMode = input.composeMutation.mode ?? "clone";
+    const requestedComposeFiles = input.composeMutation.composeFiles ?? input.composeFiles ?? [];
+    return (
+      mutation !== undefined &&
+      mutation.mode === requestedMode &&
+      mutation.originalProjectName === requested.projectName &&
+      (input.composeMutation.attachedProjectName === undefined ||
+        mutation.attachedProjectName === input.composeMutation.attachedProjectName) &&
+      sameStringList(mutation.composeFiles, requestedComposeFiles)
+    );
+  }
+
+  return (
+    attachment.mutation === undefined &&
+    attachment.projectName === requested.projectName &&
+    sameStringList(attachment.composeFiles, requested.composeFiles)
+  );
+}
+
+function requestedComposePortsAreAlreadyAttached(
+  existingPorts: readonly ComposePublishedPort[],
+  requestedPorts: readonly ComposePublishedPort[],
+): boolean {
+  const existingPortKeys = new Set(existingPorts.map(composeServiceRouteKey));
+  return requestedPorts.every((port) => existingPortKeys.has(composeServiceRouteKey(port)));
+}
+
+function findComposeRouteConflict(
+  attachments: readonly ComposeAttachment[],
+  requested: ComposeAttachment,
+): ComposeRouteConflict | undefined {
+  for (const attachment of attachments) {
+    if (attachment.id === requested.id || attachment.networkId !== requested.networkId) {
+      continue;
+    }
+
+    for (const existingPort of attachment.ports) {
+      const requestedPort = requested.ports.find(
+        (port) => port.protocol === existingPort.protocol && port.logicalPort === existingPort.logicalPort,
+      );
+      if (requestedPort !== undefined) {
+        return { attachment, existingPort, requestedPort };
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function formatComposeRouteConflictMessage(
+  network: LogicalNetwork,
+  requested: ComposeAttachment,
+  conflict: ComposeRouteConflict,
+): string {
+  const existingProjectName = conflict.attachment.mutation?.attachedProjectName ?? conflict.attachment.projectName;
+  return (
+    `Compose route already exists for logical port ${conflict.requestedPort.logicalPort}/${conflict.requestedPort.protocol} ` +
+    `in "${network.name}" from project "${existingProjectName}" service "${conflict.existingPort.serviceName}". ` +
+    `Detach that Compose route or choose another logical network before attaching "${requested.projectName}".`
+  );
+}
+
+function composeServiceRouteKey(port: ComposePublishedPort): string {
+  return `${port.serviceName}:${port.protocol}:${port.logicalPort}:${port.containerPort}`;
+}
+
+function sameStringList(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function buildComposeProjectRoutingRows(
@@ -3000,6 +3177,27 @@ function isLiveListenRoute(route: LogicalPortRoute): boolean {
 /** Sender reservations are not targets for host exposure or logical routers. */
 function isListenRoute(route: LogicalPortRoute): boolean {
   return route.routeDirection === undefined || route.routeDirection === "listen";
+}
+
+function collectComposeLogicalRouterPorts(routes: readonly LogicalPortRoute[]): readonly number[] {
+  const ports = new Set<number>();
+
+  for (const route of routes) {
+    if (
+      route.source === "compose" &&
+      isLiveListenRoute(route) &&
+      route.actualPort !== route.logicalPort &&
+      isTcpPort(route.logicalPort)
+    ) {
+      ports.add(route.logicalPort);
+    }
+  }
+
+  return [...ports].sort((left, right) => left - right);
+}
+
+function isTcpPort(port: number): boolean {
+  return Number.isInteger(port) && port > 0 && port <= 65_535;
 }
 
 /** Converts the container adapter target into the socket proxy contract. */

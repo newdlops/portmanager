@@ -5,9 +5,10 @@ import type { LogicalPortRoute } from "../../shared/types";
  * Selects active routes whose recorded process cwd matches the client cwd.
  *
  * Logical-port router clients can lose explicit network metadata when a runtime
- * refuses native library injection. The cwd comparison is intentionally scoped
- * to the same logical port and live routes so it can only narrow an already
- * relevant candidate set.
+ * refuses native library injection or daemonizes away from its terminal. The
+ * cwd comparison is intentionally scoped to the same logical port and live
+ * routes so it can only narrow an already relevant candidate set, including
+ * Compose endpoints whose hidden host ports are still owned by the project.
  */
 export function findRoutesMatchingClientCwd(
   routes: readonly LogicalPortRoute[],
@@ -25,7 +26,6 @@ export function findRoutesMatchingClientCwd(
       route.logicalPort === logicalPort &&
       route.actualPort !== route.logicalPort &&
       (route.routeDirection === undefined || route.routeDirection === "listen") &&
-      route.source !== "compose" &&
       route.cwd !== undefined &&
       route.status === "running",
   );
