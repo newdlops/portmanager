@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+
 /**
  * Shell-side Docker Compose project routing for attached logical networks.
  *
@@ -40,6 +42,13 @@ export interface ComposeContainerRoutingMapping {
   readonly attachedContainerName: string;
 }
 
+export interface ComposeRoutingFileSet {
+  /** User-authored compose files that identify the original project. */
+  readonly composeFiles: readonly string[];
+  /** Port Manager-generated override that hides host ports and rewrites names. */
+  readonly overrideFile?: string;
+}
+
 /** Serializes rows as tab-separated text so shell wrappers can read it cheaply. */
 export function serializeComposeProjectRoutingRows(rows: readonly ComposeProjectRoutingRow[]): string {
   const lines = rows.flatMap((row) => {
@@ -77,6 +86,65 @@ export function serializeComposeProjectRoutingRows(rows: readonly ComposeProject
   });
 
   return `${lines.join("\n")}${lines.length > 0 ? "\n" : ""}`;
+}
+
+/**
+ * Splits a persisted compose file list into source files and the generated
+ * Port Manager override. Older as-is clone attachments can persist both in one
+ * array without a mutation object, but shell routing needs the override as a
+ * distinct field so future compose commands keep the hidden-port project shape.
+ */
+export function splitGeneratedComposeRoutingFiles(composeFiles: readonly string[]): ComposeRoutingFileSet {
+  const sourceFiles: string[] = [];
+  let overrideFile: string | undefined;
+
+  for (const composeFile of composeFiles) {
+    if (isGeneratedComposeRoutingOverrideFile(composeFile)) {
+      overrideFile = composeFile;
+      continue;
+    }
+
+    sourceFiles.push(composeFile);
+  }
+
+  return {
+    composeFiles: sourceFiles.length > 0 ? sourceFiles : composeFiles,
+    ...(overrideFile !== undefined ? { overrideFile } : {}),
+  };
+}
+
+/**
+ * Recovers container-name rewrites for persisted clone/as-is attachments that
+ * have no mutation state. The generated override contains the attached
+ * container names; removing the project suffix recovers explicit names such as
+ * captain_db, while service names cover default Compose names like
+ * project-rabbitmq-1.
+ */
+export function inferContainerMappingsFromComposeRoutingFiles(input: {
+  readonly attachedProjectName: string;
+  readonly composeFiles: readonly string[];
+  readonly serviceNames: readonly string[];
+}): readonly ComposeContainerRoutingMapping[] {
+  const overrideContainerNames = readGeneratedOverrideContainerNames(input.composeFiles);
+  const serviceNames = uniqueStrings(input.serviceNames);
+  if (serviceNames.length === 0 || overrideContainerNames.size === 0) {
+    return [];
+  }
+
+  return serviceNames.map((serviceName) => {
+    const attachedContainerName =
+      overrideContainerNames.get(serviceName) ?? `${input.attachedProjectName}-${serviceName}-1`;
+    const originalContainerName =
+      inferOriginalContainerName(attachedContainerName, input.attachedProjectName) ?? serviceName;
+
+    return {
+      serviceName,
+      originalContainerId: originalContainerName,
+      originalContainerName,
+      attachedContainerId: attachedContainerName,
+      attachedContainerName,
+    };
+  });
 }
 
 /** Exports the dynamic map path and installs runtime wrappers in the current shell. */
@@ -1208,6 +1276,146 @@ function shellQuote(value: string): string {
 
 function sanitizeField(value: string): string {
   return value.replace(/[\t\r\n]/g, " ").trim();
+}
+
+function isGeneratedComposeRoutingOverrideFile(composeFile: string): boolean {
+  return composeFile.trim().endsWith(".ports.override.yaml");
+}
+
+function readGeneratedOverrideContainerNames(composeFiles: readonly string[]): ReadonlyMap<string, string> {
+  const names = new Map<string, string>();
+
+  for (const composeFile of composeFiles) {
+    if (!isGeneratedComposeRoutingOverrideFile(composeFile)) {
+      continue;
+    }
+
+    const text = readTextFile(composeFile);
+    if (text === undefined) {
+      continue;
+    }
+
+    for (const [serviceName, containerName] of parseComposeServiceContainerNames(text)) {
+      if (containerName === undefined) {
+        names.delete(serviceName);
+        continue;
+      }
+
+      names.set(serviceName, containerName);
+    }
+  }
+
+  return names;
+}
+
+function readTextFile(filePath: string): string | undefined {
+  try {
+    return fs.readFileSync(filePath, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+function parseComposeServiceContainerNames(text: string): ReadonlyMap<string, string | undefined> {
+  const names = new Map<string, string | undefined>();
+  let inServices = false;
+  let serviceIndent: number | undefined;
+  let currentService: string | undefined;
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    if (/^\s*(?:#.*)?$/.test(rawLine)) {
+      continue;
+    }
+
+    const indent = rawLine.length - rawLine.trimStart().length;
+    const trimmed = rawLine.trim();
+    if (indent === 0) {
+      inServices = /^services\s*:\s*(?:#.*)?$/.test(trimmed);
+      serviceIndent = undefined;
+      currentService = undefined;
+      continue;
+    }
+    if (!inServices) {
+      continue;
+    }
+
+    const separatorIndex = rawLine.indexOf(":", indent);
+    if (separatorIndex < 0) {
+      continue;
+    }
+
+    if (serviceIndent === undefined) {
+      serviceIndent = indent;
+    }
+    if (indent === serviceIndent) {
+      currentService = parseYamlMapKey(rawLine.slice(indent, separatorIndex));
+      continue;
+    }
+    if (currentService === undefined || indent <= serviceIndent) {
+      continue;
+    }
+
+    const key = parseYamlMapKey(rawLine.slice(indent, separatorIndex));
+    if (key !== "container_name") {
+      continue;
+    }
+
+    names.set(currentService, parseYamlScalarString(rawLine.slice(separatorIndex + 1)));
+  }
+
+  return names;
+}
+
+function parseYamlMapKey(value: string): string | undefined {
+  return parseYamlScalarString(value);
+}
+
+function parseYamlScalarString(value: string): string | undefined {
+  const scalar = stripYamlInlineComment(value).trim();
+  if (scalar.length === 0 || scalar === "~" || /^null$/i.test(scalar)) {
+    return undefined;
+  }
+
+  const quote = scalar[0];
+  if ((quote === "'" || quote === "\"") && scalar.endsWith(quote)) {
+    return scalar.slice(1, -1);
+  }
+
+  return scalar;
+}
+
+function stripYamlInlineComment(value: string): string {
+  let quote: string | undefined;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if ((character === "'" || character === "\"") && (index === 0 || value[index - 1] !== "\\")) {
+      quote = quote === character ? undefined : quote ?? character;
+      continue;
+    }
+
+    if (character === "#" && quote === undefined && (index === 0 || /\s/.test(value[index - 1] ?? ""))) {
+      return value.slice(0, index);
+    }
+  }
+
+  return value;
+}
+
+function inferOriginalContainerName(attachedContainerName: string, attachedProjectName: string): string | undefined {
+  const containerName = stripContainerNamePrefix(attachedContainerName);
+  for (const separator of ["-", "_"]) {
+    const suffix = `${separator}${attachedProjectName}`;
+    if (containerName.endsWith(suffix) && containerName.length > suffix.length) {
+      return containerName.slice(0, -suffix.length);
+    }
+  }
+
+  return undefined;
+}
+
+function uniqueStrings(values: readonly string[]): readonly string[] {
+  return [...new Set(values.map((value) => value.trim()).filter((value) => value.length > 0))];
 }
 
 function trimTrailingSlashes(value: string): string {

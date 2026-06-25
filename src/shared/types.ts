@@ -350,6 +350,8 @@ export interface ComposeAttachment {
   readonly networkId: string;
   /** Compose project or stack name shown to users. */
   readonly projectName: string;
+  /** Runtime CLI that owns this compose project when it was discovered. */
+  readonly runtime?: "docker" | "podman";
   /** Compose files used to launch the project, when known. */
   readonly composeFiles: readonly string[];
   /** Published service ports owned by this attachment. */

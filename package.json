@@ -70,6 +70,7 @@
     "onCommand:portManager.showDaemonStatus",
     "onCommand:portManager.clearRoutingFiles",
     "onCommand:portManager.resetRouting",
+    "onCommand:portManager.clearNetworkCache",
     "onCommand:portManager.clearNetworkRoutingFiles",
     "onCommand:portManager.startManagedProcess",
     "onCommand:portManager.addExistingProcess",
@@ -287,7 +288,7 @@
       },
       {
         "command": "portManager.clearRoutingFiles",
-        "title": "Port Manager: Clear Routing Files",
+        "title": "Port Manager: Clear All Routing Cache",
         "category": "Port Manager",
         "icon": "$(clear-all)"
       },
@@ -298,8 +299,8 @@
         "icon": "$(clear-all)"
       },
       {
-        "command": "portManager.clearNetworkRoutingFiles",
-        "title": "Port Manager: Clear Network Routing Cache",
+        "command": "portManager.clearNetworkCache",
+        "title": "Port Manager: Clear Network Cache",
         "category": "Port Manager",
         "icon": "$(clear-all)"
       },
@@ -517,7 +518,7 @@
           "group": "network@10"
         },
         {
-          "command": "portManager.clearNetworkRoutingFiles",
+          "command": "portManager.clearNetworkCache",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@11"
         },

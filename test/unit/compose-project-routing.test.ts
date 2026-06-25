@@ -8,7 +8,9 @@ import test from "node:test";
 import {
   buildComposeProjectRoutingShell,
   buildRuntimeCommandShimScript,
+  inferContainerMappingsFromComposeRoutingFiles,
   serializeComposeProjectRoutingRows,
+  splitGeneratedComposeRoutingFiles,
 } from "../../src/extension/compose-project-routing";
 
 test("serializes compose clone routing rows for shell lookup", () => {
@@ -76,6 +78,147 @@ test("docker compose wrapper targets the attached clone project by cwd and netwo
     );
 
     assert.equal(output.trim(), "network-a-app-1234");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("docker compose wrapper routes as-is attachments by cwd without an original project name", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-as-is-routing-"));
+  const projectDir = path.join(tempDir, "workspace", "docker");
+  const composeFile = path.join(projectDir, "development.yaml");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(composeFile, "services: {}\n", "utf8");
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        composeFiles: [composeFile],
+        attachedProjectName: "c1-docker-98d1ead0",
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(binDir, "docker"),
+    "#!/bin/sh\nprintf 'env=%s\\n' \"${COMPOSE_PROJECT_NAME:-}\"\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n",
+    {
+      encoding: "utf8",
+      mode: 0o700,
+    },
+  );
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          `docker compose -f ${shellQuote(composeFile)} up`,
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(
+      output,
+      [
+        "env=c1-docker-98d1ead0",
+        "<compose>",
+        "<-f>",
+        `<${composeFile}>`,
+        "<up>",
+        "<--detach>",
+        "",
+      ].join("\n"),
+    );
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("docker wrapper maps as-is clone container names inferred from generated overrides", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-as-is-container-map-"));
+  const projectDir = path.join(tempDir, "workspace", "docker");
+  const composeFile = path.join(projectDir, "development.yaml");
+  const overrideFile = path.join(tempDir, "c1-docker-98d1ead0.ports.override.yaml");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "compose-project-routing-network-a.tsv");
+  const attachedProjectName = "c1-docker-98d1ead0";
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(composeFile, "services:\n  db:\n    container_name: captain_db\n", "utf8");
+  fs.writeFileSync(
+    overrideFile,
+    [
+      "services:",
+      "  'db':",
+      "    container_name: 'captain_db-c1-docker-98d1ead0'",
+      "    ports: !override",
+      "      - '127.0.0.1::5432/tcp'",
+      "  'rabbitmq':",
+      "    container_name: !reset null",
+      "    ports: !override",
+      "      - '127.0.0.1::5672/tcp'",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  const routingFiles = splitGeneratedComposeRoutingFiles([composeFile, overrideFile]);
+  const containerMappings = inferContainerMappingsFromComposeRoutingFiles({
+    attachedProjectName,
+    composeFiles: [composeFile, overrideFile],
+    serviceNames: ["db", "rabbitmq"],
+  });
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        composeFiles: routingFiles.composeFiles,
+        attachedProjectName,
+        overrideFile: routingFiles.overrideFile,
+        containerMappings,
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker exec captain_db pg_isready",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output, "<exec>\n<captain_db-c1-docker-98d1ead0>\n<pg_isready>\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

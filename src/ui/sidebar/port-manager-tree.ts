@@ -256,9 +256,9 @@ export class PortManagerTreeProvider
         ),
         new ActionTreeItem(
           "Clear Network Cache",
-          "portManager.clearNetworkRoutingFiles",
+          "portManager.clearNetworkCache",
           "clear-all",
-          "Remove generated route files",
+          "Remove generated route maps",
           element.network,
         ),
         ...(attachments.length > 0

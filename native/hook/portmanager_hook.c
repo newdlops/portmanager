@@ -3204,17 +3204,12 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
       return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
     }
 
-    if (route_is_compose) {
-      /*
-       * A compose route that still points at the same localhost port is not an
-       * isolated endpoint. Letting it pass through would silently reach Docker's
-       * host-published port, possibly from the wrong logical network.
-       */
-      pm_debug("connect refusing same-port compose route logical=%d", logical_port);
-      errno = ECONNREFUSED;
-      return -1;
-    }
-
+    /*
+     * Same-port compose routes are produced by "attach as-is": the current
+     * logical network intentionally reaches Docker's host-published endpoint.
+     * Foreign-network compose claims were filtered before this point, so passing
+     * through here does not expose another network's clone.
+     */
     return pm_real_connect(sockfd, addr, addrlen);
   }
 

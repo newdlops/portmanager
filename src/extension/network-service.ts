@@ -84,7 +84,9 @@ import {
 } from "./terminal-hook-environment";
 import {
   buildComposeProjectRoutingShell,
+  inferContainerMappingsFromComposeRoutingFiles,
   serializeComposeProjectRoutingRows,
+  splitGeneratedComposeRoutingFiles,
   type ComposeProjectRoutingRow,
 } from "./compose-project-routing";
 import type { PortManagerProcessService } from "./process-service";
@@ -895,6 +897,7 @@ export class PortManagerNetworkService implements DisposableLike {
       id: createId("compose"),
       networkId: input.networkId,
       projectName: assertNonEmptyString(input.projectName, "Compose project name"),
+      ...(input.runtime !== undefined ? { runtime: input.runtime } : {}),
       composeFiles: [...(input.composeFiles ?? [])],
       ports: input.ports.map(normalizeComposePublishedPort),
       status: "attached",
@@ -934,6 +937,7 @@ export class PortManagerNetworkService implements DisposableLike {
         mutation = mutationResult.state;
         registeredAttachment = {
           ...attachment,
+          runtime: mutation.runtime,
           composeFiles: mutation.composeFiles,
           ports: mutationResult.ports,
           mutation,
@@ -943,6 +947,7 @@ export class PortManagerNetworkService implements DisposableLike {
         mutation = input.existingMutation;
         registeredAttachment = {
           ...attachment,
+          runtime: mutation.runtime,
           projectName: mutation.originalProjectName,
           composeFiles: mutation.composeFiles,
           ports: mutation.hiddenPorts,
@@ -2607,6 +2612,8 @@ export interface ComposePublishedPortsInput {
   readonly networkId: string;
   /** Compose project name shown in UI and route diagnostics. */
   readonly projectName: string;
+  /** Runtime CLI that owns the discovered compose project. */
+  readonly runtime?: "docker" | "podman";
   /** Working directory used for daemon route rows and cwd fallback matching. */
   readonly cwd?: string;
   /** Compose files that describe the project, when known. */
@@ -2855,12 +2862,34 @@ function buildComposeProjectRoutingRows(
 ): readonly ComposeProjectRoutingRow[] {
   return attachments.flatMap((attachment) => {
     const mutation = attachment.mutation;
-    if (
-      attachment.status !== "attached" ||
-      mutation === undefined ||
-      mutation.mode !== "clone" ||
-      mutation.attachedProjectName === mutation.originalProjectName
-    ) {
+    if (attachment.status !== "attached") {
+      return [];
+    }
+
+    if (mutation === undefined) {
+      const routingFiles = splitGeneratedComposeRoutingFiles(attachment.composeFiles);
+      const workingDirectory = composeWorkingDirectoryFromFiles(routingFiles.composeFiles);
+      if (workingDirectory === undefined || attachment.projectName.trim().length === 0) {
+        return [];
+      }
+      const containerMappings = inferContainerMappingsFromComposeRoutingFiles({
+        attachedProjectName: attachment.projectName,
+        composeFiles: attachment.composeFiles,
+        serviceNames: attachment.ports.map((port) => port.serviceName),
+      });
+
+      return composeAttachmentRuntimes(attachment).map((runtime) => ({
+        networkId: attachment.networkId,
+        runtime,
+        workingDirectory,
+        composeFiles: routingFiles.composeFiles,
+        attachedProjectName: attachment.projectName,
+        ...(routingFiles.overrideFile !== undefined ? { overrideFile: routingFiles.overrideFile } : {}),
+        ...(containerMappings.length > 0 ? { containerMappings } : {}),
+      }));
+    }
+
+    if (mutation.mode !== "clone" || mutation.attachedProjectName === mutation.originalProjectName) {
       return [];
     }
 
@@ -2869,19 +2898,36 @@ function buildComposeProjectRoutingRows(
       return [];
     }
 
+    const routingFiles = splitGeneratedComposeRoutingFiles(mutation.composeFiles);
+    const containerMappings =
+      mutation.containerMappings ??
+      inferContainerMappingsFromComposeRoutingFiles({
+        attachedProjectName: mutation.attachedProjectName,
+        composeFiles: mutation.composeFiles,
+        serviceNames: mutation.services,
+      });
+
     return [
       {
         networkId: attachment.networkId,
         runtime: mutation.runtime,
         workingDirectory,
-        composeFiles: mutation.composeFiles,
+        composeFiles: routingFiles.composeFiles,
         originalProjectName: mutation.originalProjectName,
         attachedProjectName: mutation.attachedProjectName,
-        overrideFile: mutation.overrideFile,
-        containerMappings: mutation.containerMappings,
+        overrideFile: routingFiles.overrideFile ?? mutation.overrideFile,
+        ...(containerMappings.length > 0 ? { containerMappings } : {}),
       },
     ];
   });
+}
+
+function composeAttachmentRuntimes(attachment: ComposeAttachment): ReadonlyArray<"docker" | "podman"> {
+  if (attachment.runtime !== undefined) {
+    return [attachment.runtime];
+  }
+
+  return ["docker", "podman"];
 }
 
 function composeWorkingDirectoryFromFiles(composeFiles: readonly string[]): string | undefined {

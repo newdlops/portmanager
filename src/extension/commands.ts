@@ -153,8 +153,11 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.showDaemonStatus", () => this.showDaemonStatus());
     this.registerCommand(context, "portManager.clearRoutingFiles", () => this.clearRoutingFiles());
     this.registerCommand(context, "portManager.resetRouting", () => this.clearRoutingFiles());
+    this.registerCommand(context, "portManager.clearNetworkCache", (argument) =>
+      this.clearNetworkCache(argument),
+    );
     this.registerCommand(context, "portManager.clearNetworkRoutingFiles", (argument) =>
-      this.clearNetworkRoutingFiles(argument),
+      this.clearNetworkCache(argument),
     );
     this.registerCommand(context, "portManager.startManagedProcess", () => this.startManagedProcess());
     this.registerCommand(context, "portManager.addExistingProcess", () => this.addExistingProcess());
@@ -430,6 +433,7 @@ export class PortManagerCommandController implements DisposableLike {
     const attachment = await this.dependencies.networkService.attachComposePublishedPorts({
       networkId: network.id,
       projectName: existingCloneMutation?.originalProjectName ?? candidate.composeProject ?? candidate.containerName,
+      runtime: candidate.runtime,
       cwd: candidate.composeWorkingDirectory ?? getDefaultWorkspaceFolder() ?? process.cwd(),
       composeFiles: existingCloneMutation?.composeFiles ?? candidate.composeConfigFiles,
       ...composeMutation,
@@ -925,15 +929,15 @@ export class PortManagerCommandController implements DisposableLike {
     );
   }
 
-  /** Clears generated routing cache files that belong to one logical network. */
-  private async clearNetworkRoutingFiles(argument: unknown): Promise<void> {
-    const network = await this.resolveNetworkArgument(argument, "Clear Network Routing Cache");
+  /** Clears generated network-scoped cache files from the sidebar or command palette. */
+  private async clearNetworkCache(argument: unknown): Promise<void> {
+    const network = await this.resolveNetworkArgument(argument, "Clear Network Cache");
     if (network === undefined) {
       return;
     }
 
     const selection = await vscode.window.showWarningMessage(
-      `Clear generated routing cache files for "${network.name}"? Durable bindings and Compose clone state are preserved, but attached terminals should be reattached if they still carry old environment variables.`,
+      `Clear generated cache files for "${network.name}"? Durable bindings and running Compose clone state are preserved, but attached terminals should be reattached if they still carry old environment variables.`,
       { modal: true },
       "Clear Network Cache",
     );
@@ -1841,6 +1845,20 @@ type ComposeAttachMode = "clone" | "clone-custom" | "as-is";
 async function promptForComposeAttachMode(
   candidate: ContainerServiceCandidate,
 ): Promise<ComposeAttachMode | undefined> {
+  const asIsItem =
+    candidate.portManagerClone === undefined
+      ? {
+          label: "Attach as-is",
+          description: "Register the current published ports without restarting Compose",
+          detail: "Keeps the original containers exactly as they are and only adds logical-network route rows.",
+          mode: "as-is" as const,
+        }
+      : {
+          label: "Reattach existing clone",
+          description: "Reuse the running Port Manager clone and its generated override",
+          detail: "Keeps the clone containers running and restores logical-network route rows.",
+          mode: "as-is" as const,
+        };
   const selected = await vscode.window.showQuickPick(
     [
       {
@@ -1855,12 +1873,7 @@ async function promptForComposeAttachMode(
         detail: "Use this when copying an existing clone or when the generated project name would collide.",
         mode: "clone-custom" as const,
       },
-      {
-        label: "Attach as-is",
-        description: "Register the current published ports without restarting Compose",
-        detail: "Keeps the original containers exactly as they are and only adds logical-network route rows.",
-        mode: "as-is" as const,
-      },
+      asIsItem,
     ],
     {
       title: "Attach Compose to Network",
