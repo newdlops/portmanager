@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import * as net from "node:net";
 import test from "node:test";
 
 import { findRoutesMatchingClientCwd } from "../../src/core/networks/logical-route-selection";
@@ -8,7 +9,7 @@ import {
   parseProcessCwdFromLsof,
 } from "../../src/platform/ports/tcp-connection-process-resolver";
 import type { LogicalPortRouterConnection } from "../../src/platform/ports/logical-port-router";
-import { parseNativeRouterQueryLine } from "../../src/platform/ports/logical-port-router";
+import { LogicalPortRouterManager, parseNativeRouterQueryLine } from "../../src/platform/ports/logical-port-router";
 import {
   buildProcessTreeContext,
   NodeProcessTableProvider,
@@ -55,6 +56,29 @@ test("parses native logical router control requests", () => {
     remoteAddress: "127.0.0.1",
     remotePort: 49152,
   });
+});
+
+test("keeps opening later logical routers when one desired port is already owned", async () => {
+  const occupied = await occupyRouterPort();
+  const targetServer = net.createServer((socket) => {
+    socket.end("ok");
+  });
+  await listenServer(targetServer, 0, "127.0.0.1");
+  const targetPort = serverPort(targetServer);
+  const freeLogicalPort = await findFreeLoopbackPort();
+  const manager = new LogicalPortRouterManager({
+    resolve: () => ({ host: "127.0.0.1", port: targetPort }),
+  });
+
+  try {
+    await manager.sync([occupied.port, freeLogicalPort]);
+
+    assert.equal(await readFromPort(freeLogicalPort), "ok");
+  } finally {
+    await manager.close(freeLogicalPort).catch(() => undefined);
+    await Promise.all(occupied.servers.map((server) => closeServer(server).catch(() => undefined)));
+    await closeServer(targetServer).catch(() => undefined);
+  }
 });
 
 test("parses client cwd from a cwd-only lsof query", () => {
@@ -237,6 +261,111 @@ function connection(remotePort: number): LogicalPortRouterConnection {
     remoteAddress: "127.0.0.1",
     remotePort,
   };
+}
+
+interface OccupiedRouterPort {
+  readonly port: number;
+  readonly servers: readonly net.Server[];
+}
+
+async function occupyRouterPort(): Promise<OccupiedRouterPort> {
+  const ipv4Server = net.createServer();
+  await listenServer(ipv4Server, 0, "127.0.0.1");
+  const port = serverPort(ipv4Server);
+  const servers: net.Server[] = [ipv4Server];
+
+  const ipv6Server = net.createServer();
+  try {
+    await listenServer(ipv6Server, port, "::1", true);
+    servers.push(ipv6Server);
+  } catch {
+    await closeServer(ipv6Server).catch(() => undefined);
+  }
+
+  return { port, servers };
+}
+
+async function findFreeLoopbackPort(): Promise<number> {
+  const server = net.createServer();
+  await listenServer(server, 0, "127.0.0.1");
+  const port = serverPort(server);
+  await closeServer(server);
+  return port;
+}
+
+function listenServer(server: net.Server, port: number, host: string, ipv6Only?: boolean): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onListening = () => {
+      cleanup();
+      resolve();
+    };
+    const cleanup = () => {
+      server.off("error", onError);
+      server.off("listening", onListening);
+    };
+
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen({
+      port,
+      host,
+      ...(ipv6Only === undefined ? {} : { ipv6Only }),
+    });
+  });
+}
+
+function readFromPort(port: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    let output = "";
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`Timed out reading from ${port}.`));
+    }, 1000);
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off("error", onError);
+      socket.off("end", onEnd);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve(output);
+    };
+
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk: string) => {
+      output += chunk;
+    });
+    socket.once("error", onError);
+    socket.once("end", onEnd);
+  });
+}
+
+function serverPort(server: net.Server): number {
+  const address = server.address();
+  assert.ok(address !== null && typeof address === "object");
+  return address.port;
+}
+
+function closeServer(server: net.Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    });
+  });
 }
 
 function createDeferred<T>(): {

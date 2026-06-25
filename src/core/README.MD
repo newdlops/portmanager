@@ -16,6 +16,7 @@ Port Manager의 순수 도메인 로직을 담당한다.
 
 - `port-routing.ts`
 - `process-registry.ts`
+- `process-network-labels.ts`
 - `terminal-conflict-parser.ts`
 - `networks/logical-network-registry.ts`
 

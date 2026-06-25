@@ -103,17 +103,38 @@ test("native hook lets loopback aliases own dev server ports", () => {
   );
 });
 
-test("logical routers are opened for compose clone endpoints only", () => {
+test("logical routers are opened only after logical routes are live", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
+  const collectStart = source.indexOf("function collectLogicalRouterPorts");
+  const collectEnd = source.indexOf("function isPortManagerLogicalRouterListener", collectStart);
+  const collectLogicalRouterPorts = source.slice(collectStart, collectEnd);
 
-  assert.equal(source.includes("collectComposeLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? [])"), true);
-  assert.equal(source.includes('route.source === "compose"'), true);
-  assert.equal(source.includes("route.actualPort !== route.logicalPort"), true);
-  assert.equal(source.includes("!externallyOwnedPorts.has(route.logicalPort)"), true);
+  assert.equal(source.includes("collectLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? [])"), true);
+  assert.equal(source.includes("pending allocations stay"), true);
+  assert.equal(collectLogicalRouterPorts.includes('route.source === "compose"'), false);
+  assert.equal(collectLogicalRouterPorts.includes("route.actualPort !== route.logicalPort"), true);
+  assert.equal(collectLogicalRouterPorts.includes("!externallyOwnedPorts.has(route.logicalPort)"), true);
   assert.equal(
     source.includes("await this.logicalPortRouter.sync([]).catch(() => undefined);"),
     false,
     "compose dependency clients such as Celery need a localhost TCP router fallback",
   );
+});
+
+test("logical router classifies clients by process tree label before hook environment fallback", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const methodStart = source.indexOf("private async findClientNetworkForRouter");
+  const methodEnd = source.indexOf("private async findNetworkRouteForRouter", methodStart);
+  const findClientNetworkForRouter = source.slice(methodStart, methodEnd);
+
+  assert.equal(source.includes('from "../core/process-network-labels"'), true);
+  assert.equal(
+    findClientNetworkForRouter.indexOf("this.findAttachedNetworkForPid(pid, processRows)") <
+      findClientNetworkForRouter.indexOf("this.processEnvironmentProvider.readRoutingNetworkId(pid)"),
+    true,
+    "process tree labels must be the primary router signal; inherited hook env remains fallback",
+  );
+  assert.equal(findClientNetworkForRouter.includes("return environmentNetworkId;"), true);
 });

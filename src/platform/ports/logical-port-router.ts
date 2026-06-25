@@ -96,7 +96,15 @@ export class LogicalPortRouterManager implements DisposableLike {
     }
 
     for (const port of desiredPorts) {
-      await this.open(port);
+      try {
+        await this.open(port);
+      } catch {
+        /*
+         * Another VS Code window can already own one logical router port.
+         * Reconciliation stays best-effort so later dynamic ports, including
+         * debugger listeners, still become reachable.
+         */
+      }
     }
   }
 

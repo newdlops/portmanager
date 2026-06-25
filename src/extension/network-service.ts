@@ -21,6 +21,7 @@ import {
   resolveLoopbackAddressRoutingMode,
 } from "../core/networks/loopback-address";
 import { findRoutesMatchingClientCwd } from "../core/networks/logical-route-selection";
+import { resolveProcessTreeNetworkLabel } from "../core/process-network-labels";
 import { SimpleEventEmitter } from "../shared/events";
 import {
   ContainerNetworkRuntimeAdapter,
@@ -1842,36 +1843,38 @@ export class PortManagerNetworkService implements DisposableLike {
     };
   }
 
-  /** Opens localhost routers only for network-scoped compose endpoints. */
+  /** Opens localhost routers for live logical routes that unhooked clients may need. */
   private async syncLogicalPortRouters(): Promise<void> {
     /*
-     * Native hooks normally rewrite connect() directly. Some package launchers
-     * can still lose the preload hook before opening client sockets, especially
-     * for dependency clients such as Celery. Compose clone routes have already
-     * freed their logical host ports, so a localhost router can safely accept
-     * those unhooked clients and resolve the target by terminal/network context.
-     *
-     * Do not open routers for hooked app listeners: those logical ports may be
-     * requested by the app itself, and a router would race the real bind.
+     * Native hooks normally rewrite connect() directly, but macOS protected
+     * tools such as /usr/bin/curl ignore DYLD injection and some package
+     * launchers can lose the preload before opening client sockets. Open
+     * routers only after a listener route is running; pending allocations stay
+     * excluded so the router cannot win the app server's original bind race.
      */
     const snapshot = this.processService?.getSnapshot();
-    await this.logicalPortRouter.sync(collectComposeLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? [])).catch(
+    await this.logicalPortRouter.sync(collectLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? [])).catch(
       () => undefined,
     );
   }
 
   /**
-   * Resolves the caller's network from the most direct runtime signal first.
-   * Native hook clients inherit PORT_MANAGER_NETWORK_ID even when VS Code's
-   * terminal attachment snapshot cannot map a deep process tree reliably.
+   * Resolves the caller's network from process-tree labels first.
+   * Environment variables from the native hook remain as a compatibility
+   * fallback for clients whose ancestry has already detached from a terminal.
    */
   private async findClientNetworkForRouter(
     pid: number,
     processRows: readonly ProcessTableRow[],
   ): Promise<string | undefined> {
+    const processTreeNetworkId = this.findAttachedNetworkForPid(pid, processRows);
+    if (processTreeNetworkId !== undefined) {
+      return processTreeNetworkId;
+    }
+
     const environmentNetworkId = await this.processEnvironmentProvider.readRoutingNetworkId(pid).catch(() => undefined);
 
-    return environmentNetworkId ?? this.findAttachedNetworkForPid(pid, processRows);
+    return environmentNetworkId;
   }
 
   /** Finds a route that belongs to the caller's terminal-bound logical network. */
@@ -2003,41 +2006,9 @@ export class PortManagerNetworkService implements DisposableLike {
     return candidateByNetworkId.size === 1 ? [...candidateByNetworkId.values()][0] : undefined;
   }
 
-  /** Maps an arbitrary process PID back to the network attached to its terminal. */
+  /** Maps an arbitrary process PID back to the network label attached to its process tree. */
   private findAttachedNetworkForPid(pid: number, processRows: readonly ProcessTableRow[]): string | undefined {
-    const attachments = this.registry.getSnapshot().attachments.filter((attachment) => attachment.status === "attached");
-    const directAttachment = attachments.find((attachment) => attachment.rootPid === pid);
-    if (directAttachment !== undefined) {
-      return directAttachment.networkId;
-    }
-
-    const processContext = buildProcessTreeContext(processRows, pid);
-
-    if (processContext === undefined) {
-      return undefined;
-    }
-
-    for (const attachment of attachments) {
-      if (processContext.ancestorPids.includes(attachment.rootPid)) {
-        return attachment.networkId;
-      }
-
-      if (
-        attachment.processGroupId !== undefined &&
-        processContext.row.processGroupId === attachment.processGroupId
-      ) {
-        return attachment.networkId;
-      }
-
-      if (
-        attachment.terminalWindowId?.startsWith("tty:") &&
-        processContext.row.terminalId === attachment.terminalWindowId.slice("tty:".length)
-      ) {
-        return attachment.networkId;
-      }
-    }
-
-    return undefined;
+    return resolveProcessTreeNetworkLabel(this.registry.getSnapshot().attachments, processRows, pid)?.networkId;
   }
 
   /** Rebuilds runtime descriptors from native hook support and installed container tools. */
@@ -3316,7 +3287,7 @@ function isListenRoute(route: LogicalPortRoute): boolean {
   return route.routeDirection === undefined || route.routeDirection === "listen";
 }
 
-function collectComposeLogicalRouterPorts(
+function collectLogicalRouterPorts(
   routes: readonly LogicalPortRoute[],
   listeners: readonly ListeningPort[] = [],
 ): readonly number[] {
@@ -3329,7 +3300,6 @@ function collectComposeLogicalRouterPorts(
 
   for (const route of routes) {
     if (
-      route.source === "compose" &&
       isLiveListenRoute(route) &&
       route.actualPort !== route.logicalPort &&
       isTcpPort(route.logicalPort) &&
