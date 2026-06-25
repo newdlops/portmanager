@@ -166,6 +166,32 @@ test("stores networks, terminal candidates, and exposures in snapshots", () => {
   assert.equal(eventCount, 6);
 });
 
+test("does not emit when transient discovery results are unchanged", () => {
+  const registry = new LogicalNetworkRegistry([runtime]);
+  let eventCount = 0;
+  const terminalCandidates = [
+    {
+      pid: 101,
+      name: "zsh",
+      processGroupId: 101,
+      terminalId: "ttys001",
+      vscodeTerminal: false,
+    },
+  ];
+  const containerCandidates = [createContainerServiceCandidate()];
+  registry.onDidChange(() => {
+    eventCount += 1;
+  });
+
+  registry.setTerminalCandidates(terminalCandidates);
+  registry.setTerminalCandidates(terminalCandidates);
+  registry.setContainerServiceCandidates(containerCandidates);
+  registry.setContainerServiceCandidates(containerCandidates);
+  registry.setRuntimes([runtime]);
+
+  assert.equal(eventCount, 2);
+});
+
 test("groups noisy terminal process candidates into terminal windows", () => {
   const registry = new LogicalNetworkRegistry([runtime]);
   registry.setTerminalCandidates([

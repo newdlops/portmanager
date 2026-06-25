@@ -103,7 +103,7 @@ const TERMINAL_ATTACHMENT_MARKER_DIRECTORY_NAME = "terminal-attachments";
 const TERMINAL_HOOK_SCRIPT_DIRECTORY_NAME = "terminal-hook-scripts";
 const MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX = "manual-terminal:";
 const PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX = "process-terminal:";
-const COMPOSE_ATTACHMENT_RECONCILE_INTERVAL_MS = 3_000;
+const ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 3_000;
 const execFileAsync = promisify(execFile);
 
 export interface BindingPresetSummary {
@@ -238,8 +238,11 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Guards live compose endpoint refreshes while Docker is recreating hidden containers. */
   private composeAttachmentReconcileInFlight: Promise<void> | undefined;
 
-  /** Background poller that keeps Docker-assigned hidden host ports from going stale. */
-  private composeAttachmentReconcileTimer: ReturnType<typeof setInterval> | undefined;
+  /** Guards background signal refreshes so slow Docker/process-table reads do not overlap. */
+  private routingSignalRefreshInFlight: Promise<void> | undefined;
+
+  /** Background poller that keeps terminals, containers, and compose routes current. */
+  private routingSignalRefreshTimer: ReturnType<typeof setInterval> | undefined;
 
   /** Last shared-state revision applied in this extension host. */
   private sharedNetworkStateRevision: string | undefined;
@@ -313,6 +316,7 @@ export class PortManagerNetworkService implements DisposableLike {
         this.processService.onDidChange(() => {
           void this.syncLogicalPortRouters();
           void this.restorePersistedComposeRoutesIfMissing();
+          this.localChangeEvents.emit();
         }),
       );
     }
@@ -370,7 +374,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.refreshTerminals();
     void this.refreshContainerServices();
     await this.syncLogicalPortRouters();
-    this.startComposeAttachmentReconcileLoop();
+    this.startRoutingSignalRefreshLoop();
   }
 
   /** Returns the latest logical network snapshot for the sidebar. */
@@ -1283,9 +1287,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Releases listeners and event subscriptions. */
   dispose(): void {
-    if (this.composeAttachmentReconcileTimer !== undefined) {
-      clearInterval(this.composeAttachmentReconcileTimer);
-      this.composeAttachmentReconcileTimer = undefined;
+    if (this.routingSignalRefreshTimer !== undefined) {
+      clearInterval(this.routingSignalRefreshTimer);
+      this.routingSignalRefreshTimer = undefined;
     }
 
     for (const disposable of this.disposables.splice(0)) {
@@ -1568,20 +1572,41 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * Starts a low-frequency Docker poll that keeps hidden compose endpoints live.
+   * Starts a low-frequency poll for external signals that VS Code may miss.
    *
-   * Docker assigns a fresh localhost port to `HostPort: ""` bindings whenever a
-   * clone container is recreated. The logical port must remain stable, but the
-   * daemon route row has to follow that concrete hidden port.
+   * File watchers and terminal events are best effort, and Docker can recreate
+   * hidden containers without an extension event. This loop reconciles terminal
+   * markers, container candidates, compose endpoint routes, and then lets
+   * registry events refresh the UI only when the observed state changed.
    */
-  private startComposeAttachmentReconcileLoop(): void {
-    if (this.composeAttachmentReconcileTimer !== undefined) {
+  private startRoutingSignalRefreshLoop(): void {
+    if (this.routingSignalRefreshTimer !== undefined) {
       return;
     }
 
-    this.composeAttachmentReconcileTimer = setInterval(() => {
-      void this.reconcileComposeAttachmentPublishedPorts();
-    }, COMPOSE_ATTACHMENT_RECONCILE_INTERVAL_MS);
+    this.routingSignalRefreshTimer = setInterval(() => {
+      void this.refreshRoutingSignals();
+    }, ROUTING_SIGNAL_REFRESH_INTERVAL_MS);
+  }
+
+  /** Performs one serialized background refresh of terminals and container-backed routes. */
+  private async refreshRoutingSignals(): Promise<void> {
+    if (this.routingSignalRefreshInFlight !== undefined) {
+      return this.routingSignalRefreshInFlight;
+    }
+
+    this.routingSignalRefreshInFlight = this.refreshRoutingSignalsExclusive().finally(() => {
+      this.routingSignalRefreshInFlight = undefined;
+    });
+
+    return this.routingSignalRefreshInFlight;
+  }
+
+  private async refreshRoutingSignalsExclusive(): Promise<void> {
+    await Promise.all([
+      this.refreshTerminals().catch(() => []),
+      this.refreshContainerServices().catch(() => []),
+    ]);
   }
 
   /** Rewrites compose route rows when Docker changed a running container's host port. */

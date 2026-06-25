@@ -146,20 +146,39 @@ export class LogicalNetworkRegistry implements DisposableLike {
 
   /** Replaces runtime descriptors after platform capability checks. */
   setRuntimes(runtimes: readonly NetworkRuntimeDescriptor[]): void {
-    this.runtimes = [...runtimes];
+    const nextRuntimes = [...runtimes];
+    if (sameJsonList(this.runtimes, nextRuntimes)) {
+      return;
+    }
+
+    this.runtimes = nextRuntimes;
     this.emitChange();
   }
 
   /** Replaces the transient terminal discovery list. */
   setTerminalCandidates(candidates: readonly TerminalCandidate[]): void {
-    this.terminalCandidates = dedupeTerminalCandidates(candidates);
-    this.terminalWindows = groupTerminalWindows(this.terminalCandidates);
+    const nextTerminalCandidates = dedupeTerminalCandidates(candidates);
+    const nextTerminalWindows = groupTerminalWindows(nextTerminalCandidates);
+    if (
+      sameJsonList(this.terminalCandidates, nextTerminalCandidates) &&
+      sameJsonList(this.terminalWindows, nextTerminalWindows)
+    ) {
+      return;
+    }
+
+    this.terminalCandidates = nextTerminalCandidates;
+    this.terminalWindows = nextTerminalWindows;
     this.emitChange();
   }
 
   /** Replaces transient Docker/Podman service candidates shown in the UI. */
   setContainerServiceCandidates(candidates: readonly ContainerServiceCandidate[]): void {
-    this.containerServiceCandidates = dedupeContainerServiceCandidates(candidates);
+    const nextCandidates = dedupeContainerServiceCandidates(candidates);
+    if (sameJsonList(this.containerServiceCandidates, nextCandidates)) {
+      return;
+    }
+
+    this.containerServiceCandidates = nextCandidates;
     this.emitChange();
   }
 
@@ -454,6 +473,10 @@ function dedupeContainerServiceCandidates(
   }
 
   return deduped;
+}
+
+function sameJsonList<T>(left: readonly T[], right: readonly T[]): boolean {
+  return left.length === right.length && JSON.stringify(left) === JSON.stringify(right);
 }
 
 /** Groups noisy process-level shell candidates into user-facing terminal windows. */

@@ -94,6 +94,16 @@ test("network removal restores compose attachments before deleting the network",
   );
 });
 
+test("background routing refresh polls terminals and containers", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+
+  assert.equal(source.includes("private startRoutingSignalRefreshLoop(): void"), true);
+  assert.equal(source.includes("this.refreshTerminals().catch(() => [])"), true);
+  assert.equal(source.includes("this.refreshContainerServices().catch(() => [])"), true);
+  assert.equal(source.includes("ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 3_000"), true);
+});
+
 test("terminal attach script enables loopback routing only after alias readiness", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
