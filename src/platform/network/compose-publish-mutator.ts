@@ -169,36 +169,18 @@ export class ComposePublishMutator {
     const mode = input.mode ?? "clone";
     const requestedProjectName = assertNonEmptyString(input.originalProjectName, "Compose project name");
     const resolvedComposeFiles = await this.resolveComposeFiles(input.workingDirectory, input.composeFiles ?? []);
-    const existingClone =
-      mode === "clone"
-        ? this.resolveExistingAttachedClone(input.networkName, requestedProjectName, resolvedComposeFiles)
-        : undefined;
-    const originalProjectName = existingClone?.originalProjectName ?? requestedProjectName;
-    const attachedProjectName =
-      existingClone?.attachedProjectName ??
-      (mode === "clone" ? buildAttachedProjectName(input.networkName, originalProjectName) : originalProjectName);
+    const originalProjectName = requestedProjectName;
     const composeFiles = this.removeGeneratedOverrideFiles(resolvedComposeFiles);
     if (composeFiles.length === 0) {
       throw new Error("Compose attach needs the original compose files; generated Port Manager overrides cannot be used alone.");
     }
+    const attachedProjectSourceName =
+      mode === "clone"
+        ? await this.resolveAttachedProjectSourceName(requestedProjectName, input.workingDirectory, composeFiles)
+        : originalProjectName;
+    const attachedProjectName =
+      mode === "clone" ? buildAttachedProjectName(input.networkName, attachedProjectSourceName) : originalProjectName;
     const requestedServices = uniqueStrings(input.ports.map((port) => port.serviceName));
-    if (existingClone !== undefined) {
-      return {
-        ports: input.ports.map(dropComposeProcessId),
-        state: {
-          mode: "clone",
-          runtime: input.runtime,
-          originalProjectName,
-          attachedProjectName,
-          ...(input.workingDirectory !== undefined ? { workingDirectory: input.workingDirectory } : {}),
-          composeFiles,
-          services: requestedServices,
-          overrideFile: existingClone.overrideFile,
-          originalPorts: input.ports.map(toBestEffortOriginalPort),
-          hiddenPorts: input.ports.map(dropComposeProcessId),
-        },
-      };
-    }
 
     const originalContext: ComposeCommandContext = {
       runtime: input.runtime,
@@ -405,46 +387,38 @@ export class ComposePublishMutator {
   }
 
   /**
-   * Treats a discovered Port Manager clone as an existing runtime target.
+   * Chooses the destination clone's source name without changing the source project.
    *
-   * A clone's Docker labels include the generated override file. If the clone is
-   * selected again, rebuilding its project name from that already-scoped name
-   * would stack `network-network-project-hash-hash`. Returning existing mutation
-   * state keeps repeated attach/copy flows idempotent and avoids touching Docker.
+   * Docker's current project name identifies the runtime source to stop/copy
+   * from. The clone name instead follows Compose's own source of truth: top-level
+   * `name:` in the original files, then the project directory fallback. That
+   * keeps repeated copies stable even when the selected runtime project is
+   * already a generated Port Manager clone or was started with an overridden
+   * project name.
    */
-  private resolveExistingAttachedClone(
-    networkName: string,
-    projectName: string,
+  private async resolveAttachedProjectSourceName(
+    requestedProjectName: string,
+    workingDirectory: string | undefined,
     composeFiles: readonly string[],
-  ):
-    | {
-        readonly originalProjectName: string;
-        readonly attachedProjectName: string;
-        readonly overrideFile: string;
-      }
-    | undefined {
-    const originalProjectName = parseAttachedProjectSourceName(networkName, projectName);
-    if (originalProjectName === undefined) {
-      return undefined;
-    }
-
-    const overrideFile = this.findGeneratedOverrideFile(composeFiles);
-    if (overrideFile === undefined) {
-      return undefined;
-    }
-
-    return {
-      originalProjectName,
-      attachedProjectName: buildAttachedProjectName(networkName, originalProjectName),
-      overrideFile,
-    };
+  ): Promise<string> {
+    return (await this.resolveComposeProjectNameFromFiles(workingDirectory, composeFiles)) ?? requestedProjectName;
   }
 
-  /** Returns the Port Manager override carried by Docker compose labels, if any. */
-  private findGeneratedOverrideFile(composeFiles: readonly string[]): string | undefined {
-    const storageDirectory = normalizeComparablePath(this.storageDirectory);
+  /** Reads Compose's file-defined project name, falling back to its default project directory name. */
+  private async resolveComposeProjectNameFromFiles(
+    workingDirectory: string | undefined,
+    composeFiles: readonly string[],
+  ): Promise<string | undefined> {
+    for (const composeFile of [...composeFiles].reverse()) {
+      const configuredName = await readComposeConfiguredProjectName(composeFile);
+      if (configuredName !== undefined) {
+        return configuredName;
+      }
+    }
 
-    return composeFiles.find((file) => isGeneratedOverridePath(normalizeComparablePath(file), storageDirectory));
+    const projectDirectory = workingDirectory?.trim() || path.dirname(composeFiles[0] ?? "");
+    const projectName = path.basename(path.resolve(projectDirectory)).trim();
+    return projectName.length === 0 ? undefined : projectName;
   }
 
   /** Writes a Compose override whose only job is to replace published ports. */
@@ -921,39 +895,94 @@ function buildAttachedProjectName(networkName: string, originalProjectName: stri
   return `${prefix}-${hash}`;
 }
 
-function parseAttachedProjectSourceName(networkName: string, projectName: string): string | undefined {
-  const networkSegment = sanitizeComposeProjectSegment(networkName) ?? "network";
-  const projectSegment = sanitizeComposeProjectSegment(projectName);
-  if (projectSegment === undefined || !projectSegment.startsWith(`${networkSegment}-`)) {
+async function readComposeConfiguredProjectName(composeFile: string): Promise<string | undefined> {
+  const text = await fs.readFile(composeFile, "utf8").catch(() => undefined);
+  if (text === undefined) {
     return undefined;
   }
 
-  const scopedName = projectSegment.slice(networkSegment.length + 1);
-  const hashMatch = /^(.*)-([a-f0-9]{8})$/.exec(scopedName);
-  if (hashMatch === null) {
-    return undefined;
-  }
-
-  const sourceProjectName = hashMatch[1] ?? "";
-  const currentHash = hashMatch[2] ?? "";
-  if (sourceProjectName.length === 0) {
-    return undefined;
-  }
-
-  const expectedHash = createHash("sha1").update(`${networkName}\0${sourceProjectName}`).digest("hex").slice(0, 8);
-  return currentHash === expectedHash ? sourceProjectName : undefined;
+  return parseComposeConfiguredProjectName(text);
 }
 
-function dropComposeProcessId(port: ComposePublishedPort): ComposePublishedPort {
-  const { processId: _processId, ...rest } = port;
-  return rest;
+function parseComposeConfiguredProjectName(text: string): string | undefined {
+  for (const rawLine of text.split(/\r?\n/)) {
+    if (/^\s/.test(rawLine)) {
+      continue;
+    }
+
+    const match = /^name\s*:\s*(.*)$/.exec(rawLine);
+    if (match === null) {
+      continue;
+    }
+
+    return parseYamlScalarString(match[1] ?? "");
+  }
+
+  return undefined;
 }
 
-function toBestEffortOriginalPort(port: ComposePublishedPort): ComposePublishedPort {
-  return {
-    ...dropComposeProcessId(port),
-    actualHostPort: port.logicalPort,
-  };
+function parseYamlScalarString(value: string): string | undefined {
+  const scalar = stripYamlInlineComment(value).trim();
+  if (scalar.length === 0 || scalar === "~" || /^null$/i.test(scalar)) {
+    return undefined;
+  }
+
+  if (scalar.startsWith("'")) {
+    const closingIndex = scalar.indexOf("'", 1);
+    return closingIndex <= 0 ? undefined : scalar.slice(1, closingIndex).replace(/''/g, "'").trim() || undefined;
+  }
+
+  if (scalar.startsWith('"')) {
+    const closingIndex = findClosingDoubleQuote(scalar);
+    if (closingIndex <= 0) {
+      return undefined;
+    }
+    try {
+      const parsed = JSON.parse(scalar.slice(0, closingIndex + 1));
+      return typeof parsed === "string" && parsed.trim().length > 0 ? parsed.trim() : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  if (/^[>|[{]/.test(scalar)) {
+    return undefined;
+  }
+
+  return scalar.trim();
+}
+
+function stripYamlInlineComment(value: string): string {
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    const previous = index === 0 ? "" : value[index - 1];
+    if (character === "'" && !inDoubleQuote) {
+      inSingleQuote = !inSingleQuote;
+      continue;
+    }
+    if (character === '"' && !inSingleQuote && previous !== "\\") {
+      inDoubleQuote = !inDoubleQuote;
+      continue;
+    }
+    if (character === "#" && !inSingleQuote && !inDoubleQuote && (index === 0 || /\s/.test(previous))) {
+      return value.slice(0, index);
+    }
+  }
+
+  return value;
+}
+
+function findClosingDoubleQuote(value: string): number {
+  for (let index = 1; index < value.length; index += 1) {
+    if (value[index] === '"' && value[index - 1] !== "\\") {
+      return index;
+    }
+  }
+
+  return -1;
 }
 
 function appendServiceMount(lines: string[], mount: ComposeServiceMount): void {
