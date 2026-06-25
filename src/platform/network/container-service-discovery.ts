@@ -9,6 +9,11 @@ import type {
   ContainerServiceCandidate,
   PortManagerCloneCandidateMetadata,
 } from "../../shared/types";
+import {
+  CONTAINER_ALIAS_SERVICE_PREFIX,
+  isComposeContainerAliasMapping,
+  mergeComposeContainerMappingLineage,
+} from "./compose-container-mappings";
 import type { ContainerCommandResult, ContainerCommandRunner } from "./container-runtime";
 
 /**
@@ -21,7 +26,6 @@ import type { ContainerCommandResult, ContainerCommandRunner } from "./container
 
 const execFileAsync = promisify(execFile);
 const LIST_TIMEOUT_MS = 5_000;
-const CONTAINER_ALIAS_SERVICE_PREFIX = "__portmanager_alias__:";
 
 export interface ContainerServiceDiscoveryOptions {
   /** Injected command runner used by unit tests to avoid real Docker calls. */
@@ -773,9 +777,18 @@ function refreshContainerMappingsFromIdentities(
         composeCandidateMatchesFiles(identity.composeConfigFiles, sourceComposeFiles),
     ),
   );
+  const relatedByService = groupIdentitiesByService(
+    sourceComposeFiles.length === 0
+      ? []
+      : identities.filter(
+          (identity) =>
+            services.includes(identity.composeService) &&
+            composeCandidateMatchesFiles(identity.composeConfigFiles, sourceComposeFiles),
+        ),
+  );
   const currentCanonicalByService = new Map(
     currentMappings
-      .filter((mapping) => !isContainerAliasMapping(mapping))
+      .filter((mapping) => !isComposeContainerAliasMapping(mapping))
       .map((mapping) => [mapping.serviceName, mapping]),
   );
   const serviceNames = uniqueStrings([
@@ -809,69 +822,39 @@ function refreshContainerMappingsFromIdentities(
     return currentMappings;
   }
 
-  const nextByService = new Map(canonicalMappings.map((mapping) => [mapping.serviceName, mapping]));
-  const currentServiceByAttachedId = new Map(
-    [...currentCanonicalByService.values()].map((mapping) => [mapping.attachedContainerId, mapping.serviceName]),
+  return mergeComposeContainerMappingLineage(
+    [
+      ...currentMappings,
+      ...containerIdentityAliasMappings(canonicalMappings, relatedByService),
+    ],
+    canonicalMappings,
   );
-  const aliasMappings: ComposeContainerMutationMapping[] = [];
-  const aliasKeys = new Set<string>();
-
-  for (const currentMapping of currentMappings) {
-    const serviceName =
-      !isContainerAliasMapping(currentMapping)
-        ? currentMapping.serviceName
-        : currentServiceByAttachedId.get(currentMapping.attachedContainerId);
-    const nextMapping = serviceName === undefined ? undefined : nextByService.get(serviceName);
-    if (nextMapping === undefined) {
-      continue;
-    }
-
-    if (currentMapping.attachedContainerId !== nextMapping.attachedContainerId) {
-      pushContainerAlias(aliasMappings, aliasKeys, currentMapping.attachedContainerId, "", nextMapping);
-    }
-
-    if (isContainerAliasMapping(currentMapping) && currentMapping.originalContainerId !== nextMapping.attachedContainerId) {
-      pushContainerAlias(
-        aliasMappings,
-        aliasKeys,
-        currentMapping.originalContainerId,
-        currentMapping.originalContainerName,
-        nextMapping,
-      );
-    }
-  }
-
-  return [...canonicalMappings, ...aliasMappings];
 }
 
-function pushContainerAlias(
-  aliases: ComposeContainerMutationMapping[],
-  keys: Set<string>,
-  sourceId: string,
-  sourceName: string,
-  target: ComposeContainerMutationMapping,
-): void {
-  if (sourceId.length === 0 || sourceId === target.attachedContainerId || sourceId === target.originalContainerId) {
-    return;
+function containerIdentityAliasMappings(
+  canonicalMappings: readonly ComposeContainerMutationMapping[],
+  relatedByService: ReadonlyMap<string, readonly ComposeContainerIdentity[]>,
+): readonly ComposeContainerMutationMapping[] {
+  const result: ComposeContainerMutationMapping[] = [];
+
+  for (const mapping of canonicalMappings) {
+    const identities = relatedByService.get(mapping.serviceName) ?? [];
+    for (const identity of identities) {
+      if (identity.id === mapping.attachedContainerId || identity.name === mapping.attachedContainerName) {
+        continue;
+      }
+
+      result.push({
+        serviceName: `${CONTAINER_ALIAS_SERVICE_PREFIX}${mapping.serviceName}`,
+        originalContainerId: identity.id,
+        originalContainerName: identity.name,
+        attachedContainerId: mapping.attachedContainerId,
+        attachedContainerName: mapping.attachedContainerName,
+      });
+    }
   }
 
-  const key = `${sourceId}\0${target.attachedContainerId}`;
-  if (keys.has(key)) {
-    return;
-  }
-
-  keys.add(key);
-  aliases.push({
-    serviceName: `${CONTAINER_ALIAS_SERVICE_PREFIX}${target.serviceName}`,
-    originalContainerId: sourceId,
-    originalContainerName: sourceName.length === 0 || sourceName === target.attachedContainerName ? sourceId : sourceName,
-    attachedContainerId: target.attachedContainerId,
-    attachedContainerName: target.attachedContainerName,
-  });
-}
-
-function isContainerAliasMapping(mapping: ComposeContainerMutationMapping): boolean {
-  return mapping.serviceName.length === 0 || mapping.serviceName.startsWith(CONTAINER_ALIAS_SERVICE_PREFIX);
+  return result;
 }
 
 function groupIdentitiesByService(

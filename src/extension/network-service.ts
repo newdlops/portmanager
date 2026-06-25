@@ -451,11 +451,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     for (const attachment of composeAttachments) {
-      for (const port of attachment.ports) {
-        if (port.processId !== undefined) {
-          await this.processService?.removeProcess(port.processId).catch(() => undefined);
-        }
-      }
+      await this.removeComposeAttachment(attachment.id);
     }
 
     if (network?.runtimeKind === "container") {
@@ -489,6 +485,7 @@ export class PortManagerNetworkService implements DisposableLike {
       .catch(() => []);
 
     this.registry.setContainerServiceCandidates(candidates);
+    void this.reconcileComposeAttachmentPublishedPorts();
     return this.registry.getSnapshot().containerServiceCandidates;
   }
 
@@ -933,6 +930,7 @@ export class PortManagerNetworkService implements DisposableLike {
           originalProjectName: attachment.projectName,
           workingDirectory: input.composeMutation.workingDirectory ?? input.cwd,
           composeFiles: input.composeMutation.composeFiles ?? input.composeFiles ?? [],
+          sourceContainerMappings: input.composeMutation.sourceContainerMappings,
           ports: attachment.ports,
         });
 
@@ -2611,6 +2609,8 @@ export interface ComposePublishMutationInput {
   readonly workingDirectory?: string;
   /** Compose config files discovered from runtime labels. */
   readonly composeFiles?: readonly string[];
+  /** Existing clone id/name lineage to preserve when copying a Port Manager clone. */
+  readonly sourceContainerMappings?: readonly ComposeContainerMutationMapping[];
 }
 
 export interface ComposePublishedPortInput {

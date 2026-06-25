@@ -498,6 +498,84 @@ test("refreshes clone container hash mappings after compose recreates containers
   ]);
 });
 
+test("refreshes copied clone mappings with original compose container aliases", async () => {
+  const adapter = new ContainerServiceDiscoveryAdapter({
+    runCommand: async (_executable, args) => {
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify([
+            { Id: "original123", Name: "/captain_db" },
+            { Id: "previous456", Name: "/captain_db-migration" },
+            { Id: "current789", Name: "/captain_db-worktree" },
+          ]),
+          stderr: "",
+        };
+      }
+
+      return {
+        stdout: [
+          JSON.stringify({
+            ID: "original123",
+            Names: "captain_db",
+            Ports: "",
+            Labels:
+              "com.docker.compose.project=docker,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml",
+          }),
+          JSON.stringify({
+            ID: "previous456",
+            Names: "captain_db-migration",
+            Ports: "",
+            Labels:
+              "com.docker.compose.project=migration,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml,/tmp/migration.ports.override.yaml",
+          }),
+          JSON.stringify({
+            ID: "current789",
+            Names: "captain_db-worktree",
+            Ports: "127.0.0.1:51612->5432/tcp",
+            Labels:
+              "com.docker.compose.project=worktree,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml,/tmp/worktree.ports.override.yaml",
+          }),
+        ].join("\n"),
+        stderr: "",
+      };
+    },
+  });
+
+  const mappings = await adapter.refreshComposeContainerMappings(
+    { containerRuntime: "docker", containerImage: "alpine:3.20" },
+    "migration",
+    "worktree",
+    ["/workspace/compose.yaml"],
+    ["db"],
+    [
+      {
+        serviceName: "db",
+        originalContainerId: "previous456",
+        originalContainerName: "captain_db-migration",
+        attachedContainerId: "current789",
+        attachedContainerName: "captain_db-worktree",
+      },
+    ],
+  );
+
+  assert.deepEqual(mappings, [
+    {
+      serviceName: "db",
+      originalContainerId: "previous456",
+      originalContainerName: "captain_db-migration",
+      attachedContainerId: "current789",
+      attachedContainerName: "captain_db-worktree",
+    },
+    {
+      serviceName: "__portmanager_alias__:db",
+      originalContainerId: "original123",
+      originalContainerName: "captain_db",
+      attachedContainerId: "current789",
+      attachedContainerName: "captain_db-worktree",
+    },
+  ]);
+});
+
 test("refreshes clone container mappings with inspect names when list rows omit names", async () => {
   const mutableCalls: string[][] = [];
   const adapter = new ContainerServiceDiscoveryAdapter({
@@ -892,6 +970,7 @@ test("copies an existing compose clone without stacking the network-scoped proje
   fs.writeFileSync(overrideFile, "services: {}\n", "utf8");
   const calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
   let containerListCount = 0;
+  let lastStartedProject = "";
   const mutator = new ComposePublishMutator({
     storageDirectory: tempDir,
     runCommand: async (executable, args) => {
@@ -899,14 +978,19 @@ test("copies an existing compose clone without stacking the network-scoped proje
       if (args[0] === "compose" && args.includes("config")) {
         return { stdout: "postgres\n", stderr: "" };
       }
+      if (args[0] === "compose" && args.includes("up")) {
+        lastStartedProject = args[args.indexOf("-p") + 1] ?? "";
+        return { stdout: "", stderr: "" };
+      }
       if (args[0] === "container" && args[1] === "ls") {
         containerListCount += 1;
+        const composeProject = containerListCount === 1 ? "a-app-workspace-bc74e5f2" : lastStartedProject;
         return {
           stdout: JSON.stringify({
             ID: containerListCount === 1 ? "source123" : "hidden123",
-            Names: "a-app-workspace-bc74e5f2-postgres-1",
+            Names: `${composeProject}-postgres-1`,
             Ports: `127.0.0.1:${containerListCount === 1 ? 57001 : 57002}->5432/tcp`,
-            Labels: "com.docker.compose.project=a-app-workspace-bc74e5f2,com.docker.compose.service=postgres",
+            Labels: `com.docker.compose.project=${composeProject},com.docker.compose.service=postgres`,
           }),
           stderr: "",
         };
@@ -949,14 +1033,15 @@ test("copies an existing compose clone without stacking the network-scoped proje
   const composeProjectArgs = calls
     .filter((call) => call.args[0] === "compose")
     .map((call) => call.args[call.args.indexOf("-p") + 1]);
-  assert.deepEqual(composeProjectArgs, [
-    "a-app-workspace-bc74e5f2",
+  assert.deepEqual(composeProjectArgs.slice(0, 2), [
     "a-app-workspace-bc74e5f2",
     "a-app-workspace-bc74e5f2",
   ]);
+  assert.match(composeProjectArgs[2] ?? "", /^a-app-workspace-bc74e5f2-[a-f0-9]{8}$/);
   assert.equal(result.state.originalProjectName, "a-app-workspace-bc74e5f2");
-  assert.equal(result.state.attachedProjectName, "a-app-workspace-bc74e5f2");
-  assert.equal(result.state.overrideFile, overrideFile);
+  assert.match(result.state.attachedProjectName, /^a-app-workspace-bc74e5f2-[a-f0-9]{8}$/);
+  assert.notEqual(result.state.attachedProjectName, "a-app-workspace-bc74e5f2");
+  assert.equal(result.state.overrideFile, path.join(tempDir, `${result.state.attachedProjectName}.ports.override.yaml`));
   assert.deepEqual(result.state.composeFiles, [composeFile]);
   assert.deepEqual(result.state.services, ["postgres"]);
   assert.equal(result.state.originalPorts[0]?.actualHostPort, 57001);
@@ -1455,6 +1540,81 @@ test("separates generated compose clone project names by logical network identit
   assert.notEqual(first.state.attachedProjectName, second.state.attachedProjectName);
 });
 
+test("suffixes generated compose clone project names when copying again into the same network", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-mutator-same-network-copy-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const existingProjectName = "a-app-workspace-c0445d38";
+  fs.writeFileSync(composeFile, "name: workspace\nservices:\n  postgres:\n    image: postgres:16\n", "utf8");
+  fs.writeFileSync(path.join(tempDir, `${existingProjectName}.ports.override.yaml`), "services: {}\n", "utf8");
+  let containerListCount = 0;
+  let lastStartedProject = "";
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config")) {
+        return { stdout: "postgres\n", stderr: "" };
+      }
+      if (args[0] === "compose" && args.includes("up")) {
+        lastStartedProject = args[args.indexOf("-p") + 1] ?? "";
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        containerListCount += 1;
+        const isSourceList = containerListCount === 1;
+        const composeProject = isSourceList ? "workspace" : lastStartedProject;
+        return {
+          stdout: JSON.stringify({
+            ID: isSourceList ? "source123" : "hidden123",
+            Names: `${composeProject}-postgres-1`,
+            Ports: `127.0.0.1:${isSourceList ? 15432 : 57002}->5432/tcp`,
+            Labels: `com.docker.compose.project=${composeProject},com.docker.compose.service=postgres`,
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({
+              Id: id,
+              Config: { Labels: { "com.docker.compose.service": "postgres" } },
+              Mounts: [],
+            })),
+          ),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    runtime: "docker",
+    networkName: "A app",
+    networkId: "network-a",
+    originalProjectName: "workspace",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    ports: [
+      {
+        serviceName: "postgres",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 15432,
+        containerPort: 5432,
+        protocol: "tcp",
+      },
+    ],
+  });
+
+  assert.match(result.state.attachedProjectName, /^a-app-workspace-[a-f0-9]{8}-[a-f0-9]{8}$/);
+  assert.notEqual(result.state.attachedProjectName, existingProjectName);
+  assert.equal(result.state.overrideFile, path.join(tempDir, `${result.state.attachedProjectName}.ports.override.yaml`));
+  assert.equal(result.ports[0]?.actualHostPort, 57002);
+});
+
 test("mutates compose clone container names by replacing the compose project prefix", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-name-prefix-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
@@ -1701,6 +1861,108 @@ test("suffixes repeated compose clone container names when the original SOT cont
   ]);
   assert.equal(calls.some((call) => call.args.join(" ") === "container inspect captain_db"), true);
   assert.match(fs.readFileSync(result.state.overrideFile, "utf8"), /container_name: 'captain_db-new-copy'/);
+});
+
+test("carries previous compose clone container mappings into a copied clone", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-copy-lineage-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  fs.writeFileSync(
+    composeFile,
+    "name: captain\nservices:\n  db:\n    image: postgres:16\n    container_name: captain_db\n",
+    "utf8",
+  );
+  let containerListCount = 0;
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        containerListCount += 1;
+        return {
+          stdout: JSON.stringify({
+            ID: containerListCount === 1 ? "oldclone123" : "newclone123",
+            Names: containerListCount === 1 ? "captain_db-old-copy" : "captain_db-new-copy",
+            Ports: containerListCount === 1 ? "127.0.0.1:57001->5432/tcp" : "127.0.0.1:57002->5432/tcp",
+            Labels:
+              containerListCount === 1
+                ? "com.docker.compose.project=old-copy,com.docker.compose.service=db"
+                : "com.docker.compose.project=new-copy,com.docker.compose.service=db",
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({
+              Id: id,
+              Name:
+                id === "captain_db"
+                  ? "/captain_db"
+                  : id === "oldclone123"
+                    ? "/captain_db-old-copy"
+                    : id === "newclone123"
+                      ? "/captain_db-new-copy"
+                      : `/${id}`,
+              Config: { Labels: { "com.docker.compose.service": "db" } },
+              Mounts: [],
+            })),
+          ),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    attachedProjectName: "new-copy",
+    runtime: "docker",
+    networkName: "A app",
+    originalProjectName: "old-copy",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    sourceContainerMappings: [
+      {
+        serviceName: "db",
+        originalContainerId: "original123",
+        originalContainerName: "captain_db",
+        attachedContainerId: "oldclone123",
+        attachedContainerName: "captain_db-old-copy",
+      },
+    ],
+    ports: [
+      {
+        serviceName: "db",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 57001,
+        containerPort: 5432,
+        protocol: "tcp",
+      },
+    ],
+  });
+
+  assert.deepEqual(result.state.containerMappings, [
+    {
+      serviceName: "db",
+      originalContainerId: "oldclone123",
+      originalContainerName: "captain_db-old-copy",
+      attachedContainerId: "newclone123",
+      attachedContainerName: "captain_db-new-copy",
+    },
+    {
+      serviceName: "__portmanager_alias__:db",
+      originalContainerId: "original123",
+      originalContainerName: "captain_db",
+      attachedContainerId: "newclone123",
+      attachedContainerName: "captain_db-new-copy",
+    },
+  ]);
 });
 
 test("increments clone container names when the project suffix candidate is already reserved", async (context) => {

@@ -79,6 +79,21 @@ test("terminal attach and detach commands source generated script files", () => 
   );
 });
 
+test("network removal restores compose attachments before deleting the network", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const removeNetworkBody = /async removeNetwork\(networkId: string\): Promise<LogicalNetwork \| undefined> \{([\s\S]*?)\n  \}/.exec(
+    source,
+  )?.[1] ?? "";
+
+  assert.equal(removeNetworkBody.includes("await this.removeComposeAttachment(attachment.id);"), true);
+  assert.equal(
+    removeNetworkBody.includes("for (const port of attachment.ports)"),
+    false,
+    "network removal must use the compose mutation restore path, not just delete route processes",
+  );
+});
+
 test("terminal attach script enables loopback routing only after alias readiness", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");

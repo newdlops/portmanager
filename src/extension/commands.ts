@@ -426,6 +426,9 @@ export class PortManagerCommandController implements DisposableLike {
               runtime: candidate.runtime,
               workingDirectory: candidate.composeWorkingDirectory ?? getDefaultWorkspaceFolder() ?? process.cwd(),
               composeFiles: candidate.composeConfigFiles,
+              ...(candidate.portManagerClone?.containerMappings !== undefined
+                ? { sourceContainerMappings: candidate.portManagerClone.containerMappings }
+                : {}),
             },
           }
         : {};

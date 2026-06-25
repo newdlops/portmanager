@@ -10,6 +10,7 @@ import type {
   ContainerServiceCandidate,
 } from "../../shared/types";
 import type { ContainerCommandRunner } from "./container-runtime";
+import { mergeComposeContainerMappingLineage } from "./compose-container-mappings";
 import {
   mergeRuntimeContainerRowsWithInspectNames,
   parseContainerRows,
@@ -53,6 +54,8 @@ export interface ComposePublishMutationInput {
   readonly workingDirectory?: string;
   /** Compose files discovered from runtime labels or user input. */
   readonly composeFiles?: readonly string[];
+  /** Previous clone mapping lineage that must continue to route into this new clone. */
+  readonly sourceContainerMappings?: readonly ComposeContainerMutationMapping[];
   /** Published endpoints selected for attach. */
   readonly ports: readonly ComposePublishedPort[];
 }
@@ -188,9 +191,13 @@ export class ComposePublishMutator {
         ? await this.resolveAttachedProjectSourceName(requestedProjectName, input.workingDirectory, composeFiles)
         : originalProjectName;
     const attachedProjectName =
-      mode === "clone"
-        ? requestedAttachedProjectName ?? buildAttachedProjectName(input.networkName, attachedProjectSourceName, input.networkId)
-        : originalProjectName;
+      mode !== "clone"
+        ? originalProjectName
+        : requestedAttachedProjectName ??
+          (await this.resolveGeneratedAttachedProjectName(
+            buildAttachedProjectName(input.networkName, attachedProjectSourceName, input.networkId),
+            originalProjectName,
+          ));
     const requestedServices = uniqueStrings(input.ports.map((port) => port.serviceName));
 
     const originalContext: ComposeCommandContext = {
@@ -275,7 +282,12 @@ export class ComposePublishMutator {
       const hiddenPorts = resolveHiddenPorts(attachedProjectName, ports, hiddenCandidates);
       assertHiddenPortsAreIsolated(hiddenPorts, ports);
       const containerMappings =
-        mode === "clone" ? buildContainerCloneMappings(originalContainers, hiddenCandidates) : [];
+        mode === "clone"
+          ? mergeComposeContainerMappingLineage(
+              input.sourceContainerMappings ?? [],
+              buildContainerCloneMappings(originalContainers, hiddenCandidates),
+            )
+          : [];
       const clonedVolumes = buildVolumeMutationMappings(volumeClonePlan.volumeMappings);
 
       return {
@@ -558,6 +570,39 @@ export class ComposePublishMutator {
     return projectName.length === 0 ? undefined : projectName;
   }
 
+  /**
+   * Keeps generated clone names stable until they would overwrite an existing
+   * generated override or target the source project itself. Same-network copies
+   * can share the same deterministic base name, so collisions receive a short
+   * per-copy suffix while explicit user-supplied project names remain exact.
+   */
+  private async resolveGeneratedAttachedProjectName(baseName: string, originalProjectName: string): Promise<string> {
+    if (!(await this.generatedAttachedProjectNameCollides(baseName, originalProjectName))) {
+      return baseName;
+    }
+
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      const candidate = buildAttachedProjectCollisionName(baseName, randomUUID().replace(/-/g, "").slice(0, 8));
+      if (!(await this.generatedAttachedProjectNameCollides(candidate, originalProjectName))) {
+        return candidate;
+      }
+    }
+
+    return buildAttachedProjectCollisionName(baseName, randomUUID().replace(/-/g, "").slice(0, 12));
+  }
+
+  private async generatedAttachedProjectNameCollides(projectName: string, originalProjectName: string): Promise<boolean> {
+    if (projectName === originalProjectName) {
+      return true;
+    }
+
+    return fileExists(this.getHiddenPortsOverridePath(projectName));
+  }
+
+  private getHiddenPortsOverridePath(attachedProjectName: string): string {
+    return path.join(this.storageDirectory, `${attachedProjectName}.ports.override.yaml`);
+  }
+
   /** Writes a Compose override whose only job is to replace published ports. */
   private async writeHiddenPortsOverride(
     attachedProjectName: string,
@@ -572,7 +617,7 @@ export class ComposePublishMutator {
     },
   ): Promise<string> {
     await fs.mkdir(this.storageDirectory, { recursive: true });
-    const overrideFile = path.join(this.storageDirectory, `${attachedProjectName}.ports.override.yaml`);
+    const overrideFile = this.getHiddenPortsOverridePath(attachedProjectName);
     const portsByService = groupPortsByService(ports);
     const disabledServices = new Set(options.disabledServices ?? []);
     const lines = ["services:"];
@@ -1054,6 +1099,11 @@ function buildRenamedMutationState(
   hiddenPorts: readonly ComposePublishedPort[],
   containerMappings: readonly ComposeContainerMutationMapping[],
 ): ComposePortMutationState {
+  const mergedContainerMappings = mergeComposeContainerMappingLineage(
+    state.containerMappings ?? [],
+    containerMappings,
+  );
+
   return {
     mode: state.mode,
     runtime: state.runtime,
@@ -1065,7 +1115,7 @@ function buildRenamedMutationState(
     overrideFile,
     originalPorts: state.originalPorts,
     hiddenPorts,
-    ...(containerMappings.length > 0 ? { containerMappings } : {}),
+    ...(mergedContainerMappings.length > 0 ? { containerMappings: mergedContainerMappings } : {}),
     ...(state.clonedVolumeNames !== undefined ? { clonedVolumeNames: state.clonedVolumeNames } : {}),
     ...(state.clonedVolumes !== undefined ? { clonedVolumes: state.clonedVolumes } : {}),
   };
@@ -1261,6 +1311,10 @@ function buildAttachedProjectName(
   // Network name stays first for Docker UI discoverability; the hash prevents
   // copied networks and duplicate source projects from sharing a project.
   return `${prefix}-${hash}`;
+}
+
+function buildAttachedProjectCollisionName(baseName: string, suffix: string): string {
+  return `${trimProjectName(baseName, 52)}-${suffix}`;
 }
 
 async function readComposeConfiguredProjectName(composeFile: string): Promise<string | undefined> {
