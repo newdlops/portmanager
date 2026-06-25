@@ -104,6 +104,10 @@ const TERMINAL_HOOK_SCRIPT_DIRECTORY_NAME = "terminal-hook-scripts";
 const MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX = "manual-terminal:";
 const PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX = "process-terminal:";
 const ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 3_000;
+const TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500;
+const TERMINAL_ATTACHMENT_REFRESH_DEBOUNCE_MS = 50;
+const TERMINAL_ATTACHMENT_REFRESH_BURST_WINDOW_MS = 2_000;
+const TERMINAL_ATTACHMENT_REFRESH_BURST_INTERVAL_MS = 250;
 const execFileAsync = promisify(execFile);
 
 export interface BindingPresetSummary {
@@ -250,8 +254,26 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Guards background signal refreshes so slow Docker/process-table reads do not overlap. */
   private routingSignalRefreshInFlight: Promise<void> | undefined;
 
+  /** Guards terminal refreshes so watcher bursts cannot overlap process-table scans. */
+  private terminalRefreshInFlight: Promise<readonly TerminalWindow[]> | undefined;
+
+  /** Requests one more terminal refresh after the current process-table scan completes. */
+  private terminalRefreshQueued = false;
+
   /** Background poller that keeps terminals, containers, and compose routes current. */
   private routingSignalRefreshTimer: ReturnType<typeof setInterval> | undefined;
+
+  /** Lightweight marker poller used when VS Code file events miss global storage writes. */
+  private terminalAttachmentMarkerPollTimer: ReturnType<typeof setInterval> | undefined;
+
+  /** Debounces marker file events before scanning terminals. */
+  private terminalAttachmentRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Keeps a short refresh burst alive while a newly hooked terminal appears in the process table. */
+  private terminalAttachmentRefreshBurstUntilMs = 0;
+
+  /** Last stat-level signature of terminal hook marker files. */
+  private terminalAttachmentMarkerSignature = "";
 
   /** Last shared-state revision applied in this extension host. */
   private sharedNetworkStateRevision: string | undefined;
@@ -333,24 +355,28 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Loads terminal candidates and reopens persisted host exposures. */
   async start(): Promise<void> {
-    await fs.mkdir(this.getTerminalAttachmentMarkerDirectoryPath(), { recursive: true }).catch(() => undefined);
+    const terminalAttachmentMarkerDirectory = this.getTerminalAttachmentMarkerDirectoryPath();
+    await fs.mkdir(terminalAttachmentMarkerDirectory, { recursive: true }).catch(() => undefined);
     const terminalAttachmentMarkerWatcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(this.getTerminalAttachmentMarkerDirectoryPath(), "*.tsv"),
+      new vscode.RelativePattern(terminalAttachmentMarkerDirectory, "*.tsv"),
     );
+    const nativeTerminalAttachmentMarkerWatcher =
+      this.watchTerminalAttachmentMarkers(terminalAttachmentMarkerDirectory);
 
     this.disposables.push(
       this.sharedNetworkStateStore.watch(() => {
         void this.reloadSharedNetworkState();
       }),
       terminalAttachmentMarkerWatcher,
+      nativeTerminalAttachmentMarkerWatcher,
       terminalAttachmentMarkerWatcher.onDidCreate(() => {
-        void this.refreshTerminals();
+        this.scheduleTerminalAttachmentRefreshBurst();
       }),
       terminalAttachmentMarkerWatcher.onDidChange(() => {
-        void this.refreshTerminals();
+        this.scheduleTerminalAttachmentRefreshBurst();
       }),
       terminalAttachmentMarkerWatcher.onDidDelete(() => {
-        void this.refreshTerminals();
+        this.scheduleTerminalAttachmentRefreshBurst();
       }),
       vscode.window.onDidOpenTerminal(() => {
         void this.refreshTerminals();
@@ -384,6 +410,7 @@ export class PortManagerNetworkService implements DisposableLike {
     void this.refreshContainerServices();
     await this.syncLogicalPortRouters();
     this.startRoutingSignalRefreshLoop();
+    this.startTerminalAttachmentMarkerPolling();
   }
 
   /** Returns the latest logical network snapshot for the sidebar. */
@@ -478,6 +505,32 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Refreshes VS Code and external OS terminal windows. */
   async refreshTerminals(): Promise<readonly TerminalWindow[]> {
+    if (this.terminalRefreshInFlight !== undefined) {
+      this.terminalRefreshQueued = true;
+      return this.terminalRefreshInFlight;
+    }
+
+    this.terminalRefreshInFlight = this.refreshTerminalsSerially().finally(() => {
+      this.terminalRefreshInFlight = undefined;
+    });
+
+    return this.terminalRefreshInFlight;
+  }
+
+  /** Runs terminal refreshes sequentially while preserving one queued follow-up scan. */
+  private async refreshTerminalsSerially(): Promise<readonly TerminalWindow[]> {
+    let terminalWindows: readonly TerminalWindow[] = [];
+
+    do {
+      this.terminalRefreshQueued = false;
+      terminalWindows = await this.refreshTerminalsExclusive();
+    } while (this.terminalRefreshQueued);
+
+    return terminalWindows;
+  }
+
+  /** Reads terminal/process state once and reconciles hook marker files into attachments. */
+  private async refreshTerminalsExclusive(): Promise<readonly TerminalWindow[]> {
     const processRows = await this.listProcessRowsForTerminalControl();
     const [vscodeCandidates, osCandidates] = await Promise.all([
       listVscodeTerminalCandidates(processRows),
@@ -1299,6 +1352,14 @@ export class PortManagerNetworkService implements DisposableLike {
       clearInterval(this.routingSignalRefreshTimer);
       this.routingSignalRefreshTimer = undefined;
     }
+    if (this.terminalAttachmentMarkerPollTimer !== undefined) {
+      clearInterval(this.terminalAttachmentMarkerPollTimer);
+      this.terminalAttachmentMarkerPollTimer = undefined;
+    }
+    if (this.terminalAttachmentRefreshTimer !== undefined) {
+      clearTimeout(this.terminalAttachmentRefreshTimer);
+      this.terminalAttachmentRefreshTimer = undefined;
+    }
 
     for (const disposable of this.disposables.splice(0)) {
       disposable.dispose();
@@ -1624,6 +1685,103 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.reconcileComposeAttachmentPublishedPorts().catch(() => undefined);
     await this.restorePersistedComposeRoutesIfMissing().catch(() => undefined);
     await this.syncLogicalPortRouters();
+  }
+
+  /**
+   * Watches the marker directory with Node's native watcher in addition to the
+   * VS Code watcher. Global storage file events can lag or be dropped outside a
+   * workspace folder, while this watcher observes the exact directory the shell
+   * writes to.
+   */
+  private watchTerminalAttachmentMarkers(directoryPath: string): DisposableLike {
+    try {
+      const watcher = syncFs.watch(directoryPath, { persistent: false }, (_eventType, fileName) => {
+        const markerName = fileName === undefined || fileName === null ? undefined : String(fileName);
+        if (markerName === undefined || markerName.endsWith(".tsv")) {
+          this.scheduleTerminalAttachmentRefreshBurst();
+        }
+      });
+      watcher.on("error", () => undefined);
+      return {
+        dispose: () => watcher.close(),
+      };
+    } catch {
+      return {
+        dispose: () => undefined,
+      };
+    }
+  }
+
+  /** Starts a stat-only fallback poll for terminal hook marker changes. */
+  private startTerminalAttachmentMarkerPolling(): void {
+    if (this.terminalAttachmentMarkerPollTimer !== undefined) {
+      return;
+    }
+
+    void this.refreshTerminalAttachmentsWhenMarkersChanged();
+    this.terminalAttachmentMarkerPollTimer = setInterval(() => {
+      void this.refreshTerminalAttachmentsWhenMarkersChanged();
+    }, TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS);
+    this.terminalAttachmentMarkerPollTimer.unref?.();
+  }
+
+  /** Schedules a short refresh burst so process-table discovery can catch up to the shell marker. */
+  private scheduleTerminalAttachmentRefreshBurst(): void {
+    this.terminalAttachmentRefreshBurstUntilMs = Date.now() + TERMINAL_ATTACHMENT_REFRESH_BURST_WINDOW_MS;
+    this.scheduleTerminalAttachmentRefresh(TERMINAL_ATTACHMENT_REFRESH_DEBOUNCE_MS);
+  }
+
+  private scheduleTerminalAttachmentRefresh(delayMs: number): void {
+    if (this.terminalAttachmentRefreshTimer !== undefined) {
+      return;
+    }
+
+    this.terminalAttachmentRefreshTimer = setTimeout(() => {
+      this.terminalAttachmentRefreshTimer = undefined;
+      void this.runTerminalAttachmentRefreshBurstStep();
+    }, delayMs);
+    this.terminalAttachmentRefreshTimer.unref?.();
+  }
+
+  private async runTerminalAttachmentRefreshBurstStep(): Promise<void> {
+    await this.refreshTerminals().catch(() => []);
+    if (Date.now() < this.terminalAttachmentRefreshBurstUntilMs) {
+      this.scheduleTerminalAttachmentRefresh(TERMINAL_ATTACHMENT_REFRESH_BURST_INTERVAL_MS);
+    }
+  }
+
+  /**
+   * Reads only names, sizes, and mtimes until a marker changes. Full marker
+   * parsing and process-table scans happen only when this cheap signature moves.
+   */
+  private async refreshTerminalAttachmentsWhenMarkersChanged(): Promise<void> {
+    const signature = await this.readTerminalAttachmentMarkerSignature();
+    if (signature === this.terminalAttachmentMarkerSignature) {
+      return;
+    }
+
+    this.terminalAttachmentMarkerSignature = signature;
+    this.scheduleTerminalAttachmentRefreshBurst();
+  }
+
+  private async readTerminalAttachmentMarkerSignature(): Promise<string> {
+    const markerDirectory = this.getTerminalAttachmentMarkerDirectoryPath();
+    const entries = await fs.readdir(markerDirectory, { withFileTypes: true }).catch(() => []);
+    const rows = await Promise.all(
+      entries
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".tsv"))
+        .map(async (entry) => {
+          const filePath = path.join(markerDirectory, entry.name);
+          const stats = await fs.stat(filePath).catch(() => undefined);
+          if (stats === undefined) {
+            return `${entry.name}:missing`;
+          }
+
+          return `${entry.name}:${stats.size}:${Math.trunc(stats.mtimeMs)}`;
+        }),
+    );
+
+    return rows.sort().join("\n");
   }
 
   /** Rewrites compose route rows when Docker changed a running container's host port. */

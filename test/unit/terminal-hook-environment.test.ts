@@ -106,6 +106,20 @@ test("background routing refresh polls terminals and containers", () => {
   assert.equal(source.includes("ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 3_000"), true);
 });
 
+test("terminal hook markers refresh attached UI state without manual refresh", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+
+  assert.equal(source.includes("TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500"), true);
+  assert.equal(source.includes("private watchTerminalAttachmentMarkers(directoryPath: string): DisposableLike"), true);
+  assert.equal(source.includes("syncFs.watch(directoryPath"), true);
+  assert.equal(source.includes("private scheduleTerminalAttachmentRefreshBurst(): void"), true);
+  assert.equal(source.includes("private async refreshTerminalAttachmentsWhenMarkersChanged(): Promise<void>"), true);
+  assert.equal(source.includes("this.terminalRefreshInFlight !== undefined"), true);
+  assert.equal(source.includes("this.terminalRefreshQueued = true"), true);
+  assert.equal(source.includes("this.startTerminalAttachmentMarkerPolling();"), true);
+});
+
 test("compose route rehydration retries recoverable error attachments after restart", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
