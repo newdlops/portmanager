@@ -6,12 +6,26 @@
  * address first exists as a lo0 alias; Linux commonly routes 127/8 without it.
  */
 
+import type { LoopbackAddressRoutingMode } from "../../shared/types";
+
 export const NETWORK_LOOPBACK_HOST_ENV = "PORT_MANAGER_NETWORK_LOOPBACK_HOST";
 
 export function isLoopbackAddressRoutingEnabled(settings: {
   readonly enableLoopbackAddressRouting?: boolean;
+  readonly loopbackAddressRoutingMode?: LoopbackAddressRoutingMode;
 }): boolean {
-  return settings.enableLoopbackAddressRouting !== false;
+  return resolveLoopbackAddressRoutingMode(settings) !== "high-port";
+}
+
+export function resolveLoopbackAddressRoutingMode(settings: {
+  readonly enableLoopbackAddressRouting?: boolean;
+  readonly loopbackAddressRoutingMode?: LoopbackAddressRoutingMode;
+}): LoopbackAddressRoutingMode {
+  if (settings.loopbackAddressRoutingMode !== undefined) {
+    return settings.loopbackAddressRoutingMode;
+  }
+
+  return settings.enableLoopbackAddressRouting === true ? "auto" : "high-port";
 }
 
 export function loopbackAddressForNetwork(networkId: string): string {

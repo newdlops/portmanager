@@ -18,6 +18,7 @@ import {
   isLoopbackAddressRoutingEnabled,
   loopbackAddressForNetwork,
   NETWORK_LOOPBACK_HOST_ENV,
+  resolveLoopbackAddressRoutingMode,
 } from "../core/networks/loopback-address";
 import { findRoutesMatchingClientCwd } from "../core/networks/logical-route-selection";
 import { SimpleEventEmitter } from "../shared/events";
@@ -2477,7 +2478,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellPrependLibrary(preloadVariable, hookLibraryPath),
     ];
     if (isLoopbackAddressRoutingEnabled(settings)) {
-      commands.push(buildLoopbackAddressRoutingShell(loopbackAddressForNetwork(networkId)));
+      commands.push(buildLoopbackAddressRoutingShell(loopbackAddressForNetwork(networkId), resolveLoopbackAddressRoutingMode(settings)));
     }
     commands.push(buildAgentDaemonEnsureShell(process.execPath));
 
@@ -3737,25 +3738,39 @@ function shellPrependLibrary(name: string, libraryPath: string): string {
 
 /**
  * Enables loopback-address routing only after the OS can bind the generated
- * address. macOS needs an lo0 alias, so sudo is attempted in non-interactive
- * mode and failure falls back to high-port routing without blocking startup.
+ * address. Auto mode keeps startup non-interactive; loopback mode may prompt
+ * for sudo to create the macOS lo0 alias and still falls back if provisioning
+ * fails.
  */
-function buildLoopbackAddressRoutingShell(host: string): string {
+function buildLoopbackAddressRoutingShell(host: string, mode: "auto" | "loopback" | "high-port"): string {
   const quotedHost = shellQuote(host);
+
+  if (mode === "high-port") {
+    return `unset ${NETWORK_LOOPBACK_HOST_ENV}`;
+  }
 
   if (process.platform !== "darwin") {
     return `export ${NETWORK_LOOPBACK_HOST_ENV}=${quotedHost}`;
   }
 
+  const aliasCommand =
+    mode === "loopback"
+      ? `ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1 || sudo ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null`
+      : `ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1 || sudo -n ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1`;
+  const failureMessage =
+    mode === "loopback"
+      ? "Port Manager loopback IP routing unavailable; using high-port routing fallback. Set portManager.loopbackAddressRoutingMode to high-port to skip alias provisioning."
+      : "Port Manager loopback IP routing unavailable; using high-port routing fallback.";
+
   return [
     `__pm_loopback_host=${quotedHost}`,
     `if ifconfig lo0 2>/dev/null | grep -E "inet[[:space:]]+$__pm_loopback_host([[:space:]]|$)" >/dev/null 2>&1; then`,
     `export ${NETWORK_LOOPBACK_HOST_ENV}="$__pm_loopback_host"`,
-    `elif ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1 || sudo -n ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1; then`,
+    `elif ${aliasCommand}; then`,
     `export ${NETWORK_LOOPBACK_HOST_ENV}="$__pm_loopback_host"`,
     `else`,
     `unset ${NETWORK_LOOPBACK_HOST_ENV}`,
-    `printf '%s\\n' 'Port Manager loopback IP routing unavailable; using high-port routing fallback.' >&2`,
+    `printf '%s\\n' ${shellQuote(failureMessage)} >&2`,
     `fi`,
     `unset __pm_loopback_host`,
   ].join("\n");

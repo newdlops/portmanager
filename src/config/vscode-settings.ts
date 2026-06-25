@@ -3,6 +3,7 @@ import { DEFAULT_PORT_MANAGER_SETTINGS } from "../shared/default-settings";
 import type {
   ContainerRuntimePreference,
   ContainerRuntimeSettings,
+  LoopbackAddressRoutingMode,
   PortManagerSettings,
   PortRoutingMode,
   ProcessKillSignal,
@@ -24,6 +25,7 @@ const DEFAULT_CONTAINER_RUNTIME_SETTINGS: ContainerRuntimeSettings = {
 
 const VALID_SCAN_DIRECTIONS = new Set<ScanDirection>(["up", "down", "both"]);
 const VALID_ROUTING_MODES = new Set<PortRoutingMode>(["nearest", "hashed"]);
+const VALID_LOOPBACK_ADDRESS_ROUTING_MODES = new Set<LoopbackAddressRoutingMode>(["high-port", "auto", "loopback"]);
 const VALID_CONTAINER_RUNTIMES = new Set<ContainerRuntimePreference>(["auto", "docker", "podman"]);
 
 /**
@@ -48,8 +50,9 @@ export function readPortManagerSettings(): PortManagerSettings {
     routingMode: normalizeRoutingMode(config.get<PortRoutingMode>("routingMode", DEFAULT_SETTINGS.routingMode)),
     enableLoopbackAddressRouting: config.get<boolean>(
       "enableLoopbackAddressRouting",
-      DEFAULT_SETTINGS.enableLoopbackAddressRouting ?? true,
+      DEFAULT_SETTINGS.enableLoopbackAddressRouting ?? false,
     ),
+    loopbackAddressRoutingMode: readLoopbackAddressRoutingMode(config),
     virtualPortRangeStart: virtualPortRange.start,
     virtualPortRangeEnd: virtualPortRange.end,
     preferredPorts: normalizePreferredPorts(
@@ -160,6 +163,23 @@ function normalizeScanDirection(scanDirection: ScanDirection): ScanDirection {
 /** Converts unknown routing modes to the hashed logical-port policy. */
 function normalizeRoutingMode(routingMode: PortRoutingMode): PortRoutingMode {
   return VALID_ROUTING_MODES.has(routingMode) ? routingMode : DEFAULT_SETTINGS.routingMode;
+}
+
+/** Reads the explicit loopback policy while preserving the legacy boolean setting. */
+function readLoopbackAddressRoutingMode(config: vscode.WorkspaceConfiguration): LoopbackAddressRoutingMode {
+  const inspected = config.inspect<LoopbackAddressRoutingMode>("loopbackAddressRoutingMode");
+  const configuredValue =
+    inspected?.workspaceFolderValue ??
+    inspected?.workspaceValue ??
+    inspected?.globalValue;
+
+  if (configuredValue !== undefined && VALID_LOOPBACK_ADDRESS_ROUTING_MODES.has(configuredValue)) {
+    return configuredValue;
+  }
+
+  return config.get<boolean>("enableLoopbackAddressRouting", DEFAULT_SETTINGS.enableLoopbackAddressRouting ?? false)
+    ? "auto"
+    : "high-port";
 }
 
 /** Converts unknown container runtime settings to auto detection. */

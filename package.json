@@ -705,8 +705,24 @@
         },
         "portManager.enableLoopbackAddressRouting": {
           "type": "boolean",
-          "default": true,
-          "description": "Prefer per-network loopback IP addresses for terminal socket routing when the required loopback alias is available."
+          "default": false,
+          "description": "Legacy toggle for per-network loopback IP routing. Prefer portManager.loopbackAddressRoutingMode.",
+          "deprecationMessage": "Use portManager.loopbackAddressRoutingMode instead."
+        },
+        "portManager.loopbackAddressRoutingMode": {
+          "type": "string",
+          "default": "high-port",
+          "enum": [
+            "high-port",
+            "auto",
+            "loopback"
+          ],
+          "enumDescriptions": [
+            "Keep the existing high-port remapping behavior and do not create loopback aliases.",
+            "Use a per-network loopback address only when the alias already exists or can be created without prompting.",
+            "Prefer per-network loopback addresses and allow the attach script to prompt for sudo to add a missing macOS lo0 alias."
+          ],
+          "description": "Controls whether attached terminals route sockets through high-port remapping or per-network loopback IP aliases."
         },
         "portManager.virtualPortRangeStart": {
           "type": "number",

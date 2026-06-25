@@ -99,6 +99,7 @@ static unsigned long pm_request_sequence = 1;
 
 static void pm_release_process_routes(void);
 static const char *pm_current_network_id(void);
+static const char *pm_network_loopback_host(void);
 extern char **environ;
 
 static int pm_hook_enabled(void) {
@@ -1388,8 +1389,16 @@ static int pm_is_preserved_listen_port(int port) {
 }
 
 static int pm_should_preserve_listen_bind(int logical_port) {
-  return pm_is_preserved_listen_port(logical_port) ||
-    pm_current_process_looks_like_browser_dev_server();
+  if (pm_is_preserved_listen_port(logical_port)) {
+    return 1;
+  }
+
+  /*
+   * Browser dev servers stay visible on their requested port in high-port mode.
+   * When a per-network loopback host is active, preserving localhost would
+   * collapse sessions back onto 127.0.0.1 and defeat cookie isolation.
+   */
+  return pm_network_loopback_host() == NULL && pm_current_process_looks_like_browser_dev_server();
 }
 
 static const char *pm_routing_mode(void) {

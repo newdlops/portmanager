@@ -85,8 +85,22 @@ test("terminal attach script enables loopback routing only after alias readiness
 
   assert.equal(source.includes("buildLoopbackAddressRoutingShell"), true);
   assert.equal(source.includes("sudo -n ifconfig lo0 alias"), true);
+  assert.equal(source.includes('sudo ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null'), true);
+  assert.equal(source.includes("portManager.loopbackAddressRoutingMode"), true);
   assert.equal(source.includes("Port Manager loopback IP routing unavailable; using high-port routing fallback."), true);
   assert.equal(source.includes("NETWORK_LOOPBACK_HOST_ENV"), true);
+});
+
+test("native hook lets loopback aliases own dev server ports", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+
+  assert.equal(source.includes("pm_network_loopback_host() == NULL && pm_current_process_looks_like_browser_dev_server()"), true);
+  assert.equal(source.includes("bind loopback-network logical=%d host=%s"), true);
+  assert.equal(
+    source.includes("collapse sessions back onto 127.0.0.1 and defeat cookie isolation"),
+    true,
+  );
 });
 
 test("logical routers are opened for compose clone endpoints only", () => {

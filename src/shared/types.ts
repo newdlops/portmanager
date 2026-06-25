@@ -12,6 +12,8 @@ export type ScanDirection = "up" | "down" | "both";
 
 export type PortRoutingMode = "nearest" | "hashed";
 
+export type LoopbackAddressRoutingMode = "high-port" | "auto" | "loopback";
+
 export type PortInjectionMode = "env" | "template" | "argument";
 
 export type ProcessKillSignal = NodeJS.Signals | "SIGKILL" | "SIGTERM";
@@ -443,8 +445,10 @@ export interface PortManagerSettings {
   readonly scanDirection: ScanDirection;
   /** Routing policy used to choose the actual bind port. */
   readonly routingMode: PortRoutingMode;
-  /** Whether terminal hooks should prefer per-network loopback IPs over high-port remapping. */
+  /** Whether terminal hooks should prefer per-network loopback IPs over high-port remapping. Legacy boolean setting. */
   readonly enableLoopbackAddressRouting?: boolean;
+  /** Per-network loopback address policy. High-port keeps the original remapping behavior. */
+  readonly loopbackAddressRoutingMode: LoopbackAddressRoutingMode;
   /** First TCP port in the deterministic hashed actual-port range. */
   readonly virtualPortRangeStart: number;
   /** Last TCP port in the deterministic hashed actual-port range. */

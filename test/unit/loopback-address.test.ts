@@ -5,6 +5,7 @@ import {
   isLoopbackAddressRoutingEnabled,
   loopbackAddressForNetwork,
   NETWORK_LOOPBACK_HOST_ENV,
+  resolveLoopbackAddressRoutingMode,
 } from "../../src/core/networks/loopback-address";
 
 test("loopback address routing maps network ids to stable non-default loopback hosts", () => {
@@ -18,9 +19,12 @@ test("loopback address routing maps network ids to stable non-default loopback h
   assert.notEqual(first, "127.0.0.1");
 });
 
-test("loopback address routing remains enabled for legacy settings", () => {
+test("loopback address routing mode keeps high-port as the default", () => {
   assert.equal(NETWORK_LOOPBACK_HOST_ENV, "PORT_MANAGER_NETWORK_LOOPBACK_HOST");
-  assert.equal(isLoopbackAddressRoutingEnabled({}), true);
+  assert.equal(isLoopbackAddressRoutingEnabled({}), false);
+  assert.equal(resolveLoopbackAddressRoutingMode({}), "high-port");
   assert.equal(isLoopbackAddressRoutingEnabled({ enableLoopbackAddressRouting: true }), true);
+  assert.equal(resolveLoopbackAddressRoutingMode({ enableLoopbackAddressRouting: true }), "auto");
   assert.equal(isLoopbackAddressRoutingEnabled({ enableLoopbackAddressRouting: false }), false);
+  assert.equal(resolveLoopbackAddressRoutingMode({ loopbackAddressRoutingMode: "loopback" }), "loopback");
 });
