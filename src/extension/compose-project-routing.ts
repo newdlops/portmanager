@@ -21,6 +21,8 @@ export interface ComposeProjectRoutingRow {
   readonly originalProjectName?: string;
   /** Network-scoped compose project name created by clone attach. */
   readonly attachedProjectName: string;
+  /** Generated override that removes host-visible ports and rewrites global container names. */
+  readonly overrideFile?: string;
   /** Direct container id/name rewrites for Docker CLI commands like exec/logs. */
   readonly containerMappings?: readonly ComposeContainerRoutingMapping[];
 }
@@ -48,20 +50,27 @@ export function serializeComposeProjectRoutingRows(rows: readonly ComposeProject
       sanitizeField(trimTrailingSlashes(row.workingDirectory)),
       sanitizeField(row.attachedProjectName),
     ];
-    if (row.originalProjectName !== undefined) {
-      projectFields.push(sanitizeField(row.originalProjectName));
+    if (row.originalProjectName !== undefined || row.overrideFile !== undefined) {
+      projectFields.push(sanitizeField(row.originalProjectName ?? ""));
+    }
+    if (row.overrideFile !== undefined) {
+      projectFields.push(sanitizeField(row.overrideFile));
     }
     const baseFields = projectFields.join("\t");
-    const composeFileFields = (row.composeFiles ?? []).map((composeFile) =>
-      [
+    const composeFileFields = (row.composeFiles ?? []).map((composeFile) => {
+      const fields = [
         "file",
         sanitizeField(row.networkId),
         row.runtime,
         sanitizeField(composeFile.trim()),
         sanitizeField(row.attachedProjectName),
         sanitizeField(row.originalProjectName ?? ""),
-      ].join("\t"),
-    );
+      ];
+      if (row.overrideFile !== undefined) {
+        fields.push(sanitizeField(row.overrideFile));
+      }
+      return fields.join("\t");
+    });
     const containerFields = buildContainerRoutingRows(row);
 
     return [baseFields, ...composeFileFields, ...containerFields];
@@ -447,6 +456,7 @@ __port_manager_compose_route_scan_file_for_runtime() {
 
   [ -r "\${__pm_scan_file}" ] || return 1
   while IFS="$(printf '\\t')" read -r __pm_row_kind __pm_row_network __pm_row_runtime __pm_workdir __pm_attached_project __pm_original_project __pm_rest; do
+    __pm_row_override_file="\${__pm_rest}"
     if [ "\${__pm_row_network}" != "\${__pm_scan_network}" ] || [ "\${__pm_row_runtime}" != "\${__pm_scan_runtime}" ]; then
       continue
     fi
@@ -464,12 +474,14 @@ __port_manager_compose_route_scan_file_for_runtime() {
         __pm_best_length="\${__pm_length}"
         __pm_best_attached_project="\${__pm_attached_project}"
         __pm_best_original_project="\${__pm_original_project}"
+        __pm_best_override_file="\${__pm_row_override_file}"
       fi
     elif [ "\${__pm_row_kind}" = "project" ] && [ -n "\${__pm_requested_project}" ]; then
       if [ "\${__pm_requested_project}" = "\${__pm_original_project}" ] || [ "\${__pm_requested_project}" = "\${__pm_attached_project}" ]; then
         __pm_project_match_count=$((__pm_project_match_count + 1))
         __pm_project_attached_project="\${__pm_attached_project}"
         __pm_project_original_project="\${__pm_original_project}"
+        __pm_project_override_file="\${__pm_row_override_file}"
       fi
     fi
   done < "\${__pm_scan_file}"
@@ -484,11 +496,13 @@ __port_manager_compose_route_for_runtime() {
   __pm_network="$(__port_manager_network_id)"
   __pm_best_attached_project=""
   __pm_best_original_project=""
+  __pm_best_override_file=""
   __pm_best_length=0
   __pm_requested_project="$(__port_manager_compose_requested_project_name "$@" 2>/dev/null || true)"
   __pm_project_match_count=0
   __pm_project_attached_project=""
   __pm_project_original_project=""
+  __pm_project_override_file=""
 
   if [ -z "\${__pm_file}" ] || [ -z "\${__pm_network}" ]; then
     return 1
@@ -517,12 +531,12 @@ __port_manager_compose_route_for_runtime() {
   fi
 
   if [ -n "\${__pm_best_attached_project}" ]; then
-    printf '%s\\t%s\\n' "\${__pm_best_attached_project}" "\${__pm_best_original_project}"
+    printf '%s\\t%s\\t%s\\n' "\${__pm_best_attached_project}" "\${__pm_best_original_project}" "\${__pm_best_override_file}"
     return 0
   fi
 
   if [ "\${__pm_project_match_count}" = "1" ] && [ -n "\${__pm_project_attached_project}" ]; then
-    printf '%s\\t%s\\n' "\${__pm_project_attached_project}" "\${__pm_project_original_project}"
+    printf '%s\\t%s\\t%s\\n' "\${__pm_project_attached_project}" "\${__pm_project_original_project}" "\${__pm_project_override_file}"
     return 0
   fi
 
@@ -982,6 +996,13 @@ __port_manager_run_compose_command_with_routing() {
 
   __pm_tab="$(printf '\\t')"
   __pm_attached_project="\${__pm_route%%\${__pm_tab}*}"
+  __pm_route_rest="\${__pm_route#*\${__pm_tab}}"
+  __pm_original_project="\${__pm_route_rest%%\${__pm_tab}*}"
+  if [ "\${__pm_route_rest}" = "\${__pm_original_project}" ]; then
+    __pm_override_file=""
+  else
+    __pm_override_file="\${__pm_route_rest#*\${__pm_tab}}"
+  fi
   __pm_args=""
   __pm_rewrite_next=0
   __pm_detach_up=0
@@ -989,6 +1010,16 @@ __port_manager_run_compose_command_with_routing() {
   __pm_detach_seen_compose="\${__pm_standalone_compose}"
   __pm_detach_skip_next=0
   __pm_detach_waiting_subcommand=1
+  __pm_override_enabled=0
+  __pm_override_inserted=0
+  __pm_override_seen_compose="\${__pm_standalone_compose}"
+  __pm_override_skip_next=0
+  __pm_override_waiting_subcommand=1
+  if [ -n "\${__pm_override_file}" ] && [ -r "\${__pm_override_file}" ]; then
+    if ! __port_manager_compose_args_reference_file "\${__pm_override_file}" "$@"; then
+      __pm_override_enabled=1
+    fi
+  fi
   if __port_manager_compose_should_detach_up "\${__pm_standalone_compose}" "$@"; then
     __pm_detach_up=1
   fi
@@ -1021,6 +1052,33 @@ __port_manager_run_compose_command_with_routing() {
             ;;
           *)
             __pm_detach_waiting_subcommand=0
+            ;;
+        esac
+      fi
+    fi
+
+    if [ "\${__pm_override_enabled}" = "1" ] && [ "\${__pm_override_inserted}" = "0" ]; then
+      if [ "\${__pm_override_skip_next}" = "1" ]; then
+        __pm_override_skip_next=0
+      elif [ "\${__pm_override_seen_compose}" = "0" ]; then
+        if [ "\${__pm_original_arg}" = "compose" ]; then
+          __pm_override_seen_compose=1
+        fi
+      elif [ "\${__pm_override_waiting_subcommand}" = "1" ]; then
+        case "\${__pm_original_arg}" in
+          -f|--file|-p|--project-name|--profile|--env-file|--project-directory|--parallel|--progress|--ansi)
+            __pm_override_skip_next=1
+            ;;
+          -f?*|--file=*|-p?*|--project-name=*|--profile=*|--env-file=*|--project-directory=*|--parallel=*|--progress=*|--ansi=*)
+            ;;
+          --compatibility|--dry-run|--verbose|--help|-h|--all-resources)
+            ;;
+          -*)
+            ;;
+          *)
+            __pm_args="\${__pm_args} -f $(__port_manager_shell_quote "\${__pm_override_file}")"
+            __pm_override_inserted=1
+            __pm_override_waiting_subcommand=0
             ;;
         esac
       fi

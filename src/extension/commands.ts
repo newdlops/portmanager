@@ -152,6 +152,10 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.stopDaemon", () => this.stopDaemon());
     this.registerCommand(context, "portManager.showDaemonStatus", () => this.showDaemonStatus());
     this.registerCommand(context, "portManager.clearRoutingFiles", () => this.clearRoutingFiles());
+    this.registerCommand(context, "portManager.resetRouting", () => this.clearRoutingFiles());
+    this.registerCommand(context, "portManager.clearNetworkRoutingFiles", (argument) =>
+      this.clearNetworkRoutingFiles(argument),
+    );
     this.registerCommand(context, "portManager.startManagedProcess", () => this.startManagedProcess());
     this.registerCommand(context, "portManager.addExistingProcess", () => this.addExistingProcess());
     this.registerCommand(context, "portManager.refresh", () => this.refresh());
@@ -918,6 +922,34 @@ export class PortManagerCommandController implements DisposableLike {
       summary.failedFileCount > 0 ? ` ${summary.failedFileCount} file(s) could not be removed.` : "";
     await vscode.window.showInformationMessage(
       `Cleared ${summary.removedFileCount} routing file(s) and restored ${summary.restoredComposeRouteCount} compose route(s).${failureText}`,
+    );
+  }
+
+  /** Clears generated routing cache files that belong to one logical network. */
+  private async clearNetworkRoutingFiles(argument: unknown): Promise<void> {
+    const network = await this.resolveNetworkArgument(argument, "Clear Network Routing Cache");
+    if (network === undefined) {
+      return;
+    }
+
+    const selection = await vscode.window.showWarningMessage(
+      `Clear generated routing cache files for "${network.name}"? Durable bindings and Compose clone state are preserved, but attached terminals should be reattached if they still carry old environment variables.`,
+      { modal: true },
+      "Clear Network Cache",
+    );
+
+    if (selection !== "Clear Network Cache") {
+      return;
+    }
+
+    const summary = await this.dependencies.networkService.clearNetworkRoutingFiles(network.id);
+    await this.dependencies.processService.refresh().catch(() => undefined);
+    this.dependencies.treeProvider.refresh();
+
+    const failureText =
+      summary.failedFileCount > 0 ? ` ${summary.failedFileCount} file(s) could not be removed.` : "";
+    await vscode.window.showInformationMessage(
+      `Cleared ${summary.removedFileCount} routing file(s) for "${network.name}" and restored ${summary.restoredComposeRouteCount} compose route(s).${failureText}`,
     );
   }
 

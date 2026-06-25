@@ -810,11 +810,13 @@ export class ComposePublishMutator {
     sourceContainers: readonly ComposeServiceContainer[],
     serviceContainerNameSot: ReadonlyMap<string, string>,
   ): Promise<ReadonlySet<string>> {
-    const occupiedNames = new Set(
-      sourceContainers
-        .map((container) => normalizeContainerNameText(container.name))
-        .filter((name) => name.length > 0),
-    );
+    const occupiedNames = await this.listReservedRuntimeContainerNames(runtime);
+    for (const container of sourceContainers) {
+      const containerName = normalizeContainerNameText(container.name);
+      if (containerName.length > 0) {
+        occupiedNames.add(containerName);
+      }
+    }
     const sourceServices = new Set(sourceContainers.map((container) => container.serviceName));
     const sotNames = uniqueStrings(
       [...serviceContainerNameSot]
@@ -839,6 +841,36 @@ export class ComposePublishMutator {
     }
 
     return occupiedNames;
+  }
+
+  /**
+   * Reads Docker/Podman's global container-name reservation table.
+   *
+   * Runtime container names are global even when Compose projects and networks
+   * differ. Clone overrides must therefore avoid names held by stopped originals
+   * and other Port Manager clones, not just the selected source containers.
+   */
+  private async listReservedRuntimeContainerNames(runtime: "docker" | "podman"): Promise<Set<string>> {
+    try {
+      const result = await this.runCommand(
+        runtime,
+        ["container", "ps", "--all", "--no-trunc", "--format", "{{json .}}"],
+        { timeoutMs: LIST_TIMEOUT_MS },
+      );
+
+      return new Set(
+        result.stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0)
+          .map(parseRuntimeContainerRow)
+          .filter((row): row is RuntimeContainerRow => row !== undefined)
+          .map(readRuntimeContainerName)
+          .filter((name): name is string => name !== undefined),
+      );
+    } catch {
+      return new Set();
+    }
   }
 
   /**
@@ -1046,15 +1078,30 @@ function buildCloneContainerNames(
   serviceContainerNameSot: ReadonlyMap<string, string>,
   occupiedContainerNames: ReadonlySet<string>,
 ): ReadonlyMap<string, string> {
-  const names = new Map(serviceContainerNameSot);
   const reservedNames = new Set(
     [...occupiedContainerNames]
       .map((name) => normalizeContainerNameText(name))
       .filter((name) => name.length > 0),
   );
+  const names = new Map<string, string>();
+  for (const [serviceName, containerName] of serviceContainerNameSot) {
+    const normalizedSotName = normalizeContainerNameText(containerName);
+    if (normalizedSotName.length === 0) {
+      continue;
+    }
+
+    const cloneContainerName = reservedNames.has(normalizedSotName)
+      ? buildAvailableConflictingCloneContainerName(normalizedSotName, attachedProjectName, reservedNames)
+      : normalizedSotName;
+    names.set(serviceName, cloneContainerName);
+    reservedNames.add(normalizeContainerNameText(cloneContainerName));
+  }
   const originalByService = groupBy(originalContainers, (container) => container.serviceName);
 
   for (const [serviceName, containers] of originalByService) {
+    if (names.has(serviceName)) {
+      continue;
+    }
     if (containers.length !== 1) {
       continue;
     }
@@ -1805,6 +1852,11 @@ function quoteYamlString(value: string): string {
 function readRuntimeContainerId(row: RuntimeContainerRow): string | undefined {
   const id = (row.ID ?? row.Id)?.trim();
   return id === undefined || id.length === 0 ? undefined : id;
+}
+
+function readRuntimeContainerName(row: RuntimeContainerRow): string | undefined {
+  const name = normalizeContainerNameText(row.Names ?? row.Name ?? "");
+  return name.length === 0 ? undefined : name;
 }
 
 function sameContainerId(left: string, right: string): boolean {

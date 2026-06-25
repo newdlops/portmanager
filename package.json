@@ -69,6 +69,8 @@
     "onCommand:portManager.stopDaemon",
     "onCommand:portManager.showDaemonStatus",
     "onCommand:portManager.clearRoutingFiles",
+    "onCommand:portManager.resetRouting",
+    "onCommand:portManager.clearNetworkRoutingFiles",
     "onCommand:portManager.startManagedProcess",
     "onCommand:portManager.addExistingProcess",
     "onCommand:portManager.refresh",
@@ -290,6 +292,18 @@
         "icon": "$(clear-all)"
       },
       {
+        "command": "portManager.resetRouting",
+        "title": "Port Manager: Reset Routing",
+        "category": "Port Manager",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "portManager.clearNetworkRoutingFiles",
+        "title": "Port Manager: Clear Network Routing Cache",
+        "category": "Port Manager",
+        "icon": "$(clear-all)"
+      },
+      {
         "command": "portManager.startManagedProcess",
         "title": "Port Manager: Start Managed Process",
         "category": "Port Manager"
@@ -503,9 +517,14 @@
           "group": "network@10"
         },
         {
-          "command": "portManager.removeLogicalNetwork",
+          "command": "portManager.clearNetworkRoutingFiles",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@11"
+        },
+        {
+          "command": "portManager.removeLogicalNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "network@12"
         },
         {
           "command": "portManager.refreshContainerServices",

@@ -856,6 +856,7 @@ test("mutates compose services into a hidden network-scoped project", async (con
     "compose",
     "container",
     "container",
+    "container",
     "compose",
     "volume",
     "run",
@@ -866,7 +867,7 @@ test("mutates compose services into a hidden network-scoped project", async (con
     "container",
   ]);
   assert.deepEqual(calls[0]?.args, ["compose", "-p", "workspace", "-f", composeFile, "config", "--services"]);
-  assert.deepEqual(calls[8]?.args.slice(0, 8), [
+  assert.deepEqual(calls[9]?.args.slice(0, 8), [
     "compose",
     "-p",
     "a-app-workspace-bc74e5f2",
@@ -876,10 +877,10 @@ test("mutates compose services into a hidden network-scoped project", async (con
     result.state.overrideFile,
     "up",
   ]);
-  assert.equal(calls[5]?.args.includes("workspace_pgdata:/from:ro"), true);
-  assert.equal(calls[7]?.args.includes(`${initdbDir}:/from:ro`), true);
+  assert.equal(calls[6]?.args.includes("workspace_pgdata:/from:ro"), true);
+  assert.equal(calls[8]?.args.includes(`${initdbDir}:/from:ro`), true);
   assert.equal(calls[0]?.cwd, tempDir);
-  assert.equal(calls[3]?.cwd, tempDir);
+  assert.equal(calls[4]?.cwd, tempDir);
 });
 
 test("copies an existing compose clone without stacking the network-scoped project name", async (context) => {
@@ -1787,6 +1788,192 @@ test("increments clone container names when the project suffix candidate is alre
     },
   ]);
   assert.match(fs.readFileSync(result.state.overrideFile, "utf8"), /container_name: 'captain_db-new-copy-2'/);
+});
+
+test("increments clone container names reserved by other runtime containers", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-runtime-reserved-name-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  fs.writeFileSync(
+    composeFile,
+    "name: captain\nservices:\n  db:\n    image: postgres:16\n    container_name: captain_db\n",
+    "utf8",
+  );
+  let containerListCount = 0;
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ps") {
+        return {
+          stdout: [
+            JSON.stringify({ ID: "reserved1", Names: "captain_db" }),
+            JSON.stringify({ ID: "reserved2", Names: "captain_db-new-copy" }),
+          ].join("\n"),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        containerListCount += 1;
+        return {
+          stdout: JSON.stringify({
+            ID: containerListCount === 1 ? "source123" : "newclone123",
+            Names: containerListCount === 1 ? "docker-db-1" : "captain_db-new-copy-2",
+            Ports: containerListCount === 1 ? "127.0.0.1:57001->5432/tcp" : "127.0.0.1:57002->5432/tcp",
+            Labels:
+              containerListCount === 1
+                ? "com.docker.compose.project=docker,com.docker.compose.service=db"
+                : "com.docker.compose.project=new-copy,com.docker.compose.service=db",
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({
+              Id: id,
+              Name:
+                id === "source123"
+                  ? "/docker-db-1"
+                  : id === "newclone123"
+                    ? "/captain_db-new-copy-2"
+                    : `/${id}`,
+              Config: { Labels: { "com.docker.compose.service": "db" } },
+              Mounts: [],
+            })),
+          ),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    attachedProjectName: "new-copy",
+    runtime: "docker",
+    networkName: "A app",
+    originalProjectName: "docker",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    ports: [
+      {
+        serviceName: "db",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 57001,
+        containerPort: 5432,
+        protocol: "tcp",
+      },
+    ],
+  });
+
+  assert.deepEqual(result.state.containerMappings, [
+    {
+      serviceName: "db",
+      originalContainerId: "source123",
+      originalContainerName: "docker-db-1",
+      attachedContainerId: "newclone123",
+      attachedContainerName: "captain_db-new-copy-2",
+    },
+  ]);
+  assert.match(fs.readFileSync(result.state.overrideFile, "utf8"), /container_name: 'captain_db-new-copy-2'/);
+});
+
+test("rewrites unselected compose container names when the clone override is reused", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-unselected-container-name-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: captain",
+      "services:",
+      "  db:",
+      "    image: postgres:16",
+      "    container_name: captain_db",
+      "  chrome:",
+      "    image: chromium:latest",
+      "    container_name: captain_chrome",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  let containerListCount = 0;
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config")) {
+        return { stdout: "db\nchrome\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ps") {
+        return {
+          stdout: [
+            JSON.stringify({ ID: "reserved1", Names: "captain_db" }),
+            JSON.stringify({ ID: "reserved2", Names: "captain_chrome" }),
+          ].join("\n"),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        containerListCount += 1;
+        return {
+          stdout: JSON.stringify({
+            ID: containerListCount === 1 ? "source123" : "clone123",
+            Names: containerListCount === 1 ? "captain_db" : "captain_db-new-copy",
+            Ports: containerListCount === 1 ? "127.0.0.1:15432->5432/tcp" : "127.0.0.1:57002->5432/tcp",
+            Labels:
+              containerListCount === 1
+                ? "com.docker.compose.project=captain,com.docker.compose.service=db"
+                : "com.docker.compose.project=new-copy,com.docker.compose.service=db",
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({
+              Id: id,
+              Name: id === "source123" ? "/captain_db" : id === "clone123" ? "/captain_db-new-copy" : `/${id}`,
+              Config: { Labels: { "com.docker.compose.service": "db" } },
+              Mounts: [],
+            })),
+          ),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    attachedProjectName: "new-copy",
+    runtime: "docker",
+    networkName: "A app",
+    originalProjectName: "captain",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    ports: [
+      {
+        serviceName: "db",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 15432,
+        containerPort: 5432,
+        protocol: "tcp",
+      },
+    ],
+  });
+
+  const overrideText = fs.readFileSync(result.state.overrideFile, "utf8");
+  assert.match(overrideText, /'db':\n    container_name: 'captain_db-new-copy'/);
+  assert.match(overrideText, /'chrome':\n    container_name: 'captain_chrome-new-copy'/);
 });
 
 test("suffixes explicit compose container names that look generated when the SOT name is reserved", async (context) => {

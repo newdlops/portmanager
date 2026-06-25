@@ -254,6 +254,13 @@ export class PortManagerTreeProvider
           "Load saved bindings",
           element.network,
         ),
+        new ActionTreeItem(
+          "Clear Network Cache",
+          "portManager.clearNetworkRoutingFiles",
+          "clear-all",
+          "Remove generated route files",
+          element.network,
+        ),
         ...(attachments.length > 0
           ? [new ActionTreeItem("Detach Terminal", "portManager.detachTerminalFromNetwork", "debug-disconnect")]
           : []),
@@ -362,6 +369,7 @@ export class PortManagerTreeProvider
         ];
       case "daemon":
         return [
+          new ActionTreeItem("Reset Routing", "portManager.resetRouting", "clear-all"),
           new ActionTreeItem("Restart Daemon", "portManager.restartDaemon", "debug-restart"),
           new ActionTreeItem("Start Daemon", "portManager.startDaemon", "server-process"),
           new ActionTreeItem("Stop Daemon", "portManager.stopDaemon", "debug-disconnect"),

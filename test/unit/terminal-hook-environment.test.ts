@@ -93,9 +93,10 @@ test("logical routers are opened for compose clone endpoints only", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
 
-  assert.equal(source.includes("collectComposeLogicalRouterPorts(this.processService?.getSnapshot().routes ?? [])"), true);
+  assert.equal(source.includes("collectComposeLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? [])"), true);
   assert.equal(source.includes('route.source === "compose"'), true);
   assert.equal(source.includes("route.actualPort !== route.logicalPort"), true);
+  assert.equal(source.includes("!externallyOwnedPorts.has(route.logicalPort)"), true);
   assert.equal(
     source.includes("await this.logicalPortRouter.sync([]).catch(() => undefined);"),
     false,

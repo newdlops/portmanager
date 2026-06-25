@@ -151,6 +151,77 @@ test("docker compose wrapper targets clone project by compose file outside the p
   }
 });
 
+test("docker compose wrapper appends clone override before the compose subcommand", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-routing-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const composeFile = path.join(projectDir, "docker", "development.yaml");
+  const overrideFile = path.join(tempDir, "network-a-app-1234.ports.override.yaml");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(path.dirname(composeFile), { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(composeFile, "services: {}\n", "utf8");
+  fs.writeFileSync(overrideFile, "services: {}\n", "utf8");
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        composeFiles: [composeFile],
+        originalProjectName: "workspace",
+        attachedProjectName: "network-a-app-1234",
+        overrideFile,
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(binDir, "docker"),
+    "#!/bin/sh\nprintf 'env=%s\\n' \"${COMPOSE_PROJECT_NAME:-}\"\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n",
+    {
+      encoding: "utf8",
+      mode: 0o700,
+    },
+  );
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          `docker compose -f ${shellQuote(composeFile)} up`,
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(
+      output,
+      [
+        "env=network-a-app-1234",
+        "<compose>",
+        "<-f>",
+        `<${composeFile}>`,
+        "<-f>",
+        `<${overrideFile}>`,
+        "<up>",
+        "<--detach>",
+        "",
+      ].join("\n"),
+    );
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("docker compose wrapper routes same project name from another worktree", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-worktree-project-routing-"));
   const attachedProjectDir = path.join(tempDir, "worktree-a", "app");

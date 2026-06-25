@@ -56,6 +56,7 @@ import type {
   DisposableLike,
   HostAccessBinding,
   HostPortExposure,
+  ListeningPort,
   ManagedProcess,
   LogicalNetwork,
   LogicalPortRoute,
@@ -128,6 +129,13 @@ export interface RoutingFileCleanupSummary {
   readonly failedFileCount: number;
   /** Compose endpoint routes re-registered into the singleton daemon afterward. */
   readonly restoredComposeRouteCount: number;
+}
+
+interface FileCleanupSummary {
+  /** Existing generated files removed from disk. */
+  readonly removedFileCount: number;
+  /** Files that could not be removed because the filesystem rejected cleanup. */
+  readonly failedFileCount: number;
 }
 
 export interface VscodeWindowTerminalAttachSummary {
@@ -1229,35 +1237,43 @@ export class PortManagerNetworkService implements DisposableLike {
    */
   async clearRoutingFiles(): Promise<RoutingFileCleanupSummary> {
     const cleanupPaths = await this.collectRoutingFileCleanupPaths();
-    let removedFileCount = 0;
-    let failedFileCount = 0;
-
-    await Promise.all(
-      [...cleanupPaths].map(async (filePath) => {
-        try {
-          await fs.rm(filePath, { force: true });
-          removedFileCount++;
-        } catch {
-          failedFileCount++;
-        }
-      }),
-    );
-
-    await this.writeHostAccessBindingsFile().catch(() => undefined);
-    await this.writeComposeProjectRoutingFile().catch(() => undefined);
-
+    const summary = await removeRoutingFilePaths(cleanupPaths);
     const attachments = this.registry
       .getSnapshot()
       .composeAttachments.filter((attachment) => attachment.status === "attached" && attachment.ports.length > 0);
-    const restoredComposeRouteCount =
-      this.processService === undefined ? 0 : attachments.reduce((sum, attachment) => sum + attachment.ports.length, 0);
-    await this.restorePersistedComposeRoutes(attachments);
 
-    return {
-      removedFileCount,
-      failedFileCount,
-      restoredComposeRouteCount,
-    };
+    return this.rehydrateRoutingFiles(summary, attachments);
+  }
+
+  /**
+   * Removes only generated route/cache files scoped to one logical network.
+   *
+   * Docker state and durable registry rows are preserved. The network's compose
+   * routes are rehydrated immediately so attached clones stay reachable after a
+   * stale TSV/JSON cleanup.
+   */
+  async clearNetworkRoutingFiles(networkId: string): Promise<RoutingFileCleanupSummary> {
+    const network = this.registry.getNetwork(networkId);
+    if (network === undefined) {
+      throw new Error(`Unknown logical network: ${networkId}`);
+    }
+
+    const cleanupPaths = await this.collectNetworkRoutingFileCleanupPaths(network.id);
+    const summary = await removeRoutingFilePaths(cleanupPaths);
+    const markerSummary = await this.clearManualTerminalAttachmentMarkersForNetwork(network.id);
+
+    return this.rehydrateRoutingFiles(
+      {
+        removedFileCount: summary.removedFileCount + markerSummary.removedFileCount,
+        failedFileCount: summary.failedFileCount + markerSummary.failedFileCount,
+      },
+      this.registry
+        .getSnapshot()
+        .composeAttachments.filter(
+          (attachment) =>
+            attachment.networkId === network.id && attachment.status === "attached" && attachment.ports.length > 0,
+        ),
+    );
   }
 
   /** Releases listeners and event subscriptions. */
@@ -1832,7 +1848,8 @@ export class PortManagerNetworkService implements DisposableLike {
      * Do not open routers for hooked app listeners: those logical ports may be
      * requested by the app itself, and a router would race the real bind.
      */
-    await this.logicalPortRouter.sync(collectComposeLogicalRouterPorts(this.processService?.getSnapshot().routes ?? [])).catch(
+    const snapshot = this.processService?.getSnapshot();
+    await this.logicalPortRouter.sync(collectComposeLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? [])).catch(
       () => undefined,
     );
   }
@@ -2154,6 +2171,54 @@ export class PortManagerNetworkService implements DisposableLike {
     return filePaths;
   }
 
+  /** Collects generated routing files that are scoped to one logical network. */
+  private async collectNetworkRoutingFileCleanupPaths(networkId: string): Promise<ReadonlySet<string>> {
+    const filePaths = new Set<string>();
+    const networkRouteTablePath = getRouteTablePathForNetwork(networkId);
+    const networkRouteTableName = path.basename(networkRouteTablePath);
+    const networkRouteTableStem = path.basename(networkRouteTablePath, path.extname(networkRouteTablePath));
+    const networkRouteTableExtension = path.extname(networkRouteTablePath) || ".json";
+    const networkScope = sanitizeRouteFileScope(networkId);
+
+    await this.collectMatchingFiles(path.dirname(getDefaultRouteTablePath()), (entryName) =>
+      entryName === networkRouteTableName ||
+      (entryName.startsWith(`${networkRouteTableStem}-`) && entryName.endsWith(networkRouteTableExtension)),
+    ).then((paths) => paths.forEach((filePath) => filePaths.add(filePath)));
+
+    await this.collectMatchingFiles(this.context.globalStorageUri.fsPath, (entryName) =>
+      entryName === `${COMPOSE_PROJECT_ROUTING_FILE_PREFIX}${networkScope}.tsv` ||
+      (entryName.startsWith(`${COMPOSE_PROJECT_ROUTING_FILE_PREFIX}${networkScope}${COMPOSE_PROJECT_ROUTING_COMPOSE_SEPARATOR}`) &&
+        entryName.endsWith(".tsv")) ||
+      entryName === `portmanager-bash-env-${networkScope}.sh`,
+    ).then((paths) => paths.forEach((filePath) => filePaths.add(filePath)));
+
+    await this.collectMatchingFiles(this.getTerminalHookScriptDirectoryPath(), (entryName) =>
+      entryName === `attach-${networkScope}.sh`,
+    ).then((paths) => paths.forEach((filePath) => filePaths.add(filePath)));
+
+    return filePaths;
+  }
+
+  /** Rewrites generated route files and daemon compose rows after cleanup. */
+  private async rehydrateRoutingFiles(
+    summary: FileCleanupSummary,
+    attachments: readonly ComposeAttachment[],
+  ): Promise<RoutingFileCleanupSummary> {
+    await this.writeHostAccessBindingsFile().catch(() => undefined);
+    await this.writeComposeProjectRoutingFile().catch(() => undefined);
+
+    const restoredComposeRouteCount =
+      this.processService === undefined ? 0 : attachments.reduce((sum, attachment) => sum + attachment.ports.length, 0);
+    await this.restorePersistedComposeRoutes(attachments);
+    await this.syncLogicalPortRouters();
+
+    return {
+      removedFileCount: summary.removedFileCount,
+      failedFileCount: summary.failedFileCount,
+      restoredComposeRouteCount,
+    };
+  }
+
   /** Lists generated files in one directory without letting cleanup fail on missing folders. */
   private async collectMatchingFiles(
     directoryPath: string,
@@ -2301,15 +2366,17 @@ export class PortManagerNetworkService implements DisposableLike {
     );
   }
 
+  /** Removes marker files scoped to one network and reports cleanup failures. */
+  private async clearManualTerminalAttachmentMarkersForNetwork(networkId: string): Promise<FileCleanupSummary> {
+    const markers = await this.readManualTerminalAttachmentMarkers();
+    return removeRoutingFilePaths(
+      new Set(markers.filter((marker) => marker.networkId === networkId).map((marker) => marker.filePath)),
+    );
+  }
+
   /** Removes marker files scoped to a network being deleted. */
   private async removeManualTerminalAttachmentMarkersForNetwork(networkId: string): Promise<void> {
-    const markers = await this.readManualTerminalAttachmentMarkers();
-
-    await Promise.all(
-      markers
-        .filter((marker) => marker.networkId === networkId)
-        .map((marker) => fs.rm(marker.filePath, { force: true }).catch(() => undefined)),
-    );
+    await this.clearManualTerminalAttachmentMarkersForNetwork(networkId);
   }
 
   /** Clears every manual marker when the user asks for a global terminal reset. */
@@ -2810,6 +2877,7 @@ function buildComposeProjectRoutingRows(
         composeFiles: mutation.composeFiles,
         originalProjectName: mutation.originalProjectName,
         attachedProjectName: mutation.attachedProjectName,
+        overrideFile: mutation.overrideFile,
         containerMappings: mutation.containerMappings,
       },
     ];
@@ -2924,6 +2992,27 @@ function isGeneratedHostAccessFile(entryName: string, baseHostAccessPath: string
   const extension = parsedPath.ext.length > 0 ? parsedPath.ext : ".json";
 
   return entryName === parsedPath.base || (entryName.startsWith(`${parsedPath.name}-`) && entryName.endsWith(extension));
+}
+
+async function removeRoutingFilePaths(filePaths: ReadonlySet<string>): Promise<FileCleanupSummary> {
+  let removedFileCount = 0;
+  let failedFileCount = 0;
+
+  await Promise.all(
+    [...filePaths].map(async (filePath) => {
+      try {
+        await fs.rm(filePath, { force: true });
+        removedFileCount++;
+      } catch {
+        failedFileCount++;
+      }
+    }),
+  );
+
+  return {
+    removedFileCount,
+    failedFileCount,
+  };
 }
 
 /** Builds the daemon process row that owns one compose published-port route. */
@@ -3123,6 +3212,7 @@ function composeProjectRoutingRowScope(row: ComposeProjectRoutingRow): string {
         composeFiles: row.composeFiles ?? [],
         originalProjectName: row.originalProjectName ?? "",
         attachedProjectName: row.attachedProjectName,
+        overrideFile: row.overrideFile ?? "",
       }),
     )
     .digest("hex")
@@ -3179,21 +3269,36 @@ function isListenRoute(route: LogicalPortRoute): boolean {
   return route.routeDirection === undefined || route.routeDirection === "listen";
 }
 
-function collectComposeLogicalRouterPorts(routes: readonly LogicalPortRoute[]): readonly number[] {
+function collectComposeLogicalRouterPorts(
+  routes: readonly LogicalPortRoute[],
+  listeners: readonly ListeningPort[] = [],
+): readonly number[] {
   const ports = new Set<number>();
+  const externallyOwnedPorts = new Set(
+    listeners
+      .filter((listener) => listener.protocol === "tcp" && !isPortManagerLogicalRouterListener(listener))
+      .map((listener) => listener.port),
+  );
 
   for (const route of routes) {
     if (
       route.source === "compose" &&
       isLiveListenRoute(route) &&
       route.actualPort !== route.logicalPort &&
-      isTcpPort(route.logicalPort)
+      isTcpPort(route.logicalPort) &&
+      !externallyOwnedPorts.has(route.logicalPort)
     ) {
       ports.add(route.logicalPort);
     }
   }
 
   return [...ports].sort((left, right) => left - right);
+}
+
+function isPortManagerLogicalRouterListener(listener: ListeningPort): boolean {
+  const processName = listener.processName ?? "";
+  const command = listener.command ?? "";
+  return processName.includes("portmanager_tcp_router") || command.includes("portmanager_tcp_router");
 }
 
 function isTcpPort(port: number): boolean {
