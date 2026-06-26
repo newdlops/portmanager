@@ -142,13 +142,21 @@ export class ContainerServiceDiscoveryAdapter {
     for (const executable of runtimeCandidates(settings.containerRuntime)) {
       try {
         const rows = await this.listRuntimeRows(executable, true);
+        const relevantRows = filterComposeContainerMappingRows(
+          rows,
+          originalProjectName,
+          attachedProjectName,
+          composeFiles,
+          services,
+          currentMappings,
+        );
         return refreshContainerMappingsFromIdentities(
           originalProjectName,
           attachedProjectName,
           composeFiles,
           services,
           currentMappings,
-          parseComposeContainerIdentities(await this.enrichRuntimeRowsWithInspectNames(executable, rows)),
+          parseComposeContainerIdentities(await this.enrichRuntimeRowsWithInspectNames(executable, relevantRows)),
         );
       } catch {
         // Try the next configured runtime.
@@ -362,6 +370,58 @@ function parseComposeContainerIdentities(rows: readonly RuntimeContainerRow[]): 
       };
     })
     .filter((identity): identity is ComposeContainerIdentity => identity !== undefined);
+}
+
+function filterComposeContainerMappingRows(
+  rows: readonly RuntimeContainerRow[],
+  originalProjectName: string,
+  attachedProjectName: string,
+  composeFiles: readonly string[],
+  services: readonly string[],
+  currentMappings: readonly ComposeContainerMutationMapping[],
+): readonly RuntimeContainerRow[] {
+  const projectNames = new Set([originalProjectName, attachedProjectName].filter((value) => value.trim().length > 0));
+  const serviceNames = new Set([
+    ...services,
+    ...currentMappings
+      .map((mapping) => mapping.serviceName)
+      .filter((service) => service.length > 0 && !service.startsWith(CONTAINER_ALIAS_SERVICE_PREFIX)),
+  ]);
+  const knownContainerIds = new Set(
+    currentMappings.flatMap((mapping) => [mapping.originalContainerId, mapping.attachedContainerId]),
+  );
+  const knownContainerNames = new Set(
+    currentMappings.flatMap((mapping) => [mapping.originalContainerName, mapping.attachedContainerName]),
+  );
+
+  return rows.filter((row) => {
+    const id = readFirstString(row.ID, row.Id);
+    const name = normalizeContainerName(readFirstString(row.Names, row.Name));
+
+    if (id !== undefined && [...knownContainerIds].some((knownId) => idsSharePrefix(knownId, id))) {
+      return true;
+    }
+
+    if (name !== undefined && knownContainerNames.has(name)) {
+      return true;
+    }
+
+    const labels = parseLabels(row.Labels);
+    const composeProject = readLabel(labels, "com.docker.compose.project", "io.podman.compose.project");
+    const composeService = readLabel(labels, "com.docker.compose.service", "io.podman.compose.service");
+    if (composeProject === undefined || composeService === undefined || !serviceNames.has(composeService)) {
+      return false;
+    }
+
+    if (projectNames.has(composeProject)) {
+      return true;
+    }
+
+    const rowComposeFiles = parseComposeConfigFiles(
+      readLabel(labels, "com.docker.compose.project.config_files", "io.podman.compose.project.config_files"),
+    );
+    return composeCandidateMatchesFiles(rowComposeFiles, composeFiles.filter((file) => !isPortManagerOverrideFile(file)));
+  });
 }
 
 /** Parses Docker/Podman `Ports` text into host-published TCP endpoints. */
@@ -993,6 +1053,17 @@ function sameOriginalCloneSource(left: OriginalCloneSource, right: OriginalClone
     composeCandidateMatchesFiles(left.composeConfigFiles, right.composeConfigFiles) &&
     composeCandidateMatchesFiles(right.composeConfigFiles, left.composeConfigFiles)
   );
+}
+
+function idsSharePrefix(left: string, right: string): boolean {
+  const normalizedLeft = left.trim();
+  const normalizedRight = right.trim();
+
+  if (normalizedLeft.length === 0 || normalizedRight.length === 0) {
+    return false;
+  }
+
+  return normalizedLeft.startsWith(normalizedRight) || normalizedRight.startsWith(normalizedLeft);
 }
 
 function buildPortOverrideKey(containerPort: number, protocol: string): string {

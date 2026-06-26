@@ -605,6 +605,12 @@ test("refreshes clone container mappings with inspect names when list rows omit 
             Labels:
               "com.docker.compose.project=workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml",
           }),
+          JSON.stringify({
+            ID: "unrelated999",
+            Ports: "",
+            Labels:
+              "com.docker.compose.project=unrelated,com.docker.compose.service=cache,com.docker.compose.project.config_files=/other/compose.yaml",
+          }),
         ].join("\n"),
         stderr: "",
       };
@@ -654,6 +660,7 @@ test("mutates compose services with inspect container names when list rows omit 
     "utf8",
   );
   let containerListCount = 0;
+  const inspectCalls: string[][] = [];
   const mutator = new ComposePublishMutator({
     storageDirectory: tempDir,
     runCommand: async (_executable, args) => {
@@ -675,6 +682,11 @@ test("mutates compose services with inspect container names when list rows omit 
                 Ports: "",
                 Labels: "com.docker.compose.project=workspace,com.docker.compose.service=postgres",
               }),
+              JSON.stringify({
+                ID: "unrelated789",
+                Ports: "",
+                Labels: "com.docker.compose.project=workspace,com.docker.compose.service=cache",
+              }),
             ].join("\n"),
             stderr: "",
           };
@@ -691,6 +703,7 @@ test("mutates compose services with inspect container names when list rows omit 
       }
       if (args[0] === "container" && args[1] === "inspect") {
         const ids = args.slice(2);
+        inspectCalls.push([...ids]);
         return {
           stdout: JSON.stringify(
             ids.map((id) => ({
@@ -759,6 +772,7 @@ test("mutates compose services with inspect container names when list rows omit 
   const overrideText = fs.readFileSync(result.state.overrideFile, "utf8");
   assert.match(overrideText, /container_name: 'captain_postgres-a-app-workspace-bc74e5f2'/);
   assert.doesNotMatch(overrideText, /pm-captain_postgres/);
+  assert.deepEqual(inspectCalls[0], ["original123", "stale456"]);
 });
 
 test("mutates compose services into a hidden network-scoped project", async (context) => {
@@ -2727,10 +2741,26 @@ test("mutates compose services in-place without resetting container names", asyn
     calls.map((call) => call.args.slice(0, 8)),
     [
       ["compose", "-p", "workspace", "-f", composeFile, "config", "--services"],
-      ["container", "ls", "--no-trunc", "--format", "{{json .}}"],
+      [
+        "container",
+        "ls",
+        "--no-trunc",
+        "--filter",
+        "label=com.docker.compose.project=workspace",
+        "--format",
+        "{{json .}}",
+      ],
       ["container", "inspect", "original123"],
       ["compose", "-p", "workspace", "-f", composeFile, "-f", result.state.overrideFile, "up"],
-      ["container", "ls", "--no-trunc", "--format", "{{json .}}"],
+      [
+        "container",
+        "ls",
+        "--no-trunc",
+        "--filter",
+        "label=com.docker.compose.project=workspace",
+        "--format",
+        "{{json .}}",
+      ],
       ["container", "inspect", "hidden123"],
     ],
   );

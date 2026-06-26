@@ -1128,6 +1128,52 @@ test("reserves OS listener ports even when availability probing reports them fre
   assert.equal(allocation.actualPort, 3001);
 });
 
+test("coalesces concurrent listener snapshot scans", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const scanStarted = deferred<void>();
+  const releaseScan = deferred<void>();
+  let scanCount = 0;
+  const listeners: readonly ListeningPort[] = [
+    createListener({
+      port: 3000,
+      pid: 4321,
+      processName: "node",
+    }),
+  ];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => {
+        scanCount += 1;
+        scanStarted.resolve();
+        await releaseScan.promise;
+        return listeners;
+      },
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const firstSnapshot = agent.refreshSnapshot();
+  const secondSnapshot = agent.listSnapshot();
+  const backgroundPoll = runListenerPoll(agent);
+
+  await scanStarted.promise;
+  await waitOneTurn();
+
+  assert.equal(scanCount, 1);
+
+  releaseScan.resolve();
+  const [first, second] = await Promise.all([firstSnapshot, secondSnapshot, backgroundPoll.then(() => undefined)]);
+
+  assert.equal(scanCount, 1);
+  assert.equal(first.listeners[0]?.port, 3000);
+  assert.equal(second.listeners[0]?.port, 3000);
+});
+
 function createFakeLauncher(): ProcessLauncher {
   return {
     launch: async () => ({ pid: 1234, command: "node server.js" }),

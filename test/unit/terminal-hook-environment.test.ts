@@ -52,6 +52,12 @@ test("package command shims rerun client tools without native runtime alias sema
   }
 
   assert.equal(source.includes("buildPreloadPackageCommandShimScript"), true);
+  assert.equal(source.includes("__pm_is_package_command_shim()"), true);
+  assert.equal(
+    source.includes('if __pm_is_package_command_shim "\\${__pm_candidate}"; then'),
+    true,
+    "package command shim must skip sibling Port Manager package shims in later PATH entries",
+  );
   assert.equal(source.includes('exec "\\${__pm_node}" "\\${__pm_unwrapped}" "$@"'), true);
   assert.equal(
     source.includes('__pm_exec_script="$(sed -n'),
@@ -187,10 +193,28 @@ test("background routing refresh polls terminals and containers", () => {
 
   assert.equal(source.includes("private startRoutingSignalRefreshLoop(): void"), true);
   assert.equal(source.includes("this.refreshTerminals().catch(() => [])"), true);
-  assert.equal(source.includes("this.refreshContainerServices().catch(() => [])"), true);
-  assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts().catch(() => undefined);"), true);
+  assert.equal(source.includes("this.refreshContainerServices({ background: true }).catch(() => [])"), true);
+  assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts({ background: true }).catch(() => undefined);"), true);
   assert.equal(source.includes("await this.convergeDaemonAndRoutingState();"), true);
   assert.equal(source.includes("ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 3_000"), true);
+  assert.equal(source.includes("BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS = 60_000"), true);
+  assert.equal(source.includes("tryAcquireSharedBackgroundContainerRefreshSlot()"), true);
+});
+
+test("terminal daemon ensure serializes agent startup and preserves slow live sockets", () => {
+  const networkServicePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const commandsPath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const networkSource = fs.readFileSync(networkServicePath, "utf8");
+  const commandsSource = fs.readFileSync(commandsPath, "utf8");
+
+  for (const source of [networkSource, commandsSource]) {
+    assert.equal(source.includes('__pm_agent_lock="\\${PORT_MANAGER_AGENT_SOCKET}.startup.lock"'), true);
+    assert.equal(source.includes('if mkdir "$__pm_agent_lock" 2>/dev/null; then'), true);
+    assert.equal(source.includes('timer=setTimeout(()=>finish(1,false),700);'), true);
+    assert.equal(source.includes('socket.once("error",()=>finish(1,false));'), true);
+    assert.equal(source.includes('rm -f "$PORT_MANAGER_AGENT_SOCKET" 2>/dev/null || true'), true);
+    assert.equal(source.includes('rmdir "$__pm_agent_lock" 2>/dev/null || true'), true);
+  }
 });
 
 test("background routing refresh converges daemon version and generated route files", () => {

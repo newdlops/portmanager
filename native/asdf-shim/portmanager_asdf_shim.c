@@ -26,6 +26,14 @@
 #define PM_MAX_TEXT 512
 #define PM_RUNTIME_SHIM_DIR_ENV "PORT_MANAGER_RUNTIME_SHIM_DIR"
 
+#if defined(__APPLE__)
+#define PM_PRELOAD_ENV "DYLD_INSERT_LIBRARIES"
+#define PM_PRELOAD_HINT_ENV "PORT_MANAGER_DYLD_INSERT_LIBRARIES"
+#else
+#define PM_PRELOAD_ENV "LD_PRELOAD"
+#define PM_PRELOAD_HINT_ENV "PORT_MANAGER_LD_PRELOAD"
+#endif
+
 static const char *pm_basename(const char *path) {
   char *copy;
   char *name;
@@ -275,7 +283,9 @@ static int pm_read_all(int fd, char *buffer, size_t size) {
   return used > 0 ? 0 : -1;
 }
 
-static int pm_asdf_which(const char *tool_name, char *buffer, size_t size) {
+static void pm_disable_hook_for_tool_resolution(const char *tool_name, const char *self_path);
+
+static int pm_asdf_which(const char *tool_name, const char *self_path, char *buffer, size_t size) {
   int pipe_fds[2];
   pid_t pid;
   int status = 0;
@@ -298,6 +308,7 @@ static int pm_asdf_which(const char *tool_name, char *buffer, size_t size) {
     if (devnull >= 0) {
       dup2(devnull, STDERR_FILENO);
     }
+    pm_disable_hook_for_tool_resolution(tool_name, self_path);
     execlp("asdf", "asdf", "which", tool_name, (char *)NULL);
     _exit(127);
   }
@@ -345,6 +356,21 @@ static int pm_same_directory(const char *left, const char *right) {
   return strcmp(left_path, right_path) == 0;
 }
 
+static int pm_same_file(const char *left, const char *right) {
+  struct stat left_stat;
+  struct stat right_stat;
+
+  if (left == NULL || right == NULL || left[0] == '\0' || right[0] == '\0') {
+    return 0;
+  }
+
+  if (stat(left, &left_stat) != 0 || stat(right, &right_stat) != 0) {
+    return 0;
+  }
+
+  return left_stat.st_dev == right_stat.st_dev && left_stat.st_ino == right_stat.st_ino;
+}
+
 static int pm_is_executable_file(const char *path) {
   struct stat stat_buffer;
 
@@ -355,7 +381,109 @@ static int pm_is_executable_file(const char *path) {
   return access(path, X_OK) == 0;
 }
 
-static int pm_find_on_path(const char *tool_name, char *buffer, size_t size) {
+static int pm_candidate_is_current_shim(const char *candidate, const char *self_path) {
+  return pm_is_executable_file(candidate) && pm_same_file(candidate, self_path);
+}
+
+static char *pm_path_without_runtime_shims(const char *tool_name, const char *self_path) {
+  const char *path_env = getenv("PATH");
+  const char *shim_directory = getenv(PM_RUNTIME_SHIM_DIR_ENV);
+  const char *cursor;
+  char *result;
+  size_t result_size;
+  size_t used = 0;
+
+  if (path_env == NULL || path_env[0] == '\0') {
+    return NULL;
+  }
+
+  result_size = strlen(path_env) + 1;
+  result = calloc(result_size, 1);
+  if (result == NULL) {
+    return NULL;
+  }
+
+  cursor = path_env;
+  while (cursor != NULL) {
+    const char *separator = strchr(cursor, ':');
+    size_t directory_length = separator == NULL ? strlen(cursor) : (size_t)(separator - cursor);
+    char directory[PM_MAX_PATH];
+    char candidate[PM_MAX_PATH];
+    int skip_directory = 0;
+
+    if (directory_length == 0) {
+      snprintf(directory, sizeof(directory), ".");
+    } else if (directory_length >= sizeof(directory)) {
+      skip_directory = 1;
+    } else {
+      memcpy(directory, cursor, directory_length);
+      directory[directory_length] = '\0';
+    }
+
+    if (!skip_directory && shim_directory != NULL && shim_directory[0] != '\0' &&
+        pm_same_directory(directory, shim_directory)) {
+      skip_directory = 1;
+    }
+
+    if (!skip_directory && tool_name != NULL && tool_name[0] != '\0') {
+      snprintf(candidate, sizeof(candidate), "%s/%s", directory, tool_name);
+      if (pm_candidate_is_current_shim(candidate, self_path)) {
+        skip_directory = 1;
+      }
+    }
+
+    if (!skip_directory) {
+      if (used > 0) {
+        result[used++] = ':';
+      }
+      if (used + directory_length < result_size) {
+        memcpy(result + used, cursor, directory_length);
+        used += directory_length;
+        result[used] = '\0';
+      }
+    }
+
+    if (separator == NULL) {
+      break;
+    }
+    cursor = separator + 1;
+  }
+
+  return result;
+}
+
+static void pm_disable_hook_for_tool_resolution(const char *tool_name, const char *self_path) {
+  char *clean_path = pm_path_without_runtime_shims(tool_name, self_path);
+
+  /*
+   * asdf's resolver is an implementation detail of this launcher. Letting the
+   * resolver inherit Port Manager's preload and BASH_ENV makes asdf's own
+   * helper commands re-enter this shim, which can leave the parent blocked on
+   * the resolver pipe before the requested runtime is ever exec'd.
+   */
+  setenv("PORT_MANAGER_HOOK_DISABLED", "1", 1);
+  unsetenv(PM_PRELOAD_ENV);
+  unsetenv(PM_PRELOAD_HINT_ENV);
+  unsetenv("BASH_ENV");
+  unsetenv("PORT_MANAGER_PREV_BASH_ENV");
+
+  if (clean_path != NULL) {
+    setenv("PATH", clean_path, 1);
+    free(clean_path);
+  }
+}
+
+static int pm_is_asdf_shim_candidate(const char *candidate) {
+  return candidate != NULL && strstr(candidate, "/.asdf/shims/") != NULL;
+}
+
+static int pm_find_on_path_excluding(
+  const char *tool_name,
+  const char *self_path,
+  const char *excluded_path,
+  char *buffer,
+  size_t size
+) {
   const char *path_env = getenv("PATH");
   const char *shim_directory = getenv(PM_RUNTIME_SHIM_DIR_ENV);
   const char *cursor;
@@ -386,6 +514,18 @@ static int pm_find_on_path(const char *tool_name, char *buffer, size_t size) {
     }
 
     snprintf(candidate, sizeof(candidate), "%s/%s", directory, tool_name);
+    if (pm_candidate_is_current_shim(candidate, self_path)) {
+      goto next_path_entry;
+    }
+
+    if (excluded_path != NULL && excluded_path[0] != '\0' && pm_same_file(candidate, excluded_path)) {
+      goto next_path_entry;
+    }
+
+    if (pm_is_asdf_shim_candidate(candidate)) {
+      goto next_path_entry;
+    }
+
     if (pm_is_executable_file(candidate)) {
       return pm_realpath_or_copy(candidate, buffer, size);
     }
@@ -400,12 +540,16 @@ next_path_entry:
   return -1;
 }
 
-static int pm_resolve_tool(const char *tool_name, char *buffer, size_t size) {
-  if (pm_asdf_which(tool_name, buffer, size) == 0) {
+static int pm_find_on_path(const char *tool_name, const char *self_path, char *buffer, size_t size) {
+  return pm_find_on_path_excluding(tool_name, self_path, NULL, buffer, size);
+}
+
+static int pm_resolve_tool(const char *tool_name, const char *self_path, char *buffer, size_t size) {
+  if (pm_asdf_which(tool_name, self_path, buffer, size) == 0) {
     return 0;
   }
 
-  return pm_find_on_path(tool_name, buffer, size);
+  return pm_find_on_path(tool_name, self_path, buffer, size);
 }
 
 static int pm_read_shebang(const char *path, char *buffer, size_t size) {
@@ -468,7 +612,7 @@ static int pm_shebang_uses_shell(const char *script_path) {
     strcmp(name, "env zsh") == 0;
 }
 
-static int pm_exec_env_script(const char *script_path, int argc, char **argv) {
+static int pm_exec_env_script(const char *script_path, int argc, char **argv, const char *self_path) {
   char line[PM_MAX_LINE];
   char *cursor;
   char *tool;
@@ -504,7 +648,7 @@ static int pm_exec_env_script(const char *script_path, int argc, char **argv) {
   }
   *cursor = '\0';
 
-  if (tool[0] == '\0' || pm_resolve_tool(tool, interpreter_path, sizeof(interpreter_path)) != 0) {
+  if (tool[0] == '\0' || pm_resolve_tool(tool, self_path, interpreter_path, sizeof(interpreter_path)) != 0) {
     return -1;
   }
 
@@ -525,10 +669,10 @@ static int pm_exec_env_script(const char *script_path, int argc, char **argv) {
   return -1;
 }
 
-static int pm_exec_resolved_target(const char *target_path, int argc, char **argv) {
+static int pm_exec_resolved_target(const char *target_path, int argc, char **argv, const char *self_path) {
   char **next_argv;
 
-  if (pm_exec_env_script(target_path, argc, argv) == 0) {
+  if (pm_exec_env_script(target_path, argc, argv, self_path) == 0) {
     return 0;
   }
 
@@ -597,7 +741,7 @@ static void pm_apply_simple_prefix_assignment(const char *line, const char *exec
   setenv("PREFIX", value, 1);
 }
 
-static int pm_exec_simple_shell_exec_wrapper(const char *script_path, int argc, char **argv) {
+static int pm_exec_simple_shell_exec_wrapper(const char *script_path, int argc, char **argv, const char *self_path) {
   char script[PM_MAX_SCRIPT];
   char *line;
   char *save = NULL;
@@ -650,16 +794,78 @@ static int pm_exec_simple_shell_exec_wrapper(const char *script_path, int argc, 
     }
 
     pm_apply_simple_prefix_assignment(trimmed, exec_position);
-    return pm_exec_resolved_target(target_path, argc, argv);
+    return pm_exec_resolved_target(target_path, argc, argv, self_path);
   }
 
   return -1;
+}
+
+static int pm_is_asdf_nodejs_npm_wrapper(const char *tool_name, const char *executable_path) {
+  return tool_name != NULL &&
+    strcmp(tool_name, "npm") == 0 &&
+    executable_path != NULL &&
+    strstr(executable_path, "/plugins/nodejs/shims/npm") != NULL;
+}
+
+static void pm_prepare_asdf_nodejs_npm_wrapper(
+  const char *tool_name,
+  const char *executable_path,
+  const char *self_path
+) {
+  char canonical_npm[PM_MAX_PATH];
+
+  /*
+   * asdf-nodejs' npm wrapper falls back to `command -v npm` when direct
+   * resolution fails. In a Port Manager terminal that PATH search can find this
+   * runtime shim again. Supplying the canonical npm path keeps npm scripts on
+   * the original PATH while preventing the wrapper from re-entering us.
+   */
+  if (!pm_is_asdf_nodejs_npm_wrapper(tool_name, executable_path)) {
+    return;
+  }
+
+  if (pm_find_on_path_excluding("npm", self_path, executable_path, canonical_npm, sizeof(canonical_npm)) != 0 ||
+      pm_same_file(canonical_npm, executable_path)) {
+    return;
+  }
+
+  setenv("ASDF_NODEJS_CANON_NPM_PATH", canonical_npm, 1);
+}
+
+static void pm_resolve_self_path(const char *tool_name, const char *argv0, char *buffer, size_t size) {
+  const char *shim_directory = getenv(PM_RUNTIME_SHIM_DIR_ENV);
+  char candidate[PM_MAX_PATH];
+
+  if (buffer == NULL || size == 0) {
+    return;
+  }
+
+  buffer[0] = '\0';
+  if (argv0 != NULL && strchr(argv0, '/') != NULL && pm_is_executable_file(argv0)) {
+    pm_realpath_or_copy(argv0, buffer, size);
+    return;
+  }
+
+  if (shim_directory != NULL && shim_directory[0] != '\0' &&
+      tool_name != NULL && tool_name[0] != '\0' && strchr(tool_name, '/') == NULL) {
+    snprintf(candidate, sizeof(candidate), "%s/%s", shim_directory, tool_name);
+    if (pm_is_executable_file(candidate)) {
+      pm_realpath_or_copy(candidate, buffer, size);
+      return;
+    }
+  }
+
+  if (argv0 != NULL) {
+    snprintf(buffer, size, "%s", argv0);
+  }
 }
 
 int main(int argc, char **argv) {
   const char *tool_name = pm_basename(argv[0]);
   const char *environment_tool_name = getenv("PORT_MANAGER_ASDF_TOOL_NAME");
   char executable_path[PM_MAX_PATH];
+  char self_path[PM_MAX_PATH];
+  const char *resolved_self_path;
   char **next_argv;
 
   if (tool_name == NULL) {
@@ -681,13 +887,18 @@ int main(int argc, char **argv) {
     tool_name = environment_tool_name;
   }
 
-  if (pm_resolve_tool(tool_name, executable_path, sizeof(executable_path)) != 0) {
+  pm_resolve_self_path(tool_name, argv[0], self_path, sizeof(self_path));
+  resolved_self_path = self_path[0] == '\0' ? NULL : self_path;
+
+  if (pm_resolve_tool(tool_name, resolved_self_path, executable_path, sizeof(executable_path)) != 0) {
     fprintf(stderr, "portmanager-asdf-shim: could not resolve runtime tool %s\n", tool_name);
     return 127;
   }
 
-  if (pm_exec_env_script(executable_path, argc, argv) == 0 ||
-      pm_exec_simple_shell_exec_wrapper(executable_path, argc, argv) == 0) {
+  pm_prepare_asdf_nodejs_npm_wrapper(tool_name, executable_path, resolved_self_path);
+
+  if (pm_exec_env_script(executable_path, argc, argv, resolved_self_path) == 0 ||
+      pm_exec_simple_shell_exec_wrapper(executable_path, argc, argv, resolved_self_path) == 0) {
     return 0;
   }
 

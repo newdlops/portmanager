@@ -77,6 +77,7 @@ interface PendingRequest {
 
 const AGENT_STARTUP_LOCK_STALE_MS = 10_000;
 const AGENT_STARTUP_LOCK_WAIT_MS = 5_000;
+const AGENT_CONNECT_TIMEOUT_MS = 1_000;
 
 /**
  * Agent-backed process service used by commands and the sidebar provider.
@@ -300,11 +301,14 @@ export class LocalAgentClient implements PortManagerProcessService {
 
   /** Tries an existing socket first, then starts the agent and retries. */
   private async connectWithAgentStartup(): Promise<void> {
+    let initialError: unknown;
+
     try {
       this.socket = await this.openSocket();
       this.attachSocketHandlers(this.socket);
       return;
-    } catch {
+    } catch (error) {
+      initialError = error;
       // Fall through to the startup lock. Another VS Code window may already
       // be racing to create the singleton daemon.
     }
@@ -319,7 +323,17 @@ export class LocalAgentClient implements PortManagerProcessService {
         this.socket = await this.openSocket();
         this.attachSocketHandlers(this.socket);
         return;
-      } catch {
+      } catch (error) {
+        if (isSocketConnectTimeoutError(error) || isSocketConnectTimeoutError(initialError)) {
+          /*
+           * A timeout means the socket path existed but the current daemon did
+           * not accept quickly enough. Treating that as stale would unlink a
+           * live socket and let another extension host create a second daemon.
+           */
+          await this.waitForExistingAgent();
+          return;
+        }
+
         this.startAgentProcess();
       }
 
@@ -342,6 +356,26 @@ export class LocalAgentClient implements PortManagerProcessService {
     } finally {
       releaseStartupLock();
     }
+  }
+
+  /** Waits for a slow existing daemon without removing its socket path. */
+  private async waitForExistingAgent(): Promise<void> {
+    const deadline = Date.now() + AGENT_STARTUP_LOCK_WAIT_MS;
+    let lastError: unknown;
+
+    while (Date.now() < deadline) {
+      await delay(150);
+
+      try {
+        this.socket = await this.openSocket();
+        this.attachSocketHandlers(this.socket);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error("Timed out waiting for existing Port Manager agent.");
   }
 
   /** Serializes daemon startup across extension hosts in different VS Code windows. */
@@ -403,8 +437,8 @@ export class LocalAgentClient implements PortManagerProcessService {
       const socket = net.createConnection(socketPath);
       const timer = setTimeout(() => {
         socket.destroy();
-        reject(new Error(`Timed out connecting to Port Manager agent at ${socketPath}.`));
-      }, 1000);
+        reject(createSocketConnectTimeoutError(socketPath));
+      }, AGENT_CONNECT_TIMEOUT_MS);
 
       socket.once("connect", () => {
         clearTimeout(timer);
@@ -746,6 +780,16 @@ function appendDaemonWarning(existingMessage: string | undefined, warning: strin
 
 function isFileExistsError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "EEXIST";
+}
+
+function isSocketConnectTimeoutError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "ETIMEDOUT";
+}
+
+function createSocketConnectTimeoutError(socketPath: string): Error {
+  const error = new Error(`Timed out connecting to Port Manager agent at ${socketPath}.`) as NodeJS.ErrnoException;
+  error.code = "ETIMEDOUT";
+  return error;
 }
 
 function removeStaleStartupLock(lockPath: string): void {

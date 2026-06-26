@@ -2981,10 +2981,10 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     'function finish(code,remove){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.destroy();}catch{}if(remove)removeSocket();process.exit(code);}',
     'function shutdownStale(){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.end(JSON.stringify({id:"probe-shutdown",method:"shutdownDaemon"})+"\\n");}catch{}setTimeout(()=>process.exit(2),75);}',
     'let buffer="";',
-    'timer=setTimeout(()=>finish(1,true),700);',
+    'timer=setTimeout(()=>finish(1,false),700);',
     'socket.setEncoding("utf8");',
     'socket.once("connect",()=>{socket.write(JSON.stringify({id:"probe",method:"listSnapshot"})+"\\n");});',
-    'socket.once("error",()=>finish(1,true));',
+    'socket.once("error",()=>finish(1,false));',
     'socket.on("data",(chunk)=>{buffer+=chunk;const lineEnd=buffer.indexOf("\\n");if(lineEnd<0)return;try{const message=JSON.parse(buffer.slice(0,lineEnd));const daemon=message&&message.payload&&message.payload.daemon;const actual=normalize(daemon&&daemon.agentMainPath);const expectedPath=normalize(expected);if(!actual||actual!==expectedPath||isOlder(daemon&&daemon.startedAt,expected)){shutdownStale();return;}finish(0,false);}catch{finish(1,true);}});',
   ].join("");
   const probeCommand = `${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
@@ -3200,8 +3200,18 @@ pm() {
 }
 
 __pm_agent_ready=0
+__pm_agent_lock="\${PORT_MANAGER_AGENT_SOCKET}.startup.lock"
 ${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1
 if [ "$__pm_agent_ready" != "1" ]; then
+  if mkdir "$__pm_agent_lock" 2>/dev/null; then
+    __pm_agent_wait_count=0
+    while [ $__pm_agent_wait_count -lt 50 ]; do
+      ${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1 && break
+      __pm_agent_wait_count=$((__pm_agent_wait_count + 1))
+      sleep 0.1
+    done
+    if [ "$__pm_agent_ready" != "1" ]; then
+      rm -f "$PORT_MANAGER_AGENT_SOCKET" 2>/dev/null || true
   if [ -x "$PORT_MANAGER_AGENT_EXECUTABLE" ]; then
     ${daemonRuntimePrefix} nohup "$PORT_MANAGER_AGENT_EXECUTABLE" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" --agent-main "$PORT_MANAGER_AGENT_MAIN" >/tmp/newdlops-portmanager-agent.log 2>&1 &
   else
@@ -3213,6 +3223,16 @@ if [ "$__pm_agent_ready" != "1" ]; then
     __pm_agent_wait_count=$((__pm_agent_wait_count + 1))
     sleep 0.1
   done
+    fi
+    rmdir "$__pm_agent_lock" 2>/dev/null || true
+  else
+    __pm_agent_wait_count=0
+    while [ $__pm_agent_wait_count -lt 60 ]; do
+      ${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1 && break
+      __pm_agent_wait_count=$((__pm_agent_wait_count + 1))
+      sleep 0.1
+    done
+  fi
   unset __pm_agent_wait_count
 fi
 if [ "$__pm_agent_ready" = "1" ]; then
@@ -3222,7 +3242,7 @@ else
   export PORT_MANAGER_HOOK_DAEMON_STARTED=0
   printf '%s\n' 'Port Manager routing unavailable: local daemon did not become ready.' >&2
 fi
-unset __pm_agent_ready
+unset __pm_agent_ready __pm_agent_lock
 
 if [ -f "${escapedHookLibraryPath}" ]; then
   case "$(uname -s)" in

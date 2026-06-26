@@ -103,6 +103,10 @@ interface ComposeServiceContainerList {
 interface ComposeServiceContainerListOptions {
   /** Include stopped/created containers so copy mode preserves dormant services. */
   readonly includeStopped?: boolean;
+  /** Compose project label used to keep Docker/Podman list and inspect work scoped. */
+  readonly composeProjectName?: string;
+  /** Optional service label set used after runtime listing to avoid inspecting unrelated services. */
+  readonly composeServices?: readonly string[];
 }
 
 interface HiddenPortResolutionOptions {
@@ -785,10 +789,15 @@ export class ComposePublishMutator {
     const serviceSet = new Set(services);
     const { rows, inspectedRows } = await this.listRuntimeRowsWithInspectNames(runtime, {
       includeStopped: options.includeStopped === true,
+      composeProjectName: originalProjectName,
+      composeServices: services,
     });
     const runningContainerIds =
       options.includeStopped === true
-        ? await this.listRunningContainerIds(runtime).catch(() => undefined)
+        ? await this.listRunningContainerIds(runtime, {
+            composeProjectName: originalProjectName,
+            composeServices: services,
+          }).catch(() => undefined)
         : undefined;
     const containers = selectCurrentComposeServiceContainers(parseComposeServiceContainerRows(rows, inspectedRows))
       .filter(
@@ -893,8 +902,14 @@ export class ComposePublishMutator {
   }
 
   /** Reads the runtime's running-only container ids for lifecycle classification. */
-  private async listRunningContainerIds(runtime: "docker" | "podman"): Promise<ReadonlySet<string>> {
-    const { rows } = await this.listRuntimeRowsWithInspectNames(runtime);
+  private async listRunningContainerIds(
+    runtime: "docker" | "podman",
+    options: ComposeServiceContainerListOptions = {},
+  ): Promise<ReadonlySet<string>> {
+    const rows = await this.listRuntimeRows(runtime, {
+      composeProjectName: options.composeProjectName,
+      composeServices: options.composeServices,
+    });
     return new Set(rows.map(readRuntimeContainerId).filter((id): id is string => id !== undefined));
   }
 
@@ -960,6 +975,7 @@ export class ComposePublishMutator {
   ): Promise<readonly ContainerServiceCandidate[]> {
     const { rows } = await this.listRuntimeRowsWithInspectNames(runtime, {
       includeStopped: options.includeStopped === true,
+      composeProjectName: attachedProjectName,
     });
     return parseContainerRows(runtime, rows).filter((candidate) => candidate.composeProject === attachedProjectName);
   }
@@ -1090,25 +1106,8 @@ export class ComposePublishMutator {
     readonly rows: readonly RuntimeContainerRow[];
     readonly inspectedRows: readonly RuntimeContainerInspectRow[];
   }> {
-    const result = await this.runCommand(
-      runtime,
-      ["container", "ls", ...(options.includeStopped === true ? ["--all"] : []), "--no-trunc", "--format", "{{json .}}"],
-      {
-        timeoutMs: LIST_TIMEOUT_MS,
-      },
-    );
-    const rows = result.stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0)
-      .map(parseRuntimeContainerRow)
-      .filter((row): row is RuntimeContainerRow => row !== undefined);
-
-    const containerIds = uniqueStrings(
-      rows
-        .map((row) => readRuntimeContainerId(row))
-        .filter((id): id is string => id !== undefined),
-    );
+    const rows = await this.listRuntimeRows(runtime, options);
+    const containerIds = uniqueStrings(rows.map((row) => readRuntimeContainerId(row)).filter((id): id is string => id !== undefined));
     if (containerIds.length === 0) {
       return { rows, inspectedRows: [] };
     }
@@ -1125,6 +1124,34 @@ export class ComposePublishMutator {
     } catch {
       return { rows, inspectedRows: [] };
     }
+  }
+
+  /**
+   * Reads Docker/Podman container summary rows without inspect repair.
+   *
+   * Compose attach can run while many unrelated containers exist on Docker
+   * Desktop. Project filters are pushed into the runtime command so expensive
+   * inspect repair only touches containers that can influence this mutation.
+   */
+  private async listRuntimeRows(
+    runtime: "docker" | "podman",
+    options: ComposeServiceContainerListOptions = {},
+  ): Promise<readonly RuntimeContainerRow[]> {
+    const result = await this.runCommand(
+      runtime,
+      buildRuntimeContainerListArgs(runtime, options),
+      {
+        timeoutMs: LIST_TIMEOUT_MS,
+      },
+    );
+    const rows = result.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map(parseRuntimeContainerRow)
+      .filter((row): row is RuntimeContainerRow => row !== undefined);
+
+    return filterRuntimeRowsForComposeServices(rows, options.composeServices);
   }
 
   /** Runs `docker compose` or `podman compose` with persisted cwd/file context. */
@@ -2096,6 +2123,35 @@ function quoteYamlString(value: string): string {
 function readRuntimeContainerId(row: RuntimeContainerRow): string | undefined {
   const id = (row.ID ?? row.Id)?.trim();
   return id === undefined || id.length === 0 ? undefined : id;
+}
+
+function buildRuntimeContainerListArgs(
+  runtime: "docker" | "podman",
+  options: ComposeServiceContainerListOptions,
+): readonly string[] {
+  const args = ["container", "ls", ...(options.includeStopped === true ? ["--all"] : []), "--no-trunc"];
+  if (options.composeProjectName !== undefined && options.composeProjectName.length > 0) {
+    const labelName = runtime === "podman" ? "io.podman.compose.project" : "com.docker.compose.project";
+    args.push("--filter", `label=${labelName}=${options.composeProjectName}`);
+  }
+  args.push("--format", "{{json .}}");
+  return args;
+}
+
+function filterRuntimeRowsForComposeServices(
+  rows: readonly RuntimeContainerRow[],
+  composeServices: readonly string[] | undefined,
+): readonly RuntimeContainerRow[] {
+  const serviceSet = new Set(composeServices ?? []);
+  if (serviceSet.size === 0) {
+    return rows;
+  }
+
+  return rows.filter((row) => {
+    const labels = parseRuntimeLabels(row.Labels);
+    const composeService = readRuntimeLabel(labels, "com.docker.compose.service", "io.podman.compose.service");
+    return composeService === undefined || serviceSet.has(composeService);
+  });
 }
 
 function readRuntimeContainerName(row: RuntimeContainerRow): string | undefined {

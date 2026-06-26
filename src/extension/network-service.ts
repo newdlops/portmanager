@@ -110,6 +110,10 @@ const TERMINAL_NETWORK_SELECTION_FILE_NAME = "terminal-networks.tsv";
 const MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX = "manual-terminal:";
 const PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX = "process-terminal:";
 const ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 3_000;
+const BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS = 60_000;
+const BACKGROUND_CONTAINER_REFRESH_LOCK_STALE_MS = 120_000;
+const BACKGROUND_CONTAINER_REFRESH_STAMP_PATH = buildBackgroundContainerRefreshControlPath("stamp");
+const BACKGROUND_CONTAINER_REFRESH_LOCK_PATH = buildBackgroundContainerRefreshControlPath("lock");
 const DAEMON_RESTART_BACKOFF_MS = 30_000;
 const TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500;
 const TERMINAL_ATTACHMENT_REFRESH_DEBOUNCE_MS = 50;
@@ -136,6 +140,13 @@ export interface TerminalNetworkResetSummary {
   readonly terminalCount: number;
   /** Number of persisted attachment rows removed from the logical network state. */
   readonly removedAttachmentCount: number;
+}
+
+interface BackgroundRefreshOptions {
+  /** True when called from the low-frequency repair loop instead of a user action. */
+  readonly background?: boolean;
+  /** Internal flag used when one outer Docker refresh already owns the shared lock. */
+  readonly sharedRefreshAcquired?: boolean;
 }
 
 export interface RoutingFileCleanupSummary {
@@ -283,6 +294,15 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Guards live compose endpoint refreshes while Docker is recreating hidden containers. */
   private composeAttachmentReconcileInFlight: Promise<void> | undefined;
+
+  /** Guards Docker/Podman discovery so background ticks do not stack CLI scans. */
+  private containerServiceRefreshInFlight: Promise<readonly ContainerServiceCandidate[]> | undefined;
+
+  /** Last Docker/Podman discovery time; background refreshes reuse recent state. */
+  private lastContainerServiceRefreshAtMs = 0;
+
+  /** Last compose endpoint reconciliation time; background refreshes reuse recent route rows. */
+  private lastComposeAttachmentReconcileAtMs = 0;
 
   /** Guards background signal refreshes so slow Docker/process-table reads do not overlap. */
   private routingSignalRefreshInFlight: Promise<void> | undefined;
@@ -438,7 +458,7 @@ export class PortManagerNetworkService implements DisposableLike {
           event.affectsConfiguration("portManager.enabled")
         ) {
           void this.refreshRuntimeDescriptors();
-          void this.refreshContainerServices();
+          void this.refreshContainerServices({ background: true });
           this.applyVscodeWindowTerminalEnvironment();
         }
         if (event.affectsConfiguration("portManager")) {
@@ -454,12 +474,12 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
     await this.repairPersistedPortManagerCloneComposeAttachments();
-    await this.reconcileComposeAttachmentPublishedPorts();
+    await this.reconcileComposeAttachmentPublishedPorts({ background: true });
     await this.writeComposeProjectRoutingFile();
     await this.writeTerminalNetworkSelectionFile();
     await this.restorePersistedComposeRoutesIfMissing();
     await this.refreshTerminals();
-    void this.refreshContainerServices();
+    void this.refreshContainerServices({ background: true });
     await this.convergeDaemonAndRoutingState();
     this.startRoutingSignalRefreshLoop();
     this.startTerminalAttachmentMarkerPolling();
@@ -602,13 +622,54 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /** Refreshes Docker/Podman containers that publish host ports for easy attach. */
-  async refreshContainerServices(): Promise<readonly ContainerServiceCandidate[]> {
+  async refreshContainerServices(
+    options: BackgroundRefreshOptions = {},
+  ): Promise<readonly ContainerServiceCandidate[]> {
+    if (
+      options.background === true &&
+      this.lastContainerServiceRefreshAtMs > 0 &&
+      Date.now() - this.lastContainerServiceRefreshAtMs < BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS
+    ) {
+      return this.registry.getSnapshot().containerServiceCandidates;
+    }
+
+    if (this.containerServiceRefreshInFlight !== undefined) {
+      return this.containerServiceRefreshInFlight;
+    }
+
+    const releaseSharedRefresh =
+      options.background === true && options.sharedRefreshAcquired !== true
+        ? tryAcquireSharedBackgroundContainerRefreshSlot()
+        : undefined;
+
+    if (options.background === true && options.sharedRefreshAcquired !== true && releaseSharedRefresh === undefined) {
+      return this.registry.getSnapshot().containerServiceCandidates;
+    }
+
+    this.containerServiceRefreshInFlight = this.refreshContainerServicesExclusive({
+      ...options,
+      sharedRefreshAcquired: options.sharedRefreshAcquired === true || releaseSharedRefresh !== undefined,
+    }).finally(() => {
+      this.containerServiceRefreshInFlight = undefined;
+      releaseSharedRefresh?.();
+    });
+
+    return this.containerServiceRefreshInFlight;
+  }
+
+  /** Runs one Docker/Podman discovery pass and records its refresh timestamp. */
+  private async refreshContainerServicesExclusive(
+    options: BackgroundRefreshOptions,
+  ): Promise<readonly ContainerServiceCandidate[]> {
     const candidates = await this.containerServiceDiscovery
       .list(readContainerRuntimeSettings())
       .catch(() => []);
 
+    this.lastContainerServiceRefreshAtMs = Date.now();
     this.registry.setContainerServiceCandidates(candidates);
-    void this.reconcileComposeAttachmentPublishedPorts();
+    void this.reconcileComposeAttachmentPublishedPorts(
+      options.background === true ? { background: true, sharedRefreshAcquired: options.sharedRefreshAcquired } : {},
+    );
     return this.registry.getSnapshot().containerServiceCandidates;
   }
 
@@ -1612,7 +1673,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
-    await this.reconcileComposeAttachmentPublishedPorts();
+    await this.reconcileComposeAttachmentPublishedPorts({ background: true });
     await this.writeComposeProjectRoutingFile();
     await this.writeTerminalNetworkSelectionFile();
     await this.restorePersistedComposeRoutesIfMissing();
@@ -1898,9 +1959,9 @@ export class PortManagerNetworkService implements DisposableLike {
   private async refreshRoutingSignalsExclusive(): Promise<void> {
     await Promise.all([
       this.refreshTerminals().catch(() => []),
-      this.refreshContainerServices().catch(() => []),
+      this.refreshContainerServices({ background: true }).catch(() => []),
     ]);
-    await this.reconcileComposeAttachmentPublishedPorts().catch(() => undefined);
+    await this.reconcileComposeAttachmentPublishedPorts({ background: true }).catch(() => undefined);
     await this.convergeDaemonAndRoutingState();
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
   }
@@ -2096,17 +2157,37 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /** Rewrites compose route rows when Docker changed a running container's host port. */
-  private async reconcileComposeAttachmentPublishedPorts(): Promise<void> {
+  private async reconcileComposeAttachmentPublishedPorts(
+    options: BackgroundRefreshOptions = {},
+  ): Promise<void> {
     if (this.composeRouteRestoreInFlight !== undefined) {
       await this.composeRouteRestoreInFlight.catch(() => undefined);
+    }
+
+    if (
+      options.background === true &&
+      this.lastComposeAttachmentReconcileAtMs > 0 &&
+      Date.now() - this.lastComposeAttachmentReconcileAtMs < BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS
+    ) {
+      return;
     }
 
     if (this.composeAttachmentReconcileInFlight !== undefined) {
       return this.composeAttachmentReconcileInFlight;
     }
 
+    const releaseSharedRefresh =
+      options.background === true && options.sharedRefreshAcquired !== true
+        ? tryAcquireSharedBackgroundContainerRefreshSlot()
+        : undefined;
+
+    if (options.background === true && options.sharedRefreshAcquired !== true && releaseSharedRefresh === undefined) {
+      return;
+    }
+
     this.composeAttachmentReconcileInFlight = this.reconcileComposeAttachmentPublishedPortsExclusive().finally(() => {
       this.composeAttachmentReconcileInFlight = undefined;
+      releaseSharedRefresh?.();
     });
 
     return this.composeAttachmentReconcileInFlight;
@@ -2114,6 +2195,8 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Performs one serialized live compose endpoint reconciliation pass. */
   private async reconcileComposeAttachmentPublishedPortsExclusive(): Promise<void> {
+    this.lastComposeAttachmentReconcileAtMs = Date.now();
+
     if (this.processService === undefined) {
       return;
     }
@@ -4666,10 +4749,10 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     'function finish(code,remove){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.destroy();}catch{}if(remove)removeSocket();process.exit(code);}',
     'function shutdownStale(){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.end(JSON.stringify({id:"probe-shutdown",method:"shutdownDaemon"})+"\\n");}catch{}setTimeout(()=>process.exit(2),75);}',
     'let buffer="";',
-    'timer=setTimeout(()=>finish(1,true),700);',
+    'timer=setTimeout(()=>finish(1,false),700);',
     'socket.setEncoding("utf8");',
     'socket.once("connect",()=>{socket.write(JSON.stringify({id:"probe",method:"listSnapshot"})+"\\n");});',
-    'socket.once("error",()=>finish(1,true));',
+    'socket.once("error",()=>finish(1,false));',
     'socket.on("data",(chunk)=>{buffer+=chunk;const lineEnd=buffer.indexOf("\\n");if(lineEnd<0)return;try{const message=JSON.parse(buffer.slice(0,lineEnd));const daemon=message&&message.payload&&message.payload.daemon;const actual=normalize(daemon&&daemon.agentMainPath);const expectedPath=normalize(expected);if(!actual||actual!==expectedPath||isOlder(daemon&&daemon.startedAt,expected)){shutdownStale();return;}finish(0,false);}catch{finish(1,true);}});',
   ].join("");
   const probeCommand = `${daemonRuntimePrefix} ${shellQuote(nodeExecutablePath)} -e ${shellQuote(
@@ -4678,8 +4761,18 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
 
   return [
     `__pm_agent_ready=0`,
+    `__pm_agent_lock="\${PORT_MANAGER_AGENT_SOCKET}.startup.lock"`,
     `${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1`,
     `if [ "$__pm_agent_ready" != "1" ]; then`,
+    `if mkdir "$__pm_agent_lock" 2>/dev/null; then`,
+    `__pm_agent_wait_count=0`,
+    `while [ $__pm_agent_wait_count -lt 50 ]; do`,
+    `${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1 && break`,
+    `__pm_agent_wait_count=$((__pm_agent_wait_count + 1))`,
+    `sleep 0.1`,
+    `done`,
+    `if [ "$__pm_agent_ready" != "1" ]; then`,
+    `rm -f "$PORT_MANAGER_AGENT_SOCKET" 2>/dev/null || true`,
     `if [ -x "$PORT_MANAGER_AGENT_EXECUTABLE" ]; then`,
     `${daemonRuntimePrefix} nohup "$PORT_MANAGER_AGENT_EXECUTABLE" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" --agent-main "$PORT_MANAGER_AGENT_MAIN" >/tmp/newdlops-portmanager-agent.log 2>&1 &`,
     `else`,
@@ -4693,6 +4786,16 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     `__pm_agent_wait_count=$((__pm_agent_wait_count + 1))`,
     `sleep 0.1`,
     `done`,
+    `fi`,
+    `rmdir "$__pm_agent_lock" 2>/dev/null || true`,
+    `else`,
+    `__pm_agent_wait_count=0`,
+    `while [ $__pm_agent_wait_count -lt 60 ]; do`,
+    `${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1 && break`,
+    `__pm_agent_wait_count=$((__pm_agent_wait_count + 1))`,
+    `sleep 0.1`,
+    `done`,
+    `fi`,
     `unset __pm_agent_wait_count`,
     `fi`,
     `if [ "$__pm_agent_ready" = "1" ]; then`,
@@ -4702,12 +4805,112 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     `export PORT_MANAGER_HOOK_DAEMON_STARTED=0`,
     `printf '%s\\n' 'Port Manager routing unavailable: local daemon did not become ready.' >&2`,
     `fi`,
-    `unset __pm_agent_ready`,
+    `unset __pm_agent_ready __pm_agent_lock`,
   ].join("\n");
 }
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function buildBackgroundContainerRefreshControlPath(kind: "stamp" | "lock"): string {
+  const routeTablePath = getDefaultRouteTablePath();
+  const parsedPath = path.parse(routeTablePath);
+  return path.join(parsedPath.dir, `${parsedPath.name.replace("routes", "container-refresh")}.${kind}`);
+}
+
+/**
+ * Serializes Docker/Podman background discovery across VS Code windows.
+ * Container inspection is expensive on Docker Desktop, so memory-only throttles
+ * still let each extension host wake Docker independently.
+ */
+function tryAcquireSharedBackgroundContainerRefreshSlot(): (() => void) | undefined {
+  if (isSharedBackgroundContainerRefreshRecent()) {
+    return undefined;
+  }
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let lockFd: number | undefined;
+
+    try {
+      lockFd = syncFs.openSync(BACKGROUND_CONTAINER_REFRESH_LOCK_PATH, "wx");
+      syncFs.writeFileSync(lockFd, `${process.pid}\n${new Date().toISOString()}\n`, "utf8");
+    } catch (error) {
+      if (lockFd !== undefined) {
+        closeFileDescriptor(lockFd);
+      }
+
+      if (isNodeErrorWithCode(error, "EEXIST")) {
+        removeStaleSharedBackgroundContainerRefreshLock();
+        continue;
+      }
+
+      return undefined;
+    }
+
+    const release = (writeStamp: boolean) => {
+      if (writeStamp) {
+        try {
+          syncFs.writeFileSync(
+            BACKGROUND_CONTAINER_REFRESH_STAMP_PATH,
+            `${process.pid}\n${new Date().toISOString()}\n`,
+            "utf8",
+          );
+        } catch {
+          // The stamp only throttles background work; failed writes should not
+          // block foreground attach or cleanup paths.
+        }
+      }
+
+      closeFileDescriptor(lockFd);
+      try {
+        syncFs.rmSync(BACKGROUND_CONTAINER_REFRESH_LOCK_PATH, { force: true });
+      } catch {
+        // A stale lock will be removed on a later background pass.
+      }
+    };
+
+    if (isSharedBackgroundContainerRefreshRecent()) {
+      release(false);
+      return undefined;
+    }
+
+    return () => release(true);
+  }
+
+  return undefined;
+}
+
+function isSharedBackgroundContainerRefreshRecent(): boolean {
+  try {
+    const stats = syncFs.statSync(BACKGROUND_CONTAINER_REFRESH_STAMP_PATH);
+    return Date.now() - stats.mtimeMs < BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS;
+  } catch {
+    return false;
+  }
+}
+
+function removeStaleSharedBackgroundContainerRefreshLock(): void {
+  try {
+    const stats = syncFs.statSync(BACKGROUND_CONTAINER_REFRESH_LOCK_PATH);
+    if (Date.now() - stats.mtimeMs >= BACKGROUND_CONTAINER_REFRESH_LOCK_STALE_MS) {
+      syncFs.rmSync(BACKGROUND_CONTAINER_REFRESH_LOCK_PATH, { force: true });
+    }
+  } catch {
+    // Missing lock files are expected between background refreshes.
+  }
+}
+
+function closeFileDescriptor(fd: number | undefined): void {
+  if (fd === undefined) {
+    return;
+  }
+
+  try {
+    syncFs.closeSync(fd);
+  } catch {
+    // The descriptor can already be closed during process teardown.
+  }
 }
 
 function shellPatternLiteral(value: string): string {

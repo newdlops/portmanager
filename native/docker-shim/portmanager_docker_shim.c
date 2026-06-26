@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <limits.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,7 @@
 #define PM_COMPOSE_ROUTING_FILE_SUFFIX ".tsv"
 #define PM_COMPOSE_ROUTING_COMPOSE_SEPARATOR ".compose-"
 #define PM_DOCKER_SHIM_BYPASS_ENV "PORT_MANAGER_DOCKER_SHIM_BYPASS"
+#define PM_DOCKER_SHIM_DEBUG_ENV "PORT_MANAGER_DOCKER_SHIM_DEBUG"
 
 typedef struct {
   char kind[16];
@@ -42,6 +44,26 @@ typedef struct {
   char attached_name[PM_MAX_FIELD];
   char service_name[PM_MAX_FIELD];
 } pm_route_row;
+
+/** Debug output is opt-in because the shim sits on normal Docker PATH lookups. */
+static int pm_debug_enabled(void) {
+  const char *enabled = getenv(PM_DOCKER_SHIM_DEBUG_ENV);
+  return enabled != NULL && enabled[0] != '\0' && strcmp(enabled, "0") != 0;
+}
+
+static void pm_debug(const char *format, ...) {
+  va_list args;
+
+  if (!pm_debug_enabled()) {
+    return;
+  }
+
+  fprintf(stderr, "portmanager-docker-shim: ");
+  va_start(args, format);
+  vfprintf(stderr, format, args);
+  va_end(args);
+  fprintf(stderr, "\n");
+}
 
 /** Returns the executable name used to decide whether this invocation is docker or podman. */
 static const char *pm_basename(const char *path) {
@@ -117,6 +139,22 @@ static int pm_same_directory(const char *left, const char *right) {
   return strcmp(left_path, right_path) == 0;
 }
 
+/** Hard-link comparison prevents sibling Port Manager shim dirs from being treated as real runtimes. */
+static int pm_same_file(const char *left, const char *right) {
+  struct stat left_stat;
+  struct stat right_stat;
+
+  if (left == NULL || right == NULL || left[0] == '\0' || right[0] == '\0') {
+    return 0;
+  }
+
+  if (stat(left, &left_stat) != 0 || stat(right, &right_stat) != 0) {
+    return 0;
+  }
+
+  return left_stat.st_dev == right_stat.st_dev && left_stat.st_ino == right_stat.st_ino;
+}
+
 /** True when a PATH candidate can replace this shim as the real runtime command. */
 static int pm_is_executable_file(const char *path) {
   struct stat stat_buffer;
@@ -128,8 +166,12 @@ static int pm_is_executable_file(const char *path) {
   return access(path, X_OK) == 0;
 }
 
+static int pm_candidate_is_current_shim(const char *candidate, const char *self_path) {
+  return pm_is_executable_file(candidate) && pm_same_file(candidate, self_path);
+}
+
 /** Builds the PATH passed to Docker so nested runtime calls do not re-enter this shim. */
-static char *pm_path_without_shim_directory(void) {
+static char *pm_path_without_shim_directory(const char *runtime, const char *self_path) {
   const char *path_env = getenv("PATH");
   const char *shim_directory = getenv(PM_RUNTIME_SHIM_DIR_ENV);
   const char *cursor;
@@ -137,7 +179,7 @@ static char *pm_path_without_shim_directory(void) {
   size_t result_size;
   size_t used = 0;
 
-  if (path_env == NULL || path_env[0] == '\0' || shim_directory == NULL || shim_directory[0] == '\0') {
+  if (path_env == NULL || path_env[0] == '\0') {
     return path_env == NULL ? NULL : strdup(path_env);
   }
 
@@ -152,6 +194,8 @@ static char *pm_path_without_shim_directory(void) {
     const char *separator = strchr(cursor, ':');
     size_t directory_length = separator == NULL ? strlen(cursor) : (size_t)(separator - cursor);
     char directory[PM_MAX_PATH];
+    char candidate[PM_MAX_PATH];
+    int skip_directory = 0;
 
     if (directory_length == 0) {
       snprintf(directory, sizeof(directory), ".");
@@ -159,10 +203,23 @@ static char *pm_path_without_shim_directory(void) {
       memcpy(directory, cursor, directory_length);
       directory[directory_length] = '\0';
     } else {
+      skip_directory = 1;
       directory[0] = '\0';
     }
 
-    if (directory[0] != '\0' && !pm_same_directory(directory, shim_directory)) {
+    if (!skip_directory && shim_directory != NULL && shim_directory[0] != '\0' &&
+        pm_same_directory(directory, shim_directory)) {
+      skip_directory = 1;
+    }
+
+    if (!skip_directory && runtime != NULL && runtime[0] != '\0') {
+      snprintf(candidate, sizeof(candidate), "%s/%s", directory, runtime);
+      if (pm_candidate_is_current_shim(candidate, self_path)) {
+        skip_directory = 1;
+      }
+    }
+
+    if (!skip_directory && directory[0] != '\0') {
       if (used > 0) {
         result[used++] = ':';
       }
@@ -183,8 +240,8 @@ static char *pm_path_without_shim_directory(void) {
 }
 
 /** Finds the real docker/podman command while skipping the Port Manager shim directory. */
-static int pm_find_runtime_on_path(const char *runtime, char *buffer, size_t size) {
-  char *path_env = pm_path_without_shim_directory();
+static int pm_find_runtime_on_path(const char *runtime, const char *self_path, char *buffer, size_t size) {
+  char *path_env = pm_path_without_shim_directory(runtime, self_path);
   const char *cursor;
 
   if (runtime == NULL || runtime[0] == '\0' || strchr(runtime, '/') != NULL || path_env == NULL) {
@@ -209,6 +266,10 @@ static int pm_find_runtime_on_path(const char *runtime, char *buffer, size_t siz
     }
 
     snprintf(candidate, sizeof(candidate), "%s/%s", directory, runtime);
+    if (pm_candidate_is_current_shim(candidate, self_path)) {
+      goto next_path_entry;
+    }
+
     if (pm_is_executable_file(candidate)) {
       int status = pm_realpath_or_copy(candidate, buffer, size);
       free(path_env);
@@ -255,7 +316,7 @@ static int pm_parent_directory(const char *path, char *buffer, size_t size) {
  * before searching PATH, but ignore the extension-owned shim directory to avoid
  * recursing when the shim is entered through its PATH aliases.
  */
-static int pm_find_runtime_from_invocation_path(const char *runtime, char **argv, char *buffer, size_t size) {
+static int pm_find_runtime_from_invocation_path(const char *runtime, char **argv, const char *self_path, char *buffer, size_t size) {
   const char *invocation_path = argv != NULL && argv[0] != NULL ? argv[0] : NULL;
   const char *shim_directory = getenv(PM_RUNTIME_SHIM_DIR_ENV);
   char invocation_directory[PM_MAX_PATH];
@@ -269,6 +330,10 @@ static int pm_find_runtime_from_invocation_path(const char *runtime, char **argv
     return -1;
   }
 
+  if (pm_candidate_is_current_shim(invocation_path, self_path)) {
+    return -1;
+  }
+
   if (shim_directory != NULL && shim_directory[0] != '\0' && pm_same_directory(invocation_directory, shim_directory)) {
     return -1;
   }
@@ -278,6 +343,35 @@ static int pm_find_runtime_from_invocation_path(const char *runtime, char **argv
   }
 
   return pm_realpath_or_copy(invocation_path, buffer, size);
+}
+
+static void pm_resolve_self_path(const char *runtime, char **argv, char *buffer, size_t size) {
+  const char *shim_directory = getenv(PM_RUNTIME_SHIM_DIR_ENV);
+  const char *argv0 = argv != NULL && argv[0] != NULL ? argv[0] : NULL;
+  char candidate[PM_MAX_PATH];
+
+  if (buffer == NULL || size == 0) {
+    return;
+  }
+
+  buffer[0] = '\0';
+  if (argv0 != NULL && strchr(argv0, '/') != NULL && pm_is_executable_file(argv0)) {
+    pm_realpath_or_copy(argv0, buffer, size);
+    return;
+  }
+
+  if (shim_directory != NULL && shim_directory[0] != '\0' &&
+      runtime != NULL && runtime[0] != '\0' && strchr(runtime, '/') == NULL) {
+    snprintf(candidate, sizeof(candidate), "%s/%s", shim_directory, runtime);
+    if (pm_is_executable_file(candidate)) {
+      pm_realpath_or_copy(candidate, buffer, size);
+      return;
+    }
+  }
+
+  if (argv0 != NULL) {
+    snprintf(buffer, size, "%s", argv0);
+  }
 }
 
 /** Docker global options are ignored while locating the first semantic command. */
@@ -2719,6 +2813,8 @@ int main(int argc, char **argv) {
   char runtime[PM_MAX_RUNTIME];
   char runtime_executable[PM_MAX_RUNTIME];
   char real_runtime_path[PM_MAX_PATH];
+  char self_path[PM_MAX_PATH];
+  const char *resolved_self_path;
   char attached_project[PM_MAX_FIELD];
   char original_project[PM_MAX_FIELD];
   char override_file[PM_MAX_PATH];
@@ -2732,20 +2828,32 @@ int main(int argc, char **argv) {
     return 127;
   }
 
-  if (pm_find_runtime_from_invocation_path(runtime_executable, argv, real_runtime_path, sizeof(real_runtime_path)) != 0 &&
-      pm_find_runtime_on_path(runtime_executable, real_runtime_path, sizeof(real_runtime_path)) != 0) {
+  pm_resolve_self_path(runtime_executable, argv, self_path, sizeof(self_path));
+  resolved_self_path = self_path[0] == '\0' ? NULL : self_path;
+  pm_debug("argv0=%s runtime=%s executable=%s self=%s",
+    argv[0] == NULL ? "" : argv[0],
+    runtime,
+    runtime_executable,
+    resolved_self_path == NULL ? "" : resolved_self_path
+  );
+
+  if (pm_find_runtime_from_invocation_path(runtime_executable, argv, resolved_self_path, real_runtime_path, sizeof(real_runtime_path)) != 0 &&
+      pm_find_runtime_on_path(runtime_executable, resolved_self_path, real_runtime_path, sizeof(real_runtime_path)) != 0) {
     fprintf(stderr, "portmanager-docker-shim: could not resolve real %s on PATH\n", runtime_executable);
     return 127;
   }
+  pm_debug("real=%s", real_runtime_path);
 
-  clean_path = pm_path_without_shim_directory();
+  clean_path = pm_path_without_shim_directory(runtime_executable, resolved_self_path);
   if (clean_path != NULL) {
+    pm_debug("clean_path=%s", clean_path);
     setenv("PATH", clean_path, 1);
     free(clean_path);
   }
   setenv(PM_DOCKER_SHIM_BYPASS_ENV, "1", 1);
 
   command_index = pm_first_command_index(argc, argv);
+  pm_debug("command_index=%d standalone_compose=%d", command_index, standalone_compose);
   if (standalone_compose || (command_index >= 0 && strcmp(argv[command_index], "compose") == 0)) {
     if (pm_find_compose_route(runtime, argc, argv, attached_project, sizeof(attached_project), original_project, sizeof(original_project)) == 0) {
       override_file[0] = '\0';
@@ -2774,6 +2882,12 @@ int main(int argc, char **argv) {
   if (next_argv == NULL) {
     fprintf(stderr, "portmanager-docker-shim: allocation failed\n");
     return 127;
+  }
+
+  if (pm_debug_enabled()) {
+    for (int index = 0; next_argv[index] != NULL; index++) {
+      pm_debug("exec_argv[%d]=%s", index, next_argv[index]);
+    }
   }
 
   execv(real_runtime_path, next_argv);

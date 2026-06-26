@@ -52,7 +52,8 @@ import {
 
 const DEFAULT_KILL_SIGNAL: ProcessKillSignal = "SIGTERM";
 const DETECTED_PROCESS_ID_PREFIX = "detected:";
-const DEFAULT_LISTENER_SCAN_INTERVAL_MS = 3_000;
+const DEFAULT_LISTENER_SCAN_INTERVAL_MS = 60_000;
+const DEFAULT_LISTENER_SCAN_CACHE_TTL_MS = 1_000;
 const DEFAULT_EXTERNAL_LISTENER_GRACE_MS = 60_000;
 const DEFAULT_EXTERNAL_LISTENER_MISSING_SCAN_THRESHOLD = 3;
 const ROUTE_ALLOCATION_TTL_MS = 30_000;
@@ -84,6 +85,8 @@ export interface PortManagerAgentOptions {
   readonly agentMainPath?: string;
   /** Interval for daemon-side OS listener polling. */
   readonly listenerScanIntervalMs?: number;
+  /** Short window that lets concurrent client refreshes reuse one OS listener scan. */
+  readonly listenerScanCacheTtlMs?: number;
   /** Grace period before hook/manual rows are stopped after a missing listener scan. */
   readonly externalListenerGraceMs?: number;
   /** Consecutive missing OS scans required before hook/manual rows can be stopped. */
@@ -144,6 +147,18 @@ interface BuildSnapshotRuntimeOptions {
    * must not let slow OS listener scans remove hook-owned routes.
    */
   readonly reconcileExternalListeners?: boolean;
+  /**
+   * Allows UI refreshes from multiple VS Code windows to share a very recent
+   * listener table. Route allocation still asks for a fresh scan.
+   */
+  readonly allowRecentListenerCache?: boolean;
+}
+
+interface ListenerScanCache {
+  /** Listener table returned by the most recent successful OS scan. */
+  readonly listeners: readonly ListeningPort[];
+  /** Wall-clock timestamp used only for short cache expiry. */
+  readonly scannedAtMs: number;
 }
 
 /**
@@ -215,6 +230,9 @@ export class PortManagerAgent implements DisposableLike {
   /** Interval for rescanning the OS listening table while clients are attached. */
   private readonly listenerScanIntervalMs: number;
 
+  /** Short reuse window for UI-triggered scans from concurrent extension hosts. */
+  private readonly listenerScanCacheTtlMs: number;
+
   /** Delay that absorbs short autoreload and process-table visibility gaps. */
   private readonly externalListenerGraceMs: number;
 
@@ -226,6 +244,12 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Prevents overlapping lsof/netstat scans when an interval tick is slow. */
   private listenerScanInFlight = false;
+
+  /** Shared listener scan promise so concurrent requests do not spawn many lsof processes. */
+  private listenerScanPromise: Promise<readonly ListeningPort[]> | undefined;
+
+  /** Last successful listener scan, reused briefly for client refresh bursts. */
+  private listenerScanCache: ListenerScanCache | undefined;
 
   /** Background cleanup state for hook/manual rows absent from OS scans. */
   private readonly missingListenerStateByProcessId = new Map<string, MissingExternalListenerState>();
@@ -286,6 +310,7 @@ export class PortManagerAgent implements DisposableLike {
     this.clearStaleScopedRouteTables();
     this.agentMainPath = options.agentMainPath;
     this.listenerScanIntervalMs = normalizeListenerScanInterval(options.listenerScanIntervalMs);
+    this.listenerScanCacheTtlMs = normalizeListenerScanCacheTtlMs(options.listenerScanCacheTtlMs);
     this.externalListenerGraceMs = normalizeExternalListenerGraceMs(options.externalListenerGraceMs);
     this.externalListenerMissingScanThreshold = normalizeExternalListenerMissingScanThreshold(
       options.externalListenerMissingScanThreshold,
@@ -348,7 +373,7 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Produces a complete snapshot by rescanning listening ports on demand. */
   async listSnapshot(): Promise<AgentSnapshot> {
-    return this.buildSnapshot();
+    return this.buildSnapshot({ allowRecentListenerCache: true });
   }
 
   /**
@@ -772,9 +797,9 @@ export class PortManagerAgent implements DisposableLike {
     return undefined;
   }
 
-  /** Forces a rescan and broadcasts the resulting state to all clients. */
+  /** Refreshes the snapshot and broadcasts the resulting state to all clients. */
   async refreshSnapshot(): Promise<AgentSnapshot> {
-    const snapshot = await this.buildSnapshot();
+    const snapshot = await this.buildSnapshot({ allowRecentListenerCache: true });
     this.lastSnapshotSignature = buildSnapshotSignature(snapshot);
     this.broadcastSnapshot(snapshot);
     return snapshot;
@@ -936,7 +961,7 @@ export class PortManagerAgent implements DisposableLike {
       return;
     }
 
-    void this.buildSnapshot()
+    void this.buildSnapshot({ allowRecentListenerCache: true })
       .then((snapshot) => this.broadcastSnapshot(snapshot))
       .catch((error: unknown) => {
         this.serverErrors.emit(error instanceof Error ? error : new Error(String(error)));
@@ -991,7 +1016,7 @@ export class PortManagerAgent implements DisposableLike {
     this.listenerScanInFlight = true;
 
     try {
-      const snapshot = await this.buildSnapshot({ reconcileExternalListeners: true });
+      const snapshot = await this.buildSnapshot({ reconcileExternalListeners: true, allowRecentListenerCache: true });
       const nextSignature = buildSnapshotSignature(snapshot);
 
       if (this.clients.size > 0 && nextSignature !== this.lastSnapshotSignature) {
@@ -1012,7 +1037,9 @@ export class PortManagerAgent implements DisposableLike {
    * unit-testable without a real child process or OS command.
    */
   private async buildSnapshot(options: BuildSnapshotRuntimeOptions = {}): Promise<AgentSnapshot> {
-    const listeners = await this.listeningPortProvider.list();
+    const listeners = await this.scanListeningPorts({
+      allowRecentCache: options.allowRecentListenerCache === true && this.clients.size > 0,
+    });
     this.updateReservedListeningPorts(listeners);
     this.cleanupExpiredRouteAllocations(this.reservedListeningPorts);
     if (options.reconcileExternalListeners === true) {
@@ -1185,10 +1212,54 @@ export class PortManagerAgent implements DisposableLike {
    */
   private async refreshReservedListeningPorts(): Promise<void> {
     try {
-      this.updateReservedListeningPorts(await this.listeningPortProvider.list());
+      this.updateReservedListeningPorts(await this.scanListeningPorts());
     } catch {
       // Availability probing remains the source of truth when lsof/netstat fail.
     }
+  }
+
+  /**
+   * Runs the expensive OS listener scan through one shared promise.
+   *
+   * Multiple VS Code windows often ask for a snapshot at the same time during
+   * startup. Sharing the in-flight scan keeps those refreshes from spawning a
+   * burst of lsof/PowerShell processes while preserving fresh scans for route
+   * allocation and lifecycle decisions.
+   */
+  private async scanListeningPorts(
+    options: { readonly allowRecentCache?: boolean } = {},
+  ): Promise<readonly ListeningPort[]> {
+    if (options.allowRecentCache === true && this.listenerScanCacheTtlMs > 0 && this.listenerScanCache !== undefined) {
+      const cacheAgeMs = Date.now() - this.listenerScanCache.scannedAtMs;
+
+      if (cacheAgeMs >= 0 && cacheAgeMs <= this.listenerScanCacheTtlMs) {
+        return this.listenerScanCache.listeners;
+      }
+    }
+
+    if (this.listenerScanPromise !== undefined) {
+      return this.listenerScanPromise;
+    }
+
+    const scanPromise = this.listeningPortProvider
+      .list()
+      .then((listeners) => {
+        this.listenerScanCache = {
+          listeners,
+          scannedAtMs: Date.now(),
+        };
+
+        return listeners;
+      })
+      .finally(() => {
+        if (this.listenerScanPromise === scanPromise) {
+          this.listenerScanPromise = undefined;
+        }
+      });
+
+    this.listenerScanPromise = scanPromise;
+
+    return scanPromise;
   }
 
   /** Replaces the reservation cache with one coherent listener scan. */
@@ -1203,7 +1274,7 @@ export class PortManagerAgent implements DisposableLike {
   /** Finds a live OS listener on one actual routed port, if the scanner is available. */
   private async findActiveListenerForActualPort(actualPort: number): Promise<ListeningPort | undefined> {
     try {
-      const listeners = await this.listeningPortProvider.list();
+      const listeners = await this.scanListeningPorts();
       this.updateReservedListeningPorts(listeners);
       return listeners.find((listener) => listener.port === actualPort);
     } catch {
@@ -1220,7 +1291,7 @@ export class PortManagerAgent implements DisposableLike {
    */
   private async findSamePortExternalListener(logicalPort: number): Promise<ListeningPort | undefined> {
     try {
-      const listeners = await this.listeningPortProvider.list();
+      const listeners = await this.scanListeningPorts();
       this.updateReservedListeningPorts(listeners);
       return listeners.find((listener) => listener.port === logicalPort);
     } catch {
@@ -1781,6 +1852,15 @@ function normalizeListenerScanInterval(intervalMs: number | undefined): number {
   }
 
   return Math.max(1_000, Math.trunc(intervalMs));
+}
+
+/** Allows production refresh bursts to coalesce while tests can disable reuse. */
+function normalizeListenerScanCacheTtlMs(ttlMs: number | undefined): number {
+  if (ttlMs === undefined || !Number.isFinite(ttlMs)) {
+    return DEFAULT_LISTENER_SCAN_CACHE_TTL_MS;
+  }
+
+  return Math.max(0, Math.trunc(ttlMs));
 }
 
 /** Keeps external listener cleanup delayed enough for autoreload handoffs. */
