@@ -57,6 +57,7 @@
     "onCommand:portManager.addHostPortExposure",
     "onCommand:portManager.addHostAccessBinding",
     "onCommand:portManager.addComposePublishedPort",
+    "onCommand:portManager.copyComposeAttachment",
     "onCommand:portManager.detachComposeAttachment",
     "onCommand:portManager.renameComposeAttachment",
     "onCommand:portManager.removeComposeAttachment",
@@ -70,6 +71,7 @@
     "onCommand:portManager.restartDaemon",
     "onCommand:portManager.stopDaemon",
     "onCommand:portManager.showDaemonStatus",
+    "onCommand:portManager.fixStaleRouting",
     "onCommand:portManager.clearRoutingFiles",
     "onCommand:portManager.resetRouting",
     "onCommand:portManager.clearNetworkCache",
@@ -77,6 +79,7 @@
     "onCommand:portManager.startManagedProcess",
     "onCommand:portManager.addExistingProcess",
     "onCommand:portManager.refresh",
+    "onCommand:portManager.showStatusMenu",
     "onCommand:portManager.stopProcess",
     "onCommand:portManager.restartProcess",
     "onCommand:portManager.stopAllProcesses",
@@ -223,6 +226,12 @@
         "icon": "$(database)"
       },
       {
+        "command": "portManager.copyComposeAttachment",
+        "title": "Port Manager: Copy Compose Attachment",
+        "category": "Port Manager",
+        "icon": "$(copy)"
+      },
+      {
         "command": "portManager.detachComposeAttachment",
         "title": "Port Manager: Detach Service from Network",
         "category": "Port Manager",
@@ -301,6 +310,12 @@
         "icon": "$(pulse)"
       },
       {
+        "command": "portManager.fixStaleRouting",
+        "title": "Port Manager: Fix Stale Routing",
+        "category": "Port Manager",
+        "icon": "$(debug-rerun)"
+      },
+      {
         "command": "portManager.clearRoutingFiles",
         "title": "Port Manager: Clear All Routing Cache",
         "category": "Port Manager",
@@ -333,6 +348,12 @@
         "title": "Port Manager: Refresh",
         "category": "Port Manager",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "portManager.showStatusMenu",
+        "title": "Port Manager: Show Status Menu",
+        "category": "Port Manager",
+        "icon": "$(target)"
       },
       {
         "command": "portManager.stopProcess",
@@ -568,7 +589,7 @@
         },
         {
           "command": "portManager.attachVscodeWindowTerminalsToNetwork",
-          "when": "view == portManager.processes && viewItem == section.daemon",
+          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == vscodeWindowTerminalBinding)",
           "group": "terminal@2"
         },
         {
@@ -612,6 +633,11 @@
           "group": "exposure@4"
         },
         {
+          "command": "portManager.copyComposeAttachment",
+          "when": "view == portManager.processes && viewItem == composeAttachment",
+          "group": "inline@1"
+        },
+        {
           "command": "portManager.detachComposeAttachment",
           "when": "view == portManager.processes && viewItem == composeAttachment",
           "group": "exposure@5"
@@ -642,9 +668,14 @@
           "group": "daemon@3"
         },
         {
-          "command": "portManager.clearRoutingFiles",
+          "command": "portManager.fixStaleRouting",
           "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
           "group": "daemon@4"
+        },
+        {
+          "command": "portManager.clearRoutingFiles",
+          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
+          "group": "daemon@5"
         },
         {
           "command": "portManager.openRoutedUrl",

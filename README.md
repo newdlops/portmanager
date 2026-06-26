@@ -29,6 +29,7 @@ The previous managed-process routing, native hook, and rerun-on-failure implemen
 - Discover VS Code integrated terminals and OS shell processes as grouped Terminal Windows with visible titles.
 - Attach a terminal window to a logical network as a persisted association.
 - Attach Docker Compose published ports as logical-network service routes by moving selected services into a hidden network-scoped Compose project, so the original host ports become reusable.
+- Copy an attached Compose project into another logical network as a separate hidden Compose project, including stopped services so later `docker compose start` or `up` commands keep using the copied project.
 - Discover running Docker/Podman services with published ports, group Compose services by project, and attach them from the Compose / Containers sidebar section.
 - Start every primary network command from sidebar action rows, not only Command Palette.
 - Expose a host TCP port to a target address and port through `Local TCP Proxy`.
@@ -88,6 +89,8 @@ npm run dev
 When a hooked process calls `bind(8000)`, the hook asks the same per-user daemon to allocate an actual port, rewrites the bind call, and registers the logical route. Fixed protocol ports such as SSH, MySQL, and PostgreSQL are preserved by default because the port number itself is part of the protocol contract. When another hooked local process calls `connect(...:8000)`, the hook reads the daemon route table and redirects the connection to the actual port.
 
 Compose published ports can be attached to a logical network from the sidebar. Refresh the Compose / Containers section to discover running Docker/Podman services, then attach a service or grouped Compose project to a network. Port Manager inspects the original containers, pins their actual volume/bind/tmpfs mounts into a generated Compose override, stops the original services, starts a hidden project whose name is derived from the logical network and original project, and discovers Docker's allocated localhost ports. For example, an original PostgreSQL publish on host `15432` can become logical `15432 -> 127.0.0.1:57001` inside the attached network while host `15432` is free for another local process or for `docker compose up` under the original project name. Removing the attachment stops the hidden services before starting the original services again, so data volumes are not mounted by both projects at the same time.
+
+Copy Compose Attachment creates a second hidden Compose project for the destination network when runtime metadata is available. Services with routes are started, and stopped/no-port services are created in the copied project so later lifecycle commands do not fall back to the source project.
 
 ## Local Agent
 

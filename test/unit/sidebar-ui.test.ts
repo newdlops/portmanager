@@ -19,6 +19,42 @@ test("sidebar root stays focused on networks, services, and diagnostics", () => 
   assert.equal(rootBody.includes('"Runtime Adapter"'), false);
 });
 
+test("diagnostics exposes stale routing repair and recent activity", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/ui/sidebar/port-manager-tree.ts");
+  const commandsPath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const networkServicePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const packagePath = path.resolve(__dirname, "../../../package.json");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const commandsSource = fs.readFileSync(commandsPath, "utf8");
+  const networkServiceSource = fs.readFileSync(networkServicePath, "utf8");
+  const manifest = JSON.parse(fs.readFileSync(packagePath, "utf8")) as {
+    activationEvents?: string[];
+    contributes?: {
+      commands?: Array<{ command: string; title: string }>;
+      menus?: { "view/item/context"?: Array<{ command: string; when?: string }> };
+    };
+  };
+  const menuItems = manifest.contributes?.menus?.["view/item/context"] ?? [];
+
+  assert.equal(networkServiceSource.includes("async fixStaleRouting(): Promise<StaleRoutingRepairSummary>"), true);
+  assert.equal(networkServiceSource.includes("await this.convergeDaemonAndRoutingState();"), true);
+  assert.equal(commandsSource.includes('"portManager.fixStaleRouting"'), true);
+  assert.equal(commandsSource.includes("this.dependencies.networkService.fixStaleRouting()"), true);
+  assert.equal(source.includes('"Fix Stale Routing"'), true);
+  assert.equal(source.includes("class RoutingTimelineGroupTreeItem"), true);
+  assert.equal(source.includes('"Recent Routing Activity"'), true);
+  assert.equal(source.includes("buildRoutingTimelineRows(snapshot, agentSnapshot)"), true);
+  assert.equal(manifest.activationEvents?.includes("onCommand:portManager.fixStaleRouting"), true);
+  assert.equal(
+    manifest.contributes?.commands?.some((item) => item.command === "portManager.fixStaleRouting"),
+    true,
+  );
+  assert.equal(
+    menuItems.some((item) => item.command === "portManager.fixStaleRouting" && item.when?.includes("section.daemon")),
+    true,
+  );
+});
+
 test("sidebar shows current network and route destinations", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/ui/sidebar/port-manager-tree.ts");
   const networkServicePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
@@ -44,6 +80,45 @@ test("network rows show state first and keep actions grouped", () => {
   assert.equal(source.includes('"Attach Active Terminal"'), true);
   assert.equal(source.includes('"Attach Terminal"'), true);
   assert.equal(source.includes('"Use Quick Actions"'), true);
+});
+
+test("compose attachment copy command is wired through package and sidebar", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/ui/sidebar/port-manager-tree.ts");
+  const commandsPath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const networkServicePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const packagePath = path.resolve(__dirname, "../../../package.json");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const commandsSource = fs.readFileSync(commandsPath, "utf8");
+  const networkServiceSource = fs.readFileSync(networkServicePath, "utf8");
+  const manifest = JSON.parse(fs.readFileSync(packagePath, "utf8")) as {
+    activationEvents?: string[];
+    contributes?: {
+      commands?: Array<{ command: string; title: string; icon?: string }>;
+      menus?: { "view/item/context"?: Array<{ command: string; when?: string; group?: string }> };
+    };
+  };
+  const command = manifest.contributes?.commands?.find((item) => item.command === "portManager.copyComposeAttachment");
+  const menuItems = manifest.contributes?.menus?.["view/item/context"] ?? [];
+
+  assert.equal(manifest.activationEvents?.includes("onCommand:portManager.copyComposeAttachment"), true);
+  assert.equal(command?.title, "Port Manager: Copy Compose Attachment");
+  assert.equal(command?.icon, "$(copy)");
+  assert.equal(
+    menuItems.some(
+      (item) =>
+        item.command === "portManager.copyComposeAttachment" &&
+        item.when === "view == portManager.processes && viewItem == composeAttachment",
+    ),
+    true,
+  );
+  assert.equal(source.includes("networkComposeAttachments.length > 0"), true);
+  assert.equal(source.includes('"Copy Compose Attachment"'), true);
+  assert.equal(source.includes('"portManager.copyComposeAttachment"'), true);
+  assert.equal(commandsSource.includes('"portManager.copyComposeAttachment"'), true);
+  assert.equal(commandsSource.includes("this.dependencies.networkService.copyComposeAttachment"), true);
+  assert.equal(networkServiceSource.includes("async copyComposeAttachment(input: ComposeAttachmentCopyInput)"), true);
+  assert.equal(networkServiceSource.includes('mode: "copy"'), true);
+  assert.equal(networkServiceSource.includes("copyStoppedServices: true"), true);
 });
 
 test("terminal rows expose reveal commands for injected external windows", () => {
@@ -85,6 +160,44 @@ test("terminal context menu supports active attach and reveal", () => {
   assert.equal(commands.includes("portManager.revealTerminalWindow"), true);
   assert.equal(
     menuItems.some((item) => item.command === "portManager.revealTerminalWindow" && item.when?.includes("terminalAttachment")),
+    true,
+  );
+});
+
+test("status bar exposes current routing quick menu", () => {
+  const activatePath = path.resolve(__dirname, "../../../src/extension/activate.ts");
+  const commandsPath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const packagePath = path.resolve(__dirname, "../../../package.json");
+  const activateSource = fs.readFileSync(activatePath, "utf8");
+  const commandsSource = fs.readFileSync(commandsPath, "utf8");
+  const manifest = JSON.parse(fs.readFileSync(packagePath, "utf8")) as {
+    contributes?: {
+      commands?: Array<{ command: string }>;
+      menus?: { "view/item/context"?: Array<{ command: string; when?: string }> };
+    };
+    activationEvents?: string[];
+  };
+  const menuItems = manifest.contributes?.menus?.["view/item/context"] ?? [];
+
+  assert.equal(activateSource.includes("createStatusBarItem"), true);
+  assert.equal(activateSource.includes('"portManager.showStatusMenu"'), true);
+  assert.equal(activateSource.includes("vscodeWindowTerminalBinding"), true);
+  assert.equal(activateSource.includes("attachedTerminals"), true);
+  assert.equal(commandsSource.includes('"$(target) Current Routing"'), true);
+  assert.equal(commandsSource.includes('"$(vm) Switch VS Code Terminal Network"'), true);
+  assert.equal(commandsSource.includes('"$(debug-disconnect) Detach"'), true);
+  assert.equal(commandsSource.includes('"$(refresh) Refresh"'), true);
+  assert.equal(manifest.activationEvents?.includes("onCommand:portManager.showStatusMenu"), true);
+  assert.equal(
+    manifest.contributes?.commands?.some((item) => item.command === "portManager.showStatusMenu"),
+    true,
+  );
+  assert.equal(
+    menuItems.some(
+      (item) =>
+        item.command === "portManager.attachVscodeWindowTerminalsToNetwork" &&
+        item.when?.includes("vscodeWindowTerminalBinding"),
+    ),
     true,
   );
 });

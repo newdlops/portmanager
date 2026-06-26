@@ -56,6 +56,8 @@ export interface ComposePublishMutationInput {
   readonly composeFiles?: readonly string[];
   /** Previous clone mapping lineage that must continue to route into this new clone. */
   readonly sourceContainerMappings?: readonly ComposeContainerMutationMapping[];
+  /** Copy every defined service into the hidden project, including stopped/no-port services. */
+  readonly copyStoppedServices?: boolean;
   /** Published endpoints selected for attach. */
   readonly ports: readonly ComposePublishedPort[];
 }
@@ -85,6 +87,8 @@ interface ComposeServiceContainer {
   readonly id: string;
   readonly name: string;
   readonly serviceName: string;
+  readonly status?: string;
+  readonly hasPublishedPorts: boolean;
 }
 
 interface ComposeServiceContainerList {
@@ -174,12 +178,13 @@ export class ComposePublishMutator {
     }
 
     const mode = input.mode ?? "clone";
-    if (mode !== "clone" && input.attachedProjectName !== undefined && input.attachedProjectName.trim().length > 0) {
-      throw new Error("Custom Compose project names are only supported for clone attach.");
+    const createsHiddenProject = mode === "clone" || mode === "copy";
+    if (!createsHiddenProject && input.attachedProjectName !== undefined && input.attachedProjectName.trim().length > 0) {
+      throw new Error("Custom Compose project names are only supported for clone or copy attach.");
     }
     const requestedProjectName = assertNonEmptyString(input.originalProjectName, "Compose project name");
     const requestedAttachedProjectName =
-      mode === "clone" ? parseRequestedComposeProjectName(input.attachedProjectName) : undefined;
+      createsHiddenProject ? parseRequestedComposeProjectName(input.attachedProjectName) : undefined;
     const resolvedComposeFiles = await this.resolveComposeFiles(input.workingDirectory, input.composeFiles ?? []);
     const originalProjectName = requestedProjectName;
     const composeFiles = this.removeGeneratedOverrideFiles(resolvedComposeFiles);
@@ -187,11 +192,11 @@ export class ComposePublishMutator {
       throw new Error("Compose attach needs the original compose files; generated Port Manager overrides cannot be used alone.");
     }
     const attachedProjectSourceName =
-      mode === "clone"
+      createsHiddenProject
         ? await this.resolveAttachedProjectSourceName(requestedProjectName, input.workingDirectory, composeFiles)
         : originalProjectName;
     const attachedProjectName =
-      mode !== "clone"
+      !createsHiddenProject
         ? originalProjectName
         : requestedAttachedProjectName ??
           (await this.resolveGeneratedAttachedProjectName(
@@ -209,11 +214,13 @@ export class ComposePublishMutator {
 
     const definedServices = await this.listDefinedComposeServices(originalContext);
     const services = this.filterDefinedComposeServices(originalContext.projectName, requestedServices, definedServices);
-    const overrideServices = mode === "clone" ? definedServices : services;
+    const copyStoppedServices = createsHiddenProject && input.copyStoppedServices === true;
+    const copiedServices = copyStoppedServices ? definedServices : services;
+    const overrideServices = createsHiddenProject ? (copyStoppedServices ? copiedServices : definedServices) : services;
     const disabledOverrideServices =
-      mode === "clone" ? definedServices.filter((service) => !services.includes(service)) : [];
+      mode === "clone" && !copyStoppedServices ? definedServices.filter((service) => !services.includes(service)) : [];
     const ports = input.ports.filter((port) => services.includes(port.serviceName));
-    const originalContainerList = await this.listComposeServiceContainers(input.runtime, originalProjectName, services);
+    const originalContainerList = await this.listComposeServiceContainers(input.runtime, originalProjectName, copiedServices);
     const originalContainers = originalContainerList.containers;
     const originalServiceMounts = await this.inspectServiceMounts(
       input.runtime,
@@ -221,24 +228,24 @@ export class ComposePublishMutator {
       originalContainerList.inspectedRows,
     );
     const serviceContainerNameSot =
-      mode === "clone" ? await readComposeServiceContainerNames(composeFiles) : new Map<string, string>();
+      createsHiddenProject ? await readComposeServiceContainerNames(composeFiles) : new Map<string, string>();
     const statefulCloneServices = findStatefulCloneServices(ports, originalServiceMounts);
-    if (mode === "clone" && statefulCloneServices.length > 0 && input.allowStatefulClone !== true) {
+    if (createsHiddenProject && statefulCloneServices.length > 0 && input.allowStatefulClone !== true) {
       throw new Error(
         `Clone attach includes stateful service${statefulCloneServices.length === 1 ? "" : "s"} with persistent mounts: ${statefulCloneServices.join(", ")}. Confirm stateful clone explicitly or use Attach as-is.`,
       );
     }
     const statefulServiceNames = new Set(statefulCloneServices);
     const volumeClonePlan =
-      mode === "clone"
+      createsHiddenProject
         ? await buildVolumeClonePlan(attachedProjectName, randomUUID().slice(0, 8), originalServiceMounts, statefulServiceNames)
         : { serviceMounts: originalServiceMounts, volumeClones: [], volumeMappings: [] };
     const occupiedContainerNames =
-      mode === "clone"
+      createsHiddenProject
         ? await this.findOccupiedCloneContainerNames(input.runtime, originalContainers, serviceContainerNameSot)
         : new Set<string>();
     const cloneContainerNames =
-      mode === "clone"
+      createsHiddenProject
         ? buildCloneContainerNames(
             originalProjectName,
             attachedProjectName,
@@ -253,9 +260,9 @@ export class ComposePublishMutator {
       ports,
       volumeClonePlan.serviceMounts,
       {
-        resetContainerName: mode === "clone",
+        resetContainerName: createsHiddenProject,
         cloneContainerNames,
-        isolatedNetwork: mode === "clone" ? "pm_isolated" : undefined,
+        isolatedNetwork: createsHiddenProject ? "pm_isolated" : undefined,
         disabledServices: disabledOverrideServices,
       },
     );
@@ -267,22 +274,32 @@ export class ComposePublishMutator {
     };
     let originalStopped = false;
     let hiddenStarted = false;
+    let hiddenCreated = false;
     let clonedVolumesCreated = false;
 
     try {
       if (mode === "clone") {
         await this.runCompose(originalContext, ["stop", ...services]);
         originalStopped = true;
+      }
+      if (createsHiddenProject) {
         await this.copyVolumes(input.runtime, volumeClonePlan.volumeClones);
         clonedVolumesCreated = true;
       }
       await this.runCompose(hiddenContext, ["up", "-d", "--force-recreate", "--no-deps", ...services]);
       hiddenStarted = true;
+      const stoppedCopyServices = copyStoppedServices
+        ? copiedServices.filter((service) => !services.includes(service))
+        : [];
+      if (stoppedCopyServices.length > 0) {
+        await this.runCompose(hiddenContext, ["create", "--no-recreate", ...stoppedCopyServices]);
+        hiddenCreated = true;
+      }
       const hiddenCandidates = await this.discoverHiddenComposeCandidates(input.runtime, attachedProjectName);
       const hiddenPorts = resolveHiddenPorts(attachedProjectName, ports, hiddenCandidates);
       assertHiddenPortsAreIsolated(hiddenPorts, ports);
       const containerMappings =
-        mode === "clone"
+        createsHiddenProject
           ? mergeComposeContainerMappingLineage(
               input.sourceContainerMappings ?? [],
               buildContainerCloneMappings(originalContainers, hiddenCandidates),
@@ -299,7 +316,7 @@ export class ComposePublishMutator {
           attachedProjectName,
           ...(input.workingDirectory !== undefined ? { workingDirectory: input.workingDirectory } : {}),
           composeFiles,
-          services,
+          services: copiedServices,
           overrideFile,
           originalPorts: ports.map((port) => ({ ...port })),
           hiddenPorts,
@@ -309,7 +326,7 @@ export class ComposePublishMutator {
         },
       };
     } catch (error) {
-      if (hiddenStarted && mode === "clone") {
+      if ((hiddenStarted || hiddenCreated) && createsHiddenProject) {
         await this.runCompose(hiddenContext, ["down", "--remove-orphans"]).catch(() => undefined);
       }
       if (hiddenStarted && mode === "in-place") {
@@ -357,6 +374,21 @@ export class ComposePublishMutator {
         await this.runCompose(hiddenContext, ["up", "-d", "--force-recreate", "--no-deps", ...state.services]).catch(
           () => undefined,
         );
+        throw error;
+      }
+      return;
+    }
+
+    if (state.mode === "copy") {
+      try {
+        await this.runCompose(hiddenContext, ["stop", ...state.services]);
+        hiddenStopped = true;
+        await this.runCompose(hiddenContext, ["down", "--remove-orphans"]);
+        await fs.rm(state.overrideFile, { force: true }).catch(() => undefined);
+      } catch (error) {
+        if (hiddenStopped) {
+          await this.runCompose(hiddenContext, ["start", ...state.services]).catch(() => undefined);
+        }
         throw error;
       }
       return;
@@ -698,19 +730,14 @@ export class ComposePublishMutator {
   ): Promise<ComposeServiceContainerList> {
     const serviceSet = new Set(services);
     const { rows, inspectedRows } = await this.listRuntimeRowsWithInspectNames(runtime);
-    const candidates = parseContainerRows(runtime, rows).filter(
+    const containers = selectCurrentComposeServiceContainers(parseComposeServiceContainerRows(rows)).filter(
       (candidate) =>
         candidate.composeProject === originalProjectName &&
-        candidate.composeService !== undefined &&
-        serviceSet.has(candidate.composeService),
+        serviceSet.has(candidate.serviceName),
     );
 
     return {
-      containers: candidates.map((candidate) => ({
-        id: candidate.containerId,
-        name: candidate.containerName,
-        serviceName: candidate.composeService!,
-      })),
+      containers,
       inspectedRows,
     };
   }
@@ -1087,6 +1114,7 @@ function buildRenameContainerNameSources(
         id: mapping.originalContainerId,
         name: mapping.originalContainerName,
         serviceName: mapping.serviceName,
+        hasPublishedPorts: false,
       })) ?? [];
 
   return mappingSources.length > 0 ? mappingSources : currentContainers;
@@ -1911,6 +1939,79 @@ function readRuntimeContainerId(row: RuntimeContainerRow): string | undefined {
 function readRuntimeContainerName(row: RuntimeContainerRow): string | undefined {
   const name = normalizeContainerNameText(row.Names ?? row.Name ?? "");
   return name.length === 0 ? undefined : name;
+}
+
+function parseComposeServiceContainerRows(
+  rows: readonly RuntimeContainerRow[],
+): readonly (ComposeServiceContainer & { readonly composeProject: string })[] {
+  return rows
+    .map((row) => {
+      const id = readRuntimeContainerId(row);
+      const name = readRuntimeContainerName(row);
+      const labels = parseRuntimeLabels(row.Labels);
+      const composeProject = readRuntimeLabel(labels, "com.docker.compose.project", "io.podman.compose.project");
+      const composeService = readRuntimeLabel(labels, "com.docker.compose.service", "io.podman.compose.service");
+      if (id === undefined || name === undefined || composeProject === undefined || composeService === undefined) {
+        return undefined;
+      }
+
+      return {
+        id,
+        name,
+        composeProject,
+        serviceName: composeService,
+        hasPublishedPorts: (row.Ports ?? "").trim().length > 0,
+        ...(row.Status !== undefined ? { status: row.Status } : {}),
+      };
+    })
+    .filter((container): container is ComposeServiceContainer & { readonly composeProject: string } => container !== undefined);
+}
+
+function selectCurrentComposeServiceContainers(
+  containers: readonly (ComposeServiceContainer & { readonly composeProject: string })[],
+): readonly (ComposeServiceContainer & { readonly composeProject: string })[] {
+  const hasPublishedContainerByService = new Set(
+    containers
+      .filter((container) => container.hasPublishedPorts)
+      .map((container) => `${container.composeProject}:${container.serviceName}`),
+  );
+
+  return containers.filter(
+    (container) =>
+      container.hasPublishedPorts ||
+      !hasPublishedContainerByService.has(`${container.composeProject}:${container.serviceName}`),
+  );
+}
+
+function parseRuntimeLabels(value: string | undefined): ReadonlyMap<string, string> {
+  const labels = new Map<string, string>();
+  let currentKey: string | undefined;
+
+  for (const rawLabel of value?.split(",") ?? []) {
+    const separatorIndex = rawLabel.indexOf("=");
+    if (separatorIndex <= 0) {
+      if (currentKey !== undefined) {
+        labels.set(currentKey, `${labels.get(currentKey) ?? ""},${rawLabel}`);
+      }
+      continue;
+    }
+
+    currentKey = rawLabel.slice(0, separatorIndex);
+    labels.set(currentKey, rawLabel.slice(separatorIndex + 1));
+  }
+
+  return labels;
+}
+
+function readRuntimeLabel(labels: ReadonlyMap<string, string>, ...keys: readonly string[]): string | undefined {
+  for (const key of keys) {
+    const value = labels.get(key);
+    if (value !== undefined && value.trim().length > 0) {
+      return value;
+    }
+  }
+
+  return undefined;
 }
 
 function sameContainerId(left: string, right: string): boolean {

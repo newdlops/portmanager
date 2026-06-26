@@ -39,6 +39,7 @@ import type {
   ManagedProcessStartInput,
   NetworkRuntimeDescriptor,
   NetworkRuntimeKind,
+  NetworkSnapshot,
   PortInjectionMode,
   PortManagerSettings,
   TerminalAttachment,
@@ -132,6 +133,9 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.addComposePublishedPort", (argument) =>
       this.addComposePublishedPort(argument),
     );
+    this.registerCommand(context, "portManager.copyComposeAttachment", (argument) =>
+      this.copyComposeAttachment(argument),
+    );
     this.registerCommand(context, "portManager.detachComposeAttachment", (argument) =>
       this.detachComposeAttachment(argument),
     );
@@ -159,6 +163,7 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.restartDaemon", () => this.restartDaemon());
     this.registerCommand(context, "portManager.stopDaemon", () => this.stopDaemon());
     this.registerCommand(context, "portManager.showDaemonStatus", () => this.showDaemonStatus());
+    this.registerCommand(context, "portManager.fixStaleRouting", () => this.fixStaleRouting());
     this.registerCommand(context, "portManager.clearRoutingFiles", () => this.clearRoutingFiles());
     this.registerCommand(context, "portManager.resetRouting", () => this.clearRoutingFiles());
     this.registerCommand(context, "portManager.clearNetworkCache", (argument) =>
@@ -170,6 +175,7 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.startManagedProcess", () => this.startManagedProcess());
     this.registerCommand(context, "portManager.addExistingProcess", () => this.addExistingProcess());
     this.registerCommand(context, "portManager.refresh", () => this.refresh());
+    this.registerCommand(context, "portManager.showStatusMenu", () => this.showStatusMenu());
     this.registerCommand(context, "portManager.stopProcess", (argument) => this.stopProcess(argument));
     this.registerCommand(context, "portManager.restartProcess", (argument) => this.restartProcess(argument));
     this.registerCommand(context, "portManager.stopAllProcesses", () => this.stopAllProcesses());
@@ -749,6 +755,39 @@ export class PortManagerCommandController implements DisposableLike {
     await vscode.window.showInformationMessage(`Attached compose project "${attachment.projectName}".`);
   }
 
+  /** Copies an existing Compose route attachment into another logical network. */
+  private async copyComposeAttachment(argument: unknown): Promise<void> {
+    const targetFromArgument = getLogicalNetworkFromCommandArgument(argument);
+    const source = await this.resolveComposeAttachmentForCopy(
+      targetFromArgument === undefined ? argument : undefined,
+      targetFromArgument,
+      "Copy Compose Attachment",
+    );
+    if (source === undefined) {
+      return;
+    }
+
+    const target =
+      targetFromArgument ?? (await this.resolveComposeCopyTargetNetwork(source, "Copy Compose Attachment"));
+    if (target === undefined) {
+      return;
+    }
+
+    const copied = await this.dependencies.networkService.copyComposeAttachment({
+      attachmentId: source.id,
+      networkId: target.id,
+    });
+    if (copied === undefined) {
+      await vscode.window.showWarningMessage("Compose attachment no longer exists.");
+      return;
+    }
+
+    this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage(
+      `Copied "${formatComposeAttachmentName(source)}" to "${target.name}" (${copied.ports.length} route${copied.ports.length === 1 ? "" : "s"}).`,
+    );
+  }
+
   /** Detaches compose route rows without changing the underlying Docker/Podman project. */
   private async detachComposeAttachment(argument: unknown): Promise<void> {
     const attachment = await this.resolveComposeAttachmentArgument(argument, "Detach Service from Network");
@@ -983,6 +1022,32 @@ export class PortManagerCommandController implements DisposableLike {
     );
   }
 
+  /** Converges daemon state and regenerates disposable routing files from durable bindings. */
+  private async fixStaleRouting(): Promise<void> {
+    const summary = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "Port Manager: fixing stale routing",
+      },
+      () => this.dependencies.networkService.fixStaleRouting(),
+    );
+
+    await this.dependencies.processService.refresh().catch(() => undefined);
+    this.dependencies.treeProvider.refresh();
+
+    const daemonText = summary.daemonRestarted
+      ? " Restarted the stale daemon."
+      : summary.staleDaemonDetected
+        ? " Daemon convergence is still pending or backed off."
+        : "";
+    const failureText =
+      summary.failedFileCount > 0 ? ` ${summary.failedFileCount} file(s) could not be removed.` : "";
+
+    await vscode.window.showInformationMessage(
+      `Fixed routing state: removed ${summary.removedFileCount} generated file(s), ${summary.removedMarkerCount} stale marker(s), restored ${summary.restoredComposeRouteCount} compose route(s), ${summary.routeCount} active route(s).${daemonText}${failureText}`,
+    );
+  }
+
   /** Clears generated routing cache files and rehydrates durable compose routes. */
   private async clearRoutingFiles(): Promise<void> {
     const selection = await vscode.window.showWarningMessage(
@@ -1157,6 +1222,62 @@ export class PortManagerCommandController implements DisposableLike {
       this.dependencies.networkService.refreshContainerServices(),
     ]);
     this.dependencies.treeProvider.refresh();
+  }
+
+  /** Opens the status bar command menu around the current terminal routing scope. */
+  private async showStatusMenu(): Promise<void> {
+    const snapshot = this.dependencies.networkService.getSnapshot();
+    const statusSummary = formatStatusMenuSummary(snapshot);
+    const selected = await vscode.window.showQuickPick(
+      [
+        {
+          label: "$(target) Current Routing",
+          description: statusSummary.label,
+          detail: statusSummary.detail,
+          action: "current" as const,
+        },
+        {
+          label: "$(vm) Switch VS Code Terminal Network",
+          description: "Choose the network inherited by new terminals",
+          action: "switch" as const,
+        },
+        {
+          label: "$(debug-disconnect) Detach",
+          description: statusSummary.detachDescription,
+          action: "detach" as const,
+        },
+        {
+          label: "$(refresh) Refresh",
+          description: "Rescan terminals and services",
+          action: "refresh" as const,
+        },
+      ],
+      { title: "Port Manager", placeHolder: statusSummary.label },
+    );
+
+    if (selected === undefined) {
+      return;
+    }
+
+    switch (selected.action) {
+      case "current":
+        await vscode.commands.executeCommand("workbench.view.extension.portManager");
+        await vscode.commands.executeCommand("portManager.processes.focus");
+        return;
+      case "switch":
+        await this.attachVscodeWindowTerminalsToNetwork(undefined);
+        return;
+      case "detach":
+        if (snapshot.vscodeWindowTerminalBinding !== undefined) {
+          await this.detachVscodeWindowTerminalsFromNetwork();
+          return;
+        }
+        await this.detachTerminalFromNetwork(undefined);
+        return;
+      case "refresh":
+        await this.refresh();
+        return;
+    }
   }
 
   /**
@@ -1803,6 +1924,78 @@ export class PortManagerCommandController implements DisposableLike {
     return selected?.attachment;
   }
 
+  /** Resolves a copy source, optionally excluding the destination network to avoid no-op conflicts. */
+  private async resolveComposeAttachmentForCopy(
+    argument: unknown,
+    targetNetwork: LogicalNetwork | undefined,
+    title: string,
+  ): Promise<ComposeAttachment | undefined> {
+    const attachment = getComposeAttachmentFromCommandArgument(argument);
+
+    if (attachment !== undefined) {
+      return this.dependencies.networkService.getComposeAttachment(attachment.id);
+    }
+
+    const snapshot = this.dependencies.networkService.getSnapshot();
+    const attachments = snapshot.composeAttachments.filter(
+      (item) => item.status === "attached" && item.networkId !== targetNetwork?.id,
+    );
+    if (attachments.length === 0) {
+      await vscode.window.showInformationMessage(
+        targetNetwork === undefined
+          ? "No attached compose routes exist."
+          : `No compose attachments can be copied into "${targetNetwork.name}".`,
+      );
+      return undefined;
+    }
+
+    const selected = await vscode.window.showQuickPick(
+      attachments.map((item) => {
+        const network = snapshot.networks.find((candidate) => candidate.id === item.networkId);
+        return {
+          label: formatComposeAttachmentName(item),
+          description: `${network?.name ?? item.networkId}, ${item.status}`,
+          detail: item.ports.map(formatComposePublishedPort).join(", "),
+          attachment: item,
+        };
+      }),
+      { title, placeHolder: "Select a compose attachment to copy" },
+    );
+
+    return selected?.attachment;
+  }
+
+  /** Chooses a destination network that does not already own the source attachment. */
+  private async resolveComposeCopyTargetNetwork(
+    attachment: ComposeAttachment,
+    title: string,
+  ): Promise<LogicalNetwork | undefined> {
+    const snapshot = this.dependencies.networkService.getSnapshot();
+    const networks = snapshot.networks.filter((network) => network.id !== attachment.networkId);
+    if (networks.length === 0) {
+      await vscode.window.showInformationMessage(
+        `Create another logical network before copying "${formatComposeAttachmentName(attachment)}".`,
+      );
+      return undefined;
+    }
+
+    if (networks.length === 1) {
+      return networks[0];
+    }
+
+    const selected = await vscode.window.showQuickPick(
+      networks.map((network) => ({
+        label: network.name,
+        description: network.runtimeKind,
+        detail: network.id,
+        network,
+      })),
+      { title, placeHolder: "Select the destination logical network" },
+    );
+
+    return selected?.network;
+  }
+
   /** Registers one command and wraps thrown errors in a user-visible message. */
   private registerCommand(
     context: vscode.ExtensionContext,
@@ -2245,6 +2438,10 @@ function formatComposePublishedPort(port: {
   return `${port.logicalPort}:${port.containerPort}${transport}`;
 }
 
+function formatComposeAttachmentName(attachment: ComposeAttachment): string {
+  return attachment.mutation?.attachedProjectName ?? attachment.projectName;
+}
+
 interface AttachTerminalCommandInput {
   readonly terminalWindow: TerminalWindow;
   readonly network: LogicalNetwork;
@@ -2600,6 +2797,60 @@ interface ShellHookAssets {
   readonly shellProfilePaths: readonly string[];
 }
 
+interface StatusMenuSummary {
+  /** Compact summary shown in the Quick Pick placeholder and current row. */
+  readonly label: string;
+  /** Expanded routing source explanation for the current row. */
+  readonly detail: string;
+  /** Detach row copy changes based on the active routing source. */
+  readonly detachDescription: string;
+}
+
+/** Builds the menu summary from VS Code window binding first, then terminal attachments. */
+function formatStatusMenuSummary(snapshot: NetworkSnapshot): StatusMenuSummary {
+  const windowNetwork = snapshot.networks.find(
+    (network) => network.id === snapshot.vscodeWindowTerminalBinding?.networkId,
+  );
+  if (windowNetwork !== undefined) {
+    return {
+      label: `VS Code terminals use ${windowNetwork.name}`,
+      detail: `${snapshot.vscodeWindowTerminalBinding?.injectedTerminalCount ?? 0} open terminal${snapshot.vscodeWindowTerminalBinding?.injectedTerminalCount === 1 ? "" : "s"} updated when this binding was applied.`,
+      detachDescription: "Clear the VS Code terminal default",
+    };
+  }
+
+  const attachedTerminals = snapshot.attachments.filter((attachment) => attachment.status === "attached");
+  if (attachedTerminals.length === 0) {
+    return {
+      label: "No current network",
+      detail: "Choose Switch VS Code Terminal Network to route new terminals.",
+      detachDescription: "No active VS Code default; choose an attached terminal if one exists",
+    };
+  }
+
+  const networkNames = formatAttachedNetworkNames(snapshot, attachedTerminals);
+  return {
+    label: `${attachedTerminals.length} attached terminal${attachedTerminals.length === 1 ? "" : "s"}`,
+    detail: networkNames.join(", "),
+    detachDescription: "Choose an attached terminal to detach",
+  };
+}
+
+function formatAttachedNetworkNames(
+  snapshot: NetworkSnapshot,
+  attachments: readonly TerminalAttachment[],
+): string[] {
+  const counts = new Map<string, number>();
+  for (const attachment of attachments) {
+    counts.set(attachment.networkId, (counts.get(attachment.networkId) ?? 0) + 1);
+  }
+
+  return [...counts.entries()].map(([networkId, count]) => {
+    const network = snapshot.networks.find((item) => item.id === networkId);
+    return `${network?.name ?? networkId} (${count})`;
+  });
+}
+
 /** Builds the POSIX shell snippet that injects the native socket hook. */
 function buildShellHookScript(options: ShellHookScriptOptions): string {
   const escapedHookLibraryPath = shellDoubleQuote(options.hookLibraryPath);
@@ -2618,6 +2869,30 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     options.shellEnvRestorePath !== undefined ? shellDoubleQuote(options.shellEnvRestorePath) : undefined;
   const nodeRuntimePrefix = `${ELECTRON_RUN_AS_NODE}=1`;
   const daemonRuntimePrefix = `PORT_MANAGER_HOOK_DISABLED=1 PORT_MANAGER_HOOK=0 DYLD_INSERT_LIBRARIES= LD_PRELOAD= ${nodeRuntimePrefix}`;
+  const routeCountScript = [
+    'const fs=require("node:fs");',
+    'const file=process.argv[1]||"";',
+    'try{const value=JSON.parse(fs.readFileSync(file,"utf8"));const routes=Array.isArray(value&&value.routes)?value.routes:[];console.log(routes.length);}catch{console.log("?");}',
+  ].join("");
+  const routePrintScript = [
+    'const fs=require("node:fs");',
+    'const routeFile=process.argv[1]||"";',
+    'const hostAccessFile=process.argv[2]||"";',
+    'const networkId=process.argv[3]||"";',
+    'const networkName=process.argv[4]||"";',
+    'function readJson(file){if(!file)return undefined;try{return JSON.parse(fs.readFileSync(file,"utf8"));}catch{return undefined;}}',
+    'function text(value){return value===undefined||value===null||value===""?"-":String(value);}',
+    'const routeTable=readJson(routeFile);',
+    'const routes=Array.isArray(routeTable&&routeTable.routes)?routeTable.routes:[];',
+    'const matchingRoutes=networkId?routes.filter((route)=>!route.networkId||route.networkId===networkId):routes;',
+    'const title=networkId?(networkName?networkName+" ["+networkId+"]":networkId):"all networks";',
+    'console.log("Port Manager routes: "+title);',
+    'if(matchingRoutes.length===0){console.log("  no routes");}else{for(const route of matchingRoutes){const network=route.networkId?" ["+route.networkId+"]":"";const label=route.processName?" "+route.processName:"";console.log("  "+text(route.host)+":"+text(route.logicalPort)+" -> "+text(route.actualPort)+" "+text(route.status)+" "+text(route.source)+network+label);}}',
+    'const hostAccess=readJson(hostAccessFile);',
+    'const bindings=Array.isArray(hostAccess&&hostAccess.bindings)?hostAccess.bindings:[];',
+    'const matchingBindings=networkId?bindings.filter((binding)=>binding.networkId===networkId):bindings;',
+    'if(hostAccessFile&&fs.existsSync(hostAccessFile)){console.log("Host access: "+matchingBindings.length);for(const binding of matchingBindings){console.log("  "+text(binding.logicalPort)+" -> "+text(binding.hostAddress)+":"+text(binding.hostPort)+" "+text(binding.status)+" ["+text(binding.networkId)+"]");}}',
+  ].join("");
   const nodeProbeScript = [
     'const net=require("node:net");',
     'const fs=require("node:fs");',
@@ -2676,9 +2951,112 @@ fi
 
 pm() {
   if [ "\${1:-}" = "help" ] || [ "\${1:-}" = "--help" ] || [ "\${1:-}" = "-h" ]; then
-    printf '%s\n' 'Usage: pm [current|status|network-number|network-name|network-id]' >&2
+    printf '%s\n' 'Usage: pm [current|status|doctor|routes|detach|network-number|network-name|network-id]' >&2
     printf '%s\n' 'Run without arguments to choose a Port Manager logical network for this shell.' >&2
     printf '%s\n' 'Run "pm current" to print the network currently attached to this shell.' >&2
+    printf '%s\n' 'Run "pm doctor" to inspect shell routing files and daemon readiness.' >&2
+    printf '%s\n' 'Run "pm routes" to print routes visible to this shell.' >&2
+    printf '%s\n' 'Run "pm detach" to remove Port Manager routing from this shell.' >&2
+    return 0
+  fi
+
+  if [ "\${1:-}" = "doctor" ]; then
+    __pm_current_id="\${PORT_MANAGER_NETWORK_ID:-}"
+    if [ -z "$__pm_current_id" ]; then __pm_current_id="\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-}"; fi
+    if [ -z "$__pm_current_id" ]; then __pm_current_id="\${PORT_MANAGER_BORROWED_NETWORK_ID:-}"; fi
+    __pm_current_name="\${PORT_MANAGER_NETWORK_NAME:-}"
+    __pm_routes_file="\${PORT_MANAGER_ROUTES_FILE:-\${PORT_MANAGER_GLOBAL_ROUTES_FILE:-}}"
+    __pm_networks_file="\${PORT_MANAGER_NETWORKS_FILE:-}"
+    __pm_host_access_file="\${PORT_MANAGER_HOST_ACCESS_FILE:-}"
+    if [ -n "$__pm_current_id" ] && [ -z "$__pm_current_name" ] && [ -n "$__pm_networks_file" ] && [ -s "$__pm_networks_file" ]; then
+      __pm_current_name="$(awk -F '	' -v q="$__pm_current_id" 'NF >= 3 && $1 == q { print $2; exit }' "$__pm_networks_file")"
+    fi
+    if [ -n "$__pm_current_id" ]; then
+      if [ -n "$__pm_current_name" ]; then
+        printf 'Network: %s [%s]\n' "$__pm_current_name" "$__pm_current_id"
+      else
+        printf 'Network: %s\n' "$__pm_current_id"
+      fi
+    else
+      printf '%s\n' 'Network: none'
+    fi
+    if [ "\${PORT_MANAGER_HOOK:-0}" = "1" ]; then
+      printf '%s\n' 'Hook env: enabled'
+    else
+      printf 'Hook env: disabled (PORT_MANAGER_HOOK=%s)\n' "\${PORT_MANAGER_HOOK:-unset}"
+    fi
+    if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" = "1" ]; then
+      printf '%s\n' 'Daemon readiness flag: ready'
+    else
+      printf 'Daemon readiness flag: not ready (PORT_MANAGER_HOOK_DAEMON_STARTED=%s)\n' "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-unset}"
+    fi
+    if [ -n "$__pm_routes_file" ] && [ -f "$__pm_routes_file" ]; then
+      __pm_route_count="$(${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(routeCountScript)}" "$__pm_routes_file" 2>/dev/null || printf '?')"
+      printf 'Route table: %s (%s routes)\n' "$__pm_routes_file" "$__pm_route_count"
+    elif [ -n "$__pm_routes_file" ]; then
+      printf 'Route table: missing (%s)\n' "$__pm_routes_file"
+    else
+      printf '%s\n' 'Route table: unset'
+    fi
+    if [ -n "$__pm_host_access_file" ] && [ -f "$__pm_host_access_file" ]; then
+      printf 'Host access file: %s\n' "$__pm_host_access_file"
+    elif [ -n "$__pm_host_access_file" ]; then
+      printf 'Host access file: missing (%s)\n' "$__pm_host_access_file"
+    else
+      printf '%s\n' 'Host access file: unset'
+    fi
+    if [ -n "$__pm_networks_file" ] && [ -f "$__pm_networks_file" ]; then
+      __pm_network_count="$(awk -F '	' 'NF >= 3 { count += 1 } END { print count + 0 }' "$__pm_networks_file")"
+      printf 'Network selection file: %s (%s networks)\n' "$__pm_networks_file" "$__pm_network_count"
+    elif [ -n "$__pm_networks_file" ]; then
+      printf 'Network selection file: missing (%s)\n' "$__pm_networks_file"
+    else
+      printf '%s\n' 'Network selection file: unset'
+    fi
+    unset __pm_current_id __pm_current_name __pm_routes_file __pm_networks_file __pm_host_access_file __pm_route_count __pm_network_count
+    return 0
+  fi
+
+  if [ "\${1:-}" = "routes" ]; then
+    __pm_current_id="\${PORT_MANAGER_NETWORK_ID:-}"
+    if [ -z "$__pm_current_id" ]; then __pm_current_id="\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-}"; fi
+    if [ -z "$__pm_current_id" ]; then __pm_current_id="\${PORT_MANAGER_BORROWED_NETWORK_ID:-}"; fi
+    __pm_current_name="\${PORT_MANAGER_NETWORK_NAME:-}"
+    __pm_routes_file="\${PORT_MANAGER_ROUTES_FILE:-\${PORT_MANAGER_GLOBAL_ROUTES_FILE:-}}"
+    __pm_host_access_file="\${PORT_MANAGER_HOST_ACCESS_FILE:-}"
+    if [ -z "$__pm_routes_file" ] || [ ! -f "$__pm_routes_file" ]; then
+      printf 'Port Manager route table unavailable: %s\n' "\${__pm_routes_file:-unset}" >&2
+      unset __pm_current_id __pm_current_name __pm_routes_file __pm_host_access_file
+      return 1
+    fi
+    ${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(routePrintScript)}" "$__pm_routes_file" "$__pm_host_access_file" "$__pm_current_id" "$__pm_current_name"
+    __pm_status=$?
+    unset __pm_current_id __pm_current_name __pm_routes_file __pm_host_access_file
+    return $__pm_status
+  fi
+
+  if [ "\${1:-}" = "detach" ]; then
+    if [ -n "\${PORT_MANAGER_TERMINAL_ATTACHMENT_DIR:-}" ]; then
+      __pm_tty="$(tty 2>/dev/null || true)"
+      __pm_tty="\${__pm_tty#/dev/}"
+      if [ "$__pm_tty" = "not a tty" ]; then __pm_tty=""; fi
+      __pm_pid="$$"
+      __pm_marker_key="$(printf '%s' "\${__pm_tty:-pid-$__pm_pid}" | sed 's#[^A-Za-z0-9._-]#_#g')"
+      rm -f "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR/$__pm_marker_key.tsv" 2>/dev/null || true
+    fi
+    printf '\\033]0;%s\\007' 'Port Manager: detached' 2>/dev/null || true
+    if [ -n "\${PORT_MANAGER_GLOBAL_ROUTES_FILE:-}" ]; then export PORT_MANAGER_ROUTES_FILE="$PORT_MANAGER_GLOBAL_ROUTES_FILE"; else unset PORT_MANAGER_ROUTES_FILE; fi
+    unset PORT_MANAGER_HOOK PORT_MANAGER_NETWORK_ID PORT_MANAGER_NETWORK_NAME PORT_MANAGER_ROUTE_TABLE_NETWORK_ID PORT_MANAGER_BORROWED_NETWORK_ID NEWDLOPS_PM_NETWORK_ID NEWDLOPS_PM_BORROWED_NETWORK_ID PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_TERMINAL_ATTACHMENT_DIR PORT_MANAGER_SCAN_RANGE PORT_MANAGER_ROUTING_MODE PORT_MANAGER_VIRTUAL_PORT_START PORT_MANAGER_VIRTUAL_PORT_END PORT_MANAGER_FIXED_PROTOCOL_PORTS PORT_MANAGER_PRESERVE_LISTEN_PORTS PORT_MANAGER_NETWORK_LOOPBACK_HOST PORT_MANAGER_DYLD_INSERT_LIBRARIES
+    if [ -n "\${PORT_MANAGER_PREV_BASH_ENV:-}" ]; then export BASH_ENV="\${PORT_MANAGER_PREV_BASH_ENV}"; else unset BASH_ENV; fi
+    unset PORT_MANAGER_PREV_BASH_ENV
+    if [ "\${DYLD_INSERT_LIBRARIES:-}" = "${escapedHookLibraryPath}" ]; then unset DYLD_INSERT_LIBRARIES; else export DYLD_INSERT_LIBRARIES="\${DYLD_INSERT_LIBRARIES#${shellPatternLiteral(`${options.hookLibraryPath}:`)}}"; fi
+    if [ "\${LD_PRELOAD:-}" = "${escapedHookLibraryPath}" ]; then unset LD_PRELOAD; else export LD_PRELOAD="\${LD_PRELOAD#${shellPatternLiteral(`${options.hookLibraryPath}:`)}}"; fi
+    ${escapedRuntimeShimDirectory !== undefined ? `export PATH="\${PATH#${shellPatternLiteral(`${options.runtimeShimDirectory}:`)}}"
+    unset ${RUNTIME_SHIM_DIRECTORY_ENV}
+    hash -r 2>/dev/null || true` : ""}
+    unset -f docker podman docker-compose podman-compose /usr/local/bin/docker /opt/homebrew/bin/docker /usr/bin/docker /bin/docker /Applications/Docker.app/Contents/Resources/bin/docker /usr/local/bin/podman /opt/homebrew/bin/podman /usr/bin/podman /bin/podman /usr/local/bin/docker-compose /opt/homebrew/bin/docker-compose /usr/bin/docker-compose /bin/docker-compose /Applications/Docker.app/Contents/Resources/bin/docker-compose /usr/local/bin/podman-compose /opt/homebrew/bin/podman-compose /usr/bin/podman-compose /bin/podman-compose __port_manager_runtime_first_command __port_manager_runtime_container_subcommand __port_manager_network_id __port_manager_normalize_compose_file_path __port_manager_same_compose_file_path __port_manager_compose_args_reference_file __port_manager_compose_route_for_runtime __port_manager_cwd_matches_workdir __port_manager_container_target_for_runtime __port_manager_shell_quote __port_manager_runtime_command_may_reference_container __port_manager_run_runtime_with_container_routing __port_manager_run_compose_command_with_routing __port_manager_run_standalone_compose_with_routing __port_manager_define_absolute_runtime_function 2>/dev/null || true
+    unset __pm_tty __pm_pid __pm_marker_key
+    printf '%s\n' 'Port Manager routing detached from this shell.'
     return 0
   fi
 
@@ -2813,6 +3191,11 @@ async function appendLineOnce(filePath: string, line: string): Promise<void> {
 /** Escapes a string for safe use inside POSIX double quotes. */
 function shellDoubleQuote(value: string): string {
   return value.replace(/(["\\$`])/g, "\\$1");
+}
+
+/** Escapes a literal prefix used inside POSIX parameter expansion patterns. */
+function shellPatternLiteral(value: string): string {
+  return value.replace(/([\\*?\[])/g, "\\$1");
 }
 
 /** Shows concise but specific command errors. */

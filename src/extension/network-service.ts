@@ -146,6 +146,26 @@ export interface RoutingFileCleanupSummary {
   readonly restoredComposeRouteCount: number;
 }
 
+export interface StaleRoutingRepairSummary extends RoutingFileCleanupSummary {
+  /** True when the repair path observed a stale daemon before convergence. */
+  readonly staleDaemonDetected: boolean;
+  /** True when the daemon moved from stale to current during repair. */
+  readonly daemonRestarted: boolean;
+  /** Marker files removed by terminal-marker reconciliation. */
+  readonly removedMarkerCount: number;
+  /** Discovered terminal windows scanned while deciding which markers are stale. */
+  readonly terminalCount: number;
+  /** Active daemon route rows after convergence and refresh. */
+  readonly routeCount: number;
+}
+
+export interface ComposeAttachmentCopyInput {
+  /** Existing compose attachment whose route endpoints should be reused. */
+  readonly attachmentId: string;
+  /** Destination logical network that should receive the copied endpoints. */
+  readonly networkId: string;
+}
+
 interface FileCleanupSummary {
   /** Existing generated files removed from disk. */
   readonly removedFileCount: number;
@@ -1043,6 +1063,7 @@ export class PortManagerNetworkService implements DisposableLike {
           workingDirectory: input.composeMutation.workingDirectory ?? input.cwd,
           composeFiles: input.composeMutation.composeFiles ?? input.composeFiles ?? [],
           sourceContainerMappings: input.composeMutation.sourceContainerMappings,
+          copyStoppedServices: input.composeMutation.copyStoppedServices,
           ports: attachment.ports,
         });
 
@@ -1154,6 +1175,62 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Returns one compose attachment from the latest snapshot. */
   getComposeAttachment(attachmentId: string): ComposeAttachment | undefined {
     return this.registry.getSnapshot().composeAttachments.find((attachment) => attachment.id === attachmentId);
+  }
+
+  /**
+   * Copies a Compose attachment into another logical network. When Compose
+   * runtime metadata is available this creates a separate hidden Compose
+   * project, including stopped services; older route-only rows fall back to
+   * sharing the currently published endpoints.
+   */
+  async copyComposeAttachment(input: ComposeAttachmentCopyInput): Promise<ComposeAttachment | undefined> {
+    const source = this.getComposeAttachment(input.attachmentId);
+    if (source === undefined) {
+      return undefined;
+    }
+
+    if (source.status !== "attached") {
+      throw new Error(`Only attached Compose routes can be copied. "${source.projectName}" is ${source.status}.`);
+    }
+
+    const network = requireNetwork(this.registry.getNetwork(input.networkId), input.networkId);
+    if (source.networkId === network.id) {
+      throw new Error(`"${composeRuntimeProjectName(source)}" is already attached to "${network.name}". Choose another logical network.`);
+    }
+
+    const composeFiles = composeRouteCopyFiles(source);
+    const runtime = source.runtime ?? source.mutation?.runtime;
+    const cwd = source.mutation?.workingDirectory ?? composeWorkingDirectoryFromFiles(composeFiles) ?? process.cwd();
+    if (runtime !== undefined && composeFiles.length > 0) {
+      return this.attachComposePublishedPorts({
+        networkId: network.id,
+        projectName: composeRuntimeProjectName(source),
+        runtime,
+        cwd,
+        composeFiles,
+        composeMutation: {
+          mode: "copy",
+          allowStatefulClone: true,
+          runtime,
+          workingDirectory: cwd,
+          composeFiles,
+          copyStoppedServices: true,
+          ...(source.mutation?.containerMappings !== undefined
+            ? { sourceContainerMappings: source.mutation.containerMappings }
+            : {}),
+        },
+        ports: source.ports.map(dropComposeProcessId),
+      });
+    }
+
+    return this.attachComposePublishedPorts({
+      networkId: network.id,
+      projectName: composeRuntimeProjectName(source),
+      runtime,
+      cwd,
+      composeFiles,
+      ports: source.ports.map(dropComposeProcessId),
+    });
   }
 
   /** Renames the real hidden Compose project backing a cloned attachment. */
@@ -1390,6 +1467,40 @@ export class PortManagerNetworkService implements DisposableLike {
           (attachment) => attachment.networkId === network.id && isRestorableComposeAttachment(attachment),
         ),
     );
+  }
+
+  /**
+   * User-triggered repair path for stale daemon/routes/terminal marker drift.
+   *
+   * Only generated control-plane files are deleted. Durable network bindings,
+   * Compose clone state, containers, and volumes are preserved, then runtime
+   * files and daemon rows are rebuilt from the current registry snapshot.
+   */
+  async fixStaleRouting(): Promise<StaleRoutingRepairSummary> {
+    const beforeDaemon = this.getDaemonStatus();
+    const markerCountBefore = await this.countManualTerminalAttachmentMarkerFiles();
+    const cleanupSummary = await this.clearRoutingFiles();
+    const terminalWindows = await this.refreshTerminals().catch(() => []);
+    const markerCountAfter = await this.countManualTerminalAttachmentMarkerFiles();
+
+    await this.reconcileComposeAttachmentPublishedPorts().catch(() => undefined);
+    await this.convergeDaemonAndRoutingState();
+    await this.processService?.refresh().catch(() => undefined);
+
+    const afterDaemon = this.getDaemonStatus();
+    const daemonRestarted =
+      beforeDaemon.restartRequired === true &&
+      afterDaemon.restartRequired !== true &&
+      (beforeDaemon.pid <= 0 || afterDaemon.pid !== beforeDaemon.pid || afterDaemon.versionStatus === "current");
+
+    return {
+      ...cleanupSummary,
+      staleDaemonDetected: beforeDaemon.restartRequired === true,
+      daemonRestarted,
+      removedMarkerCount: Math.max(0, markerCountBefore - markerCountAfter),
+      terminalCount: terminalWindows.length,
+      routeCount: this.getAgentSnapshot().routes.length,
+    };
   }
 
   /** Releases listeners and event subscriptions. */
@@ -2021,7 +2132,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const mutation = attachment.mutation;
     if (
       mutation === undefined ||
-      mutation.mode !== "clone" ||
+      (mutation.mode !== "clone" && mutation.mode !== "copy") ||
       mutation.containerMappings === undefined ||
       mutation.containerMappings.length === 0
     ) {
@@ -2730,6 +2841,18 @@ export class PortManagerNetworkService implements DisposableLike {
     await fs.rm(this.getTerminalAttachmentMarkerDirectoryPath(), { recursive: true, force: true });
   }
 
+  /** Counts raw marker files so repair can report how many stale rows disappeared. */
+  private async countManualTerminalAttachmentMarkerFiles(): Promise<number> {
+    const markerDirectory = this.getTerminalAttachmentMarkerDirectoryPath();
+
+    try {
+      const entries = await fs.readdir(markerDirectory, { withFileTypes: true });
+      return entries.filter((entry) => entry.isFile() && entry.name.endsWith(".tsv")).length;
+    } catch {
+      return 0;
+    }
+  }
+
   /** Directory shared between copied shell snippets and extension-side refresh. */
   private getTerminalAttachmentMarkerDirectoryPath(): string {
     return path.join(this.context.globalStorageUri.fsPath, TERMINAL_ATTACHMENT_MARKER_DIRECTORY_NAME);
@@ -3017,6 +3140,8 @@ export interface ComposePublishMutationInput {
   readonly composeFiles?: readonly string[];
   /** Existing clone id/name lineage to preserve when copying a Port Manager clone. */
   readonly sourceContainerMappings?: readonly ComposeContainerMutationMapping[];
+  /** Copy defined services that currently have no running published endpoint. */
+  readonly copyStoppedServices?: boolean;
 }
 
 export interface ComposePublishedPortInput {
@@ -3267,7 +3392,7 @@ function buildComposeProjectRoutingRows(
       }));
     }
 
-    if (mutation.mode !== "clone" || mutation.attachedProjectName === mutation.originalProjectName) {
+    if (mutation.mode === "in-place" || mutation.attachedProjectName === mutation.originalProjectName) {
       return [];
     }
 
@@ -3344,6 +3469,17 @@ function hasComposeRoute(
 
 function composeRuntimeProjectName(attachment: ComposeAttachment): string {
   return attachment.mutation?.attachedProjectName ?? attachment.projectName;
+}
+
+function composeRouteCopyFiles(attachment: ComposeAttachment): readonly string[] {
+  const mutation = attachment.mutation;
+  if (mutation === undefined) {
+    return [...attachment.composeFiles];
+  }
+
+  // A routing copy must keep the generated override so Docker/Podman shims can
+  // still map commands to the already-running hidden clone project.
+  return [...mutation.composeFiles, mutation.overrideFile];
 }
 
 function isComposeProcessForPort(

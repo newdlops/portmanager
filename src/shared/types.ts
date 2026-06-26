@@ -44,7 +44,7 @@ export type ComposeAttachmentStatus = "attached" | "detached" | "error";
 
 export type ContainerRuntimePreference = "auto" | "docker" | "podman";
 
-export type ComposePortMutationMode = "clone" | "in-place";
+export type ComposePortMutationMode = "clone" | "in-place" | "copy";
 
 /**
  * A user-facing network scope where duplicated app-internal ports remain

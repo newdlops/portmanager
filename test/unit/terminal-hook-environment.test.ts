@@ -111,6 +111,26 @@ test("external pm shell function selects a network and sources its attach script
   assert.equal(commandSource.includes('. \"$__pm_attach_script\"'), true);
 });
 
+test("external pm shell function exposes doctor routes and detach diagnostics", () => {
+  const commandSourcePath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const commandSource = fs.readFileSync(commandSourcePath, "utf8");
+
+  assert.equal(commandSource.includes("routeCountScript"), true);
+  assert.equal(commandSource.includes("routePrintScript"), true);
+  assert.equal(commandSource.includes('"doctor"'), true);
+  assert.equal(commandSource.includes('"routes"'), true);
+  assert.equal(commandSource.includes('"detach"'), true);
+  assert.equal(commandSource.includes("Daemon readiness flag:"), true);
+  assert.equal(commandSource.includes("Route table:"), true);
+  assert.equal(commandSource.includes("Network selection file:"), true);
+  assert.equal(commandSource.includes("Host access:"), true);
+  assert.equal(commandSource.includes("Port Manager routes:"), true);
+  assert.equal(commandSource.includes("Port Manager: detached"), true);
+  assert.equal(commandSource.includes('rm -f "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR/$__pm_marker_key.tsv"'), true);
+  assert.equal(commandSource.includes("Port Manager routing detached from this shell."), true);
+  assert.equal(commandSource.includes("shellPatternLiteral"), true);
+});
+
 test("extension auto-refreshes shell hook assets without auto-mutating profiles", () => {
   const activatePath = path.resolve(__dirname, "../../../src/extension/activate.ts");
   const commandSourcePath = path.resolve(__dirname, "../../../src/extension/commands.ts");

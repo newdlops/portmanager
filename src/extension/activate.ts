@@ -3,7 +3,7 @@ import { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import { LocalAgentClient } from "./local-agent-client";
 import { PortManagerCommandController } from "./commands";
 import { PortManagerNetworkService } from "./network-service";
-import type { LogicalNetwork } from "../shared/types";
+import type { DisposableLike, LogicalNetwork, NetworkSnapshot } from "../shared/types";
 
 export interface PortManagerExtensionApi {
   /** Lists logical networks so terminal-owning extensions can choose one without importing UI code. */
@@ -30,6 +30,7 @@ export function activate(context: vscode.ExtensionContext): PortManagerExtension
     networkService,
     treeProvider,
   });
+  const statusBar = new PortManagerStatusBar(networkService);
 
   context.subscriptions.push(
     vscode.window.createTreeView("portManager.processes", {
@@ -40,6 +41,7 @@ export function activate(context: vscode.ExtensionContext): PortManagerExtension
     processService,
     treeProvider,
     commandController,
+    statusBar,
   );
 
   commandController.register(context);
@@ -66,4 +68,102 @@ export function activate(context: vscode.ExtensionContext): PortManagerExtension
  */
 export function deactivate(): void {
   // Extension resources are disposed by VS Code through context.subscriptions.
+}
+
+/**
+ * Keeps the current routing scope visible without making status bar rendering
+ * depend on command or sidebar implementation details.
+ */
+class PortManagerStatusBar implements DisposableLike {
+  private readonly item: vscode.StatusBarItem;
+  private readonly sourceSubscription: DisposableLike;
+
+  constructor(private readonly networkService: PortManagerNetworkService) {
+    this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    this.item.name = "Port Manager Network";
+    this.item.command = "portManager.showStatusMenu";
+    this.sourceSubscription = this.networkService.onDidChange(() => this.update());
+    this.update();
+    this.item.show();
+  }
+
+  /** Recomputes the compact status text from the latest logical network snapshot. */
+  private update(): void {
+    const snapshot = this.networkService.getSnapshot();
+    this.item.text = formatStatusBarNetworkText(snapshot);
+    this.item.tooltip = formatStatusBarNetworkTooltip(snapshot);
+  }
+
+  dispose(): void {
+    this.sourceSubscription.dispose();
+    this.item.dispose();
+  }
+}
+
+/** Status text prefers the VS Code terminal default, then falls back to attached terminals. */
+function formatStatusBarNetworkText(snapshot: NetworkSnapshot): string {
+  const windowNetwork = snapshot.networks.find(
+    (network) => network.id === snapshot.vscodeWindowTerminalBinding?.networkId,
+  );
+  if (windowNetwork !== undefined) {
+    return `$(vm-active) Port Manager: ${windowNetwork.name}`;
+  }
+
+  const attachedTerminals = snapshot.attachments.filter((attachment) => attachment.status === "attached");
+  if (attachedTerminals.length === 0) {
+    return "$(vm-outline) Port Manager: No network";
+  }
+
+  const networkCounts = countAttachedTerminalsByNetwork(attachedTerminals);
+  if (networkCounts.size === 1) {
+    const [networkId, count] = [...networkCounts.entries()][0];
+    const network = snapshot.networks.find((item) => item.id === networkId);
+    return `$(plug) Port Manager: ${network?.name ?? networkId} (${count})`;
+  }
+
+  return `$(plug) Port Manager: ${attachedTerminals.length} terminals`;
+}
+
+/** Tooltip expands the status bar label into the current source of routing state. */
+function formatStatusBarNetworkTooltip(snapshot: NetworkSnapshot): string {
+  const windowNetwork = snapshot.networks.find(
+    (network) => network.id === snapshot.vscodeWindowTerminalBinding?.networkId,
+  );
+  if (windowNetwork !== undefined && snapshot.vscodeWindowTerminalBinding !== undefined) {
+    return [
+      `VS Code terminals use ${windowNetwork.name}.`,
+      `${snapshot.vscodeWindowTerminalBinding.injectedTerminalCount} open terminal${snapshot.vscodeWindowTerminalBinding.injectedTerminalCount === 1 ? "" : "s"} updated.`,
+      "Click to manage routing.",
+    ].join("\n");
+  }
+
+  const attachedTerminals = snapshot.attachments.filter((attachment) => attachment.status === "attached");
+  if (attachedTerminals.length === 0) {
+    return "No Port Manager network is active for this VS Code window. Click to choose one.";
+  }
+
+  const lines = ["Attached terminal routing:", ...formatAttachedTerminalSummaryLines(snapshot, attachedTerminals)];
+  lines.push("Click to manage routing.");
+  return lines.join("\n");
+}
+
+function countAttachedTerminalsByNetwork(
+  attachments: readonly NetworkSnapshot["attachments"][number][],
+): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const attachment of attachments) {
+    counts.set(attachment.networkId, (counts.get(attachment.networkId) ?? 0) + 1);
+  }
+
+  return counts;
+}
+
+function formatAttachedTerminalSummaryLines(
+  snapshot: NetworkSnapshot,
+  attachments: readonly NetworkSnapshot["attachments"][number][],
+): string[] {
+  return [...countAttachedTerminalsByNetwork(attachments).entries()].map(([networkId, count]) => {
+    const network = snapshot.networks.find((item) => item.id === networkId);
+    return `${network?.name ?? networkId}: ${count} terminal${count === 1 ? "" : "s"}`;
+  });
 }

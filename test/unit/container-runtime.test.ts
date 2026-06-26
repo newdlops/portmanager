@@ -961,6 +961,130 @@ test("mutates compose services into a hidden network-scoped project", async (con
   assert.equal(calls[4]?.cwd, tempDir);
 });
 
+test("copy mode creates stopped compose services in the hidden project", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-copy-stopped-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: workspace",
+      "services:",
+      "  db:",
+      "    image: postgres:16",
+      "  worker:",
+      "    image: busybox",
+      "    command: sleep 3600",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
+  let targetStarted = false;
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (executable, args) => {
+      calls.push({ executable, args });
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\nworker\n", stderr: "" };
+      }
+      if (args[0] === "compose" && args.includes("up") && args.includes("db")) {
+        targetStarted = true;
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "compose" && args.includes("create") && args.includes("worker")) {
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        const sourceRows = [
+          {
+            ID: "source-db",
+            Names: "workspace_db_1",
+            Status: "Up 10 seconds",
+            Ports: "127.0.0.1:15432->5432/tcp",
+            Labels: "com.docker.compose.project=workspace,com.docker.compose.service=db",
+          },
+          {
+            ID: "source-worker",
+            Names: "workspace_worker_1",
+            Status: "Exited (0) 1 minute ago",
+            Ports: "",
+            Labels: "com.docker.compose.project=workspace,com.docker.compose.service=worker",
+          },
+        ];
+        const targetRows = targetStarted
+          ? [
+              {
+                ID: "target-db",
+                Names: "copy_stack_db_1",
+                Status: "Up 1 second",
+                Ports: "127.0.0.1:57001->5432/tcp",
+                Labels: "com.docker.compose.project=copy-stack,com.docker.compose.service=db",
+              },
+              {
+                ID: "target-worker",
+                Names: "copy_stack_worker_1",
+                Status: "Created",
+                Ports: "",
+                Labels: "com.docker.compose.project=copy-stack,com.docker.compose.service=worker",
+              },
+            ]
+          : [];
+        return { stdout: [...sourceRows, ...targetRows].map((row) => JSON.stringify(row)).join("\n"), stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({
+              Id: id,
+              Name: `/${id}`,
+              Config: {
+                Labels: {
+                  "com.docker.compose.service": id.includes("worker") ? "worker" : "db",
+                },
+              },
+              Mounts: [],
+            })),
+          ),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    mode: "copy",
+    runtime: "docker",
+    networkName: "B app",
+    originalProjectName: "workspace",
+    attachedProjectName: "copy-stack",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    copyStoppedServices: true,
+    ports: [
+      {
+        serviceName: "db",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 15432,
+        containerPort: 5432,
+        protocol: "tcp",
+        protocolName: "postgresql",
+      },
+    ],
+  });
+
+  assert.equal(result.state.mode, "copy");
+  assert.deepEqual(result.state.services, ["db", "worker"]);
+  assert.ok(calls.some((call) => call.args.includes("up") && call.args.includes("db")));
+  assert.ok(calls.some((call) => call.args.includes("create") && call.args.includes("worker")));
+  assert.equal(calls.some((call) => call.args.includes("stop") && call.args.includes("workspace")), false);
+  assert.equal(result.ports[0]?.actualHostPort, 57001);
+});
+
 test("copies an existing compose clone without stacking the network-scoped project name", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-mutator-existing-clone-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));

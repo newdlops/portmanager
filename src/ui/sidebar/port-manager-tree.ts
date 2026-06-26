@@ -72,10 +72,29 @@ interface NetworkRouteConnection {
   readonly color?: vscode.ThemeColor;
 }
 
+interface RoutingTimelineEntry {
+  /** Stable row id so recent activity rows do not flicker across refreshes. */
+  readonly id: string;
+  /** User-facing event label. */
+  readonly label: string;
+  /** Compact event context shown in the description column. */
+  readonly description: string;
+  /** ISO timestamp for sorting and tooltip detail. */
+  readonly updatedAt: string;
+  /** VS Code product icon id. */
+  readonly icon: string;
+  /** Optional warning/error color. */
+  readonly color?: vscode.ThemeColor;
+  /** Tooltip with the owning network and event timestamp. */
+  readonly tooltip: vscode.MarkdownString;
+}
+
 type PortManagerTreeItem =
   | TreeSectionItem
   | NetworkRoutingGroupTreeItem
   | NetworkRouteConnectionTreeItem
+  | RoutingTimelineGroupTreeItem
+  | RoutingTimelineTreeItem
   | NetworkActionGroupTreeItem
   | ActionTreeItem
   | PlannedFeatureTreeItem
@@ -294,6 +313,9 @@ export class PortManagerTreeProvider
       }
 
       const networkAttachments = snapshot.attachments.filter((attachment) => attachment.networkId === element.network.id);
+      const networkComposeAttachments = snapshot.composeAttachments.filter(
+        (attachment) => attachment.networkId === element.network.id,
+      );
       return [
         new ActionTreeItem("Add Host Binding", "portManager.addHostPortExposure", "add", "Expose network port", element.network),
         new ActionTreeItem(
@@ -310,6 +332,17 @@ export class PortManagerTreeProvider
           "Manually attach published service",
           element.network,
         ),
+        ...(networkComposeAttachments.length > 0
+          ? [
+              new ActionTreeItem(
+                "Copy Compose Attachment",
+                "portManager.copyComposeAttachment",
+                "copy",
+                "Duplicate existing attachment",
+                element.network,
+              ),
+            ]
+          : []),
         new ActionTreeItem(
           "Attach Process",
           "portManager.attachProcessToNetwork",
@@ -348,6 +381,12 @@ export class PortManagerTreeProvider
       return element.routeRows.length > 0
         ? element.routeRows.map((route) => new NetworkRouteConnectionTreeItem(route))
         : [new EmptyTreeItem("No active routes", "Start or attach a service")];
+    }
+
+    if (element instanceof RoutingTimelineGroupTreeItem) {
+      return element.rows.length > 0
+        ? element.rows.map((row) => new RoutingTimelineTreeItem(row))
+        : [new EmptyTreeItem("No recent routing activity", "Attach a terminal or service")];
     }
 
     if (element instanceof TerminalWindowTreeItem) {
@@ -415,7 +454,7 @@ export class PortManagerTreeProvider
                 ),
               ]),
           ...snapshot.runtimes.map((runtime) => new RuntimeAdapterTreeItem(runtime)),
-          ...buildDaemonChildren(daemon),
+          ...buildDaemonChildren(daemon, snapshot, agentSnapshot),
         ];
     }
   }
@@ -473,6 +512,34 @@ class NetworkRouteConnectionTreeItem extends vscode.TreeItem {
     this.description = route.description;
     this.tooltip = route.tooltip;
     this.iconPath = new vscode.ThemeIcon(route.icon, route.color);
+  }
+}
+
+/** Collapsible recent routing event group shown in Diagnostics. */
+class RoutingTimelineGroupTreeItem extends vscode.TreeItem {
+  readonly contextValue = "routingTimelineGroup";
+
+  constructor(readonly rows: readonly RoutingTimelineEntry[]) {
+    super("Recent Routing Activity", vscode.TreeItemCollapsibleState.Collapsed);
+    this.id = "routing-timeline";
+    this.description =
+      rows.length > 0
+        ? `${rows.length} recent change${rows.length === 1 ? "" : "s"}`
+        : "no recent changes";
+    this.iconPath = new vscode.ThemeIcon("history");
+  }
+}
+
+/** One recent network attach, binding, compose, or daemon route refresh row. */
+class RoutingTimelineTreeItem extends vscode.TreeItem {
+  readonly contextValue = "routingTimeline";
+
+  constructor(readonly row: RoutingTimelineEntry) {
+    super(row.label, vscode.TreeItemCollapsibleState.None);
+    this.id = row.id;
+    this.description = row.description;
+    this.tooltip = row.tooltip;
+    this.iconPath = new vscode.ThemeIcon(row.icon, row.color);
   }
 }
 
@@ -884,8 +951,14 @@ class EmptyTreeItem extends vscode.TreeItem {
 }
 
 /** Builds child rows for the daemon accordion section. */
-function buildDaemonChildren(daemon: AgentDaemonStatus): PortManagerTreeItem[] {
+function buildDaemonChildren(
+  daemon: AgentDaemonStatus,
+  snapshot: NetworkSnapshot,
+  agentSnapshot: AgentSnapshot,
+): PortManagerTreeItem[] {
   const children: PortManagerTreeItem[] = [
+    new ActionTreeItem("Fix Stale Routing", "portManager.fixStaleRouting", "debug-rerun", "Converge daemon and routes"),
+    new RoutingTimelineGroupTreeItem(buildRoutingTimelineRows(snapshot, agentSnapshot)),
     new DaemonStatusTreeItem("Status", daemon.status, daemon.status === "running" ? "pass" : "warning"),
     new DaemonStatusTreeItem(
       "Version",
@@ -906,6 +979,140 @@ function buildDaemonChildren(daemon: AgentDaemonStatus): PortManagerTreeItem[] {
   }
 
   return children;
+}
+
+/** Builds a compact route/attachment history from durable timestamps and daemon refreshes. */
+function buildRoutingTimelineRows(
+  snapshot: NetworkSnapshot,
+  agentSnapshot: AgentSnapshot,
+): readonly RoutingTimelineEntry[] {
+  const rows: RoutingTimelineEntry[] = [];
+
+  if (snapshot.vscodeWindowTerminalBinding !== undefined) {
+    const binding = snapshot.vscodeWindowTerminalBinding;
+    const network = snapshot.networks.find((item) => item.id === binding.networkId);
+    rows.push(
+      createRoutingTimelineRow({
+        id: `timeline:vscode-window:${binding.id}`,
+        label: "VS Code terminal default",
+        description: `${network?.name ?? binding.networkId}, ${binding.status}`,
+        updatedAt: binding.attachedAt,
+        icon: binding.status === "error" ? "warning" : "terminal",
+        networkId: binding.networkId,
+        networkName: network?.name,
+      }),
+    );
+  }
+
+  for (const attachment of snapshot.attachments) {
+    const network = snapshot.networks.find((item) => item.id === attachment.networkId);
+    rows.push(
+      createRoutingTimelineRow({
+        id: `timeline:terminal:${attachment.id}`,
+        label: attachment.terminalTitle ?? `Terminal PID ${attachment.rootPid}`,
+        description: `${network?.name ?? attachment.networkId}, ${attachment.status}`,
+        updatedAt: attachment.attachedAt,
+        icon: attachment.status === "error" ? "warning" : "plug",
+        networkId: attachment.networkId,
+        networkName: network?.name,
+      }),
+    );
+  }
+
+  for (const attachment of snapshot.composeAttachments) {
+    const network = snapshot.networks.find((item) => item.id === attachment.networkId);
+    rows.push(
+      createRoutingTimelineRow({
+        id: `timeline:compose:${attachment.id}`,
+        label: attachment.mutation?.attachedProjectName ?? attachment.projectName,
+        description: `${network?.name ?? attachment.networkId}, ${formatRouteCount(attachment.ports.length)}`,
+        updatedAt: attachment.attachedAt,
+        icon: attachment.status === "error" ? "warning" : "server-environment",
+        networkId: attachment.networkId,
+        networkName: network?.name,
+      }),
+    );
+  }
+
+  for (const exposure of snapshot.exposures) {
+    const network = snapshot.networks.find((item) => item.id === exposure.networkId);
+    rows.push(
+      createRoutingTimelineRow({
+        id: `timeline:host-exposure:${exposure.id}`,
+        label: `${exposure.hostAddress}:${exposure.hostPort} exposed`,
+        description: `${network?.name ?? exposure.networkId}, ${exposure.status}`,
+        updatedAt: exposure.createdAt,
+        icon: exposure.status === "error" ? "warning" : "link-external",
+        networkId: exposure.networkId,
+        networkName: network?.name,
+      }),
+    );
+  }
+
+  for (const binding of snapshot.hostAccessBindings) {
+    const network = snapshot.networks.find((item) => item.id === binding.networkId);
+    rows.push(
+      createRoutingTimelineRow({
+        id: `timeline:host-access:${binding.id}`,
+        label: `network:${binding.logicalPort} host access`,
+        description: `${network?.name ?? binding.networkId}, ${binding.status}`,
+        updatedAt: binding.createdAt,
+        icon: binding.status === "error" ? "warning" : "arrow-swap",
+        networkId: binding.networkId,
+        networkName: network?.name,
+      }),
+    );
+  }
+
+  if (agentSnapshot.routes.length > 0) {
+    rows.push(
+      createRoutingTimelineRow({
+        id: "timeline:daemon-routes",
+        label: "Daemon route table refreshed",
+        description: `${formatRouteCount(agentSnapshot.routes.length)} active`,
+        updatedAt: agentSnapshot.updatedAt,
+        icon: "references",
+      }),
+    );
+  }
+
+  return rows
+    .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt) || left.id.localeCompare(right.id))
+    .slice(0, 8);
+}
+
+function formatRouteCount(count: number): string {
+  return `${count} route${count === 1 ? "" : "s"}`;
+}
+
+function createRoutingTimelineRow(input: {
+  readonly id: string;
+  readonly label: string;
+  readonly description: string;
+  readonly updatedAt: string;
+  readonly icon: string;
+  readonly networkId?: string;
+  readonly networkName?: string;
+}): RoutingTimelineEntry {
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.isTrusted = false;
+  tooltip.appendMarkdown(`**${escapeMarkdown(input.label)}**\n\n`);
+  tooltip.appendMarkdown(`- Context: \`${escapeMarkdown(input.description)}\`\n`);
+  if (input.networkId !== undefined) {
+    tooltip.appendMarkdown(`- Network: \`${escapeMarkdown(input.networkName ?? input.networkId)}\`\n`);
+    tooltip.appendMarkdown(`- Network ID: \`${escapeMarkdown(input.networkId)}\`\n`);
+  }
+  tooltip.appendMarkdown(`- Updated: \`${escapeMarkdown(input.updatedAt)}\`\n`);
+
+  return {
+    id: input.id,
+    label: input.label,
+    description: input.description,
+    updatedAt: input.updatedAt,
+    icon: input.icon,
+    ...(input.icon === "warning" ? { color: new vscode.ThemeColor("testing.iconFailed") } : {}),
+    tooltip,
+  };
 }
 
 /** One-line daemon summary for the root section. */
