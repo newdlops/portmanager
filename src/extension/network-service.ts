@@ -35,6 +35,14 @@ import {
 import { ComposePublishMutator } from "../platform/network/compose-publish-mutator";
 import { ContainerServiceDiscoveryAdapter } from "../platform/network/container-service-discovery";
 import { SharedLogicalNetworkStateStore } from "../platform/network/shared-network-state-store";
+import {
+  BrowserNetworkProxyManager,
+  browserNetworkProxyEndpointId,
+  browserNetworkProxyFallbackPort,
+  formatBrowserNetworkProxyUrl,
+  type BrowserNetworkProxyEndpoint,
+  type BrowserNetworkProxyTarget,
+} from "../platform/ports/browser-network-proxy";
 import { HostPortProxyManager, type HostPortProxyTarget } from "../platform/ports/host-port-proxy";
 import {
   LogicalPortRouterManager,
@@ -281,6 +289,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Legacy localhost listener router kept only so active listeners can be closed. */
   private readonly logicalPortRouter: LogicalPortRouterManager;
 
+  /** Development browser entrypoints that isolate cookie jars by network loopback host. */
+  private readonly browserNetworkProxy: BrowserNetworkProxyManager;
+
   /** Resolves accepted TCP connection tuples back to client PIDs. */
   private readonly tcpConnectionProcessResolver: NodeTcpConnectionProcessResolver;
 
@@ -328,6 +339,12 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Requests one more router reconciliation after the current sync sees an older snapshot. */
   private logicalRouterSyncQueued = false;
+
+  /** Guards browser proxy reconciliation so process snapshot bursts do not overlap. */
+  private browserProxySyncInFlight: Promise<void> | undefined;
+
+  /** Requests one more browser proxy reconciliation after the current sync completes. */
+  private browserProxySyncQueued = false;
 
   /** Serializes terminal picker rewrites so stale snapshots cannot win the last write. */
   private terminalNetworkSelectionWriteInFlight: Promise<void> | undefined;
@@ -404,6 +421,9 @@ export class PortManagerNetworkService implements DisposableLike {
         nativeRouterPath: this.context.asAbsolutePath(getTcpRouterHelperRelativePath()),
       },
     );
+    this.browserNetworkProxy = new BrowserNetworkProxyManager({
+      resolve: (endpoint) => this.resolveBrowserNetworkProxyTarget(endpoint),
+    });
     const nativeProcessLookupPath = this.context.asAbsolutePath(getProcessLookupHelperRelativePath());
     this.tcpConnectionProcessResolver = new NodeTcpConnectionProcessResolver({
       nativeLookupPath: nativeProcessLookupPath,
@@ -424,6 +444,7 @@ export class PortManagerNetworkService implements DisposableLike {
         void this.writeComposeProjectRoutingFile();
         void this.writeTerminalNetworkSelectionFile();
         void this.syncLogicalPortRouters();
+        void this.syncBrowserNetworkProxies();
         this.reconcileVscodeWindowTerminalBinding();
       }),
     );
@@ -431,6 +452,7 @@ export class PortManagerNetworkService implements DisposableLike {
       this.disposables.push(
         this.processService.onDidChange(() => {
           void this.syncLogicalPortRouters();
+          void this.syncBrowserNetworkProxies();
           void this.restorePersistedComposeRoutesIfMissing();
           void this.writeTerminalNetworkSelectionFile();
           this.localChangeEvents.emit();
@@ -500,6 +522,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.refreshTerminals();
     void this.refreshContainerServices({ background: true });
     await this.convergeDaemonAndRoutingState();
+    await this.syncBrowserNetworkProxies();
     this.startRoutingSignalRefreshLoop();
     this.startTerminalAttachmentMarkerPolling();
   }
@@ -522,6 +545,20 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Returns the latest daemon route/process snapshot for routing status UI. */
   getAgentSnapshot(): AgentSnapshot {
     return this.processService?.getSnapshot() ?? createDisconnectedAgentSnapshot();
+  }
+
+  /**
+   * Returns a browser-facing URL whose host is unique per logical network.
+   * The upstream request is still rewritten as localhost so dev auth settings
+   * that reject raw loopback aliases can continue to work.
+   */
+  async getBrowserIsolatedUrl(process: ManagedProcess): Promise<string | undefined> {
+    if (!isBrowserProxyProcess(process, this.registry.getSnapshot().networks)) {
+      return undefined;
+    }
+
+    const endpoint = await this.browserNetworkProxy.ensure(buildBrowserProxyEndpoint(process));
+    return endpoint === undefined ? undefined : formatBrowserNetworkProxyUrl(endpoint);
   }
 
   /** Lists saved binding presets without exposing mutable stored arrays. */
@@ -1630,6 +1667,7 @@ export class PortManagerNetworkService implements DisposableLike {
     this.registry.dispose();
     this.localChangeEvents.clear();
     void this.proxyManager.dispose();
+    void this.browserNetworkProxy.dispose();
     this.logicalPortRouter.dispose();
     releaseLogicalRouterOwnerLease();
   }
@@ -2437,6 +2475,25 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
+   * Resolves a browser alias request to the current network-local web server.
+   * The HTTP proxy rewrites headers, while this method only chooses the live
+   * socket target from the daemon route table.
+   */
+  private async resolveBrowserNetworkProxyTarget(
+    endpoint: Pick<BrowserNetworkProxyEndpoint, "networkId" | "logicalPort">,
+  ): Promise<BrowserNetworkProxyTarget> {
+    const route = await this.findNetworkRoute(endpoint.networkId, endpoint.logicalPort);
+    if (route === undefined || !isLiveListenRoute(route)) {
+      throw new Error(`No browser proxy route for ${endpoint.networkId}:${endpoint.logicalPort}.`);
+    }
+
+    return {
+      host: route.host,
+      port: route.actualPort,
+    };
+  }
+
+  /**
    * Resolves a raw localhost logical-port connection to a network route.
    * This path is intentionally application-agnostic: it uses only the accepted
    * TCP tuple, process table ancestry, terminal attachments, and route rows.
@@ -2523,6 +2580,38 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);
+  }
+
+  /** Keeps per-network browser entrypoints in sync with running web process rows. */
+  private async syncBrowserNetworkProxies(): Promise<void> {
+    if (this.browserProxySyncInFlight !== undefined) {
+      this.browserProxySyncQueued = true;
+      return this.browserProxySyncInFlight;
+    }
+
+    this.browserProxySyncInFlight = this.syncBrowserNetworkProxiesQueued().finally(() => {
+      this.browserProxySyncInFlight = undefined;
+    });
+
+    return this.browserProxySyncInFlight;
+  }
+
+  /** Runs browser proxy reconciliation until one queued refresh sees the latest snapshot. */
+  private async syncBrowserNetworkProxiesQueued(): Promise<void> {
+    do {
+      this.browserProxySyncQueued = false;
+      await this.syncBrowserNetworkProxiesExclusive();
+    } while (this.browserProxySyncQueued);
+  }
+
+  private async syncBrowserNetworkProxiesExclusive(): Promise<void> {
+    const snapshot = this.processService?.getSnapshot();
+    const endpoints = collectBrowserProxyEndpoints(
+      snapshot?.processes ?? [],
+      this.registry.getSnapshot().networks,
+    );
+
+    await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);
   }
 
   /**
@@ -4241,6 +4330,63 @@ function collectLogicalRouterPorts(
   }
 
   return [...ports].sort((left, right) => left - right);
+}
+
+function collectBrowserProxyEndpoints(
+  processes: readonly ManagedProcess[],
+  networks: readonly LogicalNetwork[],
+): readonly BrowserNetworkProxyEndpoint[] {
+  const endpoints = new Map<string, BrowserNetworkProxyEndpoint>();
+
+  for (const process of processes) {
+    if (!isBrowserProxyProcess(process, networks)) {
+      continue;
+    }
+
+    const endpoint = buildBrowserProxyEndpoint(process);
+    endpoints.set(endpoint.id, endpoint);
+  }
+
+  return [...endpoints.values()];
+}
+
+function isBrowserProxyProcess(
+  process: ManagedProcess,
+  networks: readonly LogicalNetwork[],
+): process is ManagedProcess & {
+  readonly networkId: string;
+  readonly url: string;
+} {
+  if (
+    process.status !== "running" ||
+    process.networkId === undefined ||
+    process.url === undefined ||
+    !isTcpPort(process.requestedPort)
+  ) {
+    return false;
+  }
+
+  if (!networks.some((network) => network.id === process.networkId)) {
+    return false;
+  }
+
+  return process.source !== "detected" && process.source !== "compose" && process.source !== "allocated";
+}
+
+function buildBrowserProxyEndpoint(
+  process: ManagedProcess & { readonly networkId: string },
+): BrowserNetworkProxyEndpoint {
+  const fallbackPort = browserNetworkProxyFallbackPort(process.requestedPort);
+  const listenPorts =
+    fallbackPort === process.requestedPort ? [process.requestedPort] : [process.requestedPort, fallbackPort];
+
+  return {
+    id: browserNetworkProxyEndpointId(process.networkId, process.requestedPort),
+    networkId: process.networkId,
+    logicalPort: process.requestedPort,
+    listenHost: loopbackAddressForNetwork(process.networkId),
+    listenPorts,
+  };
 }
 
 function isPortManagerLogicalRouterListener(listener: ListeningPort): boolean {

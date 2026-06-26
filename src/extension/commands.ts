@@ -1315,7 +1315,8 @@ export class PortManagerCommandController implements DisposableLike {
     const restarted = await this.dependencies.processService.restartProcess(process.id, settings);
 
     if (settings.autoOpenBrowser && restarted?.url) {
-      await openUrl(restarted.url);
+      const url = (await this.dependencies.networkService.getBrowserIsolatedUrl(restarted)) ?? restarted.url;
+      await openUrl(url);
     }
   }
 
@@ -1340,8 +1341,9 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
-    await vscode.env.clipboard.writeText(process.url);
-    await vscode.window.showInformationMessage(`Copied ${process.url}`);
+    const url = (await this.dependencies.networkService.getBrowserIsolatedUrl(process)) ?? process.url;
+    await vscode.env.clipboard.writeText(url);
+    await vscode.window.showInformationMessage(`Copied ${url}`);
   }
 
   /** Opens the selected process URL in the user's default browser. */
@@ -1352,7 +1354,8 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
-    await openUrl(process.url);
+    const url = (await this.dependencies.networkService.getBrowserIsolatedUrl(process)) ?? process.url;
+    await openUrl(url);
   }
 
   /**
@@ -1497,7 +1500,8 @@ export class PortManagerCommandController implements DisposableLike {
     }
 
     if (settings.autoOpenBrowser && process.url) {
-      await openUrl(process.url);
+      const url = (await this.dependencies.networkService.getBrowserIsolatedUrl(process)) ?? process.url;
+      await openUrl(url);
     }
 
     return process;

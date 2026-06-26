@@ -973,4 +973,814 @@ lky@KB-i lky J43N4T4334 fix-payroll-employee-number-to-hrmemp-employee-number % 
 --> Sending SIGTERM to other processes..
 [00:12:00] app ./zz run app-only exited with code SIGHUP
 ^C
+lky@KB-i lky J43N4T4334 fix-payroll-employee-number-to-hrmemp-employee-number % pm detach
+Port Manager routing detached from this shell.
+lky@KB-i lky J43N4T4334 fix-payroll-employee-number-to-hrmemp-employee-number % . '/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/terminal-hook-scripts/detach.sh'
+Port Manager routing detached from this shell.
+lky@KB-i lky J43N4T4334 fix-payroll-employee-number-to-hrmemp-employee-number % . '/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/terminal-hook-scripts/detach.sh'
+Port Manager routing detached from this shell.
+lky@KB-i lky J43N4T4334 fix-payroll-employee-number-to-hrmemp-employee-number % pm
+  1) migrationt1 [network-06b57784-936f-4d9f-b832-3a27b8aa7b18]
+     compose: worktree1-docker-6b31357e-31ba4936 (/Users/lky/project/master-worktree/docker)
+  2) alpha1 [network-a35c8f81-1cd7-4a9b-b034-cf67097a9e93]
+     compose: docker (/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/docker)
+  3) worktree1 [network-c5b41032-39d7-4cb3-a121-e3a199aeecf6]
+     no services
+Select Port Manager network: 2
+Port Manager routing active for alpha1 (network-a35c8f81-1cd7-4a9b-b034-cf67097a9e93). Restart servers launched before attach.
+Port Manager shell network: alpha1 [network-a35c8f81-1cd7-4a9b-b034-cf67097a9e93]
+lky@KB-i lky J43N4T4334 fix-payroll-employee-number-to-hrmemp-employee-number % ./zz run
+Installing Django dependencies...
+Resolved 339 packages in 2ms
+Checked 337 packages in 37ms
+INFO Chromium is installed
+INFO Puppeteer will use Chromium at /opt/homebrew/bin/chromium
+Installing React dependencies...
+yarn install v1.22.22
+[1/5] 🔍  Validating package.json...
+[2/5] 🔍  Resolving packages...
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@^6.1.0"
+warning Resolution field "node-fetch@2.6.7" is incompatible with requested version "node-fetch@^1.0.1"
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@^5.2.0 || ^6.0.0 || ^7.0.0"
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@8.13.0"
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@8.13.0"
+warning Resolution field "node-fetch@2.6.7" is incompatible with requested version "node-fetch@^2.7.0"
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@^8.18.0"
+warning Resolution field "meow@9.0.0" is incompatible with requested version "meow@^13.2.0"
+success Already up-to-date.
+$ patch-package
+patch-package 6.5.1
+Applying patches...
+@graphql-codegen/client-preset@1.3.0 ✔
+@graphql-codegen/visitor-plugin-common@2.13.8 ✔
+@nivo/arcs@0.87.0 ✔
+retry-cli@0.7.0 ✔
+$ husky install
+husky - Git hooks installed
+✨  Done in 1.06s.
+yarn run v1.22.22
+$ patch-package
+patch-package 6.5.1
+Applying patches...
+@graphql-codegen/client-preset@1.3.0 ✔
+@graphql-codegen/visitor-plugin-common@2.13.8 ✔
+@nivo/arcs@0.87.0 ✔
+retry-cli@0.7.0 ✔
+✨  Done in 0.08s.
+yarn link v1.22.22
+warning There's already a package called "captain" registered. This command has had no effect. If this command was run in another folder with the same name, the other folder is still linked. Please run yarn unlink in the other folder if you want to register this folder.
+✨  Done in 0.01s.
+yarn run v1.22.22
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names db,staff,staff-hq,staff-partner,app './zz run db' './zz run staff-only' './zz run staff-hq-only' './zz run staff-partner-only' './zz run app-only'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] 'docker compose -f ./docker/development.yaml up ' 'yarn retry -t 250 ./zz db_isready && ./zz migrate'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names server,client,worker,sass './zz run staff-hq-server' './zz run staff-hq-client' './zz run staff-hq-worker' './zz run staff-hq-sass'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names server,client,worker,sass './zz run staff-partner-server' './zz run staff-partner-client' './zz run staff-partner-worker' './zz run staff-partner-sass'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names server,client,worker,sass './zz run app-server' './zz run app-client' './zz run app-worker' './zz run app-sass'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names server,client,worker,sass './zz run staff-server' './zz run staff-client' './zz run staff-worker' './zz run staff-sass'
+[00:24:48] staff-hq [00:24:48] worker ERROR Unknown target
+[00:24:48] staff-hq [00:24:48] worker ./zz run staff-hq-worker exited with code 0
+[00:24:48] staff-partner [00:24:48] worker ERROR Unknown target
+[00:24:48] staff-partner [00:24:48] worker ./zz run staff-partner-worker exited with code 0
+[00:24:48] staff [00:24:48] worker ERROR Unknown target
+[00:24:48] staff [00:24:48] worker ./zz run staff-worker exited with code 0
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on tcp:6379
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+[00:24:49] staff-hq [00:24:49] server /var/run/postgresql:5432 - accepting connections
+[00:24:49] staff-partner [00:24:49] server /var/run/postgresql:5432 - accepting connections
+[00:24:49] db [00:24:49]  time="2026-06-27T00:24:49+09:00" level=warning msg="/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/docker/development.yaml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+[00:24:49] db [00:24:49]   Container captain_document_converter-alpha1-docker-b5836516-d0384031 Running 
+[00:24:49] db [00:24:49]   Container alpha1-docker-b5836516-d0384031-rabbitmq-1 Running 
+[00:24:49] db [00:24:49]   Container captain_chrome-alpha1-docker-b5836516-d0384031 Running 
+[00:24:49] db [00:24:49]   Container alpha1-docker-b5836516-d0384031-redis-worker-1 Running 
+[00:24:49] db [00:24:49]   Container captain_db-alpha1-docker-b5836516-d0384031 Running 
+[00:24:49] staff [00:24:49] server /var/run/postgresql:5432 - accepting connections
+[00:24:49] db [00:24:49]  docker compose -f ./docker/development.yaml up  exited with code 0
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on http-get://localhost:8007/healthz
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on http-get://localhost:8002/healthz
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on http-get://localhost:8004/healthz
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on http-get://localhost:8006/healthz
+[00:24:49] app [00:24:49] server /var/run/postgresql:5432 - accepting connections
+[00:24:49] db [00:24:49]  /var/run/postgresql:5432 - accepting connections
+[00:24:50] db [00:24:50]  /var/run/postgresql:5432 - accepting connections
+[00:24:50] app [00:24:50] worker celery multi v5.3.4 (emerald-rush)
+[00:24:50] app [00:24:50] worker > Starting nodes...
+[00:24:50] app [00:24:50] worker 	> celery1@localhost: OK
+[00:24:50] app [00:24:50] worker ERROR: Pidfile (/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/.celery/celery1.pid) already exists.
+[00:24:50] app [00:24:50] worker Seems we're already running? (pid: 93451)
+[00:24:50] app [00:24:50] worker "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/dotenv yarn workspace @zuzu/client vite:start
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/dotenv yarn workspace @zuzu/client vite:start
+$ NODE_OPTIONS=--max-old-space-size=8192 vite --host
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/dotenv yarn workspace @zuzu/client vite:start
+$ NODE_OPTIONS=--max-old-space-size=8192 vite --host
+$ NODE_OPTIONS=--max-old-space-size=8192 vite --host
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/dotenv yarn workspace @zuzu/client vite:start
+$ NODE_OPTIONS=--max-old-space-size=8192 vite --host
+[00:24:53] staff [00:24:53] client Port 3002 is in use, trying another one...
+[00:24:53] staff-partner [00:24:53] client Port 3007 is in use, trying another one...
+[00:24:53] staff [00:24:53] client 
+[00:24:53] staff [00:24:53] client   VITE v7.1.3  ready in 1836 ms
+[00:24:53] staff [00:24:53] client 
+[00:24:53] staff [00:24:53] client   ➜  Local:   http://localhost:3003/
+[00:24:53] staff [00:24:53] client   ➜  Network: http://127.104.49.204:3003/
+[00:24:53] staff [00:24:53] client   ➜  Network: http://127.98.202.69:3003/
+[00:24:53] staff [00:24:53] client   ➜  Network: http://172.16.1.48:3003/
+[00:24:53] staff-partner [00:24:53] client 
+[00:24:53] staff-partner [00:24:53] client   VITE v7.1.3  ready in 2120 ms
+[00:24:53] staff-partner [00:24:53] client 
+[00:24:53] staff-partner [00:24:53] client   ➜  Local:   http://localhost:3008/
+[00:24:53] staff-partner [00:24:53] client   ➜  Network: http://127.104.49.204:3008/
+[00:24:53] staff-partner [00:24:53] client   ➜  Network: http://127.98.202.69:3008/
+[00:24:53] staff-partner [00:24:53] client   ➜  Network: http://172.16.1.48:3008/
+[00:24:53] app [00:24:53] client Port 3004 is in use, trying another one...
+[00:24:53] app [00:24:53] client 
+[00:24:53] app [00:24:53] client   VITE v7.1.3  ready in 1767 ms
+[00:24:53] app [00:24:53] client 
+[00:24:53] app [00:24:53] client   ➜  Local:   http://localhost:3005/
+[00:24:53] app [00:24:53] client   ➜  Network: http://127.104.49.204:3005/
+[00:24:53] app [00:24:53] client   ➜  Network: http://127.98.202.69:3005/
+[00:24:53] app [00:24:53] client   ➜  Network: http://172.16.1.48:3005/
+[00:24:53] staff-partner [00:24:53] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:24:53] staff-hq [00:24:53] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:24:53] staff [00:24:53] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:24:53] app [00:24:53] sass [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:24:53] staff-hq [00:24:53] client Port 3006 is in use, trying another one...
+[00:24:53] staff-hq [00:24:53] client Port 3007 is in use, trying another one...
+[00:24:53] staff-hq [00:24:53] client Port 3008 is in use, trying another one...
+[00:24:53] staff-hq [00:24:53] client 
+[00:24:53] staff-hq [00:24:53] client   VITE v7.1.3  ready in 1518 ms
+[00:24:53] staff-hq [00:24:53] client 
+[00:24:53] staff-hq [00:24:53] client   ➜  Local:   http://localhost:3009/
+[00:24:53] staff-hq [00:24:53] client   ➜  Network: http://127.104.49.204:3009/
+[00:24:53] staff-hq [00:24:53] client   ➜  Network: http://127.98.202.69:3009/
+[00:24:53] staff-hq [00:24:53] client   ➜  Network: http://172.16.1.48:3009/
+[00:24:53] app [00:24:53] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:24:57] db [00:24:57]  [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:24:58] staff-partner [00:24:58] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:24:58] staff-partner [00:24:58] server [INFO] [django.utils.autoreload] Watching for file changes with StatReloader
+[00:24:58] staff-hq [00:24:58] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:24:58] staff [00:24:58] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:24:58] staff-hq [00:24:58] server [INFO] [django.utils.autoreload] Watching for file changes with StatReloader
+[00:24:58] app [00:24:58] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:24:58] app [00:24:58] server [INFO] [django.utils.autoreload] Watching for file changes with StatReloader
+[00:24:58] staff [00:24:58] server [INFO] [django.utils.autoreload] Watching for file changes with StatReloader
+^C[00:25:02] app [00:25:02] server "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+[00:25:02] app [00:25:02] server Performing system checks...
+[00:25:02] app [00:25:02] server 
+[00:25:02] app [00:25:02] sass "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+[00:25:02] app [00:25:02] sass Watching...
+[00:25:02] app [00:25:02] sass Updated files at 1782487497.533411
+[00:25:02] app [00:25:02] sass Bye.
+[00:25:02] staff-hq [00:25:02] server "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+[00:25:02] staff-hq [00:25:02] server Performing system checks...
+[00:25:02] staff-hq [00:25:02] server 
+[00:25:02] staff-partner [00:25:02] server "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+[00:25:02] staff-partner [00:25:02] server Performing system checks...
+[00:25:02] staff-partner [00:25:02] server 
+lky@KB-i lky J43N4T4334 fix-payroll-employee-number-to-hrmemp-employee-number % [00:25:02] db [00:25:02]  "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+[00:25:02] db [00:25:02]  Traceback (most recent call last):
+[00:25:02] db [00:25:02]    File "/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/manage.py", line 22, in <module>
+[00:25:02] db [00:25:02]      execute_from_command_line(sys.argv)
+[00:25:02] db [00:25:02]    File "/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/.venv/lib/python3.11/site-packages/django/core/management/__init__.py", line 442, in execute_from_command_line
+[00:25:02] db [00:25:02]      utility.execute()
+[00:25:02] db [00:25:02]    File "/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/.venv/lib/python3.11/site-packages/django/core/management/__init__.py", line 436, in execute
+[00:25:02] db [00:25:02]      self.fetch_command(subcommand).run_from_argv(self.argv)
+[00:25:02] db [00:25:02]    File "/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/.venv/lib/python3.11/site-packages/django/core/management/base.py", line 420, in run_from_argv
+[00:25:02] db [00:25:02]      self.execute(*args, **cmd_options)
+[00:25:02] db [00:25:02]    File "/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/.venv/lib/python3.11/site-packages/django/core/management/base.py", line 464, in execute
+[00:25:02] db [00:25:02]      output = self.handle(*args, **options)
+[00:25:02] db [00:25:02]               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[00:25:02] db [00:25:02]    File "/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/.venv/lib/python3.11/site-packages/django/core/management/base.py", line 111, in wrapper
+[00:25:02] db [00:25:02]      res = handle_func(*args, **kwargs)
+[00:25:02] db [00:25:02]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[00:25:02] db [00:25:02]    File "/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/.venv/lib/python3.11/site-packages/django/core/management/commands/migrate.py", line 114, in handle
+[00:25:02] db [00:25:02]      executor = MigrationExecutor(connection, self.migration_progress_callback)
+[00:25:02] db [00:25:02]                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[00:25:02] db [00:25:02]    File "/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/.venv/lib/python3.11/site-packages/django/db/migrations/executor.py", line 18, in __init__
+[00:25:02] staff [00:25:02] server "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+[00:25:02] staff [00:25:02] server Performing system checks...
+[00:25:02] staff [00:25:02] server 
+[00:25:02] db [00:25:02]  yarn retry -t 250 ./zz db_isready && ./zz migrate exited with code SIGHUP
+[00:25:02] staff [00:25:02] sass ./zz run staff-sass exited with code 130
+[00:25:02] staff --> Sending SIGTERM to other processes..
+[00:25:02] staff [00:25:02] client ./zz run staff-client exited with code 130
+[00:25:02] staff --> Sending SIGTERM to other processes..
+[00:25:02] staff-partner [00:25:02] sass ./zz run staff-partner-sass exited with code 130
+[00:25:02] staff-partner --> Sending SIGTERM to other processes..
+[00:25:02] staff-partner [00:25:02] client ./zz run staff-partner-client exited with code 130
+[00:25:02] staff-partner --> Sending SIGTERM to other processes..
+[00:25:02] staff-hq [00:25:02] sass ./zz run staff-hq-sass exited with code 130
+[00:25:02] staff-hq --> Sending SIGTERM to other processes..
+[00:25:02] db ./zz run db exited with code 130
+--> Sending SIGTERM to other processes..
+[00:25:02] staff [00:25:02] server ./zz run staff-server exited with code SIGHUP
+[00:25:02] staff-partner [00:25:02] server ./zz run staff-partner-server exited with code SIGHUP
+[00:25:02] staff-hq [00:25:02] client ./zz run staff-hq-client exited with code 130
+[00:25:02] staff-hq --> Sending SIGTERM to other processes..
+[00:25:02] staff-hq [00:25:02] server ./zz run staff-hq-server exited with code SIGHUP
+[00:25:02] app [00:25:02] worker ./zz run app-worker exited with code SIGHUP
+[00:25:02] app --> Sending SIGTERM to other processes..
+[00:25:02] staff-hq ./zz run staff-hq-only exited with code 130
+--> Sending SIGTERM to other processes..
+[00:25:02] staff-partner ./zz run staff-partner-only exited with code 130
+--> Sending SIGTERM to other processes..
+[00:25:02] staff ./zz run staff-only exited with code 130
+--> Sending SIGTERM to other processes..
+[00:25:02] app [00:25:02] client ./zz run app-client exited with code 130
+[00:25:02] app --> Sending SIGTERM to other processes..
+[00:25:02] app [00:25:02] server ./zz run app-server exited with code SIGHUP
+[00:25:02] app --> Sending SIGTERM to other processes..
+[00:25:02] app [00:25:02] sass ./zz run app-sass exited with code SIGHUP
+[00:25:02] app ./zz run app-only exited with code 130
+^C
+lky@KB-i lky J43N4T4334 fix-payroll-employee-number-to-hrmemp-employee-number % ./zz run
+Installing Django dependencies...
+Resolved 339 packages in 2ms
+Checked 337 packages in 36ms
+INFO Chromium is installed
+INFO Puppeteer will use Chromium at /opt/homebrew/bin/chromium
+Installing React dependencies...
+yarn install v1.22.22
+[1/5] 🔍  Validating package.json...
+[2/5] 🔍  Resolving packages...
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@^6.1.0"
+warning Resolution field "node-fetch@2.6.7" is incompatible with requested version "node-fetch@^1.0.1"
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@^5.2.0 || ^6.0.0 || ^7.0.0"
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@8.13.0"
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@8.13.0"
+warning Resolution field "node-fetch@2.6.7" is incompatible with requested version "node-fetch@^2.7.0"
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@^8.18.0"
+warning Resolution field "meow@9.0.0" is incompatible with requested version "meow@^13.2.0"
+success Already up-to-date.
+$ patch-package
+patch-package 6.5.1
+Applying patches...
+@graphql-codegen/client-preset@1.3.0 ✔
+@graphql-codegen/visitor-plugin-common@2.13.8 ✔
+@nivo/arcs@0.87.0 ✔
+retry-cli@0.7.0 ✔
+$ husky install
+husky - Git hooks installed
+✨  Done in 0.31s.
+yarn run v1.22.22
+$ patch-package
+patch-package 6.5.1
+Applying patches...
+@graphql-codegen/client-preset@1.3.0 ✔
+@graphql-codegen/visitor-plugin-common@2.13.8 ✔
+@nivo/arcs@0.87.0 ✔
+retry-cli@0.7.0 ✔
+✨  Done in 0.07s.
+yarn link v1.22.22
+warning There's already a package called "captain" registered. This command has had no effect. If this command was run in another folder with the same name, the other folder is still linked. Please run yarn unlink in the other folder if you want to register this folder.
+✨  Done in 0.01s.
+yarn run v1.22.22
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names db,staff,staff-hq,staff-partner,app './zz run db' './zz run staff-only' './zz run staff-hq-only' './zz run staff-partner-only' './zz run app-only'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] 'docker compose -f ./docker/development.yaml up ' 'yarn retry -t 250 ./zz db_isready && ./zz migrate'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names server,client,worker,sass './zz run staff-server' './zz run staff-client' './zz run staff-worker' './zz run staff-sass'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names server,client,worker,sass './zz run staff-partner-server' './zz run staff-partner-client' './zz run staff-partner-worker' './zz run staff-partner-sass'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names server,client,worker,sass './zz run staff-hq-server' './zz run staff-hq-client' './zz run staff-hq-worker' './zz run staff-hq-sass'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names server,client,worker,sass './zz run app-server' './zz run app-client' './zz run app-worker' './zz run app-sass'
+[00:25:07] staff-partner [00:25:07] worker ERROR Unknown target
+[00:25:07] staff-partner [00:25:07] worker ./zz run staff-partner-worker exited with code 0
+[00:25:07] staff [00:25:07] worker ERROR Unknown target
+[00:25:07] staff [00:25:07] worker ./zz run staff-worker exited with code 0
+[00:25:07] staff-hq [00:25:07] worker ERROR Unknown target
+[00:25:07] staff-hq [00:25:07] worker ./zz run staff-hq-worker exited with code 0
+[00:25:07] db [00:25:07]  time="2026-06-27T00:25:07+09:00" level=warning msg="/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/docker/development.yaml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+[00:25:07] db [00:25:07]   Container alpha1-docker-b5836516-d0384031-rabbitmq-1 Running 
+[00:25:07] db [00:25:07]   Container alpha1-docker-b5836516-d0384031-redis-worker-1 Running 
+[00:25:07] db [00:25:07]   Container captain_chrome-alpha1-docker-b5836516-d0384031 Running 
+[00:25:07] db [00:25:07]   Container captain_db-alpha1-docker-b5836516-d0384031 Running 
+[00:25:07] db [00:25:07]   Container captain_document_converter-alpha1-docker-b5836516-d0384031 Running 
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+[00:25:07] db [00:25:07]  docker compose -f ./docker/development.yaml up  exited with code 0
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on tcp:6379
+[00:25:07] staff [00:25:07] server /var/run/postgresql:5432 - accepting connections
+[00:25:08] staff-partner [00:25:08] server /var/run/postgresql:5432 - accepting connections
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on http-get://localhost:8002/healthz
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on http-get://localhost:8006/healthz
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on http-get://localhost:8007/healthz
+[00:25:08] staff-hq [00:25:08] server /var/run/postgresql:5432 - accepting connections
+[00:25:08] app [00:25:08] server /var/run/postgresql:5432 - accepting connections
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on http-get://localhost:8004/healthz
+[00:25:08] db [00:25:08]  /var/run/postgresql:5432 - accepting connections
+[00:25:08] db [00:25:08]  /var/run/postgresql:5432 - accepting connections
+[00:25:09] app [00:25:09] worker celery multi v5.3.4 (emerald-rush)
+[00:25:09] app [00:25:09] worker > Starting nodes...
+[00:25:09] app [00:25:09] worker 	> celery1@localhost: OK
+[00:25:09] app [00:25:09] worker ERROR: Pidfile (/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/.celery/celery1.pid) already exists.
+[00:25:09] app [00:25:09] worker Seems we're already running? (pid: 93451)
+[00:25:09] app [00:25:09] worker "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/dotenv yarn workspace @zuzu/client vite:start
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/dotenv yarn workspace @zuzu/client vite:start
+$ NODE_OPTIONS=--max-old-space-size=8192 vite --host
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/dotenv yarn workspace @zuzu/client vite:start
+$ NODE_OPTIONS=--max-old-space-size=8192 vite --host
+$ NODE_OPTIONS=--max-old-space-size=8192 vite --host
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/dotenv yarn workspace @zuzu/client vite:start
+[00:25:10] app [00:25:10] sass [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+$ NODE_OPTIONS=--max-old-space-size=8192 vite --host
+[00:25:12] staff [00:25:12] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:25:12] staff [00:25:12] client Port 3002 is in use, trying another one...
+[00:25:12] staff [00:25:12] client 
+[00:25:12] staff [00:25:12] client   VITE v7.1.3  ready in 1877 ms
+[00:25:12] staff [00:25:12] client 
+[00:25:12] staff [00:25:12] client   ➜  Local:   http://localhost:3003/
+[00:25:12] staff [00:25:12] client   ➜  Network: http://127.104.49.204:3003/
+[00:25:12] staff [00:25:12] client   ➜  Network: http://127.98.202.69:3003/
+[00:25:12] staff [00:25:12] client   ➜  Network: http://172.16.1.48:3003/
+[00:25:12] staff-partner [00:25:12] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:25:12] staff-hq [00:25:12] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:25:12] app [00:25:12] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:25:12] staff-hq [00:25:12] client Port 3006 is in use, trying another one...
+[00:25:12] staff-hq [00:25:12] client Port 3007 is in use, trying another one...
+[00:25:12] staff-hq [00:25:12] client 
+[00:25:12] staff-hq [00:25:12] client   VITE v7.1.3  ready in 1787 ms
+[00:25:12] staff-hq [00:25:12] client 
+[00:25:12] staff-hq [00:25:12] client   ➜  Local:   http://localhost:3008/
+[00:25:12] staff-hq [00:25:12] client   ➜  Network: http://127.104.49.204:3008/
+[00:25:12] staff-hq [00:25:12] client   ➜  Network: http://127.98.202.69:3008/
+[00:25:12] staff-hq [00:25:12] client   ➜  Network: http://172.16.1.48:3008/
+[00:25:12] app [00:25:12] client Port 3004 is in use, trying another one...
+[00:25:12] app [00:25:12] client 
+[00:25:12] app [00:25:12] client   VITE v7.1.3  ready in 1699 ms
+[00:25:12] app [00:25:12] client 
+[00:25:12] app [00:25:12] client   ➜  Local:   http://localhost:3005/
+[00:25:12] app [00:25:12] client   ➜  Network: http://127.104.49.204:3005/
+[00:25:12] app [00:25:12] client   ➜  Network: http://127.98.202.69:3005/
+[00:25:12] app [00:25:12] client   ➜  Network: http://172.16.1.48:3005/
+[00:25:12] staff-partner [00:25:12] client Port 3007 is in use, trying another one...
+[00:25:12] staff-partner [00:25:12] client Port 3008 is in use, trying another one...
+[00:25:12] staff-partner [00:25:12] client 
+[00:25:12] staff-partner [00:25:12] client   VITE v7.1.3  ready in 1558 ms
+[00:25:12] staff-partner [00:25:12] client 
+[00:25:12] staff-partner [00:25:12] client   ➜  Local:   http://localhost:3009/
+[00:25:12] staff-partner [00:25:12] client   ➜  Network: http://127.104.49.204:3009/
+[00:25:12] staff-partner [00:25:12] client   ➜  Network: http://127.98.202.69:3009/
+[00:25:12] staff-partner [00:25:12] client   ➜  Network: http://172.16.1.48:3009/
+[00:25:15] db [00:25:15]  [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:25:16] staff [00:25:16] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:25:16] staff [00:25:16] server [INFO] [django.utils.autoreload] Watching for file changes with StatReloader
+[00:25:16] staff-partner [00:25:16] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:25:16] staff-hq [00:25:16] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:25:16] app [00:25:16] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:25:17] app [00:25:17] server [INFO] [django.utils.autoreload] Watching for file changes with StatReloader
+[00:25:17] staff-partner [00:25:17] server [INFO] [django.utils.autoreload] Watching for file changes with StatReloader
+[00:25:17] staff-hq [00:25:17] server [INFO] [django.utils.autoreload] Watching for file changes with StatReloader
+[00:25:18] staff [00:25:18] server [INFO] [daphne.server] HTTP/2 support not enabled (install the http2 and tls Twisted extras)
+[00:25:18] staff [00:25:18] server [INFO] [daphne.server] Configuring endpoint tcp:port=8002:interface=127.0.0.1
+[00:25:18] staff [00:25:18] server [INFO] [daphne.server] Listening on TCP address 127.0.0.1:8002
+[00:25:19] staff-partner [00:25:19] server [INFO] [daphne.server] HTTP/2 support not enabled (install the http2 and tls Twisted extras)
+[00:25:19] staff-partner [00:25:19] server [INFO] [daphne.server] Configuring endpoint tcp:port=8007:interface=127.0.0.1
+[00:25:19] staff-hq [00:25:19] server [INFO] [daphne.server] HTTP/2 support not enabled (install the http2 and tls Twisted extras)
+[00:25:19] staff-hq [00:25:19] server [INFO] [daphne.server] Configuring endpoint tcp:port=8006:interface=127.0.0.1
+[00:25:19] staff-partner [00:25:19] server [INFO] [daphne.server] Listening on TCP address 127.0.0.1:8007
+[00:25:19] staff-hq [00:25:19] server [INFO] [daphne.server] Listening on TCP address 127.0.0.1:8006
+[00:25:19] app [00:25:19] server [INFO] [daphne.server] HTTP/2 support not enabled (install the http2 and tls Twisted extras)
+[00:25:19] app [00:25:19] server [INFO] [daphne.server] Configuring endpoint tcp:port=8004:interface=127.0.0.1
+[00:25:19] app [00:25:19] server [INFO] [daphne.server] Listening on TCP address 127.0.0.1:8004
+[00:25:23] db [00:25:23]  "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+[00:25:23] db [00:25:23]  Operations to perform:
+[00:25:23] db [00:25:23]    Apply all migrations: admin, auth, axes, contenttypes, db, django_celery_beat, document_ai, fi_sta, oauth2_provider, open_ai, sequences, sessions, taggit, vcm, vertex_ai, wagtailadmin, wagtailcore, wagtaildocs, wagtailembeds, wagtailforms, wagtailimages, wagtailredirects, wagtailsearch, wagtailusers
+[00:25:23] db [00:25:23]  Running migrations:
+[00:25:23] db [00:25:23]    No migrations to apply.
+[00:25:24] db [00:25:24]  yarn retry -t 250 ./zz db_isready && ./zz migrate exited with code 0
+[00:25:24] db ./zz run db exited with code 0
+^C[00:26:24] staff-hq [00:26:24] server "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+[00:26:24] staff-hq [00:26:24] server Performing system checks...
+[00:26:24] staff-hq [00:26:24] server 
+[00:26:24] staff-hq [00:26:24] server System check identified no issues (2 silenced).
+[00:26:24] staff-hq [00:26:24] server June 27, 2026 - 00:25:19
+[00:26:24] staff-hq [00:26:24] server Django version 5.2.13, using settings 'zuzu.staff.settings'
+[00:26:24] staff-hq [00:26:24] server Starting ASGI/Daphne version 4.2.1 development server at http://127.0.0.1:8006/
+[00:26:24] staff-hq [00:26:24] server Quit the server with CONTROL-C.
+[00:26:24] app [00:26:24] server "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+[00:26:24] app [00:26:24] server Performing system checks...
+[00:26:24] app [00:26:24] server 
+[00:26:24] app [00:26:24] server System check identified no issues (2 silenced).
+[00:26:24] app [00:26:24] server June 27, 2026 - 00:25:19
+[00:26:24] app [00:26:24] server Django version 5.2.13, using settings 'zuzu.app.settings'
+[00:26:24] app [00:26:24] server Starting ASGI/Daphne version 4.2.1 development server at http://127.0.0.1:8004/
+[00:26:24] app [00:26:24] server Quit the server with CONTROL-C.
+[00:26:24] staff-partner [00:26:24] server "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+[00:26:24] staff-partner [00:26:24] server Performing system checks...
+[00:26:24] staff-partner [00:26:24] server 
+[00:26:24] staff-partner [00:26:24] server System check identified no issues (2 silenced).
+[00:26:24] staff-partner [00:26:24] server June 27, 2026 - 00:25:19
+[00:26:24] staff-partner [00:26:24] server Django version 5.2.13, using settings 'zuzu.staff.settings'
+[00:26:24] staff-partner [00:26:24] server Starting ASGI/Daphne version 4.2.1 development server at http://127.0.0.1:8007/
+[00:26:24] staff-partner [00:26:24] server Quit the server with CONTROL-C.
+[00:26:24] staff [00:26:24] server "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+[00:26:24] staff [00:26:24] server Performing system checks...
+[00:26:24] staff [00:26:24] server 
+[00:26:24] staff [00:26:24] server System check identified no issues (2 silenced).
+[00:26:24] staff [00:26:24] server June 27, 2026 - 00:25:18
+[00:26:24] staff [00:26:24] server Django version 5.2.13, using settings 'zuzu.staff.settings'
+[00:26:24] staff [00:26:24] server Starting ASGI/Daphne version 4.2.1 development server at http://127.0.0.1:8002/
+[00:26:24] staff [00:26:24] server Quit the server with CONTROL-C.
+lky@KB-i lky J43N4T4334 fix-payroll-employee-number-to-hrmemp-employee-number % [00:26:24] app [00:26:24] sass "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+[00:26:24] app [00:26:24] sass Watching...
+[00:26:24] app [00:26:24] sass Updated files at 1782487515.071028
+[00:26:24] app [00:26:24] sass Bye.
+[00:26:24] staff-hq [00:26:24] sass ./zz run staff-hq-sass exited with code 130
+[00:26:24] staff-hq --> Sending SIGTERM to other processes..
+[00:26:24] staff-partner [00:26:24] sass ./zz run staff-partner-sass exited with code 130
+[00:26:24] staff-partner --> Sending SIGTERM to other processes..
+[00:26:24] staff [00:26:24] sass ./zz run staff-sass exited with code 130
+[00:26:24] staff --> Sending SIGTERM to other processes..
+[00:26:24] app [00:26:24] worker ./zz run app-worker exited with code SIGHUP
+[00:26:24] app --> Sending SIGTERM to other processes..
+[00:26:24] staff-hq [00:26:24] client ./zz run staff-hq-client exited with code 130
+[00:26:24] staff-hq --> Sending SIGTERM to other processes..
+[00:26:24] staff-partner [00:26:24] client ./zz run staff-partner-client exited with code 130
+[00:26:24] staff-partner --> Sending SIGTERM to other processes..
+[00:26:24] staff [00:26:24] client ./zz run staff-client exited with code 130
+[00:26:24] staff --> Sending SIGTERM to other processes..
+[00:26:24] app [00:26:24] client ./zz run app-client exited with code 130
+[00:26:24] app --> Sending SIGTERM to other processes..
+[00:26:24] app [00:26:24] sass ./zz run app-sass exited with code SIGHUP
+[00:26:24] app --> Sending SIGTERM to other processes..
+[00:26:24] staff-hq [00:26:24] server ./zz run staff-hq-server exited with code SIGHUP
+[00:26:24] staff-partner [00:26:24] server ./zz run staff-partner-server exited with code SIGHUP
+[00:26:24] staff [00:26:24] server ./zz run staff-server exited with code SIGHUP
+[00:26:24] staff-hq ./zz run staff-hq-only exited with code 130
+--> Sending SIGTERM to other processes..
+[00:26:24] app [00:26:24] server ./zz run app-server exited with code SIGHUP
+[00:26:24] staff ./zz run staff-only exited with code 130
+--> Sending SIGTERM to other processes..
+[00:26:24] staff-partner ./zz run staff-partner-only exited with code 130
+--> Sending SIGTERM to other processes..
+[00:26:24] app ./zz run app-only exited with code 130
+^C
 lky@KB-i lky J43N4T4334 fix-payroll-employee-number-to-hrmemp-employee-number % 
+lky@KB-i lky J43N4T4334 fix-payroll-employee-number-to-hrmemp-employee-number % pm detach
+Port Manager routing detached from this shell.
+lky@KB-i lky J43N4T4334 fix-payroll-employee-number-to-hrmemp-employee-number % pm
+  1) migrationt1 [network-06b57784-936f-4d9f-b832-3a27b8aa7b18]
+     compose: worktree1-docker-6b31357e-31ba4936 (/Users/lky/project/master-worktree/docker)
+  2) alpha1 [network-a35c8f81-1cd7-4a9b-b034-cf67097a9e93]
+     compose: docker (/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/docker)
+  3) worktree1 [network-c5b41032-39d7-4cb3-a121-e3a199aeecf6]
+     no services
+Select Port Manager network: 2
+Port Manager routing active for alpha1 (network-a35c8f81-1cd7-4a9b-b034-cf67097a9e93). Restart servers launched before attach.
+Port Manager shell network: alpha1 [network-a35c8f81-1cd7-4a9b-b034-cf67097a9e93]
+lky@KB-i lky J43N4T4334 fix-payroll-employee-number-to-hrmemp-employee-number % ./zz run
+Installing Django dependencies...
+Resolved 339 packages in 2ms
+Checked 337 packages in 40ms
+INFO Chromium is installed
+INFO Puppeteer will use Chromium at /opt/homebrew/bin/chromium
+Installing React dependencies...
+yarn install v1.22.22
+[1/5] 🔍  Validating package.json...
+[2/5] 🔍  Resolving packages...
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@^6.1.0"
+warning Resolution field "node-fetch@2.6.7" is incompatible with requested version "node-fetch@^1.0.1"
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@^5.2.0 || ^6.0.0 || ^7.0.0"
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@8.13.0"
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@8.13.0"
+warning Resolution field "node-fetch@2.6.7" is incompatible with requested version "node-fetch@^2.7.0"
+warning Resolution field "ws@8.17.1" is incompatible with requested version "ws@^8.18.0"
+warning Resolution field "meow@9.0.0" is incompatible with requested version "meow@^13.2.0"
+success Already up-to-date.
+$ patch-package
+patch-package 6.5.1
+Applying patches...
+@graphql-codegen/client-preset@1.3.0 ✔
+@graphql-codegen/visitor-plugin-common@2.13.8 ✔
+@nivo/arcs@0.87.0 ✔
+retry-cli@0.7.0 ✔
+$ husky install
+husky - Git hooks installed
+✨  Done in 1.08s.
+yarn run v1.22.22
+$ patch-package
+patch-package 6.5.1
+Applying patches...
+@graphql-codegen/client-preset@1.3.0 ✔
+@graphql-codegen/visitor-plugin-common@2.13.8 ✔
+@nivo/arcs@0.87.0 ✔
+retry-cli@0.7.0 ✔
+✨  Done in 0.08s.
+yarn link v1.22.22
+warning There's already a package called "captain" registered. This command has had no effect. If this command was run in another folder with the same name, the other folder is still linked. Please run yarn unlink in the other folder if you want to register this folder.
+✨  Done in 0.02s.
+yarn run v1.22.22
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names db,staff,staff-hq,staff-partner,app './zz run db' './zz run staff-only' './zz run staff-hq-only' './zz run staff-partner-only' './zz run app-only'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names server,client,worker,sass './zz run staff-server' './zz run staff-client' './zz run staff-worker' './zz run staff-sass'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names server,client,worker,sass './zz run app-server' './zz run app-client' './zz run app-worker' './zz run app-sass'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names server,client,worker,sass './zz run staff-hq-server' './zz run staff-hq-client' './zz run staff-hq-worker' './zz run staff-hq-sass'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] 'docker compose -f ./docker/development.yaml up ' 'yarn retry -t 250 ./zz db_isready && ./zz migrate'
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/concurrently --kill-others-on-fail --prefix-colors auto --prefix '{time} {name}' --timestampFormat [HH:mm:ss] --names server,client,worker,sass './zz run staff-partner-server' './zz run staff-partner-client' './zz run staff-partner-worker' './zz run staff-partner-sass'
+[00:28:12] staff-hq [00:28:12] worker ERROR Unknown target
+[00:28:12] staff-hq [00:28:12] worker ./zz run staff-hq-worker exited with code 0
+[00:28:12] staff-partner [00:28:12] worker ERROR Unknown target
+[00:28:12] staff-partner [00:28:12] worker ./zz run staff-partner-worker exited with code 0
+[00:28:12] staff [00:28:12] worker ERROR Unknown target
+[00:28:12] staff [00:28:12] worker ./zz run staff-worker exited with code 0
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on tcp:6379
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/retry -t 250 ./zz db_isready
+[00:28:12] db [00:28:12]  time="2026-06-27T00:28:12+09:00" level=warning msg="/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/docker/development.yaml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+[00:28:13] db [00:28:13]   Container alpha1-docker-b5836516-d0384031-redis-worker-1 Running 
+[00:28:13] db [00:28:13]   Container captain_document_converter-alpha1-docker-b5836516-d0384031 Running 
+[00:28:13] db [00:28:13]   Container alpha1-docker-b5836516-d0384031-rabbitmq-1 Running 
+[00:28:13] db [00:28:13]   Container captain_chrome-alpha1-docker-b5836516-d0384031 Running 
+[00:28:13] db [00:28:13]   Container captain_db-alpha1-docker-b5836516-d0384031 Running 
+[00:28:13] db [00:28:13]  docker compose -f ./docker/development.yaml up  exited with code 0
+[00:28:13] staff [00:28:13] server /var/run/postgresql:5432 - accepting connections
+[00:28:13] staff-partner [00:28:13] server /var/run/postgresql:5432 - accepting connections
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on http-get://localhost:8004/healthz
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on http-get://localhost:8002/healthz
+[00:28:13] app [00:28:13] server /var/run/postgresql:5432 - accepting connections
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on http-get://localhost:8007/healthz
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/wait-on http-get://localhost:8006/healthz
+[00:28:13] staff-hq [00:28:13] server /var/run/postgresql:5432 - accepting connections
+[00:28:13] db [00:28:13]  /var/run/postgresql:5432 - accepting connections
+[00:28:14] db [00:28:14]  /var/run/postgresql:5432 - accepting connections
+[00:28:14] app [00:28:14] worker celery multi v5.3.4 (emerald-rush)
+[00:28:14] app [00:28:14] worker > Starting nodes...
+[00:28:14] app [00:28:14] worker 	> celery1@localhost: OK
+[00:28:14] app [00:28:14] worker ERROR: Pidfile (/Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/.celery/celery1.pid) already exists.
+[00:28:14] app [00:28:14] worker Seems we're already running? (pid: 93451)
+[00:28:14] app [00:28:14] worker "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/dotenv yarn workspace @zuzu/client vite:start
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/dotenv yarn workspace @zuzu/client vite:start
+$ NODE_OPTIONS=--max-old-space-size=8192 vite --host
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/dotenv yarn workspace @zuzu/client vite:start
+$ NODE_OPTIONS=--max-old-space-size=8192 vite --host
+$ /Users/lky/project/fix-payroll-employee-number-to-hrmemp-employee-number/node_modules/.bin/dotenv yarn workspace @zuzu/client vite:start
+$ NODE_OPTIONS=--max-old-space-size=8192 vite --host
+$ NODE_OPTIONS=--max-old-space-size=8192 vite --host
+[00:28:17] staff-partner [00:28:17] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:28:17] app [00:28:17] sass [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:28:17] staff [00:28:17] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:28:17] app [00:28:17] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:28:17] staff-hq [00:28:17] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:28:17] app [00:28:17] client Port 3004 is in use, trying another one...
+[00:28:17] staff [00:28:17] client Port 3002 is in use, trying another one...
+[00:28:17] staff-partner [00:28:17] client Port 3007 is in use, trying another one...
+[00:28:17] app [00:28:17] client 
+[00:28:17] app [00:28:17] client   VITE v7.1.3  ready in 2230 ms
+[00:28:17] app [00:28:17] client 
+[00:28:17] app [00:28:17] client   ➜  Local:   http://localhost:3005/
+[00:28:17] app [00:28:17] client   ➜  Network: http://127.104.49.204:3005/
+[00:28:17] app [00:28:17] client   ➜  Network: http://127.98.202.69:3005/
+[00:28:17] app [00:28:17] client   ➜  Network: http://172.16.1.48:3005/
+[00:28:17] staff [00:28:17] client 
+[00:28:17] staff [00:28:17] client   VITE v7.1.3  ready in 1792 ms
+[00:28:17] staff [00:28:17] client 
+[00:28:17] staff [00:28:17] client   ➜  Local:   http://localhost:3003/
+[00:28:17] staff [00:28:17] client   ➜  Network: http://127.104.49.204:3003/
+[00:28:17] staff [00:28:17] client   ➜  Network: http://127.98.202.69:3003/
+[00:28:17] staff [00:28:17] client   ➜  Network: http://172.16.1.48:3003/
+[00:28:17] staff-partner [00:28:17] client 
+[00:28:17] staff-partner [00:28:17] client   VITE v7.1.3  ready in 1983 ms
+[00:28:17] staff-partner [00:28:17] client 
+[00:28:17] staff-partner [00:28:17] client   ➜  Local:   http://localhost:3008/
+[00:28:17] staff-partner [00:28:17] client   ➜  Network: http://127.104.49.204:3008/
+[00:28:17] staff-partner [00:28:17] client   ➜  Network: http://127.98.202.69:3008/
+[00:28:17] staff-partner [00:28:17] client   ➜  Network: http://172.16.1.48:3008/
+[00:28:17] staff-hq [00:28:17] client Port 3006 is in use, trying another one...
+[00:28:17] staff-hq [00:28:17] client Port 3007 is in use, trying another one...
+[00:28:17] staff-hq [00:28:17] client Port 3008 is in use, trying another one...
+[00:28:18] staff-hq [00:28:18] client 
+[00:28:18] staff-hq [00:28:18] client   VITE v7.1.3  ready in 1665 ms
+[00:28:18] staff-hq [00:28:18] client 
+[00:28:18] staff-hq [00:28:18] client   ➜  Local:   http://localhost:3009/
+[00:28:18] staff-hq [00:28:18] client   ➜  Network: http://127.104.49.204:3009/
+[00:28:18] staff-hq [00:28:18] client   ➜  Network: http://127.98.202.69:3009/
+[00:28:18] staff-hq [00:28:18] client   ➜  Network: http://172.16.1.48:3009/
+[00:28:19] db [00:28:19]  [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:28:24] app [00:28:24] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:28:24] staff-partner [00:28:24] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:28:24] staff [00:28:24] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:28:24] staff-hq [00:28:24] server [INFO] [axes.apps] AXES: BEGIN version 6.1.1, blocking by username
+[00:28:24] app [00:28:24] server [INFO] [django.utils.autoreload] Watching for file changes with StatReloader
+[00:28:24] staff-partner [00:28:24] server [INFO] [django.utils.autoreload] Watching for file changes with StatReloader
+[00:28:24] staff [00:28:24] server [INFO] [django.utils.autoreload] Watching for file changes with StatReloader
+[00:28:24] staff-hq [00:28:24] server [INFO] [django.utils.autoreload] Watching for file changes with StatReloader
+[00:28:28] staff-partner [00:28:28] server [INFO] [daphne.server] HTTP/2 support not enabled (install the http2 and tls Twisted extras)
+[00:28:28] staff-partner [00:28:28] server [INFO] [daphne.server] Configuring endpoint tcp:port=8007:interface=127.0.0.1
+[00:28:28] staff [00:28:28] server [INFO] [daphne.server] HTTP/2 support not enabled (install the http2 and tls Twisted extras)
+[00:28:28] staff [00:28:28] server [INFO] [daphne.server] Configuring endpoint tcp:port=8002:interface=127.0.0.1
+[00:28:28] staff-hq [00:28:28] server [INFO] [daphne.server] HTTP/2 support not enabled (install the http2 and tls Twisted extras)
+[00:28:28] staff-hq [00:28:28] server [INFO] [daphne.server] Configuring endpoint tcp:port=8006:interface=127.0.0.1
+[00:28:28] staff-partner [00:28:28] server [INFO] [daphne.server] Listening on TCP address 127.0.0.1:8007
+[00:28:28] staff [00:28:28] server [INFO] [daphne.server] Listening on TCP address 127.0.0.1:8002
+[00:28:28] staff-hq [00:28:28] server [INFO] [daphne.server] Listening on TCP address 127.0.0.1:8006
+[00:28:28] app [00:28:28] server [INFO] [daphne.server] HTTP/2 support not enabled (install the http2 and tls Twisted extras)
+[00:28:28] app [00:28:28] server [INFO] [daphne.server] Configuring endpoint tcp:port=8004:interface=127.0.0.1
+[00:28:28] app [00:28:28] server [INFO] [daphne.server] Listening on TCP address 127.0.0.1:8004
+[00:28:32] db [00:28:32]  "gspread_credentials.json" file is missing. Google Sheets features may not work properly.
+[00:28:32] db [00:28:32]  Operations to perform:
+[00:28:32] db [00:28:32]    Apply all migrations: admin, auth, axes, contenttypes, db, django_celery_beat, document_ai, fi_sta, oauth2_provider, open_ai, sequences, sessions, taggit, vcm, vertex_ai, wagtailadmin, wagtailcore, wagtaildocs, wagtailembeds, wagtailforms, wagtailimages, wagtailredirects, wagtailsearch, wagtailusers
+[00:28:32] db [00:28:32]  Running migrations:
+[00:28:32] db [00:28:32]    No migrations to apply.
+[00:28:33] db [00:28:33]  yarn retry -t 250 ./zz db_isready && ./zz migrate exited with code 0
+[00:28:33] db ./zz run db exited with code 0
+[00:29:25] app [00:29:25] client 
+[00:29:25] app [00:29:25] client  WARN  Files in the public directory are served at the root path.
+[00:29:25] app [00:29:25] client Instead of /public/index.html, use /index.html.
+[00:29:25] app [00:29:25] client 
+[00:29:26] app [00:29:26] client 
+[00:29:26] app [00:29:26] client  WARN  Browserslist: browsers data (caniuse-lite) is 10 months old. Please run:
+[00:29:26] app [00:29:26] client   npx update-browserslist-db@latest
+[00:29:26] app [00:29:26] client   Why you should do it regularly: https://github.com/browserslist/update-db#readme
+[00:29:26] app [00:29:26] client 
+[00:29:26] app [00:29:26] client 
+[00:29:26] app [00:29:26] client  WARN  Sass @import rules are deprecated and will be removed in Dart Sass 3.0.0.
+[00:29:26] app [00:29:26] client 
+[00:29:26] app [00:29:26] client More info and automated migrator: https://sass-lang.com/d/import
+[00:29:26] app [00:29:26] client 
+[00:29:29] app [00:29:29] client 
+[00:29:29] app [00:29:29] client  WARN  268 repetitive deprecation warnings omitted.
+[00:29:29] app [00:29:29] client Run in verbose mode to see all warnings.
+[00:29:29] app [00:29:29] client 
+[00:29:30] app [00:29:30] server [INFO] [django.channels.server] WebSocket HANDSHAKING /graphql [127.0.0.1:55538]
+[00:29:30] app [00:29:30] server [INFO] [django.channels.server] WebSocket CONNECT /graphql [127.0.0.1:55538]
+[00:29:31] app [00:29:31] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: Context
+[00:29:33] app [00:29:33] server [INFO] [pikepdf._core] pikepdf C++ to Python logger bridge initialized
+[00:29:35] app [00:29:35] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: Context
+[00:29:35] app [00:29:35] server [INFO] [django.channels.server] HTTP POST /graphql 200 [4.82, 127.0.0.1:55545]
+[00:29:51] app [00:29:51] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: LoginPanelLogin
+[00:29:51] app [00:29:51] server [INFO] [axes.attempts] AXES: Cleaned up 0 expired access attempts from database that were older than 2026-06-27 00:14:51.138457
+[00:29:51] app [00:29:51] server [INFO] [axes.handlers.database] AXES: Successful login by {username: "********************", ip_address: "********************", user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36", path_info: "/graphql"}.
+[00:29:51] app [00:29:51] server [INFO] [axes.attempts] AXES: Reset 0 access attempts from database.
+[00:29:51] app [00:29:51] server [INFO] [axes.handlers.database] AXES: Deleted 0 failed login attempts by {username: "********************", ip_address: "********************", user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36", path_info: "/graphql"} from database.
+[00:29:51] app [00:29:51] worker [INFO] [celery.worker.strategy] Task zuzu.packages.alimtalk.tasks.send_alimtalk[8697f387-04b2-43c8-adb4-25a0e3358afd] received
+[00:29:51] app [00:29:51] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: LoginPanelLogin
+[00:29:51] app [00:29:51] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.19, 127.0.0.1:55702]
+[00:29:51] app [00:29:51] client 
+[00:29:51] app [00:29:51] client  WARN  Files in the public directory are served at the root path.
+[00:29:51] app [00:29:51] client Instead of /public/index.html, use /index.html.
+[00:29:51] app [00:29:51] client 
+[00:29:51] app [00:29:51] worker [INFO] [celery.app.trace] Task zuzu.packages.alimtalk.tasks.send_alimtalk[8697f387-04b2-43c8-adb4-25a0e3358afd] succeeded in 0.017112875000748318s: None
+[00:29:51] app [00:29:51] server [INFO] [django.channels.server] WebSocket DISCONNECT /graphql [127.0.0.1:55538]
+[00:29:52] app [00:29:52] server [INFO] [django.channels.server] WebSocket HANDSHAKING /graphql [127.0.0.1:55726]
+[00:29:52] app [00:29:52] server [INFO] [django.channels.server] WebSocket CONNECT /graphql [127.0.0.1:55726]
+[00:29:52] app [00:29:52] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: Context
+[00:29:52] app [00:29:52] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: Context
+[00:29:52] app [00:29:52] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.05, 127.0.0.1:55728]
+[00:30:17] app [00:30:17] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: LoginPanelLogin
+[00:30:17] app [00:30:17] server [INFO] [axes.attempts] AXES: Cleaned up 0 expired access attempts from database that were older than 2026-06-27 00:15:17.184172
+[00:30:17] app [00:30:17] server [INFO] [axes.handlers.database] AXES: Successful login by {username: "********************", ip_address: "********************", user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36", path_info: "/graphql"}.
+[00:30:17] app [00:30:17] server [INFO] [axes.attempts] AXES: Reset 0 access attempts from database.
+[00:30:17] app [00:30:17] server [INFO] [axes.handlers.database] AXES: Deleted 0 failed login attempts by {username: "********************", ip_address: "********************", user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36", path_info: "/graphql"} from database.
+[00:30:17] app [00:30:17] worker [INFO] [celery.worker.strategy] Task zuzu.packages.alimtalk.tasks.send_alimtalk[82b9e534-17b7-4c9b-ae2b-80e2bad32481] received
+[00:30:17] app [00:30:17] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: LoginPanelLogin
+[00:30:17] app [00:30:17] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.15, 127.0.0.1:55864]
+[00:30:17] app [00:30:17] worker [INFO] [celery.app.trace] Task zuzu.packages.alimtalk.tasks.send_alimtalk[82b9e534-17b7-4c9b-ae2b-80e2bad32481] succeeded in 0.011531874995853286s: None
+[00:30:17] app [00:30:17] client 
+[00:30:17] app [00:30:17] client  WARN  Files in the public directory are served at the root path.
+[00:30:17] app [00:30:17] client Instead of /public/index.html, use /index.html.
+[00:30:17] app [00:30:17] client 
+[00:30:17] app [00:30:17] server [INFO] [django.channels.server] WebSocket DISCONNECT /graphql [127.0.0.1:55726]
+[00:30:18] app [00:30:18] server [INFO] [django.channels.server] WebSocket HANDSHAKING /graphql [127.0.0.1:55883]
+[00:30:18] app [00:30:18] server [INFO] [django.channels.server] WebSocket CONNECT /graphql [127.0.0.1:55883]
+[00:30:18] app [00:30:18] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: Context
+[00:30:18] app [00:30:18] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: Context
+[00:30:18] app [00:30:18] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.02, 127.0.0.1:55885]
+[00:30:46] app [00:30:46] client 
+[00:30:46] app [00:30:46] client  WARN  Files in the public directory are served at the root path.
+[00:30:46] app [00:30:46] client Instead of /public/index.html, use /index.html.
+[00:30:46] app [00:30:46] client 
+[00:30:46] app [00:30:46] server [INFO] [django.channels.server] WebSocket DISCONNECT /graphql [127.0.0.1:55883]
+[00:30:48] app [00:30:48] server [INFO] [django.channels.server] WebSocket HANDSHAKING /graphql [127.0.0.1:56056]
+[00:30:48] app [00:30:48] server [INFO] [django.channels.server] WebSocket CONNECT /graphql [127.0.0.1:56056]
+[00:30:48] app [00:30:48] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: Context
+[00:30:48] app [00:30:48] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: Context
+[00:30:48] app [00:30:48] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.09, 127.0.0.1:56062]
+[00:30:58] app [00:30:58] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: LoginPanelLogin
+[00:30:58] app [00:30:58] server [INFO] [axes.attempts] AXES: Cleaned up 0 expired access attempts from database that were older than 2026-06-27 00:15:58.816181
+[00:30:58] app [00:30:58] server [INFO] [axes.handlers.database] AXES: Successful login by {username: "********************", ip_address: "********************", user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36", path_info: "/graphql"}.
+[00:30:58] app [00:30:58] server [INFO] [axes.attempts] AXES: Reset 0 access attempts from database.
+[00:30:58] app [00:30:58] server [INFO] [axes.handlers.database] AXES: Deleted 0 failed login attempts by {username: "********************", ip_address: "********************", user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36", path_info: "/graphql"} from database.
+[00:30:58] app [00:30:58] worker [INFO] [celery.worker.strategy] Task zuzu.packages.alimtalk.tasks.send_alimtalk[7331ae0d-4de5-47a6-b96b-7c99e4bdf103] received
+[00:30:58] app [00:30:58] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: LoginPanelLogin
+[00:30:58] app [00:30:58] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.15, 127.0.0.1:56122]
+[00:30:58] app [00:30:58] worker [INFO] [celery.app.trace] Task zuzu.packages.alimtalk.tasks.send_alimtalk[7331ae0d-4de5-47a6-b96b-7c99e4bdf103] succeeded in 0.009778375002497341s: None
+[00:30:58] app [00:30:58] client 
+[00:30:58] app [00:30:58] client  WARN  Files in the public directory are served at the root path.
+[00:30:58] app [00:30:58] client Instead of /public/index.html, use /index.html.
+[00:30:58] app [00:30:58] client 
+[00:30:58] app [00:30:58] server [INFO] [django.channels.server] WebSocket DISCONNECT /graphql [127.0.0.1:56056]
+[00:30:59] app [00:30:59] server [INFO] [django.channels.server] WebSocket HANDSHAKING /graphql [127.0.0.1:56139]
+[00:30:59] app [00:30:59] server [INFO] [django.channels.server] WebSocket CONNECT /graphql [127.0.0.1:56139]
+[00:31:00] app [00:31:00] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: Context
+[00:31:00] app [00:31:00] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: Context
+[00:31:00] app [00:31:00] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.03, 127.0.0.1:56141]
+[00:31:04] app [00:31:04] server [INFO] [django.channels.server] WebSocket DISCONNECT /graphql [127.0.0.1:56139]
+[00:31:26] app [00:31:26] client 
+[00:31:26] app [00:31:26] client  WARN  Files in the public directory are served at the root path.
+[00:31:26] app [00:31:26] client Instead of /public/index.html, use /index.html.
+[00:31:26] app [00:31:26] client 
+[00:31:27] app [00:31:27] server [INFO] [django.channels.server] WebSocket HANDSHAKING /graphql [127.0.0.1:56278]
+[00:31:27] app [00:31:27] server [INFO] [django.channels.server] WebSocket CONNECT /graphql [127.0.0.1:56278]
+[00:31:27] app [00:31:27] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: Context
+[00:31:27] app [00:31:27] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: Context
+[00:31:27] app [00:31:27] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.03, 127.0.0.1:56284]
+[00:31:37] app [00:31:37] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: LoginPanelLogin
+[00:31:37] app [00:31:37] server [INFO] [axes.attempts] AXES: Cleaned up 0 expired access attempts from database that were older than 2026-06-27 00:16:37.715304
+[00:31:37] app [00:31:37] server [INFO] [axes.handlers.database] AXES: Successful login by {username: "********************", ip_address: "********************", user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36", path_info: "/graphql"}.
+[00:31:37] app [00:31:37] server [INFO] [axes.attempts] AXES: Reset 0 access attempts from database.
+[00:31:37] app [00:31:37] server [INFO] [axes.handlers.database] AXES: Deleted 0 failed login attempts by {username: "********************", ip_address: "********************", user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36", path_info: "/graphql"} from database.
+[00:31:37] app [00:31:37] worker [INFO] [celery.worker.strategy] Task zuzu.packages.alimtalk.tasks.send_alimtalk[afbe353b-4d67-4bb7-b321-cb3c68f698a3] received
+[00:31:37] app [00:31:37] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: LoginPanelLogin
+[00:31:37] app [00:31:37] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.16, 127.0.0.1:56339]
+[00:31:37] app [00:31:37] worker [INFO] [celery.app.trace] Task zuzu.packages.alimtalk.tasks.send_alimtalk[afbe353b-4d67-4bb7-b321-cb3c68f698a3] succeeded in 0.011379208001017105s: None
+[00:31:37] app [00:31:37] client 
+[00:31:37] app [00:31:37] client  WARN  Files in the public directory are served at the root path.
+[00:31:37] app [00:31:37] client Instead of /public/index.html, use /index.html.
+[00:31:37] app [00:31:37] client 
+[00:31:37] app [00:31:37] server [INFO] [django.channels.server] WebSocket DISCONNECT /graphql [127.0.0.1:56278]
+[00:31:38] app [00:31:38] server [INFO] [django.channels.server] WebSocket HANDSHAKING /graphql [127.0.0.1:56357]
+[00:31:38] app [00:31:38] server [INFO] [django.channels.server] WebSocket CONNECT /graphql [127.0.0.1:56357]
+[00:31:38] app [00:31:38] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: Context
+[00:31:38] app [00:31:38] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: Context
+[00:31:38] app [00:31:38] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.02, 127.0.0.1:56359]
+[00:31:45] app [00:31:45] client 
+[00:31:45] app [00:31:45] client  WARN  Files in the public directory are served at the root path.
+[00:31:45] app [00:31:45] client Instead of /public/index.html, use /index.html.
+[00:31:45] app [00:31:45] client 
+[00:31:46] app [00:31:46] server [INFO] [django.channels.server] WebSocket DISCONNECT /graphql [127.0.0.1:56357]
+[00:31:46] app [00:31:46] server [INFO] [django.channels.server] WebSocket HANDSHAKING /graphql [127.0.0.1:56409]
+[00:31:46] app [00:31:46] server [INFO] [django.channels.server] WebSocket CONNECT /graphql [127.0.0.1:56409]
+[00:31:47] app [00:31:47] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: Context
+[00:31:47] app [00:31:47] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: Context
+[00:31:47] app [00:31:47] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.03, 127.0.0.1:56411]
+[00:31:56] app [00:31:56] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: LoginPanelLogin
+[00:31:56] app [00:31:56] server [INFO] [axes.attempts] AXES: Cleaned up 0 expired access attempts from database that were older than 2026-06-27 00:16:56.876924
+[00:31:56] app [00:31:56] server [INFO] [axes.handlers.database] AXES: Successful login by {username: "********************", ip_address: "********************", user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36", path_info: "/graphql"}.
+[00:31:56] app [00:31:56] server [INFO] [axes.attempts] AXES: Reset 0 access attempts from database.
+[00:31:56] app [00:31:56] server [INFO] [axes.handlers.database] AXES: Deleted 0 failed login attempts by {username: "********************", ip_address: "********************", user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36", path_info: "/graphql"} from database.
+[00:31:56] app [00:31:56] worker [INFO] [celery.worker.strategy] Task zuzu.packages.alimtalk.tasks.send_alimtalk[3153cdbb-f09d-43eb-94de-ec92e7c2ef8e] received
+[00:31:56] app [00:31:56] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: LoginPanelLogin
+[00:31:57] app [00:31:57] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.14, 127.0.0.1:56469]
+[00:31:57] app [00:31:57] worker [INFO] [celery.app.trace] Task zuzu.packages.alimtalk.tasks.send_alimtalk[3153cdbb-f09d-43eb-94de-ec92e7c2ef8e] succeeded in 0.009960208997654263s: None
+[00:31:57] app [00:31:57] client 
+[00:31:57] app [00:31:57] client  WARN  Files in the public directory are served at the root path.
+[00:31:57] app [00:31:57] client Instead of /public/index.html, use /index.html.
+[00:31:57] app [00:31:57] client 
+[00:31:57] app [00:31:57] server [INFO] [django.channels.server] WebSocket DISCONNECT /graphql [127.0.0.1:56409]
+[00:31:57] app [00:31:57] server [INFO] [django.channels.server] WebSocket HANDSHAKING /graphql [127.0.0.1:56481]
+[00:31:57] app [00:31:57] server [INFO] [django.channels.server] WebSocket CONNECT /graphql [127.0.0.1:56481]
+[00:31:57] app [00:31:57] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: Context
+[00:31:57] app [00:31:57] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: Context
+[00:31:57] app [00:31:57] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.12, 127.0.0.1:56484]
+[00:31:58] app [00:31:58] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: ContentsPreviewListQuery
+[00:31:58] app [00:31:58] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: AppCompanyList
+[00:31:58] app [00:31:58] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: UserDetailedSurvey
+[00:31:58] app [00:31:58] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: ContentsPreviewListQuery
+[00:31:58] app [00:31:58] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: UserDetailedSurvey
+[00:31:58] app [00:31:58] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.35, 127.0.0.1:56494]
+[00:31:58] app [00:31:58] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.35, 127.0.0.1:56492]
+[00:31:58] app [00:31:58] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: AppCompanyList
+[00:31:58] app [00:31:58] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.37, 127.0.0.1:56493]
+[00:32:03] app [00:32:03] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: UserDetailedSurvey
+[00:32:03] app [00:32:03] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: MyVentureCapitals
+[00:32:03] app [00:32:03] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: UserDetailedSurvey
+[00:32:03] app [00:32:03] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: MyVentureCapitals
+[00:32:03] app [00:32:03] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.03, 127.0.0.1:56526]
+[00:32:03] app [00:32:03] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.03, 127.0.0.1:56525]
+[00:32:03] app [00:32:03] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: ContentsPreviewListQuery
+[00:32:03] app [00:32:03] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: ContentsPreviewListQuery
+[00:32:03] app [00:32:03] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.03, 127.0.0.1:56529]
+[00:32:04] app [00:32:04] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: UserDetailedSurvey
+[00:32:04] app [00:32:04] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: ContentsPreviewListQuery
+[00:32:04] app [00:32:04] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: UserDetailedSurvey
+[00:32:04] app [00:32:04] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.03, 127.0.0.1:56535]
+[00:32:04] app [00:32:04] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: ContentsPreviewListQuery
+[00:32:04] app [00:32:04] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.03, 127.0.0.1:56536]
+[00:32:04] app [00:32:04] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: MyVentureCapitals
+[00:32:04] app [00:32:04] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: UserDetailedSurvey
+[00:32:04] app [00:32:04] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: UserDetailedSurvey
+[00:32:04] app [00:32:04] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: MyVentureCapitals
+[00:32:04] app [00:32:04] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.06, 127.0.0.1:56542]
+[00:32:04] app [00:32:04] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.06, 127.0.0.1:56543]
+[00:32:04] app [00:32:04] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: ContentsPreviewListQuery
+[00:32:04] app [00:32:04] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: ContentsPreviewListQuery
+[00:32:04] app [00:32:04] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.03, 127.0.0.1:56547]
+[00:32:05] app [00:32:05] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: UserDetailedSurvey
+[00:32:05] app [00:32:05] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: AppCompanyList
+[00:32:05] app [00:32:05] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: UserDetailedSurvey
+[00:32:05] app [00:32:05] server [INFO] [zuzu.common.middleware._graphql_access_log_service] AccessLog: ContentsPreviewListQuery
+[00:32:05] app [00:32:05] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.11, 127.0.0.1:56556]
+[00:32:05] app [00:32:05] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: ContentsPreviewListQuery
+[00:32:05] app [00:32:05] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.11, 127.0.0.1:56558]
+[00:32:05] app [00:32:05] server [INFO] [zuzu.common.middleware.access_log_middleware] AccessLog Response: AppCompanyList
+[00:32:05] app [00:32:05] server [INFO] [django.channels.server] HTTP POST /graphql 200 [0.13, 127.0.0.1:56557]
+
