@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import type { DisposableLike } from "../../shared/types";
+import { buildNodeRuntimeEnvironment } from "../process/node-runtime";
 
 export interface LogicalPortRouterConnection {
   /** Logical TCP port the local client connected to. */
@@ -277,6 +278,8 @@ class NativeLogicalPortRouterProcess implements LogicalPortRouterListenerHandle 
 
     this.closed = false;
     this.child = spawn(this.executablePath, [String(this.logicalPort)], {
+      // The router's outbound target connection must not re-enter Port Manager's native hook.
+      env: buildNodeRuntimeEnvironment(),
       stdio: ["pipe", "pipe", "pipe"],
     });
 

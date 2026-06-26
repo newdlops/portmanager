@@ -114,7 +114,9 @@ const BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS = 60_000;
 const BACKGROUND_CONTAINER_REFRESH_LOCK_STALE_MS = 120_000;
 const BACKGROUND_CONTAINER_REFRESH_STAMP_PATH = buildBackgroundContainerRefreshControlPath("stamp");
 const BACKGROUND_CONTAINER_REFRESH_LOCK_PATH = buildBackgroundContainerRefreshControlPath("lock");
-const LOGICAL_ROUTER_OWNER_LEASE_MS = 15_000;
+// Owner lease must outlive the routing refresh interval; otherwise multiple
+// VS Code windows can take turns stealing router ownership between renewals.
+const LOGICAL_ROUTER_OWNER_LEASE_MS = 120_000;
 const LOGICAL_ROUTER_OWNER_LOCK_STALE_MS = 30_000;
 const LOGICAL_ROUTER_OWNER_PATH = buildLogicalRouterOwnerControlPath("owner");
 const LOGICAL_ROUTER_OWNER_LOCK_PATH = buildLogicalRouterOwnerControlPath("lock");
@@ -2572,8 +2574,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /**
    * Allows host-side tooling to reach unambiguous routed ports.
-   * Debug adapters and browsers can originate outside an attached terminal; a
-   * single live route is still safe because there is no network choice to make.
+   * Debug adapters, browsers, and host CLIs can originate outside an attached
+   * terminal. A single live route, including a Compose route, is still safe
+   * because there is no network choice to make.
    */
   private async findUniqueRouteForRouter(
     logicalPort: number,
@@ -2591,18 +2594,11 @@ export class PortManagerNetworkService implements DisposableLike {
         isLiveListenRoute(route),
     );
 
-    /*
-     * Compose/container attachments deliberately shadow host-published ports
-     * only inside their owning logical network. Host-side fallback would make
-     * those services reachable without network membership, so exclude them.
-     */
-    const fallbackCandidates = candidates.filter((route) => !isNetworkScopedComposeRoute(route));
-
-    if (fallbackCandidates.length === 1) {
-      return fallbackCandidates[0];
+    if (candidates.length === 1) {
+      return candidates[0];
     }
 
-    return this.findSingleAttachedRouteForRouter(fallbackCandidates, snapshot.processes, processRows);
+    return this.findSingleAttachedRouteForRouter(candidates, snapshot.processes, processRows);
   }
 
   /**
@@ -5168,10 +5164,6 @@ function appleScriptString(value: string): string {
 
 function isNodeErrorWithCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
-}
-
-function isNetworkScopedComposeRoute(route: LogicalPortRoute): boolean {
-  return route.source === "compose" && route.networkId !== undefined && route.networkId.trim().length > 0;
 }
 
 const BASE_RUNTIMES: readonly NetworkRuntimeDescriptor[] = [

@@ -248,7 +248,8 @@ test("logical port routers use a single cross-window owner lease", () => {
   const syncEnd = source.indexOf("private async findClientNetworkForRouter", syncStart);
   const syncBody = source.slice(syncStart, syncEnd);
 
-  assert.equal(source.includes("LOGICAL_ROUTER_OWNER_LEASE_MS = 15_000"), true);
+  assert.equal(source.includes("Owner lease must outlive the routing refresh interval"), true);
+  assert.equal(source.includes("LOGICAL_ROUTER_OWNER_LEASE_MS = 120_000"), true);
   assert.equal(source.includes("LOGICAL_ROUTER_OWNER_LOCK_STALE_MS = 30_000"), true);
   assert.equal(source.includes('function buildLogicalRouterOwnerControlPath(kind: "owner" | "lock"): string'), true);
   assert.equal(source.includes("function tryAcquireLogicalRouterOwnerLease(): boolean"), true);
@@ -404,6 +405,9 @@ test("logical router classifies clients by process tree label before hook enviro
   const methodStart = source.indexOf("private async findClientNetworkForRouter");
   const methodEnd = source.indexOf("private async findNetworkRouteForRouter", methodStart);
   const findClientNetworkForRouter = source.slice(methodStart, methodEnd);
+  const uniqueRouteStart = source.indexOf("private async findUniqueRouteForRouter");
+  const uniqueRouteEnd = source.indexOf("private findClientCwdRouteForRouter", uniqueRouteStart);
+  const findUniqueRouteForRouter = source.slice(uniqueRouteStart, uniqueRouteEnd);
 
   assert.equal(source.includes('from "../core/process-network-labels"'), true);
   assert.equal(
@@ -413,4 +417,7 @@ test("logical router classifies clients by process tree label before hook enviro
     "process tree labels must be the primary router signal; inherited hook env remains fallback",
   );
   assert.equal(findClientNetworkForRouter.includes("return environmentNetworkId;"), true);
+  assert.equal(source.includes("including a Compose route"), true);
+  assert.equal(findUniqueRouteForRouter.includes("candidates.filter((route) => !isNetworkScopedComposeRoute(route))"), false);
+  assert.equal(source.includes("function isNetworkScopedComposeRoute"), false);
 });

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
 import * as net from "node:net";
+import * as os from "node:os";
+import * as path from "node:path";
 import test from "node:test";
 
 import { findRoutesMatchingClientCwd } from "../../src/core/networks/logical-route-selection";
@@ -56,6 +59,64 @@ test("parses native logical router control requests", () => {
     remoteAddress: "127.0.0.1",
     remotePort: 49152,
   });
+});
+
+test("native logical router helper starts without inherited hook environment", async () => {
+  const logicalPort = 61234;
+  const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pm-router-env-"));
+  const routerPath = path.join(tempDirectory, "router.js");
+  const capturedEnvPath = path.join(tempDirectory, "env.json");
+  fs.writeFileSync(
+    routerPath,
+    [
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      'fs.writeFileSync(process.env.PM_ROUTER_ENV_PATH, JSON.stringify(process.env));',
+      'process.stdout.write(`READY\\t${process.argv[2]}\\n`);',
+      "process.stdin.resume();",
+    ].join("\n"),
+    "utf8",
+  );
+  fs.chmodSync(routerPath, 0o755);
+
+  const previousEnvironment = setProcessEnvironment({
+    BASH_ENV: "/tmp/portmanager-bash-env.sh",
+    DYLD_INSERT_LIBRARIES: "/tmp/libportmanager_hook.dylib",
+    LD_PRELOAD: "/tmp/libportmanager_hook.so",
+    PM_ROUTER_ENV_PATH: capturedEnvPath,
+    PORT_MANAGER_DYLD_INSERT_LIBRARIES: "/tmp/libportmanager_hook.dylib",
+    PORT_MANAGER_HOOK: "1",
+    PORT_MANAGER_NETWORK_ID: "network-a",
+    PORT_MANAGER_RUNTIME_SHIM_DIR: "/tmp/runtime-shims",
+  });
+  const manager = new LogicalPortRouterManager(
+    {
+      resolve: () => ({ host: "127.0.0.1", port: logicalPort }),
+    },
+    {
+      nativeRouterPath: routerPath,
+      nativeStartupTimeoutMs: 1000,
+    },
+  );
+
+  try {
+    await manager.open(logicalPort);
+
+    const capturedEnvironment = JSON.parse(fs.readFileSync(capturedEnvPath, "utf8")) as NodeJS.ProcessEnv;
+    assert.equal(capturedEnvironment.PORT_MANAGER_HOOK_DISABLED, "1");
+    assert.equal(capturedEnvironment.PORT_MANAGER_HOOK, undefined);
+    assert.equal(capturedEnvironment.PORT_MANAGER_NETWORK_ID, undefined);
+    assert.equal(capturedEnvironment.PORT_MANAGER_RUNTIME_SHIM_DIR, undefined);
+    assert.equal(capturedEnvironment.PORT_MANAGER_DYLD_INSERT_LIBRARIES, undefined);
+    assert.equal(capturedEnvironment.BASH_ENV, undefined);
+    assert.equal(capturedEnvironment.DYLD_INSERT_LIBRARIES, undefined);
+    assert.equal(capturedEnvironment.LD_PRELOAD, undefined);
+    assert.equal(capturedEnvironment.PM_ROUTER_ENV_PATH, capturedEnvPath);
+  } finally {
+    await manager.close(logicalPort).catch(() => undefined);
+    restoreProcessEnvironment(previousEnvironment);
+    fs.rmSync(tempDirectory, { recursive: true, force: true });
+  }
 });
 
 test("keeps opening later logical routers when one desired port is already owned", async () => {
@@ -316,6 +377,28 @@ function listenServer(server: net.Server, port: number, host: string, ipv6Only?:
       ...(ipv6Only === undefined ? {} : { ipv6Only }),
     });
   });
+}
+
+function setProcessEnvironment(values: Record<string, string>): Map<string, string | undefined> {
+  const previousEnvironment = new Map<string, string | undefined>();
+
+  for (const [key, value] of Object.entries(values)) {
+    previousEnvironment.set(key, process.env[key]);
+    process.env[key] = value;
+  }
+
+  return previousEnvironment;
+}
+
+function restoreProcessEnvironment(previousEnvironment: ReadonlyMap<string, string | undefined>): void {
+  for (const [key, value] of previousEnvironment) {
+    if (value === undefined) {
+      delete process.env[key];
+      continue;
+    }
+
+    process.env[key] = value;
+  }
 }
 
 function readFromPort(port: number): Promise<string> {
