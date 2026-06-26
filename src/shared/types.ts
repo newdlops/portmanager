@@ -831,6 +831,53 @@ export interface AgentSnapshot {
   readonly updatedAt: string;
 }
 
+export interface BrowserDnsResolverRecordStatus {
+  /** Logical network id that owns this alias. */
+  readonly networkId: string;
+  /** User-facing logical network name used to derive hostname. */
+  readonly networkName: string;
+  /** Single-label browser hostname derived from a logical network name. */
+  readonly hostname: string;
+  /** Per-network loopback address returned by the local DNS responder. */
+  readonly address: string;
+  /** True when macOS resolver configuration points this hostname at Port Manager DNS. */
+  readonly configured: boolean;
+  /** Browser-visible port routes currently known for this alias. */
+  readonly routes: readonly BrowserDnsAliasRouteStatus[];
+}
+
+export interface BrowserDnsAliasRouteStatus {
+  /** Browser-facing URL users should type, including the http scheme. */
+  readonly url: string;
+  /** Logical web port requested by the development server. */
+  readonly logicalPort: number;
+  /** Loopback address and port where the browser isolation proxy listens. */
+  readonly proxyHost: string;
+  readonly proxyPort: number;
+  /** True when the proxy listener is already active. */
+  readonly proxyActive: boolean;
+  /** Current upstream host and port selected from the logical route table. */
+  readonly upstreamHost?: string;
+  readonly upstreamPort?: number;
+  /** Process label used to explain which server owns this browser route. */
+  readonly processName: string;
+}
+
+export interface BrowserDnsResolverStatus {
+  /** True when the host OS supports /etc/resolver single-label routing. */
+  readonly supported: boolean;
+  /** True when the local UDP DNS responder is currently bound. */
+  readonly dnsRunning: boolean;
+  /** UDP port used by the local DNS responder. */
+  readonly dnsPort: number;
+  /** Resolver rows that can be installed for unique network names. */
+  readonly records: readonly BrowserDnsResolverRecordStatus[];
+  /** Number of resolver rows already installed. */
+  readonly installedCount: number;
+  /** Number of resolver rows missing or pointing somewhere else. */
+  readonly missingCount: number;
+}
+
 export interface DisposableLike {
   /** Releases event subscriptions or low-level handles. */
   dispose(): void;

@@ -76,6 +76,69 @@ test("registers native hook processes as hooked managed rows", async (context) =
   listeners = [];
 });
 
+test("releases loopback routes without adopting another network on the same port", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  let listeners: readonly ListeningPort[] = [];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 1111,
+    name: "vite",
+    command: "vite --host 0.0.0.0 --port 3004",
+    cwd: "/workspace/app-a",
+    requestedPort: 3004,
+    actualPort: 3004,
+    host: "127.80.1.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+  await agent.registerExistingProcess({
+    pid: 2222,
+    name: "vite",
+    command: "vite --host 0.0.0.0 --port 3004",
+    cwd: "/workspace/app-b",
+    requestedPort: 3004,
+    actualPort: 3004,
+    host: "127.80.1.2",
+    networkId: "network-b",
+    source: "hooked",
+  });
+  listeners = [
+    createListener({
+      id: "tcp:127.80.1.2:3004:2222",
+      localAddress: "127.80.1.2",
+      port: 3004,
+      pid: 2222,
+      processName: "vite",
+      command: "vite --host 0.0.0.0 --port 3004",
+    }),
+  ];
+
+  const released = await agent.releaseProcessRoute({
+    pid: 1111,
+    requestedPort: 3004,
+    actualPort: 3004,
+    networkId: "network-a",
+  });
+  const snapshot = await agent.listSnapshot();
+
+  assert.equal(released, true);
+  assert.equal(snapshot.routes.some((route) => route.networkId === "network-a"), false);
+  assert.equal(snapshot.routes.some((route) => route.networkId === "network-b"), true);
+  assert.equal(snapshot.processes.find((process) => process.networkId === "network-a")?.status, "stopped");
+  assert.equal(snapshot.processes.find((process) => process.networkId === "network-b")?.status, "running");
+});
+
 test("recovers hooked routes from live listeners after daemon restart", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const listeners: readonly ListeningPort[] = [

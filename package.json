@@ -830,7 +830,7 @@
           "items": {
             "type": "number"
           },
-          "description": "Host-visible listener ports that terminal hooks should keep on the requested port. Browser dev servers are auto-detected; this list is an override."
+          "description": "Host-visible listener ports that terminal hooks should keep on the requested port. Leave browser dev servers out so Port Manager can provide stable network aliases."
         },
         "portManager.containerRuntime": {
           "type": "string",

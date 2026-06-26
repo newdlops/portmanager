@@ -10,6 +10,8 @@ export interface BrowserNetworkProxyEndpoint {
   readonly logicalPort: number;
   /** Network-specific loopback address exposed to the browser cookie jar. */
   readonly listenHost: string;
+  /** Browser-facing hostname that resolves to listenHost when local DNS is configured. */
+  readonly publicHost?: string;
   /** Ports tried in order; the logical port is preferred when it is not already occupied. */
   readonly listenPorts: readonly number[];
 }
@@ -431,7 +433,7 @@ function appendHeaderLines(lines: string[], name: string, value: number | string
 }
 
 function publicOrigin(endpoint: ActiveBrowserNetworkProxyEndpoint): string {
-  return `http://${formatHostForUrl(endpoint.listenHost)}:${endpoint.listenPort}`;
+  return `http://${formatHostForUrl(endpoint.publicHost ?? endpoint.listenHost)}:${endpoint.listenPort}`;
 }
 
 function upstreamOrigin(endpoint: ActiveBrowserNetworkProxyEndpoint): string {

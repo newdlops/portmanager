@@ -37,6 +37,15 @@ export function loopbackAddressForNetwork(networkId: string): string {
   return `127.${secondOctet}.${thirdOctet}.${fourthOctet}`;
 }
 
+export function browserLoopbackAddressForNetwork(networkId: string): string {
+  const hash = fnv1a32(`browser:${networkId}`);
+  const secondOctet = 112 + (hash & 0x1f);
+  const thirdOctet = (hash >>> 8) & 0xff;
+  const fourthOctet = 1 + ((hash >>> 16) % 254);
+
+  return `127.${secondOctet}.${thirdOctet}.${fourthOctet}`;
+}
+
 function fnv1a32(value: string): number {
   let hash = 0x811c9dc5;
 

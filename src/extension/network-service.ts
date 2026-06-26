@@ -19,6 +19,7 @@ import {
   type LogicalNetworkRegistryState,
 } from "../core/networks/logical-network-registry";
 import {
+  browserLoopbackAddressForNetwork,
   isLoopbackAddressRoutingEnabled,
   loopbackAddressForNetwork,
   NETWORK_LOOPBACK_HOST_ENV,
@@ -32,6 +33,7 @@ import {
   type ContainerRuntimeTarget,
   runContainerCommand,
 } from "../platform/network/container-runtime";
+import { BrowserDnsServer, browserDnsPort, normalizeBrowserDnsHostname } from "../platform/network/browser-dns-server";
 import { ComposePublishMutator } from "../platform/network/compose-publish-mutator";
 import { ContainerServiceDiscoveryAdapter } from "../platform/network/container-service-discovery";
 import { SharedLogicalNetworkStateStore } from "../platform/network/shared-network-state-store";
@@ -62,6 +64,7 @@ import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
 import type {
   AgentDaemonStatus,
   AgentSnapshot,
+  BrowserDnsResolverStatus,
   ComposeAttachment,
   ComposeContainerMutationMapping,
   ComposePortMutationMode,
@@ -301,6 +304,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Reads inherited Port Manager routing scope from local client processes. */
   private readonly processEnvironmentProvider: NodeProcessEnvironmentProvider;
 
+  /** Local DNS responder that maps browser hostnames to per-network loopback addresses. */
+  private readonly browserDnsServer: BrowserDnsServer;
+
   /** Container runtime adapter that provides actual same-port isolation. */
   private readonly containerRuntime: ContainerNetworkRuntimeAdapter;
 
@@ -345,6 +351,12 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Requests one more browser proxy reconciliation after the current sync completes. */
   private browserProxySyncQueued = false;
+
+  /** Guards privileged resolver installation so duplicate UI/registry events cannot stack prompts. */
+  private browserDnsResolverInstallInFlight: Promise<BrowserDnsResolverStatus> | undefined;
+
+  /** Last missing-resolver signature that already triggered an automatic admin prompt. */
+  private browserDnsAutoInstallSignature: string | undefined;
 
   /** Serializes terminal picker rewrites so stale snapshots cannot win the last write. */
   private terminalNetworkSelectionWriteInFlight: Promise<void> | undefined;
@@ -399,6 +411,7 @@ export class PortManagerNetworkService implements DisposableLike {
       storageDirectory: this.context.globalStorageUri.fsPath,
     });
     this.terminalCandidateProvider = new NodeTerminalCandidateProvider();
+    this.browserDnsServer = new BrowserDnsServer();
     this.containerRuntime = new ContainerNetworkRuntimeAdapter();
     this.containerServiceDiscovery = new ContainerServiceDiscoveryAdapter();
     this.composePublishMutator = new ComposePublishMutator({
@@ -443,6 +456,8 @@ export class PortManagerNetworkService implements DisposableLike {
         void this.writeHostAccessBindingsFile();
         void this.writeComposeProjectRoutingFile();
         void this.writeTerminalNetworkSelectionFile();
+        void this.syncBrowserDnsRecords();
+        void this.maybeAutoInstallBrowserDnsResolvers();
         void this.syncLogicalPortRouters();
         void this.syncBrowserNetworkProxies();
         this.reconcileVscodeWindowTerminalBinding();
@@ -518,6 +533,9 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.reconcileComposeAttachmentPublishedPorts({ background: true });
     await this.writeComposeProjectRoutingFile();
     await this.writeTerminalNetworkSelectionFile();
+    await this.startBrowserDnsServer();
+    this.syncBrowserDnsRecords();
+    void this.maybeAutoInstallBrowserDnsResolvers();
     await this.restorePersistedComposeRoutesIfMissing();
     await this.refreshTerminals();
     void this.refreshContainerServices({ background: true });
@@ -557,8 +575,109 @@ export class PortManagerNetworkService implements DisposableLike {
       return undefined;
     }
 
-    const endpoint = await this.browserNetworkProxy.ensure(buildBrowserProxyEndpoint(process));
+    const endpoint = await this.browserNetworkProxy.ensure(
+      buildBrowserProxyEndpoint(process, this.registry.getSnapshot().networks, this.browserDnsServer.isRunning()),
+    );
     return endpoint === undefined ? undefined : formatBrowserNetworkProxyUrl(endpoint);
+  }
+
+  /** Builds a sudo shell script that points macOS single-label resolvers at Port Manager DNS. */
+  createBrowserDnsResolverSetupScript(): string {
+    return buildBrowserDnsResolverSetupScript(
+      buildBrowserDnsRecords(this.registry.getSnapshot().networks),
+      this.browserDnsServer.getPort(),
+    );
+  }
+
+  /** Returns browser DNS resolver installation state for diagnostics UI. */
+  getBrowserDnsResolverStatus(): BrowserDnsResolverStatus {
+    const networkSnapshot = this.registry.getSnapshot();
+    const agentSnapshot = this.getAgentSnapshot();
+
+    return buildBrowserDnsResolverStatus(
+      buildBrowserDnsRecords(networkSnapshot.networks),
+      this.browserDnsServer.getPort(),
+      this.browserDnsServer.isRunning(),
+      agentSnapshot.processes,
+      agentSnapshot.routes,
+      networkSnapshot.networks,
+      this.browserNetworkProxy,
+    );
+  }
+
+  /** Installs macOS resolver rows so browser URLs can use network names as hosts. */
+  async installBrowserDnsResolvers(options: { readonly automatic?: boolean } = {}): Promise<BrowserDnsResolverStatus> {
+    if (this.browserDnsResolverInstallInFlight !== undefined) {
+      return this.browserDnsResolverInstallInFlight;
+    }
+
+    this.browserDnsResolverInstallInFlight = this.installBrowserDnsResolversExclusive(options);
+    try {
+      return await this.browserDnsResolverInstallInFlight;
+    } finally {
+      this.browserDnsResolverInstallInFlight = undefined;
+    }
+  }
+
+  /** Removes only Port Manager-owned browser resolver files for current aliases. */
+  async cleanupBrowserDnsResolvers(): Promise<BrowserDnsResolverStatus> {
+    const status = this.getBrowserDnsResolverStatus();
+    if (!status.supported || status.records.length === 0) {
+      return status;
+    }
+
+    await runShellScriptWithAdministratorPrivileges(buildBrowserDnsResolverCleanupScript(status.records));
+    this.localChangeEvents.emit();
+    return this.getBrowserDnsResolverStatus();
+  }
+
+  private async installBrowserDnsResolversExclusive(
+    options: { readonly automatic?: boolean },
+  ): Promise<BrowserDnsResolverStatus> {
+    const status = this.getBrowserDnsResolverStatus();
+    if (!status.supported || status.records.length === 0 || status.missingCount === 0) {
+      return status;
+    }
+
+    await runShellScriptWithAdministratorPrivileges(buildBrowserDnsResolverSetupScript(status.records, status.dnsPort));
+    this.localChangeEvents.emit();
+
+    if (options.automatic === true) {
+      void vscode.window.showInformationMessage("Port Manager browser DNS aliases installed.");
+    }
+
+    return this.getBrowserDnsResolverStatus();
+  }
+
+  /** Starts one automatic resolver install prompt for each distinct missing alias set. */
+  private maybeAutoInstallBrowserDnsResolvers(): void {
+    const status = this.getBrowserDnsResolverStatus();
+    if (!status.supported || !status.dnsRunning || status.missingCount === 0) {
+      return;
+    }
+
+    const signature = status.records
+      .filter((record) => !record.configured)
+      .map((record) => `${record.hostname}:${record.address}:${status.dnsPort}`)
+      .sort()
+      .join("|");
+    if (signature.length === 0 || this.browserDnsAutoInstallSignature === signature) {
+      return;
+    }
+
+    this.browserDnsAutoInstallSignature = signature;
+    void this.installBrowserDnsResolvers({ automatic: true }).catch(() => undefined);
+  }
+
+  /** Starts the local DNS responder used for single-label browser aliases. */
+  private async startBrowserDnsServer(): Promise<void> {
+    await this.browserDnsServer.start().catch(() => undefined);
+  }
+
+  /** Publishes current network-name aliases to the local browser DNS responder. */
+  private syncBrowserDnsRecords(): void {
+    const records = buildBrowserDnsRecords(this.registry.getSnapshot().networks);
+    this.browserDnsServer.sync(records);
   }
 
   /** Lists saved binding presets without exposing mutable stored arrays. */
@@ -1668,6 +1787,7 @@ export class PortManagerNetworkService implements DisposableLike {
     this.localChangeEvents.clear();
     void this.proxyManager.dispose();
     void this.browserNetworkProxy.dispose();
+    this.browserDnsServer.dispose();
     this.logicalPortRouter.dispose();
     releaseLogicalRouterOwnerLease();
   }
@@ -2484,6 +2604,11 @@ export class PortManagerNetworkService implements DisposableLike {
   ): Promise<BrowserNetworkProxyTarget> {
     const route = await this.findNetworkRoute(endpoint.networkId, endpoint.logicalPort);
     if (route === undefined || !isLiveListenRoute(route)) {
+      const fallbackTarget = await this.findBrowserProxyFallbackListenerTarget(endpoint.networkId, endpoint.logicalPort);
+      if (fallbackTarget !== undefined) {
+        return fallbackTarget;
+      }
+
       throw new Error(`No browser proxy route for ${endpoint.networkId}:${endpoint.logicalPort}.`);
     }
 
@@ -2491,6 +2616,57 @@ export class PortManagerNetworkService implements DisposableLike {
       host: route.host,
       port: route.actualPort,
     };
+  }
+
+  /**
+   * Package managers sometimes launch dev servers through an absolute runtime
+   * path after protected shebang hops have stripped DYLD. Those processes still
+   * inherit the terminal's network id, so browser isolation can safely target a
+   * same-port live listener without changing the global logical route table.
+   */
+  private async findBrowserProxyFallbackListenerTarget(
+    networkId: string,
+    logicalPort: number,
+  ): Promise<BrowserNetworkProxyTarget | undefined> {
+    const listener = await this.findNetworkScopedListener(networkId, logicalPort);
+    if (listener === undefined) {
+      return undefined;
+    }
+
+    return {
+      host: normalizeBrowserProxyTargetHost(listener.localAddress),
+      port: listener.port,
+    };
+  }
+
+  private async findNetworkScopedListener(
+    networkId: string,
+    logicalPort: number,
+  ): Promise<ListeningPort | undefined> {
+    const findInSnapshot = async (snapshot: AgentSnapshot): Promise<ListeningPort | undefined> => {
+      for (const listener of snapshot.listeners) {
+        if (listener.port !== logicalPort || listener.pid === undefined) {
+          continue;
+        }
+
+        const listenerNetworkId = await this.processEnvironmentProvider
+          .readRoutingNetworkId(listener.pid)
+          .catch(() => undefined);
+        if (listenerNetworkId === networkId) {
+          return listener;
+        }
+      }
+
+      return undefined;
+    };
+
+    const current = await findInSnapshot(this.getAgentSnapshot());
+    if (current !== undefined || this.processService === undefined) {
+      return current;
+    }
+
+    await this.processService.refresh().catch(() => undefined);
+    return findInSnapshot(this.processService.getSnapshot());
   }
 
   /**
@@ -2609,6 +2785,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const endpoints = collectBrowserProxyEndpoints(
       snapshot?.processes ?? [],
       this.registry.getSnapshot().networks,
+      this.browserDnsServer.isRunning(),
     );
 
     await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);
@@ -4335,6 +4512,7 @@ function collectLogicalRouterPorts(
 function collectBrowserProxyEndpoints(
   processes: readonly ManagedProcess[],
   networks: readonly LogicalNetwork[],
+  useDnsAlias: boolean,
 ): readonly BrowserNetworkProxyEndpoint[] {
   const endpoints = new Map<string, BrowserNetworkProxyEndpoint>();
 
@@ -4343,7 +4521,7 @@ function collectBrowserProxyEndpoints(
       continue;
     }
 
-    const endpoint = buildBrowserProxyEndpoint(process);
+    const endpoint = buildBrowserProxyEndpoint(process, networks, useDnsAlias);
     endpoints.set(endpoint.id, endpoint);
   }
 
@@ -4370,23 +4548,256 @@ function isBrowserProxyProcess(
     return false;
   }
 
-  return process.source !== "detected" && process.source !== "compose" && process.source !== "allocated";
+  return (
+    process.source !== "detected" &&
+    process.source !== "compose" &&
+    process.source !== "allocated" &&
+    isPublicWebEntrypointProcess(process)
+  );
+}
+
+function isPublicWebEntrypointProcess(process: ManagedProcess): boolean {
+  const text = `${process.name} ${process.command} ${process.cwd} ${process.url ?? ""}`.toLowerCase();
+
+  /*
+   * DNS aliases are for the browser entrypoint, not every network-local API or
+   * worker listener. Keep this as a positive classifier so backend ports remain
+   * available through routing without taking browser cookie/DNS slots.
+   */
+  return [
+    /\bvite\b/,
+    /\bnext\s+dev\b/,
+    /\bnuxt\s+dev\b/,
+    /\bstorybook\s+dev\b/,
+    /\bwebpack-dev-server\b/,
+    /\breact-scripts\s+start\b/,
+    /\bvue-cli-service\s+serve\b/,
+    /\bastro\s+dev\b/,
+    /\bsvelte-kit\b/,
+    /\bremix\s+vite:dev\b/,
+  ].some((pattern) => pattern.test(text));
 }
 
 function buildBrowserProxyEndpoint(
   process: ManagedProcess & { readonly networkId: string },
+  networks: readonly LogicalNetwork[],
+  useDnsAlias: boolean,
 ): BrowserNetworkProxyEndpoint {
   const fallbackPort = browserNetworkProxyFallbackPort(process.requestedPort);
   const listenPorts =
     fallbackPort === process.requestedPort ? [process.requestedPort] : [process.requestedPort, fallbackPort];
+  const publicHost = useDnsAlias ? browserPublicHostForNetwork(process.networkId, networks) : undefined;
 
   return {
     id: browserNetworkProxyEndpointId(process.networkId, process.requestedPort),
     networkId: process.networkId,
     logicalPort: process.requestedPort,
-    listenHost: loopbackAddressForNetwork(process.networkId),
+    listenHost: browserLoopbackAddressForNetwork(process.networkId),
+    ...(publicHost === undefined ? {} : { publicHost }),
     listenPorts,
   };
+}
+
+function buildBrowserDnsRecords(
+  networks: readonly LogicalNetwork[],
+): readonly {
+  readonly networkId: string;
+  readonly networkName: string;
+  readonly hostname: string;
+  readonly address: string;
+}[] {
+  const hostnameCounts = new Map<string, number>();
+  const hostnamesByNetworkId = new Map<string, string>();
+
+  for (const network of networks) {
+    const hostname = normalizeBrowserDnsHostname(network.name);
+    if (hostname === undefined) {
+      continue;
+    }
+
+    hostnamesByNetworkId.set(network.id, hostname);
+    hostnameCounts.set(hostname, (hostnameCounts.get(hostname) ?? 0) + 1);
+  }
+
+  return networks
+    .map((network) => {
+      const hostname = hostnamesByNetworkId.get(network.id);
+      if (hostname === undefined || hostnameCounts.get(hostname) !== 1) {
+        return undefined;
+      }
+
+      return {
+        networkId: network.id,
+        networkName: network.name,
+        hostname,
+        address: browserLoopbackAddressForNetwork(network.id),
+      };
+    })
+    .filter(
+      (
+        record,
+      ): record is {
+        readonly networkId: string;
+        readonly networkName: string;
+        readonly hostname: string;
+        readonly address: string;
+      } => record !== undefined,
+    );
+}
+
+function browserPublicHostForNetwork(networkId: string, networks: readonly LogicalNetwork[]): string | undefined {
+  const records = buildBrowserDnsRecords(networks);
+  const address = browserLoopbackAddressForNetwork(networkId);
+
+  const record = records.find((item) => item.address === address);
+  if (record === undefined || !isBrowserDnsResolverConfigured(record.hostname)) {
+    return undefined;
+  }
+
+  return record.hostname;
+}
+
+function isBrowserDnsResolverConfigured(hostname: string): boolean {
+  if (process.platform !== "darwin") {
+    return false;
+  }
+
+  const filePath = path.join("/etc/resolver", hostname);
+
+  try {
+    const content = syncFs.readFileSync(filePath, "utf8");
+    return (
+      /^nameserver[ \t]+127\.0\.0\.1$/m.test(content) &&
+      new RegExp(`^port[ \\t]+${browserDnsPort()}$`, "m").test(content)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function normalizeBrowserProxyTargetHost(host: string): string {
+  if (host === "0.0.0.0" || host === "*" || host === "") {
+    return "127.0.0.1";
+  }
+
+  if (host === "::" || host === "[::]") {
+    return "::1";
+  }
+
+  return host;
+}
+
+function buildBrowserDnsResolverStatus(
+  records: readonly {
+    readonly networkId: string;
+    readonly networkName: string;
+    readonly hostname: string;
+    readonly address: string;
+  }[],
+  dnsPort: number,
+  dnsRunning: boolean,
+  processes: readonly ManagedProcess[],
+  routes: readonly LogicalPortRoute[],
+  networks: readonly LogicalNetwork[],
+  browserNetworkProxy: BrowserNetworkProxyManager,
+): BrowserDnsResolverStatus {
+  const supported = process.platform === "darwin";
+  const recordStatuses = records.map((record) => ({
+    ...record,
+    configured: supported && isBrowserDnsResolverConfigured(record.hostname),
+    routes: buildBrowserDnsAliasRouteStatus(record, processes, routes, networks, browserNetworkProxy),
+  }));
+
+  return {
+    supported,
+    dnsRunning,
+    dnsPort,
+    records: recordStatuses,
+    installedCount: recordStatuses.filter((record) => record.configured).length,
+    missingCount: recordStatuses.filter((record) => !record.configured).length,
+  };
+}
+
+function buildBrowserDnsAliasRouteStatus(
+  record: {
+    readonly networkId: string;
+    readonly hostname: string;
+    readonly address: string;
+  },
+  processes: readonly ManagedProcess[],
+  routes: readonly LogicalPortRoute[],
+  networks: readonly LogicalNetwork[],
+  browserNetworkProxy: BrowserNetworkProxyManager,
+): BrowserDnsResolverStatus["records"][number]["routes"] {
+  return processes
+    .filter((process): process is ManagedProcess & { readonly networkId: string; readonly url: string } =>
+      process.networkId === record.networkId && isBrowserProxyProcess(process, networks),
+    )
+    .map((process) => {
+      const endpoint = buildBrowserProxyEndpoint(process, networks, true);
+      const activeEndpoint = browserNetworkProxy.get(record.networkId, process.requestedPort);
+      const proxyPort = activeEndpoint?.listenPort ?? endpoint.listenPorts[0] ?? process.requestedPort;
+      const route = findMatchingRoute(routes, record.networkId, process.requestedPort);
+
+      return {
+        url: `http://${record.hostname}:${proxyPort}/`,
+        logicalPort: process.requestedPort,
+        proxyHost: endpoint.listenHost,
+        proxyPort,
+        proxyActive: activeEndpoint !== undefined,
+        ...(route === undefined ? {} : { upstreamHost: route.host, upstreamPort: route.actualPort }),
+        processName: process.name,
+      };
+    })
+    .sort((left, right) => left.logicalPort - right.logicalPort || left.processName.localeCompare(right.processName));
+}
+
+function buildBrowserDnsResolverSetupScript(
+  records: readonly { readonly hostname: string; readonly address: string }[],
+  dnsPort: number,
+): string {
+  const uniqueRecords = [...new Map(records.map((record) => [record.hostname, record])).values()];
+  const lines = [
+    "#!/bin/sh",
+    "set -eu",
+    "mkdir -p /etc/resolver",
+  ];
+
+  for (const record of uniqueRecords) {
+    lines.push(
+      `cat > ${shellQuote(path.join("/etc/resolver", record.hostname))} <<'PORTMANAGER_RESOLVER'`,
+      "# Port Manager browser DNS resolver",
+      `# ${record.hostname} -> ${record.address}`,
+      "nameserver 127.0.0.1",
+      `port ${dnsPort}`,
+      "timeout 1",
+      "PORTMANAGER_RESOLVER",
+    );
+  }
+
+  lines.push("dscacheutil -flushcache >/dev/null 2>&1 || true");
+  lines.push("killall -HUP mDNSResponder >/dev/null 2>&1 || true");
+  return `${lines.join("\n")}\n`;
+}
+
+function buildBrowserDnsResolverCleanupScript(
+  records: readonly { readonly hostname: string; readonly address: string }[],
+): string {
+  const uniqueRecords = [...new Map(records.map((record) => [record.hostname, record])).values()];
+  const lines = ["#!/bin/sh", "set -eu"];
+
+  for (const record of uniqueRecords) {
+    const filePath = path.join("/etc/resolver", record.hostname);
+    lines.push(
+      `if [ -f ${shellQuote(filePath)} ] && grep -q '^# Port Manager browser DNS resolver$' ${shellQuote(filePath)}; then`,
+      `  rm -f ${shellQuote(filePath)}`,
+      "fi",
+    );
+  }
+
+  lines.push("dscacheutil -flushcache >/dev/null 2>&1 || true");
+  lines.push("killall -HUP mDNSResponder >/dev/null 2>&1 || true");
+  return `${lines.join("\n")}\n`;
 }
 
 function isPortManagerLogicalRouterListener(listener: ListeningPort): boolean {
@@ -4868,6 +5279,13 @@ async function runAppleScript(script: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function runShellScriptWithAdministratorPrivileges(script: string): Promise<void> {
+  const encodedScript = Buffer.from(script, "utf8").toString("base64");
+  const command = `printf %s ${shellQuote(encodedScript)} | /usr/bin/base64 -D | /bin/sh`;
+  const appleScript = `do shell script "${appleScriptString(command)}" with administrator privileges`;
+  await execFileAsync("osascript", ["-e", appleScript], { timeout: 120_000 });
 }
 
 function normalizeTerminalTty(terminalId: string): string {

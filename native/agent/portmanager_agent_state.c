@@ -35,7 +35,7 @@ static int pm_scan_lsof_cached(pm_agent_state *state, pm_listener_list *listener
 static int pm_listener_cache_store(pm_agent_state *state, const pm_listener_list *listeners, const char *updated_at, time_t now);
 static void pm_listener_cache_invalidate(pm_agent_state *state);
 static int pm_state_needs_external_listener_fresh_scan(pm_agent_state *state);
-static int pm_find_listener_for_port(int port, pm_listener *out);
+static int pm_find_listener_for_port_host(int port, const char *host, pm_listener *out);
 static const char *pm_listener_route_host(const pm_listener *listener, const char *fallback_host, char *buffer, size_t size);
 
 static void pm_copy(char *target, size_t size, const char *value) {
@@ -677,9 +677,94 @@ static int pm_process_is_external_listener_owned(const pm_process *process) {
      strcmp(process->source, "compose") == 0);
 }
 
-static const pm_listener *pm_find_listener_by_pid_port(const pm_listener_list *listeners, pid_t pid, int port) {
+static void pm_normalize_endpoint_host_key(const char *host, char *out, size_t out_size) {
+  const char *start = host == NULL ? "" : host;
+  const char *end;
+  size_t length;
+
+  while (*start != '\0' && isspace((unsigned char)*start)) {
+    start++;
+  }
+
+  end = start + strlen(start);
+  while (end > start && isspace((unsigned char)*(end - 1))) {
+    end--;
+  }
+
+  if (end > start && *start == '[' && *(end - 1) == ']') {
+    start++;
+    end--;
+  }
+
+  length = (size_t)(end - start);
+  if (
+    length == 0 ||
+    (length == 1 && strncmp(start, "*", 1) == 0) ||
+    (length == 7 && strncasecmp(start, "0.0.0.0", 7) == 0) ||
+    (length == 2 && strncmp(start, "::", 2) == 0)
+  ) {
+    pm_copy(out, out_size, "*");
+    return;
+  }
+
+  if (length == 9 && strncasecmp(start, "localhost", 9) == 0) {
+    pm_copy(out, out_size, "127.0.0.1");
+    return;
+  }
+
+  if (length >= out_size) {
+    length = out_size - 1;
+  }
+  for (size_t index = 0; index < length; index++) {
+    out[index] = (char)tolower((unsigned char)start[index]);
+  }
+  out[length] = '\0';
+}
+
+static int pm_is_non_default_loopback_host(const char *host) {
+  struct in_addr address;
+  uint32_t ip;
+
+  if (inet_pton(AF_INET, host, &address) != 1) {
+    return 0;
+  }
+
+  ip = ntohl(address.s_addr);
+  return (ip >> 24) == 127 && ip != 0x7f000001u;
+}
+
+static int pm_endpoint_hosts_match(const char *listener_host, const char *route_host) {
+  char normalized_listener[PM_SMALL];
+  char normalized_route[PM_SMALL];
+
+  pm_normalize_endpoint_host_key(listener_host, normalized_listener, sizeof(normalized_listener));
+  pm_normalize_endpoint_host_key(route_host, normalized_route, sizeof(normalized_route));
+
+  if (pm_is_non_default_loopback_host(normalized_route)) {
+    return strcmp(normalized_listener, normalized_route) == 0;
+  }
+
+  if (strcmp(normalized_listener, "*") == 0 || strcmp(normalized_route, "*") == 0) {
+    return 1;
+  }
+
+  if (
+    (strcmp(normalized_route, "127.0.0.1") == 0 && strcmp(normalized_listener, "::1") == 0) ||
+    (strcmp(normalized_route, "::1") == 0 && strcmp(normalized_listener, "127.0.0.1") == 0)
+  ) {
+    return 1;
+  }
+
+  return strcmp(normalized_listener, normalized_route) == 0;
+}
+
+static const pm_listener *pm_find_listener_by_process_pid_endpoint(const pm_listener_list *listeners, const pm_process *process) {
   for (size_t index = 0; listeners != NULL && index < listeners->count; index++) {
-    if (listeners->items[index].pid == pid && listeners->items[index].port == port) {
+    if (
+      listeners->items[index].pid == process->pid &&
+      listeners->items[index].port == process->actual_port &&
+      pm_endpoint_hosts_match(listeners->items[index].local_address, process->host)
+    ) {
       return &listeners->items[index];
     }
   }
@@ -687,11 +772,14 @@ static const pm_listener *pm_find_listener_by_pid_port(const pm_listener_list *l
   return NULL;
 }
 
-static const pm_listener *pm_find_listener_by_port(const pm_listener_list *listeners, int port) {
+static const pm_listener *pm_find_listener_by_process_endpoint(const pm_listener_list *listeners, const pm_process *process) {
   const pm_listener *fallback = NULL;
 
   for (size_t index = 0; listeners != NULL && index < listeners->count; index++) {
-    if (listeners->items[index].port != port) {
+    if (
+      listeners->items[index].port != process->actual_port ||
+      !pm_endpoint_hosts_match(listeners->items[index].local_address, process->host)
+    ) {
       continue;
     }
 
@@ -750,13 +838,13 @@ static int pm_reconcile_external_processes_with_listeners(
       continue;
     }
 
-    listener = pm_find_listener_by_pid_port(listeners, process->pid, process->actual_port);
+    listener = pm_find_listener_by_process_pid_endpoint(listeners, process);
     if (listener != NULL) {
       pm_clear_missing_listener_state(process);
       continue;
     }
 
-    listener = pm_find_listener_by_port(listeners, process->actual_port);
+    listener = pm_find_listener_by_process_endpoint(listeners, process);
     if (listener != NULL) {
       changed = pm_adopt_listener_owner(process, listener) || changed;
       continue;
@@ -1306,7 +1394,7 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
      * the OS has the requested listener but no route row exists yet, so a new
      * 5xxxx reservation would shadow the real server and make wait-on hang.
      */
-    if (pm_find_listener_for_port(input->requested_port, &same_port_listener)) {
+    if (pm_find_listener_for_port_host(input->requested_port, input->host, &same_port_listener)) {
       return pm_build_allocation_payload(
         state,
         "",
@@ -1682,8 +1770,9 @@ static int pm_scan_lsof_cached(pm_agent_state *state, pm_listener_list *listener
   return 0;
 }
 
-static int pm_find_listener_for_port(int port, pm_listener *out) {
+static int pm_find_listener_for_port_host(int port, const char *host, pm_listener *out) {
   pm_listener_list listeners = {0};
+  const pm_listener *fallback = NULL;
   char updated_at[PM_TIME];
   int found = 0;
 
@@ -1694,11 +1783,22 @@ static int pm_find_listener_for_port(int port, pm_listener *out) {
   }
 
   for (size_t index = 0; index < listeners.count; index++) {
-    if (listeners.items[index].port == port) {
+    if (listeners.items[index].port != port || !pm_endpoint_hosts_match(listeners.items[index].local_address, host)) {
+      continue;
+    }
+
+    if (listeners.items[index].pid > 0) {
       *out = listeners.items[index];
       found = 1;
       break;
     }
+
+    fallback = &listeners.items[index];
+  }
+
+  if (!found && fallback != NULL) {
+    *out = *fallback;
+    found = 1;
   }
 
   free(listeners.items);
@@ -1707,21 +1807,29 @@ static int pm_find_listener_for_port(int port, pm_listener *out) {
 
 int pm_state_release_process_route(pm_agent_state *state, const pm_release_process_input *input, pm_buffer *payload) {
   char network_id[PM_SMALL];
-  pm_listener active_listener;
-  int has_listener;
+  pm_listener_list listeners = {0};
+  char updated_at[PM_TIME];
+  int listener_scan_ok = 0;
   int released = 0;
   int retained = 0;
 
   pm_normalize_network(input->network_id, network_id, sizeof(network_id));
+  pm_iso_now(updated_at, sizeof(updated_at));
+  listener_scan_ok = pm_scan_lsof(&listeners, updated_at) == 0;
+  if (listener_scan_ok) {
+    (void)pm_listener_cache_store(state, &listeners, updated_at, time(NULL));
+  }
+
   if (input->allocation_id[0] != '\0') {
     size_t before = state->pending_count;
     pm_remove_pending_allocation(state, input->allocation_id);
     released = released || before != state->pending_count;
   }
 
-  has_listener = pm_find_listener_for_port(input->actual_port, &active_listener);
   for (size_t index = 0; index < state->process_count; index++) {
     pm_process *process = &state->processes[index];
+    const pm_listener *active_listener;
+
     if (strcmp(process->status, "running") != 0 ||
         strcmp(process->source, "detected") == 0 ||
         process->pid != input->pid ||
@@ -1731,13 +1839,9 @@ int pm_state_release_process_route(pm_agent_state *state, const pm_release_proce
       continue;
     }
 
-    if (has_listener) {
-      process->pid = active_listener.pid > 0 ? active_listener.pid : process->pid;
-      if (active_listener.process_name[0] != '\0') {
-        pm_copy(process->name, sizeof(process->name), active_listener.process_name);
-        pm_copy(process->command, sizeof(process->command), active_listener.command);
-      }
-      pm_clear_missing_listener_state(process);
+    active_listener = listener_scan_ok ? pm_find_listener_by_process_endpoint(&listeners, process) : NULL;
+    if (active_listener != NULL) {
+      (void)pm_adopt_listener_owner(process, active_listener);
       retained = 1;
       continue;
     }
@@ -1754,6 +1858,7 @@ int pm_state_release_process_route(pm_agent_state *state, const pm_release_proce
     pm_write_route_tables(state);
   }
 
+  free(listeners.items);
   return pm_buffer_append(payload, released ? "true" : "false");
 }
 
@@ -2073,7 +2178,12 @@ int pm_state_remove_process(pm_agent_state *state, const char *id, pm_buffer *pa
 static int pm_listener_is_tracked(pm_agent_state *state, const pm_listener *listener) {
   for (size_t index = 0; index < state->process_count; index++) {
     pm_process *process = &state->processes[index];
-    if (strcmp(process->status, "stopped") != 0 && process->pid == listener->pid && process->actual_port == listener->port) {
+    if (
+      strcmp(process->status, "stopped") != 0 &&
+      process->pid == listener->pid &&
+      process->actual_port == listener->port &&
+      pm_endpoint_hosts_match(listener->local_address, process->host)
+    ) {
       return 1;
     }
   }
@@ -2297,7 +2407,7 @@ int pm_state_listener_signature(pm_agent_state *state, pm_buffer *signature) {
   }
 
   for (size_t index = 0; index < listeners.count; index++) {
-    pm_buffer_appendf(signature, "%ld:%d;", (long)listeners.items[index].pid, listeners.items[index].port);
+    pm_buffer_appendf(signature, "%ld:%s:%d;", (long)listeners.items[index].pid, listeners.items[index].local_address, listeners.items[index].port);
   }
 
   free(listeners.items);

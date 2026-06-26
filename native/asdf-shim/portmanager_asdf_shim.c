@@ -68,6 +68,14 @@ static void pm_restore_dyld(void) {
     return;
   }
 
+  /*
+   * The native hook only repairs stripped preload variables for processes that
+   * crossed an extension-owned runtime boundary. This keeps package-manager
+   * lifecycle commands outside routing while preserving child tools launched by
+   * real runtime/server processes.
+   */
+  setenv("PORT_MANAGER_PRELOAD_REPAIR", "1", 1);
+
   if (current != NULL && strstr(current, hook) != NULL) {
     return;
   }

@@ -37,8 +37,15 @@ test("package command shims rerun client tools without native runtime alias sema
   const source = fs.readFileSync(sourcePath, "utf8");
   const launcherList = /const PRELOAD_RUNTIME_LAUNCHER_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
   const packageCommandList = /const PRELOAD_PACKAGE_COMMAND_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
+  const packageManagerList = /const PRELOAD_PACKAGE_MANAGER_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
+  const packageManagerShimStart = source.indexOf("function buildPreloadPackageManagerCommandShimScript");
+  const packageManagerShimEnd = source.indexOf("function shellEnvRestoreFileName", packageManagerShimStart);
+  const packageManagerShim = source.slice(packageManagerShimStart, packageManagerShimEnd);
+  const packageManagerDevServerStart = packageManagerShim.indexOf("if __pm_text_looks_like_dev_server");
+  const packageManagerDevServerEnd = packageManagerShim.indexOf('exec "\\${__pm_target}" "$@"', packageManagerDevServerStart);
+  const packageManagerDevServerBlock = packageManagerShim.slice(packageManagerDevServerStart, packageManagerDevServerEnd);
 
-  for (const packageBinary of ["yarn", "concurrently", "wait-on", "retry", "vite", "dotenv", "celery", "uvicorn", "gunicorn", "daphne"]) {
+  for (const packageBinary of ["concurrently", "wait-on", "retry", "vite", "dotenv", "celery", "uvicorn", "gunicorn", "daphne"]) {
     assert.equal(
       launcherList.includes(`"${packageBinary}"`),
       false,
@@ -51,8 +58,40 @@ test("package command shims rerun client tools without native runtime alias sema
     );
   }
 
+  for (const packageManager of ["npm", "npx", "pnpm", "pnpx", "corepack", "yarn", "yarnpkg"]) {
+    assert.equal(
+      launcherList.includes(`"${packageManager}"`),
+      false,
+      `${packageManager} must not be hooked as a runtime launcher`,
+    );
+    assert.equal(
+      packageCommandList.includes(`"${packageManager}"`),
+      false,
+      `${packageManager} must not be hooked as a package command shim`,
+    );
+    assert.equal(
+      packageManagerList.includes(`"${packageManager}"`),
+      true,
+      `${packageManager} must use the package-manager dev-server detector shim`,
+    );
+  }
+
   assert.equal(source.includes("buildPreloadPackageCommandShimScript"), true);
+  assert.equal(source.includes("buildPreloadPackageManagerCommandShimScript"), true);
+  assert.equal(source.includes("writePreloadPackageManagerCommandShims"), true);
+  assert.equal(source.includes("__pm_text_looks_like_dev_server()"), true);
+  assert.equal(source.includes("__pm_package_script_text()"), true);
+  assert.equal(source.includes("*vite*"), true);
+  assert.equal(source.includes("*uvicorn*"), true);
+  assert.equal(source.includes("removeLegacyPreloadPackageManagerShims"), true);
+  assert.equal(source.includes("PRELOAD_PACKAGE_MANAGER_NAMES.includes(entry.name)"), true);
   assert.equal(source.includes("__pm_is_package_command_shim()"), true);
+  assert.equal(source.includes("export PORT_MANAGER_PRELOAD_REPAIR=1"), true);
+  assert.equal(
+    source.includes('if [ "\\${PORT_MANAGER_PRELOAD_REPAIR:-}" = "1" ] && [ -n "\\${PORT_MANAGER_DYLD_INSERT_LIBRARIES:-}" ]; then'),
+    true,
+    "BASH_ENV must not restore DYLD for package-manager lifecycle shells unless a runtime shim opted in",
+  );
   assert.equal(
     source.includes('if __pm_is_package_command_shim "\\${__pm_candidate}"; then'),
     true,
@@ -68,6 +107,21 @@ test("package command shims rerun client tools without native runtime alias sema
     source.includes('exec "\\${__pm_node}" "\\${__pm_exec_script}" "$@"'),
     true,
     "package command shim must bypass temporary shell wrappers before they strip DYLD again",
+  );
+  assert.equal(
+    source.includes("function buildPreloadNodeEntrypointBypassShell"),
+    true,
+    "Node entrypoint bypass should be shared by package-bin and package-manager shims",
+  );
+  assert.equal(
+    packageManagerDevServerBlock.includes("${buildPreloadNodeEntrypointBypassShell()}"),
+    true,
+    "package-manager dev-server commands must bypass /usr/bin/env node before DYLD is stripped",
+  );
+  assert.equal(
+    packageManagerDevServerBlock.includes("export PORT_MANAGER_PRELOAD_REPAIR=1"),
+    true,
+    "package-manager shim must keep lifecycle commands unhooked unless a dev-server command was detected",
   );
 });
 
@@ -377,16 +431,24 @@ test("terminal attach script enables loopback routing only after alias readiness
   assert.equal(source.includes("NETWORK_LOOPBACK_HOST_ENV"), true);
 });
 
-test("native hook lets loopback aliases own dev server ports", () => {
+test("native hook preserves listener ports only for explicit overrides", () => {
   const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
   const source = fs.readFileSync(sourcePath, "utf8");
 
-  assert.equal(source.includes("pm_network_loopback_host() == NULL && pm_current_process_looks_like_browser_dev_server()"), true);
-  assert.equal(source.includes("bind loopback-network logical=%d host=%s"), true);
-  assert.equal(
-    source.includes("collapse sessions back onto 127.0.0.1 and defeat cookie isolation"),
-    true,
-  );
+  assert.equal(source.includes("return pm_is_preserved_listen_port(logical_port);"), true);
+  assert.equal(source.includes("pm_current_process_looks_like_browser_dev_server"), false);
+  assert.equal(source.includes("stable browser alias"), true);
+});
+
+test("native preload repair is opt-in at runtime shim boundaries", () => {
+  const hookSourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
+  const asdfShimSourcePath = path.resolve(__dirname, "../../../native/asdf-shim/portmanager_asdf_shim.c");
+  const hookSource = fs.readFileSync(hookSourcePath, "utf8");
+  const asdfShimSource = fs.readFileSync(asdfShimSourcePath, "utf8");
+
+  assert.equal(hookSource.includes('!pm_envp_value_is(envp, "PORT_MANAGER_PRELOAD_REPAIR", "1")'), true);
+  assert.equal(hookSource.includes("Runtime/package-bin shims opt into repair"), true);
+  assert.equal(asdfShimSource.includes('setenv("PORT_MANAGER_PRELOAD_REPAIR", "1", 1);'), true);
 });
 
 test("logical routers are opened only after logical routes are live", () => {

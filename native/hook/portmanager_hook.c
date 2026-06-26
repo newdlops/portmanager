@@ -143,68 +143,6 @@ static const char *pm_path_basename(const char *path) {
   return slash == NULL ? path : slash + 1;
 }
 
-static int pm_basename_is_one_of(const char *path, const char *const names[]) {
-  const char *base_name = pm_path_basename(path);
-
-  if (base_name == NULL) {
-    return 0;
-  }
-
-  for (size_t index = 0; names[index] != NULL; index++) {
-    if (strcmp(base_name, names[index]) == 0) {
-      return 1;
-    }
-  }
-
-  return 0;
-}
-
-static int pm_text_contains_any(const char *value, const char *const needles[]) {
-  if (value == NULL || value[0] == '\0') {
-    return 0;
-  }
-
-  for (size_t index = 0; needles[index] != NULL; index++) {
-    if (strstr(value, needles[index]) != NULL) {
-      return 1;
-    }
-  }
-
-  return 0;
-}
-
-static int pm_current_process_looks_like_browser_dev_server(void) {
-  static const char *const executable_names[] = {
-    "vite",
-    "vite.js",
-    "next",
-    "astro",
-    "storybook",
-    "webpack-dev-server",
-    NULL,
-  };
-  static const char *const lifecycle_markers[] = {
-    "vite",
-    "storybook",
-    "next dev",
-    "astro dev",
-    "webpack-dev-server",
-    NULL,
-  };
-  const char *underscore = getenv("_");
-
-  /*
-   * Browser dev servers are host entrypoints, not service-to-service endpoints.
-   * Package managers usually preserve either "_" or npm lifecycle metadata, so
-   * use those stable hints instead of guessing from the numeric port alone.
-   */
-  return pm_basename_is_one_of(underscore, executable_names) ||
-    pm_text_contains_any(getenv("npm_lifecycle_event"), lifecycle_markers) ||
-    pm_text_contains_any(getenv("npm_lifecycle_script"), lifecycle_markers) ||
-    getenv("VITE_PROXY_TARGET_HOST") != NULL ||
-    getenv("VITE_ZUZU_SERVICE") != NULL;
-}
-
 static int pm_env_flag_is_one(const char *name) {
   const char *value = getenv(name);
   return value != NULL && strcmp(value, "1") == 0;
@@ -323,13 +261,16 @@ static pm_child_environment pm_prepare_child_environment(char *const envp[]) {
   size_t name_length = strlen(PM_PRELOAD_ENV);
 
   /*
-   * Package managers can remove DYLD_INSERT_LIBRARIES while preserving the
-   * Port Manager hint variable. Repair the child environment at exec time so
-   * client-side tools such as wait-on keep the same routing view as servers.
+   * Protected launchers can remove DYLD_INSERT_LIBRARIES while preserving the
+   * Port Manager hint variable. Repairing every child exec makes package
+   * manager lifecycle commands inherit the socket hook even when they are not
+   * serving traffic. Runtime/package-bin shims opt into repair only for the
+   * execution boundary that must keep routing semantics.
    */
   if (!pm_hook_enabled() || pm_hook_depth > 0 || envp == NULL ||
       pm_envp_value_is(envp, "PORT_MANAGER_HOOK_DISABLED", "1") ||
-      pm_envp_value_is(envp, "PORT_MANAGER_HOOK", "0")) {
+      pm_envp_value_is(envp, "PORT_MANAGER_HOOK", "0") ||
+      !pm_envp_value_is(envp, "PORT_MANAGER_PRELOAD_REPAIR", "1")) {
     return prepared;
   }
 
@@ -1389,16 +1330,13 @@ static int pm_is_preserved_listen_port(int port) {
 }
 
 static int pm_should_preserve_listen_bind(int logical_port) {
-  if (pm_is_preserved_listen_port(logical_port)) {
-    return 1;
-  }
-
   /*
-   * Browser dev servers stay visible on their requested port in high-port mode.
-   * When a per-network loopback host is active, preserving localhost would
-   * collapse sessions back onto 127.0.0.1 and defeat cookie isolation.
+   * Preserving a bind means the kernel sees the original host/port. That is
+   * only safe for explicit user overrides; auto-preserving Vite/Next-style dev
+   * servers lets their own conflict detector increment ports before Port
+   * Manager can present a stable browser alias.
    */
-  return pm_network_loopback_host() == NULL && pm_current_process_looks_like_browser_dev_server();
+  return pm_is_preserved_listen_port(logical_port);
 }
 
 static const char *pm_routing_mode(void) {

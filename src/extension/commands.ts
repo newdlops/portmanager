@@ -182,6 +182,12 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.copyRoutedUrl", (argument) => this.copyRoutedUrl(argument));
     this.registerCommand(context, "portManager.openRoutedUrl", (argument) => this.openRoutedUrl(argument));
     this.registerCommand(context, "portManager.removeProcess", (argument) => this.removeProcess(argument));
+    this.registerCommand(context, "portManager.installBrowserDnsResolvers", () =>
+      this.installBrowserDnsResolvers(),
+    );
+    this.registerCommand(context, "portManager.cleanupBrowserDnsResolvers", () =>
+      this.cleanupBrowserDnsResolvers(),
+    );
     this.registerCommand(context, "portManager.installShellHook", () => this.installShellHook(context));
     this.registerCommand(context, "portManager.installExternalCli", () => this.installExternalCli(context));
     this.registerCommand(context, "portManager.openSettings", () => openPortManagerSettings());
@@ -1356,6 +1362,38 @@ export class PortManagerCommandController implements DisposableLike {
 
     const url = (await this.dependencies.networkService.getBrowserIsolatedUrl(process)) ?? process.url;
     await openUrl(url);
+  }
+
+  /** Installs macOS resolver rows needed for single-label browser aliases. */
+  private async installBrowserDnsResolvers(): Promise<void> {
+    try {
+      const status = await this.dependencies.networkService.installBrowserDnsResolvers();
+      if (!status.supported) {
+        await vscode.window.showInformationMessage("Browser DNS aliases are only supported on macOS.");
+        return;
+      }
+      await vscode.window.showInformationMessage(
+        `Browser DNS aliases installed: ${status.installedCount}/${status.records.length}`,
+      );
+    } catch (error) {
+      await vscode.window.showWarningMessage(`Browser DNS install failed: ${toErrorMessage(error)}`);
+    }
+  }
+
+  /** Removes Port Manager-owned macOS resolver rows for browser aliases. */
+  private async cleanupBrowserDnsResolvers(): Promise<void> {
+    try {
+      const status = await this.dependencies.networkService.cleanupBrowserDnsResolvers();
+      if (!status.supported) {
+        await vscode.window.showInformationMessage("Browser DNS aliases are only supported on macOS.");
+        return;
+      }
+      await vscode.window.showInformationMessage(
+        `Browser DNS aliases cleaned: ${status.records.length - status.installedCount}/${status.records.length}`,
+      );
+    } catch (error) {
+      await vscode.window.showWarningMessage(`Browser DNS cleanup failed: ${toErrorMessage(error)}`);
+    }
   }
 
   /**
@@ -3317,4 +3355,8 @@ async function showCommandError(error: unknown): Promise<void> {
   }
 
   await vscode.window.showErrorMessage(String(error));
+}
+
+function toErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

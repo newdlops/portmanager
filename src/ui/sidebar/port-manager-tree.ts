@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type {
   AgentDaemonStatus,
   AgentSnapshot,
+  BrowserDnsResolverStatus,
   ComposeAttachment,
   ComposePublishedPort,
   ContainerServiceCandidate,
@@ -45,6 +46,8 @@ export interface PortManagerNetworkTreeSource {
   getDaemonStatus(): AgentDaemonStatus;
   /** Returns daemon routes and process rows used by routing status displays. */
   getAgentSnapshot(): AgentSnapshot;
+  /** Returns browser DNS alias resolver status for diagnostics rows. */
+  getBrowserDnsResolverStatus(): BrowserDnsResolverStatus;
   /** Notifies the tree when networks, terminals, or exposures change. */
   onDidChange(listener: () => void): DisposableLike;
 }
@@ -215,6 +218,7 @@ export class PortManagerTreeProvider
     const snapshot = this.source.getSnapshot();
     const agentSnapshot = this.source.getAgentSnapshot();
     const daemon = this.source.getDaemonStatus();
+    const browserDns = this.source.getBrowserDnsResolverStatus();
 
     if (element === undefined) {
       return [
@@ -474,7 +478,7 @@ export class PortManagerTreeProvider
                 ),
               ]),
           ...snapshot.runtimes.map((runtime) => new RuntimeAdapterTreeItem(runtime)),
-          ...buildDaemonChildren(daemon, snapshot, agentSnapshot),
+          ...buildDaemonChildren(daemon, snapshot, agentSnapshot, browserDns),
         ];
     }
   }
@@ -937,10 +941,11 @@ function buildActionChildren(): PortManagerTreeItem[] {
 class DaemonStatusTreeItem extends vscode.TreeItem {
   readonly contextValue = "daemonStatus";
 
-  constructor(label: string, description: string, icon: string = "info") {
+  constructor(label: string, description: string, icon: string = "info", tooltip?: vscode.MarkdownString) {
     super(label, vscode.TreeItemCollapsibleState.None);
     this.description = description;
     this.iconPath = new vscode.ThemeIcon(icon);
+    this.tooltip = tooltip;
   }
 }
 
@@ -1005,10 +1010,12 @@ function buildDaemonChildren(
   daemon: AgentDaemonStatus,
   snapshot: NetworkSnapshot,
   agentSnapshot: AgentSnapshot,
+  browserDns: BrowserDnsResolverStatus,
 ): PortManagerTreeItem[] {
   const children: PortManagerTreeItem[] = [
     new ActionTreeItem("Fix Stale Routing", "portManager.fixStaleRouting", "debug-rerun", "Converge daemon and routes"),
     new RoutingTimelineGroupTreeItem(buildRoutingTimelineRows(snapshot, agentSnapshot)),
+    ...buildBrowserDnsDiagnosticRows(browserDns),
     new DaemonStatusTreeItem("Status", daemon.status, daemon.status === "running" ? "pass" : "warning"),
     new DaemonStatusTreeItem(
       "Version",
@@ -1029,6 +1036,78 @@ function buildDaemonChildren(
   }
 
   return children;
+}
+
+function buildBrowserDnsDiagnosticRows(browserDns: BrowserDnsResolverStatus): PortManagerTreeItem[] {
+  if (!browserDns.supported) {
+    return [new DaemonStatusTreeItem("Browser DNS", "unsupported", "circle-slash")];
+  }
+
+  const description =
+    browserDns.records.length === 0
+      ? "no aliases"
+      : `${browserDns.installedCount}/${browserDns.records.length} installed`;
+  const icon = browserDns.missingCount === 0 ? "globe" : "warning";
+
+  return [
+    new DaemonStatusTreeItem("Browser DNS", `${description}, port ${browserDns.dnsPort}`, icon),
+    ...browserDns.records.flatMap((record) => buildBrowserDnsRecordRows(record)),
+    new ActionTreeItem("Install Browser DNS", "portManager.installBrowserDnsResolvers", "cloud-upload", "Create aliases"),
+    new ActionTreeItem("Clean Browser DNS", "portManager.cleanupBrowserDnsResolvers", "trash", "Remove aliases"),
+  ];
+}
+
+function buildBrowserDnsRecordRows(record: BrowserDnsResolverStatus["records"][number]): PortManagerTreeItem[] {
+  const configured = record.configured ? "configured" : "missing resolver";
+  const aliasTooltip = new vscode.MarkdownString(
+    [
+      `Network: ${record.networkName}`,
+      `Alias: ${record.hostname}`,
+      `Loopback: ${record.address}`,
+      `Resolver: ${configured}`,
+    ].join("\n\n"),
+  );
+  const rows: PortManagerTreeItem[] = [
+    new DaemonStatusTreeItem(
+      `DNS ${record.hostname}`,
+      `${record.address}, ${configured}`,
+      record.configured ? "globe" : "warning",
+      aliasTooltip,
+    ),
+  ];
+
+  if (record.routes.length === 0) {
+    rows.push(new DaemonStatusTreeItem(`DNS ${record.hostname}:ports`, "no running browser routes", "circle-slash"));
+    return rows;
+  }
+
+  for (const route of record.routes) {
+    const upstream =
+      route.upstreamHost === undefined || route.upstreamPort === undefined
+        ? "route missing"
+        : `${route.upstreamHost}:${route.upstreamPort}`;
+    const proxy = `${route.proxyHost}:${route.proxyPort}${route.proxyActive ? "" : " pending"}`;
+    const routeTooltip = new vscode.MarkdownString(
+      [
+        `URL: ${route.url}`,
+        `Logical port: ${route.logicalPort}`,
+        `Proxy: ${proxy}`,
+        `Upstream: ${upstream}`,
+        `Process: ${route.processName}`,
+      ].join("\n\n"),
+    );
+
+    rows.push(
+      new DaemonStatusTreeItem(
+        `DNS ${record.hostname}:${route.proxyPort}`,
+        `${proxy} -> ${upstream}`,
+        route.proxyActive && route.upstreamHost !== undefined ? "link" : "warning",
+        routeTooltip,
+      ),
+    );
+  }
+
+  return rows;
 }
 
 /** Builds a compact route/attachment history from durable timestamps and daemon refreshes. */

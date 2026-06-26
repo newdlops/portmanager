@@ -37,6 +37,18 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(snapshotBody.includes("pm_scan_lsof_cached(state, &listeners"), true);
 });
 
+test("native agent matches loopback listeners by host as well as port", () => {
+  const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
+
+  assert.equal(source.includes("static int pm_endpoint_hosts_match"), true);
+  assert.equal(source.includes("pm_is_non_default_loopback_host(normalized_route)"), true);
+  assert.equal(source.includes("pm_find_listener_by_process_endpoint(&listeners, process)"), true);
+  assert.equal(source.includes("pm_find_listener_by_process_pid_endpoint(listeners, process)"), true);
+  assert.equal(source.includes("pm_find_listener_for_port_host(input->requested_port, input->host"), true);
+  assert.equal(source.includes("pm_endpoint_hosts_match(listener->local_address, process->host)"), true);
+  assert.equal(source.includes("pm_find_listener_by_port("), false);
+});
+
 if (!fs.existsSync(nativeAgentPath)) {
   test("native agent serves concurrent hook-like clients while extension client receives events", { skip: "native agent binary is not built" }, () => undefined);
 } else {

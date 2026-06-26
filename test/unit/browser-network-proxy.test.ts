@@ -30,20 +30,20 @@ test("rewrites browser alias HTTP requests as localhost upstream requests", asyn
       port: getServerPort(upstream),
     }),
   });
-  const endpoint = createEndpoint({ listenPorts: [proxyPort] });
+  const endpoint = createEndpoint({ publicHost: "alpha1", listenPorts: [proxyPort] });
 
   try {
     const activeEndpoint = await proxy.ensure(endpoint);
 
     assert.ok(activeEndpoint);
 
-    const publicOrigin = `http://127.0.0.1:${activeEndpoint.listenPort}`;
+    const publicOrigin = `http://alpha1:${activeEndpoint.listenPort}`;
     const response = await requestHttp({
       host: "127.0.0.1",
       port: activeEndpoint.listenPort,
       path: "/dashboard",
       headers: {
-        host: `127.0.0.1:${activeEndpoint.listenPort}`,
+        host: `alpha1:${activeEndpoint.listenPort}`,
         origin: publicOrigin,
         referer: `${publicOrigin}/start`,
       },

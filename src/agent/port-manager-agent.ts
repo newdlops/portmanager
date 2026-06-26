@@ -522,7 +522,14 @@ export class PortManagerAgent implements DisposableLike {
   /** Releases an external process route while route files are updated in order. */
   private async releaseProcessRouteExclusive(input: ReleaseProcessRoutePayload): Promise<boolean> {
     const inputNetworkId = normalizeNetworkId(input.networkId);
-    const activeListener = await this.findActiveListenerForActualPort(input.actualPort);
+    let listeners: readonly ListeningPort[] = [];
+
+    try {
+      listeners = await this.scanListeningPorts();
+      this.updateReservedListeningPorts(listeners);
+    } catch {
+      // If listener scans fail, fall back to the explicit lifecycle signal.
+    }
     let released = false;
     let retained = false;
 
@@ -542,6 +549,7 @@ export class PortManagerAgent implements DisposableLike {
         continue;
       }
 
+      const activeListener = findListenerForRoute(process, listeners);
       if (activeListener !== undefined) {
         /*
          * Autoreload and worker handoff can make the process that registered the
@@ -1077,8 +1085,6 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Marks hook-registered external processes stopped when their listener exits. */
   private reconcileRegisteredProcessesWithListeners(listeners: readonly ListeningPort[]): void {
-    const activeListenerKeys = new Set(listeners.map((listener) => buildListenerKey(listener.pid, listener.port)));
-    const listenersByActualPort = buildListenersByActualPort(listeners);
     const nowMs = this.now().getTime();
 
     for (const process of this.registry.list()) {
@@ -1087,12 +1093,12 @@ export class PortManagerAgent implements DisposableLike {
         continue;
       }
 
-      if (activeListenerKeys.has(buildListenerKey(process.pid, process.actualPort))) {
+      if (listeners.some((listener) => listenerMatchesProcess(listener, process))) {
         this.missingListenerStateByProcessId.delete(process.id);
         continue;
       }
 
-      const listenerForActualPort = listenersByActualPort.get(process.actualPort);
+      const listenerForActualPort = findListenerForRoute(process, listeners);
       if (listenerForActualPort !== undefined) {
         this.adoptExternalListenerOwner(process, listenerForActualPort);
         this.missingListenerStateByProcessId.delete(process.id);
@@ -1136,7 +1142,7 @@ export class PortManagerAgent implements DisposableLike {
     const nowMs = this.now().getTime();
 
     for (const listener of listeners) {
-      const listenerKey = buildListenerKey(listener.pid, listener.port);
+      const listenerKey = buildListenerKey(listener.pid, listener.port, listener.localAddress);
       if (listener.pid === undefined || trackedListenerKeys.has(listenerKey)) {
         continue;
       }
@@ -1317,18 +1323,6 @@ export class PortManagerAgent implements DisposableLike {
         .map((listener) => listener.port)
         .filter((port) => Number.isInteger(port) && port > 0 && port <= 65_535),
     );
-  }
-
-  /** Finds a live OS listener on one actual routed port, if the scanner is available. */
-  private async findActiveListenerForActualPort(actualPort: number): Promise<ListeningPort | undefined> {
-    try {
-      const listeners = await this.scanListeningPorts();
-      this.updateReservedListeningPorts(listeners);
-      return listeners.find((listener) => listener.port === actualPort);
-    } catch {
-      // If listener scans fail, fall back to the explicit lifecycle signal.
-      return undefined;
-    }
   }
 
   /**
@@ -1601,13 +1595,13 @@ function normalizeRegisteredProcessSource(source: RegisteredProcessInput["source
 export function buildAgentSnapshot(options: BuildAgentSnapshotOptions): AgentSnapshot {
   const activeTrackedListenerKeys = buildActiveTrackedListenerKeys(options.registryProcesses);
   const normalizedListeners = dedupeListeners(options.listeners).map((listener) =>
-    activeTrackedListenerKeys.has(buildListenerKey(listener.pid, listener.port))
+    activeTrackedListenerKeys.has(buildListenerKey(listener.pid, listener.port, listener.localAddress))
       ? { ...listener, source: "managed" as const }
       : listener,
   );
 
   const detectedProcesses = normalizedListeners
-    .filter((listener) => !activeTrackedListenerKeys.has(buildListenerKey(listener.pid, listener.port)))
+    .filter((listener) => !activeTrackedListenerKeys.has(buildListenerKey(listener.pid, listener.port, listener.localAddress)))
     .map((listener) =>
       buildDetectedProcess(listener, {
         defaultHost: options.defaultHost ?? "localhost",
@@ -1789,29 +1783,112 @@ function buildActiveTrackedListenerKeys(processes: readonly ManagedProcess[]): R
       continue;
     }
 
-    keys.add(buildListenerKey(process.pid, process.actualPort));
+    for (const host of listenerHostCandidatesForProcess(process)) {
+      keys.add(buildListenerKey(process.pid, process.actualPort, host));
+    }
   }
 
   return keys;
 }
 
-/** Creates a stable listener match key from the OS PID and TCP port. */
-function buildListenerKey(pid: number | undefined, port: number): string {
-  return `${pid ?? "unknown"}:${port}`;
+/** Creates a stable listener match key from the OS PID, bind host, and TCP port. */
+function buildListenerKey(pid: number | undefined, port: number, host = "*"): string {
+  return `${pid ?? "unknown"}:${normalizeEndpointHostKey(host)}:${port}`;
 }
 
-/** Indexes listeners by actual TCP port, preferring rows with a concrete PID. */
-function buildListenersByActualPort(listeners: readonly ListeningPort[]): ReadonlyMap<number, ListeningPort> {
-  const listenersByActualPort = new Map<number, ListeningPort>();
+/** True when a listener is still owned by the exact registered PID and endpoint. */
+function listenerMatchesProcess(listener: ListeningPort, process: ManagedProcess): boolean {
+  return listener.pid === process.pid &&
+    listener.port === process.actualPort &&
+    endpointHostMatches(listener.localAddress, routeHostFromUrl(process.url));
+}
 
-  for (const listener of listeners) {
-    const existingListener = listenersByActualPort.get(listener.port);
-    if (existingListener === undefined || existingListener.pid === undefined) {
-      listenersByActualPort.set(listener.port, { ...listener });
-    }
+/**
+ * Finds a listener with the same route endpoint, allowing PID handoff.
+ * Per-network loopback hosts must match exactly so two networks can both own
+ * logical port 3004 without route cleanup/adoption crossing network boundaries.
+ */
+function findListenerForRoute(process: ManagedProcess, listeners: readonly ListeningPort[]): ListeningPort | undefined {
+  const routeHost = routeHostFromUrl(process.url);
+
+  return listeners.find(
+    (listener) =>
+      listener.port === process.actualPort &&
+      endpointHostMatches(listener.localAddress, routeHost),
+  );
+}
+
+/** Builds every OS bind-host spelling that can represent one process route. */
+function listenerHostCandidatesForProcess(process: ManagedProcess): readonly string[] {
+  const routeHost = routeHostFromUrl(process.url);
+  const normalizedHost = normalizeEndpointHostKey(routeHost);
+
+  if (isNonDefaultLoopbackHost(normalizedHost)) {
+    return [normalizedHost];
   }
 
-  return listenersByActualPort;
+  if (normalizedHost === "127.0.0.1" || normalizedHost === "::1") {
+    return ["127.0.0.1", "::1", "*"];
+  }
+
+  if (normalizedHost === "*") {
+    return ["*"];
+  }
+
+  return [normalizedHost, "*"];
+}
+
+/** Compares a scanned listener host with a route host without merging network loopbacks. */
+function endpointHostMatches(listenerHost: string, routeHost: string): boolean {
+  const normalizedListenerHost = normalizeEndpointHostKey(listenerHost);
+  const normalizedRouteHost = normalizeEndpointHostKey(routeHost);
+
+  if (isNonDefaultLoopbackHost(normalizedRouteHost)) {
+    return normalizedListenerHost === normalizedRouteHost;
+  }
+
+  if (normalizedListenerHost === "*" || normalizedRouteHost === "*") {
+    return true;
+  }
+
+  if (
+    (normalizedRouteHost === "127.0.0.1" && normalizedListenerHost === "::1") ||
+    (normalizedRouteHost === "::1" && normalizedListenerHost === "127.0.0.1")
+  ) {
+    return true;
+  }
+
+  return normalizedListenerHost === normalizedRouteHost;
+}
+
+/** Normalizes listener host spellings while keeping network-specific 127/8 IPs distinct. */
+function normalizeEndpointHostKey(host: string): string {
+  const trimmedHost = host.trim().toLowerCase();
+
+  if (
+    trimmedHost.length === 0 ||
+    trimmedHost === "*" ||
+    trimmedHost === "0.0.0.0" ||
+    trimmedHost === "::" ||
+    trimmedHost === "[::]"
+  ) {
+    return "*";
+  }
+
+  if (trimmedHost === "localhost") {
+    return "127.0.0.1";
+  }
+
+  if (trimmedHost.startsWith("[") && trimmedHost.endsWith("]")) {
+    return trimmedHost.slice(1, -1);
+  }
+
+  return trimmedHost;
+}
+
+/** True only for generated per-network loopback hosts, not the default localhost. */
+function isNonDefaultLoopbackHost(host: string): boolean {
+  return /^127\.(?!0\.0\.1$)\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 
 /**
