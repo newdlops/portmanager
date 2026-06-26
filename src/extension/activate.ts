@@ -43,6 +43,7 @@ export function activate(context: vscode.ExtensionContext): PortManagerExtension
   );
 
   commandController.register(context);
+  void commandController.ensureShellHookAssets(context).catch(() => undefined);
   const startPromise = networkService.start();
   void startPromise.catch((error) => {
     const message = error instanceof Error ? error.message : String(error);

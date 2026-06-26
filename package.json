@@ -42,6 +42,8 @@
     "onCommand:portManager.refreshTerminals",
     "onCommand:portManager.refreshContainerServices",
     "onCommand:portManager.attachTerminalToNetwork",
+    "onCommand:portManager.attachActiveTerminalToNetwork",
+    "onCommand:portManager.revealTerminalWindow",
     "onCommand:portManager.attachProcessToNetwork",
     "onCommand:portManager.attachVscodeWindowTerminalsToNetwork",
     "onCommand:portManager.detachVscodeWindowTerminalsFromNetwork",
@@ -147,6 +149,18 @@
         "title": "Port Manager: Attach Terminal Window to Network",
         "category": "Port Manager",
         "icon": "$(debug-console)"
+      },
+      {
+        "command": "portManager.attachActiveTerminalToNetwork",
+        "title": "Port Manager: Attach Active Terminal to Network",
+        "category": "Port Manager",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "portManager.revealTerminalWindow",
+        "title": "Port Manager: Reveal Terminal Window",
+        "category": "Port Manager",
+        "icon": "$(go-to-file)"
       },
       {
         "command": "portManager.attachProcessToNetwork",
@@ -383,29 +397,14 @@
           "group": "navigation@1"
         },
         {
-          "command": "portManager.addHostPortExposure",
+          "command": "portManager.refresh",
           "when": "view == portManager.processes",
           "group": "navigation@2"
         },
         {
-          "command": "portManager.addHostAccessBinding",
-          "when": "view == portManager.processes",
-          "group": "navigation@3"
-        },
-        {
-          "command": "portManager.addComposePublishedPort",
-          "when": "view == portManager.processes",
-          "group": "navigation@4"
-        },
-        {
-          "command": "portManager.refresh",
-          "when": "view == portManager.processes",
-          "group": "navigation@5"
-        },
-        {
           "command": "portManager.openSettings",
           "when": "view == portManager.processes",
-          "group": "navigation@6"
+          "group": "navigation@3"
         }
       ],
       "commandPalette": [
@@ -493,39 +492,44 @@
           "group": "network@5"
         },
         {
-          "command": "portManager.attachProcessToNetwork",
+          "command": "portManager.attachActiveTerminalToNetwork",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@6"
         },
         {
-          "command": "portManager.attachVscodeWindowTerminalsToNetwork",
+          "command": "portManager.attachProcessToNetwork",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@7"
         },
         {
-          "command": "portManager.copyTerminalRoutingScript",
+          "command": "portManager.attachVscodeWindowTerminalsToNetwork",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@8"
         },
         {
-          "command": "portManager.saveBindingPreset",
+          "command": "portManager.copyTerminalRoutingScript",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@9"
         },
         {
-          "command": "portManager.applyBindingPreset",
+          "command": "portManager.saveBindingPreset",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@10"
         },
         {
-          "command": "portManager.clearNetworkCache",
+          "command": "portManager.applyBindingPreset",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@11"
         },
         {
-          "command": "portManager.removeLogicalNetwork",
+          "command": "portManager.clearNetworkCache",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@12"
+        },
+        {
+          "command": "portManager.removeLogicalNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "network@13"
         },
         {
           "command": "portManager.refreshContainerServices",
@@ -549,7 +553,12 @@
         },
         {
           "command": "portManager.refreshTerminals",
-          "when": "view == portManager.processes && viewItem == section.terminals",
+          "when": "view == portManager.processes && viewItem == section.daemon",
+          "group": "terminal@1"
+        },
+        {
+          "command": "portManager.revealTerminalWindow",
+          "when": "view == portManager.processes && (viewItem == terminalWindow || viewItem == terminalAttachment)",
           "group": "terminal@1"
         },
         {
@@ -559,7 +568,7 @@
         },
         {
           "command": "portManager.attachVscodeWindowTerminalsToNetwork",
-          "when": "view == portManager.processes && viewItem == section.terminals",
+          "when": "view == portManager.processes && viewItem == section.daemon",
           "group": "terminal@2"
         },
         {
@@ -569,7 +578,7 @@
         },
         {
           "command": "portManager.detachVscodeWindowTerminalsFromNetwork",
-          "when": "view == portManager.processes && (viewItem == section.terminals || viewItem == vscodeWindowTerminalBinding)",
+          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == vscodeWindowTerminalBinding)",
           "group": "terminal@3"
         },
         {

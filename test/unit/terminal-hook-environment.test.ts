@@ -79,6 +79,56 @@ test("terminal attach and detach commands source generated script files", () => 
   );
 });
 
+test("external pm shell function selects a network and sources its attach script", () => {
+  const networkServicePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const commandSourcePath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const terminalHookEnvironmentPath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
+  const networkServiceSource = fs.readFileSync(networkServicePath, "utf8");
+  const commandSource = fs.readFileSync(commandSourcePath, "utf8");
+  const terminalHookEnvironmentSource = fs.readFileSync(terminalHookEnvironmentPath, "utf8");
+
+  assert.equal(networkServiceSource.includes('const TERMINAL_NETWORK_SELECTION_FILE_NAME = "terminal-networks.tsv";'), true);
+  assert.equal(networkServiceSource.includes("private async writeTerminalNetworkSelectionFile(): Promise<void>"), true);
+  assert.equal(networkServiceSource.includes("serializeTerminalNetworkSelectionRow(network.id, network.name, scriptPath)"), true);
+  assert.equal(networkServiceSource.includes("await this.writeTerminalNetworkSelectionFile().catch(() => undefined);"), true);
+  assert.equal(networkServiceSource.includes('shellExport("PORT_MANAGER_NETWORK_NAME", networkName)'), true);
+  assert.equal(networkServiceSource.includes("buildTerminalTitleShell(buildPortManagerTerminalTitle(networkName))"), true);
+  assert.equal(networkServiceSource.includes('buildTerminalTitleShell("Port Manager: detached")'), true);
+  assert.equal(terminalHookEnvironmentSource.includes("readonly networkName?: string;"), true);
+  assert.equal(terminalHookEnvironmentSource.includes('collection.replace("PORT_MANAGER_NETWORK_NAME", scope.networkName'), true);
+  assert.equal(commandSource.includes("readonly terminalNetworkSelectionFilePath: string;"), true);
+  assert.equal(commandSource.includes('export PORT_MANAGER_NETWORKS_FILE="'), true);
+  assert.equal(commandSource.includes("PORT_MANAGER_NETWORK_NAME"), true);
+  assert.equal(commandSource.includes("Port Manager: \\${PORT_MANAGER_NETWORK_NAME}"), true);
+  assert.equal(commandSource.includes("pm() {"), true);
+  assert.equal(commandSource.includes('"pm current"'), true);
+  assert.equal(commandSource.includes('= "current"'), true);
+  assert.equal(commandSource.includes('= "status"'), true);
+  assert.equal(commandSource.includes("Port Manager shell network: none"), true);
+  assert.equal(commandSource.includes('__pm_current_id="\\${PORT_MANAGER_NETWORK_ID:-}"'), true);
+  assert.equal(commandSource.includes("Select Port Manager network:"), true);
+  assert.equal(commandSource.includes('printf "%s %d) %s [%s]\\\\n", marker, NR, $2, $1'), true);
+  assert.equal(commandSource.includes('. \"$__pm_attach_script\"'), true);
+});
+
+test("extension auto-refreshes shell hook assets without auto-mutating profiles", () => {
+  const activatePath = path.resolve(__dirname, "../../../src/extension/activate.ts");
+  const commandSourcePath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const activateSource = fs.readFileSync(activatePath, "utf8");
+  const commandSource = fs.readFileSync(commandSourcePath, "utf8");
+  const ensureStart = commandSource.indexOf("async ensureShellHookAssets");
+  const installStart = commandSource.indexOf("private async installShellHook", ensureStart);
+  const ensureBody = commandSource.slice(ensureStart, installStart);
+  const installEnd = commandSource.indexOf("private async writeShellHookAssets", installStart);
+  const installBody = commandSource.slice(installStart, installEnd);
+
+  assert.equal(activateSource.includes("void commandController.ensureShellHookAssets(context).catch(() => undefined);"), true);
+  assert.equal(commandSource.includes("private async writeShellHookAssets"), true);
+  assert.equal(ensureBody.includes("await this.writeShellHookAssets(context);"), true);
+  assert.equal(ensureBody.includes("appendLineOnce"), false);
+  assert.equal(installBody.includes("appendLineOnce"), true);
+});
+
 test("network removal restores compose attachments before deleting the network", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
@@ -102,8 +152,31 @@ test("background routing refresh polls terminals and containers", () => {
   assert.equal(source.includes("this.refreshTerminals().catch(() => [])"), true);
   assert.equal(source.includes("this.refreshContainerServices().catch(() => [])"), true);
   assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts().catch(() => undefined);"), true);
-  assert.equal(source.includes("await this.restorePersistedComposeRoutesIfMissing().catch(() => undefined);"), true);
+  assert.equal(source.includes("await this.convergeDaemonAndRoutingState();"), true);
   assert.equal(source.includes("ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 3_000"), true);
+});
+
+test("background routing refresh converges daemon version and generated route files", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const convergeStart = source.indexOf("private async convergeDaemonAndRoutingStateExclusive");
+  const convergeEnd = source.indexOf("private async ensureCurrentProcessDaemon", convergeStart);
+  const convergeBody = source.slice(convergeStart, convergeEnd);
+  const ensureStart = source.indexOf("private async ensureCurrentProcessDaemon");
+  const ensureEnd = source.indexOf("private watchTerminalAttachmentMarkers", ensureStart);
+  const ensureBody = source.slice(ensureStart, ensureEnd);
+
+  assert.equal(source.includes("DAEMON_RESTART_BACKOFF_MS = 30_000"), true);
+  assert.equal(convergeBody.includes("await this.ensureCurrentProcessDaemon().catch(() => undefined);"), true);
+  assert.equal(convergeBody.includes("await this.writeHostAccessBindingsFile().catch(() => undefined);"), true);
+  assert.equal(convergeBody.includes("await this.writeComposeProjectRoutingFile().catch(() => undefined);"), true);
+  assert.equal(convergeBody.includes("await this.restorePersistedComposeRoutesIfMissing().catch(() => undefined);"), true);
+  assert.equal(convergeBody.includes("await this.processService.refresh().catch(() => undefined);"), true);
+  assert.equal(convergeBody.includes("await this.syncLogicalPortRouters().catch(() => undefined);"), true);
+  assert.equal(ensureBody.includes('daemon.status !== "running"'), true);
+  assert.equal(ensureBody.includes("await this.processService.start();"), true);
+  assert.equal(ensureBody.includes("daemon.restartRequired"), true);
+  assert.equal(ensureBody.includes("await this.processService.restartDaemon();"), true);
 });
 
 test("terminal hook markers refresh attached UI state without manual refresh", () => {
@@ -115,9 +188,26 @@ test("terminal hook markers refresh attached UI state without manual refresh", (
   assert.equal(source.includes("syncFs.watch(directoryPath"), true);
   assert.equal(source.includes("private scheduleTerminalAttachmentRefreshBurst(): void"), true);
   assert.equal(source.includes("private async refreshTerminalAttachmentsWhenMarkersChanged(): Promise<void>"), true);
+  assert.equal(source.includes("selectLatestTerminalAttachmentMarkerCandidates"), true);
+  assert.equal(source.includes("terminalAttachmentsShareIdentity"), true);
+  assert.equal(source.includes("selectedMarkerPaths"), true);
   assert.equal(source.includes("this.terminalRefreshInFlight !== undefined"), true);
   assert.equal(source.includes("this.terminalRefreshQueued = true"), true);
   assert.equal(source.includes("this.startTerminalAttachmentMarkerPolling();"), true);
+});
+
+test("terminal reveal focuses injected VS Code and external terminal windows", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+
+  assert.equal(source.includes("async revealTerminalWindow(terminalWindowId: string): Promise<boolean>"), true);
+  assert.equal(source.includes("function findMatchingVscodeTerminal"), true);
+  assert.equal(source.includes("terminal.show(false);"), true);
+  assert.equal(source.includes("function revealExternalTerminalWindow"), true);
+  assert.equal(source.includes("function revealTerminalAppleScript"), true);
+  assert.equal(source.includes("set selected tab of windowItem to tabItem"), true);
+  assert.equal(source.includes("function revealITermAppleScript"), true);
+  assert.equal(source.includes("select sessionItem"), true);
 });
 
 test("compose route rehydration retries recoverable error attachments after restart", () => {

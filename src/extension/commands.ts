@@ -45,6 +45,8 @@ import type {
   TerminalWindow,
 } from "../shared/types";
 
+const TERMINAL_NETWORK_SELECTION_FILE_NAME = "terminal-networks.tsv";
+
 /**
  * Registers Port Manager commands and coordinates the MVP flow.
  *
@@ -86,6 +88,12 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.refreshContainerServices", () => this.refreshContainerServices());
     this.registerCommand(context, "portManager.attachTerminalToNetwork", (argument) =>
       this.attachTerminalToNetwork(argument),
+    );
+    this.registerCommand(context, "portManager.attachActiveTerminalToNetwork", (argument) =>
+      this.attachActiveTerminalToNetwork(argument),
+    );
+    this.registerCommand(context, "portManager.revealTerminalWindow", (argument) =>
+      this.revealTerminalWindow(argument),
     );
     this.registerCommand(context, "portManager.attachProcessToNetwork", (argument) =>
       this.attachProcessToNetwork(argument),
@@ -173,6 +181,15 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.openSettings", () => openPortManagerSettings());
   }
 
+  /** Refreshes generated shell hook assets without mutating user profile files. */
+  async ensureShellHookAssets(context: vscode.ExtensionContext): Promise<void> {
+    if (process.platform === "win32") {
+      return;
+    }
+
+    await this.writeShellHookAssets(context);
+  }
+
   /** Creates a logical network row backed by the selected runtime adapter. */
   private async createLogicalNetwork(): Promise<void> {
     const runtimeKind = await promptForRuntimeKind(this.dependencies.networkService.getSnapshot().runtimes);
@@ -234,12 +251,16 @@ export class PortManagerCommandController implements DisposableLike {
   /** Attaches a selected terminal window to a selected network when the runtime supports it. */
   private async attachTerminalToNetwork(argument: unknown): Promise<void> {
     const directInput = getAttachTerminalInput(argument);
+    const networkFromArgument = getLogicalNetworkFromCommandArgument(argument);
     const terminalWindow = directInput?.terminalWindow ?? (await this.resolveTerminalWindowArgument(argument, "Attach Terminal Window to Network"));
     if (terminalWindow === undefined) {
       return;
     }
 
-    const network = directInput?.network ?? (await this.resolveNetworkArgument(undefined, "Attach Terminal Window to Network"));
+    const network =
+      directInput?.network ??
+      networkFromArgument ??
+      (await this.resolveNetworkArgument(undefined, "Attach Terminal Window to Network"));
     if (network === undefined) {
       return;
     }
@@ -256,8 +277,41 @@ export class PortManagerCommandController implements DisposableLike {
     }
     this.dependencies.treeProvider.refresh();
 
-    await vscode.window.showInformationMessage(
+    const selection = await vscode.window.showInformationMessage(
       `Attached "${terminalWindow.title}" to "${network.name}" (${attachment.mode ?? "isolated"} mode).`,
+      "Reveal Terminal",
+    );
+    if (selection === "Reveal Terminal") {
+      await this.revealTerminalWindow(terminalWindow);
+    }
+  }
+
+  /** Attaches the currently focused VS Code terminal to a selected network without opening a terminal picker. */
+  private async attachActiveTerminalToNetwork(argument: unknown): Promise<void> {
+    const network = await this.resolveNetworkArgument(argument, "Attach Active Terminal to Network");
+    if (network === undefined) {
+      return;
+    }
+
+    const terminalWindow = await this.resolveActiveTerminalWindow();
+    if (terminalWindow === undefined) {
+      return;
+    }
+
+    let attachment: TerminalAttachment;
+    try {
+      attachment = await this.dependencies.networkService.attachTerminalWindow(network.id, terminalWindow.id);
+    } catch (error) {
+      if (await this.offerTerminalRoutingScriptFallback(error, network, terminalWindow)) {
+        return;
+      }
+
+      throw error;
+    }
+
+    this.dependencies.treeProvider.refresh();
+    await vscode.window.showInformationMessage(
+      `Attached active terminal "${terminalWindow.title}" to "${network.name}" (${attachment.mode ?? "isolated"} mode).`,
     );
   }
 
@@ -338,10 +392,15 @@ export class PortManagerCommandController implements DisposableLike {
 
     const selection = await vscode.window.showWarningMessage(
       `Could not write to "${terminalWindow.title}" automatically. Copy the routing script and paste it into that terminal prompt.`,
+      "Reveal Terminal",
       "Copy Script",
       "Show Error",
     );
 
+    if (selection === "Reveal Terminal") {
+      await this.revealTerminalWindow(terminalWindow);
+      return true;
+    }
     if (selection === "Show Error") {
       throw error;
     }
@@ -493,6 +552,21 @@ export class PortManagerCommandController implements DisposableLike {
     await this.dependencies.networkService.detachTerminal(attachment.id);
     this.dependencies.treeProvider.refresh();
     await vscode.window.showInformationMessage(`Detached "${attachment.terminalTitle ?? attachment.rootPid}".`);
+  }
+
+  /** Reveals a discovered VS Code, Terminal.app, or iTerm2 terminal window. */
+  private async revealTerminalWindow(argument: unknown): Promise<void> {
+    const terminalWindow = await this.resolveTerminalWindowForReveal(argument);
+    if (terminalWindow === undefined) {
+      return;
+    }
+
+    const revealed = await this.dependencies.networkService.revealTerminalWindow(terminalWindow.id);
+    if (!revealed) {
+      await vscode.window.showWarningMessage(
+        `Could not focus "${terminalWindow.title}". Use the terminal id ${terminalWindow.terminalId ?? terminalWindow.id}.`,
+      );
+    }
   }
 
   /** Opens a host TCP listener/proxy for a network target port. */
@@ -1199,6 +1273,25 @@ export class PortManagerCommandController implements DisposableLike {
 
   /** Installs the native socket hook into the user's shell startup file. */
   private async installShellHook(context: vscode.ExtensionContext): Promise<void> {
+    const assets = await this.writeShellHookAssets(context);
+
+    for (const shellProfilePath of assets.shellProfilePaths) {
+      await appendLineOnce(shellProfilePath, assets.sourceLine);
+    }
+
+    const message =
+      assets.shellProfilePaths.length === 0
+        ? `Installed Port Manager shell hook: ${assets.hookScriptPath}`
+        : `Installed Port Manager shell hook and updated ${assets.shellProfilePaths.join(", ")}`;
+    const selection = await vscode.window.showInformationMessage(message, "Copy Source Line");
+
+    if (selection === "Copy Source Line") {
+      await vscode.env.clipboard.writeText(assets.sourceLine);
+    }
+  }
+
+  /** Writes the generated shell hook that external terminals source on startup. */
+  private async writeShellHookAssets(context: vscode.ExtensionContext): Promise<ShellHookAssets> {
     const settings = readPortManagerSettings();
     const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
     const asdfShimLauncherPath = context.asAbsolutePath(getAsdfShimLauncherRelativePath());
@@ -1208,6 +1301,10 @@ export class PortManagerCommandController implements DisposableLike {
     const nativeContainerMapPath = context.asAbsolutePath(path.join("media", "native", "portmanager_container_map"));
     const hookDirectory = path.join(os.homedir(), ".portmanager");
     const hookScriptPath = path.join(hookDirectory, "portmanager-hook.sh");
+    const terminalNetworkSelectionFilePath = path.join(
+      context.globalStorageUri.fsPath,
+      TERMINAL_NETWORK_SELECTION_FILE_NAME,
+    );
     const shellProfilePaths = getShellProfilePaths();
     const sourceLine = `. "${hookScriptPath}"`;
 
@@ -1239,6 +1336,7 @@ export class PortManagerCommandController implements DisposableLike {
         socketPath: getAgentSocketPath(),
         routeTablePath: getDefaultRouteTablePath(),
         hostAccessFilePath: getDefaultHostAccessBindingsPath(),
+        terminalNetworkSelectionFilePath,
         settings,
         runtimeShimDirectory,
         shellEnvRestorePath,
@@ -1246,19 +1344,15 @@ export class PortManagerCommandController implements DisposableLike {
       "utf8",
     );
 
-    for (const shellProfilePath of shellProfilePaths) {
-      await appendLineOnce(shellProfilePath, sourceLine);
+    if (process.platform !== "win32") {
+      await fs.chmod(hookScriptPath, 0o700).catch(() => undefined);
     }
 
-    const message =
-      shellProfilePaths.length === 0
-        ? `Installed Port Manager shell hook: ${hookScriptPath}`
-        : `Installed Port Manager shell hook and updated ${shellProfilePaths.join(", ")}`;
-    const selection = await vscode.window.showInformationMessage(message, "Copy Source Line");
-
-    if (selection === "Copy Source Line") {
-      await vscode.env.clipboard.writeText(sourceLine);
-    }
+    return {
+      hookScriptPath,
+      sourceLine,
+      shellProfilePaths,
+    };
   }
 
   /**
@@ -1400,6 +1494,77 @@ export class PortManagerCommandController implements DisposableLike {
     );
 
     return selected?.terminalWindow;
+  }
+
+  /** Resolves the active VS Code terminal into the same grouped terminal model used by attach. */
+  private async resolveActiveTerminalWindow(): Promise<TerminalWindow | undefined> {
+    const activeTerminal = vscode.window.activeTerminal;
+    if (activeTerminal === undefined) {
+      await vscode.window.showInformationMessage("No active VS Code terminal.");
+      return undefined;
+    }
+
+    let processId: number | undefined;
+    try {
+      processId = await activeTerminal.processId;
+    } catch {
+      processId = undefined;
+    }
+
+    await this.dependencies.networkService.refreshTerminals().catch(() => []);
+    const terminalWindows = this.dependencies.networkService.getSnapshot().terminalWindows;
+    const terminalWindow = terminalWindows.find((candidate) =>
+      isActiveVscodeTerminalWindow(candidate, activeTerminal, processId),
+    );
+
+    if (terminalWindow === undefined) {
+      await vscode.window.showWarningMessage(
+        `Could not match active terminal "${activeTerminal.name}". Use Attach Terminal and choose it from the list.`,
+      );
+    }
+
+    return terminalWindow;
+  }
+
+  /** Resolves terminal rows and attachment rows to a visible terminal window for focusing. */
+  private async resolveTerminalWindowForReveal(argument: unknown): Promise<TerminalWindow | undefined> {
+    const terminalWindow = getTerminalWindowFromCommandArgument(argument);
+    if (terminalWindow !== undefined) {
+      return terminalWindow;
+    }
+
+    const attachment = getTerminalAttachmentFromCommandArgument(argument);
+    if (attachment !== undefined) {
+      const window = await this.findTerminalWindowForAttachment(attachment);
+      if (window === undefined) {
+        await vscode.window.showWarningMessage(
+          `Could not find a live terminal window for "${attachment.terminalTitle ?? attachment.rootPid}".`,
+        );
+      }
+
+      return window;
+    }
+
+    return this.resolveTerminalWindowArgument(argument, "Reveal Terminal Window");
+  }
+
+  /** Refreshes discovery and maps an attachment back to a current terminal row. */
+  private async findTerminalWindowForAttachment(attachment: TerminalAttachment): Promise<TerminalWindow | undefined> {
+    let window = this.findSnapshotTerminalWindowForAttachment(attachment);
+    if (window !== undefined) {
+      return window;
+    }
+
+    await this.dependencies.networkService.refreshTerminals().catch(() => []);
+    window = this.findSnapshotTerminalWindowForAttachment(attachment);
+
+    return window;
+  }
+
+  private findSnapshotTerminalWindowForAttachment(attachment: TerminalAttachment): TerminalWindow | undefined {
+    return this.dependencies.networkService
+      .getSnapshot()
+      .terminalWindows.find((window) => isTerminalWindowForAttachment(window, attachment));
   }
 
   /** Resolves an arbitrary local process from known listeners or a manual PID/port entry. */
@@ -2104,6 +2269,36 @@ interface AttachContainerCommandInput {
   readonly attachedProjectName?: string;
 }
 
+function isActiveVscodeTerminalWindow(
+  terminalWindow: TerminalWindow,
+  terminal: vscode.Terminal,
+  processId: number | undefined,
+): boolean {
+  if (
+    processId !== undefined &&
+    (terminalWindow.rootPid === processId ||
+      terminalWindow.processGroupId === processId ||
+      terminalWindow.candidatePids.includes(processId) ||
+      terminalWindow.id === `vscode:${processId}`)
+  ) {
+    return true;
+  }
+
+  return terminalWindow.source === "vscode" && terminalWindow.title === terminal.name;
+}
+
+function isTerminalWindowForAttachment(terminalWindow: TerminalWindow, attachment: TerminalAttachment): boolean {
+  if (attachment.terminalWindowId !== undefined && terminalWindow.id === attachment.terminalWindowId) {
+    return true;
+  }
+
+  if (terminalWindow.rootPid === attachment.rootPid || terminalWindow.candidatePids.includes(attachment.rootPid)) {
+    return true;
+  }
+
+  return attachment.processGroupId !== undefined && terminalWindow.processGroupId === attachment.processGroupId;
+}
+
 function getAttachTerminalInput(argument: unknown): AttachTerminalCommandInput | undefined {
   if (typeof argument !== "object" || argument === null) {
     return undefined;
@@ -2386,12 +2581,23 @@ interface ShellHookScriptOptions {
   readonly routeTablePath: string;
   /** Network-to-host binding JSON file written by the extension. */
   readonly hostAccessFilePath: string;
+  /** TSV file mapping logical networks to generated attach scripts for `pm`. */
+  readonly terminalNetworkSelectionFilePath: string;
   /** Routing settings mirrored into native hook environment variables. */
   readonly settings: PortManagerSettings;
   /** Optional PATH directory that restores DYLD after protected runtime launch boundaries. */
   readonly runtimeShimDirectory?: string;
   /** Optional BASH_ENV fragment that restores DYLD after protected shebang boundaries. */
   readonly shellEnvRestorePath?: string;
+}
+
+interface ShellHookAssets {
+  /** Generated hook script that profile files source. */
+  readonly hookScriptPath: string;
+  /** One-line profile entry users can add when automatic profile mutation is not desired. */
+  readonly sourceLine: string;
+  /** Candidate shell startup files for the current user shell. */
+  readonly shellProfilePaths: readonly string[];
 }
 
 /** Builds the POSIX shell snippet that injects the native socket hook. */
@@ -2405,6 +2611,7 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
   const escapedSocketPath = shellDoubleQuote(options.socketPath);
   const escapedRouteTablePath = shellDoubleQuote(options.routeTablePath);
   const escapedHostAccessFilePath = shellDoubleQuote(options.hostAccessFilePath);
+  const escapedTerminalNetworkSelectionFilePath = shellDoubleQuote(options.terminalNetworkSelectionFilePath);
   const escapedRuntimeShimDirectory =
     options.runtimeShimDirectory !== undefined ? shellDoubleQuote(options.runtimeShimDirectory) : undefined;
   const escapedShellEnvRestorePath =
@@ -2443,6 +2650,7 @@ export PORT_MANAGER_AGENT_SOCKET="${escapedSocketPath}"
 export PORT_MANAGER_ROUTES_FILE="${escapedRouteTablePath}"
 export PORT_MANAGER_GLOBAL_ROUTES_FILE="${escapedRouteTablePath}"
 export PORT_MANAGER_HOST_ACCESS_FILE="${escapedHostAccessFilePath}"
+export PORT_MANAGER_NETWORKS_FILE="${escapedTerminalNetworkSelectionFilePath}"
 export PORT_MANAGER_AGENT_MAIN="${escapedAgentMainPath}"
 export PORT_MANAGER_AGENT_EXECUTABLE="${escapedNativeAgentPath}"
 export PORT_MANAGER_CONTAINER_MAP_HELPER="${escapedNativeContainerMapPath}"
@@ -2461,6 +2669,84 @@ if [ -n "\${BASH_ENV:-}" ] && [ "\${BASH_ENV}" != "${escapedShellEnvRestorePath}
   export PORT_MANAGER_PREV_BASH_ENV="\${BASH_ENV}"
 fi
 export BASH_ENV="${escapedShellEnvRestorePath}"` : ""}
+
+if [ -n "\${PORT_MANAGER_NETWORK_NAME:-}" ]; then
+  printf '\\033]0;%s\\007' "Port Manager: \${PORT_MANAGER_NETWORK_NAME}" 2>/dev/null || true
+fi
+
+pm() {
+  if [ "\${1:-}" = "help" ] || [ "\${1:-}" = "--help" ] || [ "\${1:-}" = "-h" ]; then
+    printf '%s\n' 'Usage: pm [current|status|network-number|network-name|network-id]' >&2
+    printf '%s\n' 'Run without arguments to choose a Port Manager logical network for this shell.' >&2
+    printf '%s\n' 'Run "pm current" to print the network currently attached to this shell.' >&2
+    return 0
+  fi
+
+  if [ "\${1:-}" = "current" ] || [ "\${1:-}" = "status" ] || [ "\${1:-}" = "--current" ]; then
+    __pm_current_id="\${PORT_MANAGER_NETWORK_ID:-}"
+    if [ -z "$__pm_current_id" ]; then __pm_current_id="\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-}"; fi
+    if [ -z "$__pm_current_id" ]; then __pm_current_id="\${PORT_MANAGER_BORROWED_NETWORK_ID:-}"; fi
+    __pm_current_name="\${PORT_MANAGER_NETWORK_NAME:-}"
+    __pm_networks_file="\${PORT_MANAGER_NETWORKS_FILE:-}"
+    if [ -n "$__pm_current_id" ] && [ -z "$__pm_current_name" ] && [ -n "$__pm_networks_file" ] && [ -s "$__pm_networks_file" ]; then
+      __pm_current_name="$(awk -F '	' -v q="$__pm_current_id" 'NF >= 3 && $1 == q { print $2; exit }' "$__pm_networks_file")"
+    fi
+    if [ -z "$__pm_current_id" ]; then
+      printf '%s\n' 'Port Manager shell network: none'
+      unset __pm_current_id __pm_current_name __pm_networks_file
+      return 1
+    fi
+    if [ -n "$__pm_current_name" ]; then
+      printf 'Port Manager shell network: %s [%s]\n' "$__pm_current_name" "$__pm_current_id"
+    else
+      printf 'Port Manager shell network: %s\n' "$__pm_current_id"
+    fi
+    unset __pm_current_id __pm_current_name __pm_networks_file
+    return 0
+  fi
+
+  __pm_networks_file="\${PORT_MANAGER_NETWORKS_FILE:-}"
+  if [ -z "$__pm_networks_file" ] || [ ! -s "$__pm_networks_file" ]; then
+    printf '%s\n' 'Port Manager has no exported networks yet. Open VS Code Port Manager and create or refresh a logical network.' >&2
+    unset __pm_networks_file
+    return 1
+  fi
+
+  if [ "$#" -gt 0 ]; then
+    __pm_choice="$*"
+  else
+    awk -F '	' -v current="\${PORT_MANAGER_NETWORK_ID:-}" 'NF >= 3 { marker = ($1 == current ? "*" : " "); printf "%s %d) %s [%s]\\n", marker, NR, $2, $1 }' "$__pm_networks_file" >&2
+    printf '%s' 'Select Port Manager network: ' >&2
+    IFS= read -r __pm_choice || {
+      unset __pm_networks_file __pm_choice
+      return 1
+    }
+  fi
+
+  __pm_row="$(awk -F '	' -v q="$__pm_choice" 'NF >= 3 && q ~ /^[0-9]+$/ && NR == q { print; exit } NF >= 3 && ($1 == q || $2 == q) { print; exit }' "$__pm_networks_file")"
+  if [ -z "$__pm_row" ]; then
+    printf 'Port Manager network not found: %s\n' "$__pm_choice" >&2
+    unset __pm_networks_file __pm_choice __pm_row
+    return 1
+  fi
+
+  __pm_network_id="$(printf '%s\n' "$__pm_row" | awk -F '	' '{ print $1 }')"
+  __pm_network_name="$(printf '%s\n' "$__pm_row" | awk -F '	' '{ print $2 }')"
+  __pm_attach_script="$(printf '%s\n' "$__pm_row" | awk -F '	' '{ print $3 }')"
+  if [ ! -f "$__pm_attach_script" ]; then
+    printf 'Port Manager attach script missing for %s. Refresh VS Code Port Manager and try again.\n' "$__pm_network_name" >&2
+    unset __pm_networks_file __pm_choice __pm_row __pm_network_id __pm_network_name __pm_attach_script
+    return 1
+  fi
+
+  . "$__pm_attach_script"
+  __pm_status=$?
+  if [ "$__pm_status" -eq 0 ]; then
+    printf 'Port Manager shell network: %s [%s]\n' "$__pm_network_name" "$__pm_network_id" >&2
+  fi
+  unset __pm_networks_file __pm_choice __pm_row __pm_network_id __pm_network_name __pm_attach_script
+  return $__pm_status
+}
 
 __pm_agent_ready=0
 ${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1

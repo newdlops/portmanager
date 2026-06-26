@@ -9,6 +9,7 @@ import type {
   HostPortExposure,
   LogicalNetwork,
   NetworkRuntimeDescriptor,
+  TerminalAttachment,
 } from "../../src/shared/types";
 
 const runtime: NetworkRuntimeDescriptor = {
@@ -83,6 +84,21 @@ function createComposeAttachment(overrides: Partial<ComposeAttachment> = {}): Co
     ],
     status: "attached",
     attachedAt: "2026-06-22T00:04:00.000Z",
+    ...overrides,
+  };
+}
+
+function createTerminalAttachment(overrides: Partial<TerminalAttachment> = {}): TerminalAttachment {
+  return {
+    id: "attachment-1",
+    networkId: "network-1",
+    rootPid: 101,
+    processGroupId: 101,
+    terminalWindowId: "tty:ttys001",
+    terminalTitle: "Captain dev cluster",
+    mode: "isolated",
+    status: "attached",
+    attachedAt: "2026-06-22T00:02:00.000Z",
     ...overrides,
   };
 }
@@ -288,6 +304,50 @@ test("rejects duplicate host access bindings in the same network", () => {
     () => registry.addHostAccessBinding(createHostAccessBinding({ id: "host-access-2" })),
     /Host access binding already exists/,
   );
+});
+
+test("moves a terminal attachment when the same terminal joins another network", () => {
+  const registry = new LogicalNetworkRegistry([runtime]);
+  registry.addNetwork(createNetwork());
+  registry.addNetwork(createNetwork({ id: "network-2", name: "B app" }));
+
+  registry.addAttachment(createTerminalAttachment());
+  registry.addAttachment(
+    createTerminalAttachment({
+      id: "attachment-2",
+      networkId: "network-2",
+      attachedAt: "2026-06-22T00:05:00.000Z",
+    }),
+  );
+
+  const attachments = registry.getSnapshot().attachments;
+
+  assert.equal(attachments.length, 1);
+  assert.equal(attachments[0]?.id, "attachment-2");
+  assert.equal(attachments[0]?.networkId, "network-2");
+});
+
+test("loads persisted duplicate terminal attachments as one latest row", () => {
+  const registry = new LogicalNetworkRegistry([runtime], {
+    networks: [createNetwork(), createNetwork({ id: "network-2", name: "B app" })],
+    attachments: [
+      createTerminalAttachment({
+        id: "attachment-2",
+        networkId: "network-2",
+        attachedAt: "2026-06-22T00:05:00.000Z",
+      }),
+      createTerminalAttachment(),
+    ],
+    exposures: [],
+    hostAccessBindings: [],
+    composeAttachments: [],
+  });
+
+  const attachments = registry.getSnapshot().attachments;
+
+  assert.equal(attachments.length, 1);
+  assert.equal(attachments[0]?.id, "attachment-2");
+  assert.equal(attachments[0]?.networkId, "network-2");
 });
 
 test("removing a network removes dependent attachments and exposures", () => {

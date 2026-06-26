@@ -13,7 +13,11 @@ import {
   getRouteTablePathForNetwork,
 } from "../agent/route-table";
 import { readContainerRuntimeSettings, readPortManagerSettings } from "../config/vscode-settings";
-import { LogicalNetworkRegistry, type LogicalNetworkRegistryState } from "../core/networks/logical-network-registry";
+import {
+  LogicalNetworkRegistry,
+  terminalAttachmentsShareIdentity,
+  type LogicalNetworkRegistryState,
+} from "../core/networks/logical-network-registry";
 import {
   isLoopbackAddressRoutingEnabled,
   loopbackAddressForNetwork,
@@ -49,6 +53,7 @@ import { NodeTerminalCandidateProvider } from "../platform/process/node-terminal
 import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
 import type {
   AgentDaemonStatus,
+  AgentSnapshot,
   ComposeAttachment,
   ComposeContainerMutationMapping,
   ComposePortMutationMode,
@@ -101,9 +106,11 @@ const COMPOSE_PROJECT_ROUTING_FILE_PREFIX = "compose-project-routing-";
 const COMPOSE_PROJECT_ROUTING_COMPOSE_SEPARATOR = ".compose-";
 const TERMINAL_ATTACHMENT_MARKER_DIRECTORY_NAME = "terminal-attachments";
 const TERMINAL_HOOK_SCRIPT_DIRECTORY_NAME = "terminal-hook-scripts";
+const TERMINAL_NETWORK_SELECTION_FILE_NAME = "terminal-networks.tsv";
 const MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX = "manual-terminal:";
 const PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX = "process-terminal:";
 const ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 3_000;
+const DAEMON_RESTART_BACKOFF_MS = 30_000;
 const TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500;
 const TERMINAL_ATTACHMENT_REFRESH_DEBOUNCE_MS = 50;
 const TERMINAL_ATTACHMENT_REFRESH_BURST_WINDOW_MS = 2_000;
@@ -191,6 +198,11 @@ interface TerminalAttachmentMarker {
   readonly filePath: string;
 }
 
+interface TerminalAttachmentMarkerCandidate {
+  readonly attachment: TerminalAttachment;
+  readonly markerPath: string;
+}
+
 interface ComposeRouteRestoreOptions {
   /**
    * Reconcile calls this after it has refreshed Docker-published endpoints. The
@@ -253,6 +265,12 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Guards background signal refreshes so slow Docker/process-table reads do not overlap. */
   private routingSignalRefreshInFlight: Promise<void> | undefined;
+
+  /** Guards daemon and routing-file convergence so refresh events cannot recurse. */
+  private daemonConvergenceInFlight: Promise<void> | undefined;
+
+  /** Next timestamp at which a stale daemon restart may be retried after failure. */
+  private daemonRestartBackoffUntilMs = 0;
 
   /** Guards terminal refreshes so watcher bursts cannot overlap process-table scans. */
   private terminalRefreshInFlight: Promise<readonly TerminalWindow[]> | undefined;
@@ -338,6 +356,7 @@ export class PortManagerNetworkService implements DisposableLike {
         this.saveState();
         void this.writeHostAccessBindingsFile();
         void this.writeComposeProjectRoutingFile();
+        void this.writeTerminalNetworkSelectionFile();
         void this.syncLogicalPortRouters();
         this.reconcileVscodeWindowTerminalBinding();
       }),
@@ -378,7 +397,8 @@ export class PortManagerNetworkService implements DisposableLike {
       terminalAttachmentMarkerWatcher.onDidDelete(() => {
         this.scheduleTerminalAttachmentRefreshBurst();
       }),
-      vscode.window.onDidOpenTerminal(() => {
+      vscode.window.onDidOpenTerminal((terminal) => {
+        this.scheduleVscodeTerminalTitleRefresh(terminal);
         void this.refreshTerminals();
       }),
       vscode.window.onDidCloseTerminal(() => {
@@ -393,6 +413,9 @@ export class PortManagerNetworkService implements DisposableLike {
           void this.refreshContainerServices();
           this.applyVscodeWindowTerminalEnvironment();
         }
+        if (event.affectsConfiguration("portManager")) {
+          void this.writeTerminalNetworkSelectionFile();
+        }
       }),
     );
 
@@ -405,10 +428,11 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.repairPersistedPortManagerCloneComposeAttachments();
     await this.reconcileComposeAttachmentPublishedPorts();
     await this.writeComposeProjectRoutingFile();
+    await this.writeTerminalNetworkSelectionFile();
     await this.restorePersistedComposeRoutesIfMissing();
     await this.refreshTerminals();
     void this.refreshContainerServices();
-    await this.syncLogicalPortRouters();
+    await this.convergeDaemonAndRoutingState();
     this.startRoutingSignalRefreshLoop();
     this.startTerminalAttachmentMarkerPolling();
   }
@@ -426,6 +450,11 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Returns daemon status when process service is available for the sidebar. */
   getDaemonStatus(): AgentDaemonStatus {
     return this.processService?.getSnapshot().daemon ?? createDisconnectedDaemonStatus();
+  }
+
+  /** Returns the latest daemon route/process snapshot for routing status UI. */
+  getAgentSnapshot(): AgentSnapshot {
+    return this.processService?.getSnapshot() ?? createDisconnectedAgentSnapshot();
   }
 
   /** Lists saved binding presets without exposing mutable stored arrays. */
@@ -592,6 +621,7 @@ export class PortManagerNetworkService implements DisposableLike {
       if (!sent) {
         throw new Error(`Could not send network namespace attach command to "${terminalWindow.title}".`);
       }
+      this.scheduleTerminalWindowTitleRefresh(terminalWindow, network.name, processRows);
     } else if (runtime.kind === "nativeHelper") {
       const settings = readPortManagerSettings();
       if (shouldInjectTerminalHook(settings)) {
@@ -621,6 +651,20 @@ export class PortManagerNetworkService implements DisposableLike {
       status: "attached",
       attachedAt: new Date().toISOString(),
     });
+  }
+
+  /** Brings a discovered terminal window to the foreground when the platform exposes a focus route. */
+  async revealTerminalWindow(terminalWindowId: string): Promise<boolean> {
+    const terminalWindow = this.registry
+      .getSnapshot()
+      .terminalWindows.find((window) => window.id === terminalWindowId);
+
+    if (terminalWindow === undefined) {
+      throw new Error(`Unknown terminal window: ${terminalWindowId}`);
+    }
+
+    const processRows = await this.listProcessRowsForTerminalControl();
+    return revealTerminalWindow(terminalWindow, processRows);
   }
 
   /**
@@ -655,7 +699,7 @@ export class PortManagerNetworkService implements DisposableLike {
     this.saveVscodeWindowTerminalBinding();
     this.applyVscodeWindowTerminalEnvironment();
 
-    const injectedTerminalCount = await this.injectRoutingIntoOpenVscodeTerminals(networkId, settings);
+    const injectedTerminalCount = await this.injectRoutingIntoOpenVscodeTerminals(network, settings);
     const updatedBinding = {
       ...binding,
       injectedTerminalCount,
@@ -702,7 +746,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     await this.processService?.start();
-    return this.buildTerminalRoutingScript(network.id, settings);
+    return this.buildTerminalRoutingScript(network, settings);
   }
 
   /** Returns the shell snippet that removes Port Manager routing variables from a custom terminal shell. */
@@ -730,6 +774,7 @@ export class PortManagerNetworkService implements DisposableLike {
         await sendCommandToTerminalWindow(terminalWindow, "exit", processRows, this.getTtyInputHelperPath()).catch(
           () => false,
         );
+        this.scheduleTerminalWindowTitleRefresh(terminalWindow, "detached", processRows);
       } else if (network?.runtimeKind === "nativeHelper") {
         await sendCommandToTerminalWindow(
           terminalWindow,
@@ -846,7 +891,8 @@ export class PortManagerNetworkService implements DisposableLike {
       };
     }
 
-    const script = this.buildTerminalRoutingScript(networkId, settings);
+    const network = requireNetwork(this.registry.getNetwork(networkId), networkId);
+    const script = this.buildTerminalRoutingScript(network, settings);
     const processRows = await this.listProcessRowsForTerminalControl();
     if (await sendRoutingScriptToVscodeTerminal(terminalWindow, script, processRows)) {
       return { injected: true };
@@ -1476,6 +1522,7 @@ export class PortManagerNetworkService implements DisposableLike {
         ? undefined
         : {
             networkId,
+            networkName: this.registry.getNetwork(networkId)?.name,
             composeRoutingFilePath: this.getComposeProjectRoutingFilePath(networkId),
           },
     );
@@ -1483,14 +1530,48 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Sends the current network routing script to all already-open VS Code terminals. */
   private async injectRoutingIntoOpenVscodeTerminals(
-    networkId: string,
+    network: LogicalNetwork,
     settings: PortManagerSettings,
   ): Promise<number> {
     const injectedTerminalCount = sendCommandToOpenVscodeTerminals(
-      this.buildTerminalRoutingScript(networkId, settings),
+      this.buildTerminalRoutingScript(network, settings),
     );
     await this.refreshTerminals().catch(() => []);
     return injectedTerminalCount;
+  }
+
+  /** Labels a newly opened VS Code terminal after env collection selects a network. */
+  private scheduleVscodeTerminalTitleRefresh(terminal: vscode.Terminal): void {
+    const networkId = this.vscodeWindowTerminalBinding?.networkId;
+    const network = networkId === undefined ? undefined : this.registry.getNetwork(networkId);
+
+    if (network === undefined) {
+      return;
+    }
+
+    setTimeout(() => {
+      try {
+        terminal.sendText(buildTerminalTitleShell(buildPortManagerTerminalTitle(network.name)), true);
+      } catch {
+        // The terminal can close between the open event and the delayed title write.
+      }
+    }, 250);
+  }
+
+  /** Sends a delayed title command to a known terminal window after shell state changes. */
+  private scheduleTerminalWindowTitleRefresh(
+    terminalWindow: TerminalWindow,
+    networkName: string,
+    processRows: readonly ProcessTableRow[],
+  ): void {
+    setTimeout(() => {
+      void sendCommandToTerminalWindow(
+        terminalWindow,
+        buildTerminalTitleShell(buildPortManagerTerminalTitle(networkName)),
+        processRows,
+        this.getTtyInputHelperPath(),
+      ).catch(() => undefined);
+    }, 250);
   }
 
   /** Reads process rows used only to match VS Code Terminal objects to OS-discovered TTY rows. */
@@ -1683,8 +1764,79 @@ export class PortManagerNetworkService implements DisposableLike {
       this.refreshContainerServices().catch(() => []),
     ]);
     await this.reconcileComposeAttachmentPublishedPorts().catch(() => undefined);
+    await this.convergeDaemonAndRoutingState();
+  }
+
+  /**
+   * Gradually converges all generated routing channels after missed events.
+   *
+   * UI state is durable in VS Code storage, while the daemon and generated files
+   * are disposable runtime state. Running this from the background refresh loop
+   * makes stale daemon replacement, host-access files, compose project maps,
+   * daemon route tables, and localhost logical routers eventually agree even
+   * when VS Code or Docker drops an event.
+   */
+  private async convergeDaemonAndRoutingState(): Promise<void> {
+    if (this.daemonConvergenceInFlight !== undefined) {
+      return this.daemonConvergenceInFlight;
+    }
+
+    this.daemonConvergenceInFlight = this.convergeDaemonAndRoutingStateExclusive().finally(() => {
+      this.daemonConvergenceInFlight = undefined;
+    });
+
+    return this.daemonConvergenceInFlight;
+  }
+
+  private async convergeDaemonAndRoutingStateExclusive(): Promise<void> {
+    await this.ensureCurrentProcessDaemon().catch(() => undefined);
+    await this.writeHostAccessBindingsFile().catch(() => undefined);
+    await this.writeComposeProjectRoutingFile().catch(() => undefined);
+    await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
     await this.restorePersistedComposeRoutesIfMissing().catch(() => undefined);
-    await this.syncLogicalPortRouters();
+
+    if (this.processService !== undefined) {
+      /*
+       * The daemon refresh path rewrites its route-table files from the current
+       * snapshot, so deleted or stale route JSON files are healed without
+       * requiring a user-triggered sidebar refresh.
+       */
+      await this.processService.refresh().catch(() => undefined);
+    }
+
+    await this.syncLogicalPortRouters().catch(() => undefined);
+  }
+
+  /**
+   * Ensures the singleton daemon is connected and belongs to this extension
+   * build. Restart failures are backed off because route convergence continues
+   * through file regeneration and compose rehydration on later passes.
+   */
+  private async ensureCurrentProcessDaemon(): Promise<void> {
+    if (this.processService === undefined) {
+      return;
+    }
+
+    const daemon = this.processService.getSnapshot().daemon;
+    if (daemon.status !== "running") {
+      await this.processService.start();
+      this.localChangeEvents.emit();
+      return;
+    }
+
+    if (!daemon.restartRequired) {
+      return;
+    }
+
+    const nowMs = Date.now();
+    if (nowMs < this.daemonRestartBackoffUntilMs) {
+      return;
+    }
+
+    this.daemonRestartBackoffUntilMs = nowMs + DAEMON_RESTART_BACKOFF_MS;
+    await this.processService.restartDaemon();
+    this.daemonRestartBackoffUntilMs = 0;
+    this.localChangeEvents.emit();
   }
 
   /**
@@ -2434,7 +2586,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const existingManualAttachments = snapshot.attachments.filter((attachment) =>
       attachment.id.startsWith(MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX),
     );
-    const nextAttachments: TerminalAttachment[] = [];
+    const nextAttachmentCandidates: TerminalAttachmentMarkerCandidate[] = [];
     const staleMarkerPaths: string[] = [];
 
     for (const marker of markers) {
@@ -2463,25 +2615,36 @@ export class PortManagerNetworkService implements DisposableLike {
         continue;
       }
 
-      nextAttachments.push({
-        id: createManualTerminalAttachmentId(marker.networkId, terminalWindow.id),
-        networkId: network.id,
-        rootPid: terminalWindow.rootPid,
-        processGroupId: terminalWindow.processGroupId ?? marker.processGroupId,
-        terminalWindowId: terminalWindow.id,
-        terminalTitle: terminalWindow.title,
-        mode: "isolated",
-        status: "attached",
-        attachedAt: marker.attachedAt,
+      nextAttachmentCandidates.push({
+        attachment: {
+          id: createManualTerminalAttachmentId(marker.networkId, terminalWindow.id),
+          networkId: network.id,
+          rootPid: terminalWindow.rootPid,
+          processGroupId: terminalWindow.processGroupId ?? marker.processGroupId,
+          terminalWindowId: terminalWindow.id,
+          terminalTitle: terminalWindow.title,
+          mode: "isolated",
+          status: "attached",
+          attachedAt: marker.attachedAt,
+        },
+        markerPath: marker.filePath,
       });
     }
+
+    const selectedAttachmentCandidates = selectLatestTerminalAttachmentMarkerCandidates(nextAttachmentCandidates);
+    const selectedMarkerPaths = new Set(selectedAttachmentCandidates.map((candidate) => candidate.markerPath));
+    staleMarkerPaths.push(
+      ...nextAttachmentCandidates
+        .filter((candidate) => !selectedMarkerPaths.has(candidate.markerPath))
+        .map((candidate) => candidate.markerPath),
+    );
 
     for (const attachment of existingManualAttachments) {
       this.registry.removeAttachment(attachment.id);
     }
 
-    for (const attachment of nextAttachments) {
-      this.registry.addAttachment(attachment);
+    for (const candidate of selectedAttachmentCandidates) {
+      this.registry.addAttachment(candidate.attachment);
     }
 
     for (const markerPath of staleMarkerPaths) {
@@ -2577,6 +2740,11 @@ export class PortManagerNetworkService implements DisposableLike {
     return path.join(this.context.globalStorageUri.fsPath, TERMINAL_HOOK_SCRIPT_DIRECTORY_NAME);
   }
 
+  /** Stable TSV path read by the external `pm` shell function. */
+  private getTerminalNetworkSelectionFilePath(): string {
+    return path.join(this.context.globalStorageUri.fsPath, TERMINAL_NETWORK_SELECTION_FILE_NAME);
+  }
+
   /**
    * Writes a generated terminal script body and returns the stable path to source.
    * Terminal input must stay short because some PTY paste paths truncate very long
@@ -2592,18 +2760,41 @@ export class PortManagerNetworkService implements DisposableLike {
     return scriptPath;
   }
 
+  /**
+   * Writes the network picker file consumed by the external `pm` shell function.
+   *
+   * A shell function is required because selecting a network mutates the current
+   * shell environment. Each row points at the same attach script used by UI
+   * injection, keeping external terminals on the full native-hook path.
+   */
+  private async writeTerminalNetworkSelectionFile(): Promise<void> {
+    const settings = readPortManagerSettings();
+    const rows = this.registry.getSnapshot().networks.map((network) => {
+      const scriptPath = this.writeTerminalHookScript(
+        `attach-${sanitizeRouteFileScope(network.id)}.sh`,
+        this.buildTerminalRoutingScriptBody(network.id, network.name, settings),
+      );
+
+      return serializeTerminalNetworkSelectionRow(network.id, network.name, scriptPath);
+    });
+    const filePath = this.getTerminalNetworkSelectionFilePath();
+
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, rows.length === 0 ? "" : `${rows.join("\n")}\n`, "utf8");
+  }
+
   /** Builds a one-line command that makes later child processes join one logical network scope. */
-  private buildTerminalRoutingScript(networkId: string, settings: PortManagerSettings): string {
+  private buildTerminalRoutingScript(network: Pick<LogicalNetwork, "id" | "name">, settings: PortManagerSettings): string {
     const scriptPath = this.writeTerminalHookScript(
-      `attach-${sanitizeRouteFileScope(networkId)}.sh`,
-      this.buildTerminalRoutingScriptBody(networkId, settings),
+      `attach-${sanitizeRouteFileScope(network.id)}.sh`,
+      this.buildTerminalRoutingScriptBody(network.id, network.name, settings),
     );
 
     return `. ${shellQuote(scriptPath)}`;
   }
 
   /** Builds the full attach bootstrap stored in globalStorage and sourced by the shell. */
-  private buildTerminalRoutingScriptBody(networkId: string, settings: PortManagerSettings): string {
+  private buildTerminalRoutingScriptBody(networkId: string, networkName: string, settings: PortManagerSettings): string {
     const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
     const agentMainPath = this.context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
     const nativeAgentPath = this.context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
@@ -2631,6 +2822,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const commands = [
       shellExport("PORT_MANAGER_HOOK", "1"),
       shellExport("PORT_MANAGER_NETWORK_ID", networkId),
+      shellExport("PORT_MANAGER_NETWORK_NAME", networkName),
       shellExport("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID", networkId),
       shellExport("PORT_MANAGER_BORROWED_NETWORK_ID", networkId),
       shellExport("NEWDLOPS_PM_NETWORK_ID", networkId),
@@ -2644,6 +2836,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath()),
       shellExport("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath()),
       shellExport("PORT_MANAGER_TERMINAL_ATTACHMENT_DIR", this.getTerminalAttachmentMarkerDirectoryPath()),
+      buildTerminalTitleShell(buildPortManagerTerminalTitle(networkName)),
       buildTerminalAttachmentMarkerWriteShell(),
       buildComposeProjectRoutingShell(this.getComposeProjectRoutingFilePath(networkId), nativeContainerMapPath),
       shellExport("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange)),
@@ -2676,8 +2869,8 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     commands.push(
-      `if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" = "1" ]; then printf '%s\\n' ${shellQuote(
-        `Port Manager routing active for ${networkId}. Restart servers launched before attach.`,
+        `if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" = "1" ]; then printf '%s\\n' ${shellQuote(
+        `Port Manager routing active for ${networkName} (${networkId}). Restart servers launched before attach.`,
       )}; fi`,
     );
 
@@ -2704,6 +2897,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const variables = [
       "PORT_MANAGER_HOOK",
       "PORT_MANAGER_NETWORK_ID",
+      "PORT_MANAGER_NETWORK_NAME",
       "PORT_MANAGER_ROUTE_TABLE_NETWORK_ID",
       "PORT_MANAGER_BORROWED_NETWORK_ID",
       "NEWDLOPS_PM_NETWORK_ID",
@@ -2728,7 +2922,11 @@ export class PortManagerNetworkService implements DisposableLike {
       "PORT_MANAGER_DYLD_INSERT_LIBRARIES",
       RUNTIME_SHIM_DIRECTORY_ENV,
     ];
-    const commands = [buildTerminalAttachmentMarkerRemoveShell(), ...variables.map((variable) => `unset ${variable}`)];
+    const commands = [
+      buildTerminalAttachmentMarkerRemoveShell(),
+      buildTerminalTitleShell("Port Manager: detached"),
+      ...variables.map((variable) => `unset ${variable}`),
+    ];
 
     if (process.platform === "darwin") {
       commands.push(
@@ -3430,6 +3628,15 @@ function sanitizeRouteFileScope(value: string): string {
   return sanitized.length > 0 ? sanitized : "network";
 }
 
+/** Serializes one shell-readable network picker row as id, display name, and attach script path. */
+function serializeTerminalNetworkSelectionRow(networkId: string, networkName: string, scriptPath: string): string {
+  return [networkId, networkName, scriptPath].map(serializeTerminalNetworkSelectionCell).join("\t");
+}
+
+function serializeTerminalNetworkSelectionCell(value: string): string {
+  return value.replace(/[\t\r\n]/g, " ").trim();
+}
+
 /**
  * Builds a stable per-compose scope inside a logical network.
  * The readable prefix helps diagnostics, while the hash covers cwd, compose
@@ -3466,6 +3673,18 @@ function createDisconnectedDaemonStatus(): AgentDaemonStatus {
     monitoringAllListeners: false,
     versionStatus: "unknown",
     restartRequired: false,
+  };
+}
+
+/** Builds a UI-safe agent snapshot when the process service is unavailable. */
+function createDisconnectedAgentSnapshot(): AgentSnapshot {
+  return {
+    agentPid: 0,
+    daemon: createDisconnectedDaemonStatus(),
+    processes: [],
+    listeners: [],
+    routes: [],
+    updatedAt: new Date(0).toISOString(),
   };
 }
 
@@ -3575,6 +3794,32 @@ async function sendCommandToVscodeTerminal(
   command: string,
   processRows: readonly ProcessTableRow[] = [],
 ): Promise<boolean> {
+  const terminal = await findMatchingVscodeTerminal(terminalWindow, processRows);
+  if (terminal === undefined) {
+    return false;
+  }
+
+  terminal.sendText(command, true);
+  return true;
+}
+
+/** Brings a terminal window to the foreground without writing input. */
+async function revealTerminalWindow(
+  terminalWindow: TerminalWindow,
+  processRows: readonly ProcessTableRow[] = [],
+): Promise<boolean> {
+  if (await revealVscodeTerminal(terminalWindow, processRows)) {
+    return true;
+  }
+
+  return revealExternalTerminalWindow(terminalWindow);
+}
+
+/** Finds the matching integrated terminal using process ancestry first and display names as fallback. */
+async function findMatchingVscodeTerminal(
+  terminalWindow: TerminalWindow,
+  processRows: readonly ProcessTableRow[] = [],
+): Promise<vscode.Terminal | undefined> {
   const nameMatchedTerminals: vscode.Terminal[] = [];
 
   for (const terminal of vscode.window.terminals) {
@@ -3594,24 +3839,35 @@ async function sendCommandToVscodeTerminal(
       continue;
     }
 
-    terminal.sendText(command, true);
-    return true;
+    return terminal;
   }
 
   if (nameMatchedTerminals.length === 1) {
-    nameMatchedTerminals[0].sendText(command, true);
-    return true;
+    return nameMatchedTerminals[0];
   }
 
   if (
     vscode.window.activeTerminal !== undefined &&
     isVscodeTerminalNameMatch(terminalWindow, vscode.window.activeTerminal)
   ) {
-    vscode.window.activeTerminal.sendText(command, true);
-    return true;
+    return vscode.window.activeTerminal;
   }
 
-  return false;
+  return undefined;
+}
+
+/** Focuses an integrated terminal when VS Code owns the terminal object. */
+async function revealVscodeTerminal(
+  terminalWindow: TerminalWindow,
+  processRows: readonly ProcessTableRow[] = [],
+): Promise<boolean> {
+  const terminal = await findMatchingVscodeTerminal(terminalWindow, processRows);
+  if (terminal === undefined) {
+    return false;
+  }
+
+  terminal.show(false);
+  return true;
 }
 
 /** Matches process-less VS Code pseudoterminals by stable display names only when unambiguous. */
@@ -3723,6 +3979,39 @@ function createProcessTerminalAttachmentId(networkId: string, pid: number): stri
   return `${PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX}${encodeURIComponent(networkId)}:${pid}`;
 }
 
+/** Collapses competing marker files so each terminal keeps the latest network label. */
+function selectLatestTerminalAttachmentMarkerCandidates(
+  candidates: readonly TerminalAttachmentMarkerCandidate[],
+): readonly TerminalAttachmentMarkerCandidate[] {
+  const selected: TerminalAttachmentMarkerCandidate[] = [];
+
+  for (const candidate of candidates) {
+    const existingIndex = selected.findIndex((existing) =>
+      terminalAttachmentsShareIdentity(existing.attachment, candidate.attachment),
+    );
+    if (existingIndex < 0) {
+      selected.push(candidate);
+      continue;
+    }
+
+    if (isAttachmentAtLeastAsNew(candidate.attachment, selected[existingIndex]!.attachment)) {
+      selected[existingIndex] = candidate;
+    }
+  }
+
+  return selected;
+}
+
+/** Compares attach timestamps while treating malformed legacy values as oldest. */
+function isAttachmentAtLeastAsNew(candidate: TerminalAttachment, existing: TerminalAttachment): boolean {
+  return parseAttachmentTime(candidate.attachedAt) >= parseAttachmentTime(existing.attachedAt);
+}
+
+function parseAttachmentTime(attachedAt: string): number {
+  const parsed = Date.parse(attachedAt);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 /** Parses the TSV marker emitted by copied routing scripts. */
 function parseTerminalAttachmentMarker(contents: string, filePath: string): TerminalAttachmentMarker | undefined {
   const line = contents.split(/\r?\n/).find((item) => item.trim().length > 0);
@@ -3804,6 +4093,16 @@ async function sendCommandToExternalTerminalWindow(
   );
 }
 
+/** Brings an external Terminal.app or iTerm2 session to the foreground by tty. */
+async function revealExternalTerminalWindow(terminalWindow: TerminalWindow): Promise<boolean> {
+  if (process.platform !== "darwin" || terminalWindow.terminalId === undefined) {
+    return false;
+  }
+
+  const tty = normalizeTerminalTty(terminalWindow.terminalId);
+  return (await revealTerminalAppleScript(tty)) || (await revealITermAppleScript(tty));
+}
+
 /** Generic PTY input fallback for terminals that are not exposed through VS Code, Terminal.app, or iTerm2 APIs. */
 async function runGenericTtyInput(
   tty: string,
@@ -3847,6 +4146,29 @@ return "missing"
   return runAppleScript(appleScript);
 }
 
+/** Selects the Terminal.app tab owning the target tty and activates its window. */
+async function revealTerminalAppleScript(tty: string): Promise<boolean> {
+  const escapedTty = appleScriptString(tty);
+  const appleScript = `
+if application "Terminal" is not running then return "missing"
+tell application "Terminal"
+  repeat with windowItem in windows
+    repeat with tabItem in tabs of windowItem
+      if (tty of tabItem) is "${escapedTty}" then
+        set selected tab of windowItem to tabItem
+        set index of windowItem to 1
+        activate
+        return "ok"
+      end if
+    end repeat
+  end repeat
+end tell
+return "missing"
+`;
+
+  return runAppleScript(appleScript);
+}
+
 /** iTerm2 exposes tty on sessions, so session selection does not depend on mutable titles. */
 async function runITermAppleScript(tty: string, script: string): Promise<boolean> {
   const escapedScript = appleScriptString(script);
@@ -3871,6 +4193,32 @@ return "missing"
   return runAppleScript(appleScript);
 }
 
+/** Selects the iTerm2 session owning the target tty and activates its window. */
+async function revealITermAppleScript(tty: string): Promise<boolean> {
+  const escapedTty = appleScriptString(tty);
+  const appleScript = `
+if application "iTerm2" is not running then return "missing"
+tell application "iTerm2"
+  repeat with windowItem in windows
+    repeat with tabItem in tabs of windowItem
+      repeat with sessionItem in sessions of tabItem
+        if (tty of sessionItem) is "${escapedTty}" then
+          select windowItem
+          select tabItem
+          select sessionItem
+          activate
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end repeat
+end tell
+return "missing"
+`;
+
+  return runAppleScript(appleScript);
+}
+
 async function runAppleScript(script: string): Promise<boolean> {
   try {
     const { stdout } = await execFileAsync("osascript", ["-e", script], { timeout: 1500 });
@@ -3882,6 +4230,16 @@ async function runAppleScript(script: string): Promise<boolean> {
 
 function normalizeTerminalTty(terminalId: string): string {
   return terminalId.startsWith("/dev/") ? terminalId : path.join("/dev", terminalId);
+}
+
+/** User-visible terminal title while a shell is attached to a logical network. */
+function buildPortManagerTerminalTitle(networkName: string): string {
+  return `Port Manager: ${networkName}`;
+}
+
+/** Shell fragment that writes an OSC terminal-title escape from inside the PTY. */
+function buildTerminalTitleShell(title: string): string {
+  return `printf '\\033]0;%s\\007' ${shellQuote(title)} 2>/dev/null || true`;
 }
 
 /** Shell fragment that records a manually routed shell for later sidebar refresh. */

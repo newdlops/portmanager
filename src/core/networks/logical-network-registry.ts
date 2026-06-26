@@ -58,8 +58,8 @@ export class LogicalNetworkRegistry implements DisposableLike {
       this.networks.set(network.id, network);
     }
 
-    for (const attachment of initialState?.attachments ?? []) {
-      this.attachments.set(attachment.id, attachment);
+    for (const attachment of sortTerminalAttachmentsByAttachedAt(initialState?.attachments ?? [])) {
+      this.setAttachment(attachment);
     }
 
     for (const exposure of initialState?.exposures ?? []) {
@@ -125,8 +125,8 @@ export class LogicalNetworkRegistry implements DisposableLike {
       this.networks.set(network.id, network);
     }
 
-    for (const attachment of state.attachments) {
-      this.attachments.set(attachment.id, attachment);
+    for (const attachment of sortTerminalAttachmentsByAttachedAt(state.attachments)) {
+      this.setAttachment(attachment);
     }
 
     for (const exposure of state.exposures) {
@@ -241,7 +241,7 @@ export class LogicalNetworkRegistry implements DisposableLike {
       throw new Error(`Unknown logical network: ${attachment.networkId}`);
     }
 
-    this.attachments.set(attachment.id, attachment);
+    this.setAttachment(attachment);
     this.emitChange();
     return attachment;
   }
@@ -391,6 +391,26 @@ export class LogicalNetworkRegistry implements DisposableLike {
   }
 
   /**
+   * Commits one terminal attachment while preserving the product invariant that
+   * one visible terminal root can belong to only one logical network. This runs
+   * during persisted-state load too, so stale duplicate rows converge without a
+   * user-triggered detach.
+   */
+  private setAttachment(attachment: TerminalAttachment): void {
+    this.removeConflictingTerminalAttachments(attachment);
+    this.attachments.set(attachment.id, attachment);
+  }
+
+  /** Removes previous network labels for the same terminal identity. */
+  private removeConflictingTerminalAttachments(attachment: TerminalAttachment): void {
+    for (const [attachmentId, existing] of this.attachments) {
+      if (attachmentId !== attachment.id && terminalAttachmentsShareIdentity(existing, attachment)) {
+        this.attachments.delete(attachmentId);
+      }
+    }
+  }
+
+  /**
    * A logical network can shadow a host port with one compose service endpoint,
    * but two active compose endpoints for the same logical port would make
    * routing nondeterministic.
@@ -477,6 +497,35 @@ function dedupeContainerServiceCandidates(
 
 function sameJsonList<T>(left: readonly T[], right: readonly T[]): boolean {
   return left.length === right.length && JSON.stringify(left) === JSON.stringify(right);
+}
+
+/**
+ * Returns true when two attachment rows describe the same user-facing terminal
+ * identity. Matching on any stable terminal key lets VS Code, OS discovery,
+ * pasted hook scripts, and process-only attach rows converge to one network.
+ */
+export function terminalAttachmentsShareIdentity(left: TerminalAttachment, right: TerminalAttachment): boolean {
+  if (left.terminalWindowId !== undefined && left.terminalWindowId === right.terminalWindowId) {
+    return true;
+  }
+
+  if (left.rootPid === right.rootPid) {
+    return true;
+  }
+
+  return left.processGroupId !== undefined && left.processGroupId === right.processGroupId;
+}
+
+/** Applies persisted attachment rows oldest-first so the newest terminal label wins conflicts. */
+function sortTerminalAttachmentsByAttachedAt(attachments: readonly TerminalAttachment[]): readonly TerminalAttachment[] {
+  return [...attachments].sort(
+    (left, right) => parseAttachmentTime(left.attachedAt) - parseAttachmentTime(right.attachedAt),
+  );
+}
+
+function parseAttachmentTime(attachedAt: string): number {
+  const parsed = Date.parse(attachedAt);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 /** Groups noisy process-level shell candidates into user-facing terminal windows. */

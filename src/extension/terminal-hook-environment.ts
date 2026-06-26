@@ -72,6 +72,8 @@ const PRELOAD_PACKAGE_COMMAND_NAMES = [
 export interface TerminalHookEnvironmentScope {
   /** Logical network applied to every new VS Code terminal in this extension host. */
   readonly networkId: string;
+  /** Display name used by shell startup hooks to label attached terminals. */
+  readonly networkName?: string;
   /** Dynamic Compose/container routing map consumed by Docker/Podman shims. */
   readonly composeRoutingFilePath?: string;
 }
@@ -142,6 +144,9 @@ export function applyTerminalHookEnvironment(
 
   collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
+  if (scope.networkName !== undefined) {
+    collection.replace("PORT_MANAGER_NETWORK_NAME", scope.networkName, TERMINAL_MUTATOR_OPTIONS);
+  }
   collection.replace("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_BORROWED_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
   collection.replace("NEWDLOPS_PM_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
