@@ -32,6 +32,8 @@ import {
 const COMPOSE_TIMEOUT_MS = 60_000;
 const LIST_TIMEOUT_MS = 5_000;
 const VOLUME_COPY_TIMEOUT_MS = 120_000;
+const HIDDEN_PORT_DISCOVERY_ATTEMPTS = 8;
+const HIDDEN_PORT_DISCOVERY_DELAY_MS = 250;
 const VOLUME_COPY_IMAGE = "alpine:3.20";
 const DEFAULT_COMPOSE_FILES = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
 
@@ -89,11 +91,27 @@ interface ComposeServiceContainer {
   readonly serviceName: string;
   readonly status?: string;
   readonly hasPublishedPorts: boolean;
+  /** True when the container appears in the runtime's running-only list. */
+  readonly isRunning: boolean;
 }
 
 interface ComposeServiceContainerList {
   readonly containers: readonly ComposeServiceContainer[];
   readonly inspectedRows: readonly RuntimeContainerInspectRow[];
+}
+
+interface ComposeServiceContainerListOptions {
+  /** Include stopped/created containers so copy mode preserves dormant services. */
+  readonly includeStopped?: boolean;
+}
+
+interface HiddenPortResolutionOptions {
+  /**
+   * Copy/rename flows may intentionally create services that are not running
+   * yet. Running containers are still preferred; stopped rows are only a final
+   * fallback so Docker's control-plane lag does not fail a valid copy.
+   */
+  readonly includeStoppedFallback?: boolean;
 }
 
 interface RuntimeContainerInspectRow {
@@ -212,16 +230,38 @@ export class ComposePublishMutator {
       composeFiles,
     };
 
-    const definedServices = await this.listDefinedComposeServices(originalContext);
-    const services = this.filterDefinedComposeServices(originalContext.projectName, requestedServices, definedServices);
     const copyStoppedServices = createsHiddenProject && input.copyStoppedServices === true;
-    const copiedServices = copyStoppedServices ? definedServices : services;
+    const definedServices = await this.listDefinedComposeServices(originalContext);
+    const existingServices =
+      copyStoppedServices
+        ? await this.listExistingComposeServices(originalContext).catch(() => [])
+        : [];
+    const availableServices = uniqueStrings([...definedServices, ...existingServices]);
+    const requestedRouteServices = this.filterAvailableComposeServices(
+      originalContext.projectName,
+      requestedServices,
+      availableServices,
+    );
+    const copiedServices = copyStoppedServices ? availableServices : requestedRouteServices;
+    const originalContainerList = await this.listComposeServiceContainers(input.runtime, originalProjectName, copiedServices, {
+      includeStopped: copyStoppedServices,
+    });
+    const originalContainers = originalContainerList.containers;
+    const runningOriginalServices = new Set(
+      originalContainers
+        .filter(isRunningComposeServiceContainer)
+        .map((container) => container.serviceName),
+    );
+    const services =
+      mode === "copy" && copyStoppedServices
+        ? requestedRouteServices.filter((service) => runningOriginalServices.has(service))
+        : requestedRouteServices;
+    const ports = input.ports.filter((port) => services.includes(port.serviceName));
     const overrideServices = createsHiddenProject ? (copyStoppedServices ? copiedServices : definedServices) : services;
     const disabledOverrideServices =
-      mode === "clone" && !copyStoppedServices ? definedServices.filter((service) => !services.includes(service)) : [];
-    const ports = input.ports.filter((port) => services.includes(port.serviceName));
-    const originalContainerList = await this.listComposeServiceContainers(input.runtime, originalProjectName, copiedServices);
-    const originalContainers = originalContainerList.containers;
+      mode === "clone" && !copyStoppedServices
+        ? definedServices.filter((service) => !services.includes(service))
+        : [];
     const originalServiceMounts = await this.inspectServiceMounts(
       input.runtime,
       originalContainers,
@@ -278,7 +318,7 @@ export class ComposePublishMutator {
     let clonedVolumesCreated = false;
 
     try {
-      if (mode === "clone") {
+      if (mode === "clone" && services.length > 0) {
         await this.runCompose(originalContext, ["stop", ...services]);
         originalStopped = true;
       }
@@ -286,8 +326,10 @@ export class ComposePublishMutator {
         await this.copyVolumes(input.runtime, volumeClonePlan.volumeClones);
         clonedVolumesCreated = true;
       }
-      await this.runCompose(hiddenContext, ["up", "-d", "--force-recreate", "--no-deps", ...services]);
-      hiddenStarted = true;
+      if (services.length > 0) {
+        await this.runCompose(hiddenContext, ["up", "-d", "--force-recreate", "--no-deps", ...services]);
+        hiddenStarted = true;
+      }
       const stoppedCopyServices = copyStoppedServices
         ? copiedServices.filter((service) => !services.includes(service))
         : [];
@@ -295,14 +337,21 @@ export class ComposePublishMutator {
         await this.runCompose(hiddenContext, ["create", "--no-recreate", ...stoppedCopyServices]);
         hiddenCreated = true;
       }
-      const hiddenCandidates = await this.discoverHiddenComposeCandidates(input.runtime, attachedProjectName);
-      const hiddenPorts = resolveHiddenPorts(attachedProjectName, ports, hiddenCandidates);
+      const hiddenPorts = await this.resolveHiddenPortsAfterComposeUp(input.runtime, attachedProjectName, ports, {
+        includeStoppedFallback: copyStoppedServices,
+      });
       assertHiddenPortsAreIsolated(hiddenPorts, ports);
+      const hiddenContainerList =
+        createsHiddenProject
+          ? await this.listComposeServiceContainers(input.runtime, attachedProjectName, copiedServices, {
+              includeStopped: copyStoppedServices,
+            })
+          : { containers: [], inspectedRows: [] };
       const containerMappings =
         createsHiddenProject
           ? mergeComposeContainerMappingLineage(
               input.sourceContainerMappings ?? [],
-              buildContainerCloneMappings(originalContainers, hiddenCandidates),
+              buildContainerCloneMappings(originalContainers, hiddenContainerList.containers),
             )
           : [];
       const clonedVolumes = buildVolumeMutationMappings(volumeClonePlan.volumeMappings);
@@ -500,10 +549,14 @@ export class ComposePublishMutator {
       currentStopped = true;
       await this.runCompose(nextHiddenContext, ["up", "-d", "--force-recreate", "--no-deps", ...state.services]);
       nextStarted = true;
-      const hiddenCandidates = await this.discoverHiddenComposeCandidates(state.runtime, attachedProjectName);
-      const hiddenPorts = resolveHiddenPorts(attachedProjectName, state.originalPorts, hiddenCandidates);
+      const hiddenPorts = await this.resolveHiddenPortsAfterComposeUp(state.runtime, attachedProjectName, state.originalPorts, {
+        includeStoppedFallback: true,
+      });
       assertHiddenPortsAreIsolated(hiddenPorts, state.originalPorts);
-      const containerMappings = buildContainerCloneMappings(originalContainerSources, hiddenCandidates);
+      const hiddenContainerList = await this.listComposeServiceContainers(state.runtime, attachedProjectName, state.services, {
+        includeStopped: true,
+      });
+      const containerMappings = buildContainerCloneMappings(originalContainerSources, hiddenContainerList.containers);
 
       await this.runCompose(currentHiddenContext, ["down", "--remove-orphans"]).catch(() => undefined);
       await fs.rm(state.overrideFile, { force: true }).catch(() => undefined);
@@ -722,19 +775,31 @@ export class ComposePublishMutator {
     return overrideFile;
   }
 
-  /** Finds the original running service containers before they are stopped. */
+  /** Finds the original service containers before mutation; copy mode also needs stopped containers. */
   private async listComposeServiceContainers(
     runtime: "docker" | "podman",
     originalProjectName: string,
     services: readonly string[],
+    options: ComposeServiceContainerListOptions = {},
   ): Promise<ComposeServiceContainerList> {
     const serviceSet = new Set(services);
-    const { rows, inspectedRows } = await this.listRuntimeRowsWithInspectNames(runtime);
-    const containers = selectCurrentComposeServiceContainers(parseComposeServiceContainerRows(rows, inspectedRows)).filter(
-      (candidate) =>
-        candidate.composeProject === originalProjectName &&
-        serviceSet.has(candidate.serviceName),
-    );
+    const { rows, inspectedRows } = await this.listRuntimeRowsWithInspectNames(runtime, {
+      includeStopped: options.includeStopped === true,
+    });
+    const runningContainerIds =
+      options.includeStopped === true
+        ? await this.listRunningContainerIds(runtime).catch(() => undefined)
+        : undefined;
+    const containers = selectCurrentComposeServiceContainers(parseComposeServiceContainerRows(rows, inspectedRows))
+      .filter(
+        (candidate) =>
+          candidate.composeProject === originalProjectName &&
+          serviceSet.has(candidate.serviceName),
+      )
+      .map((container) => ({
+        ...container,
+        isRunning: runningContainerIds?.has(container.id) ?? container.isRunning,
+      }));
 
     return {
       containers,
@@ -807,8 +872,34 @@ export class ComposePublishMutator {
     );
   }
 
+  /**
+   * Lists services that already have compose containers, including stopped
+   * profile services. Copy attach preserves the user's materialized stack, so
+   * this runtime view is merged with static config service names.
+   */
+  private async listExistingComposeServices(
+    context: ComposeCommandContext,
+  ): Promise<readonly string[]> {
+    const result = await this.runCommand(context.runtime, this.buildComposeArgs(context, ["ps", "--all", "--services"]), {
+      timeoutMs: COMPOSE_TIMEOUT_MS,
+      ...(context.workingDirectory !== undefined ? { cwd: context.workingDirectory } : {}),
+    });
+    return uniqueStrings(
+      result.stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0),
+    );
+  }
+
+  /** Reads the runtime's running-only container ids for lifecycle classification. */
+  private async listRunningContainerIds(runtime: "docker" | "podman"): Promise<ReadonlySet<string>> {
+    const { rows } = await this.listRuntimeRowsWithInspectNames(runtime);
+    return new Set(rows.map(readRuntimeContainerId).filter((id): id is string => id !== undefined));
+  }
+
   /** Drops stale runtime-label services before mutating current compose services. */
-  private filterDefinedComposeServices(
+  private filterAvailableComposeServices(
     projectName: string,
     services: readonly string[],
     definedServicesList: readonly string[],
@@ -865,9 +956,49 @@ export class ComposePublishMutator {
   private async discoverHiddenComposeCandidates(
     runtime: "docker" | "podman",
     attachedProjectName: string,
+    options: ComposeServiceContainerListOptions = {},
   ): Promise<readonly ContainerServiceCandidate[]> {
-    const { rows } = await this.listRuntimeRowsWithInspectNames(runtime);
+    const { rows } = await this.listRuntimeRowsWithInspectNames(runtime, {
+      includeStopped: options.includeStopped === true,
+    });
     return parseContainerRows(runtime, rows).filter((candidate) => candidate.composeProject === attachedProjectName);
+  }
+
+  /**
+   * Waits briefly for Docker/Podman to expose the hidden project's published
+   * ports after `compose up`. Runtime list output can lag behind compose's
+   * return, so attach treats route publication as a convergence step.
+   */
+  private async resolveHiddenPortsAfterComposeUp(
+    runtime: "docker" | "podman",
+    attachedProjectName: string,
+    ports: readonly ComposePublishedPort[],
+    options: HiddenPortResolutionOptions = {},
+  ): Promise<readonly ComposePublishedPort[]> {
+    let lastCandidates: readonly ContainerServiceCandidate[] = [];
+    let lastError: Error | undefined;
+
+    for (let attempt = 0; attempt < HIDDEN_PORT_DISCOVERY_ATTEMPTS; attempt += 1) {
+      lastCandidates = await this.discoverHiddenComposeCandidates(runtime, attachedProjectName);
+      try {
+        return resolveHiddenPorts(attachedProjectName, ports, lastCandidates);
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+      }
+
+      if (attempt + 1 < HIDDEN_PORT_DISCOVERY_ATTEMPTS) {
+        await sleep(HIDDEN_PORT_DISCOVERY_DELAY_MS);
+      }
+    }
+
+    if (options.includeStoppedFallback === true) {
+      const stoppedCandidates = await this.discoverHiddenComposeCandidates(runtime, attachedProjectName, {
+        includeStopped: true,
+      });
+      return resolveHiddenPorts(attachedProjectName, ports, stoppedCandidates);
+    }
+
+    throw lastError ?? new Error(`Hidden compose project ${attachedProjectName} did not publish selected ports.`);
   }
 
   /**
@@ -952,13 +1083,20 @@ export class ComposePublishMutator {
    * edge cases. Attach state needs the exact runtime name because later Docker
    * lifecycle commands are rewritten to that stable target instead of a stale id.
    */
-  private async listRuntimeRowsWithInspectNames(runtime: "docker" | "podman"): Promise<{
+  private async listRuntimeRowsWithInspectNames(
+    runtime: "docker" | "podman",
+    options: ComposeServiceContainerListOptions = {},
+  ): Promise<{
     readonly rows: readonly RuntimeContainerRow[];
     readonly inspectedRows: readonly RuntimeContainerInspectRow[];
   }> {
-    const result = await this.runCommand(runtime, ["container", "ls", "--no-trunc", "--format", "{{json .}}"], {
-      timeoutMs: LIST_TIMEOUT_MS,
-    });
+    const result = await this.runCommand(
+      runtime,
+      ["container", "ls", ...(options.includeStopped === true ? ["--all"] : []), "--no-trunc", "--format", "{{json .}}"],
+      {
+        timeoutMs: LIST_TIMEOUT_MS,
+      },
+    );
     const rows = result.stdout
       .split(/\r?\n/)
       .map((line) => line.trim())
@@ -1029,6 +1167,10 @@ function groupPortsByService(
   return grouped;
 }
 
+function sleep(delayMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
 function buildPortKey(port: ComposePublishedPort): string {
   return `${port.serviceName}:${port.containerPort}:${port.protocol}`;
 }
@@ -1069,13 +1211,10 @@ function resolveHiddenPorts(
 
 function buildContainerCloneMappings(
   originalContainers: readonly ComposeServiceContainer[],
-  hiddenCandidates: readonly ContainerServiceCandidate[],
+  hiddenContainers: readonly ComposeServiceContainer[],
 ): readonly ComposeContainerMutationMapping[] {
   const originalByService = groupBy(originalContainers, (container) => container.serviceName);
-  const hiddenByService = groupBy(
-    hiddenCandidates.filter((candidate) => candidate.composeService !== undefined),
-    (candidate) => candidate.composeService!,
-  );
+  const hiddenByService = groupBy(hiddenContainers, (container) => container.serviceName);
   const mappings: ComposeContainerMutationMapping[] = [];
 
   for (const [serviceName, originals] of originalByService) {
@@ -1088,12 +1227,34 @@ function buildContainerCloneMappings(
       serviceName,
       originalContainerId: originals[0]!.id,
       originalContainerName: originals[0]!.name,
-      attachedContainerId: hidden[0]!.containerId,
-      attachedContainerName: hidden[0]!.containerName,
+      attachedContainerId: hidden[0]!.id,
+      attachedContainerName: hidden[0]!.name,
     });
   }
 
   return mappings;
+}
+
+function isRunningComposeServiceContainer(container: ComposeServiceContainer): boolean {
+  return container.isRunning;
+}
+
+function isRunningStatus(value: string | undefined): boolean {
+  const status = value?.trim().toLowerCase();
+  if (status === undefined || status.length === 0) {
+    return true;
+  }
+
+  if (
+    status.startsWith("exited") ||
+    status.startsWith("created") ||
+    status.startsWith("dead") ||
+    status.startsWith("removing")
+  ) {
+    return false;
+  }
+
+  return status.startsWith("up") || status.includes("running");
 }
 
 function buildRenameContainerNameSources(
@@ -1115,6 +1276,7 @@ function buildRenameContainerNameSources(
         name: mapping.originalContainerName,
         serviceName: mapping.serviceName,
         hasPublishedPorts: false,
+        isRunning: true,
       })) ?? [];
 
   return mappingSources.length > 0 ? mappingSources : currentContainers;
@@ -1963,6 +2125,7 @@ function parseComposeServiceContainerRows(
         composeProject,
         serviceName: composeService,
         hasPublishedPorts: (row.Ports ?? "").trim().length > 0,
+        isRunning: isRunningStatus(row.Status),
         ...(row.Status !== undefined ? { status: row.Status } : {}),
       };
     })

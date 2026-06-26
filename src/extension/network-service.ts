@@ -290,6 +290,12 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Guards daemon and routing-file convergence so refresh events cannot recurse. */
   private daemonConvergenceInFlight: Promise<void> | undefined;
 
+  /** Serializes terminal picker rewrites so stale snapshots cannot win the last write. */
+  private terminalNetworkSelectionWriteInFlight: Promise<void> | undefined;
+
+  /** Requests one more terminal picker rewrite after the current filesystem write completes. */
+  private terminalNetworkSelectionWriteQueued = false;
+
   /** Next timestamp at which a stale daemon restart may be retried after failure. */
   private daemonRestartBackoffUntilMs = 0;
 
@@ -1158,6 +1164,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const removedAttachment = this.registry.removeComposeAttachment(attachmentId);
     await this.removeComposeRouteProcesses(attachment, attachment.ports);
+    await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
     return removedAttachment;
   }
 
@@ -1186,6 +1193,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const removedAttachment = this.registry.removeComposeAttachment(attachmentId);
     await this.removeComposeRouteProcesses(attachment, attachment.ports);
+    await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
     return removedAttachment;
   }
 
@@ -1606,6 +1614,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.writeHostAccessBindingsFile();
     await this.reconcileComposeAttachmentPublishedPorts();
     await this.writeComposeProjectRoutingFile();
+    await this.writeTerminalNetworkSelectionFile();
     await this.restorePersistedComposeRoutesIfMissing();
     await this.syncLogicalPortRouters();
   }
@@ -1893,6 +1902,7 @@ export class PortManagerNetworkService implements DisposableLike {
     ]);
     await this.reconcileComposeAttachmentPublishedPorts().catch(() => undefined);
     await this.convergeDaemonAndRoutingState();
+    await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
   }
 
   /**
@@ -2649,6 +2659,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     await this.collectMatchingFiles(this.context.globalStorageUri.fsPath, (entryName) =>
       entryName === COMPOSE_PROJECT_ROUTING_FILE_NAME ||
+      entryName === TERMINAL_NETWORK_SELECTION_FILE_NAME ||
       (entryName.startsWith(COMPOSE_PROJECT_ROUTING_FILE_PREFIX) && entryName.endsWith(".tsv")),
     ).then((paths) => paths.forEach((filePath) => filePaths.add(filePath)));
 
@@ -2690,6 +2701,7 @@ export class PortManagerNetworkService implements DisposableLike {
   ): Promise<RoutingFileCleanupSummary> {
     await this.writeHostAccessBindingsFile().catch(() => undefined);
     await this.writeComposeProjectRoutingFile().catch(() => undefined);
+    await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
 
     const restoredComposeRouteCount =
       this.processService === undefined ? 0 : attachments.reduce((sum, attachment) => sum + attachment.ports.length, 0);
@@ -2929,6 +2941,28 @@ export class PortManagerNetworkService implements DisposableLike {
    * injection, keeping external terminals on the full native-hook path.
    */
   private async writeTerminalNetworkSelectionFile(): Promise<void> {
+    if (this.terminalNetworkSelectionWriteInFlight !== undefined) {
+      this.terminalNetworkSelectionWriteQueued = true;
+      return this.terminalNetworkSelectionWriteInFlight;
+    }
+
+    this.terminalNetworkSelectionWriteInFlight = this.writeTerminalNetworkSelectionFileSerially().finally(() => {
+      this.terminalNetworkSelectionWriteInFlight = undefined;
+    });
+
+    return this.terminalNetworkSelectionWriteInFlight;
+  }
+
+  /** Re-runs if another registry/process event arrived while the previous TSV was being written. */
+  private async writeTerminalNetworkSelectionFileSerially(): Promise<void> {
+    do {
+      this.terminalNetworkSelectionWriteQueued = false;
+      await this.writeTerminalNetworkSelectionFileExclusive();
+    } while (this.terminalNetworkSelectionWriteQueued);
+  }
+
+  /** Writes the latest terminal network picker rows with an atomic replace. */
+  private async writeTerminalNetworkSelectionFileExclusive(): Promise<void> {
     const settings = readPortManagerSettings();
     const snapshot = this.registry.getSnapshot();
     const rows = snapshot.networks.map((network) => {
@@ -2943,7 +2977,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const filePath = this.getTerminalNetworkSelectionFilePath();
 
     await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.writeFile(filePath, rows.length === 0 ? "" : `${rows.join("\n")}\n`, "utf8");
+    await writeTextFileAtomically(filePath, rows.length === 0 ? "" : `${rows.join("\n")}\n`);
   }
 
   /** Builds a one-line command that makes later child processes join one logical network scope. */
@@ -3442,13 +3476,15 @@ function buildComposeProjectRoutingRows(
     }
 
     const routingFiles = splitGeneratedComposeRoutingFiles(mutation.composeFiles);
-    const containerMappings =
-      mutation.containerMappings ??
-      inferContainerMappingsFromComposeRoutingFiles({
-        attachedProjectName: mutation.attachedProjectName,
-        composeFiles: mutation.composeFiles,
-        serviceNames: mutation.services,
-      });
+    const inferredContainerMappings = inferContainerMappingsFromComposeRoutingFiles({
+      attachedProjectName: mutation.attachedProjectName,
+      composeFiles: mutation.composeFiles,
+      serviceNames: mutation.services,
+    });
+    const containerMappings = mergeComposeRoutingContainerMappings(
+      mutation.containerMappings ?? [],
+      inferredContainerMappings,
+    );
 
     return [
       {
@@ -3463,6 +3499,17 @@ function buildComposeProjectRoutingRows(
       },
     ];
   });
+}
+
+function mergeComposeRoutingContainerMappings(
+  primaryMappings: readonly ComposeContainerMutationMapping[],
+  fallbackMappings: readonly ComposeContainerMutationMapping[],
+): readonly ComposeContainerMutationMapping[] {
+  const serviceNames = new Set(primaryMappings.map((mapping) => mapping.serviceName));
+  return [
+    ...primaryMappings,
+    ...fallbackMappings.filter((mapping) => !serviceNames.has(mapping.serviceName)),
+  ];
 }
 
 function composeAttachmentRuntimes(attachment: ComposeAttachment): ReadonlyArray<"docker" | "podman"> {
@@ -3843,21 +3890,17 @@ function buildTerminalNetworkServiceSummary(
   };
 
   for (const attachment of snapshot.composeAttachments.filter(
-    (item) => item.networkId === networkId && item.status === "attached",
+    (item) => item.networkId === networkId && (item.status === "attached" || item.status === "error"),
   )) {
     if (isContainerStyleComposeAttachment(attachment)) {
       for (const containerName of composeAttachmentContainerNames(attachment)) {
-        addEntry(`container: ${containerName}`);
+        addEntry(formatTerminalNetworkServiceEntry("container", containerName, undefined, attachment.status));
       }
       continue;
     }
 
     const workingDirectory = composeAttachmentWorkingDirectory(attachment);
-    addEntry(
-      workingDirectory === undefined
-        ? `compose: ${attachment.projectName}`
-        : `compose: ${attachment.projectName} (${workingDirectory})`,
-    );
+    addEntry(formatTerminalNetworkServiceEntry("compose", attachment.projectName, workingDirectory, attachment.status));
   }
 
   if (entries.length === 0) {
@@ -3881,6 +3924,17 @@ function composeAttachmentContainerNames(attachment: ComposeAttachment): readonl
   return names.length > 0 ? names : [attachment.projectName];
 }
 
+function formatTerminalNetworkServiceEntry(
+  kind: "compose" | "container",
+  name: string,
+  workingDirectory: string | undefined,
+  status: ComposeAttachment["status"],
+): string {
+  const location = workingDirectory === undefined ? "" : ` (${workingDirectory})`;
+  const statusSuffix = status === "attached" ? "" : ` [${status}]`;
+  return `${kind}: ${name}${location}${statusSuffix}`;
+}
+
 /** Serializes one shell-readable network picker row as id, name, attach script, and visible services. */
 function serializeTerminalNetworkSelectionRow(
   networkId: string,
@@ -3893,6 +3947,16 @@ function serializeTerminalNetworkSelectionRow(
 
 function serializeTerminalNetworkSelectionCell(value: string): string {
   return value.replace(/[\t\r\n]/g, " ").trim();
+}
+
+async function writeTextFileAtomically(filePath: string, contents: string): Promise<void> {
+  const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+
+  await fs.writeFile(tempPath, contents, "utf8");
+  await fs.rename(tempPath, filePath).catch(async (error) => {
+    await fs.rm(tempPath, { force: true }).catch(() => undefined);
+    throw error;
+  });
 }
 
 /**

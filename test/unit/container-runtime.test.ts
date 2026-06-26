@@ -943,6 +943,8 @@ test("mutates compose services into a hidden network-scoped project", async (con
     "compose",
     "container",
     "container",
+    "container",
+    "container",
   ]);
   assert.deepEqual(calls[0]?.args, ["compose", "-p", "workspace", "-f", composeFile, "config", "--services"]);
   assert.deepEqual(calls[9]?.args.slice(0, 8), [
@@ -961,7 +963,7 @@ test("mutates compose services into a hidden network-scoped project", async (con
   assert.equal(calls[4]?.cwd, tempDir);
 });
 
-test("copy mode creates stopped compose services in the hidden project", async (context) => {
+test("copy mode creates stopped langgraph_server discovered from compose ps", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-copy-stopped-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
   const composeFile = path.join(tempDir, "compose.yaml");
@@ -972,9 +974,11 @@ test("copy mode creates stopped compose services in the hidden project", async (
       "services:",
       "  db:",
       "    image: postgres:16",
-      "  worker:",
+      "  langgraph_server:",
       "    image: busybox",
       "    command: sleep 3600",
+      "    ports:",
+      "      - 9002:9002",
       "",
     ].join("\n"),
     "utf8",
@@ -982,21 +986,27 @@ test("copy mode creates stopped compose services in the hidden project", async (
 
   const calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
   let targetStarted = false;
+  let targetCreated = false;
   const mutator = new ComposePublishMutator({
     storageDirectory: tempDir,
     runCommand: async (executable, args) => {
       calls.push({ executable, args });
       if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
-        return { stdout: "db\nworker\n", stderr: "" };
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (args[0] === "compose" && args.includes("ps") && args.includes("--all") && args.includes("--services")) {
+        return { stdout: "db\nlanggraph_server\n", stderr: "" };
       }
       if (args[0] === "compose" && args.includes("up") && args.includes("db")) {
         targetStarted = true;
         return { stdout: "", stderr: "" };
       }
-      if (args[0] === "compose" && args.includes("create") && args.includes("worker")) {
+      if (args[0] === "compose" && args.includes("create") && args.includes("langgraph_server")) {
+        targetCreated = true;
         return { stdout: "", stderr: "" };
       }
       if (args[0] === "container" && args[1] === "ls") {
+        const includeStopped = args.includes("--all");
         const sourceRows = [
           {
             ID: "source-db",
@@ -1005,13 +1015,17 @@ test("copy mode creates stopped compose services in the hidden project", async (
             Ports: "127.0.0.1:15432->5432/tcp",
             Labels: "com.docker.compose.project=workspace,com.docker.compose.service=db",
           },
-          {
-            ID: "source-worker",
-            Names: "workspace_worker_1",
-            Status: "Exited (0) 1 minute ago",
-            Ports: "",
-            Labels: "",
-          },
+          ...(includeStopped
+            ? [
+                {
+                  ID: "source-worker",
+                  Names: "workspace_langgraph_server_1",
+                  Status: "Exited (0) 1 minute ago",
+                  Ports: "127.0.0.1:19002->9002/tcp",
+                  Labels: "com.docker.compose.project=workspace,com.docker.compose.service=langgraph_server",
+                },
+              ]
+            : []),
         ];
         const targetRows = targetStarted
           ? [
@@ -1022,27 +1036,37 @@ test("copy mode creates stopped compose services in the hidden project", async (
                 Ports: "127.0.0.1:57001->5432/tcp",
                 Labels: "com.docker.compose.project=copy-stack,com.docker.compose.service=db",
               },
-              {
-                ID: "target-worker",
-                Names: "copy_stack_worker_1",
-                Status: "Created",
-                Ports: "",
-                Labels: "com.docker.compose.project=copy-stack,com.docker.compose.service=worker",
-              },
+              ...(targetCreated && includeStopped
+                ? [
+                    {
+                      ID: "target-worker",
+                      Names: "copy_stack_langgraph_server_1",
+                      Status: "Created",
+                      Ports: "127.0.0.1:57002->9002/tcp",
+                      Labels: "com.docker.compose.project=copy-stack,com.docker.compose.service=langgraph_server",
+                    },
+                  ]
+                : []),
             ]
           : [];
         return { stdout: [...sourceRows, ...targetRows].map((row) => JSON.stringify(row)).join("\n"), stderr: "" };
       }
       if (args[0] === "container" && args[1] === "inspect") {
+        const containerNames = new Map([
+          ["source-db", "workspace_db_1"],
+          ["source-worker", "workspace_langgraph_server_1"],
+          ["target-db", "copy_stack_db_1"],
+          ["target-worker", "copy_stack_langgraph_server_1"],
+        ]);
         return {
           stdout: JSON.stringify(
             args.slice(2).map((id) => ({
               Id: id,
-              Name: `/${id}`,
+              Name: `/${containerNames.get(id) ?? id}`,
               Config: {
                 Labels: {
                   "com.docker.compose.project": id.startsWith("target") ? "copy-stack" : "workspace",
-                  "com.docker.compose.service": id.includes("worker") ? "worker" : "db",
+                  "com.docker.compose.service": id.includes("worker") ? "langgraph_server" : "db",
                 },
               },
               Mounts: [],
@@ -1075,15 +1099,42 @@ test("copy mode creates stopped compose services in the hidden project", async (
         protocol: "tcp",
         protocolName: "postgresql",
       },
+      {
+        serviceName: "langgraph_server",
+        logicalPort: 9002,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 19002,
+        containerPort: 9002,
+        protocol: "tcp",
+      },
     ],
   });
 
   assert.equal(result.state.mode, "copy");
-  assert.deepEqual(result.state.services, ["db", "worker"]);
+  assert.deepEqual(result.state.services, ["db", "langgraph_server"]);
   assert.ok(calls.some((call) => call.args.includes("up") && call.args.includes("db")));
-  assert.ok(calls.some((call) => call.args.includes("create") && call.args.includes("worker")));
+  assert.equal(calls.some((call) => call.args.includes("up") && call.args.includes("langgraph_server")), false);
+  assert.ok(calls.some((call) => call.args.includes("create") && call.args.includes("langgraph_server")));
+  assert.ok(calls.some((call) => call.args[0] === "container" && call.args[1] === "ls" && call.args.includes("--all")));
   assert.equal(calls.some((call) => call.args.includes("stop") && call.args.includes("workspace")), false);
+  assert.deepEqual(result.state.containerMappings, [
+    {
+      serviceName: "db",
+      originalContainerId: "source-db",
+      originalContainerName: "workspace_db_1",
+      attachedContainerId: "target-db",
+      attachedContainerName: "copy_stack_db_1",
+    },
+    {
+      serviceName: "langgraph_server",
+      originalContainerId: "source-worker",
+      originalContainerName: "workspace_langgraph_server_1",
+      attachedContainerId: "target-worker",
+      attachedContainerName: "copy_stack_langgraph_server_1",
+    },
+  ]);
   assert.equal(result.ports[0]?.actualHostPort, 57001);
+  assert.equal(result.ports[1], undefined);
 });
 
 test("copies an existing compose clone without stacking the network-scoped project name", async (context) => {
@@ -1611,15 +1662,26 @@ test("separates generated compose clone project names by logical network identit
       }
       if (args[0] === "container" && args[1] === "ls") {
         containerListCount += 1;
-        const isSourceList = containerListCount % 2 === 1;
-        const composeProject = isSourceList ? "workspace" : lastStartedProject;
+        const rows = [
+          {
+            ID: `source${containerListCount}`,
+            Names: "workspace-postgres-1",
+            Ports: "127.0.0.1:15432->5432/tcp",
+            Labels: "com.docker.compose.project=workspace,com.docker.compose.service=postgres",
+          },
+          ...(lastStartedProject.length > 0
+            ? [
+                {
+                  ID: `hidden${containerListCount}`,
+                  Names: `${lastStartedProject}-postgres-1`,
+                  Ports: `127.0.0.1:${57000 + containerListCount}->5432/tcp`,
+                  Labels: `com.docker.compose.project=${lastStartedProject},com.docker.compose.service=postgres`,
+                },
+              ]
+            : []),
+        ];
         return {
-          stdout: JSON.stringify({
-            ID: isSourceList ? `source${containerListCount}` : `hidden${containerListCount}`,
-            Names: `${composeProject}-postgres-1`,
-            Ports: `127.0.0.1:${isSourceList ? 15432 : 57000 + containerListCount}->5432/tcp`,
-            Labels: `com.docker.compose.project=${composeProject},com.docker.compose.service=postgres`,
-          }),
+          stdout: rows.map((row) => JSON.stringify(row)).join("\n"),
           stderr: "",
         };
       }
