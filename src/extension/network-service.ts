@@ -2344,13 +2344,16 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const snapshot = this.processService.getSnapshot();
     return attachments.some((attachment) =>
-      attachment.ports.some(
-        (port) =>
-          hasComposePublishedPortListener(snapshot.listeners, port) &&
-          (attachment.status !== "attached" ||
-            attachment.errorMessage !== undefined ||
-            !hasComposeRoute(snapshot.routes, attachment.networkId, port)),
-      ),
+      attachment.ports.some((port) => {
+        const hasRuntimeListener = hasComposePublishedPortListener(snapshot.listeners, attachment, port);
+        const hasRoute = hasComposeRoute(snapshot.routes, attachment.networkId, port);
+
+        if (!hasRuntimeListener) {
+          return hasRoute || port.processId !== undefined;
+        }
+
+        return attachment.status !== "attached" || attachment.errorMessage !== undefined || !hasRoute;
+      }),
     );
   }
 
@@ -2369,10 +2372,14 @@ export class PortManagerNetworkService implements DisposableLike {
         const cwd = composeAttachmentWorkingDirectory(attachment);
         const snapshot = this.processService.getSnapshot();
         for (const port of attachment.ports) {
-          if (
-            !hasComposePublishedPortListener(snapshot.listeners, port) &&
-            !hasComposeRoute(snapshot.routes, attachment.networkId, port)
-          ) {
+          const hasRuntimeListener = hasComposePublishedPortListener(snapshot.listeners, attachment, port);
+          const hasRoute = hasComposeRoute(snapshot.routes, attachment.networkId, port);
+
+          if (!hasRuntimeListener) {
+            if (hasRoute || port.processId !== undefined) {
+              await this.removeComposeRouteProcesses(attachment, [port]);
+            }
+
             ports.push(dropComposeProcessId(port));
             continue;
           }
@@ -2446,7 +2453,7 @@ export class PortManagerNetworkService implements DisposableLike {
       const cwdRoute =
         clientProcess?.cwd === undefined
           ? undefined
-          : this.findClientCwdRouteForRouter(connection.logicalPort, clientProcess.cwd, processRows);
+          : this.findClientCwdRouteForRouter(connection.logicalPort, clientProcess.cwd);
 
       if (cwdRoute !== undefined) {
         return {
@@ -2455,7 +2462,7 @@ export class PortManagerNetworkService implements DisposableLike {
         };
       }
 
-      const uniqueRoute = await this.findUniqueRouteForRouter(connection.logicalPort, processRows);
+      const uniqueRoute = await this.findUniqueRouteForRouter(connection.logicalPort);
       if (uniqueRoute === undefined) {
         throw new Error(`No attached logical network found for localhost:${connection.logicalPort} client.`);
       }
@@ -2580,7 +2587,6 @@ export class PortManagerNetworkService implements DisposableLike {
    */
   private async findUniqueRouteForRouter(
     logicalPort: number,
-    processRows: readonly ProcessTableRow[],
   ): Promise<LogicalPortRoute | undefined> {
     if (this.processService === undefined) {
       return undefined;
@@ -2598,7 +2604,7 @@ export class PortManagerNetworkService implements DisposableLike {
       return candidates[0];
     }
 
-    return this.findSingleAttachedRouteForRouter(candidates, snapshot.processes, processRows);
+    return undefined;
   }
 
   /**
@@ -2609,7 +2615,6 @@ export class PortManagerNetworkService implements DisposableLike {
   private findClientCwdRouteForRouter(
     logicalPort: number,
     clientCwd: string,
-    processRows: readonly ProcessTableRow[],
   ): LogicalPortRoute | undefined {
     if (this.processService === undefined) {
       return undefined;
@@ -2622,42 +2627,7 @@ export class PortManagerNetworkService implements DisposableLike {
       return candidates[0];
     }
 
-    return this.findSingleAttachedRouteForRouter(candidates, snapshot.processes, processRows);
-  }
-
-  /**
-   * Falls back to the only attached network candidate when a host-side client
-   * cannot be mapped back to a terminal PID. This keeps launcher chains that
-   * briefly lose hook metadata from failing just because stale rows from another
-   * network still exist in the daemon snapshot.
-   */
-  private findSingleAttachedRouteForRouter(
-    candidates: readonly LogicalPortRoute[],
-    processes: readonly ManagedProcess[],
-    processRows: readonly ProcessTableRow[],
-  ): LogicalPortRoute | undefined {
-    const attachedNetworkIds = new Set(
-      this.registry
-        .getSnapshot()
-        .attachments.filter((attachment) => attachment.status === "attached")
-        .map((attachment) => attachment.networkId),
-    );
-    const candidateByNetworkId = new Map<string, LogicalPortRoute>();
-
-    for (const route of candidates) {
-      const process =
-        route.processId === undefined ? undefined : processes.find((item) => item.id === route.processId);
-      const routeNetworkId =
-        route.networkId ??
-        process?.networkId ??
-        (process === undefined ? undefined : this.findAttachedNetworkForPid(process.pid, processRows));
-
-      if (routeNetworkId !== undefined && attachedNetworkIds.has(routeNetworkId)) {
-        candidateByNetworkId.set(routeNetworkId, route);
-      }
-    }
-
-    return candidateByNetworkId.size === 1 ? [...candidateByNetworkId.values()][0] : undefined;
+    return undefined;
   }
 
   /** Maps an arbitrary process PID back to the network label attached to its process tree. */
@@ -3702,6 +3672,7 @@ function hasComposeRoute(
 /** True when Docker/Podman still exposes the host-side endpoint for a compose route. */
 function hasComposePublishedPortListener(
   listeners: readonly ListeningPort[],
+  attachment: ComposeAttachment,
   port: ComposePublishedPort,
 ): boolean {
   if (port.protocol !== "tcp") {
@@ -3712,7 +3683,34 @@ function hasComposePublishedPortListener(
     (listener) =>
       listener.protocol === "tcp" &&
       listener.port === port.actualHostPort &&
-      listenerAddressMatchesHost(listener.localAddress, port.actualHostAddress),
+      listenerAddressMatchesHost(listener.localAddress, port.actualHostAddress) &&
+      isComposeRuntimeListener(listener, attachment.runtime ?? attachment.mutation?.runtime),
+  );
+}
+
+function isComposeRuntimeListener(listener: ListeningPort, runtime: "docker" | "podman" | undefined): boolean {
+  const owner = `${listener.processName ?? ""} ${listener.command ?? ""}`.toLowerCase();
+
+  if (owner.trim().length === 0) {
+    return false;
+  }
+
+  if (runtime === "docker") {
+    return owner.includes("docker") || owner.includes("vpnkit");
+  }
+
+  if (runtime === "podman") {
+    return owner.includes("podman") || owner.includes("gvproxy") || owner.includes("conmon");
+  }
+
+  return (
+    owner.includes("docker") ||
+    owner.includes("podman") ||
+    owner.includes("vpnkit") ||
+    owner.includes("gvproxy") ||
+    owner.includes("conmon") ||
+    owner.includes("rootlesskit") ||
+    owner.includes("slirp4netns")
   );
 }
 
@@ -4767,7 +4765,7 @@ function buildTerminalAttachmentMarkerRemoveShell(): string {
     'rm -f "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR/$__pm_marker_key.tsv" 2>/dev/null || true',
     "unset __pm_tty __pm_pid __pm_marker_key",
     "fi",
-  ].join("; ");
+  ].join("\n");
 }
 
 function shellExport(name: string, value: string): string {

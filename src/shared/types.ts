@@ -778,6 +778,16 @@ export interface RegisteredProcessInput {
   readonly source?: "registered" | "hooked" | "compose";
 }
 
+export interface HookRouteRecoveryProvider {
+  /**
+   * Reconstructs a hook-owned route for a live OS listener after the agent has
+   * restarted and lost its in-memory registry. Implementations belong to the
+   * platform layer because they inspect another process's command line,
+   * environment, or working directory.
+   */
+  recoverHookRoute(listener: ListeningPort): Promise<RegisteredProcessInput | undefined>;
+}
+
 export interface ManagedProcessStartInput {
   /** User-facing process name. */
   readonly name: string;

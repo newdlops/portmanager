@@ -17,6 +17,7 @@ import type {
   AgentStartManagedProcessRequest,
   DisposableLike,
   AgentDaemonStatus,
+  HookRouteRecoveryProvider,
   LogicalPortRouteDirection,
   LogicalPortRoute,
   ListeningPort,
@@ -56,6 +57,7 @@ const DEFAULT_LISTENER_SCAN_INTERVAL_MS = 60_000;
 const DEFAULT_LISTENER_SCAN_CACHE_TTL_MS = 1_000;
 const DEFAULT_EXTERNAL_LISTENER_GRACE_MS = 60_000;
 const DEFAULT_EXTERNAL_LISTENER_MISSING_SCAN_THRESHOLD = 3;
+const HOOK_ROUTE_RECOVERY_MISS_TTL_MS = 60_000;
 const ROUTE_ALLOCATION_TTL_MS = 30_000;
 
 export interface PortManagerAgentOptions {
@@ -67,6 +69,8 @@ export interface PortManagerAgentOptions {
   readonly portAvailabilityProvider?: PortAvailabilityProvider;
   /** Full listening-port table provider for snapshot generation. */
   readonly listeningPortProvider: ListeningPortProvider;
+  /** Best-effort recovery for hook-owned listeners after daemon restart. */
+  readonly hookRouteRecoveryProvider?: HookRouteRecoveryProvider;
   /** Optional prebuilt router, useful for tests that fake routing behavior. */
   readonly routingService?: PortRoutingService;
   /** Agent PID exposed in snapshots; injectable to keep tests deterministic. */
@@ -179,6 +183,9 @@ export class PortManagerAgent implements DisposableLike {
   /** Provider used to merge all OS-level listeners into each snapshot. */
   private readonly listeningPortProvider: ListeningPortProvider;
 
+  /** Reconstructs hook rows from live listener process metadata after restart. */
+  private readonly hookRouteRecoveryProvider: HookRouteRecoveryProvider | undefined;
+
   /** Saved profiles keyed by registry id; these are required for restart. */
   private readonly launchProfilesByProcessId = new Map<string, AgentStartManagedProcessRequest>();
 
@@ -254,6 +261,9 @@ export class PortManagerAgent implements DisposableLike {
   /** Background cleanup state for hook/manual rows absent from OS scans. */
   private readonly missingListenerStateByProcessId = new Map<string, MissingExternalListenerState>();
 
+  /** Listener keys that recently lacked hook metadata, avoiding repeated ps reads. */
+  private readonly hookRouteRecoveryMissesByListenerKey = new Map<string, number>();
+
   /** Last broadcast signature, used to skip unchanged polling updates. */
   private lastSnapshotSignature = "";
 
@@ -278,6 +288,7 @@ export class PortManagerAgent implements DisposableLike {
       });
     this.processLauncher = options.processLauncher;
     this.listeningPortProvider = options.listeningPortProvider;
+    this.hookRouteRecoveryProvider = options.hookRouteRecoveryProvider;
     const portAvailabilityProvider = options.portAvailabilityProvider;
     this.routingService =
       options.routingService ??
@@ -1042,6 +1053,7 @@ export class PortManagerAgent implements DisposableLike {
     });
     this.updateReservedListeningPorts(listeners);
     this.cleanupExpiredRouteAllocations(this.reservedListeningPorts);
+    await this.recoverHookRoutesFromListeners(listeners);
     if (options.reconcileExternalListeners === true) {
       this.reconcileRegisteredProcessesWithListeners(listeners);
     }
@@ -1108,6 +1120,42 @@ export class PortManagerAgent implements DisposableLike {
   private buildCurrentLogicalRoutes(): readonly LogicalPortRoute[] {
     this.cleanupExpiredRouteAllocations();
     return buildLogicalRoutes(this.registry.list(), this.listPendingRoutes());
+  }
+
+  /**
+   * Rehydrates hook-owned rows after the daemon restarts. Running app servers do
+   * not know the in-memory registry disappeared, so the agent reconstructs the
+   * logical requestedPort -> actualPort mapping from live listener metadata.
+   */
+  private async recoverHookRoutesFromListeners(listeners: readonly ListeningPort[]): Promise<void> {
+    if (this.hookRouteRecoveryProvider === undefined) {
+      return;
+    }
+
+    const trackedListenerKeys = new Set(buildActiveTrackedListenerKeys(this.registry.list()));
+    const nowMs = this.now().getTime();
+
+    for (const listener of listeners) {
+      const listenerKey = buildListenerKey(listener.pid, listener.port);
+      if (listener.pid === undefined || trackedListenerKeys.has(listenerKey)) {
+        continue;
+      }
+
+      const missExpiresAtMs = this.hookRouteRecoveryMissesByListenerKey.get(listenerKey);
+      if (missExpiresAtMs !== undefined && missExpiresAtMs > nowMs) {
+        continue;
+      }
+
+      const recoveredInput = await this.hookRouteRecoveryProvider.recoverHookRoute(listener).catch(() => undefined);
+      if (recoveredInput === undefined) {
+        this.hookRouteRecoveryMissesByListenerKey.set(listenerKey, nowMs + HOOK_ROUTE_RECOVERY_MISS_TTL_MS);
+        continue;
+      }
+
+      this.upsertRegisteredProcess(recoveredInput, "hooked");
+      this.hookRouteRecoveryMissesByListenerKey.delete(listenerKey);
+      trackedListenerKeys.add(listenerKey);
+    }
   }
 
   /** Lists pending route rows in a stable order for snapshots and env payloads. */

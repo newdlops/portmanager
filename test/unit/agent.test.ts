@@ -76,6 +76,72 @@ test("registers native hook processes as hooked managed rows", async (context) =
   listeners = [];
 });
 
+test("recovers hooked routes from live listeners after daemon restart", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const listeners: readonly ListeningPort[] = [
+    createListener({
+      id: "tcp:127.0.0.1:57282:64255",
+      port: 57282,
+      pid: 64255,
+      processName: "python3.11",
+      command: "python3.11",
+    }),
+  ];
+  let recoverCalls = 0;
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    hookRouteRecoveryProvider: {
+      recoverHookRoute: async (listener) => {
+        recoverCalls += 1;
+        return {
+          pid: listener.pid ?? 0,
+          name: listener.processName ?? "python3",
+          command: "python manage.py runserver 8004",
+          cwd: "/workspace/app",
+          requestedPort: 8004,
+          actualPort: listener.port,
+          host: "127.0.0.1",
+          networkId: "network-a",
+          source: "hooked",
+        };
+      },
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const snapshot = await agent.refreshSnapshot();
+  const secondSnapshot = await agent.refreshSnapshot();
+  const networkRouteTable = readRouteTable(getNetworkRouteTablePath("network-a", routeTablePath));
+  const routeEntryTable = readRouteTable(getRouteTablePathForLogicalPort(8004, "network-a", routeTablePath));
+
+  assert.equal(recoverCalls, 1);
+  assert.equal(snapshot.processes[0]?.source, "hooked");
+  assert.equal(secondSnapshot.routes.length, 1);
+  assert.deepEqual(snapshot.routes, [
+    {
+      logicalPort: 8004,
+      actualPort: 57282,
+      routeDirection: "listen",
+      host: "127.0.0.1",
+      cwd: "/workspace/app",
+      networkId: "network-a",
+      processId: snapshot.processes[0]?.id,
+      processName: "python3.11",
+      status: "running",
+      source: "hooked",
+    },
+  ]);
+  assert.deepEqual(networkRouteTable.routes, snapshot.routes);
+  assert.deepEqual(routeEntryTable.routes, snapshot.routes);
+});
+
 test("releases hooked process routes and removes endpoint files when the owner exits", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   let listeners: readonly ListeningPort[] = [

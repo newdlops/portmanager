@@ -83,6 +83,16 @@ test("terminal attach and detach commands source generated script files", () => 
     false,
     "terminal injection must not inline the full bootstrap as one long command",
   );
+  assert.equal(
+    source.includes("buildTerminalAttachmentMarkerRemoveShell(): string"),
+    true,
+    "detach script must remove the shell marker through a generated helper",
+  );
+  assert.equal(
+    source.includes('].join("\\n");'),
+    true,
+    "detach marker removal must be multiline so `then` is not followed by an invalid semicolon",
+  );
 });
 
 test("external pm shell function selects a network and sources its attach script", () => {
@@ -349,8 +359,10 @@ test("compose route rehydration retries recoverable error attachments after rest
   );
   assert.equal(source.includes("attachment.errorMessage !== undefined"), true);
   assert.equal(source.includes("function hasComposePublishedPortListener"), true);
-  assert.equal(source.includes("hasComposePublishedPortListener(snapshot.listeners, port)"), true);
-  assert.equal(source.includes("!hasComposePublishedPortListener(snapshot.listeners, port)"), true);
+  assert.equal(source.includes("function isComposeRuntimeListener"), true);
+  assert.equal(source.includes("hasComposePublishedPortListener(snapshot.listeners, attachment, port)"), true);
+  assert.equal(source.includes("const hasRuntimeListener = hasComposePublishedPortListener"), true);
+  assert.equal(source.includes("await this.removeComposeRouteProcesses(attachment, [port]);"), true);
 });
 
 test("terminal attach script enables loopback routing only after alias readiness", () => {
@@ -408,6 +420,9 @@ test("logical router classifies clients by process tree label before hook enviro
   const uniqueRouteStart = source.indexOf("private async findUniqueRouteForRouter");
   const uniqueRouteEnd = source.indexOf("private findClientCwdRouteForRouter", uniqueRouteStart);
   const findUniqueRouteForRouter = source.slice(uniqueRouteStart, uniqueRouteEnd);
+  const cwdRouteStart = source.indexOf("private findClientCwdRouteForRouter");
+  const cwdRouteEnd = source.indexOf("private findAttachedNetworkForPid", cwdRouteStart);
+  const findClientCwdRouteForRouter = source.slice(cwdRouteStart, cwdRouteEnd);
 
   assert.equal(source.includes('from "../core/process-network-labels"'), true);
   assert.equal(
@@ -420,4 +435,11 @@ test("logical router classifies clients by process tree label before hook enviro
   assert.equal(source.includes("including a Compose route"), true);
   assert.equal(findUniqueRouteForRouter.includes("candidates.filter((route) => !isNetworkScopedComposeRoute(route))"), false);
   assert.equal(source.includes("function isNetworkScopedComposeRoute"), false);
+  assert.equal(source.includes("findSingleAttachedRouteForRouter"), false);
+  assert.equal(findUniqueRouteForRouter.includes("return undefined;"), true);
+  assert.equal(findClientCwdRouteForRouter.includes("return undefined;"), true);
+  assert.equal(
+    findClientCwdRouteForRouter.includes(".attachments.filter((attachment) => attachment.status === \"attached\")"),
+    false,
+  );
 });

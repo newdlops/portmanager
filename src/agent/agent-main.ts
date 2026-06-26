@@ -1,5 +1,6 @@
 import { NodePortScanner } from "../platform/ports/node-port-scanner";
 import { NodeListeningPortProvider } from "../platform/ports/node-listening-port-provider";
+import { NodeProcessEnvironmentProvider } from "../platform/process/node-process-environment";
 import { NodeProcessLauncher } from "../platform/process/node-process-launcher";
 import { disableNativeHookForCurrentProcess } from "../platform/process/node-runtime";
 import { PortManagerAgent } from "./port-manager-agent";
@@ -31,6 +32,7 @@ async function main(args: readonly string[]): Promise<void> {
       processLauncher: new NodeProcessLauncher(),
       portAvailabilityProvider: new NodePortScanner(),
       listeningPortProvider: new NodeListeningPortProvider(),
+      hookRouteRecoveryProvider: new NodeProcessEnvironmentProvider(),
       routeTablePath: process.env.PORT_MANAGER_ROUTES_FILE,
       agentMainPath: __filename,
     });

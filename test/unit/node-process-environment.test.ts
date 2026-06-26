@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  inferRequestedPortFromCommand,
   NodeProcessEnvironmentProvider,
   parseRoutingNetworkIdFromProcessEnvironment,
 } from "../../src/platform/process/node-process-environment";
+import type { ListeningPort } from "../../src/shared/types";
 
 /**
  * Unit tests for extracting native-hook routing scope from process metadata.
@@ -66,6 +68,94 @@ test("coalesces concurrent process environment reads for the same PID", async ()
   assert.equal(calls, 1);
 });
 
+test("infers requested ports from common server command lines", () => {
+  assert.equal(inferRequestedPortFromCommand("python manage.py runserver 8004", 57282), 8004);
+  assert.equal(inferRequestedPortFromCommand("vite --host --port=3004", 57291), 3004);
+  assert.equal(inferRequestedPortFromCommand("node server.js --listen-port 9000", 58000), 9000);
+});
+
+test("recovers hook route registration from listener process metadata", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  const listener = createListener({
+    port: 57282,
+    pid: 64255,
+    processName: "python3.11",
+  });
+  const provider = new NodeProcessEnvironmentProvider({
+    nativeLookupProvider: {
+      inspectProcess: async () => ({
+        ancestorPids: [],
+        cwd: "/workspace/app",
+        networkId: "network-a",
+      }),
+    },
+    commandRunner: async (_file, args) => {
+      if (args.includes("eww")) {
+        return {
+          stdout:
+            "64255 s003 python3 manage.py runserver 8004 PORT_MANAGER_HOOK=1 PORT_MANAGER_NETWORK_ID=network-a PWD=/workspace/app",
+        };
+      }
+
+      return {
+        stdout: "python3 manage.py runserver 8004\n",
+      };
+    },
+  });
+
+  const recovered = await provider.recoverHookRoute(listener);
+
+  assert.deepEqual(recovered, {
+    pid: 64255,
+    name: "python3.11",
+    command: "python3 manage.py runserver 8004",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    actualPort: 57282,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+});
+
+test("does not recover debug adapter helper listeners as app routes", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  const listener = createListener({
+    port: 56474,
+    pid: 82648,
+    processName: "python3.11",
+  });
+  const provider = new NodeProcessEnvironmentProvider({
+    nativeLookupProvider: {
+      inspectProcess: async () => ({
+        ancestorPids: [],
+        cwd: "/workspace/app",
+        networkId: "network-a",
+      }),
+    },
+    commandRunner: async (_file, args) => {
+      if (args.includes("eww")) {
+        return {
+          stdout:
+            "82648 s001 python debugpy/adapter --for-server 56469 PORT_MANAGER_HOOK=1 PORT_MANAGER_NETWORK_ID=network-a",
+        };
+      }
+
+      return {
+        stdout: "python .venv/lib/python3.11/site-packages/debugpy/adapter --for-server 56469 --port 0\n",
+      };
+    },
+  });
+
+  assert.equal(await provider.recoverHookRoute(listener), undefined);
+});
+
 function createDeferred<T>(): {
   readonly promise: Promise<T>;
   readonly resolve: (value: T) => void;
@@ -79,4 +169,19 @@ function createDeferred<T>(): {
   });
 
   return { promise, resolve, reject };
+}
+
+function createListener(overrides: Partial<ListeningPort> = {}): ListeningPort {
+  return {
+    id: "tcp:127.0.0.1:57282:64255",
+    protocol: "tcp",
+    localAddress: "127.0.0.1",
+    port: 57282,
+    pid: 64255,
+    processName: "python3.11",
+    command: "python3.11",
+    source: "external",
+    updatedAt: "2026-06-21T10:00:00.000Z",
+    ...overrides,
+  };
 }
