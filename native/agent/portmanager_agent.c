@@ -16,6 +16,7 @@
 #define PM_CLIENT_BUFFER 262144
 #define PM_LISTEN_BACKLOG 256
 #define PM_LISTENER_POLL_IDLE_GRACE_SECONDS 2
+#define PM_LISTENER_POLL_INTERVAL_SECONDS 60
 
 typedef struct {
   int fd;
@@ -567,7 +568,7 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
           }
         }
         pm_buffer_free(&signature);
-        next_poll = now + 3;
+        next_poll = now + PM_LISTENER_POLL_INTERVAL_SECONDS;
       }
     }
 

@@ -18,6 +18,13 @@
 #define PM_ROUTE_TTL_SECONDS 30
 #define PM_EXTERNAL_LISTENER_GRACE_SECONDS 2
 #define PM_EXTERNAL_LISTENER_MISSING_SCAN_THRESHOLD 2
+/*
+ * VS Code windows can request snapshots concurrently, and macOS lsof scans can
+ * be expensive when Docker Desktop is active. This cache keeps UI/background
+ * reads from spawning repeated lsof processes while state-changing paths below
+ * explicitly invalidate it before publishing the next snapshot.
+ */
+#define PM_LISTENER_SCAN_CACHE_SECONDS 60
 
 typedef struct {
   char *data;
@@ -98,6 +105,10 @@ typedef struct {
   char **written_entry_paths;
   size_t written_entry_count;
   size_t written_entry_capacity;
+  pm_listener *listener_cache_items;
+  size_t listener_cache_count;
+  time_t listener_cache_expires_at;
+  char listener_cache_updated_at[PM_TIME];
   char route_table_path[PM_TEXT];
   char agent_main_path[PM_TEXT];
   char started_at[PM_TIME];

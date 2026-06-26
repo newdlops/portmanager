@@ -196,7 +196,7 @@ test("background routing refresh polls terminals and containers", () => {
   assert.equal(source.includes("this.refreshContainerServices({ background: true }).catch(() => [])"), true);
   assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts({ background: true }).catch(() => undefined);"), true);
   assert.equal(source.includes("await this.convergeDaemonAndRoutingState();"), true);
-  assert.equal(source.includes("ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 3_000"), true);
+  assert.equal(source.includes("ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 60_000"), true);
   assert.equal(source.includes("BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS = 60_000"), true);
   assert.equal(source.includes("tryAcquireSharedBackgroundContainerRefreshSlot()"), true);
 });
@@ -232,12 +232,34 @@ test("background routing refresh converges daemon version and generated route fi
   assert.equal(convergeBody.includes("await this.writeHostAccessBindingsFile().catch(() => undefined);"), true);
   assert.equal(convergeBody.includes("await this.writeComposeProjectRoutingFile().catch(() => undefined);"), true);
   assert.equal(convergeBody.includes("await this.restorePersistedComposeRoutesIfMissing().catch(() => undefined);"), true);
+  assert.equal(convergeBody.includes("this.processService !== undefined && tryAcquireLogicalRouterOwnerLease()"), true);
   assert.equal(convergeBody.includes("await this.processService.refresh().catch(() => undefined);"), true);
   assert.equal(convergeBody.includes("await this.syncLogicalPortRouters().catch(() => undefined);"), true);
   assert.equal(ensureBody.includes('daemon.status !== "running"'), true);
   assert.equal(ensureBody.includes("await this.processService.start();"), true);
   assert.equal(ensureBody.includes("daemon.restartRequired"), true);
   assert.equal(ensureBody.includes("await this.processService.restartDaemon();"), true);
+});
+
+test("logical port routers use a single cross-window owner lease", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const syncStart = source.indexOf("private async syncLogicalPortRouters(): Promise<void>");
+  const syncEnd = source.indexOf("private async findClientNetworkForRouter", syncStart);
+  const syncBody = source.slice(syncStart, syncEnd);
+
+  assert.equal(source.includes("LOGICAL_ROUTER_OWNER_LEASE_MS = 15_000"), true);
+  assert.equal(source.includes("LOGICAL_ROUTER_OWNER_LOCK_STALE_MS = 30_000"), true);
+  assert.equal(source.includes('function buildLogicalRouterOwnerControlPath(kind: "owner" | "lock"): string'), true);
+  assert.equal(source.includes("function tryAcquireLogicalRouterOwnerLease(): boolean"), true);
+  assert.equal(source.includes("function isActiveLogicalRouterOwner"), true);
+  assert.equal(source.includes("return isProcessAlive(owner.pid);"), true);
+  assert.equal(syncBody.includes("this.logicalRouterSyncInFlight !== undefined"), true);
+  assert.equal(syncBody.includes("this.logicalRouterSyncQueued = true;"), true);
+  assert.equal(syncBody.includes("if (!tryAcquireLogicalRouterOwnerLease())"), true);
+  assert.equal(syncBody.includes("await this.logicalPortRouter.sync([]).catch(() => undefined);"), true);
+  assert.equal(syncBody.includes("await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);"), true);
+  assert.equal(source.includes("releaseLogicalRouterOwnerLease();"), true);
 });
 
 test("compose attach waits for routing convergence before returning", () => {
@@ -325,6 +347,9 @@ test("compose route rehydration retries recoverable error attachments after rest
     true,
   );
   assert.equal(source.includes("attachment.errorMessage !== undefined"), true);
+  assert.equal(source.includes("function hasComposePublishedPortListener"), true);
+  assert.equal(source.includes("hasComposePublishedPortListener(snapshot.listeners, port)"), true);
+  assert.equal(source.includes("!hasComposePublishedPortListener(snapshot.listeners, port)"), true);
 });
 
 test("terminal attach script enables loopback routing only after alias readiness", () => {
@@ -357,6 +382,9 @@ test("logical routers are opened only after logical routes are live", () => {
   const collectStart = source.indexOf("function collectLogicalRouterPorts");
   const collectEnd = source.indexOf("function isPortManagerLogicalRouterListener", collectStart);
   const collectLogicalRouterPorts = source.slice(collectStart, collectEnd);
+  const syncStart = source.indexOf("private async syncLogicalPortRoutersExclusive(): Promise<void>");
+  const syncEnd = source.indexOf("private async findClientNetworkForRouter", syncStart);
+  const syncBody = source.slice(syncStart, syncEnd);
 
   assert.equal(source.includes("collectLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? [])"), true);
   assert.equal(source.includes("pending allocations stay"), true);
@@ -364,8 +392,8 @@ test("logical routers are opened only after logical routes are live", () => {
   assert.equal(collectLogicalRouterPorts.includes("route.actualPort !== route.logicalPort"), true);
   assert.equal(collectLogicalRouterPorts.includes("!externallyOwnedPorts.has(route.logicalPort)"), true);
   assert.equal(
-    source.includes("await this.logicalPortRouter.sync([]).catch(() => undefined);"),
-    false,
+    syncBody.includes("await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);"),
+    true,
     "compose dependency clients such as Celery need a localhost TCP router fallback",
   );
 });

@@ -109,11 +109,15 @@ const TERMINAL_HOOK_SCRIPT_DIRECTORY_NAME = "terminal-hook-scripts";
 const TERMINAL_NETWORK_SELECTION_FILE_NAME = "terminal-networks.tsv";
 const MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX = "manual-terminal:";
 const PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX = "process-terminal:";
-const ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 3_000;
+const ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 60_000;
 const BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS = 60_000;
 const BACKGROUND_CONTAINER_REFRESH_LOCK_STALE_MS = 120_000;
 const BACKGROUND_CONTAINER_REFRESH_STAMP_PATH = buildBackgroundContainerRefreshControlPath("stamp");
 const BACKGROUND_CONTAINER_REFRESH_LOCK_PATH = buildBackgroundContainerRefreshControlPath("lock");
+const LOGICAL_ROUTER_OWNER_LEASE_MS = 15_000;
+const LOGICAL_ROUTER_OWNER_LOCK_STALE_MS = 30_000;
+const LOGICAL_ROUTER_OWNER_PATH = buildLogicalRouterOwnerControlPath("owner");
+const LOGICAL_ROUTER_OWNER_LOCK_PATH = buildLogicalRouterOwnerControlPath("lock");
 const DAEMON_RESTART_BACKOFF_MS = 30_000;
 const TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500;
 const TERMINAL_ATTACHMENT_REFRESH_DEBOUNCE_MS = 50;
@@ -147,6 +151,13 @@ interface BackgroundRefreshOptions {
   readonly background?: boolean;
   /** Internal flag used when one outer Docker refresh already owns the shared lock. */
   readonly sharedRefreshAcquired?: boolean;
+}
+
+interface LogicalRouterOwnerDocument {
+  /** Extension host process that currently owns localhost logical router children. */
+  readonly pid: number;
+  /** Lease renewal time; stale leases can be stolen by another active window. */
+  readonly updatedAt: string;
 }
 
 export interface RoutingFileCleanupSummary {
@@ -309,6 +320,12 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Guards daemon and routing-file convergence so refresh events cannot recurse. */
   private daemonConvergenceInFlight: Promise<void> | undefined;
+
+  /** Guards localhost router reconciliation so owner handoffs do not overlap in one host. */
+  private logicalRouterSyncInFlight: Promise<void> | undefined;
+
+  /** Requests one more router reconciliation after the current sync sees an older snapshot. */
+  private logicalRouterSyncQueued = false;
 
   /** Serializes terminal picker rewrites so stale snapshots cannot win the last write. */
   private terminalNetworkSelectionWriteInFlight: Promise<void> | undefined;
@@ -1612,6 +1629,7 @@ export class PortManagerNetworkService implements DisposableLike {
     this.localChangeEvents.clear();
     void this.proxyManager.dispose();
     this.logicalPortRouter.dispose();
+    releaseLogicalRouterOwnerLease();
   }
 
   /** Reads persisted logical network state from VS Code global storage. */
@@ -2015,11 +2033,12 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
     await this.restorePersistedComposeRoutesIfMissing().catch(() => undefined);
 
-    if (this.processService !== undefined) {
+    if (this.processService !== undefined && tryAcquireLogicalRouterOwnerLease()) {
       /*
        * The daemon refresh path rewrites its route-table files from the current
-       * snapshot, so deleted or stale route JSON files are healed without
-       * requiring a user-triggered sidebar refresh.
+       * snapshot. Only the cross-window router owner performs this expensive
+       * listener scan; other windows consume the agent's event snapshots and
+       * close any local routers they still own below.
        */
       await this.processService.refresh().catch(() => undefined);
     }
@@ -2321,11 +2340,15 @@ export class PortManagerNetworkService implements DisposableLike {
       return false;
     }
 
-    const routes = this.processService.getSnapshot().routes;
+    const snapshot = this.processService.getSnapshot();
     return attachments.some((attachment) =>
-      attachment.status !== "attached" ||
-      attachment.errorMessage !== undefined ||
-      attachment.ports.some((port) => !hasComposeRoute(routes, attachment.networkId, port)),
+      attachment.ports.some(
+        (port) =>
+          hasComposePublishedPortListener(snapshot.listeners, port) &&
+          (attachment.status !== "attached" ||
+            attachment.errorMessage !== undefined ||
+            !hasComposeRoute(snapshot.routes, attachment.networkId, port)),
+      ),
     );
   }
 
@@ -2342,7 +2365,16 @@ export class PortManagerNetworkService implements DisposableLike {
 
       try {
         const cwd = composeAttachmentWorkingDirectory(attachment);
+        const snapshot = this.processService.getSnapshot();
         for (const port of attachment.ports) {
+          if (
+            !hasComposePublishedPortListener(snapshot.listeners, port) &&
+            !hasComposeRoute(snapshot.routes, attachment.networkId, port)
+          ) {
+            ports.push(dropComposeProcessId(port));
+            continue;
+          }
+
           const process = await this.processService.registerExistingProcess(
             buildComposeRegisteredProcessInput(attachment, port, cwd),
           );
@@ -2445,6 +2477,27 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Opens localhost routers for live logical routes that unhooked clients may need. */
   private async syncLogicalPortRouters(): Promise<void> {
+    if (this.logicalRouterSyncInFlight !== undefined) {
+      this.logicalRouterSyncQueued = true;
+      return this.logicalRouterSyncInFlight;
+    }
+
+    this.logicalRouterSyncInFlight = this.syncLogicalPortRoutersQueued().finally(() => {
+      this.logicalRouterSyncInFlight = undefined;
+    });
+
+    return this.logicalRouterSyncInFlight;
+  }
+
+  /** Runs router reconciliation until one queued refresh has seen the latest snapshot. */
+  private async syncLogicalPortRoutersQueued(): Promise<void> {
+    do {
+      this.logicalRouterSyncQueued = false;
+      await this.syncLogicalPortRoutersExclusive();
+    } while (this.logicalRouterSyncQueued);
+  }
+
+  private async syncLogicalPortRoutersExclusive(): Promise<void> {
     /*
      * Native hooks normally rewrite connect() directly, but macOS protected
      * tools such as /usr/bin/curl ignore DYLD injection and some package
@@ -2453,9 +2506,14 @@ export class PortManagerNetworkService implements DisposableLike {
      * excluded so the router cannot win the app server's original bind race.
      */
     const snapshot = this.processService?.getSnapshot();
-    await this.logicalPortRouter.sync(collectLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? [])).catch(
-      () => undefined,
-    );
+    const logicalPorts = collectLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? []);
+
+    if (!tryAcquireLogicalRouterOwnerLease()) {
+      await this.logicalPortRouter.sync([]).catch(() => undefined);
+      return;
+    }
+
+    await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);
   }
 
   /**
@@ -3645,6 +3703,45 @@ function hasComposeRoute(
   );
 }
 
+/** True when Docker/Podman still exposes the host-side endpoint for a compose route. */
+function hasComposePublishedPortListener(
+  listeners: readonly ListeningPort[],
+  port: ComposePublishedPort,
+): boolean {
+  if (port.protocol !== "tcp") {
+    return false;
+  }
+
+  return listeners.some(
+    (listener) =>
+      listener.protocol === "tcp" &&
+      listener.port === port.actualHostPort &&
+      listenerAddressMatchesHost(listener.localAddress, port.actualHostAddress),
+  );
+}
+
+function listenerAddressMatchesHost(listenerAddress: string, host: string): boolean {
+  const normalizedListener = listenerAddress.trim().toLowerCase();
+  const normalizedHost = host.trim().toLowerCase();
+
+  if (normalizedListener === "*" || normalizedListener === "0.0.0.0" || normalizedListener === "::") {
+    return true;
+  }
+
+  if (normalizedHost === "" || normalizedHost === "*" || normalizedHost === "0.0.0.0" || normalizedHost === "::") {
+    return true;
+  }
+
+  if (
+    (normalizedHost === "localhost" || normalizedHost === "127.0.0.1" || normalizedHost === "::1") &&
+    (normalizedListener === "localhost" || normalizedListener === "127.0.0.1" || normalizedListener === "::1")
+  ) {
+    return true;
+  }
+
+  return normalizedListener === normalizedHost;
+}
+
 function composeRuntimeProjectName(attachment: ComposeAttachment): string {
   return attachment.mutation?.attachedProjectName ?? attachment.projectName;
 }
@@ -4817,6 +4914,154 @@ function buildBackgroundContainerRefreshControlPath(kind: "stamp" | "lock"): str
   const routeTablePath = getDefaultRouteTablePath();
   const parsedPath = path.parse(routeTablePath);
   return path.join(parsedPath.dir, `${parsedPath.name.replace("routes", "container-refresh")}.${kind}`);
+}
+
+function buildLogicalRouterOwnerControlPath(kind: "owner" | "lock"): string {
+  const routeTablePath = getDefaultRouteTablePath();
+  const parsedPath = path.parse(routeTablePath);
+  return path.join(parsedPath.dir, `${parsedPath.name.replace("routes", "logical-router-owner")}.${kind}`);
+}
+
+/**
+ * Elects one VS Code extension host to own localhost logical router processes.
+ * Logical routers bind fixed localhost ports, so letting every window reconcile
+ * them independently can split ports across windows and cause repeated handoff.
+ */
+function tryAcquireLogicalRouterOwnerLease(): boolean {
+  const nowMs = Date.now();
+  const owner = readLogicalRouterOwner();
+  if (owner?.pid === process.pid) {
+    return writeLogicalRouterOwnerLease(nowMs);
+  }
+
+  if (isActiveLogicalRouterOwner(owner, nowMs)) {
+    return false;
+  }
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let lockFd: number | undefined;
+
+    try {
+      ensureLogicalRouterOwnerControlDirectory();
+      lockFd = syncFs.openSync(LOGICAL_ROUTER_OWNER_LOCK_PATH, "wx");
+      syncFs.writeFileSync(lockFd, `${process.pid}\n${new Date(nowMs).toISOString()}\n`, "utf8");
+    } catch (error) {
+      if (lockFd !== undefined) {
+        closeFileDescriptor(lockFd);
+      }
+
+      if (isNodeErrorWithCode(error, "EEXIST")) {
+        removeStaleLogicalRouterOwnerLock();
+        continue;
+      }
+
+      return false;
+    }
+
+    try {
+      const currentOwner = readLogicalRouterOwner();
+      if (currentOwner?.pid !== process.pid && isActiveLogicalRouterOwner(currentOwner, nowMs)) {
+        return false;
+      }
+
+      return writeLogicalRouterOwnerLease(nowMs);
+    } finally {
+      closeFileDescriptor(lockFd);
+      try {
+        syncFs.rmSync(LOGICAL_ROUTER_OWNER_LOCK_PATH, { force: true });
+      } catch {
+        // A stale lock will be removed by a later owner election attempt.
+      }
+    }
+  }
+
+  return false;
+}
+
+function releaseLogicalRouterOwnerLease(): void {
+  const owner = readLogicalRouterOwner();
+  if (owner?.pid !== process.pid) {
+    return;
+  }
+
+  try {
+    syncFs.rmSync(LOGICAL_ROUTER_OWNER_PATH, { force: true });
+  } catch {
+    // Stale owner leases expire naturally when another window refreshes routing.
+  }
+}
+
+function readLogicalRouterOwner(): LogicalRouterOwnerDocument | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(syncFs.readFileSync(LOGICAL_ROUTER_OWNER_PATH, "utf8"));
+  } catch {
+    return undefined;
+  }
+
+  if (typeof parsed !== "object" || parsed === null) {
+    return undefined;
+  }
+
+  const owner = parsed as Partial<LogicalRouterOwnerDocument>;
+  if (typeof owner.pid !== "number" || !Number.isInteger(owner.pid) || owner.pid <= 0) {
+    return undefined;
+  }
+  if (typeof owner.updatedAt !== "string" || Number.isNaN(Date.parse(owner.updatedAt))) {
+    return undefined;
+  }
+
+  return { pid: owner.pid, updatedAt: owner.updatedAt };
+}
+
+function writeLogicalRouterOwnerLease(nowMs: number): boolean {
+  try {
+    ensureLogicalRouterOwnerControlDirectory();
+    syncFs.writeFileSync(
+      LOGICAL_ROUTER_OWNER_PATH,
+      `${JSON.stringify({ pid: process.pid, updatedAt: new Date(nowMs).toISOString() })}\n`,
+      "utf8",
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isActiveLogicalRouterOwner(owner: LogicalRouterOwnerDocument | undefined, nowMs: number): boolean {
+  if (owner === undefined) {
+    return false;
+  }
+
+  if (nowMs - Date.parse(owner.updatedAt) >= LOGICAL_ROUTER_OWNER_LEASE_MS) {
+    return false;
+  }
+
+  return isProcessAlive(owner.pid);
+}
+
+function removeStaleLogicalRouterOwnerLock(): void {
+  try {
+    const stats = syncFs.statSync(LOGICAL_ROUTER_OWNER_LOCK_PATH);
+    if (Date.now() - stats.mtimeMs >= LOGICAL_ROUTER_OWNER_LOCK_STALE_MS) {
+      syncFs.rmSync(LOGICAL_ROUTER_OWNER_LOCK_PATH, { force: true });
+    }
+  } catch {
+    // Missing lock files are expected between owner election attempts.
+  }
+}
+
+function ensureLogicalRouterOwnerControlDirectory(): void {
+  syncFs.mkdirSync(path.dirname(LOGICAL_ROUTER_OWNER_PATH), { recursive: true });
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !isNodeErrorWithCode(error, "ESRCH");
+  }
 }
 
 /**

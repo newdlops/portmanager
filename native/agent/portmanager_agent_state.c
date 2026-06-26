@@ -31,6 +31,10 @@ typedef struct {
 } pm_listener_list;
 
 static int pm_scan_lsof(pm_listener_list *listeners, const char *updated_at);
+static int pm_scan_lsof_cached(pm_agent_state *state, pm_listener_list *listeners, char *updated_at, size_t updated_at_size, int *fresh_scan);
+static int pm_listener_cache_store(pm_agent_state *state, const pm_listener_list *listeners, const char *updated_at, time_t now);
+static void pm_listener_cache_invalidate(pm_agent_state *state);
+static int pm_state_needs_external_listener_fresh_scan(pm_agent_state *state);
 static int pm_find_listener_for_port(int port, pm_listener *out);
 static const char *pm_listener_route_host(const pm_listener *listener, const char *fallback_host, char *buffer, size_t size);
 
@@ -351,6 +355,7 @@ void pm_state_dispose(pm_agent_state *state) {
   pm_string_array_clear(&state->suppressed_detected_ids, &state->suppressed_count, &state->suppressed_capacity);
   pm_string_array_clear(&state->written_network_ids, &state->written_network_count, &state->written_network_capacity);
   pm_string_array_clear(&state->written_entry_paths, &state->written_entry_count, &state->written_entry_capacity);
+  free(state->listener_cache_items);
   memset(state, 0, sizeof(*state));
 }
 
@@ -781,6 +786,28 @@ static int pm_reconcile_external_processes_with_listeners(
   return changed;
 }
 
+static int pm_state_needs_external_listener_fresh_scan(pm_agent_state *state) {
+  time_t now = time(NULL);
+
+  for (size_t index = 0; index < state->process_count; index++) {
+    pm_process *process = &state->processes[index];
+    if (strcmp(process->status, "running") != 0 || !pm_process_is_external_listener_owned(process)) {
+      continue;
+    }
+
+    /*
+     * Once a real scan has observed a missing hooked listener, the next scan
+     * after the grace window must be fresh. Replaying a cached "missing" list
+     * would make cleanup fast but would not prove the listener stayed gone.
+     */
+    if (process->missing_listener_since > 0 && now - process->missing_listener_since >= PM_EXTERNAL_LISTENER_GRACE_SECONDS) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
 static int pm_cleanup_pending(pm_agent_state *state) {
   time_t now = time(NULL);
   size_t before = state->pending_count;
@@ -803,6 +830,9 @@ static int pm_cleanup_pending(pm_agent_state *state) {
         char updated_at[PM_TIME];
         pm_iso_now(updated_at, sizeof(updated_at));
         listener_scan_ok = pm_scan_lsof(&listeners, updated_at) == 0;
+        if (listener_scan_ok) {
+          (void)pm_listener_cache_store(state, &listeners, updated_at, now);
+        }
         listener_scan_attempted = 1;
       }
 
@@ -1245,6 +1275,7 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
     if (pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
       pm_write_route_tables(state);
     }
+    (void)pm_listener_cache_store(state, &listeners, updated_at, time(NULL));
   }
   free(listeners.items);
 
@@ -1472,6 +1503,7 @@ int pm_state_register_process(pm_agent_state *state, const pm_register_input *in
   pm_clear_missing_listener_state(process);
 
   pm_remove_pending_endpoint(state, process->requested_port, network_id);
+  pm_listener_cache_invalidate(state);
   pm_write_route_tables(state);
   return pm_append_process_json(payload, process);
 }
@@ -1581,6 +1613,75 @@ static int pm_scan_lsof(pm_listener_list *listeners, const char *updated_at) {
   return 0;
 }
 
+static int pm_listener_list_copy(pm_listener_list *target, const pm_listener *items, size_t count) {
+  memset(target, 0, sizeof(*target));
+  if (count == 0) {
+    return 0;
+  }
+
+  target->items = (pm_listener *)malloc(count * sizeof(pm_listener));
+  if (target->items == NULL) {
+    return -1;
+  }
+
+  memcpy(target->items, items, count * sizeof(pm_listener));
+  target->count = count;
+  target->capacity = count;
+  return 0;
+}
+
+static int pm_listener_cache_store(pm_agent_state *state, const pm_listener_list *listeners, const char *updated_at, time_t now) {
+  pm_listener *next_items = NULL;
+
+  if (listeners->count > 0) {
+    next_items = (pm_listener *)malloc(listeners->count * sizeof(pm_listener));
+    if (next_items == NULL) {
+      return -1;
+    }
+    memcpy(next_items, listeners->items, listeners->count * sizeof(pm_listener));
+  }
+
+  free(state->listener_cache_items);
+  state->listener_cache_items = next_items;
+  state->listener_cache_count = listeners->count;
+  state->listener_cache_expires_at = now + PM_LISTENER_SCAN_CACHE_SECONDS;
+  pm_copy(state->listener_cache_updated_at, sizeof(state->listener_cache_updated_at), updated_at);
+  return 0;
+}
+
+static void pm_listener_cache_invalidate(pm_agent_state *state) {
+  state->listener_cache_expires_at = 0;
+  state->listener_cache_updated_at[0] = '\0';
+}
+
+static int pm_scan_lsof_cached(pm_agent_state *state, pm_listener_list *listeners, char *updated_at, size_t updated_at_size, int *fresh_scan) {
+  time_t now = time(NULL);
+
+  if (fresh_scan != NULL) {
+    *fresh_scan = 0;
+  }
+
+  if (state->listener_cache_updated_at[0] != '\0' && now < state->listener_cache_expires_at) {
+    if (updated_at != NULL && updated_at_size > 0) {
+      pm_copy(updated_at, updated_at_size, state->listener_cache_updated_at);
+    }
+    return pm_listener_list_copy(listeners, state->listener_cache_items, state->listener_cache_count);
+  }
+
+  if (updated_at != NULL && updated_at_size > 0) {
+    pm_iso_now(updated_at, updated_at_size);
+  }
+  if (pm_scan_lsof(listeners, updated_at) != 0) {
+    return -1;
+  }
+
+  (void)pm_listener_cache_store(state, listeners, updated_at, now);
+  if (fresh_scan != NULL) {
+    *fresh_scan = 1;
+  }
+  return 0;
+}
+
 static int pm_find_listener_for_port(int port, pm_listener *out) {
   pm_listener_list listeners = {0};
   char updated_at[PM_TIME];
@@ -1649,6 +1750,7 @@ int pm_state_release_process_route(pm_agent_state *state, const pm_release_proce
   }
 
   if (released || retained) {
+    pm_listener_cache_invalidate(state);
     pm_write_route_tables(state);
   }
 
@@ -1822,6 +1924,7 @@ static int pm_start_process_with_actual(pm_agent_state *state, const pm_start_in
   process->virtual_start = input->virtual_start;
   process->virtual_end = input->virtual_end;
 
+  pm_listener_cache_invalidate(state);
   pm_write_route_tables(state);
   *out_process = process;
   return 0;
@@ -1887,6 +1990,7 @@ int pm_state_stop_process(pm_agent_state *state, const char *id, const char *sig
   pm_iso_now(process->stopped_at, sizeof(process->stopped_at));
   process->url[0] = '\0';
   pm_clear_missing_listener_state(process);
+  pm_listener_cache_invalidate(state);
   pm_write_route_tables(state);
   return pm_append_process_json(payload, process);
 }
@@ -1953,6 +2057,7 @@ int pm_state_remove_process(pm_agent_state *state, const char *id, pm_buffer *pa
       pm_process removed = state->processes[index];
       memmove(&state->processes[index], &state->processes[index + 1], (state->process_count - index - 1) * sizeof(pm_process));
       state->process_count--;
+      pm_listener_cache_invalidate(state);
       pm_write_route_tables(state);
       return pm_append_process_json(payload, &removed);
     }
@@ -2043,12 +2148,17 @@ int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload) {
   pm_listener_list listeners = {0};
   pm_route_list routes;
   char updated_at[PM_TIME];
+  int listener_scan_fresh = 0;
 
   pm_iso_now(updated_at, sizeof(updated_at));
   if (pm_cleanup_pending(state)) {
     pm_write_route_tables(state);
   }
-  if (pm_scan_lsof(&listeners, updated_at) == 0 &&
+  if (pm_state_needs_external_listener_fresh_scan(state)) {
+    pm_listener_cache_invalidate(state);
+  }
+  if (pm_scan_lsof_cached(state, &listeners, updated_at, sizeof(updated_at), &listener_scan_fresh) == 0 &&
+      listener_scan_fresh &&
       pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
     pm_write_route_tables(state);
   }
@@ -2158,6 +2268,7 @@ int pm_state_reap_children(pm_agent_state *state) {
         pm_iso_now(process->stopped_at, sizeof(process->stopped_at));
         process->url[0] = '\0';
         pm_clear_missing_listener_state(process);
+        pm_listener_cache_invalidate(state);
         changed = 1;
       }
     }
@@ -2173,12 +2284,15 @@ int pm_state_reap_children(pm_agent_state *state) {
 int pm_state_listener_signature(pm_agent_state *state, pm_buffer *signature) {
   pm_listener_list listeners = {0};
   char updated_at[PM_TIME];
+  int listener_scan_fresh = 0;
 
-  pm_iso_now(updated_at, sizeof(updated_at));
-  if (pm_scan_lsof(&listeners, updated_at) != 0) {
+  if (pm_state_needs_external_listener_fresh_scan(state)) {
+    pm_listener_cache_invalidate(state);
+  }
+  if (pm_scan_lsof_cached(state, &listeners, updated_at, sizeof(updated_at), &listener_scan_fresh) != 0) {
     return -1;
   }
-  if (pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
+  if (listener_scan_fresh && pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
     pm_write_route_tables(state);
   }
 

@@ -19,6 +19,24 @@ import { getRouteTablePathForLogicalPort } from "../../src/agent/route-table";
 const projectRoot = path.resolve(__dirname, "../../..");
 const nativeAgentPath = path.join(projectRoot, "media", "native", "portmanager_agent");
 
+test("native agent caches listener scans for concurrent snapshot readers", () => {
+  const header = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.h"), "utf8");
+  const agentSource = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.c"), "utf8");
+  const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
+  const snapshotStart = source.indexOf("int pm_state_snapshot");
+  const snapshotEnd = source.indexOf("int pm_state_refresh_snapshot", snapshotStart);
+  const snapshotBody = source.slice(snapshotStart, snapshotEnd);
+
+  assert.equal(header.includes("PM_LISTENER_SCAN_CACHE_SECONDS 60"), true);
+  assert.equal(header.includes("pm_listener *listener_cache_items;"), true);
+  assert.equal(agentSource.includes("PM_LISTENER_POLL_INTERVAL_SECONDS 60"), true);
+  assert.equal(source.includes("static int pm_scan_lsof_cached"), true);
+  assert.equal(source.includes("pm_state_needs_external_listener_fresh_scan(state)"), true);
+  assert.equal(source.includes("pm_listener_cache_invalidate(state);"), true);
+  assert.equal(snapshotBody.includes("listener_scan_fresh &&"), true);
+  assert.equal(snapshotBody.includes("pm_scan_lsof_cached(state, &listeners"), true);
+});
+
 if (!fs.existsSync(nativeAgentPath)) {
   test("native agent serves concurrent hook-like clients while extension client receives events", { skip: "native agent binary is not built" }, () => undefined);
 } else {
