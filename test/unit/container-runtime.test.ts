@@ -1010,7 +1010,7 @@ test("copy mode creates stopped compose services in the hidden project", async (
             Names: "workspace_worker_1",
             Status: "Exited (0) 1 minute ago",
             Ports: "",
-            Labels: "com.docker.compose.project=workspace,com.docker.compose.service=worker",
+            Labels: "",
           },
         ];
         const targetRows = targetStarted
@@ -1041,6 +1041,7 @@ test("copy mode creates stopped compose services in the hidden project", async (
               Name: `/${id}`,
               Config: {
                 Labels: {
+                  "com.docker.compose.project": id.startsWith("target") ? "copy-stack" : "workspace",
                   "com.docker.compose.service": id.includes("worker") ? "worker" : "db",
                 },
               },

@@ -115,6 +115,7 @@ const TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500;
 const TERMINAL_ATTACHMENT_REFRESH_DEBOUNCE_MS = 50;
 const TERMINAL_ATTACHMENT_REFRESH_BURST_WINDOW_MS = 2_000;
 const TERMINAL_ATTACHMENT_REFRESH_BURST_INTERVAL_MS = 250;
+const TERMINAL_NETWORK_SERVICE_ENTRY_SEPARATOR = " || ";
 const execFileAsync = promisify(execFile);
 
 export interface BindingPresetSummary {
@@ -386,6 +387,7 @@ export class PortManagerNetworkService implements DisposableLike {
         this.processService.onDidChange(() => {
           void this.syncLogicalPortRouters();
           void this.restorePersistedComposeRoutesIfMissing();
+          void this.writeTerminalNetworkSelectionFile();
           this.localChangeEvents.emit();
         }),
       );
@@ -1024,12 +1026,14 @@ export class PortManagerNetworkService implements DisposableLike {
       throw new Error("Compose attach cannot both mutate a project and reattach an existing clone.");
     }
 
+    const workingDirectory = normalizeOptionalString(input.cwd);
     const attachment: ComposeAttachment = {
       id: createId("compose"),
       networkId: input.networkId,
       projectName: assertNonEmptyString(input.projectName, "Compose project name"),
       ...(input.runtime !== undefined ? { runtime: input.runtime } : {}),
       composeFiles: [...(input.composeFiles ?? [])],
+      ...(workingDirectory !== undefined ? { workingDirectory } : {}),
       ports: input.ports.map(normalizeComposePublishedPort),
       status: "attached",
       attachedAt: new Date().toISOString(),
@@ -1037,8 +1041,16 @@ export class PortManagerNetworkService implements DisposableLike {
     const existingAttachments = this.registry.getSnapshot().composeAttachments;
     const equivalentAttachment = findEquivalentComposeAttachment(existingAttachments, attachment, input);
     if (equivalentAttachment !== undefined) {
-      await this.restorePersistedComposeRoutes([equivalentAttachment]);
-      return this.getComposeAttachment(equivalentAttachment.id) ?? equivalentAttachment;
+      const refreshedAttachment =
+        equivalentAttachment.workingDirectory === undefined && attachment.workingDirectory !== undefined
+          ? this.registry.updateComposeAttachment({
+              ...equivalentAttachment,
+              workingDirectory: attachment.workingDirectory,
+            })
+          : equivalentAttachment;
+      await this.restorePersistedComposeRoutes([refreshedAttachment]);
+      await this.convergeAfterComposeAttachmentChange([refreshedAttachment]);
+      return this.getComposeAttachment(refreshedAttachment.id) ?? refreshedAttachment;
     }
 
     const conflict = findComposeRouteConflict(existingAttachments, attachment);
@@ -1071,6 +1083,7 @@ export class PortManagerNetworkService implements DisposableLike {
         registeredAttachment = {
           ...attachment,
           runtime: mutation.runtime,
+          workingDirectory: mutation.workingDirectory ?? attachment.workingDirectory,
           composeFiles: mutation.composeFiles,
           ports: mutationResult.ports,
           mutation,
@@ -1082,6 +1095,7 @@ export class PortManagerNetworkService implements DisposableLike {
           ...attachment,
           runtime: mutation.runtime,
           projectName: mutation.originalProjectName,
+          workingDirectory: mutation.workingDirectory ?? attachment.workingDirectory,
           composeFiles: mutation.composeFiles,
           ports: mutation.hiddenPorts,
           mutation,
@@ -1097,7 +1111,7 @@ export class PortManagerNetworkService implements DisposableLike {
           buildComposeRegisteredProcessInput(
             registeredAttachment,
             port,
-            input.cwd ?? mutation?.workingDirectory,
+            composeAttachmentWorkingDirectory(registeredAttachment),
           ),
         );
 
@@ -1108,10 +1122,13 @@ export class PortManagerNetworkService implements DisposableLike {
         });
       }
 
-      return this.registry.updateComposeAttachment({
+      const updatedAttachment = this.registry.updateComposeAttachment({
         ...registeredAttachment,
         ports,
       });
+      await this.convergeAfterComposeAttachmentChange([updatedAttachment]);
+
+      return updatedAttachment;
     } catch (error) {
       for (const processId of registeredProcessIds) {
         await this.processService.removeProcess(processId).catch(() => undefined);
@@ -1200,7 +1217,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const composeFiles = composeRouteCopyFiles(source);
     const runtime = source.runtime ?? source.mutation?.runtime;
-    const cwd = source.mutation?.workingDirectory ?? composeWorkingDirectoryFromFiles(composeFiles) ?? process.cwd();
+    const cwd = composeAttachmentWorkingDirectory(source) ?? composeWorkingDirectoryFromFiles(composeFiles) ?? process.cwd();
     if (runtime !== undefined && composeFiles.length > 0) {
       return this.attachComposePublishedPorts({
         networkId: network.id,
@@ -1879,6 +1896,27 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
+   * Closes the small stale window after a compose attach/copy command.
+   *
+   * Registry change events also rewrite these files, but they are intentionally
+   * fire-and-forget. Waiting here means a terminal that was already attached to
+   * the target network can run `docker compose` immediately after the command
+   * returns and see the new project routing rows.
+   */
+  private async convergeAfterComposeAttachmentChange(attachments: readonly ComposeAttachment[]): Promise<void> {
+    if (attachments.length === 0) {
+      return;
+    }
+
+    await this.writeComposeProjectRoutingFile().catch(() => undefined);
+    await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
+    await this.restorePersistedComposeRoutesIfMissing().catch(() => undefined);
+    await this.convergeDaemonAndRoutingState();
+    await this.refreshContainerServices().catch(() => []);
+    this.localChangeEvents.emit();
+  }
+
+  /**
    * Gradually converges all generated routing channels after missed events.
    *
    * UI state is durable in VS Code storage, while the daemon and generated files
@@ -2210,7 +2248,7 @@ export class PortManagerNetworkService implements DisposableLike {
       const ports: ComposePublishedPort[] = [];
 
       try {
-        const cwd = attachment.mutation?.workingDirectory ?? composeWorkingDirectoryFromFiles(attachment.composeFiles);
+        const cwd = composeAttachmentWorkingDirectory(attachment);
         for (const port of attachment.ports) {
           const process = await this.processService.registerExistingProcess(
             buildComposeRegisteredProcessInput(attachment, port, cwd),
@@ -2892,13 +2930,15 @@ export class PortManagerNetworkService implements DisposableLike {
    */
   private async writeTerminalNetworkSelectionFile(): Promise<void> {
     const settings = readPortManagerSettings();
-    const rows = this.registry.getSnapshot().networks.map((network) => {
+    const snapshot = this.registry.getSnapshot();
+    const rows = snapshot.networks.map((network) => {
       const scriptPath = this.writeTerminalHookScript(
         `attach-${sanitizeRouteFileScope(network.id)}.sh`,
         this.buildTerminalRoutingScriptBody(network.id, network.name, settings),
       );
+      const serviceSummary = buildTerminalNetworkServiceSummary(network.id, snapshot);
 
-      return serializeTerminalNetworkSelectionRow(network.id, network.name, scriptPath);
+      return serializeTerminalNetworkSelectionRow(network.id, network.name, scriptPath, serviceSummary);
     });
     const filePath = this.getTerminalNetworkSelectionFilePath();
 
@@ -3371,7 +3411,7 @@ function buildComposeProjectRoutingRows(
 
     if (mutation === undefined) {
       const routingFiles = splitGeneratedComposeRoutingFiles(attachment.composeFiles);
-      const workingDirectory = composeWorkingDirectoryFromFiles(routingFiles.composeFiles);
+      const workingDirectory = attachment.workingDirectory ?? composeWorkingDirectoryFromFiles(routingFiles.composeFiles);
       if (workingDirectory === undefined || attachment.projectName.trim().length === 0) {
         return [];
       }
@@ -3396,7 +3436,7 @@ function buildComposeProjectRoutingRows(
       return [];
     }
 
-    const workingDirectory = mutation.workingDirectory ?? composeWorkingDirectoryFromFiles(mutation.composeFiles);
+    const workingDirectory = composeAttachmentWorkingDirectory(attachment);
     if (workingDirectory === undefined) {
       return [];
     }
@@ -3436,6 +3476,14 @@ function composeAttachmentRuntimes(attachment: ComposeAttachment): ReadonlyArray
 function composeWorkingDirectoryFromFiles(composeFiles: readonly string[]): string | undefined {
   const firstFile = composeFiles.find((file) => file.trim().length > 0);
   return firstFile === undefined ? undefined : path.dirname(firstFile);
+}
+
+function composeAttachmentWorkingDirectory(attachment: ComposeAttachment): string | undefined {
+  return (
+    attachment.mutation?.workingDirectory ??
+    attachment.workingDirectory ??
+    composeWorkingDirectoryFromFiles(attachment.composeFiles)
+  );
 }
 
 function stringifyPersistedNetworkState(state: LogicalNetworkRegistryState): string {
@@ -3720,6 +3768,11 @@ function assertNonEmptyString(value: string, label: string): string {
   return normalized;
 }
 
+function normalizeOptionalString(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  return normalized === undefined || normalized.length === 0 ? undefined : normalized;
+}
+
 /** Prevents duplicate exposure rows before the platform bind call. */
 function ensureNoExposureConflict(
   exposures: readonly HostPortExposure[],
@@ -3764,9 +3817,78 @@ function sanitizeRouteFileScope(value: string): string {
   return sanitized.length > 0 ? sanitized : "network";
 }
 
-/** Serializes one shell-readable network picker row as id, display name, and attach script path. */
-function serializeTerminalNetworkSelectionRow(networkId: string, networkName: string, scriptPath: string): string {
-  return [networkId, networkName, scriptPath].map(serializeTerminalNetworkSelectionCell).join("\t");
+/** Builds readable service rows displayed under each network in the external `pm` picker. */
+function buildTerminalNetworkServiceSummary(
+  networkId: string,
+  snapshot: NetworkSnapshot,
+): string {
+  const entries: string[] = [];
+  const seen = new Set<string>();
+
+  // The picker is for choosing the correct logical network, so summarize the
+  // owning Compose project/container instead of repeating every routed port.
+  const addEntry = (entry: string): void => {
+    const normalized = entry.trim();
+    if (normalized.length === 0) {
+      return;
+    }
+
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    entries.push(normalized);
+  };
+
+  for (const attachment of snapshot.composeAttachments.filter(
+    (item) => item.networkId === networkId && item.status === "attached",
+  )) {
+    if (isContainerStyleComposeAttachment(attachment)) {
+      for (const containerName of composeAttachmentContainerNames(attachment)) {
+        addEntry(`container: ${containerName}`);
+      }
+      continue;
+    }
+
+    const workingDirectory = composeAttachmentWorkingDirectory(attachment);
+    addEntry(
+      workingDirectory === undefined
+        ? `compose: ${attachment.projectName}`
+        : `compose: ${attachment.projectName} (${workingDirectory})`,
+    );
+  }
+
+  if (entries.length === 0) {
+    return "no services";
+  }
+
+  return entries.join(TERMINAL_NETWORK_SERVICE_ENTRY_SEPARATOR);
+}
+
+function isContainerStyleComposeAttachment(attachment: ComposeAttachment): boolean {
+  return (
+    attachment.mutation === undefined &&
+    attachment.composeFiles.length === 0 &&
+    attachment.ports.length > 0 &&
+    attachment.ports.every((port) => port.serviceName === attachment.projectName)
+  );
+}
+
+function composeAttachmentContainerNames(attachment: ComposeAttachment): readonly string[] {
+  const names = [...new Set(attachment.ports.map((port) => port.serviceName).filter((name) => name.length > 0))];
+  return names.length > 0 ? names : [attachment.projectName];
+}
+
+/** Serializes one shell-readable network picker row as id, name, attach script, and visible services. */
+function serializeTerminalNetworkSelectionRow(
+  networkId: string,
+  networkName: string,
+  scriptPath: string,
+  serviceSummary: string,
+): string {
+  return [networkId, networkName, scriptPath, serviceSummary].map(serializeTerminalNetworkSelectionCell).join("\t");
 }
 
 function serializeTerminalNetworkSelectionCell(value: string): string {

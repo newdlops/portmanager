@@ -121,6 +121,44 @@ test("compose attachment copy command is wired through package and sidebar", () 
   assert.equal(networkServiceSource.includes("copyStoppedServices: true"), true);
 });
 
+test("compose attachment rows expose original compose folders", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/ui/sidebar/port-manager-tree.ts");
+  const commandsPath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const networkServicePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const sharedTypesPath = path.resolve(__dirname, "../../../src/shared/types.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const commandsSource = fs.readFileSync(commandsPath, "utf8");
+  const networkServiceSource = fs.readFileSync(networkServicePath, "utf8");
+  const sharedTypesSource = fs.readFileSync(sharedTypesPath, "utf8");
+
+  assert.equal(sharedTypesSource.includes("readonly workingDirectory?: string;"), true);
+  assert.equal(source.includes("formatComposeAttachmentDescription(attachment)"), true);
+  assert.equal(source.includes("Original Folder"), true);
+  assert.equal(source.includes("Compose Files"), true);
+  assert.equal(source.includes("ServiceDetailTreeItem"), true);
+  assert.equal(source.includes("ServiceDetailGroupTreeItem"), true);
+  assert.equal(source.includes("ComposeAttachmentPortTreeItem"), true);
+  assert.equal(source.includes("buildComposeAttachmentDetailRows(element.attachment)"), true);
+  assert.equal(source.includes("buildComposeProjectCandidateDetailRows(element.aggregateCandidate)"), true);
+  assert.equal(source.includes("buildContainerCandidateDetailRows(element.candidate)"), true);
+  assert.equal(source.includes("buildComposeFilesDetailGroup"), true);
+  assert.equal(source.includes("vscode.TreeItemCollapsibleState.Collapsed);"), true);
+  assert.equal(source.includes("attachment.workingDirectory"), true);
+  assert.equal(source.includes("formatContainerServiceCandidateDescription(candidate)"), true);
+  assert.equal(source.includes("formatComposeProjectCandidateDescription(this.aggregateCandidate"), true);
+  assert.equal(source.includes("composeCandidateWorkingDirectory(candidate)"), true);
+  assert.equal(source.includes("candidate.portManagerClone?.composeFiles ?? candidate.composeConfigFiles"), true);
+  assert.equal(commandsSource.includes("formatContainerServiceCandidateDescription(item)"), true);
+  assert.equal(commandsSource.includes("formatContainerServiceCandidateDetail(item)"), true);
+  assert.equal(commandsSource.includes("const contextDetail = formatComposeAttachContextDetail(candidate);"), true);
+  assert.equal(commandsSource.includes("joinQuickPickDetails(["), true);
+  assert.equal(commandsSource.includes("candidate.portManagerClone?.composeFiles ?? candidate.composeConfigFiles"), true);
+  assert.equal(commandsSource.includes("formatComposeFilesDetail(composeCandidateSourceFiles(candidate))"), true);
+  assert.equal(commandsSource.includes("resolveComposeWorkingDirectory(candidate.composeWorkingDirectory, composeFiles)"), true);
+  assert.equal(networkServiceSource.includes("workingDirectory: mutation.workingDirectory ?? attachment.workingDirectory"), true);
+  assert.equal(networkServiceSource.includes("const workingDirectory = normalizeOptionalString(input.cwd);"), true);
+});
+
 test("terminal rows expose reveal commands for injected external windows", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/ui/sidebar/port-manager-tree.ts");
   const source = fs.readFileSync(sourcePath, "utf8");

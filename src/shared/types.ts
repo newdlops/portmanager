@@ -356,6 +356,8 @@ export interface ComposeAttachment {
   readonly runtime?: "docker" | "podman";
   /** Compose files used to launch the project, when known. */
   readonly composeFiles: readonly string[];
+  /** Original working directory where compose commands resolve relative files. */
+  readonly workingDirectory?: string;
   /** Published service ports owned by this attachment. */
   readonly ports: readonly ComposePublishedPort[];
   /** Compose runtime mutation state used to restore the original project. */

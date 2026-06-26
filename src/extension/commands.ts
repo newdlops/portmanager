@@ -481,6 +481,11 @@ export class PortManagerCommandController implements DisposableLike {
 
     const existingCloneMutation =
       composeAttachMode === "as-is" ? buildExistingCloneMutationFromCandidate(candidate) : undefined;
+    const composeFiles = existingCloneMutation?.composeFiles ?? candidate.composeConfigFiles;
+    const composeWorkingDirectory =
+      resolveComposeWorkingDirectory(candidate.composeWorkingDirectory, composeFiles) ??
+      getDefaultWorkspaceFolder() ??
+      process.cwd();
     const composeMutation =
       candidate.composeProject !== undefined && isComposeCloneAttachMode(composeAttachMode)
         ? {
@@ -489,7 +494,7 @@ export class PortManagerCommandController implements DisposableLike {
               allowStatefulClone,
               ...(attachedProjectName !== undefined ? { attachedProjectName } : {}),
               runtime: candidate.runtime,
-              workingDirectory: candidate.composeWorkingDirectory ?? getDefaultWorkspaceFolder() ?? process.cwd(),
+              workingDirectory: composeWorkingDirectory,
               composeFiles: candidate.composeConfigFiles,
               ...(candidate.portManagerClone?.containerMappings !== undefined
                 ? { sourceContainerMappings: candidate.portManagerClone.containerMappings }
@@ -502,8 +507,8 @@ export class PortManagerCommandController implements DisposableLike {
       networkId: network.id,
       projectName: existingCloneMutation?.originalProjectName ?? candidate.composeProject ?? candidate.containerName,
       runtime: candidate.runtime,
-      cwd: candidate.composeWorkingDirectory ?? getDefaultWorkspaceFolder() ?? process.cwd(),
-      composeFiles: existingCloneMutation?.composeFiles ?? candidate.composeConfigFiles,
+      cwd: composeWorkingDirectory,
+      composeFiles,
       ...composeMutation,
       ...(existingCloneMutation !== undefined ? { existingMutation: existingCloneMutation } : {}),
       ports: candidate.ports.map((port) => ({
@@ -1792,8 +1797,8 @@ export class PortManagerCommandController implements DisposableLike {
     const selected = await vscode.window.showQuickPick(
       candidates.map((item) => ({
         label: formatContainerServiceLabel(item),
-        description: `${item.runtime}, ${item.ports.length} port${item.ports.length === 1 ? "" : "s"}`,
-        detail: item.ports.map(formatComposePublishedPort).join(", "),
+        description: formatContainerServiceCandidateDescription(item),
+        detail: formatContainerServiceCandidateDetail(item),
         candidate: item,
       })),
       { title, placeHolder: "Select a container or compose service" },
@@ -2111,6 +2116,52 @@ function formatContainerServiceLabel(candidate: ContainerServiceCandidate): stri
   return candidate.containerName;
 }
 
+function formatContainerServiceCandidateDescription(candidate: ContainerServiceCandidate): string {
+  const details = [
+    candidate.runtime,
+    `${candidate.ports.length} port${candidate.ports.length === 1 ? "" : "s"}`,
+    formatComposeWorkingDirectory(candidate),
+  ].filter((item): item is string => item !== undefined && item.length > 0);
+
+  return details.join(", ");
+}
+
+function formatContainerServiceCandidateDetail(candidate: ContainerServiceCandidate): string {
+  const details = [
+    candidate.ports.map(formatComposePublishedPort).join(", "),
+    formatComposeFilesDetail(composeCandidateSourceFiles(candidate)),
+  ].filter((item): item is string => item !== undefined && item.length > 0);
+
+  return details.join(" | ");
+}
+
+function formatComposeAttachContextDetail(candidate: ContainerServiceCandidate): string | undefined {
+  const details = [
+    formatComposeWorkingDirectory(candidate),
+    formatComposeFilesDetail(composeCandidateSourceFiles(candidate)),
+  ].filter((item): item is string => item !== undefined && item.length > 0);
+
+  return details.length === 0 ? undefined : details.join(" | ");
+}
+
+function joinQuickPickDetails(details: readonly (string | undefined)[]): string {
+  return details.filter((item): item is string => item !== undefined && item.length > 0).join(" ");
+}
+
+function formatComposeWorkingDirectory(candidate: ContainerServiceCandidate): string | undefined {
+  const workingDirectory = resolveComposeWorkingDirectory(candidate.composeWorkingDirectory, composeCandidateSourceFiles(candidate));
+  return workingDirectory === undefined ? undefined : `cwd ${workingDirectory}`;
+}
+
+function composeCandidateSourceFiles(candidate: ContainerServiceCandidate): readonly string[] | undefined {
+  return candidate.portManagerClone?.composeFiles ?? candidate.composeConfigFiles;
+}
+
+function formatComposeFilesDetail(composeFiles: readonly string[] | undefined): string | undefined {
+  const files = composeFiles?.filter((file) => file.trim().length > 0);
+  return files === undefined || files.length === 0 ? undefined : `compose ${files.join(", ")}`;
+}
+
 function resolveLatestContainerServiceCandidate(
   candidates: readonly ContainerServiceCandidate[],
   candidate: ContainerServiceCandidate,
@@ -2206,18 +2257,25 @@ type ComposeAttachMode = "clone" | "clone-custom" | "as-is";
 async function promptForComposeAttachMode(
   candidate: ContainerServiceCandidate,
 ): Promise<ComposeAttachMode | undefined> {
+  const contextDetail = formatComposeAttachContextDetail(candidate);
   const asIsItem =
     candidate.portManagerClone === undefined
       ? {
           label: "Attach as-is",
           description: "Register the current published ports without restarting Compose",
-          detail: "Keeps the original containers exactly as they are and only adds logical-network route rows.",
+          detail: joinQuickPickDetails([
+            "Keeps the original containers exactly as they are and only adds logical-network route rows.",
+            contextDetail,
+          ]),
           mode: "as-is" as const,
         }
       : {
           label: "Reattach existing clone",
           description: "Reuse the running Port Manager clone and its generated override",
-          detail: "Keeps the clone containers running and restores logical-network route rows.",
+          detail: joinQuickPickDetails([
+            "Keeps the clone containers running and restores logical-network route rows.",
+            contextDetail,
+          ]),
           mode: "as-is" as const,
         };
   const selected = await vscode.window.showQuickPick(
@@ -2225,13 +2283,19 @@ async function promptForComposeAttachMode(
       {
         label: "Clone and hide host ports",
         description: "Recreate services under a network-scoped Compose project",
-        detail: "Frees original host ports so the original Compose project can be started again.",
+        detail: joinQuickPickDetails([
+          "Frees original host ports so the original Compose project can be started again.",
+          contextDetail,
+        ]),
         mode: "clone" as const,
       },
       {
         label: "Clone with custom Compose name",
         description: "Choose the hidden Compose project name before recreating services",
-        detail: "Use this when copying an existing clone or when the generated project name would collide.",
+        detail: joinQuickPickDetails([
+          "Use this when copying an existing clone or when the generated project name would collide.",
+          contextDetail,
+        ]),
         mode: "clone-custom" as const,
       },
       asIsItem,
@@ -2893,6 +2957,15 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     'const matchingBindings=networkId?bindings.filter((binding)=>binding.networkId===networkId):bindings;',
     'if(hostAccessFile&&fs.existsSync(hostAccessFile)){console.log("Host access: "+matchingBindings.length);for(const binding of matchingBindings){console.log("  "+text(binding.logicalPort)+" -> "+text(binding.hostAddress)+":"+text(binding.hostPort)+" "+text(binding.status)+" ["+text(binding.networkId)+"]");}}',
   ].join("");
+  const networkPrintScript = [
+    'const fs=require("node:fs");',
+    'const file=process.argv[1]||"";',
+    'const current=process.argv[2]||"";',
+    'function text(value){return value===undefined||value===null?"":String(value);}',
+    'let rows=[];',
+    'try{rows=fs.readFileSync(file,"utf8").split(/\\r?\\n/).filter((line)=>line.length>0).map((line)=>line.split("\\t"));}catch{}',
+    'rows.forEach((row,index)=>{if(row.length<3)return;const marker=row[0]===current?"*":" ";console.error(marker+" "+(index+1)+") "+text(row[1])+" ["+text(row[0])+"]");const summary=row[3]&&row[3].trim()?row[3]:"no services";summary.split(/\\s+\\|\\|\\s+/).filter((entry)=>entry.trim().length>0).forEach((entry)=>console.error("     "+entry.trim()));});',
+  ].join("");
   const nodeProbeScript = [
     'const net=require("node:net");',
     'const fs=require("node:fs");',
@@ -3093,7 +3166,7 @@ pm() {
   if [ "$#" -gt 0 ]; then
     __pm_choice="$*"
   else
-    awk -F '	' -v current="\${PORT_MANAGER_NETWORK_ID:-}" 'NF >= 3 { marker = ($1 == current ? "*" : " "); printf "%s %d) %s [%s]\\n", marker, NR, $2, $1 }' "$__pm_networks_file" >&2
+    ${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(networkPrintScript)}" "$__pm_networks_file" "\${PORT_MANAGER_NETWORK_ID:-}" >&2
     printf '%s' 'Select Port Manager network: ' >&2
     IFS= read -r __pm_choice || {
       unset __pm_networks_file __pm_choice
@@ -3196,6 +3269,20 @@ function shellDoubleQuote(value: string): string {
 /** Escapes a literal prefix used inside POSIX parameter expansion patterns. */
 function shellPatternLiteral(value: string): string {
   return value.replace(/([\\*?\[])/g, "\\$1");
+}
+
+/** Chooses the compose working directory before falling back to the VS Code workspace. */
+function resolveComposeWorkingDirectory(
+  workingDirectory: string | undefined,
+  composeFiles: readonly string[] | undefined,
+): string | undefined {
+  const normalizedWorkingDirectory = workingDirectory?.trim();
+  if (normalizedWorkingDirectory !== undefined && normalizedWorkingDirectory.length > 0) {
+    return normalizedWorkingDirectory;
+  }
+
+  const firstComposeFile = composeFiles?.find((file) => file.trim().length > 0);
+  return firstComposeFile === undefined ? undefined : path.dirname(firstComposeFile);
 }
 
 /** Shows concise but specific command errors. */

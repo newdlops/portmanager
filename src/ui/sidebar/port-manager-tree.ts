@@ -104,9 +104,12 @@ type PortManagerTreeItem =
   | ComposeProjectCandidateTreeItem
   | ContainerServiceCandidateTreeItem
   | ContainerPublishedPortTreeItem
+  | ServiceDetailTreeItem
+  | ServiceDetailGroupTreeItem
   | VscodeWindowTerminalBindingTreeItem
   | TerminalAttachmentTreeItem
   | ComposeAttachmentTreeItem
+  | ComposeAttachmentPortTreeItem
   | HostPortExposureTreeItem
   | HostAccessBindingTreeItem
   | RuntimeAdapterTreeItem
@@ -397,11 +400,28 @@ export class PortManagerTreeProvider
     }
 
     if (element instanceof ComposeProjectCandidateTreeItem) {
-      return element.candidates.map((candidate) => new ContainerServiceCandidateTreeItem(candidate));
+      return [
+        ...buildComposeProjectCandidateDetailRows(element.aggregateCandidate),
+        ...element.candidates.map((candidate) => new ContainerServiceCandidateTreeItem(candidate)),
+      ];
     }
 
     if (element instanceof ContainerServiceCandidateTreeItem) {
-      return element.candidate.ports.map((port) => new ContainerPublishedPortTreeItem(element.candidate, port));
+      return [
+        ...buildContainerCandidateDetailRows(element.candidate),
+        ...element.candidate.ports.map((port) => new ContainerPublishedPortTreeItem(element.candidate, port)),
+      ];
+    }
+
+    if (element instanceof ComposeAttachmentTreeItem) {
+      return [
+        ...buildComposeAttachmentDetailRows(element.attachment),
+        ...element.attachment.ports.map((port) => new ComposeAttachmentPortTreeItem(element.attachment, port)),
+      ];
+    }
+
+    if (element instanceof ServiceDetailGroupTreeItem) {
+      return [...element.children];
     }
 
     if (!(element instanceof TreeSectionItem)) {
@@ -643,12 +663,9 @@ export class ComposeAttachmentTreeItem extends vscode.TreeItem {
   readonly contextValue = "composeAttachment";
 
   constructor(readonly attachment: ComposeAttachment) {
-    super(attachment.mutation?.attachedProjectName ?? attachment.projectName, vscode.TreeItemCollapsibleState.None);
+    super(attachment.mutation?.attachedProjectName ?? attachment.projectName, vscode.TreeItemCollapsibleState.Collapsed);
     this.id = attachment.id;
-    this.description =
-      attachment.mutation === undefined
-        ? attachment.ports.map(formatComposePort).join(", ")
-        : `${attachment.mutation.originalProjectName} ${attachment.ports.map(formatComposePort).join(", ")}`;
+    this.description = formatComposeAttachmentDescription(attachment);
     this.tooltip = buildComposeAttachmentTooltip(attachment);
     this.iconPath = new vscode.ThemeIcon(
       attachment.status === "attached" ? "database" : "warning",
@@ -699,31 +716,11 @@ export class ComposeProjectCandidateTreeItem extends vscode.TreeItem {
     readonly candidates: readonly ContainerServiceCandidate[],
   ) {
     const ports = candidates.flatMap((candidate) => [...candidate.ports]);
-    const portManagerClone = mergePortManagerCloneMetadata(candidates);
 
     super(projectName, vscode.TreeItemCollapsibleState.Collapsed);
-    this.aggregateCandidate = {
-      id: buildComposeProjectCandidateId(
-        runtime,
-        projectName,
-        candidates[0]?.composeWorkingDirectory,
-        uniqueStrings(candidates.flatMap((candidate) => [...(candidate.composeConfigFiles ?? [])])),
-      ),
-      runtime,
-      containerId: projectName,
-      containerName: projectName,
-      composeProject: projectName,
-      ...(candidates[0]?.composeWorkingDirectory !== undefined
-        ? { composeWorkingDirectory: candidates[0].composeWorkingDirectory }
-        : {}),
-      ...(candidates.flatMap((candidate) => [...(candidate.composeConfigFiles ?? [])]).length > 0
-        ? { composeConfigFiles: uniqueStrings(candidates.flatMap((candidate) => [...(candidate.composeConfigFiles ?? [])])) }
-        : {}),
-      ...(portManagerClone !== undefined ? { portManagerClone } : {}),
-      ports,
-    };
+    this.aggregateCandidate = buildAggregateComposeProjectCandidate(projectName, runtime, candidates);
     this.id = this.aggregateCandidate.id;
-    this.description = `${candidates.length} services, ${ports.length} port${ports.length === 1 ? "" : "s"}`;
+    this.description = formatComposeProjectCandidateDescription(this.aggregateCandidate, candidates.length, ports.length);
     this.tooltip = buildComposeProjectCandidateTooltip(projectName, runtime, candidates);
     this.iconPath = new vscode.ThemeIcon("server-environment");
     this.command = {
@@ -741,7 +738,7 @@ export class ContainerServiceCandidateTreeItem extends vscode.TreeItem {
   constructor(readonly candidate: ContainerServiceCandidate) {
     super(formatContainerServiceTreeLabel(candidate), vscode.TreeItemCollapsibleState.Collapsed);
     this.id = candidate.id;
-    this.description = `${candidate.runtime}, ${candidate.ports.length} port${candidate.ports.length === 1 ? "" : "s"}`;
+    this.description = formatContainerServiceCandidateDescription(candidate);
     this.tooltip = buildContainerServiceTooltip(candidate);
     this.iconPath = new vscode.ThemeIcon(candidate.composeProject ? "server-environment" : "server-process");
     this.command = {
@@ -768,6 +765,59 @@ export class ContainerPublishedPortTreeItem extends vscode.TreeItem {
         : `via ${port.actualHostAddress}:${port.actualHostPort}`;
     this.tooltip = buildContainerPortTooltip(candidate, port);
     this.iconPath = new vscode.ThemeIcon("plug");
+  }
+}
+
+/** Attached compose route endpoint nested under the owning compose attachment. */
+export class ComposeAttachmentPortTreeItem extends vscode.TreeItem {
+  readonly contextValue = "composeAttachmentPort";
+
+  constructor(
+    readonly attachment: ComposeAttachment,
+    readonly port: ComposePublishedPort,
+  ) {
+    super(formatComposePort(port), vscode.TreeItemCollapsibleState.None);
+    this.id = `${attachment.id}:port:${port.serviceName}:${port.logicalPort}:${port.containerPort}`;
+    this.description =
+      port.actualHostPort === port.logicalPort
+        ? `${port.serviceName}`
+        : `${port.serviceName} via ${port.actualHostAddress}:${port.actualHostPort}`;
+    this.tooltip = buildComposeRouteTooltip(attachment, port);
+    this.iconPath = new vscode.ThemeIcon("plug");
+  }
+}
+
+/** Read-only detail row used to keep long service metadata out of parent descriptions. */
+export class ServiceDetailTreeItem extends vscode.TreeItem {
+  readonly contextValue = "serviceDetail";
+
+  constructor(
+    readonly detailId: string,
+    readonly detailLabel: string,
+    readonly detailValue: string,
+    icon = "symbol-property",
+  ) {
+    super(`${detailLabel}: ${detailValue}`, vscode.TreeItemCollapsibleState.None);
+    this.id = detailId;
+    this.tooltip = buildServiceDetailTooltip(detailLabel, detailValue);
+    this.iconPath = new vscode.ThemeIcon(icon);
+  }
+}
+
+/** Collapsible group for repeated detail rows such as compose files or cloned containers. */
+export class ServiceDetailGroupTreeItem extends vscode.TreeItem {
+  readonly contextValue = "serviceDetailGroup";
+
+  constructor(
+    readonly detailId: string,
+    label: string,
+    readonly children: readonly ServiceDetailTreeItem[],
+    icon = "list-tree",
+  ) {
+    super(label, vscode.TreeItemCollapsibleState.Collapsed);
+    this.id = detailId;
+    this.description = `${children.length} ${children.length === 1 ? "item" : "items"}`;
+    this.iconPath = new vscode.ThemeIcon(icon);
   }
 }
 
@@ -1579,10 +1629,20 @@ function buildNetworkRoutingGroupTooltip(
 function buildComposeAttachmentTooltip(attachment: ComposeAttachment): vscode.MarkdownString {
   const tooltip = new vscode.MarkdownString(undefined, true);
   tooltip.isTrusted = false;
+  const workingDirectory = composeAttachmentWorkingDirectory(attachment);
   tooltip.appendMarkdown(`**${escapeMarkdown(attachment.projectName)}**\n\n`);
   tooltip.appendMarkdown(`- Network ID: \`${escapeMarkdown(attachment.networkId)}\`\n`);
   tooltip.appendMarkdown(`- Status: \`${attachment.status}\`\n`);
   tooltip.appendMarkdown(`- Attached: \`${attachment.attachedAt}\`\n`);
+  if (workingDirectory !== undefined) {
+    tooltip.appendMarkdown(`- Original Folder: \`${escapeMarkdown(workingDirectory)}\`\n`);
+  }
+  if (attachment.composeFiles.length > 0) {
+    tooltip.appendMarkdown("- Compose Files:\n");
+    for (const composeFile of attachment.composeFiles) {
+      tooltip.appendMarkdown(`  - \`${escapeMarkdown(composeFile)}\`\n`);
+    }
+  }
   if (attachment.mutation !== undefined) {
     tooltip.appendMarkdown(`- Original Project: \`${escapeMarkdown(attachment.mutation.originalProjectName)}\`\n`);
     tooltip.appendMarkdown(`- Hidden Project: \`${escapeMarkdown(attachment.mutation.attachedProjectName)}\`\n`);
@@ -1620,14 +1680,98 @@ function buildComposeAttachmentTooltip(attachment: ComposeAttachment): vscode.Ma
   return tooltip;
 }
 
+/** Builds a compact row description; folder, file, and route details live in child rows. */
+function formatComposeAttachmentDescription(attachment: ComposeAttachment): string {
+  const details = [
+    attachment.status,
+    attachment.mutation?.originalProjectName,
+    `${attachment.ports.length} port${attachment.ports.length === 1 ? "" : "s"}`,
+  ].filter((item): item is string => item !== undefined && item.length > 0);
+
+  return details.join(" | ");
+}
+
+function buildComposeAttachmentDetailRows(attachment: ComposeAttachment): PortManagerTreeItem[] {
+  const rows: PortManagerTreeItem[] = [];
+  const workingDirectory = composeAttachmentWorkingDirectory(attachment);
+
+  if (attachment.mutation !== undefined) {
+    rows.push(
+      new ServiceDetailTreeItem(
+        `${attachment.id}:detail:original-project`,
+        "Original Project",
+        attachment.mutation.originalProjectName,
+        "repo",
+      ),
+    );
+    rows.push(
+      new ServiceDetailTreeItem(
+        `${attachment.id}:detail:hidden-project`,
+        "Attached Project",
+        attachment.mutation.attachedProjectName,
+        "server-environment",
+      ),
+    );
+  }
+
+  if (workingDirectory !== undefined) {
+    rows.push(new ServiceDetailTreeItem(`${attachment.id}:detail:folder`, "Original Folder", workingDirectory, "folder"));
+  }
+
+  const composeFilesGroup = buildComposeFilesDetailGroup(
+    `${attachment.id}:detail:compose-files`,
+    attachment.mutation?.composeFiles ?? attachment.composeFiles,
+  );
+  if (composeFilesGroup !== undefined) {
+    rows.push(composeFilesGroup);
+  }
+
+  const containerGroup = buildComposeContainerMappingDetailGroup(
+    `${attachment.id}:detail:containers`,
+    attachment.mutation?.containerMappings ?? [],
+  );
+  if (containerGroup !== undefined) {
+    rows.push(containerGroup);
+  }
+
+  return rows;
+}
+
+function composeAttachmentWorkingDirectory(attachment: ComposeAttachment): string | undefined {
+  return (
+    attachment.mutation?.workingDirectory ??
+    attachment.workingDirectory ??
+    composeWorkingDirectoryFromFiles(attachment.composeFiles)
+  );
+}
+
+function composeWorkingDirectoryFromFiles(composeFiles: readonly string[]): string | undefined {
+  const firstFile = composeFiles.find((file) => file.trim().length > 0);
+  return firstFile === undefined ? undefined : dirnameFromPath(firstFile);
+}
+
+function dirnameFromPath(filePath: string): string | undefined {
+  const normalized = filePath.replace(/[/\\]+$/, "");
+  const lastSlash = Math.max(normalized.lastIndexOf("/"), normalized.lastIndexOf("\\"));
+  if (lastSlash < 0) {
+    return undefined;
+  }
+
+  return lastSlash === 0 ? normalized.slice(0, 1) : normalized.slice(0, lastSlash);
+}
+
 /** Builds tooltip details for one compose route endpoint. */
 function buildComposeRouteTooltip(attachment: ComposeAttachment, port: ComposePublishedPort): vscode.MarkdownString {
   const tooltip = new vscode.MarkdownString(undefined, true);
   tooltip.isTrusted = false;
+  const workingDirectory = composeAttachmentWorkingDirectory(attachment);
   tooltip.appendMarkdown(`**Compose Route**\n\n`);
   tooltip.appendMarkdown(`- Project: \`${escapeMarkdown(attachment.projectName)}\`\n`);
   tooltip.appendMarkdown(`- Service: \`${escapeMarkdown(port.serviceName)}\`\n`);
   tooltip.appendMarkdown(`- Network ID: \`${escapeMarkdown(attachment.networkId)}\`\n`);
+  if (workingDirectory !== undefined) {
+    tooltip.appendMarkdown(`- Original Folder: \`${escapeMarkdown(workingDirectory)}\`\n`);
+  }
   tooltip.appendMarkdown(`- Logical Port: \`${port.logicalPort}\`\n`);
   tooltip.appendMarkdown(`- Transport: \`${escapeMarkdown(port.actualHostAddress)}:${port.actualHostPort}\`\n`);
   tooltip.appendMarkdown(`- Container Port: \`${port.containerPort}\`\n`);
@@ -1726,10 +1870,12 @@ function buildContainerServiceTooltip(candidate: ContainerServiceCandidate): vsc
   tooltip.appendMarkdown(`- Status: \`${escapeMarkdown(candidate.status ?? "n/a")}\`\n`);
 
   if (candidate.composeProject || candidate.composeService) {
+    const workingDirectory = composeCandidateWorkingDirectory(candidate);
+    const composeFiles = composeCandidateSourceFiles(candidate);
     tooltip.appendMarkdown(`- Compose Project: \`${escapeMarkdown(candidate.composeProject ?? "n/a")}\`\n`);
     tooltip.appendMarkdown(`- Compose Service: \`${escapeMarkdown(candidate.composeService ?? "n/a")}\`\n`);
-    tooltip.appendMarkdown(`- Compose CWD: \`${escapeMarkdown(candidate.composeWorkingDirectory ?? "n/a")}\`\n`);
-    tooltip.appendMarkdown(`- Compose Files: \`${escapeMarkdown(candidate.composeConfigFiles?.join(", ") ?? "n/a")}\`\n`);
+    tooltip.appendMarkdown(`- Original Folder: \`${escapeMarkdown(workingDirectory ?? "n/a")}\`\n`);
+    tooltip.appendMarkdown(`- Compose Files: \`${escapeMarkdown(composeFiles?.join(", ") ?? "n/a")}\`\n`);
   }
 
   for (const port of candidate.ports) {
@@ -1753,10 +1899,22 @@ function buildComposeProjectCandidateTooltip(
 ): vscode.MarkdownString {
   const tooltip = new vscode.MarkdownString(undefined, true);
   tooltip.isTrusted = false;
+  const aggregateCandidate = buildAggregateComposeProjectCandidate(projectName, runtime, candidates);
+  const workingDirectory = composeCandidateWorkingDirectory(aggregateCandidate);
   tooltip.appendMarkdown(`**${escapeMarkdown(projectName)}**\n\n`);
   tooltip.appendMarkdown(`- Runtime: \`${runtime}\`\n`);
   tooltip.appendMarkdown(`- Services: \`${candidates.length}\`\n`);
   tooltip.appendMarkdown(`- Published Ports: \`${candidates.reduce((total, candidate) => total + candidate.ports.length, 0)}\`\n`);
+  if (workingDirectory !== undefined) {
+    tooltip.appendMarkdown(`- Original Folder: \`${escapeMarkdown(workingDirectory)}\`\n`);
+  }
+  const composeFiles = composeCandidateSourceFiles(aggregateCandidate);
+  if (composeFiles !== undefined && composeFiles.length > 0) {
+    tooltip.appendMarkdown("- Compose Files:\n");
+    for (const composeFile of composeFiles) {
+      tooltip.appendMarkdown(`  - \`${escapeMarkdown(composeFile)}\`\n`);
+    }
+  }
 
   for (const candidate of candidates) {
     tooltip.appendMarkdown(
@@ -1844,6 +2002,142 @@ function formatContainerServiceLabel(candidate: ContainerServiceCandidate): stri
 
 function formatContainerServiceTreeLabel(candidate: ContainerServiceCandidate): string {
   return candidate.composeService ?? formatContainerServiceLabel(candidate);
+}
+
+function buildAggregateComposeProjectCandidate(
+  projectName: string,
+  runtime: ContainerServiceCandidate["runtime"],
+  candidates: readonly ContainerServiceCandidate[],
+): ContainerServiceCandidate {
+  const composeConfigFiles = uniqueStrings(candidates.flatMap((candidate) => [...(candidate.composeConfigFiles ?? [])]));
+  const portManagerClone = mergePortManagerCloneMetadata(candidates);
+
+  return {
+    id: buildComposeProjectCandidateId(
+      runtime,
+      projectName,
+      candidates[0]?.composeWorkingDirectory,
+      composeConfigFiles,
+    ),
+    runtime,
+    containerId: projectName,
+    containerName: projectName,
+    composeProject: projectName,
+    ...(candidates[0]?.composeWorkingDirectory !== undefined
+      ? { composeWorkingDirectory: candidates[0].composeWorkingDirectory }
+      : {}),
+    ...(composeConfigFiles.length > 0 ? { composeConfigFiles } : {}),
+    ...(portManagerClone !== undefined ? { portManagerClone } : {}),
+    ports: candidates.flatMap((candidate) => [...candidate.ports]),
+  };
+}
+
+function formatComposeProjectCandidateDescription(
+  candidate: ContainerServiceCandidate,
+  serviceCount: number,
+  portCount: number,
+): string {
+  const details = [
+    candidate.runtime,
+    `${serviceCount} services`,
+    `${portCount} port${portCount === 1 ? "" : "s"}`,
+  ].filter((item): item is string => item !== undefined && item.length > 0);
+
+  return details.join(", ");
+}
+
+function formatContainerServiceCandidateDescription(candidate: ContainerServiceCandidate): string {
+  const details = [
+    candidate.runtime,
+    `${candidate.ports.length} port${candidate.ports.length === 1 ? "" : "s"}`,
+  ].filter((item): item is string => item !== undefined && item.length > 0);
+
+  return details.join(", ");
+}
+
+function buildComposeProjectCandidateDetailRows(candidate: ContainerServiceCandidate): PortManagerTreeItem[] {
+  const rows: PortManagerTreeItem[] = [];
+  const workingDirectory = composeCandidateWorkingDirectory(candidate);
+
+  if (workingDirectory !== undefined) {
+    rows.push(new ServiceDetailTreeItem(`${candidate.id}:detail:folder`, "Original Folder", workingDirectory, "folder"));
+  }
+
+  const composeFilesGroup = buildComposeFilesDetailGroup(
+    `${candidate.id}:detail:compose-files`,
+    composeCandidateSourceFiles(candidate) ?? [],
+  );
+  if (composeFilesGroup !== undefined) {
+    rows.push(composeFilesGroup);
+  }
+
+  return rows;
+}
+
+function buildContainerCandidateDetailRows(candidate: ContainerServiceCandidate): PortManagerTreeItem[] {
+  const rows: PortManagerTreeItem[] = [
+    new ServiceDetailTreeItem(`${candidate.id}:detail:container`, "Container", candidate.containerName, "server-process"),
+  ];
+
+  if (candidate.image !== undefined && candidate.image.length > 0) {
+    rows.push(new ServiceDetailTreeItem(`${candidate.id}:detail:image`, "Image", candidate.image, "package"));
+  }
+  if (candidate.status !== undefined && candidate.status.length > 0) {
+    rows.push(new ServiceDetailTreeItem(`${candidate.id}:detail:status`, "Status", candidate.status, "pulse"));
+  }
+
+  return rows;
+}
+
+function composeCandidateWorkingDirectory(candidate: ContainerServiceCandidate): string | undefined {
+  return candidate.composeWorkingDirectory ?? composeWorkingDirectoryFromFiles(composeCandidateSourceFiles(candidate) ?? []);
+}
+
+function composeCandidateSourceFiles(candidate: ContainerServiceCandidate): readonly string[] | undefined {
+  return candidate.portManagerClone?.composeFiles ?? candidate.composeConfigFiles;
+}
+
+function buildComposeFilesDetailGroup(
+  groupId: string,
+  composeFiles: readonly string[],
+): ServiceDetailGroupTreeItem | undefined {
+  const fileRows = composeFiles
+    .map((file) => file.trim())
+    .filter((file) => file.length > 0)
+    .map((file, index) => new ServiceDetailTreeItem(`${groupId}:${index}`, "File", file, "file-code"));
+
+  return fileRows.length > 0 ? new ServiceDetailGroupTreeItem(groupId, "Compose Files", fileRows, "files") : undefined;
+}
+
+function buildComposeContainerMappingDetailGroup(
+  groupId: string,
+  mappings: readonly {
+    readonly serviceName: string;
+    readonly originalContainerName: string;
+    readonly attachedContainerName: string;
+  }[],
+): ServiceDetailGroupTreeItem | undefined {
+  const containerRows = mappings.map(
+    (mapping, index) =>
+      new ServiceDetailTreeItem(
+        `${groupId}:${index}`,
+        mapping.serviceName.length > 0 ? mapping.serviceName : "Container",
+        `${mapping.originalContainerName} -> ${mapping.attachedContainerName}`,
+        "server-process",
+      ),
+  );
+
+  return containerRows.length > 0
+    ? new ServiceDetailGroupTreeItem(groupId, "Containers", containerRows, "server-process")
+    : undefined;
+}
+
+function buildServiceDetailTooltip(label: string, value: string): vscode.MarkdownString {
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.isTrusted = false;
+  tooltip.appendMarkdown(`**${escapeMarkdown(label)}**\n\n`);
+  tooltip.appendMarkdown(`\`${escapeMarkdown(value)}\``);
+  return tooltip;
 }
 
 /** Groups compose service containers under their compose project while keeping raw containers flat. */

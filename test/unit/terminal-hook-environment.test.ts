@@ -89,8 +89,15 @@ test("external pm shell function selects a network and sources its attach script
 
   assert.equal(networkServiceSource.includes('const TERMINAL_NETWORK_SELECTION_FILE_NAME = "terminal-networks.tsv";'), true);
   assert.equal(networkServiceSource.includes("private async writeTerminalNetworkSelectionFile(): Promise<void>"), true);
-  assert.equal(networkServiceSource.includes("serializeTerminalNetworkSelectionRow(network.id, network.name, scriptPath)"), true);
+  assert.equal(networkServiceSource.includes("const serviceSummary = buildTerminalNetworkServiceSummary"), true);
+  assert.equal(networkServiceSource.includes("serializeTerminalNetworkSelectionRow(network.id, network.name, scriptPath, serviceSummary)"), true);
+  assert.equal(networkServiceSource.includes("void this.writeTerminalNetworkSelectionFile();"), true);
   assert.equal(networkServiceSource.includes("await this.writeTerminalNetworkSelectionFile().catch(() => undefined);"), true);
+  assert.equal(networkServiceSource.includes('const TERMINAL_NETWORK_SERVICE_ENTRY_SEPARATOR = " || ";'), true);
+  assert.equal(networkServiceSource.includes("buildTerminalNetworkServiceSummary(network.id, snapshot)"), true);
+  assert.equal(networkServiceSource.includes("isContainerStyleComposeAttachment(attachment)"), true);
+  assert.equal(networkServiceSource.includes("container: ${containerName}"), true);
+  assert.equal(networkServiceSource.includes("compose: ${attachment.projectName}"), true);
   assert.equal(networkServiceSource.includes('shellExport("PORT_MANAGER_NETWORK_NAME", networkName)'), true);
   assert.equal(networkServiceSource.includes("buildTerminalTitleShell(buildPortManagerTerminalTitle(networkName))"), true);
   assert.equal(networkServiceSource.includes('buildTerminalTitleShell("Port Manager: detached")'), true);
@@ -107,7 +114,10 @@ test("external pm shell function selects a network and sources its attach script
   assert.equal(commandSource.includes("Port Manager shell network: none"), true);
   assert.equal(commandSource.includes('__pm_current_id="\\${PORT_MANAGER_NETWORK_ID:-}"'), true);
   assert.equal(commandSource.includes("Select Port Manager network:"), true);
-  assert.equal(commandSource.includes('printf "%s %d) %s [%s]\\\\n", marker, NR, $2, $1'), true);
+  assert.equal(commandSource.includes("const networkPrintScript = ["), true);
+  assert.equal(commandSource.includes("summary.split(/\\\\s+\\\\|\\\\|\\\\s+/)"), true);
+  assert.equal(commandSource.includes('console.error("     "+entry.trim())'), true);
+  assert.equal(commandSource.includes('summary = (NF >= 4 && $4 != "" ? " - " $4 : " - no services")'), false);
   assert.equal(commandSource.includes('. \"$__pm_attach_script\"'), true);
 });
 
@@ -197,6 +207,26 @@ test("background routing refresh converges daemon version and generated route fi
   assert.equal(ensureBody.includes("await this.processService.start();"), true);
   assert.equal(ensureBody.includes("daemon.restartRequired"), true);
   assert.equal(ensureBody.includes("await this.processService.restartDaemon();"), true);
+});
+
+test("compose attach waits for routing convergence before returning", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const attachStart = source.indexOf("async attachComposePublishedPorts(input: ComposePublishedPortsInput)");
+  const attachEnd = source.indexOf("async detachComposeAttachment", attachStart);
+  const attachBody = source.slice(attachStart, attachEnd);
+  const convergeStart = source.indexOf("private async convergeAfterComposeAttachmentChange");
+  const convergeEnd = source.indexOf("private async convergeDaemonAndRoutingState", convergeStart);
+  const convergeBody = source.slice(convergeStart, convergeEnd);
+
+  assert.equal(attachBody.includes("await this.convergeAfterComposeAttachmentChange([refreshedAttachment]);"), true);
+  assert.equal(attachBody.includes("await this.convergeAfterComposeAttachmentChange([updatedAttachment]);"), true);
+  assert.equal(convergeBody.includes("await this.writeComposeProjectRoutingFile().catch(() => undefined);"), true);
+  assert.equal(convergeBody.includes("await this.writeTerminalNetworkSelectionFile().catch(() => undefined);"), true);
+  assert.equal(convergeBody.includes("await this.restorePersistedComposeRoutesIfMissing().catch(() => undefined);"), true);
+  assert.equal(convergeBody.includes("await this.convergeDaemonAndRoutingState();"), true);
+  assert.equal(convergeBody.includes("await this.refreshContainerServices().catch(() => []);"), true);
+  assert.equal(convergeBody.includes("this.localChangeEvents.emit();"), true);
 });
 
 test("terminal hook markers refresh attached UI state without manual refresh", () => {

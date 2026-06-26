@@ -730,7 +730,7 @@ export class ComposePublishMutator {
   ): Promise<ComposeServiceContainerList> {
     const serviceSet = new Set(services);
     const { rows, inspectedRows } = await this.listRuntimeRowsWithInspectNames(runtime);
-    const containers = selectCurrentComposeServiceContainers(parseComposeServiceContainerRows(rows)).filter(
+    const containers = selectCurrentComposeServiceContainers(parseComposeServiceContainerRows(rows, inspectedRows)).filter(
       (candidate) =>
         candidate.composeProject === originalProjectName &&
         serviceSet.has(candidate.serviceName),
@@ -1943,12 +1943,14 @@ function readRuntimeContainerName(row: RuntimeContainerRow): string | undefined 
 
 function parseComposeServiceContainerRows(
   rows: readonly RuntimeContainerRow[],
+  inspectedRows: readonly RuntimeContainerInspectRow[] = [],
 ): readonly (ComposeServiceContainer & { readonly composeProject: string })[] {
   return rows
     .map((row) => {
       const id = readRuntimeContainerId(row);
-      const name = readRuntimeContainerName(row);
-      const labels = parseRuntimeLabels(row.Labels);
+      const inspected = id === undefined ? undefined : findInspectedRuntimeContainer(inspectedRows, id);
+      const name = readRuntimeContainerName(row) ?? normalizeContainerNameText(inspected?.Name ?? "");
+      const labels = mergeRuntimeLabels(parseRuntimeLabels(row.Labels), inspected?.Config?.Labels);
       const composeProject = readRuntimeLabel(labels, "com.docker.compose.project", "io.podman.compose.project");
       const composeService = readRuntimeLabel(labels, "com.docker.compose.service", "io.podman.compose.service");
       if (id === undefined || name === undefined || composeProject === undefined || composeService === undefined) {
@@ -1965,6 +1967,27 @@ function parseComposeServiceContainerRows(
       };
     })
     .filter((container): container is ComposeServiceContainer & { readonly composeProject: string } => container !== undefined);
+}
+
+function findInspectedRuntimeContainer(
+  inspectedRows: readonly RuntimeContainerInspectRow[],
+  containerId: string,
+): RuntimeContainerInspectRow | undefined {
+  return inspectedRows.find((row) => {
+    const inspectedId = row.ID ?? row.Id;
+    return inspectedId !== undefined && sameContainerId(inspectedId, containerId);
+  });
+}
+
+function mergeRuntimeLabels(
+  rowLabels: ReadonlyMap<string, string>,
+  inspectedLabels: Record<string, string> | undefined,
+): ReadonlyMap<string, string> {
+  const labels = new Map(inspectedLabels === undefined ? [] : Object.entries(inspectedLabels));
+  for (const [key, value] of rowLabels) {
+    labels.set(key, value);
+  }
+  return labels;
 }
 
 function selectCurrentComposeServiceContainers(
