@@ -840,8 +840,12 @@ export interface BrowserDnsResolverRecordStatus {
   readonly hostname: string;
   /** Per-network loopback address returned by the local DNS responder. */
   readonly address: string;
-  /** True when macOS resolver configuration points this hostname at Port Manager DNS. */
+  /** True when both the resolver file and loopback alias are ready for browser traffic. */
   readonly configured: boolean;
+  /** True when macOS resolver configuration points this hostname at Port Manager DNS. */
+  readonly resolverConfigured: boolean;
+  /** True when macOS can bind/connect the DNS-returned loopback address on lo0. */
+  readonly loopbackAliasConfigured: boolean;
   /** Browser-visible port routes currently known for this alias. */
   readonly routes: readonly BrowserDnsAliasRouteStatus[];
 }

@@ -56,8 +56,15 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
 
   assert.equal(networkServiceSource.includes("# Port Manager browser DNS resolver"), true);
   assert.equal(networkServiceSource.includes("buildBrowserDnsResolverCleanupScript"), true);
+  assert.equal(networkServiceSource.includes("ifconfig lo0 alias"), true);
+  assert.equal(networkServiceSource.includes("ifconfig lo0 -alias"), true);
   assert.equal(networkServiceSource.includes("with administrator privileges"), true);
   assert.equal(networkServiceSource.includes("maybeAutoInstallBrowserDnsResolvers"), true);
+  assert.equal(networkServiceSource.includes("isBrowserDnsLoopbackAliasConfigured"), true);
+  assert.equal(networkServiceSource.includes("loopbackAliasConfigured"), true);
+  assert.equal(networkServiceSource.includes("readBrowserProxyProcessCommandTexts"), true);
+  assert.equal(networkServiceSource.includes("readProcessCommand(process.pid)"), true);
+  assert.equal(networkServiceSource.includes("processCommandTextByPid"), true);
   assert.equal(networkServiceSource.includes("isPublicWebEntrypointProcess"), true);
   assert.equal(networkServiceSource.includes("/\\bvite\\b/"), true);
   assert.equal(networkServiceSource.includes("backend ports remain"), true);
@@ -72,6 +79,7 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(commandSource.includes("copyBrowserDnsResolverSetup"), false);
   assert.equal(treeSource.includes("Install Browser DNS"), true);
   assert.equal(treeSource.includes("Clean Browser DNS"), true);
+  assert.equal(treeSource.includes("Loopback alias: ${aliasStatus}"), true);
   assert.equal(treeSource.includes("buildBrowserDnsRecordRows"), true);
   assert.equal(treeSource.includes("Logical port: ${route.logicalPort}"), true);
   assert.equal(treeSource.includes("Proxy: ${proxy}"), true);

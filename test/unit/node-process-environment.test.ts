@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   inferRequestedPortFromCommand,
+  inferRequestedPortFromProcessEnvironment,
   NodeProcessEnvironmentProvider,
   parseRoutingNetworkIdFromProcessEnvironment,
 } from "../../src/platform/process/node-process-environment";
@@ -74,6 +75,14 @@ test("infers requested ports from common server command lines", () => {
   assert.equal(inferRequestedPortFromCommand("node server.js --listen-port 9000", 58000), 9000);
 });
 
+test("infers requested ports from explicit dev server environment variables", () => {
+  assert.equal(
+    inferRequestedPortFromProcessEnvironment("node vite PORT_MANAGER_HOOK=1 VITE_CLIENT_PORT=3004", 53743),
+    3004,
+  );
+  assert.equal(inferRequestedPortFromProcessEnvironment("node server PORT=53743", 53743), undefined);
+});
+
 test("recovers hook route registration from listener process metadata", async () => {
   if (process.platform === "win32") {
     return;
@@ -119,6 +128,46 @@ test("recovers hook route registration from listener process metadata", async ()
     networkId: "network-a",
     source: "hooked",
   });
+});
+
+test("recovers wrapper-launched Vite routes from environment port metadata", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  const listener = createListener({
+    port: 53743,
+    pid: 70925,
+    processName: "node",
+    command: "node",
+  });
+  const provider = new NodeProcessEnvironmentProvider({
+    nativeLookupProvider: {
+      inspectProcess: async () => ({
+        ancestorPids: [],
+        cwd: "/workspace/client",
+        networkId: "network-a",
+      }),
+    },
+    commandRunner: async (_file, args) => {
+      if (args.includes("eww")) {
+        return {
+          stdout:
+            "70925 s005 node /workspace/node_modules/.bin/vite --host PORT_MANAGER_HOOK=1 PORT_MANAGER_NETWORK_ID=network-a VITE_CLIENT_PORT=3004 PWD=/workspace",
+        };
+      }
+
+      return {
+        stdout: "node /workspace/node_modules/.bin/vite --host\n",
+      };
+    },
+  });
+
+  const recovered = await provider.recoverHookRoute(listener);
+
+  assert.equal(recovered?.requestedPort, 3004);
+  assert.equal(recovered?.actualPort, 53743);
+  assert.equal(recovered?.command, "node /workspace/node_modules/.bin/vite --host");
 });
 
 test("does not recover debug adapter helper listeners as app routes", async () => {

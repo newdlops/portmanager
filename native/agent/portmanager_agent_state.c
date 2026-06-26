@@ -18,6 +18,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#define PM_PROCESS_INSPECT_TEXT 65536
+
 typedef struct {
   pm_route *items;
   size_t count;
@@ -37,6 +39,8 @@ static void pm_listener_cache_invalidate(pm_agent_state *state);
 static int pm_state_needs_external_listener_fresh_scan(pm_agent_state *state);
 static int pm_find_listener_for_port_host(int port, const char *host, pm_listener *out);
 static const char *pm_listener_route_host(const pm_listener *listener, const char *fallback_host, char *buffer, size_t size);
+static void pm_remove_pending_endpoint(pm_agent_state *state, int logical_port, const char *network_id);
+static int pm_listener_is_tracked(pm_agent_state *state, const pm_listener *listener);
 
 static void pm_copy(char *target, size_t size, const char *value) {
   if (size == 0) {
@@ -822,6 +826,431 @@ static int pm_adopt_listener_owner(pm_process *process, const pm_listener *liste
   return changed;
 }
 
+static void pm_trim_process_text(char *text) {
+  size_t length;
+
+  if (text == NULL) {
+    return;
+  }
+
+  length = strlen(text);
+  while (length > 0 && isspace((unsigned char)text[length - 1])) {
+    text[--length] = '\0';
+  }
+}
+
+static int pm_read_process_text(pid_t pid, const char *command_template, char *out, size_t out_size) {
+  char command[PM_TEXT];
+  char line[4096];
+  FILE *pipe;
+  size_t used = 0;
+
+  if (out == NULL || out_size == 0 || pid <= 0) {
+    return 0;
+  }
+
+  out[0] = '\0';
+  snprintf(command, sizeof(command), command_template, (long)pid);
+  pipe = popen(command, "r");
+  if (pipe == NULL) {
+    return 0;
+  }
+
+  while (fgets(line, sizeof(line), pipe) != NULL && used + 1 < out_size) {
+    size_t line_length = strlen(line);
+    if (line_length > out_size - used - 1) {
+      line_length = out_size - used - 1;
+    }
+    memcpy(out + used, line, line_length);
+    used += line_length;
+    out[used] = '\0';
+  }
+
+  pclose(pipe);
+  pm_trim_process_text(out);
+  return out[0] != '\0';
+}
+
+static int pm_read_process_environment_text(pid_t pid, char *out, size_t out_size) {
+  return pm_read_process_text(pid, "ps eww -p %ld 2>/dev/null", out, out_size);
+}
+
+static int pm_read_process_command_text(pid_t pid, char *out, size_t out_size) {
+  return pm_read_process_text(pid, "ps -o command= -p %ld 2>/dev/null", out, out_size);
+}
+
+static int pm_process_text_value(const char *text, const char *name, char *out, size_t out_size) {
+  size_t name_length;
+  const char *cursor;
+
+  if (text == NULL || name == NULL || out == NULL || out_size == 0) {
+    return 0;
+  }
+
+  name_length = strlen(name);
+  cursor = text;
+  while ((cursor = strstr(cursor, name)) != NULL) {
+    const char *value_start;
+    const char *value_end;
+    size_t value_length;
+
+    if ((cursor == text || isspace((unsigned char)*(cursor - 1))) && cursor[name_length] == '=') {
+      value_start = cursor + name_length + 1;
+      value_end = value_start;
+      while (*value_end != '\0' && !isspace((unsigned char)*value_end)) {
+        value_end++;
+      }
+
+      value_length = (size_t)(value_end - value_start);
+      if (value_length > 0) {
+        if (value_length >= out_size) {
+          value_length = out_size - 1;
+        }
+        memcpy(out, value_start, value_length);
+        out[value_length] = '\0';
+        return 1;
+      }
+    }
+
+    cursor += name_length;
+  }
+
+  return 0;
+}
+
+static int pm_process_text_has_any_value(const char *text, const char *const *names, size_t count) {
+  char value[PM_SMALL];
+
+  for (size_t index = 0; index < count; index++) {
+    if (pm_process_text_value(text, names[index], value, sizeof(value))) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int pm_process_text_first_value(const char *text, const char *const *names, size_t count, char *out, size_t out_size) {
+  for (size_t index = 0; index < count; index++) {
+    if (pm_process_text_value(text, names[index], out, out_size)) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int pm_parse_port_token(const char *value, int actual_port) {
+  const char *cursor;
+  long port = 0;
+  int digits = 0;
+
+  if (value == NULL || value[0] == '\0') {
+    return 0;
+  }
+
+  cursor = strrchr(value, ':');
+  cursor = cursor == NULL ? value : cursor + 1;
+  if (!isdigit((unsigned char)*cursor)) {
+    return 0;
+  }
+
+  while (isdigit((unsigned char)*cursor) && digits < 6) {
+    port = port * 10 + (*cursor - '0');
+    cursor++;
+    digits++;
+  }
+
+  if (digits == 0 || (*cursor != '\0' && *cursor != '/') || !pm_is_valid_port((int)port) || (int)port == actual_port) {
+    return 0;
+  }
+
+  return (int)port;
+}
+
+static int pm_infer_requested_port_from_environment(const char *environment, int actual_port) {
+  static const char *const port_variables[] = {
+    "VITE_CLIENT_PORT",
+    "PORT",
+    "SERVER_PORT",
+    "DEV_SERVER_PORT",
+    "HTTP_PORT",
+  };
+  char value[PM_SMALL];
+
+  for (size_t index = 0; index < sizeof(port_variables) / sizeof(port_variables[0]); index++) {
+    if (pm_process_text_value(environment, port_variables[index], value, sizeof(value))) {
+      int port = pm_parse_port_token(value, actual_port);
+      if (port > 0) {
+        return port;
+      }
+    }
+  }
+
+  return 0;
+}
+
+static int pm_token_matches_any(const char *token, const char *const *values, size_t count) {
+  for (size_t index = 0; index < count; index++) {
+    if (strcmp(token, values[index]) == 0) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int pm_token_has_prefix_port(const char *token, const char *prefix, int actual_port) {
+  size_t prefix_length = strlen(prefix);
+
+  if (strncmp(token, prefix, prefix_length) != 0) {
+    return 0;
+  }
+
+  return pm_parse_port_token(token + prefix_length, actual_port);
+}
+
+static int pm_infer_requested_port_from_command(const char *command, int actual_port) {
+  static const char *const port_flags[] = {
+    "--port",
+    "--listen-port",
+    "--http-port",
+    "--server-port",
+    "-p",
+  };
+  static const char *const server_commands[] = {
+    "runserver",
+    "serve",
+    "http.server",
+  };
+  char copy[PM_TEXT];
+  char *save = NULL;
+  char *token;
+  int next_token_is_port = 0;
+
+  if (command == NULL || command[0] == '\0') {
+    return 0;
+  }
+
+  pm_copy(copy, sizeof(copy), command);
+  for (token = strtok_r(copy, " \t\r\n", &save); token != NULL; token = strtok_r(NULL, " \t\r\n", &save)) {
+    int port;
+
+    if (next_token_is_port) {
+      port = pm_parse_port_token(token, actual_port);
+      if (port > 0) {
+        return port;
+      }
+      next_token_is_port = 0;
+    }
+
+    port = pm_token_has_prefix_port(token, "--port=", actual_port);
+    if (port <= 0) {
+      port = pm_token_has_prefix_port(token, "--listen-port=", actual_port);
+    }
+    if (port <= 0) {
+      port = pm_token_has_prefix_port(token, "--http-port=", actual_port);
+    }
+    if (port <= 0) {
+      port = pm_token_has_prefix_port(token, "--server-port=", actual_port);
+    }
+    if (port > 0) {
+      return port;
+    }
+
+    if (pm_token_matches_any(token, port_flags, sizeof(port_flags) / sizeof(port_flags[0])) ||
+        pm_token_matches_any(token, server_commands, sizeof(server_commands) / sizeof(server_commands[0]))) {
+      next_token_is_port = 1;
+      continue;
+    }
+
+    if (strstr(token, "localhost:") != NULL ||
+        strstr(token, "127.0.0.1:") != NULL ||
+        strstr(token, "0.0.0.0:") != NULL ||
+        strstr(token, "*:") != NULL ||
+        strstr(token, "::1:") != NULL) {
+      port = pm_parse_port_token(token, actual_port);
+      if (port > 0) {
+        return port;
+      }
+    }
+  }
+
+  return 0;
+}
+
+static int pm_is_hook_recovery_helper_text(const char *text) {
+  return text != NULL &&
+    (strstr(text, "portmanager_agent") != NULL ||
+     strstr(text, "portmanager_tcp_router") != NULL ||
+     strstr(text, "portmanager_process_lookup") != NULL ||
+     strstr(text, "debugpy/adapter") != NULL ||
+     strstr(text, "debugpy.adapter") != NULL);
+}
+
+static void pm_infer_process_name_from_command(const char *command, char *out, size_t out_size) {
+  const char *end;
+  size_t length;
+
+  if (out == NULL || out_size == 0) {
+    return;
+  }
+
+  if (command == NULL || command[0] == '\0') {
+    pm_copy(out, out_size, "hooked process");
+    return;
+  }
+
+  end = command;
+  while (*end != '\0' && !isspace((unsigned char)*end)) {
+    end++;
+  }
+
+  length = (size_t)(end - command);
+  if (length == 0) {
+    pm_copy(out, out_size, "hooked process");
+    return;
+  }
+  if (length >= out_size) {
+    length = out_size - 1;
+  }
+
+  memcpy(out, command, length);
+  out[length] = '\0';
+}
+
+static int pm_recovered_hook_route_exists(
+  pm_agent_state *state,
+  pid_t pid,
+  int requested_port,
+  int actual_port,
+  const char *network_id) {
+  for (size_t index = 0; index < state->process_count; index++) {
+    pm_process *process = &state->processes[index];
+    if (strcmp(process->status, "stopped") != 0 &&
+        process->pid == pid &&
+        process->requested_port == requested_port &&
+        process->actual_port == actual_port &&
+        strcmp(process->network_id, network_id) == 0) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int pm_recover_untracked_hooked_listener(pm_agent_state *state, const pm_listener *listener, const char *updated_at) {
+  static const char *const hook_markers[] = {
+    "PORT_MANAGER_HOOK",
+    "PORT_MANAGER_DYLD_INSERT_LIBRARIES",
+    "PORT_MANAGER_AGENT_SOCKET",
+    "PORT_MANAGER_ROUTES_FILE",
+  };
+  static const char *const network_variables[] = {
+    "PORT_MANAGER_NETWORK_ID",
+    "PORT_MANAGER_BORROWED_NETWORK_ID",
+    "NEWDLOPS_PM_NETWORK_ID",
+    "NEWDLOPS_PM_BORROWED_NETWORK_ID",
+  };
+  static const char *const cwd_variables[] = {
+    "PWD",
+    "INIT_CWD",
+  };
+  char environment[PM_PROCESS_INSPECT_TEXT];
+  char command[PM_TEXT];
+  char network_id[PM_SMALL];
+  char cwd[PM_TEXT];
+  char host[PM_SMALL];
+  char name[PM_SMALL];
+  pm_process *process;
+  int requested_port;
+
+  if (listener == NULL ||
+      listener->pid <= 0 ||
+      listener->pid == state->agent_pid ||
+      pm_listener_is_tracked(state, listener) ||
+      pm_is_hook_recovery_helper_text(listener->process_name) ||
+      pm_is_hook_recovery_helper_text(listener->command)) {
+    return 0;
+  }
+
+  if (!pm_read_process_environment_text(listener->pid, environment, sizeof(environment)) ||
+      !pm_process_text_has_any_value(environment, hook_markers, sizeof(hook_markers) / sizeof(hook_markers[0])) ||
+      !pm_process_text_first_value(environment, network_variables, sizeof(network_variables) / sizeof(network_variables[0]), network_id, sizeof(network_id))) {
+    return 0;
+  }
+
+  if (!pm_read_process_command_text(listener->pid, command, sizeof(command))) {
+    pm_copy(command, sizeof(command), listener->command[0] ? listener->command : listener->process_name);
+  }
+  if (pm_is_hook_recovery_helper_text(command)) {
+    return 0;
+  }
+
+  requested_port = pm_infer_requested_port_from_environment(environment, listener->port);
+  if (requested_port <= 0) {
+    requested_port = pm_infer_requested_port_from_command(command, listener->port);
+  }
+  if (requested_port <= 0 || requested_port == listener->port ||
+      pm_recovered_hook_route_exists(state, listener->pid, requested_port, listener->port, network_id)) {
+    return 0;
+  }
+
+  if (!pm_process_text_first_value(environment, cwd_variables, sizeof(cwd_variables) / sizeof(cwd_variables[0]), cwd, sizeof(cwd))) {
+    pm_copy(cwd, sizeof(cwd), ".");
+  }
+  if (listener->process_name[0] != '\0') {
+    pm_copy(name, sizeof(name), listener->process_name);
+  } else {
+    pm_infer_process_name_from_command(command, name, sizeof(name));
+  }
+
+  if (pm_reserve_processes(state, state->process_count + 1) != 0) {
+    return 0;
+  }
+
+  process = &state->processes[state->process_count++];
+  memset(process, 0, sizeof(*process));
+  snprintf(process->id, sizeof(process->id), "managed-process-%lu", state->next_process_id++);
+  process->pid = listener->pid;
+  pm_copy(process->name, sizeof(process->name), name);
+  pm_copy(process->command, sizeof(process->command), command);
+  pm_copy(process->cwd, sizeof(process->cwd), cwd);
+  pm_copy(process->network_id, sizeof(process->network_id), network_id);
+  process->requested_port = requested_port;
+  process->actual_port = listener->port;
+  pm_copy(process->host, sizeof(process->host), pm_listener_route_host(listener, "127.0.0.1", host, sizeof(host)));
+  pm_copy(process->status, sizeof(process->status), "running");
+  pm_copy(process->started_at, sizeof(process->started_at), updated_at);
+  pm_url(process->url, sizeof(process->url), process->host, process->actual_port);
+  pm_copy(process->source, sizeof(process->source), "hooked");
+  process->child_owned = 0;
+  pm_clear_missing_listener_state(process);
+
+  pm_remove_pending_endpoint(state, process->requested_port, network_id);
+  return 1;
+}
+
+static int pm_recover_untracked_hooked_listeners(
+  pm_agent_state *state,
+  const pm_listener_list *listeners,
+  const char *updated_at) {
+  int changed = 0;
+
+  for (size_t index = 0; listeners != NULL && index < listeners->count; index++) {
+    /*
+     * Daemon restarts erase in-memory hook registrations, but the server keeps
+     * the Port Manager environment. Rehydrate only listeners that still carry
+     * that environment and expose an explicit logical-port hint.
+     */
+    if (pm_recover_untracked_hooked_listener(state, &listeners->items[index], updated_at)) {
+      changed = 1;
+    }
+  }
+
+  return changed;
+}
+
 static int pm_reconcile_external_processes_with_listeners(
   pm_agent_state *state,
   const pm_listener_list *listeners,
@@ -871,6 +1300,7 @@ static int pm_reconcile_external_processes_with_listeners(
     }
   }
 
+  changed = pm_recover_untracked_hooked_listeners(state, listeners, updated_at) || changed;
   return changed;
 }
 

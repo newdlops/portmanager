@@ -49,6 +49,19 @@ test("native agent matches loopback listeners by host as well as port", () => {
   assert.equal(source.includes("pm_find_listener_by_port("), false);
 });
 
+test("native agent recovers restarted hook routes from process environment", () => {
+  const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
+
+  assert.equal(source.includes("pm_recover_untracked_hooked_listeners"), true);
+  assert.equal(source.includes("pm_read_process_environment_text"), true);
+  assert.equal(source.includes("pm_read_process_command_text"), true);
+  assert.equal(source.includes("VITE_CLIENT_PORT"), true);
+  assert.equal(source.includes("PORT_MANAGER_NETWORK_ID"), true);
+  assert.equal(source.includes("NEWDLOPS_PM_NETWORK_ID"), true);
+  assert.equal(source.includes("requested_port == listener->port"), true);
+  assert.equal(source.includes("pm_remove_pending_endpoint(state, process->requested_port, network_id)"), true);
+});
+
 if (!fs.existsSync(nativeAgentPath)) {
   test("native agent serves concurrent hook-like clients while extension client receives events", { skip: "native agent binary is not built" }, () => undefined);
 } else {

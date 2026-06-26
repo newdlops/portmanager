@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import * as syncFs from "node:fs";
 import type { Dirent } from "node:fs";
@@ -2782,13 +2782,37 @@ export class PortManagerNetworkService implements DisposableLike {
 
   private async syncBrowserNetworkProxiesExclusive(): Promise<void> {
     const snapshot = this.processService?.getSnapshot();
+    const processCommandTextByPid = await this.readBrowserProxyProcessCommandTexts(snapshot?.processes ?? []);
     const endpoints = collectBrowserProxyEndpoints(
       snapshot?.processes ?? [],
       this.registry.getSnapshot().networks,
       this.browserDnsServer.isRunning(),
+      processCommandTextByPid,
     );
 
     await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);
+  }
+
+  /** Wrapper-launched dev servers can register as `node`; inspect argv before classifying browser routes. */
+  private async readBrowserProxyProcessCommandTexts(
+    processes: readonly ManagedProcess[],
+  ): Promise<ReadonlyMap<number, string>> {
+    const candidates = processes.filter(
+      (process): process is ManagedProcess & { readonly pid: number; readonly networkId: string; readonly url: string } =>
+        process.pid !== undefined &&
+        process.status === "running" &&
+        process.networkId !== undefined &&
+        process.url !== undefined &&
+        !isPublicWebEntrypointProcess(process),
+    );
+    const entries = await Promise.all(
+      candidates.map(async (process) => {
+        const command = await this.processEnvironmentProvider.readProcessCommand(process.pid).catch(() => undefined);
+        return command === undefined ? undefined : ([process.pid, command] as const);
+      }),
+    );
+
+    return new Map(entries.filter((entry): entry is readonly [number, string] => entry !== undefined));
   }
 
   /**
@@ -4513,11 +4537,13 @@ function collectBrowserProxyEndpoints(
   processes: readonly ManagedProcess[],
   networks: readonly LogicalNetwork[],
   useDnsAlias: boolean,
+  processCommandTextByPid: ReadonlyMap<number, string> = new Map(),
 ): readonly BrowserNetworkProxyEndpoint[] {
   const endpoints = new Map<string, BrowserNetworkProxyEndpoint>();
 
   for (const process of processes) {
-    if (!isBrowserProxyProcess(process, networks)) {
+    const processCommandText = process.pid === undefined ? undefined : processCommandTextByPid.get(process.pid);
+    if (!isBrowserProxyProcess(process, networks, processCommandText)) {
       continue;
     }
 
@@ -4531,6 +4557,7 @@ function collectBrowserProxyEndpoints(
 function isBrowserProxyProcess(
   process: ManagedProcess,
   networks: readonly LogicalNetwork[],
+  processCommandText?: string,
 ): process is ManagedProcess & {
   readonly networkId: string;
   readonly url: string;
@@ -4552,12 +4579,12 @@ function isBrowserProxyProcess(
     process.source !== "detected" &&
     process.source !== "compose" &&
     process.source !== "allocated" &&
-    isPublicWebEntrypointProcess(process)
+    isPublicWebEntrypointProcess(process, processCommandText)
   );
 }
 
-function isPublicWebEntrypointProcess(process: ManagedProcess): boolean {
-  const text = `${process.name} ${process.command} ${process.cwd} ${process.url ?? ""}`.toLowerCase();
+function isPublicWebEntrypointProcess(process: ManagedProcess, processCommandText = ""): boolean {
+  const text = `${process.name} ${process.command} ${processCommandText} ${process.cwd} ${process.url ?? ""}`.toLowerCase();
 
   /*
    * DNS aliases are for the browser entrypoint, not every network-local API or
@@ -4675,6 +4702,23 @@ function isBrowserDnsResolverConfigured(hostname: string): boolean {
   }
 }
 
+/**
+ * Browser DNS aliases return non-default 127.x.x.x addresses. On macOS those
+ * addresses must exist on lo0 before the browser isolation proxy can bind them.
+ */
+function isBrowserDnsLoopbackAliasConfigured(address: string): boolean {
+  if (process.platform !== "darwin") {
+    return true;
+  }
+
+  try {
+    const output = execFileSync("ifconfig", ["lo0"], { encoding: "utf8", timeout: 1000 });
+    return new RegExp(`inet[ \\t]+${escapeRegExp(address)}(?:[ \\t]|$)`).test(output);
+  } catch {
+    return false;
+  }
+}
+
 function normalizeBrowserProxyTargetHost(host: string): string {
   if (host === "0.0.0.0" || host === "*" || host === "") {
     return "127.0.0.1";
@@ -4702,11 +4746,18 @@ function buildBrowserDnsResolverStatus(
   browserNetworkProxy: BrowserNetworkProxyManager,
 ): BrowserDnsResolverStatus {
   const supported = process.platform === "darwin";
-  const recordStatuses = records.map((record) => ({
-    ...record,
-    configured: supported && isBrowserDnsResolverConfigured(record.hostname),
-    routes: buildBrowserDnsAliasRouteStatus(record, processes, routes, networks, browserNetworkProxy),
-  }));
+  const recordStatuses = records.map((record) => {
+    const resolverConfigured = supported && isBrowserDnsResolverConfigured(record.hostname);
+    const loopbackAliasConfigured = supported && isBrowserDnsLoopbackAliasConfigured(record.address);
+
+    return {
+      ...record,
+      configured: resolverConfigured && loopbackAliasConfigured,
+      resolverConfigured,
+      loopbackAliasConfigured,
+      routes: buildBrowserDnsAliasRouteStatus(record, processes, routes, networks, browserNetworkProxy),
+    };
+  });
 
   return {
     supported,
@@ -4765,6 +4816,9 @@ function buildBrowserDnsResolverSetupScript(
 
   for (const record of uniqueRecords) {
     lines.push(
+      `if ! ifconfig lo0 2>/dev/null | grep -E ${shellQuote(`inet[[:space:]]+${record.address}([[:space:]]|$)`)} >/dev/null 2>&1; then`,
+      `  ifconfig lo0 alias ${shellQuote(record.address)} 255.255.255.255`,
+      "fi",
       `cat > ${shellQuote(path.join("/etc/resolver", record.hostname))} <<'PORTMANAGER_RESOLVER'`,
       "# Port Manager browser DNS resolver",
       `# ${record.hostname} -> ${record.address}`,
@@ -4791,6 +4845,7 @@ function buildBrowserDnsResolverCleanupScript(
     lines.push(
       `if [ -f ${shellQuote(filePath)} ] && grep -q '^# Port Manager browser DNS resolver$' ${shellQuote(filePath)}; then`,
       `  rm -f ${shellQuote(filePath)}`,
+      `  ifconfig lo0 -alias ${shellQuote(record.address)} >/dev/null 2>&1 || true`,
       "fi",
     );
   }
@@ -4808,6 +4863,10 @@ function isPortManagerLogicalRouterListener(listener: ListeningPort): boolean {
 
 function isTcpPort(port: number): boolean {
   return Number.isInteger(port) && port > 0 && port <= 65_535;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /** Converts the container adapter target into the socket proxy contract. */

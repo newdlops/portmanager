@@ -107,6 +107,15 @@ export class NodeProcessEnvironmentProvider {
     return request;
   }
 
+  /** Reads the full command line for classifiers that must inspect wrapper-launched runtimes. */
+  async readProcessCommand(pid: number): Promise<string | undefined> {
+    if (!isPositiveInteger(pid) || process.platform === "win32") {
+      return undefined;
+    }
+
+    return normalizeCommandText(await this.readProcessCommandText(pid));
+  }
+
   /**
    * Rebuilds a hook-owned listener registration for an already-running process.
    * This is used only after daemon restart, when the in-memory registry is gone
@@ -134,7 +143,9 @@ export class NodeProcessEnvironmentProvider {
       return undefined;
     }
 
-    const requestedPort = inferRequestedPortFromCommand(command, listener.port);
+    const requestedPort =
+      inferRequestedPortFromProcessEnvironment(environmentOutput, listener.port) ??
+      inferRequestedPortFromCommand(command, listener.port);
     if (requestedPort === undefined || requestedPort === listener.port) {
       return undefined;
     }
@@ -220,6 +231,18 @@ export function inferRequestedPortFromCommand(command: string, actualPort?: numb
   }
 
   return [...candidates].reverse().find((port) => actualPort === undefined || port !== actualPort);
+}
+
+/** Infers the logical port from explicit dev-server environment variables. */
+export function inferRequestedPortFromProcessEnvironment(output: string, actualPort?: number): number | undefined {
+  for (const name of ["VITE_CLIENT_PORT", "PORT", "SERVER_PORT", "DEV_SERVER_PORT", "HTTP_PORT"]) {
+    const port = parseTcpPort(parseProcessEnvironmentValue(output, [name]));
+    if (port !== undefined && (actualPort === undefined || port !== actualPort)) {
+      return port;
+    }
+  }
+
+  return undefined;
 }
 
 function hasPortManagerHookEnvironment(output: string): boolean {
