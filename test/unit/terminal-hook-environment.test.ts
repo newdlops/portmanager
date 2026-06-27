@@ -35,7 +35,6 @@ test("BASH_ENV restore script promotes runtime shims ahead of inherited PATH ent
 test("package command shims rerun client tools without native runtime alias semantics", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
-  const launcherList = /const PRELOAD_RUNTIME_LAUNCHER_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
   const packageCommandList = /const PRELOAD_PACKAGE_COMMAND_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
   const packageManagerList = /const PRELOAD_PACKAGE_MANAGER_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
   const packageManagerShimStart = source.indexOf("function buildPreloadPackageManagerCommandShimScript");
@@ -47,11 +46,6 @@ test("package command shims rerun client tools without native runtime alias sema
 
   for (const packageBinary of ["concurrently", "wait-on", "retry", "vite", "dotenv", "celery", "uvicorn", "gunicorn", "daphne"]) {
     assert.equal(
-      launcherList.includes(`"${packageBinary}"`),
-      false,
-      `${packageBinary} must not use the native runtime launcher argv semantics`,
-    );
-    assert.equal(
       packageCommandList.includes(`"${packageBinary}"`),
       true,
       `${packageBinary} must use the command-capturing preload shim`,
@@ -59,11 +53,6 @@ test("package command shims rerun client tools without native runtime alias sema
   }
 
   for (const packageManager of ["npm", "npx", "pnpm", "pnpx", "corepack", "yarn", "yarnpkg"]) {
-    assert.equal(
-      launcherList.includes(`"${packageManager}"`),
-      false,
-      `${packageManager} must not be hooked as a runtime launcher`,
-    );
     assert.equal(
       packageCommandList.includes(`"${packageManager}"`),
       false,
@@ -79,6 +68,27 @@ test("package command shims rerun client tools without native runtime alias sema
   assert.equal(source.includes("buildPreloadPackageCommandShimScript"), true);
   assert.equal(source.includes("buildPreloadPackageManagerCommandShimScript"), true);
   assert.equal(source.includes("writePreloadPackageManagerCommandShims"), true);
+  assert.equal(source.includes("removeStaleBroadRuntimeLauncherAliases"), true);
+  assert.equal(
+    source.includes("PRELOAD_RUNTIME_LAUNCHER_NAMES"),
+    false,
+    "generic runtime names must not be public PATH shims",
+  );
+  assert.equal(
+    source.includes("for (const runtimeName"),
+    false,
+    "runtime-shims PATH must not shadow node/python/ruby for arbitrary /usr/bin/env scripts",
+  );
+  assert.equal(
+    source.includes("const sourceShimDirectory = getAsdfShimDirectory()"),
+    false,
+    "runtime shims must not mirror arbitrary asdf shims such as vsce into PATH",
+  );
+  assert.equal(
+    source.includes("ensureExecutableAlias(path.join(targetDirectory, entry.name), launcherPath)"),
+    false,
+    "only explicit runtime names should use the native runtime launcher",
+  );
   assert.equal(source.includes("__pm_text_looks_like_dev_server()"), true);
   assert.equal(source.includes("__pm_package_script_text()"), true);
   assert.equal(source.includes("*vite*"), true);
@@ -122,6 +132,28 @@ test("package command shims rerun client tools without native runtime alias sema
     packageManagerDevServerBlock.includes("export PORT_MANAGER_PRELOAD_REPAIR=1"),
     true,
     "package-manager shim must keep lifecycle commands unhooked unless a dev-server command was detected",
+  );
+  assert.equal(
+    packageManagerShim.includes("__pm_exec_without_port_manager_preload()"),
+    true,
+    "package-manager dependency commands must run without the native preload hook",
+  );
+  assert.equal(packageManagerShim.includes("unset DYLD_INSERT_LIBRARIES"), true);
+  assert.equal(packageManagerShim.includes("unset LD_PRELOAD"), true);
+  assert.equal(packageManagerShim.includes("unset BASH_ENV"), true);
+  assert.equal(packageManagerShim.includes("unset ENV"), true);
+  assert.equal(packageManagerShim.includes("unset PORT_MANAGER_RUNTIME_SHIM_DIR"), true);
+  assert.equal(packageManagerShim.includes("export PORT_MANAGER_HOOK=0"), true);
+  assert.equal(packageManagerShim.includes("export PORT_MANAGER_HOOK_DISABLED=1"), true);
+  assert.equal(
+    packageManagerShim.includes("__pm_strip_port_manager_runtime_shims_from_path"),
+    true,
+    "non-dev package-manager commands must not resolve node through Port Manager runtime shims",
+  );
+  assert.equal(
+    packageManagerShim.includes('__pm_exec_without_port_manager_preload "$@"'),
+    true,
+    "non-dev package-manager commands must use the clean execution path",
   );
 });
 
