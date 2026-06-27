@@ -1091,6 +1091,59 @@ test("does not reuse active listener routes for a new listener allocation", asyn
   assert.equal(allocation.actualPort, 58001);
 });
 
+test("keeps shared logical ports free when allocating an unscoped host listener", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const checkedPorts: number[] = [];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: {
+      check: async (port) => {
+        checkedPorts.push(port);
+        return {
+          port,
+          available: true,
+        };
+      },
+    },
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 1234,
+    name: "postgres",
+    command: "postgres -p 15432",
+    cwd: "/workspace/network-a",
+    requestedPort: 15432,
+    actualPort: 57001,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+
+  const allocation = await agent.allocateRoute({
+    name: "postgres",
+    command: "postgres -p 15432",
+    cwd: "/workspace/host",
+    requestedPort: 15432,
+    host: "127.0.0.1",
+    routeDirection: "listen",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "nearest",
+  });
+
+  assert.notEqual(allocation.allocationId, "");
+  assert.equal(allocation.actualPort, 15433);
+  assert.deepEqual(checkedPorts, [15433]);
+  assert.equal(allocation.logicalRoutes.some((route) => route.logicalPort === 15432 && route.networkId === undefined), true);
+});
+
 test("removes stale pending routes when a receiver registers without an allocation id", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const agent = new PortManagerAgent({

@@ -61,6 +61,28 @@ test("uses the requested port when it is available", async () => {
   assert.deepEqual(provider.checkedPorts, [3000]);
 });
 
+test("keeps the requested port free when a logical router must own it", async () => {
+  const provider = new FakePortAvailabilityProvider([]);
+  const service = new PortRoutingService(provider);
+
+  const decision = await service.route({
+    requestedPort: 3000,
+    host: "localhost",
+    avoidRequestedPort: true,
+    scanRange: 3,
+    scanDirection: "up",
+  });
+
+  assert.equal(decision.requestedPort, 3000);
+  assert.equal(decision.actualPort, 3001);
+  assert.equal(decision.routed, true);
+  assert.deepEqual(
+    decision.checkedCandidates.map((candidate) => candidate.port),
+    [3001],
+  );
+  assert.deepEqual(provider.checkedPorts, [3001]);
+});
+
 test("hashed routing keeps the logical requested port unoccupied", async () => {
   const provider = new FakePortAvailabilityProvider([]);
   const service = new PortRoutingService(provider);

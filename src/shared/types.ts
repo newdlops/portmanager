@@ -582,6 +582,8 @@ export interface PortRoutingRequest {
   readonly requestedPort: number;
   /** Host passed to the port availability provider. */
   readonly host: string;
+  /** True when the logical port must remain free for a localhost router even if it is currently bindable. */
+  readonly avoidRequestedPort?: boolean;
   /** Maximum number of nearby ports to consider after the requested port. */
   readonly scanRange: number;
   /** Candidate generation policy for nearby ports. */

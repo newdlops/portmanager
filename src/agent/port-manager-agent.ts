@@ -458,6 +458,11 @@ export class PortManagerAgent implements DisposableLike {
       const decision = await this.routingService.route({
         requestedPort: input.requestedPort,
         host: input.host,
+        avoidRequestedPort: this.shouldKeepLogicalPortAvailableForHostRoute(
+          input.requestedPort,
+          networkRouteScope,
+          routeDirection,
+        ),
         scanRange: input.scanRange,
         scanDirection: input.scanDirection,
         routingMode: input.routingMode,
@@ -1211,6 +1216,29 @@ export class PortManagerAgent implements DisposableLike {
     );
   }
 
+  /**
+   * Host/unscoped listeners must not consume the shared logical port when scoped
+   * networks already expose that port. The localhost router needs the logical
+   * port so unscoped host clients can reach the host route while attached
+   * clients continue to resolve to their own network route.
+   */
+  private shouldKeepLogicalPortAvailableForHostRoute(
+    logicalPort: number,
+    networkId: string | undefined,
+    routeDirection: LogicalPortRouteDirection,
+  ): boolean {
+    if (networkId !== undefined || routeDirection !== "listen") {
+      return false;
+    }
+
+    return this.buildCurrentLogicalRoutes().some(
+      (route) =>
+        route.logicalPort === logicalPort &&
+        route.networkId !== undefined &&
+        isLiveListenRoute(route),
+    );
+  }
+
   /** Removes stale sender-first reservations once a receiver is authoritative. */
   private removePendingRouteAllocationsForIdentity(logicalPort: number, networkId: string | undefined): void {
     const routeIdentity = buildLogicalEndpointIdentity({
@@ -1610,7 +1638,9 @@ export function buildAgentSnapshot(options: BuildAgentSnapshotOptions): AgentSna
     )
     .filter((process) => !options.suppressedDetectedProcessIds?.has(process.id));
 
-  const routes = buildLogicalRoutes(options.registryProcesses, options.pendingRoutes ?? []);
+  const routes = buildLogicalRoutes(options.registryProcesses, options.pendingRoutes ?? [], normalizedListeners, {
+    defaultHost: options.defaultHost ?? "localhost",
+  });
   const daemon = buildDaemonStatus({
     agentPid: options.agentPid,
     updatedAt: options.updatedAt,
@@ -1662,6 +1692,8 @@ function buildDaemonStatus(options: {
 function buildLogicalRoutes(
   processes: readonly ManagedProcess[],
   pendingRoutes: readonly LogicalPortRoute[] = [],
+  listeners: readonly ListeningPort[] = [],
+  options: { readonly defaultHost?: string } = {},
 ): readonly LogicalPortRoute[] {
   const normalizedPendingRoutes = pendingRoutes.map((route) => ({
     ...route,
@@ -1682,7 +1714,61 @@ function buildLogicalRoutes(
       source: process.source ?? "managed",
     }));
 
-  return dedupeLogicalRoutes([...normalizedPendingRoutes, ...routes]);
+  const routeRows = dedupeLogicalRoutes([...normalizedPendingRoutes, ...routes]);
+  return dedupeLogicalRoutes([
+    ...routeRows,
+    ...buildExternalHostLogicalRoutes(routeRows, listeners, {
+      defaultHost: options.defaultHost ?? "localhost",
+    }),
+  ]);
+}
+
+/**
+ * Host processes usually run without the native hook, so they cannot be moved
+ * away from a requested port. When a host listener already owns a logical port
+ * that scoped networks also expose, publish it as an unscoped route while
+ * keeping the logical router closed for that port.
+ */
+function buildExternalHostLogicalRoutes(
+  routes: readonly LogicalPortRoute[],
+  listeners: readonly ListeningPort[],
+  options: { readonly defaultHost: string },
+): readonly LogicalPortRoute[] {
+  const sharedLogicalPorts = new Set(
+    routes
+      .filter(
+        (route) =>
+          route.networkId !== undefined &&
+          isLiveListenRoute(route) &&
+          route.actualPort !== route.logicalPort,
+      )
+      .map((route) => route.logicalPort),
+  );
+  const unscopedLogicalPorts = new Set(
+    routes
+      .filter((route) => route.networkId === undefined && isListenRoute(route))
+      .map((route) => route.logicalPort),
+  );
+
+  return listeners
+    .filter(
+      (listener) =>
+        listener.protocol === "tcp" &&
+        listener.source !== "managed" &&
+        !isPortManagerLogicalRouterListener(listener) &&
+        sharedLogicalPorts.has(listener.port) &&
+        !unscopedLogicalPorts.has(listener.port),
+    )
+    .map((listener) => ({
+      logicalPort: listener.port,
+      actualPort: listener.port,
+      routeDirection: "listen" as const,
+      host: normalizeListenerHost(listener.localAddress, options.defaultHost),
+      processId: `${DETECTED_PROCESS_ID_PREFIX}${listener.id}`,
+      processName: listener.processName ?? `Port ${listener.port}`,
+      status: "running" as const,
+      source: "detected" as const,
+    }));
 }
 
 /**
@@ -1754,6 +1840,22 @@ function buildAllocatedLogicalRoute(
 /** Existing clients did not send a direction; those allocations are listener reservations. */
 function normalizeRouteDirection(direction: LogicalPortRouteDirection | undefined): LogicalPortRouteDirection {
   return direction === "send" ? "send" : "listen";
+}
+
+/** True when a route row represents a running listener target. */
+function isLiveListenRoute(route: LogicalPortRoute): boolean {
+  return isListenRoute(route) && route.status === "running";
+}
+
+/** Sender reservations are not live listener targets. */
+function isListenRoute(route: LogicalPortRoute): boolean {
+  return route.routeDirection === undefined || route.routeDirection === "listen";
+}
+
+function isPortManagerLogicalRouterListener(listener: ListeningPort): boolean {
+  const processName = listener.processName ?? "";
+  const command = listener.command ?? "";
+  return processName.includes("portmanager_tcp_router") || command.includes("portmanager_tcp_router");
 }
 
 /** Normalizes absent or blank terminal network scope to the unscoped route path. */

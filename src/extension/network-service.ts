@@ -25,7 +25,6 @@ import {
   NETWORK_LOOPBACK_HOST_ENV,
   resolveLoopbackAddressRoutingMode,
 } from "../core/networks/loopback-address";
-import { findRoutesMatchingClientCwd } from "../core/networks/logical-route-selection";
 import { resolveProcessTreeNetworkLabel } from "../core/process-network-labels";
 import { SimpleEventEmitter } from "../shared/events";
 import {
@@ -2683,27 +2682,15 @@ export class PortManagerNetworkService implements DisposableLike {
       clientProcess === undefined ? undefined : await this.findClientNetworkForRouter(clientProcess.pid, processRows);
 
     if (networkId === undefined) {
-      const cwdRoute =
-        clientProcess?.cwd === undefined
-          ? undefined
-          : this.findClientCwdRouteForRouter(connection.logicalPort, clientProcess.cwd);
-
-      if (cwdRoute !== undefined) {
+      const hostRoute = this.findHostRouteForRouter(connection.logicalPort);
+      if (hostRoute !== undefined) {
         return {
-          host: cwdRoute.host,
-          port: cwdRoute.actualPort,
+          host: hostRoute.host,
+          port: hostRoute.actualPort,
         };
       }
 
-      const uniqueRoute = await this.findUniqueRouteForRouter(connection.logicalPort);
-      if (uniqueRoute === undefined) {
-        throw new Error(`No attached logical network found for localhost:${connection.logicalPort} client.`);
-      }
-
-      return {
-        host: uniqueRoute.host,
-        port: uniqueRoute.actualPort,
-      };
+      throw new Error(`No host route found for localhost:${connection.logicalPort} client.`);
     }
 
     const route = await this.findNetworkRouteForRouter(networkId, connection.logicalPort, processRows);
@@ -2741,11 +2728,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
   private async syncLogicalPortRoutersExclusive(): Promise<void> {
     /*
-     * Native hooks normally rewrite connect() directly, but macOS protected
-     * tools such as /usr/bin/curl ignore DYLD injection and some package
-     * launchers can lose the preload before opening client sockets. Open
-     * routers only after a listener route is running; pending allocations stay
-     * excluded so the router cannot win the app server's original bind race.
+     * Host loopback belongs to the host unless an explicit unscoped host route
+     * needs a localhost compatibility listener. Scoped network routes are
+     * intentionally excluded so they cannot occupy host localhost ports.
      */
     const snapshot = this.processService?.getSnapshot();
     const logicalPorts = collectLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? []);
@@ -2870,56 +2855,25 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * Allows host-side tooling to reach unambiguous routed ports.
-   * Debug adapters, browsers, and host CLIs can originate outside an attached
-   * terminal. A single live route, including a Compose route, is still safe
-   * because there is no network choice to make.
+   * Host/unscoped routes are the explicit target for clients that have no
+   * logical network. Require a routed actual port so the localhost router never
+   * forwards back into its own logical listener.
    */
-  private async findUniqueRouteForRouter(
-    logicalPort: number,
-  ): Promise<LogicalPortRoute | undefined> {
+  private findHostRouteForRouter(logicalPort: number): LogicalPortRoute | undefined {
     if (this.processService === undefined) {
       return undefined;
     }
 
-    const snapshot = this.processService.getSnapshot();
-    const candidates = snapshot.routes.filter(
+    const candidates = this.processService.getSnapshot().routes.filter(
       (route) =>
         route.logicalPort === logicalPort &&
         route.actualPort !== route.logicalPort &&
+        route.networkId === undefined &&
         isLiveListenRoute(route),
     );
 
-    if (candidates.length === 1) {
-      return candidates[0];
-    }
-
-    return undefined;
+    return candidates.length === 1 ? candidates[0] : undefined;
   }
-
-  /**
-   * Uses client cwd as a deterministic fallback when environment variables and
-   * terminal ancestry are unavailable. This keeps simultaneous logical ports in
-   * sibling projects from collapsing into the global "unique route" fallback.
-   */
-  private findClientCwdRouteForRouter(
-    logicalPort: number,
-    clientCwd: string,
-  ): LogicalPortRoute | undefined {
-    if (this.processService === undefined) {
-      return undefined;
-    }
-
-    const snapshot = this.processService.getSnapshot();
-    const candidates = findRoutesMatchingClientCwd(snapshot.routes, logicalPort, clientCwd);
-
-    if (candidates.length === 1) {
-      return candidates[0];
-    }
-
-    return undefined;
-  }
-
   /** Maps an arbitrary process PID back to the network label attached to its process tree. */
   private findAttachedNetworkForPid(pid: number, processRows: readonly ProcessTableRow[]): string | undefined {
     return resolveProcessTreeNetworkLabel(this.registry.getSnapshot().attachments, processRows, pid)?.networkId;
@@ -4522,6 +4476,7 @@ function collectLogicalRouterPorts(
   for (const route of routes) {
     if (
       isLiveListenRoute(route) &&
+      route.networkId === undefined &&
       route.actualPort !== route.logicalPort &&
       isTcpPort(route.logicalPort) &&
       !externallyOwnedPorts.has(route.logicalPort)

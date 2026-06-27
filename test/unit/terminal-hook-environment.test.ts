@@ -440,6 +440,21 @@ test("native hook preserves listener ports only for explicit overrides", () => {
   assert.equal(source.includes("stable browser alias"), true);
 });
 
+test("native hook leaves host loopback outside logical network fallback", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const matchLevelStart = source.indexOf("static int pm_route_network_match_level");
+  const matchLevelEnd = source.indexOf("static int pm_route_is_compose", matchLevelStart);
+  const matchLevel = source.slice(matchLevelStart, matchLevelEnd);
+  const foreignStart = source.indexOf("static int pm_route_is_foreign_to_current_network");
+  const foreignEnd = source.indexOf("static int pm_host_access_lookup", foreignStart);
+  const foreign = source.slice(foreignStart, foreignEnd);
+
+  assert.equal(matchLevel.includes("Host loopback"), true);
+  assert.equal(matchLevel.includes("return pm_json_string(route_json, \"networkId\", route_network, sizeof(route_network)) != 0 ? 2 : 0;"), true);
+  assert.equal(foreign.includes("return 0;"), true);
+});
+
 test("native preload repair is opt-in at runtime shim boundaries", () => {
   const hookSourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
   const asdfShimSourcePath = path.resolve(__dirname, "../../../native/asdf-shim/portmanager_asdf_shim.c");
@@ -462,14 +477,15 @@ test("logical routers are opened only after logical routes are live", () => {
   const syncBody = source.slice(syncStart, syncEnd);
 
   assert.equal(source.includes("collectLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? [])"), true);
-  assert.equal(source.includes("pending allocations stay"), true);
+  assert.equal(source.includes("Scoped network routes are"), true);
   assert.equal(collectLogicalRouterPorts.includes('route.source === "compose"'), false);
+  assert.equal(collectLogicalRouterPorts.includes("route.networkId === undefined"), true);
   assert.equal(collectLogicalRouterPorts.includes("route.actualPort !== route.logicalPort"), true);
   assert.equal(collectLogicalRouterPorts.includes("!externallyOwnedPorts.has(route.logicalPort)"), true);
   assert.equal(
     syncBody.includes("await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);"),
     true,
-    "compose dependency clients such as Celery need a localhost TCP router fallback",
+    "unscoped host routes can still expose a localhost TCP router fallback",
   );
 });
 
@@ -479,12 +495,12 @@ test("logical router classifies clients by process tree label before hook enviro
   const methodStart = source.indexOf("private async findClientNetworkForRouter");
   const methodEnd = source.indexOf("private async findNetworkRouteForRouter", methodStart);
   const findClientNetworkForRouter = source.slice(methodStart, methodEnd);
-  const uniqueRouteStart = source.indexOf("private async findUniqueRouteForRouter");
-  const uniqueRouteEnd = source.indexOf("private findClientCwdRouteForRouter", uniqueRouteStart);
-  const findUniqueRouteForRouter = source.slice(uniqueRouteStart, uniqueRouteEnd);
-  const cwdRouteStart = source.indexOf("private findClientCwdRouteForRouter");
-  const cwdRouteEnd = source.indexOf("private findAttachedNetworkForPid", cwdRouteStart);
-  const findClientCwdRouteForRouter = source.slice(cwdRouteStart, cwdRouteEnd);
+  const hostRouteStart = source.indexOf("private findHostRouteForRouter");
+  const hostRouteEnd = source.indexOf("private findAttachedNetworkForPid", hostRouteStart);
+  const findHostRouteForRouter = source.slice(hostRouteStart, hostRouteEnd);
+  const resolverStart = source.indexOf("private async resolveLogicalPortRouterTarget");
+  const resolverEnd = source.indexOf("private async syncLogicalPortRouters", resolverStart);
+  const resolveLogicalPortRouterTarget = source.slice(resolverStart, resolverEnd);
 
   assert.equal(source.includes('from "../core/process-network-labels"'), true);
   assert.equal(
@@ -494,14 +510,14 @@ test("logical router classifies clients by process tree label before hook enviro
     "process tree labels must be the primary router signal; inherited hook env remains fallback",
   );
   assert.equal(findClientNetworkForRouter.includes("return environmentNetworkId;"), true);
-  assert.equal(source.includes("including a Compose route"), true);
-  assert.equal(findUniqueRouteForRouter.includes("candidates.filter((route) => !isNetworkScopedComposeRoute(route))"), false);
+  assert.equal(source.includes("including a Compose route"), false);
+  assert.equal(source.includes("private async findUniqueRouteForRouter"), false);
+  assert.equal(source.includes("private findClientCwdRouteForRouter"), false);
+  assert.equal(resolveLogicalPortRouterTarget.includes("No host route found for localhost"), true);
   assert.equal(source.includes("function isNetworkScopedComposeRoute"), false);
   assert.equal(source.includes("findSingleAttachedRouteForRouter"), false);
-  assert.equal(findUniqueRouteForRouter.includes("return undefined;"), true);
-  assert.equal(findClientCwdRouteForRouter.includes("return undefined;"), true);
-  assert.equal(
-    findClientCwdRouteForRouter.includes(".attachments.filter((attachment) => attachment.status === \"attached\")"),
-    false,
-  );
+  assert.equal(source.includes("this.findHostRouteForRouter(connection.logicalPort)"), true);
+  assert.equal(findHostRouteForRouter.includes("route.networkId === undefined"), true);
+  assert.equal(findHostRouteForRouter.includes("route.actualPort !== route.logicalPort"), true);
+  assert.equal(source.includes("findRoutesMatchingClientCwd"), false);
 });

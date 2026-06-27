@@ -2305,12 +2305,11 @@ static int pm_route_network_match_level(const char *route_json) {
 
   if (network_id == NULL || network_id[0] == '\0') {
     /*
-     * Some launcher chains briefly lose the scoped network env while keeping the
-     * injected hook alive. Prefer legacy unscoped rows; scoped rows are only a
-     * lower-priority fallback after the caller verifies the cwd still belongs to
-     * the same worktree.
+     * A caller without a logical network is the host machine. Host loopback
+     * must stay on the host even when scoped networks publish the same logical
+     * port, so scoped rows are not a fallback here.
      */
-    return pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0 ? 2 : 1;
+    return pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0 ? 2 : 0;
   }
 
   if (pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0) {
@@ -2335,7 +2334,7 @@ static int pm_route_is_foreign_to_current_network(const char *route_json) {
   }
 
   if (network_id == NULL || network_id[0] == '\0') {
-    return 1;
+    return 0;
   }
 
   return strcmp(route_network, network_id) != 0;

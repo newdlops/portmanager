@@ -59,10 +59,19 @@ export class PortRoutingService {
       return this.routeHashed(request);
     }
 
-    const requestedPortStatus = await this.availabilityProvider.check(
-      request.requestedPort,
-      request.host,
-    );
+    const requestedPortStatus =
+      request.avoidRequestedPort === true
+        ? {
+            port: request.requestedPort,
+            available: false,
+            owner: {
+              name: "Port Manager logical route",
+            },
+          }
+        : await this.availabilityProvider.check(
+            request.requestedPort,
+            request.host,
+          );
 
     if (requestedPortStatus.available) {
       return {
