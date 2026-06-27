@@ -171,7 +171,11 @@ test("global shell hook keeps no-network shells out of native preload routing", 
   const hookTemplate = source.slice(hookStart, hookEnd);
 
   assert.equal(hookTemplate.includes('if [ -n "\\${PORT_MANAGER_NETWORK_ID:-}" ]'), true);
-  assert.equal(hookTemplate.includes("unset PORT_MANAGER_HOOK PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_DYLD_INSERT_LIBRARIES"), true);
+  assert.equal(hookTemplate.includes("unset PORT_MANAGER_HOOK_DISABLED\n  export PORT_MANAGER_HOOK=1"), true);
+  assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK=0"), true);
+  assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK_DISABLED=1"), true);
+  assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK_DAEMON_STARTED=0"), true);
+  assert.equal(hookTemplate.includes("unset PORT_MANAGER_DYLD_INSERT_LIBRARIES"), true);
   const preloadRepairExport = hookTemplate.indexOf("export PORT_MANAGER_DYLD_INSERT_LIBRARIES");
   assert.notEqual(preloadRepairExport, -1);
   assert.notEqual(hookTemplate.lastIndexOf('if [ "\\${PORT_MANAGER_HOOK:-0}" = "1" ]; then', preloadRepairExport), -1);
@@ -262,7 +266,16 @@ test("external pm shell function exposes doctor routes and detach diagnostics", 
   assert.equal(commandSource.includes('"routes"'), true);
   assert.equal(commandSource.includes('"detach"'), true);
   assert.equal(commandSource.includes("Daemon readiness flag:"), true);
+  assert.equal(commandSource.includes("Routing mode:"), true);
+  assert.equal(commandSource.includes("Network loopback host:"), true);
   assert.equal(commandSource.includes("Route table:"), true);
+  assert.equal(commandSource.includes("Route sources:"), true);
+  assert.equal(commandSource.includes("Route warning: current network has no app/server route rows."), true);
+  assert.equal(commandSource.includes("Process routing check:"), true);
+  assert.equal(commandSource.includes("hook-disabled"), true);
+  assert.equal(commandSource.includes("other-network"), true);
+  assert.equal(commandSource.includes("manage\\\\.py\\\\s+runserver"), true);
+  assert.equal(commandSource.includes("PORT_MANAGER_NETWORK_LOOPBACK_HOST"), true);
   assert.equal(commandSource.includes("Network selection file:"), true);
   assert.equal(commandSource.includes("Host access:"), true);
   assert.equal(commandSource.includes("Port Manager routes:"), true);
@@ -365,6 +378,9 @@ test("logical port routers use a single cross-window owner lease", () => {
   const syncStart = source.indexOf("private async syncLogicalPortRouters(): Promise<void>");
   const syncEnd = source.indexOf("private async findClientNetworkForRouter", syncStart);
   const syncBody = source.slice(syncStart, syncEnd);
+  const browserSyncStart = source.indexOf("private async syncBrowserNetworkProxiesExclusive(): Promise<void>");
+  const browserSyncEnd = source.indexOf("private async readBrowserProxyProcessCommandTexts", browserSyncStart);
+  const browserSyncBody = source.slice(browserSyncStart, browserSyncEnd);
 
   assert.equal(source.includes("Owner lease must outlive the routing refresh interval"), true);
   assert.equal(source.includes("LOGICAL_ROUTER_OWNER_LEASE_MS = 120_000"), true);
@@ -379,6 +395,13 @@ test("logical port routers use a single cross-window owner lease", () => {
   assert.equal(syncBody.includes("await this.logicalPortRouter.sync([]).catch(() => undefined);"), true);
   assert.equal(syncBody.includes("await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);"), true);
   assert.equal(source.includes("releaseLogicalRouterOwnerLease();"), true);
+  assert.equal(source.includes("BROWSER_NETWORK_PROXY_OWNER_LEASE_MS = 120_000"), true);
+  assert.equal(source.includes('function buildBrowserNetworkProxyOwnerControlPath(kind: "owner" | "lock"): string'), true);
+  assert.equal(source.includes("function tryAcquireBrowserNetworkProxyOwnerLease(): boolean"), true);
+  assert.equal(browserSyncBody.includes("if (!tryAcquireBrowserNetworkProxyOwnerLease())"), true);
+  assert.equal(browserSyncBody.includes("await this.browserNetworkProxy.sync([]).catch(() => undefined);"), true);
+  assert.equal(browserSyncBody.includes("await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);"), true);
+  assert.equal(source.includes("releaseBrowserNetworkProxyOwnerLease();"), true);
 });
 
 test("compose attach waits for routing convergence before returning", () => {
@@ -482,6 +505,9 @@ test("terminal attach script enables loopback routing only after alias readiness
   assert.equal(source.includes('sudo ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null'), true);
   assert.equal(source.includes("portManager.loopbackAddressRoutingMode"), true);
   assert.equal(source.includes("Port Manager loopback IP routing unavailable; using high-port routing fallback."), true);
+  assert.equal(source.includes("Port Manager loopback IP routing unavailable; attach aborted."), true);
+  assert.equal(source.includes("export PORT_MANAGER_HOOK_DISABLED=1"), true);
+  assert.equal(source.includes("return 1 2>/dev/null || exit 1"), true);
   assert.equal(source.includes("NETWORK_LOOPBACK_HOST_ENV"), true);
 });
 

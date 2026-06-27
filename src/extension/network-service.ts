@@ -131,6 +131,10 @@ const LOGICAL_ROUTER_OWNER_LEASE_MS = 120_000;
 const LOGICAL_ROUTER_OWNER_LOCK_STALE_MS = 30_000;
 const LOGICAL_ROUTER_OWNER_PATH = buildLogicalRouterOwnerControlPath("owner");
 const LOGICAL_ROUTER_OWNER_LOCK_PATH = buildLogicalRouterOwnerControlPath("lock");
+const BROWSER_NETWORK_PROXY_OWNER_LEASE_MS = 120_000;
+const BROWSER_NETWORK_PROXY_OWNER_LOCK_STALE_MS = 30_000;
+const BROWSER_NETWORK_PROXY_OWNER_PATH = buildBrowserNetworkProxyOwnerControlPath("owner");
+const BROWSER_NETWORK_PROXY_OWNER_LOCK_PATH = buildBrowserNetworkProxyOwnerControlPath("lock");
 const DAEMON_RESTART_BACKOFF_MS = 30_000;
 const TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500;
 const TERMINAL_ATTACHMENT_REFRESH_DEBOUNCE_MS = 50;
@@ -1790,6 +1794,7 @@ export class PortManagerNetworkService implements DisposableLike {
     this.browserDnsServer.dispose();
     this.logicalPortRouter.dispose();
     releaseLogicalRouterOwnerLease();
+    releaseBrowserNetworkProxyOwnerLease();
   }
 
   /** Reads persisted logical network state from VS Code global storage. */
@@ -2780,6 +2785,11 @@ export class PortManagerNetworkService implements DisposableLike {
 
   private async syncBrowserNetworkProxiesExclusive(): Promise<void> {
     const snapshot = this.processService?.getSnapshot();
+    if (!tryAcquireBrowserNetworkProxyOwnerLease()) {
+      await this.browserNetworkProxy.sync([]).catch(() => undefined);
+      return;
+    }
+
     const processCommandTextByPid = await this.readBrowserProxyProcessCommandTexts(snapshot?.processes ?? []);
     const endpoints = collectBrowserProxyEndpoints(
       snapshot?.processes ?? [],
@@ -3411,6 +3421,7 @@ export class PortManagerNetworkService implements DisposableLike {
     });
     const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
     const commands = [
+      "unset PORT_MANAGER_HOOK_DISABLED",
       shellExport("PORT_MANAGER_HOOK", "1"),
       shellExport("PORT_MANAGER_NETWORK_ID", networkId),
       shellExport("PORT_MANAGER_NETWORK_NAME", networkName),
@@ -3487,6 +3498,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
     const variables = [
       "PORT_MANAGER_HOOK",
+      "PORT_MANAGER_HOOK_DISABLED",
       "PORT_MANAGER_NETWORK_ID",
       "PORT_MANAGER_NETWORK_NAME",
       "PORT_MANAGER_ROUTE_TABLE_NETWORK_ID",
@@ -3517,6 +3529,9 @@ export class PortManagerNetworkService implements DisposableLike {
       buildTerminalAttachmentMarkerRemoveShell(),
       buildTerminalTitleShell("Port Manager: detached"),
       ...variables.map((variable) => `unset ${variable}`),
+      shellExport("PORT_MANAGER_HOOK", "0"),
+      shellExport("PORT_MANAGER_HOOK_DISABLED", "1"),
+      shellExport("PORT_MANAGER_HOOK_DAEMON_STARTED", "0"),
     ];
 
     if (process.platform === "darwin") {
@@ -5416,8 +5431,8 @@ function shellPrependLibrary(name: string, libraryPath: string): string {
 
 /**
  * Enables loopback-address routing only after the OS can bind the generated
- * address. Auto mode keeps startup non-interactive; loopback mode may prompt
- * for sudo to create the macOS lo0 alias and still falls back if provisioning
+ * address. Auto mode keeps startup non-interactive and can fall back to high
+ * ports; loopback mode may prompt for sudo and fails closed if provisioning
  * fails.
  */
 function buildLoopbackAddressRoutingShell(host: string, mode: "auto" | "loopback" | "high-port"): string {
@@ -5437,8 +5452,24 @@ function buildLoopbackAddressRoutingShell(host: string, mode: "auto" | "loopback
       : `ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1 || sudo -n ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1`;
   const failureMessage =
     mode === "loopback"
-      ? "Port Manager loopback IP routing unavailable; using high-port routing fallback. Set portManager.loopbackAddressRoutingMode to high-port to skip alias provisioning."
+      ? "Port Manager loopback IP routing unavailable; attach aborted. Set portManager.loopbackAddressRoutingMode to auto or high-port to allow fallback."
       : "Port Manager loopback IP routing unavailable; using high-port routing fallback.";
+  const failureCommands =
+    mode === "loopback"
+      ? [
+          `unset ${NETWORK_LOOPBACK_HOST_ENV}`,
+          `export PORT_MANAGER_HOOK=0`,
+          `export PORT_MANAGER_HOOK_DISABLED=1`,
+          `export PORT_MANAGER_HOOK_DAEMON_STARTED=0`,
+          `printf '%s\\n' ${shellQuote(failureMessage)} >&2`,
+          `unset __pm_loopback_host`,
+          `return 1 2>/dev/null || exit 1`,
+        ]
+      : [
+          `unset ${NETWORK_LOOPBACK_HOST_ENV}`,
+          `printf '%s\\n' ${shellQuote(failureMessage)} >&2`,
+          `unset __pm_loopback_host`,
+        ];
 
   return [
     `__pm_loopback_host=${quotedHost}`,
@@ -5447,8 +5478,7 @@ function buildLoopbackAddressRoutingShell(host: string, mode: "auto" | "loopback
     `elif ${aliasCommand}; then`,
     `export ${NETWORK_LOOPBACK_HOST_ENV}="$__pm_loopback_host"`,
     `else`,
-    `unset ${NETWORK_LOOPBACK_HOST_ENV}`,
-    `printf '%s\\n' ${shellQuote(failureMessage)} >&2`,
+    ...failureCommands,
     `fi`,
     `unset __pm_loopback_host`,
   ].join("\n");
@@ -5531,6 +5561,7 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     `export PORT_MANAGER_HOOK_DAEMON_STARTED=1`,
     `else`,
     `export PORT_MANAGER_HOOK=0`,
+    `export PORT_MANAGER_HOOK_DISABLED=1`,
     `export PORT_MANAGER_HOOK_DAEMON_STARTED=0`,
     `printf '%s\\n' 'Port Manager routing unavailable: local daemon did not become ready.' >&2`,
     `fi`,
@@ -5552,6 +5583,12 @@ function buildLogicalRouterOwnerControlPath(kind: "owner" | "lock"): string {
   const routeTablePath = getDefaultRouteTablePath();
   const parsedPath = path.parse(routeTablePath);
   return path.join(parsedPath.dir, `${parsedPath.name.replace("routes", "logical-router-owner")}.${kind}`);
+}
+
+function buildBrowserNetworkProxyOwnerControlPath(kind: "owner" | "lock"): string {
+  const routeTablePath = getDefaultRouteTablePath();
+  const parsedPath = path.parse(routeTablePath);
+  return path.join(parsedPath.dir, `${parsedPath.name.replace("routes", "browser-network-proxy-owner")}.${kind}`);
 }
 
 /**
@@ -5621,6 +5658,139 @@ function releaseLogicalRouterOwnerLease(): void {
   } catch {
     // Stale owner leases expire naturally when another window refreshes routing.
   }
+}
+
+/**
+ * Elects one VS Code extension host to own browser DNS proxy listeners.
+ * DNS records point to fixed per-network loopback addresses, so only one host
+ * should decide which public ports are active for those addresses.
+ */
+function tryAcquireBrowserNetworkProxyOwnerLease(): boolean {
+  const nowMs = Date.now();
+  const owner = readBrowserNetworkProxyOwner();
+  if (owner?.pid === process.pid) {
+    return writeBrowserNetworkProxyOwnerLease(nowMs);
+  }
+
+  if (isActiveBrowserNetworkProxyOwner(owner, nowMs)) {
+    return false;
+  }
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let lockFd: number | undefined;
+
+    try {
+      ensureBrowserNetworkProxyOwnerControlDirectory();
+      lockFd = syncFs.openSync(BROWSER_NETWORK_PROXY_OWNER_LOCK_PATH, "wx");
+      syncFs.writeFileSync(lockFd, `${process.pid}\n${new Date(nowMs).toISOString()}\n`, "utf8");
+    } catch (error) {
+      if (lockFd !== undefined) {
+        closeFileDescriptor(lockFd);
+      }
+
+      if (isNodeErrorWithCode(error, "EEXIST")) {
+        removeStaleBrowserNetworkProxyOwnerLock();
+        continue;
+      }
+
+      return false;
+    }
+
+    try {
+      const currentOwner = readBrowserNetworkProxyOwner();
+      if (currentOwner?.pid !== process.pid && isActiveBrowserNetworkProxyOwner(currentOwner, nowMs)) {
+        return false;
+      }
+
+      return writeBrowserNetworkProxyOwnerLease(nowMs);
+    } finally {
+      closeFileDescriptor(lockFd);
+      try {
+        syncFs.rmSync(BROWSER_NETWORK_PROXY_OWNER_LOCK_PATH, { force: true });
+      } catch {
+        // A stale lock will be removed by a later owner election attempt.
+      }
+    }
+  }
+
+  return false;
+}
+
+function releaseBrowserNetworkProxyOwnerLease(): void {
+  const owner = readBrowserNetworkProxyOwner();
+  if (owner?.pid !== process.pid) {
+    return;
+  }
+
+  try {
+    syncFs.rmSync(BROWSER_NETWORK_PROXY_OWNER_PATH, { force: true });
+  } catch {
+    // Stale owner leases expire naturally when another window refreshes routing.
+  }
+}
+
+function readBrowserNetworkProxyOwner(): LogicalRouterOwnerDocument | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(syncFs.readFileSync(BROWSER_NETWORK_PROXY_OWNER_PATH, "utf8"));
+  } catch {
+    return undefined;
+  }
+
+  if (typeof parsed !== "object" || parsed === null) {
+    return undefined;
+  }
+
+  const owner = parsed as Partial<LogicalRouterOwnerDocument>;
+  if (typeof owner.pid !== "number" || !Number.isInteger(owner.pid) || owner.pid <= 0) {
+    return undefined;
+  }
+  if (typeof owner.updatedAt !== "string" || Number.isNaN(Date.parse(owner.updatedAt))) {
+    return undefined;
+  }
+
+  return { pid: owner.pid, updatedAt: owner.updatedAt };
+}
+
+function writeBrowserNetworkProxyOwnerLease(nowMs: number): boolean {
+  try {
+    ensureBrowserNetworkProxyOwnerControlDirectory();
+    syncFs.writeFileSync(
+      BROWSER_NETWORK_PROXY_OWNER_PATH,
+      `${JSON.stringify({ pid: process.pid, updatedAt: new Date(nowMs).toISOString() })}\n`,
+      "utf8",
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isActiveBrowserNetworkProxyOwner(owner: LogicalRouterOwnerDocument | undefined, nowMs: number): boolean {
+  if (owner === undefined) {
+    return false;
+  }
+
+  if (nowMs - Date.parse(owner.updatedAt) >= BROWSER_NETWORK_PROXY_OWNER_LEASE_MS) {
+    return false;
+  }
+
+  return isProcessAlive(owner.pid);
+}
+
+function removeStaleBrowserNetworkProxyOwnerLock(): void {
+  try {
+    const stats = syncFs.statSync(BROWSER_NETWORK_PROXY_OWNER_LOCK_PATH);
+    if (Date.now() - stats.mtimeMs >= BROWSER_NETWORK_PROXY_OWNER_LOCK_STALE_MS) {
+      syncFs.rmSync(BROWSER_NETWORK_PROXY_OWNER_LOCK_PATH, { force: true });
+    }
+  } catch {
+    // Missing lock files are expected between owner election attempts.
+  }
+}
+
+function ensureBrowserNetworkProxyOwnerControlDirectory(): void {
+  syncFs.mkdirSync(path.dirname(BROWSER_NETWORK_PROXY_OWNER_PATH), { recursive: true });
 }
 
 function readLogicalRouterOwner(): LogicalRouterOwnerDocument | undefined {

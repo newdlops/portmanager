@@ -2999,6 +2999,46 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     'const matchingBindings=networkId?bindings.filter((binding)=>binding.networkId===networkId):bindings;',
     'if(hostAccessFile&&fs.existsSync(hostAccessFile)){console.log("Host access: "+matchingBindings.length);for(const binding of matchingBindings){console.log("  "+text(binding.logicalPort)+" -> "+text(binding.hostAddress)+":"+text(binding.hostPort)+" "+text(binding.status)+" ["+text(binding.networkId)+"]");}}',
   ].join("");
+  const doctorRoutingScript = [
+    'const fs=require("node:fs");',
+    'const cp=require("node:child_process");',
+    'const path=require("node:path");',
+    'const currentNetwork=process.argv[1]||"";',
+    'const currentCwd=process.argv[2]||process.cwd();',
+    'const routeFile=process.argv[3]||"";',
+    'const routingMode=process.argv[4]||"";',
+    'const loopbackHost=process.argv[5]||"";',
+    'function readJson(file){if(!file)return undefined;try{return JSON.parse(fs.readFileSync(file,"utf8"));}catch{return undefined;}}',
+    'function text(value){return value===undefined||value===null||value===""?"-":String(value);}',
+    'function envValue(line,name){const match=line.match(new RegExp("(?:^|\\\\s)"+name+"=([^\\\\s]*)"));return match?match[1]:"";}',
+    'function normalize(value){if(!value)return "";try{return fs.realpathSync.native(value);}catch{return path.resolve(value);}}',
+    'function isSubPath(parent,child){if(!parent||!child)return false;const relative=path.relative(parent,child);return relative===""||(!relative.startsWith("..")&&!path.isAbsolute(relative));}',
+    'function pathsRelated(a,b){return isSubPath(a,b)||isSubPath(b,a);}',
+    'function cleanCommand(command){return String(command||"").replace(/\\s[A-Za-z_][A-Za-z0-9_]*=[^\\s]*/g,"").replace(/\\s+/g," ").trim().slice(0,140);}',
+    'function hostKey(value){const host=String(value||"").toLowerCase();return host==="localhost"?"127.0.0.1":host;}',
+    'function portFromLine(line){for(const name of ["PORT","VITE_CLIENT_PORT","VITE_PORT","DJANGO_PORT"]){const value=Number(envValue(line,name));if(Number.isInteger(value)&&value>0)return value;}let match=line.match(/(?:--port|-p)\\s+(\\d{2,5})(?:\\s|$)/);if(match)return Number(match[1]);match=line.match(/runserver(?:\\s+[0-9A-Fa-f:.]+:)?(\\d{2,5})(?:\\s|$)/);if(match)return Number(match[1]);match=line.match(/(?:^|\\s)(\\d{2,5})(?:\\s|$)/);return match?Number(match[1]):undefined;}',
+    'function serverLike(line){return /manage\\.py\\s+runserver|(?:^|[\\/\\s])vite(?:$|[\\s.-])|uvicorn|gunicorn|daphne|webpack-dev-server|next\\s+dev|nuxt\\s+dev|astro\\s+dev|remix\\s+dev|rails\\s+server|bin\\/rails\\s+s|docker\\s+compose/i.test(line);}',
+    'const routeTable=readJson(routeFile);',
+    'const allRoutes=Array.isArray(routeTable&&routeTable.routes)?routeTable.routes:[];',
+    'const routes=currentNetwork?allRoutes.filter((route)=>!route.networkId||route.networkId===currentNetwork):allRoutes;',
+    'const sourceCounts=new Map();',
+    'for(const route of routes){const source=text(route.source);sourceCounts.set(source,(sourceCounts.get(source)||0)+1);}',
+    'const sourceSummary=Array.from(sourceCounts.entries()).map(([source,count])=>source+"="+count).join(", ")||"none";',
+    'console.log("Routing mode detail: "+text(routingMode)+" loopback="+text(loopbackHost));',
+    'console.log("Route sources: "+sourceSummary+" (current network routes="+routes.length+")");',
+    'const appRouteCount=routes.filter((route)=>["managed","registered","hooked","allocated"].includes(String(route.source||""))).length;',
+    'if(currentNetwork&&routes.length>0&&appRouteCount===0){console.log("Route warning: current network has no app/server route rows.");}',
+    'if(currentNetwork&&routes.length===0){console.log("Route warning: current network has no route rows.");}',
+    'const routeLogicalPorts=new Set(routes.map((route)=>Number(route.logicalPort)).filter((port)=>Number.isInteger(port)));',
+    'const routeEndpointKeys=new Set(routes.map((route)=>hostKey(route.host)+":"+Number(route.logicalPort)).filter((value)=>!/NaN$/.test(value)));',
+    'const routeRoots=Array.from(new Set(routes.map((route)=>route.cwd).filter(Boolean).map(normalize)));',
+    'let psOutput="";',
+    'try{psOutput=cp.execFileSync("ps",["eww","-Ao","pid=,ppid=,pgid=,tty=,command="],{encoding:"utf8",stdio:["ignore","pipe","ignore"]});}catch{}',
+    'const currentRoot=normalize(currentCwd);',
+    'const suspicious=[];',
+    'for(const rawLine of psOutput.split(/\\r?\\n/)){if(!serverLike(rawLine))continue;const row=rawLine.match(/^\\s*(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\S+)\\s+([\\s\\S]+)$/);if(!row)continue;const command=row[5];if(command.includes("PORT_MANAGER_DOCTOR_PROCESS_SCAN=1"))continue;const hookDisabled=envValue(command,"PORT_MANAGER_HOOK_DISABLED")==="1"||envValue(command,"PORT_MANAGER_HOOK")==="0";const network=envValue(command,"PORT_MANAGER_NETWORK_ID")||envValue(command,"PORT_MANAGER_ROUTE_TABLE_NETWORK_ID")||envValue(command,"PORT_MANAGER_BORROWED_NETWORK_ID")||envValue(command,"NEWDLOPS_PM_NETWORK_ID");const cwd=envValue(command,"PWD")||envValue(command,"INIT_CWD");const normalizedCwd=normalize(cwd);const related=!normalizedCwd||pathsRelated(currentRoot,normalizedCwd)||routeRoots.some((root)=>pathsRelated(root,normalizedCwd));const port=portFromLine(command);const processLoopback=envValue(command,"PORT_MANAGER_NETWORK_LOOPBACK_HOST")||loopbackHost||"127.0.0.1";const endpointKey=hostKey(processLoopback)+":"+Number(port);const portMissing=Number.isInteger(port)&&!routeLogicalPorts.has(Number(port))&&!routeEndpointKeys.has(endpointKey);const wrongNetwork=Boolean(currentNetwork&&network&&network!==currentNetwork);const missingNetwork=Boolean(currentNetwork&&!network);if(!hookDisabled&&!wrongNetwork&&!(missingNetwork&&related)&&!(portMissing&&related))continue;suspicious.push({pid:row[1],pgid:row[3],tty:row[4],hook:hookDisabled?"disabled":envValue(command,"PORT_MANAGER_HOOK")||"unset",network:network||"none",cwd:cwd||"-",port:Number.isInteger(port)?String(port):"-",reason:wrongNetwork?"other-network":hookDisabled?"hook-disabled":portMissing?"no-current-route":"no-network",command:cleanCommand(command)});if(suspicious.length>=12)break;}',
+    'if(suspicious.length===0){console.log("Process routing check: no obvious mismatches");}else{console.log("Process routing check: "+suspicious.length+" suspicious server process"+(suspicious.length===1?"":"es"));for(const item of suspicious){console.log("  pid "+item.pid+" tty="+item.tty+" pgid="+item.pgid+" port="+item.port+" hook="+item.hook+" network="+item.network+" reason="+item.reason+" cwd="+item.cwd);if(item.command)console.log("    "+item.command);}}',
+  ].join("");
   const networkPrintScript = [
     'const fs=require("node:fs");',
     'const file=process.argv[1]||"";',
@@ -3036,9 +3076,13 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
   return `# Port Manager shell hook
 # This file is generated by the VS Code Port Manager extension.
 if [ -n "\${PORT_MANAGER_NETWORK_ID:-}" ] || [ -n "\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-}" ] || [ -n "\${PORT_MANAGER_BORROWED_NETWORK_ID:-}" ] || [ -n "\${NEWDLOPS_PM_NETWORK_ID:-}" ] || [ -n "\${NEWDLOPS_PM_BORROWED_NETWORK_ID:-}" ]; then
+  unset PORT_MANAGER_HOOK_DISABLED
   export PORT_MANAGER_HOOK=1
 else
-  unset PORT_MANAGER_HOOK PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_DYLD_INSERT_LIBRARIES
+  export PORT_MANAGER_HOOK=0
+  export PORT_MANAGER_HOOK_DISABLED=1
+  export PORT_MANAGER_HOOK_DAEMON_STARTED=0
+  unset PORT_MANAGER_DYLD_INSERT_LIBRARIES
   ${escapedShellEnvRestorePath !== undefined ? `if [ -n "\${PORT_MANAGER_PREV_BASH_ENV:-}" ] && [ "\${BASH_ENV:-}" = "${escapedShellEnvRestorePath}" ]; then export BASH_ENV="\${PORT_MANAGER_PREV_BASH_ENV}"; elif [ "\${BASH_ENV:-}" = "${escapedShellEnvRestorePath}" ]; then unset BASH_ENV; fi` : ""}
   unset PORT_MANAGER_PREV_BASH_ENV
   if [ "\${DYLD_INSERT_LIBRARIES:-}" = "${escapedHookLibraryPath}" ]; then unset DYLD_INSERT_LIBRARIES; else export DYLD_INSERT_LIBRARIES="\${DYLD_INSERT_LIBRARIES#${shellPatternLiteral(`${options.hookLibraryPath}:`)}}"; fi
@@ -3115,6 +3159,8 @@ pm() {
     else
       printf 'Daemon readiness flag: not ready (PORT_MANAGER_HOOK_DAEMON_STARTED=%s)\n' "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-unset}"
     fi
+    printf 'Routing mode: %s\n' "\${PORT_MANAGER_ROUTING_MODE:-unset}"
+    printf 'Network loopback host: %s\n' "\${PORT_MANAGER_NETWORK_LOOPBACK_HOST:--}"
     if [ -n "$__pm_routes_file" ] && [ -f "$__pm_routes_file" ]; then
       __pm_route_count="$(${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(routeCountScript)}" "$__pm_routes_file" 2>/dev/null || printf '?')"
       printf 'Route table: %s (%s routes)\n' "$__pm_routes_file" "$__pm_route_count"
@@ -3138,6 +3184,9 @@ pm() {
     else
       printf '%s\n' 'Network selection file: unset'
     fi
+    PORT_MANAGER_DOCTOR_PROCESS_SCAN=1 ${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
+      doctorRoutingScript,
+    )}" "$__pm_current_id" "$PWD" "$__pm_routes_file" "\${PORT_MANAGER_ROUTING_MODE:-}" "\${PORT_MANAGER_NETWORK_LOOPBACK_HOST:-}" 2>/dev/null || true
     unset __pm_current_id __pm_current_name __pm_routes_file __pm_networks_file __pm_host_access_file __pm_route_count __pm_network_count
     return 0
   fi
@@ -3171,7 +3220,10 @@ pm() {
     fi
     printf '\\033]0;%s\\007' 'Port Manager: detached' 2>/dev/null || true
     if [ -n "\${PORT_MANAGER_GLOBAL_ROUTES_FILE:-}" ]; then export PORT_MANAGER_ROUTES_FILE="$PORT_MANAGER_GLOBAL_ROUTES_FILE"; else unset PORT_MANAGER_ROUTES_FILE; fi
-    unset PORT_MANAGER_HOOK PORT_MANAGER_NETWORK_ID PORT_MANAGER_NETWORK_NAME PORT_MANAGER_ROUTE_TABLE_NETWORK_ID PORT_MANAGER_BORROWED_NETWORK_ID NEWDLOPS_PM_NETWORK_ID NEWDLOPS_PM_BORROWED_NETWORK_ID PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_TERMINAL_ATTACHMENT_DIR PORT_MANAGER_SCAN_RANGE PORT_MANAGER_ROUTING_MODE PORT_MANAGER_VIRTUAL_PORT_START PORT_MANAGER_VIRTUAL_PORT_END PORT_MANAGER_FIXED_PROTOCOL_PORTS PORT_MANAGER_PRESERVE_LISTEN_PORTS PORT_MANAGER_NETWORK_LOOPBACK_HOST PORT_MANAGER_DYLD_INSERT_LIBRARIES
+    unset PORT_MANAGER_HOOK PORT_MANAGER_HOOK_DISABLED PORT_MANAGER_NETWORK_ID PORT_MANAGER_NETWORK_NAME PORT_MANAGER_ROUTE_TABLE_NETWORK_ID PORT_MANAGER_BORROWED_NETWORK_ID NEWDLOPS_PM_NETWORK_ID NEWDLOPS_PM_BORROWED_NETWORK_ID PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_TERMINAL_ATTACHMENT_DIR PORT_MANAGER_SCAN_RANGE PORT_MANAGER_ROUTING_MODE PORT_MANAGER_VIRTUAL_PORT_START PORT_MANAGER_VIRTUAL_PORT_END PORT_MANAGER_FIXED_PROTOCOL_PORTS PORT_MANAGER_PRESERVE_LISTEN_PORTS PORT_MANAGER_NETWORK_LOOPBACK_HOST PORT_MANAGER_DYLD_INSERT_LIBRARIES
+    export PORT_MANAGER_HOOK=0
+    export PORT_MANAGER_HOOK_DISABLED=1
+    export PORT_MANAGER_HOOK_DAEMON_STARTED=0
     if [ -n "\${PORT_MANAGER_PREV_BASH_ENV:-}" ]; then export BASH_ENV="\${PORT_MANAGER_PREV_BASH_ENV}"; else unset BASH_ENV; fi
     unset PORT_MANAGER_PREV_BASH_ENV
     if [ "\${DYLD_INSERT_LIBRARIES:-}" = "${escapedHookLibraryPath}" ]; then unset DYLD_INSERT_LIBRARIES; else export DYLD_INSERT_LIBRARIES="\${DYLD_INSERT_LIBRARIES#${shellPatternLiteral(`${options.hookLibraryPath}:`)}}"; fi

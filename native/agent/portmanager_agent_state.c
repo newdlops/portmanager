@@ -1791,13 +1791,20 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
   pm_pending_route pending;
   pm_listener_list listeners = {0};
   char updated_at[PM_TIME];
+  int listener_scan_fresh = 0;
 
-  pm_iso_now(updated_at, sizeof(updated_at));
-  if (pm_scan_lsof(&listeners, updated_at) == 0) {
-    if (pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
+  /*
+   * Allocation bursts come from short-lived hook clients, so one fresh lsof per
+   * request can starve response delivery. The scan here only reconciles process
+   * metadata; actual port safety still goes through bind() probes below.
+   */
+  if (pm_state_needs_external_listener_fresh_scan(state)) {
+    pm_listener_cache_invalidate(state);
+  }
+  if (pm_scan_lsof_cached(state, &listeners, updated_at, sizeof(updated_at), &listener_scan_fresh) == 0) {
+    if (listener_scan_fresh && pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
       pm_write_route_tables(state);
     }
-    (void)pm_listener_cache_store(state, &listeners, updated_at, time(NULL));
   }
   free(listeners.items);
 

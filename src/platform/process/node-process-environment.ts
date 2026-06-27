@@ -12,12 +12,9 @@ const ROUTING_NETWORK_VARIABLES = [
   "NEWDLOPS_PM_NETWORK_ID",
   "NEWDLOPS_PM_BORROWED_NETWORK_ID",
 ] as const;
-const HOOK_MARKER_VARIABLES = [
-  "PORT_MANAGER_HOOK",
-  "PORT_MANAGER_DYLD_INSERT_LIBRARIES",
-  "PORT_MANAGER_AGENT_SOCKET",
-  "PORT_MANAGER_ROUTES_FILE",
-] as const;
+const HOOK_PRELOAD_HINT_VARIABLES = ["PORT_MANAGER_DYLD_INSERT_LIBRARIES", "PORT_MANAGER_LD_PRELOAD"] as const;
+const HOOK_PRELOAD_VARIABLES = ["DYLD_INSERT_LIBRARIES", "LD_PRELOAD"] as const;
+const PORT_MANAGER_HOOK_LIBRARY_PATTERN = /(?:^|[:/])libportmanager_hook\.(?:dylib|so)(?=$|:)/i;
 
 interface CommandResult {
   readonly stdout: string | Buffer;
@@ -246,7 +243,34 @@ export function inferRequestedPortFromProcessEnvironment(output: string, actualP
 }
 
 function hasPortManagerHookEnvironment(output: string): boolean {
-  return HOOK_MARKER_VARIABLES.some((variable) => parseProcessEnvironmentValue(output, [variable]) !== undefined);
+  if (parseProcessEnvironmentValue(output, ["PORT_MANAGER_HOOK_DISABLED"]) === "1") {
+    return false;
+  }
+
+  const hookFlag = parseProcessEnvironmentValue(output, ["PORT_MANAGER_HOOK"]);
+  if (hookFlag === "0") {
+    return false;
+  }
+
+  if (hookFlag === "1") {
+    return true;
+  }
+
+  /*
+   * Agent socket and route-table paths can exist in global/no-network shells.
+   * Route recovery needs evidence that the native preload hook was active for
+   * this process, not just that Port Manager daemon metadata was inherited.
+   */
+  return (
+    HOOK_PRELOAD_HINT_VARIABLES.some((variable) => parseProcessEnvironmentValue(output, [variable]) !== undefined) ||
+    HOOK_PRELOAD_VARIABLES.some((variable) =>
+      isPortManagerHookPreloadValue(parseProcessEnvironmentValue(output, [variable])),
+    )
+  );
+}
+
+function isPortManagerHookPreloadValue(value: string | undefined): boolean {
+  return value !== undefined && PORT_MANAGER_HOOK_LIBRARY_PATTERN.test(value);
 }
 
 function isHookRecoveryHelperCommand(command: string): boolean {

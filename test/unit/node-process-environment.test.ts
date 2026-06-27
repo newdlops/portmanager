@@ -170,6 +170,50 @@ test("recovers wrapper-launched Vite routes from environment port metadata", asy
   assert.equal(recovered?.command, "node /workspace/node_modules/.bin/vite --host");
 });
 
+test("does not recover no-network or disabled hook marker environments as app routes", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  const cases = [
+    {
+      name: "global shell route metadata without hook marker",
+      environment:
+        "72931 s004 node server.js --port 3004 PORT_MANAGER_AGENT_SOCKET=/tmp/pm.sock PORT_MANAGER_ROUTES_FILE=/tmp/routes.json PWD=/workspace/app",
+    },
+    {
+      name: "explicit hook opt-out",
+      environment:
+        "72931 s004 node server.js --port 3004 PORT_MANAGER_HOOK=0 PORT_MANAGER_DYLD_INSERT_LIBRARIES=/tmp/libportmanager_hook.dylib DYLD_INSERT_LIBRARIES=/tmp/libportmanager_hook.dylib",
+    },
+    {
+      name: "disabled hook process",
+      environment:
+        "72931 s004 node server.js --port 3004 PORT_MANAGER_HOOK=1 PORT_MANAGER_HOOK_DISABLED=1 PORT_MANAGER_DYLD_INSERT_LIBRARIES=/tmp/libportmanager_hook.dylib",
+    },
+  ];
+
+  for (const current of cases) {
+    const listener = createListener({
+      port: 53743,
+      pid: 72931,
+      processName: "node",
+      command: "node",
+    });
+    const provider = new NodeProcessEnvironmentProvider({
+      commandRunner: async (_file, args) => {
+        if (args.includes("eww")) {
+          return { stdout: current.environment };
+        }
+
+        return { stdout: "node server.js --port 3004\n" };
+      },
+    });
+
+    assert.equal(await provider.recoverHookRoute(listener), undefined, current.name);
+  }
+});
+
 test("does not recover debug adapter helper listeners as app routes", async () => {
   if (process.platform === "win32") {
     return;

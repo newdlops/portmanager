@@ -26,6 +26,9 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   const snapshotStart = source.indexOf("int pm_state_snapshot");
   const snapshotEnd = source.indexOf("int pm_state_refresh_snapshot", snapshotStart);
   const snapshotBody = source.slice(snapshotStart, snapshotEnd);
+  const allocationStart = source.indexOf("int pm_state_allocate_route");
+  const allocationEnd = source.indexOf("static void pm_remove_pending_allocation", allocationStart);
+  const allocationBody = source.slice(allocationStart, allocationEnd);
 
   assert.equal(header.includes("PM_LISTENER_SCAN_CACHE_SECONDS 60"), true);
   assert.equal(header.includes("pm_listener *listener_cache_items;"), true);
@@ -35,6 +38,9 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(source.includes("pm_listener_cache_invalidate(state);"), true);
   assert.equal(snapshotBody.includes("listener_scan_fresh &&"), true);
   assert.equal(snapshotBody.includes("pm_scan_lsof_cached(state, &listeners"), true);
+  assert.equal(allocationBody.includes("pm_scan_lsof_cached(state, &listeners"), true);
+  assert.equal(allocationBody.includes("listener_scan_fresh &&"), true);
+  assert.equal(allocationBody.includes("pm_scan_lsof(&listeners"), false);
 });
 
 test("native agent matches loopback listeners by host as well as port", () => {
