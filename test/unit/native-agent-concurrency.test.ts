@@ -151,7 +151,7 @@ if (!fs.existsSync(nativeAgentPath)) {
     await waitForFileMissing(routeEntryPath);
   });
 
-  test("native agent infers network scope for detached cwd-matched hook routes", async (context) => {
+  test("native agent keeps unscoped host listeners out of cwd-matched networks", async (context) => {
     const fixture = await startNativeAgent(context);
     if (fixture === undefined) {
       return;
@@ -180,6 +180,11 @@ if (!fs.existsSync(nativeAgentPath)) {
       },
     });
 
+    /*
+     * This cwd deliberately matches the scoped compose project's root. Native
+     * hook requests without an explicit network id are host listeners and must
+     * not be adopted by a network only because the paths overlap.
+     */
     const allocation = await requestOnce<{
       readonly allocationId: string;
       readonly actualPort: number;
@@ -217,15 +222,15 @@ if (!fs.existsSync(nativeAgentPath)) {
       },
     });
 
-    await waitForFile(scopedRouteEntryPath);
-    const route = readRouteTable(scopedRouteEntryPath).routes[0] as {
+    await waitForFile(unscopedRouteEntryPath);
+    const route = readRouteTable(unscopedRouteEntryPath).routes[0] as {
       readonly networkId?: string;
       readonly source?: string;
     };
 
-    assert.equal(route.networkId, networkId);
+    assert.equal(route.networkId, undefined);
     assert.equal(route.source, "hooked");
-    assert.equal(fs.existsSync(unscopedRouteEntryPath), false);
+    assert.equal(fs.existsSync(scopedRouteEntryPath), false);
   });
 
   test("native agent reuses sender-first reservations for later listeners", async (context) => {

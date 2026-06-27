@@ -163,6 +163,22 @@ test("runtime shim directory removes reverted clean-run artifacts before rewriti
   assert.equal(staleCheckBody.includes('"__pm_exec_without_port_manager_preload"'), true);
 });
 
+test("global shell hook keeps no-network shells out of native preload routing", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const hookStart = source.indexOf("return `# Port Manager shell hook");
+  const hookEnd = source.indexOf("/** Appends one line to a shell profile", hookStart);
+  const hookTemplate = source.slice(hookStart, hookEnd);
+
+  assert.equal(hookTemplate.includes('if [ -n "\\${PORT_MANAGER_NETWORK_ID:-}" ]'), true);
+  assert.equal(hookTemplate.includes("unset PORT_MANAGER_HOOK PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_DYLD_INSERT_LIBRARIES"), true);
+  const preloadRepairExport = hookTemplate.indexOf("export PORT_MANAGER_DYLD_INSERT_LIBRARIES");
+  assert.notEqual(preloadRepairExport, -1);
+  assert.notEqual(hookTemplate.lastIndexOf('if [ "\\${PORT_MANAGER_HOOK:-0}" = "1" ]; then', preloadRepairExport), -1);
+  assert.equal(hookTemplate.includes('if [ "\\${PORT_MANAGER_HOOK:-0}" = "1" ] && [ -f "${escapedHookLibraryPath}" ]; then'), true);
+  assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK=1\nexport PORT_MANAGER_AGENT_SOCKET"), false);
+});
+
 test("terminal attach and detach commands source generated script files", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");

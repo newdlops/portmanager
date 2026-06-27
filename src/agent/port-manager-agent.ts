@@ -396,7 +396,12 @@ export class PortManagerAgent implements DisposableLike {
     return this.runExclusiveRouteOperation(async () => {
       this.cleanupExpiredRouteAllocations();
 
-      const networkRouteScope = this.resolveNetworkIdForCwd(input.networkId, input.cwd);
+      /*
+       * Network scope is an authority signal from the terminal hook or compose
+       * wrapper. CWD overlap alone must not move host listeners into a network,
+       * otherwise an unscoped local dev server can disappear behind an alias.
+       */
+      const networkRouteScope = normalizeNetworkId(input.networkId);
       const scopedInput =
         networkRouteScope === normalizeNetworkId(input.networkId)
           ? input
@@ -663,10 +668,7 @@ export class PortManagerAgent implements DisposableLike {
       this.pendingRouteAllocations.delete(input.allocationId);
     }
 
-    const registeredNetworkId =
-      normalizeNetworkId(input.networkId) ??
-      normalizeNetworkId(allocation?.route.networkId) ??
-      this.inferNetworkIdFromCwd(input.cwd);
+    const registeredNetworkId = normalizeNetworkId(input.networkId) ?? normalizeNetworkId(allocation?.route.networkId);
     const registeredInput = registeredNetworkId === undefined ? input : { ...input, networkId: registeredNetworkId };
 
     const process = this.upsertRegisteredProcess(registeredInput, normalizeRegisteredProcessSource(input.source));
@@ -1131,57 +1133,6 @@ export class PortManagerAgent implements DisposableLike {
   private buildCurrentLogicalRoutes(): readonly LogicalPortRoute[] {
     this.cleanupExpiredRouteAllocations();
     return buildLogicalRoutes(this.registry.list(), this.listPendingRoutes());
-  }
-
-  /** Resolves detached hook input back to a known network when terminal env lost the id. */
-  private resolveNetworkIdForCwd(networkId: string | undefined, cwd: string): string | undefined {
-    return normalizeNetworkId(networkId) ?? this.inferNetworkIdFromCwd(cwd);
-  }
-
-  /**
-   * Infers a network only when cwd maps to exactly one existing scoped route.
-   * Ambiguous sibling worktrees stay unscoped instead of leaking across networks.
-   */
-  private inferNetworkIdFromCwd(cwd: string): string | undefined {
-    const normalizedCwd = normalizeComparablePath(cwd);
-    if (normalizedCwd === undefined) {
-      return undefined;
-    }
-
-    let matchedNetworkId: string | undefined;
-    const noteMatch = (networkId: string | undefined): boolean => {
-      const normalizedNetworkId = normalizeNetworkId(networkId);
-      if (normalizedNetworkId === undefined) {
-        return true;
-      }
-      if (matchedNetworkId === undefined) {
-        matchedNetworkId = normalizedNetworkId;
-        return true;
-      }
-      return matchedNetworkId === normalizedNetworkId;
-    };
-
-    for (const allocation of this.pendingRouteAllocations.values()) {
-      if (
-        cwdMatchesNetworkRoute(normalizedCwd, allocation.route.cwd, allocation.route.source) &&
-        !noteMatch(allocation.route.networkId)
-      ) {
-        return undefined;
-      }
-    }
-
-    for (const process of this.registry.list()) {
-      if (
-        process.status === "running" &&
-        process.source !== "detected" &&
-        cwdMatchesNetworkRoute(normalizedCwd, process.cwd, process.source) &&
-        !noteMatch(process.networkId)
-      ) {
-        return undefined;
-      }
-    }
-
-    return matchedNetworkId;
   }
 
   /**
@@ -1826,49 +1777,6 @@ function logicalNetworkRouteScope(
   return normalized === undefined ? {} : { networkId: normalized };
 }
 
-function normalizeComparablePath(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
-  if (trimmed === undefined || trimmed.length === 0 || trimmed === ".") {
-    return undefined;
-  }
-
-  return path.resolve(trimmed);
-}
-
-function pathContainsOrEquals(candidate: string | undefined, root: string | undefined): boolean {
-  if (candidate === undefined || root === undefined || root === path.parse(root).root) {
-    return false;
-  }
-
-  const relative = path.relative(root, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
-function cwdMatchesNetworkRoute(
-  normalizedCwd: string,
-  routeCwd: string | undefined,
-  routeSource: string | undefined,
-): boolean {
-  const normalizedRouteCwd = normalizeComparablePath(routeCwd);
-  if (
-    pathContainsOrEquals(normalizedCwd, normalizedRouteCwd) ||
-    pathContainsOrEquals(normalizedRouteCwd, normalizedCwd)
-  ) {
-    return true;
-  }
-
-  /*
-   * Compose files often live in a project subdirectory while app servers run
-   * from the project root or a package directory. Treat the compose cwd parent
-   * as the network root without hard-coding a project layout name.
-   */
-  if (routeSource === "compose" && normalizedRouteCwd !== undefined) {
-    const parent = path.dirname(normalizedRouteCwd);
-    return parent !== normalizedRouteCwd && parent !== path.parse(parent).root && pathContainsOrEquals(normalizedCwd, parent);
-  }
-
-  return false;
-}
 
 /**
  * Builds match keys for registry rows that should suppress duplicate detected

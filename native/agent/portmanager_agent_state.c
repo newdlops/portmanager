@@ -54,112 +54,6 @@ static int pm_text_empty(const char *value) {
   return value == NULL || value[0] == '\0';
 }
 
-static int pm_path_contains_or_equals(const char *candidate, const char *root) {
-  size_t root_length;
-
-  if (pm_text_empty(candidate) || pm_text_empty(root) || strcmp(candidate, ".") == 0 || strcmp(root, ".") == 0 || strcmp(root, "/") == 0) {
-    return 0;
-  }
-
-  root_length = strlen(root);
-  if (strcmp(candidate, root) == 0) {
-    return 1;
-  }
-
-  return strncmp(candidate, root, root_length) == 0 && (root[root_length - 1] == '/' || candidate[root_length] == '/');
-}
-
-static int pm_path_parent(const char *value, char *out, size_t out_size) {
-  const char *slash;
-  size_t length;
-
-  if (pm_text_empty(value) || strcmp(value, "/") == 0 || out_size == 0) {
-    return 0;
-  }
-
-  slash = strrchr(value, '/');
-  if (slash == NULL || slash == value) {
-    return 0;
-  }
-
-  length = (size_t)(slash - value);
-  if (length >= out_size) {
-    length = out_size - 1;
-  }
-
-  memcpy(out, value, length);
-  out[length] = '\0';
-  return out[0] != '\0' && strcmp(out, "/") != 0;
-}
-
-static int pm_cwd_matches_network_route(const char *cwd, const char *route_cwd, const char *route_source) {
-  char parent[PM_TEXT];
-
-  if (pm_path_contains_or_equals(cwd, route_cwd) || pm_path_contains_or_equals(route_cwd, cwd)) {
-    return 1;
-  }
-
-  /*
-   * Compose files often live in a project subdirectory while app servers run
-   * from the project root or a package directory. Treat the compose cwd parent
-   * as the network root without hard-coding a project layout name.
-   */
-  if (route_source != NULL &&
-      strcmp(route_source, "compose") == 0 &&
-      pm_path_parent(route_cwd, parent, sizeof(parent)) &&
-      pm_path_contains_or_equals(cwd, parent)) {
-    return 1;
-  }
-
-  return 0;
-}
-
-static int pm_note_network_match(char *matched_network_id, size_t matched_size, const char *network_id) {
-  if (pm_text_empty(network_id)) {
-    return 1;
-  }
-
-  if (matched_network_id[0] == '\0') {
-    pm_copy(matched_network_id, matched_size, network_id);
-    return 1;
-  }
-
-  return strcmp(matched_network_id, network_id) == 0;
-}
-
-static int pm_infer_network_id_from_cwd(pm_agent_state *state, const char *cwd, char *out, size_t out_size) {
-  char matched_network_id[PM_SMALL] = "";
-
-  if (pm_text_empty(cwd) || strcmp(cwd, ".") == 0) {
-    return 0;
-  }
-
-  for (size_t index = 0; index < state->pending_count; index++) {
-    pm_route *route = &state->pending_routes[index].route;
-    if (pm_cwd_matches_network_route(cwd, route->cwd, route->source) &&
-        !pm_note_network_match(matched_network_id, sizeof(matched_network_id), route->network_id)) {
-      return 0;
-    }
-  }
-
-  for (size_t index = 0; index < state->process_count; index++) {
-    pm_process *process = &state->processes[index];
-    if (strcmp(process->status, "running") == 0 &&
-        strcmp(process->source, "detected") != 0 &&
-        pm_cwd_matches_network_route(cwd, process->cwd, process->source) &&
-        !pm_note_network_match(matched_network_id, sizeof(matched_network_id), process->network_id)) {
-      return 0;
-    }
-  }
-
-  if (matched_network_id[0] == '\0') {
-    return 0;
-  }
-
-  pm_copy(out, out_size, matched_network_id);
-  return 1;
-}
-
 static void pm_normalize_network(const char *value, char *out, size_t out_size) {
   const char *start = value == NULL ? "" : value;
   const char *end;
@@ -1301,9 +1195,6 @@ static int pm_recover_untracked_hooked_listener(pm_agent_state *state, const pm_
   if (!pm_process_text_first_value(environment, cwd_variables, sizeof(cwd_variables) / sizeof(cwd_variables[0]), cwd, sizeof(cwd))) {
     pm_copy(cwd, sizeof(cwd), ".");
   }
-  if (network_id[0] == '\0') {
-    (void)pm_infer_network_id_from_cwd(state, cwd, network_id, sizeof(network_id));
-  }
   if (network_id[0] == '\0' ||
       requested_port <= 0 ||
       requested_port == listener->port ||
@@ -1914,14 +1805,11 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
     pm_write_route_tables(state);
   }
   pm_normalize_network(input->network_id, network_id, sizeof(network_id));
-  if (network_id[0] == '\0') {
-    (void)pm_infer_network_id_from_cwd(state, input->cwd, network_id, sizeof(network_id));
-  }
 
   /*
-   * The chosen actual port must be derived from the same logical network that
-   * will be written to the route table; otherwise detached launchers can hash
-   * by cwd first and later register into a different network scope.
+   * The chosen actual port must be derived from the explicit logical network
+   * that will be written to the route table. CWD overlap is not an authority
+   * signal; unscoped host listeners must stay reachable through localhost.
    */
   effective_input = *input;
   pm_copy(effective_input.network_id, sizeof(effective_input.network_id), network_id);
@@ -2109,9 +1997,6 @@ int pm_state_register_process(pm_agent_state *state, const pm_register_input *in
   allocation = pm_find_pending_allocation(state, input->allocation_id);
   if (network_id[0] == '\0' && allocation != NULL) {
     pm_copy(network_id, sizeof(network_id), allocation->route.network_id);
-  }
-  if (network_id[0] == '\0') {
-    (void)pm_infer_network_id_from_cwd(state, input->cwd, network_id, sizeof(network_id));
   }
   pm_copy(source, sizeof(source), pm_normalized_source(input->source));
   if (input->allocation_id[0] != '\0') {

@@ -76,7 +76,7 @@ test("registers native hook processes as hooked managed rows", async (context) =
   listeners = [];
 });
 
-test("infers network scope for detached cwd-matched hook routes", async (context) => {
+test("keeps unscoped host listeners out of cwd-matched networks", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const agent = new PortManagerAgent({
     processLauncher: createFakeLauncher(),
@@ -102,6 +102,11 @@ test("infers network scope for detached cwd-matched hook routes", async (context
     source: "compose",
   });
 
+  /*
+   * The cwd is intentionally inside the same project as the scoped compose
+   * route. Without an explicit network id from the terminal hook, this listener
+   * is still a host listener and must remain unscoped.
+   */
   const allocation = await agent.allocateRoute({
     name: "vite",
     command: "vite --host",
@@ -130,9 +135,9 @@ test("infers network scope for detached cwd-matched hook routes", async (context
   const snapshot = await agent.listSnapshot();
   const route = snapshot.routes.find((item) => item.logicalPort === 3004);
 
-  assert.equal(route?.networkId, "network-a");
-  assert.equal(fs.existsSync(getRouteTablePathForLogicalPort(3004, undefined, routeTablePath)), false);
-  assert.equal(readRouteTable(getRouteTablePathForLogicalPort(3004, "network-a", routeTablePath)).routes.length, 1);
+  assert.equal(route?.networkId, undefined);
+  assert.equal(readRouteTable(getRouteTablePathForLogicalPort(3004, undefined, routeTablePath)).routes.length, 1);
+  assert.equal(fs.existsSync(getRouteTablePathForLogicalPort(3004, "network-a", routeTablePath)), false);
 });
 
 test("releases loopback routes without adopting another network on the same port", async (context) => {
