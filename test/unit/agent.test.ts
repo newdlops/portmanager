@@ -76,6 +76,65 @@ test("registers native hook processes as hooked managed rows", async (context) =
   listeners = [];
 });
 
+test("infers network scope for detached cwd-matched hook routes", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 0,
+    name: "postgres",
+    command: "docker compose up postgres",
+    cwd: "/workspace/app/docker",
+    requestedPort: 15432,
+    actualPort: 55432,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "compose",
+  });
+
+  const allocation = await agent.allocateRoute({
+    name: "vite",
+    command: "vite --host",
+    cwd: "/workspace/app/zuzu/client",
+    requestedPort: 3004,
+    host: "127.0.0.1",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 59000,
+  });
+
+  await agent.registerExistingProcess({
+    pid: 4321,
+    name: "vite",
+    command: "vite --host",
+    cwd: "/workspace/app/zuzu/client",
+    requestedPort: 3004,
+    actualPort: allocation.actualPort,
+    host: "127.0.0.1",
+    allocationId: allocation.allocationId,
+    source: "hooked",
+  });
+
+  const snapshot = await agent.listSnapshot();
+  const route = snapshot.routes.find((item) => item.logicalPort === 3004);
+
+  assert.equal(route?.networkId, "network-a");
+  assert.equal(fs.existsSync(getRouteTablePathForLogicalPort(3004, undefined, routeTablePath)), false);
+  assert.equal(readRouteTable(getRouteTablePathForLogicalPort(3004, "network-a", routeTablePath)).routes.length, 1);
+});
+
 test("releases loopback routes without adopting another network on the same port", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   let listeners: readonly ListeningPort[] = [];
@@ -1089,59 +1148,6 @@ test("does not reuse active listener routes for a new listener allocation", asyn
 
   assert.notEqual(allocation.allocationId, "");
   assert.equal(allocation.actualPort, 58001);
-});
-
-test("keeps shared logical ports free when allocating an unscoped host listener", async (context) => {
-  const routeTablePath = createRouteTablePath(context);
-  const checkedPorts: number[] = [];
-  const agent = new PortManagerAgent({
-    processLauncher: createFakeLauncher(),
-    portAvailabilityProvider: {
-      check: async (port) => {
-        checkedPorts.push(port);
-        return {
-          port,
-          available: true,
-        };
-      },
-    },
-    listeningPortProvider: {
-      list: async () => [],
-    },
-    agentPid: 777,
-    now: fixedNow,
-    routeTablePath,
-  });
-  context.after(() => agent.dispose());
-
-  await agent.registerExistingProcess({
-    pid: 1234,
-    name: "postgres",
-    command: "postgres -p 15432",
-    cwd: "/workspace/network-a",
-    requestedPort: 15432,
-    actualPort: 57001,
-    host: "127.0.0.1",
-    networkId: "network-a",
-    source: "hooked",
-  });
-
-  const allocation = await agent.allocateRoute({
-    name: "postgres",
-    command: "postgres -p 15432",
-    cwd: "/workspace/host",
-    requestedPort: 15432,
-    host: "127.0.0.1",
-    routeDirection: "listen",
-    scanRange: 20,
-    scanDirection: "up",
-    routingMode: "nearest",
-  });
-
-  assert.notEqual(allocation.allocationId, "");
-  assert.equal(allocation.actualPort, 15433);
-  assert.deepEqual(checkedPorts, [15433]);
-  assert.equal(allocation.logicalRoutes.some((route) => route.logicalPort === 15432 && route.networkId === undefined), true);
 });
 
 test("removes stale pending routes when a receiver registers without an allocation id", async (context) => {

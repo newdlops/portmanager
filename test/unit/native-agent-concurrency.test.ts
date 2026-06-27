@@ -62,25 +62,6 @@ test("native agent recovers restarted hook routes from process environment", () 
   assert.equal(source.includes("pm_remove_pending_endpoint(state, process->requested_port, network_id)"), true);
 });
 
-test("native agent keeps host listener allocations off shared logical ports", () => {
-  const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
-
-  assert.equal(source.includes("pm_has_scoped_listen_route_for_logical_port"), true);
-  assert.equal(source.includes("avoid_requested_port"), true);
-  assert.equal(source.includes("network_id[0] == '\\0'"), true);
-  assert.equal(source.includes("pm_route_nearest(state, input, avoid_requested_port)"), true);
-});
-
-test("native agent publishes hookless host listeners as unscoped shared routes", () => {
-  const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
-
-  assert.equal(source.includes("pm_append_external_host_routes"), true);
-  assert.equal(source.includes("pm_routes_have_scoped_shared_port"), true);
-  assert.equal(source.includes("pm_routes_have_unscoped_listen_port"), true);
-  assert.equal(source.includes("pm_build_routes(state, NULL, &listeners, &routes)"), true);
-  assert.equal(source.includes("pm_write_route_tables_from_routes(state, &routes)"), true);
-});
-
 if (!fs.existsSync(nativeAgentPath)) {
   test("native agent serves concurrent hook-like clients while extension client receives events", { skip: "native agent binary is not built" }, () => undefined);
 } else {
@@ -168,6 +149,83 @@ if (!fs.existsSync(nativeAgentPath)) {
 
     assert.equal(released, true);
     await waitForFileMissing(routeEntryPath);
+  });
+
+  test("native agent infers network scope for detached cwd-matched hook routes", async (context) => {
+    const fixture = await startNativeAgent(context);
+    if (fixture === undefined) {
+      return;
+    }
+
+    const networkId = "network-native-cwd-infer";
+    const projectCwd = path.join(projectRoot, ".tmp", "native-agent-tests", "cwd-infer-project");
+    const composeCwd = path.join(projectCwd, "docker");
+    const clientCwd = path.join(projectCwd, "zuzu", "client");
+    const scopedRouteEntryPath = getRouteTablePathForLogicalPort(3004, networkId, fixture.routeTablePath);
+    const unscopedRouteEntryPath = getRouteTablePathForLogicalPort(3004, undefined, fixture.routeTablePath);
+
+    await requestOnce(fixture.socketPath, {
+      id: `hook-${process.pid}-cwd-infer-compose`,
+      method: "registerExistingProcess",
+      payload: {
+        pid: 0,
+        name: "postgres",
+        command: "docker compose up postgres",
+        cwd: composeCwd,
+        requestedPort: 15432,
+        actualPort: 55432,
+        host: "127.0.0.1",
+        networkId,
+        source: "compose",
+      },
+    });
+
+    const allocation = await requestOnce<{
+      readonly allocationId: string;
+      readonly actualPort: number;
+    }>(fixture.socketPath, {
+      id: `hook-${process.pid}-cwd-infer-allocate`,
+      method: "allocateRoute",
+      payload: {
+        name: "vite",
+        command: "vite --host",
+        cwd: clientCwd,
+        requestedPort: 3004,
+        host: "127.0.0.1",
+        routeDirection: "listen",
+        scanRange: 20,
+        scanDirection: "up",
+        routingMode: "hashed",
+        virtualPortRangeStart: 58000,
+        virtualPortRangeEnd: 59000,
+      },
+    });
+
+    await requestOnce(fixture.socketPath, {
+      id: `hook-${process.pid}-cwd-infer-register`,
+      method: "registerExistingProcess",
+      payload: {
+        pid: process.pid,
+        name: "vite",
+        command: "vite --host",
+        cwd: clientCwd,
+        requestedPort: 3004,
+        actualPort: allocation.actualPort,
+        host: "127.0.0.1",
+        allocationId: allocation.allocationId,
+        source: "hooked",
+      },
+    });
+
+    await waitForFile(scopedRouteEntryPath);
+    const route = readRouteTable(scopedRouteEntryPath).routes[0] as {
+      readonly networkId?: string;
+      readonly source?: string;
+    };
+
+    assert.equal(route.networkId, networkId);
+    assert.equal(route.source, "hooked");
+    assert.equal(fs.existsSync(unscopedRouteEntryPath), false);
   });
 
   test("native agent reuses sender-first reservations for later listeners", async (context) => {
@@ -322,128 +380,6 @@ if (!fs.existsSync(nativeAgentPath)) {
     assert.equal(fs.existsSync(routeEntryPath), false);
   });
 
-  test("native agent routes unscoped host listeners away from scoped logical ports", async (context) => {
-    const fixture = await startNativeAgent(context);
-    if (fixture === undefined) {
-      return;
-    }
-
-    const logicalPort = await reserveUnusedTcpPort();
-    const scopedActualPort = await reserveUnusedTcpPort();
-
-    await requestOnce(fixture.socketPath, {
-      id: `hook-${process.pid}-host-shared-scoped-register`,
-      method: "registerExistingProcess",
-      payload: {
-        pid: process.pid,
-        name: "postgres",
-        command: `postgres -p ${logicalPort}`,
-        cwd: projectRoot,
-        requestedPort: logicalPort,
-        actualPort: scopedActualPort,
-        host: "127.0.0.1",
-        networkId: "network-native-scoped",
-        source: "hooked",
-      },
-    });
-
-    const allocation = await requestOnce<{
-      readonly allocationId: string;
-      readonly requestedPort: number;
-      readonly actualPort: number;
-      readonly routed: boolean;
-    }>(fixture.socketPath, {
-      id: `hook-${process.pid}-host-shared-listener`,
-      method: "allocateRoute",
-      payload: {
-        name: "postgres",
-        command: `postgres -p ${logicalPort}`,
-        cwd: projectRoot,
-        requestedPort: logicalPort,
-        host: "127.0.0.1",
-        routeDirection: "listen",
-        scanRange: 20,
-        scanDirection: "up",
-        routingMode: "nearest",
-        virtualPortRangeStart: 58000,
-        virtualPortRangeEnd: 59000,
-      },
-    });
-
-    assert.notEqual(allocation.allocationId, "");
-    assert.notEqual(allocation.actualPort, logicalPort);
-    assert.equal(allocation.routed, true);
-  });
-
-  test("native agent exposes hookless host listeners beside scoped network routes", async (context) => {
-    const fixture = await startNativeAgent(context);
-    if (fixture === undefined) {
-      return;
-    }
-
-    const server = await openTcpServer();
-    context.after(async () => {
-      await closeTcpServer(server);
-    });
-
-    const address = server.address();
-    if (address === null || typeof address === "string") {
-      throw new Error("Failed to read test server address.");
-    }
-
-    const networkId = "network-native-hookless-host";
-    const scopedActualPort = await reserveUnusedTcpPort();
-    const hostRouteEntryPath = getRouteTablePathForLogicalPort(address.port, undefined, fixture.routeTablePath);
-
-    await requestOnce(fixture.socketPath, {
-      id: `hook-${process.pid}-hookless-host-scoped-register`,
-      method: "registerExistingProcess",
-      payload: {
-        pid: process.pid,
-        name: "postgres",
-        command: `postgres -p ${address.port}`,
-        cwd: projectRoot,
-        requestedPort: address.port,
-        actualPort: scopedActualPort,
-        host: "127.0.0.1",
-        networkId,
-        source: "hooked",
-      },
-    });
-
-    await delay(100);
-    const snapshot = await requestOnce<{ readonly routes: readonly unknown[] }>(fixture.socketPath, {
-      id: `hook-${process.pid}-hookless-host-refresh`,
-      method: "refreshSnapshot",
-    });
-    const routes = snapshot.routes as ReadonlyArray<{
-      readonly logicalPort?: number;
-      readonly actualPort?: number;
-      readonly networkId?: string;
-      readonly source?: string;
-    }>;
-
-    assert.equal(
-      routes.some((route) => route.logicalPort === address.port && route.actualPort === scopedActualPort && route.networkId === networkId),
-      true,
-    );
-    assert.equal(
-      routes.some((route) => route.logicalPort === address.port && route.actualPort === address.port && route.networkId === undefined && route.source === "detected"),
-      true,
-    );
-
-    await waitForFile(hostRouteEntryPath);
-    const hostEntryRoutes = readRouteTable(hostRouteEntryPath).routes as ReadonlyArray<{
-      readonly logicalPort?: number;
-      readonly actualPort?: number;
-      readonly source?: string;
-    }>;
-    assert.equal(
-      hostEntryRoutes.some((route) => route.logicalPort === address.port && route.actualPort === address.port && route.source === "detected"),
-      true,
-    );
-  });
-
   test("native agent removes hooked route files after the listener disappears", async (context) => {
     const fixture = await startNativeAgent(context);
     if (fixture === undefined) {
@@ -486,13 +422,7 @@ if (!fs.existsSync(nativeAgentPath)) {
       method: "refreshSnapshot",
     });
 
-    assert.equal(
-      snapshot.routes.some((route) => {
-        const item = route as { readonly logicalPort?: number; readonly networkId?: string };
-        return item.logicalPort === logicalPort && item.networkId === networkId;
-      }),
-      false,
-    );
+    assert.deepEqual(snapshot.routes, []);
     await waitForFileMissing(routeEntryPath);
   });
 }

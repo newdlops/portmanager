@@ -35,16 +35,25 @@ test("BASH_ENV restore script promotes runtime shims ahead of inherited PATH ent
 test("package command shims rerun client tools without native runtime alias semantics", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
+  const launcherList = /const PRELOAD_RUNTIME_LAUNCHER_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
   const packageCommandList = /const PRELOAD_PACKAGE_COMMAND_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
   const packageManagerList = /const PRELOAD_PACKAGE_MANAGER_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
   const packageManagerShimStart = source.indexOf("function buildPreloadPackageManagerCommandShimScript");
   const packageManagerShimEnd = source.indexOf("function shellEnvRestoreFileName", packageManagerShimStart);
   const packageManagerShim = source.slice(packageManagerShimStart, packageManagerShimEnd);
-  const packageManagerDevServerStart = packageManagerShim.indexOf("if __pm_text_looks_like_dev_server");
-  const packageManagerDevServerEnd = packageManagerShim.indexOf('exec "\\${__pm_target}" "$@"', packageManagerDevServerStart);
-  const packageManagerDevServerBlock = packageManagerShim.slice(packageManagerDevServerStart, packageManagerDevServerEnd);
+  const packageManagerProjectCommandStart = packageManagerShim.indexOf("if __pm_package_manager_command_runs_project_code");
+  const packageManagerProjectCommandEnd = packageManagerShim.indexOf('exec "\\${__pm_target}" "$@"', packageManagerProjectCommandStart);
+  const packageManagerProjectCommandBlock = packageManagerShim.slice(
+    packageManagerProjectCommandStart,
+    packageManagerProjectCommandEnd,
+  );
 
   for (const packageBinary of ["concurrently", "wait-on", "retry", "vite", "dotenv", "celery", "uvicorn", "gunicorn", "daphne"]) {
+    assert.equal(
+      launcherList.includes(`"${packageBinary}"`),
+      false,
+      `${packageBinary} must not use the native runtime launcher argv semantics`,
+    );
     assert.equal(
       packageCommandList.includes(`"${packageBinary}"`),
       true,
@@ -52,7 +61,12 @@ test("package command shims rerun client tools without native runtime alias sema
     );
   }
 
-  for (const packageManager of ["npm", "npx", "pnpm", "pnpx", "corepack", "yarn", "yarnpkg"]) {
+  for (const packageManager of ["npm", "npx", "pnpm", "pnpx", "corepack", "uv", "uvx", "yarn", "yarnpkg"]) {
+    assert.equal(
+      launcherList.includes(`"${packageManager}"`),
+      false,
+      `${packageManager} must not be hooked as a runtime launcher`,
+    );
     assert.equal(
       packageCommandList.includes(`"${packageManager}"`),
       false,
@@ -61,34 +75,18 @@ test("package command shims rerun client tools without native runtime alias sema
     assert.equal(
       packageManagerList.includes(`"${packageManager}"`),
       true,
-      `${packageManager} must use the package-manager dev-server detector shim`,
+      `${packageManager} must use the package-manager project-command detector shim`,
     );
   }
 
   assert.equal(source.includes("buildPreloadPackageCommandShimScript"), true);
   assert.equal(source.includes("buildPreloadPackageManagerCommandShimScript"), true);
   assert.equal(source.includes("writePreloadPackageManagerCommandShims"), true);
-  assert.equal(source.includes("removeStaleBroadRuntimeLauncherAliases"), true);
-  assert.equal(
-    source.includes("PRELOAD_RUNTIME_LAUNCHER_NAMES"),
-    false,
-    "generic runtime names must not be public PATH shims",
-  );
-  assert.equal(
-    source.includes("for (const runtimeName"),
-    false,
-    "runtime-shims PATH must not shadow node/python/ruby for arbitrary /usr/bin/env scripts",
-  );
-  assert.equal(
-    source.includes("const sourceShimDirectory = getAsdfShimDirectory()"),
-    false,
-    "runtime shims must not mirror arbitrary asdf shims such as vsce into PATH",
-  );
-  assert.equal(
-    source.includes("ensureExecutableAlias(path.join(targetDirectory, entry.name), launcherPath)"),
-    false,
-    "only explicit runtime names should use the native runtime launcher",
-  );
+  assert.equal(source.includes("__pm_package_manager_command_runs_project_code()"), true);
+  assert.equal(source.includes("__pm_dependency_command_name()"), true);
+  assert.equal(source.includes("run|tool|x|uvx) return 0"), true);
+  assert.equal(source.includes("install|i|ci|add|remove|rm|uninstall|unlink|link"), true);
+  assert.equal(source.includes("preinstall|install:clean|postinstall|prepare"), true);
   assert.equal(source.includes("__pm_text_looks_like_dev_server()"), true);
   assert.equal(source.includes("__pm_package_script_text()"), true);
   assert.equal(source.includes("*vite*"), true);
@@ -124,37 +122,45 @@ test("package command shims rerun client tools without native runtime alias sema
     "Node entrypoint bypass should be shared by package-bin and package-manager shims",
   );
   assert.equal(
-    packageManagerDevServerBlock.includes("${buildPreloadNodeEntrypointBypassShell()}"),
+    packageManagerProjectCommandBlock.includes("${buildPreloadNodeEntrypointBypassShell()}"),
     true,
-    "package-manager dev-server commands must bypass /usr/bin/env node before DYLD is stripped",
+    "package-manager project commands must bypass /usr/bin/env node before DYLD is stripped",
   );
   assert.equal(
-    packageManagerDevServerBlock.includes("export PORT_MANAGER_PRELOAD_REPAIR=1"),
+    packageManagerProjectCommandBlock.includes("export PORT_MANAGER_PRELOAD_REPAIR=1"),
     true,
-    "package-manager shim must keep lifecycle commands unhooked unless a dev-server command was detected",
+    "package-manager shim must repair runtime commands while keeping dependency lifecycle commands clean",
   );
+});
+
+test("runtime shim directory removes reverted clean-run artifacts before rewriting shims", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const prepareStart = source.indexOf("export function prepareRuntimeShimLauncherDirectory");
+  const prepareEnd = source.indexOf("function removeLegacyPreloadPackageManagerShims", prepareStart);
+  const prepareBody = source.slice(prepareStart, prepareEnd);
+  const cleanupStart = source.indexOf("function removeStaleRuntimeShimArtifacts");
+  const cleanupEnd = source.indexOf("function isStaleGeneratedRuntimeShim", cleanupStart);
+  const cleanupBody = source.slice(cleanupStart, cleanupEnd);
+  const staleCheckStart = source.indexOf("function isStaleGeneratedRuntimeShim");
+  const staleCheckEnd = source.indexOf("/**\n * Creates a bash startup fragment", staleCheckStart);
+  const staleCheckBody = source.slice(staleCheckStart, staleCheckEnd);
+
   assert.equal(
-    packageManagerShim.includes("__pm_exec_without_port_manager_preload()"),
+    prepareBody.indexOf("removeStaleRuntimeShimArtifacts(targetDirectory);") <
+      prepareBody.indexOf("writePreloadPackageManagerCommandShims(targetDirectory);"),
     true,
-    "package-manager dependency commands must run without the native preload hook",
+    "stale artifacts must be removed before stable package-manager shims are rewritten",
   );
-  assert.equal(packageManagerShim.includes("unset DYLD_INSERT_LIBRARIES"), true);
-  assert.equal(packageManagerShim.includes("unset LD_PRELOAD"), true);
-  assert.equal(packageManagerShim.includes("unset BASH_ENV"), true);
-  assert.equal(packageManagerShim.includes("unset ENV"), true);
-  assert.equal(packageManagerShim.includes("unset PORT_MANAGER_RUNTIME_SHIM_DIR"), true);
-  assert.equal(packageManagerShim.includes("export PORT_MANAGER_HOOK=0"), true);
-  assert.equal(packageManagerShim.includes("export PORT_MANAGER_HOOK_DISABLED=1"), true);
-  assert.equal(
-    packageManagerShim.includes("__pm_strip_port_manager_runtime_shims_from_path"),
-    true,
-    "non-dev package-manager commands must not resolve node through Port Manager runtime shims",
-  );
-  assert.equal(
-    packageManagerShim.includes('__pm_exec_without_port_manager_preload "$@"'),
-    true,
-    "non-dev package-manager commands must use the clean execution path",
-  );
+  assert.equal(cleanupBody.includes('path.join(targetDirectory, ".portmanager-node")'), true);
+  assert.equal(cleanupBody.includes("PRELOAD_PACKAGE_MANAGER_NAMES"), true);
+  assert.equal(cleanupBody.includes("PRELOAD_PACKAGE_COMMAND_NAMES"), true);
+  assert.equal(staleCheckBody.includes('"Generated by Port Manager."'), true);
+  assert.equal(staleCheckBody.includes('"__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS"'), true);
+  assert.equal(staleCheckBody.includes('".portmanager-node"'), true);
+  assert.equal(staleCheckBody.includes('"PORT_MANAGER_HOOK_DISABLED"'), true);
+  assert.equal(staleCheckBody.includes('"__pm_package_manager_command_should_run_clean"'), true);
+  assert.equal(staleCheckBody.includes('"__pm_exec_without_port_manager_preload"'), true);
 });
 
 test("terminal attach and detach commands source generated script files", () => {
@@ -472,21 +478,6 @@ test("native hook preserves listener ports only for explicit overrides", () => {
   assert.equal(source.includes("stable browser alias"), true);
 });
 
-test("native hook leaves host loopback outside logical network fallback", () => {
-  const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
-  const source = fs.readFileSync(sourcePath, "utf8");
-  const matchLevelStart = source.indexOf("static int pm_route_network_match_level");
-  const matchLevelEnd = source.indexOf("static int pm_route_is_compose", matchLevelStart);
-  const matchLevel = source.slice(matchLevelStart, matchLevelEnd);
-  const foreignStart = source.indexOf("static int pm_route_is_foreign_to_current_network");
-  const foreignEnd = source.indexOf("static int pm_host_access_lookup", foreignStart);
-  const foreign = source.slice(foreignStart, foreignEnd);
-
-  assert.equal(matchLevel.includes("Host loopback"), true);
-  assert.equal(matchLevel.includes("return pm_json_string(route_json, \"networkId\", route_network, sizeof(route_network)) != 0 ? 2 : 0;"), true);
-  assert.equal(foreign.includes("return 0;"), true);
-});
-
 test("native preload repair is opt-in at runtime shim boundaries", () => {
   const hookSourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
   const asdfShimSourcePath = path.resolve(__dirname, "../../../native/asdf-shim/portmanager_asdf_shim.c");
@@ -513,11 +504,12 @@ test("logical routers are opened only after logical routes are live", () => {
   assert.equal(collectLogicalRouterPorts.includes('route.source === "compose"'), false);
   assert.equal(collectLogicalRouterPorts.includes("route.networkId === undefined"), true);
   assert.equal(collectLogicalRouterPorts.includes("route.actualPort !== route.logicalPort"), true);
+  assert.equal(collectLogicalRouterPorts.includes("!isDetachedNetworkRoute(route, networkScopedLiveRoutes)"), true);
   assert.equal(collectLogicalRouterPorts.includes("!externallyOwnedPorts.has(route.logicalPort)"), true);
   assert.equal(
     syncBody.includes("await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);"),
     true,
-    "unscoped host routes can still expose a localhost TCP router fallback",
+    "unscoped host routes can still use a localhost TCP router fallback",
   );
 });
 
@@ -527,12 +519,12 @@ test("logical router classifies clients by process tree label before hook enviro
   const methodStart = source.indexOf("private async findClientNetworkForRouter");
   const methodEnd = source.indexOf("private async findNetworkRouteForRouter", methodStart);
   const findClientNetworkForRouter = source.slice(methodStart, methodEnd);
-  const hostRouteStart = source.indexOf("private findHostRouteForRouter");
-  const hostRouteEnd = source.indexOf("private findAttachedNetworkForPid", hostRouteStart);
-  const findHostRouteForRouter = source.slice(hostRouteStart, hostRouteEnd);
-  const resolverStart = source.indexOf("private async resolveLogicalPortRouterTarget");
-  const resolverEnd = source.indexOf("private async syncLogicalPortRouters", resolverStart);
-  const resolveLogicalPortRouterTarget = source.slice(resolverStart, resolverEnd);
+  const uniqueRouteStart = source.indexOf("private async findUniqueRouteForRouter");
+  const uniqueRouteEnd = source.indexOf("private findClientCwdRouteForRouter", uniqueRouteStart);
+  const findUniqueRouteForRouter = source.slice(uniqueRouteStart, uniqueRouteEnd);
+  const cwdRouteStart = source.indexOf("private findClientCwdRouteForRouter");
+  const cwdRouteEnd = source.indexOf("private findAttachedNetworkForPid", cwdRouteStart);
+  const findClientCwdRouteForRouter = source.slice(cwdRouteStart, cwdRouteEnd);
 
   assert.equal(source.includes('from "../core/process-network-labels"'), true);
   assert.equal(
@@ -542,14 +534,15 @@ test("logical router classifies clients by process tree label before hook enviro
     "process tree labels must be the primary router signal; inherited hook env remains fallback",
   );
   assert.equal(findClientNetworkForRouter.includes("return environmentNetworkId;"), true);
-  assert.equal(source.includes("including a Compose route"), false);
-  assert.equal(source.includes("private async findUniqueRouteForRouter"), false);
-  assert.equal(source.includes("private findClientCwdRouteForRouter"), false);
-  assert.equal(resolveLogicalPortRouterTarget.includes("No host route found for localhost"), true);
+  assert.equal(source.includes("explicit unscoped host routes"), true);
+  assert.equal(findUniqueRouteForRouter.includes("route.networkId === undefined"), true);
+  assert.equal(findUniqueRouteForRouter.includes("candidates.filter((route) => !isNetworkScopedComposeRoute(route))"), false);
   assert.equal(source.includes("function isNetworkScopedComposeRoute"), false);
   assert.equal(source.includes("findSingleAttachedRouteForRouter"), false);
-  assert.equal(source.includes("this.findHostRouteForRouter(connection.logicalPort)"), true);
-  assert.equal(findHostRouteForRouter.includes("route.networkId === undefined"), true);
-  assert.equal(findHostRouteForRouter.includes("route.actualPort !== route.logicalPort"), true);
-  assert.equal(source.includes("findRoutesMatchingClientCwd"), false);
+  assert.equal(findUniqueRouteForRouter.includes("return undefined;"), true);
+  assert.equal(findClientCwdRouteForRouter.includes("return undefined;"), true);
+  assert.equal(
+    findClientCwdRouteForRouter.includes(".attachments.filter((attachment) => attachment.status === \"attached\")"),
+    false,
+  );
 });

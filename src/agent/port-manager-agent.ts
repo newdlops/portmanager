@@ -396,7 +396,11 @@ export class PortManagerAgent implements DisposableLike {
     return this.runExclusiveRouteOperation(async () => {
       this.cleanupExpiredRouteAllocations();
 
-      const networkRouteScope = normalizeNetworkId(input.networkId);
+      const networkRouteScope = this.resolveNetworkIdForCwd(input.networkId, input.cwd);
+      const scopedInput =
+        networkRouteScope === normalizeNetworkId(input.networkId)
+          ? input
+          : { ...input, networkId: networkRouteScope };
       const routeDirection = normalizeRouteDirection(input.routeDirection);
       const activeRoute =
         routeDirection === "send" ? this.findReusableActiveRoute(input.requestedPort, networkRouteScope) : undefined;
@@ -458,11 +462,6 @@ export class PortManagerAgent implements DisposableLike {
       const decision = await this.routingService.route({
         requestedPort: input.requestedPort,
         host: input.host,
-        avoidRequestedPort: this.shouldKeepLogicalPortAvailableForHostRoute(
-          input.requestedPort,
-          networkRouteScope,
-          routeDirection,
-        ),
         scanRange: input.scanRange,
         scanDirection: input.scanDirection,
         routingMode: input.routingMode,
@@ -472,7 +471,7 @@ export class PortManagerAgent implements DisposableLike {
       });
       const allocationId = `allocation:${randomUUID()}`;
       const expiresAtMs = this.now().getTime() + ROUTE_ALLOCATION_TTL_MS;
-      const route = buildAllocatedLogicalRoute(input, decision.actualPort, routeDirection);
+      const route = buildAllocatedLogicalRoute(scopedInput, decision.actualPort, routeDirection);
 
       this.pendingRouteAllocations.set(allocationId, {
         id: allocationId,
@@ -664,10 +663,11 @@ export class PortManagerAgent implements DisposableLike {
       this.pendingRouteAllocations.delete(input.allocationId);
     }
 
-    const registeredInput =
-      input.networkId === undefined && allocation?.route.networkId !== undefined
-        ? { ...input, networkId: allocation.route.networkId }
-        : input;
+    const registeredNetworkId =
+      normalizeNetworkId(input.networkId) ??
+      normalizeNetworkId(allocation?.route.networkId) ??
+      this.inferNetworkIdFromCwd(input.cwd);
+    const registeredInput = registeredNetworkId === undefined ? input : { ...input, networkId: registeredNetworkId };
 
     const process = this.upsertRegisteredProcess(registeredInput, normalizeRegisteredProcessSource(input.source));
     this.removePendingRouteAllocationsForIdentity(process.requestedPort, normalizeNetworkId(process.networkId));
@@ -1133,6 +1133,57 @@ export class PortManagerAgent implements DisposableLike {
     return buildLogicalRoutes(this.registry.list(), this.listPendingRoutes());
   }
 
+  /** Resolves detached hook input back to a known network when terminal env lost the id. */
+  private resolveNetworkIdForCwd(networkId: string | undefined, cwd: string): string | undefined {
+    return normalizeNetworkId(networkId) ?? this.inferNetworkIdFromCwd(cwd);
+  }
+
+  /**
+   * Infers a network only when cwd maps to exactly one existing scoped route.
+   * Ambiguous sibling worktrees stay unscoped instead of leaking across networks.
+   */
+  private inferNetworkIdFromCwd(cwd: string): string | undefined {
+    const normalizedCwd = normalizeComparablePath(cwd);
+    if (normalizedCwd === undefined) {
+      return undefined;
+    }
+
+    let matchedNetworkId: string | undefined;
+    const noteMatch = (networkId: string | undefined): boolean => {
+      const normalizedNetworkId = normalizeNetworkId(networkId);
+      if (normalizedNetworkId === undefined) {
+        return true;
+      }
+      if (matchedNetworkId === undefined) {
+        matchedNetworkId = normalizedNetworkId;
+        return true;
+      }
+      return matchedNetworkId === normalizedNetworkId;
+    };
+
+    for (const allocation of this.pendingRouteAllocations.values()) {
+      if (
+        cwdMatchesNetworkRoute(normalizedCwd, allocation.route.cwd, allocation.route.source) &&
+        !noteMatch(allocation.route.networkId)
+      ) {
+        return undefined;
+      }
+    }
+
+    for (const process of this.registry.list()) {
+      if (
+        process.status === "running" &&
+        process.source !== "detected" &&
+        cwdMatchesNetworkRoute(normalizedCwd, process.cwd, process.source) &&
+        !noteMatch(process.networkId)
+      ) {
+        return undefined;
+      }
+    }
+
+    return matchedNetworkId;
+  }
+
   /**
    * Rehydrates hook-owned rows after the daemon restarts. Running app servers do
    * not know the in-memory registry disappeared, so the agent reconstructs the
@@ -1213,29 +1264,6 @@ export class PortManagerAgent implements DisposableLike {
 
     return [...this.pendingRouteAllocations.values()].find(
       (allocation) => buildLogicalEndpointIdentity(allocation.route) === routeIdentity,
-    );
-  }
-
-  /**
-   * Host/unscoped listeners must not consume the shared logical port when scoped
-   * networks already expose that port. The localhost router needs the logical
-   * port so unscoped host clients can reach the host route while attached
-   * clients continue to resolve to their own network route.
-   */
-  private shouldKeepLogicalPortAvailableForHostRoute(
-    logicalPort: number,
-    networkId: string | undefined,
-    routeDirection: LogicalPortRouteDirection,
-  ): boolean {
-    if (networkId !== undefined || routeDirection !== "listen") {
-      return false;
-    }
-
-    return this.buildCurrentLogicalRoutes().some(
-      (route) =>
-        route.logicalPort === logicalPort &&
-        route.networkId !== undefined &&
-        isLiveListenRoute(route),
     );
   }
 
@@ -1638,9 +1666,7 @@ export function buildAgentSnapshot(options: BuildAgentSnapshotOptions): AgentSna
     )
     .filter((process) => !options.suppressedDetectedProcessIds?.has(process.id));
 
-  const routes = buildLogicalRoutes(options.registryProcesses, options.pendingRoutes ?? [], normalizedListeners, {
-    defaultHost: options.defaultHost ?? "localhost",
-  });
+  const routes = buildLogicalRoutes(options.registryProcesses, options.pendingRoutes ?? []);
   const daemon = buildDaemonStatus({
     agentPid: options.agentPid,
     updatedAt: options.updatedAt,
@@ -1692,8 +1718,6 @@ function buildDaemonStatus(options: {
 function buildLogicalRoutes(
   processes: readonly ManagedProcess[],
   pendingRoutes: readonly LogicalPortRoute[] = [],
-  listeners: readonly ListeningPort[] = [],
-  options: { readonly defaultHost?: string } = {},
 ): readonly LogicalPortRoute[] {
   const normalizedPendingRoutes = pendingRoutes.map((route) => ({
     ...route,
@@ -1714,61 +1738,7 @@ function buildLogicalRoutes(
       source: process.source ?? "managed",
     }));
 
-  const routeRows = dedupeLogicalRoutes([...normalizedPendingRoutes, ...routes]);
-  return dedupeLogicalRoutes([
-    ...routeRows,
-    ...buildExternalHostLogicalRoutes(routeRows, listeners, {
-      defaultHost: options.defaultHost ?? "localhost",
-    }),
-  ]);
-}
-
-/**
- * Host processes usually run without the native hook, so they cannot be moved
- * away from a requested port. When a host listener already owns a logical port
- * that scoped networks also expose, publish it as an unscoped route while
- * keeping the logical router closed for that port.
- */
-function buildExternalHostLogicalRoutes(
-  routes: readonly LogicalPortRoute[],
-  listeners: readonly ListeningPort[],
-  options: { readonly defaultHost: string },
-): readonly LogicalPortRoute[] {
-  const sharedLogicalPorts = new Set(
-    routes
-      .filter(
-        (route) =>
-          route.networkId !== undefined &&
-          isLiveListenRoute(route) &&
-          route.actualPort !== route.logicalPort,
-      )
-      .map((route) => route.logicalPort),
-  );
-  const unscopedLogicalPorts = new Set(
-    routes
-      .filter((route) => route.networkId === undefined && isListenRoute(route))
-      .map((route) => route.logicalPort),
-  );
-
-  return listeners
-    .filter(
-      (listener) =>
-        listener.protocol === "tcp" &&
-        listener.source !== "managed" &&
-        !isPortManagerLogicalRouterListener(listener) &&
-        sharedLogicalPorts.has(listener.port) &&
-        !unscopedLogicalPorts.has(listener.port),
-    )
-    .map((listener) => ({
-      logicalPort: listener.port,
-      actualPort: listener.port,
-      routeDirection: "listen" as const,
-      host: normalizeListenerHost(listener.localAddress, options.defaultHost),
-      processId: `${DETECTED_PROCESS_ID_PREFIX}${listener.id}`,
-      processName: listener.processName ?? `Port ${listener.port}`,
-      status: "running" as const,
-      source: "detected" as const,
-    }));
+  return dedupeLogicalRoutes([...normalizedPendingRoutes, ...routes]);
 }
 
 /**
@@ -1842,22 +1812,6 @@ function normalizeRouteDirection(direction: LogicalPortRouteDirection | undefine
   return direction === "send" ? "send" : "listen";
 }
 
-/** True when a route row represents a running listener target. */
-function isLiveListenRoute(route: LogicalPortRoute): boolean {
-  return isListenRoute(route) && route.status === "running";
-}
-
-/** Sender reservations are not live listener targets. */
-function isListenRoute(route: LogicalPortRoute): boolean {
-  return route.routeDirection === undefined || route.routeDirection === "listen";
-}
-
-function isPortManagerLogicalRouterListener(listener: ListeningPort): boolean {
-  const processName = listener.processName ?? "";
-  const command = listener.command ?? "";
-  return processName.includes("portmanager_tcp_router") || command.includes("portmanager_tcp_router");
-}
-
 /** Normalizes absent or blank terminal network scope to the unscoped route path. */
 function normalizeNetworkId(networkId: string | undefined): string | undefined {
   const normalized = networkId?.trim();
@@ -1870,6 +1824,50 @@ function logicalNetworkRouteScope(
 ): Pick<LogicalPortRoute, "networkId"> | Record<string, never> {
   const normalized = normalizeNetworkId(networkId);
   return normalized === undefined ? {} : { networkId: normalized };
+}
+
+function normalizeComparablePath(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (trimmed === undefined || trimmed.length === 0 || trimmed === ".") {
+    return undefined;
+  }
+
+  return path.resolve(trimmed);
+}
+
+function pathContainsOrEquals(candidate: string | undefined, root: string | undefined): boolean {
+  if (candidate === undefined || root === undefined || root === path.parse(root).root) {
+    return false;
+  }
+
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function cwdMatchesNetworkRoute(
+  normalizedCwd: string,
+  routeCwd: string | undefined,
+  routeSource: string | undefined,
+): boolean {
+  const normalizedRouteCwd = normalizeComparablePath(routeCwd);
+  if (
+    pathContainsOrEquals(normalizedCwd, normalizedRouteCwd) ||
+    pathContainsOrEquals(normalizedRouteCwd, normalizedCwd)
+  ) {
+    return true;
+  }
+
+  /*
+   * Compose files often live in a project subdirectory while app servers run
+   * from the project root or a package directory. Treat the compose cwd parent
+   * as the network root without hard-coding a project layout name.
+   */
+  if (routeSource === "compose" && normalizedRouteCwd !== undefined) {
+    const parent = path.dirname(normalizedRouteCwd);
+    return parent !== normalizedRouteCwd && parent !== path.parse(parent).root && pathContainsOrEquals(normalizedCwd, parent);
+  }
+
+  return false;
 }
 
 /**

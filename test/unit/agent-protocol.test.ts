@@ -188,60 +188,6 @@ test("snapshot merge includes pending external route allocations", () => {
   ]);
 });
 
-test("snapshot merge publishes hookless host listeners for shared scoped logical ports", () => {
-  const scopedProcess = createManagedProcess({
-    id: "managed-network-db",
-    pid: 42,
-    name: "postgres",
-    requestedPort: 15432,
-    actualPort: 53989,
-    networkId: "network-a",
-    source: "compose",
-  });
-  const hostListener = createListener({
-    id: "tcp:0.0.0.0:15432:99",
-    localAddress: "0.0.0.0",
-    port: 15432,
-    pid: 99,
-    processName: "com.docker.backend",
-    command: "com.docker.backend services",
-  });
-
-  const snapshot = buildAgentSnapshot({
-    agentPid: 777,
-    registryProcesses: [scopedProcess],
-    listeners: [hostListener],
-    updatedAt: fixedUpdatedAt,
-    defaultHost: "localhost",
-  });
-
-  assert.equal(snapshot.daemon.routeCount, 2);
-  assert.deepEqual(snapshot.routes, [
-    {
-      logicalPort: 15432,
-      actualPort: 53989,
-      routeDirection: "listen",
-      host: "localhost",
-      cwd: "/workspace/app",
-      networkId: "network-a",
-      processId: "managed-network-db",
-      processName: "postgres",
-      status: "running",
-      source: "compose",
-    },
-    {
-      logicalPort: 15432,
-      actualPort: 15432,
-      routeDirection: "listen",
-      host: "localhost",
-      processId: "detected:tcp:0.0.0.0:15432:99",
-      processName: "com.docker.backend",
-      status: "running",
-      source: "detected",
-    },
-  ]);
-});
-
 test("snapshot merge can suppress detected listener rows", () => {
   const listener = createListener({
     id: "tcp:127.0.0.1:8080:88",

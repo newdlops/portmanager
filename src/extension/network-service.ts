@@ -25,6 +25,7 @@ import {
   NETWORK_LOOPBACK_HOST_ENV,
   resolveLoopbackAddressRoutingMode,
 } from "../core/networks/loopback-address";
+import { findRoutesMatchingClientCwd, pathsShareDirectoryScope } from "../core/networks/logical-route-selection";
 import { resolveProcessTreeNetworkLabel } from "../core/process-network-labels";
 import { SimpleEventEmitter } from "../shared/events";
 import {
@@ -2682,15 +2683,27 @@ export class PortManagerNetworkService implements DisposableLike {
       clientProcess === undefined ? undefined : await this.findClientNetworkForRouter(clientProcess.pid, processRows);
 
     if (networkId === undefined) {
-      const hostRoute = this.findHostRouteForRouter(connection.logicalPort);
-      if (hostRoute !== undefined) {
+      const cwdRoute =
+        clientProcess?.cwd === undefined
+          ? undefined
+          : this.findClientCwdRouteForRouter(connection.logicalPort, clientProcess.cwd);
+
+      if (cwdRoute !== undefined) {
         return {
-          host: hostRoute.host,
-          port: hostRoute.actualPort,
+          host: cwdRoute.host,
+          port: cwdRoute.actualPort,
         };
       }
 
-      throw new Error(`No host route found for localhost:${connection.logicalPort} client.`);
+      const uniqueRoute = await this.findUniqueRouteForRouter(connection.logicalPort);
+      if (uniqueRoute === undefined) {
+        throw new Error(`No attached logical network found for localhost:${connection.logicalPort} client.`);
+      }
+
+      return {
+        host: uniqueRoute.host,
+        port: uniqueRoute.actualPort,
+      };
     }
 
     const route = await this.findNetworkRouteForRouter(networkId, connection.logicalPort, processRows);
@@ -2855,16 +2868,18 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * Host/unscoped routes are the explicit target for clients that have no
-   * logical network. Require a routed actual port so the localhost router never
-   * forwards back into its own logical listener.
+   * Allows host-side tooling to reach explicit unscoped host routes without
+   * letting scoped network routes occupy host localhost ports.
    */
-  private findHostRouteForRouter(logicalPort: number): LogicalPortRoute | undefined {
+  private async findUniqueRouteForRouter(
+    logicalPort: number,
+  ): Promise<LogicalPortRoute | undefined> {
     if (this.processService === undefined) {
       return undefined;
     }
 
-    const candidates = this.processService.getSnapshot().routes.filter(
+    const snapshot = this.processService.getSnapshot();
+    const candidates = snapshot.routes.filter(
       (route) =>
         route.logicalPort === logicalPort &&
         route.actualPort !== route.logicalPort &&
@@ -2872,8 +2887,36 @@ export class PortManagerNetworkService implements DisposableLike {
         isLiveListenRoute(route),
     );
 
-    return candidates.length === 1 ? candidates[0] : undefined;
+    if (candidates.length === 1) {
+      return candidates[0];
+    }
+
+    return undefined;
   }
+
+  /**
+   * Uses client cwd as a deterministic fallback when environment variables and
+   * terminal ancestry are unavailable. This keeps simultaneous logical ports in
+   * sibling projects from collapsing into the global "unique route" fallback.
+   */
+  private findClientCwdRouteForRouter(
+    logicalPort: number,
+    clientCwd: string,
+  ): LogicalPortRoute | undefined {
+    if (this.processService === undefined) {
+      return undefined;
+    }
+
+    const snapshot = this.processService.getSnapshot();
+    const candidates = findRoutesMatchingClientCwd(snapshot.routes, logicalPort, clientCwd);
+
+    if (candidates.length === 1) {
+      return candidates[0];
+    }
+
+    return undefined;
+  }
+
   /** Maps an arbitrary process PID back to the network label attached to its process tree. */
   private findAttachedNetworkForPid(pid: number, processRows: readonly ProcessTableRow[]): string | undefined {
     return resolveProcessTreeNetworkLabel(this.registry.getSnapshot().attachments, processRows, pid)?.networkId;
@@ -4467,6 +4510,9 @@ function collectLogicalRouterPorts(
   listeners: readonly ListeningPort[] = [],
 ): readonly number[] {
   const ports = new Set<number>();
+  const networkScopedLiveRoutes = routes.filter(
+    (route) => isLiveListenRoute(route) && route.networkId !== undefined && route.cwd !== undefined,
+  );
   const externallyOwnedPorts = new Set(
     listeners
       .filter((listener) => listener.protocol === "tcp" && !isPortManagerLogicalRouterListener(listener))
@@ -4479,6 +4525,7 @@ function collectLogicalRouterPorts(
       route.networkId === undefined &&
       route.actualPort !== route.logicalPort &&
       isTcpPort(route.logicalPort) &&
+      !isDetachedNetworkRoute(route, networkScopedLiveRoutes) &&
       !externallyOwnedPorts.has(route.logicalPort)
     ) {
       ports.add(route.logicalPort);
@@ -4486,6 +4533,19 @@ function collectLogicalRouterPorts(
   }
 
   return [...ports].sort((left, right) => left - right);
+}
+
+function isDetachedNetworkRoute(
+  route: LogicalPortRoute,
+  networkScopedLiveRoutes: readonly LogicalPortRoute[],
+): boolean {
+  return networkScopedLiveRoutes.some(
+    (networkRoute) =>
+      networkRoute.logicalPort === route.logicalPort &&
+      route.cwd !== undefined &&
+      networkRoute.cwd !== undefined &&
+      pathsShareDirectoryScope(route.cwd, networkRoute.cwd),
+  );
 }
 
 function collectBrowserProxyEndpoints(

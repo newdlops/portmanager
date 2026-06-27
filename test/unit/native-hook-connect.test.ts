@@ -67,6 +67,55 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.equal(result.stdout, "ok\n");
     assert.equal(result.stderr, "");
   });
+
+  test("native hook allows detached cwd-matched compose routes", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-connect-"));
+    const server = net.createServer((socket) => {
+      socket.end("ok\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-detached";
+    const logicalPort = chooseDifferentTcpPort(address.port);
+    const routeTablePath = path.join(tempDir, "newdlops-portmanager-routes-detached.json");
+    fs.writeFileSync(
+      routeTablePath,
+      JSON.stringify({
+        updatedAt: "2026-06-27T00:00:00.000Z",
+        routes: [
+          {
+            logicalPort,
+            actualPort: address.port,
+            routeDirection: "listen",
+            host: "127.0.0.1",
+            cwd: path.join(projectRoot, "docker"),
+            networkId,
+            processId: "managed-process-compose",
+            processName: "docker:db/postgresql",
+            status: "running",
+            source: "compose",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const result = await runHookedNodeClient(logicalPort, routeTablePath, undefined);
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "ok\n");
+    assert.equal(result.stderr, "");
+  });
 }
 
 function getNativeHookLibraryPath(): string | undefined {
@@ -86,6 +135,10 @@ async function listen(server: net.Server): Promise<void> {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => resolve());
   });
+}
+
+function chooseDifferentTcpPort(actualPort: number): number {
+  return actualPort < 64000 ? actualPort + 1000 : actualPort - 1000;
 }
 
 async function closeServer(server: net.Server): Promise<void> {
@@ -108,7 +161,7 @@ async function closeServer(server: net.Server): Promise<void> {
 async function runHookedNodeClient(
   port: number,
   routeTablePath: string,
-  networkId: string,
+  networkId: string | undefined,
 ): Promise<{ readonly exitCode: number | null; readonly stdout: string; readonly stderr: string }> {
   const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
   const script = [
@@ -127,8 +180,12 @@ async function runHookedNodeClient(
       ...process.env,
       [preloadVariable]: hookLibraryPath,
       PORT_MANAGER_HOOK: "1",
+      PORT_MANAGER_HOOK_DISABLED: "",
       PORT_MANAGER_ROUTES_FILE: routeTablePath,
-      PORT_MANAGER_NETWORK_ID: networkId,
+      PORT_MANAGER_GLOBAL_ROUTES_FILE: routeTablePath,
+      BASH_ENV: "",
+      PORT_MANAGER_NETWORK_ID: networkId ?? "",
+      PORT_MANAGER_ROUTE_TABLE_NETWORK_ID: "",
       PORT_MANAGER_BORROWED_NETWORK_ID: "",
       NEWDLOPS_PM_NETWORK_ID: "",
       NEWDLOPS_PM_BORROWED_NETWORK_ID: "",

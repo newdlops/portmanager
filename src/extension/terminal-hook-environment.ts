@@ -32,6 +32,21 @@ const TERMINAL_MUTATOR_OPTIONS: vscode.EnvironmentVariableMutatorOptions = {
 export const RUNTIME_SHIM_DIRECTORY_ENV = "PORT_MANAGER_RUNTIME_SHIM_DIR";
 export const DOCKER_SHIM_PATH_ENV = "PORT_MANAGER_DOCKER_SHIM";
 const PRELOAD_PACKAGE_MANAGER_NAMES = ["npm", "npx", "pnpm", "pnpx", "corepack", "uv", "uvx", "yarn", "yarnpkg"];
+const PRELOAD_RUNTIME_LAUNCHER_NAMES = [
+  "node",
+  "python",
+  "python3",
+  "python3.8",
+  "python3.9",
+  "python3.10",
+  "python3.11",
+  "python3.12",
+  "python3.13",
+  "python3.14",
+  "ruby",
+  "php",
+  "perl",
+];
 // These names are project-bin commands that commonly bind or probe dev ports.
 // Package managers are intentionally excluded so install/link lifecycle work
 // does not inherit socket routing unless the invoked tool crosses a runtime
@@ -186,25 +201,50 @@ export function shouldInjectTerminalHook(settings: PortManagerSettings): boolean
 }
 
 /**
- * Creates a PATH directory that shadows only commands which need routing-aware
- * launch behavior. Generic runtime names such as node stay off this PATH so
- * arbitrary package tools with /usr/bin/env shebangs do not inherit routing.
+ * Creates a PATH directory that shadows common runtime names with native
+ * launchers. This preserves DYLD_INSERT_LIBRARIES for the real server process
+ * on macOS, where protected launch boundaries can strip DYLD_* variables.
  *
- * This is not part of routing policy. It only keeps the preload hook present at
- * selected command boundaries so bind/connect can still be routed for servers.
+ * This is not part of routing policy. It only keeps the preload hook present
+ * so bind/connect can still be routed from the socket address and port.
  */
 export function prepareRuntimeShimLauncherDirectory(
   baseDirectory: string,
   launcherPath: string,
   runtimeCommandShimPath?: string,
 ): string | undefined {
+  const sourceShimDirectory = getAsdfShimDirectory();
   const targetDirectory = path.join(baseDirectory, "runtime-shims");
   fs.mkdirSync(targetDirectory, { recursive: true });
+  removeStaleRuntimeShimArtifacts(targetDirectory);
   removeLegacyPreloadPackageManagerShims(targetDirectory, launcherPath);
-  removeStaleBroadRuntimeLauncherAliases(targetDirectory, launcherPath);
   writeRuntimeCommandShims(targetDirectory, runtimeCommandShimPath);
   writePreloadPackageManagerCommandShims(targetDirectory);
   writePreloadPackageCommandShims(targetDirectory);
+
+  if (process.platform !== "darwin" || !fs.existsSync(launcherPath)) {
+    return targetDirectory;
+  }
+
+  for (const runtimeName of PRELOAD_RUNTIME_LAUNCHER_NAMES) {
+    ensureExecutableAlias(path.join(targetDirectory, runtimeName), launcherPath);
+  }
+
+  if (sourceShimDirectory !== undefined) {
+    for (const entry of fs.readdirSync(sourceShimDirectory, { withFileTypes: true })) {
+      if (
+        entry.name === "asdf" ||
+        entry.name.startsWith(".") ||
+        PRELOAD_PACKAGE_MANAGER_NAMES.includes(entry.name) ||
+        PRELOAD_PACKAGE_COMMAND_NAMES.includes(entry.name) ||
+        (!entry.isFile() && !entry.isSymbolicLink())
+      ) {
+        continue;
+      }
+
+      ensureExecutableAlias(path.join(targetDirectory, entry.name), launcherPath);
+    }
+  }
 
   return targetDirectory;
 }
@@ -245,55 +285,53 @@ function isExtensionOwnedPreloadShim(filePath: string, launcherPath: string): bo
   }
 }
 
-/**
- * Older builds mirrored almost every asdf shim into runtime-shims. That made
- * ordinary package tools such as vsce inherit the native preload launcher during
- * install/package work. Keep only explicit runtime names on the native launcher.
- */
-function removeStaleBroadRuntimeLauncherAliases(targetDirectory: string, launcherPath: string): void {
-  for (const entry of fs.readdirSync(targetDirectory, { withFileTypes: true })) {
-    if (
-      entry.name.startsWith(".") ||
-      PRELOAD_PACKAGE_MANAGER_NAMES.includes(entry.name) ||
-      PRELOAD_PACKAGE_COMMAND_NAMES.includes(entry.name) ||
-      ["docker", "podman", "docker-compose", "podman-compose"].includes(entry.name)
-    ) {
-      continue;
-    }
-
-    const shimPath = path.join(targetDirectory, entry.name);
-    if (isExecutableAliasTo(shimPath, launcherPath)) {
-      fs.rmSync(shimPath, { force: true });
-    }
-  }
-}
-
-function isExecutableAliasTo(filePath: string, targetPath: string): boolean {
-  try {
-    const file = fs.lstatSync(filePath);
-    if (file.isDirectory() && !file.isSymbolicLink()) {
-      return false;
-    }
-
-    if (file.isSymbolicLink()) {
-      const linkTarget = fs.readlinkSync(filePath);
-      return linkTarget === targetPath || path.resolve(path.dirname(filePath), linkTarget) === targetPath;
-    }
-
-    const target = fs.statSync(targetPath);
-    const existing = fs.statSync(filePath);
-    return existing.dev === target.dev && existing.ino === target.ino;
-  } catch {
-    return false;
-  }
-}
-
 /** Compatibility wrapper for older call sites and external imports. */
 export function prepareAsdfShimLauncherDirectory(
   baseDirectory: string,
   launcherPath: string,
 ): string | undefined {
   return prepareRuntimeShimLauncherDirectory(baseDirectory, launcherPath);
+}
+
+/**
+ * Removes files left by reverted runtime-shim experiments before stable shims
+ * are regenerated. These files live in the extension-owned shim directory and
+ * can keep disabling the preload hook even after the extension code is rolled
+ * back, because existing terminals continue to resolve commands through PATH.
+ */
+function removeStaleRuntimeShimArtifacts(targetDirectory: string): void {
+  fs.rmSync(path.join(targetDirectory, ".portmanager-node"), { force: true });
+
+  for (const commandName of [...PRELOAD_PACKAGE_MANAGER_NAMES, ...PRELOAD_PACKAGE_COMMAND_NAMES]) {
+    const shimPath = path.join(targetDirectory, commandName);
+    if (isStaleGeneratedRuntimeShim(shimPath)) {
+      fs.rmSync(shimPath, { recursive: true, force: true });
+    }
+  }
+}
+
+function isStaleGeneratedRuntimeShim(filePath: string): boolean {
+  try {
+    const existingPath = fs.lstatSync(filePath);
+    if (existingPath.isDirectory()) {
+      return false;
+    }
+
+    const contents = fs.readFileSync(filePath, "utf8");
+    if (!contents.includes("Generated by Port Manager.")) {
+      return false;
+    }
+
+    return [
+      "__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS",
+      ".portmanager-node",
+      "PORT_MANAGER_HOOK_DISABLED",
+      "__pm_package_manager_command_should_run_clean",
+      "__pm_exec_without_port_manager_preload",
+    ].some((marker) => contents.includes(marker));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -376,6 +414,14 @@ export function getAsdfShimLauncherRelativePath(): string {
 /** Returns the packaged native Docker/Podman PATH shim. */
 export function getRuntimeCommandShimRelativePath(): string {
   return path.join("media", "native", "portmanager_docker_shim");
+}
+
+/** Locates the user's asdf shim directory without requiring asdf to be loaded. */
+function getAsdfShimDirectory(): string | undefined {
+  const asdfDataDirectory = process.env.ASDF_DATA_DIR ?? path.join(os.homedir(), ".asdf");
+  const shimDirectory = path.join(asdfDataDirectory, "shims");
+
+  return fs.existsSync(shimDirectory) ? shimDirectory : undefined;
 }
 
 /**
@@ -580,10 +626,10 @@ ${buildPreloadNodeEntrypointBypassShell()}
 
 function buildPreloadPackageManagerCommandShimScript(): string {
   return `#!/bin/sh
-# Generated by Port Manager. Routes package-manager dev server scripts only.
+# Generated by Port Manager. Routes package-manager project commands only.
 __pm_name="\${0##*/}"
 __pm_shim_dir="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd -P)"
-__pm_marker="# Generated by Port Manager. Routes package-manager dev server scripts only."
+__pm_marker="# Generated by Port Manager. Routes package-manager project commands only."
 
 __pm_is_package_manager_shim() {
   [ -f "$1" ] || return 1
@@ -641,6 +687,55 @@ __pm_package_script_text() {
   sed -n "s/.*\\\"\${__pm_script_name}\\\"[[:space:]]*:[[:space:]]*\\\"\\([^\\\"]*\\)\\\".*/\\1/p" package.json 2>/dev/null | head -n 1
 }
 
+__pm_dependency_command_name() {
+  case "$1" in
+    ""|install|i|ci|add|remove|rm|uninstall|unlink|link|upgrade|update|up|dedupe|rebuild|prune|audit|fund|cache|config|doctor|why|list|info|outdated|import|set|version|versions|publish|pack|login|logout|owner|team|token|profile|whoami|init|create|dlx|patch|patch-commit|plugin|plugins|env|self)
+      return 0
+      ;;
+    preinstall|install:clean|postinstall|prepare|prepublish|prepublishOnly|postpublish)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+__pm_package_manager_command_runs_project_code() {
+  __pm_first="$(__pm_first_script_arg "$@" 2>/dev/null || true)"
+
+  case "\${__pm_name}" in
+    uv|uvx)
+      case "\${__pm_first}" in
+        run|tool|x|uvx) return 0 ;;
+      esac
+      __pm_dependency_command_name "\${__pm_first}" && return 1
+      return 0
+      ;;
+    npx|pnpx)
+      return 0
+      ;;
+    corepack)
+      case "\${__pm_first}" in
+        npm|npx|pnpm|pnpx|yarn|yarnpkg) return 0 ;;
+      esac
+      __pm_dependency_command_name "\${__pm_first}" && return 1
+      return 0
+      ;;
+    npm|pnpm)
+      case "\${__pm_first}" in
+        run|run-script|start|test|exec|x|dlx) return 0 ;;
+      esac
+      __pm_dependency_command_name "\${__pm_first}" && return 1
+      return 0
+      ;;
+    yarn|yarnpkg)
+      __pm_dependency_command_name "\${__pm_first}" && return 1
+      return 0
+      ;;
+  esac
+
+  return 0
+}
+
 __pm_text_looks_like_dev_server() {
   __pm_text="$(printf '%s' "$*" | tr '[:upper:]' '[:lower:]')"
   case "\${__pm_text}" in
@@ -656,73 +751,9 @@ __pm_target="$(__pm_find_next_command)" || {
   exit 127
 }
 
-# Dependency lifecycle commands should not resolve nested /usr/bin/env node
-# through Port Manager runtime shims; that re-enters preload routing during
-# install/link work and can be killed by the operating system.
-__pm_path_entry_is_runtime_shim_dir() {
-  __pm_entry="$1"
-  [ -n "\${__pm_entry}" ] || return 1
-
-  __pm_entry_physical="$(CDPATH= cd "\${__pm_entry}" 2>/dev/null && pwd -P)"
-  [ -n "\${__pm_entry_physical}" ] || __pm_entry_physical="\${__pm_entry}"
-
-  if [ "\${__pm_entry_physical}" = "\${__pm_shim_dir}" ]; then
-    return 0
-  fi
-
-  if [ -n "\${PORT_MANAGER_RUNTIME_SHIM_DIR:-}" ]; then
-    __pm_runtime_physical="$(CDPATH= cd "\${PORT_MANAGER_RUNTIME_SHIM_DIR}" 2>/dev/null && pwd -P)"
-    [ -n "\${__pm_runtime_physical}" ] || __pm_runtime_physical="\${PORT_MANAGER_RUNTIME_SHIM_DIR}"
-    if [ "\${__pm_entry_physical}" = "\${__pm_runtime_physical}" ]; then
-      return 0
-    fi
-  fi
-
-  for __pm_probe in npm yarn pnpm; do
-    if [ -f "\${__pm_entry}/\${__pm_probe}" ] && [ "$(sed -n 2p "\${__pm_entry}/\${__pm_probe}" 2>/dev/null)" = "\${__pm_marker}" ]; then
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-__pm_strip_port_manager_runtime_shims_from_path() {
-  __pm_clean_path=""
-  __pm_old_ifs="\${IFS}"
-  IFS=:
-  for __pm_dir in \${PATH:-}; do
-    if __pm_path_entry_is_runtime_shim_dir "\${__pm_dir}"; then
-      continue
-    fi
-    if [ -z "\${__pm_clean_path}" ]; then
-      __pm_clean_path="\${__pm_dir}"
-    else
-      __pm_clean_path="\${__pm_clean_path}:\${__pm_dir}"
-    fi
-  done
-  IFS="\${__pm_old_ifs}"
-  export PATH="\${__pm_clean_path}"
-  unset __pm_dir __pm_clean_path __pm_old_ifs
-}
-
-__pm_exec_without_port_manager_preload() {
-  __pm_strip_port_manager_runtime_shims_from_path
-  unset PORT_MANAGER_PRELOAD_REPAIR
-  unset PORT_MANAGER_RUNTIME_SHIM_DIR
-  unset PORT_MANAGER_PREV_BASH_ENV
-  unset BASH_ENV
-  unset ENV
-  unset DYLD_INSERT_LIBRARIES
-  unset LD_PRELOAD
-  export PORT_MANAGER_HOOK=0
-  export PORT_MANAGER_HOOK_DISABLED=1
-  exec "\${__pm_target}" "$@"
-}
-
 __pm_script_name="$(__pm_first_script_arg "$@" 2>/dev/null || true)"
 __pm_script_text="$(__pm_package_script_text "\${__pm_script_name}" 2>/dev/null || true)"
-if __pm_text_looks_like_dev_server "$*" "\${npm_lifecycle_script:-}" "\${__pm_script_text}"; then
+if __pm_package_manager_command_runs_project_code "$@" || __pm_text_looks_like_dev_server "$*" "\${npm_lifecycle_script:-}" "\${__pm_script_text}"; then
   export PORT_MANAGER_PRELOAD_REPAIR=1
   if [ -n "\${PORT_MANAGER_DYLD_INSERT_LIBRARIES:-}" ]; then
     case ":\${DYLD_INSERT_LIBRARIES:-}:" in
@@ -733,7 +764,7 @@ if __pm_text_looks_like_dev_server "$*" "\${npm_lifecycle_script:-}" "\${__pm_sc
   ${buildPreloadNodeEntrypointBypassShell()}
 fi
 
-__pm_exec_without_port_manager_preload "$@"
+exec "\${__pm_target}" "$@"
 `;
 }
 

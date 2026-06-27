@@ -2305,11 +2305,12 @@ static int pm_route_network_match_level(const char *route_json) {
 
   if (network_id == NULL || network_id[0] == '\0') {
     /*
-     * A caller without a logical network is the host machine. Host loopback
-     * must stay on the host even when scoped networks publish the same logical
-     * port, so scoped rows are not a fallback here.
+     * Some launcher chains briefly lose the scoped network env while keeping the
+     * injected hook alive. Prefer legacy unscoped rows; scoped rows are only a
+     * lower-priority fallback after the caller verifies the cwd still belongs to
+     * the same worktree.
      */
-    return pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0 ? 2 : 0;
+    return pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0 ? 2 : 1;
   }
 
   if (pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0) {
@@ -2334,7 +2335,7 @@ static int pm_route_is_foreign_to_current_network(const char *route_json) {
   }
 
   if (network_id == NULL || network_id[0] == '\0') {
-    return 0;
+    return 1;
   }
 
   return strcmp(route_network, network_id) != 0;
@@ -2685,6 +2686,7 @@ static int pm_route_table_lookup_file(
     int logical;
     int actual;
     int match_level;
+    int route_matches_cwd;
 
     while (object_start > buffer && *object_start != '{') {
       object_start--;
@@ -2699,6 +2701,7 @@ static int pm_route_table_lookup_file(
     logical = pm_json_int(object_start, "logicalPort", 0);
     actual = pm_json_int(object_start, "actualPort", 0);
     match_level = pm_route_network_match_level(object_start);
+    route_matches_cwd = pm_route_matches_cwd(object_start, current_cwd);
     if (!pm_route_direction_matches(object_start, required_direction)) {
       *object_end = object_end_saved;
       cursor = object_end + 1;
@@ -2707,10 +2710,13 @@ static int pm_route_table_lookup_file(
 
     /*
      * Compose/container routes are network-local claims over host-published
-     * ports. A scoped route for another network must not become a cwd/global
+     * ports. A scoped route for another worktree must not become a global
      * fallback, otherwise localhost:<logical> would leak through host publish.
+     * Detached hook processes can still use their own worktree's Compose
+     * route; package launchers sometimes preserve the preload while losing the
+     * explicit network id.
      */
-    if (pm_route_is_compose(object_start) && match_level < 2) {
+    if (pm_route_is_compose(object_start) && match_level < 2 && !route_matches_cwd) {
       *object_end = object_end_saved;
       cursor = object_end + 1;
       continue;
@@ -2725,7 +2731,7 @@ static int pm_route_table_lookup_file(
         return logical;
       }
 
-      if (fallback_port == 0 && (source_is_actual || pm_route_matches_cwd(object_start, current_cwd))) {
+      if (fallback_port == 0 && (source_is_actual || route_matches_cwd)) {
         fallback_port = logical;
         fallback_is_compose = pm_route_is_compose(object_start);
       }
@@ -2743,7 +2749,7 @@ static int pm_route_table_lookup_file(
         return actual;
       }
 
-      if (fallback_port == 0 && pm_route_matches_cwd(object_start, current_cwd)) {
+      if (fallback_port == 0 && route_matches_cwd) {
         fallback_port = actual;
         fallback_is_compose = pm_route_is_compose(object_start);
         if (pm_json_string(object_start, "host", fallback_host, sizeof(fallback_host)) != 0) {
