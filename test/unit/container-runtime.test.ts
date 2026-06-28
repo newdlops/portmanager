@@ -411,6 +411,50 @@ test("refreshes clone hidden host ports after compose recreates containers", asy
   assert.equal(ports[0]?.processId, "managed-process-14");
 });
 
+test("lists only live compose published ports for daemon route registration", async () => {
+  const adapter = new ContainerServiceDiscoveryAdapter({
+    runCommand: async (_executable, args) => {
+      if (args.includes("-a")) {
+        return {
+          stdout: JSON.stringify({
+            ID: "stopped123",
+            Names: "network-workspace-postgres-1",
+            Ports: "",
+            Labels:
+              "com.docker.compose.project=network-workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml,/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml",
+          }),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const ports = await adapter.listLiveComposePublishedPorts(
+    { containerRuntime: "docker", containerImage: "alpine:3.20" },
+    "network-workspace",
+    [
+      "/workspace/compose.yaml",
+      "/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml",
+    ],
+    [
+      {
+        serviceName: "db",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 63816,
+        containerPort: 5432,
+        protocol: "tcp",
+        protocolName: "postgresql",
+        processId: "managed-process-14",
+      },
+    ],
+  );
+
+  assert.deepEqual(ports, []);
+});
+
 test("refreshes clone container hash mappings after compose recreates containers", async () => {
   const adapter = new ContainerServiceDiscoveryAdapter({
     runCommand: async (_executable, args) => {
@@ -2833,6 +2877,87 @@ test("restores original compose services before removing the hidden project", as
     ],
   );
   assert.equal(fs.existsSync(overrideFile), false);
+});
+
+test("recreates missing compose clone override from persisted mutation state", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-restore-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const overrideFile = path.join(tempDir, "network-workspace.ports.override.yaml");
+  const calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
+
+  fs.writeFileSync(
+    composeFile,
+    [
+      "services:",
+      "  db:",
+      "    image: postgres:16",
+      "    container_name: captain_db",
+      "  langgraph_server:",
+      "    image: langchain/langgraph-api:latest",
+      "    container_name: captain_langgraph_server",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (executable, args) => {
+      calls.push({ executable, args });
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\nlanggraph_server\n", stderr: "" };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await mutator.restoreHiddenPortsOverride({
+    mode: "clone",
+    runtime: "docker",
+    originalProjectName: "workspace",
+    attachedProjectName: "network-workspace",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    services: ["db"],
+    overrideFile,
+    originalPorts: [
+      {
+        serviceName: "db",
+        logicalPort: 5432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 5432,
+        containerPort: 5432,
+        protocol: "tcp",
+      },
+    ],
+    hiddenPorts: [
+      {
+        serviceName: "db",
+        logicalPort: 5432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 57002,
+        containerPort: 5432,
+        protocol: "tcp",
+      },
+    ],
+    containerMappings: [
+      {
+        serviceName: "db",
+        originalContainerId: "source-db",
+        originalContainerName: "captain_db",
+        attachedContainerId: "clone-db",
+        attachedContainerName: "captain_db-network",
+      },
+    ],
+  });
+
+  const overrideText = fs.readFileSync(overrideFile, "utf8");
+  assert.deepEqual(calls.map((call) => call.args), [["compose", "-p", "workspace", "-f", composeFile, "config", "--services"]]);
+  assert.match(overrideText, /'db':\n    container_name: 'captain_db-network'/);
+  assert.match(overrideText, /'langgraph_server':\n    container_name: !reset null/);
+  assert.match(overrideText, /profiles: !override\n      - 'pm_unattached'/);
 });
 
 function createRecordingRunner(

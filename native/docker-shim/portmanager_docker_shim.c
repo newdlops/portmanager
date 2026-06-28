@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -32,6 +33,7 @@
 #define PM_COMPOSE_ROUTING_COMPOSE_SEPARATOR ".compose-"
 #define PM_DOCKER_SHIM_BYPASS_ENV "PORT_MANAGER_DOCKER_SHIM_BYPASS"
 #define PM_DOCKER_SHIM_DEBUG_ENV "PORT_MANAGER_DOCKER_SHIM_DEBUG"
+#define PM_TERMINAL_ATTACHMENT_DIR_ENV "PORT_MANAGER_TERMINAL_ATTACHMENT_DIR"
 
 typedef struct {
   char kind[16];
@@ -1315,6 +1317,22 @@ static int pm_compose_should_detach_up(int argc, char **argv, int command_index,
   }
 
   return 1;
+}
+
+/** Compose lifecycle commands can change published host ports after the shim returns. */
+static int pm_compose_command_may_change_endpoints(int argc, char **argv, int command_index, int standalone_compose) {
+  int subcommand_index = pm_compose_subcommand_index(argc, argv, command_index, standalone_compose);
+  const char *subcommand;
+  const char *lifecycle_commands = "|up|start|restart|create|run|down|stop|rm|kill|";
+  char lookup[64];
+
+  if (subcommand_index < 0 || subcommand_index >= argc) {
+    return 0;
+  }
+
+  subcommand = argv[subcommand_index];
+  snprintf(lookup, sizeof(lookup), "|%s|", subcommand);
+  return strstr(lifecycle_commands, lookup) != NULL;
 }
 
 static const char *pm_find_json_key(const char *json, const char *key) {
@@ -2809,6 +2827,186 @@ static int pm_resolve_invocation(char **argv, char *runtime, size_t runtime_size
   return -1;
 }
 
+/** Creates parent directories for the marker path without depending on /bin/mkdir. */
+static int pm_mkdir_p(const char *directory) {
+  char path[PM_MAX_PATH];
+  size_t length;
+
+  if (directory == NULL || directory[0] == '\0') {
+    return -1;
+  }
+
+  pm_copy(path, sizeof(path), directory);
+  length = strlen(path);
+  while (length > 1 && path[length - 1] == '/') {
+    path[--length] = '\0';
+  }
+
+  for (char *cursor = path + 1; *cursor != '\0'; cursor++) {
+    if (*cursor != '/') {
+      continue;
+    }
+
+    *cursor = '\0';
+    if (mkdir(path, 0700) != 0 && errno != EEXIST) {
+      *cursor = '/';
+      return -1;
+    }
+    *cursor = '/';
+  }
+
+  return mkdir(path, 0700) == 0 || errno == EEXIST ? 0 : -1;
+}
+
+/** Mirrors shell marker key sanitization so VS Code sees child-side compose updates. */
+static void pm_sanitize_marker_key(const char *value, char *buffer, size_t size) {
+  size_t used = 0;
+
+  if (buffer == NULL || size == 0) {
+    return;
+  }
+
+  if (value == NULL || value[0] == '\0') {
+    snprintf(buffer, size, "pid-%ld", (long)getpid());
+    return;
+  }
+
+  for (size_t index = 0; value[index] != '\0' && used + 1 < size; index++) {
+    unsigned char ch = (unsigned char)value[index];
+    buffer[used++] = (isalnum(ch) || ch == '_' || ch == '.' || ch == '-') ? (char)ch : '_';
+  }
+
+  if (used == 0) {
+    snprintf(buffer, size, "pid-%ld", (long)getpid());
+    return;
+  }
+
+  buffer[used] = '\0';
+}
+
+static void pm_current_utc_timestamp(char *buffer, size_t size) {
+  time_t now;
+  struct tm utc_time;
+
+  if (buffer == NULL || size == 0) {
+    return;
+  }
+
+  now = time(NULL);
+  if (gmtime_r(&now, &utc_time) == NULL ||
+      strftime(buffer, size, "%Y-%m-%dT%H:%M:%SZ", &utc_time) == 0) {
+    snprintf(buffer, size, "1970-01-01T00:00:00Z");
+  }
+}
+
+/**
+ * Compose route refresh is driven by terminal attachment markers. Child
+ * process PATH shims do not run shell functions, so the native shim has to
+ * update the same marker after lifecycle commands complete successfully.
+ */
+static void pm_signal_terminal_attachment_changed(void) {
+  const char *marker_directory = getenv(PM_TERMINAL_ATTACHMENT_DIR_ENV);
+  const char *network_id = pm_network_id();
+  const char *tty_path;
+  char tty_name[PM_MAX_FIELD] = "";
+  char key_source[PM_MAX_FIELD];
+  char marker_key[PM_MAX_FIELD];
+  char marker_path[PM_MAX_PATH];
+  char timestamp[64];
+  FILE *file;
+
+  if (marker_directory == NULL || marker_directory[0] == '\0' ||
+      network_id == NULL || network_id[0] == '\0') {
+    return;
+  }
+
+  if (pm_mkdir_p(marker_directory) != 0) {
+    return;
+  }
+
+  tty_path = ttyname(STDIN_FILENO);
+  if (tty_path == NULL || tty_path[0] == '\0') {
+    tty_path = ttyname(STDOUT_FILENO);
+  }
+  if (tty_path == NULL || tty_path[0] == '\0') {
+    tty_path = ttyname(STDERR_FILENO);
+  }
+  if (tty_path != NULL && tty_path[0] != '\0') {
+    if (strncmp(tty_path, "/dev/", 5) == 0) {
+      tty_path += 5;
+    }
+    pm_copy(tty_name, sizeof(tty_name), tty_path);
+  }
+
+  if (tty_name[0] == '\0') {
+    snprintf(key_source, sizeof(key_source), "pid-%ld", (long)getpid());
+  } else {
+    pm_copy(key_source, sizeof(key_source), tty_name);
+  }
+  pm_sanitize_marker_key(key_source, marker_key, sizeof(marker_key));
+
+  if (snprintf(marker_path, sizeof(marker_path), "%s/%s.tsv", marker_directory, marker_key) >= (int)sizeof(marker_path)) {
+    return;
+  }
+
+  pm_current_utc_timestamp(timestamp, sizeof(timestamp));
+  file = fopen(marker_path, "w");
+  if (file == NULL) {
+    return;
+  }
+
+  fprintf(
+    file,
+    "%s\t%s\t%ld\t%ld\t%s\n",
+    network_id,
+    tty_name,
+    (long)getpid(),
+    (long)getpgrp(),
+    timestamp
+  );
+  fclose(file);
+}
+
+/** Runs lifecycle commands as a child so the shim can refresh VS Code afterward. */
+static int pm_spawn_and_signal_on_success(const char *real_runtime_path, char **next_argv) {
+  pid_t child;
+  int status = 0;
+
+  child = fork();
+  if (child < 0) {
+    fprintf(stderr, "portmanager-docker-shim: failed to fork %s: %s\n", real_runtime_path, strerror(errno));
+    return 127;
+  }
+
+  if (child == 0) {
+    execv(real_runtime_path, next_argv);
+    fprintf(stderr, "portmanager-docker-shim: failed to execute %s: %s\n", real_runtime_path, strerror(errno));
+    _exit(127);
+  }
+
+  while (waitpid(child, &status, 0) < 0) {
+    if (errno != EINTR) {
+      fprintf(stderr, "portmanager-docker-shim: failed to wait for %s: %s\n", real_runtime_path, strerror(errno));
+      return 127;
+    }
+  }
+
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    pm_signal_terminal_attachment_changed();
+    return 0;
+  }
+
+  if (WIFEXITED(status)) {
+    return WEXITSTATUS(status);
+  }
+
+  if (WIFSIGNALED(status)) {
+    return 128 + WTERMSIG(status);
+  }
+
+  return 127;
+}
+
 int main(int argc, char **argv) {
   char runtime[PM_MAX_RUNTIME];
   char runtime_executable[PM_MAX_RUNTIME];
@@ -2822,6 +3020,7 @@ int main(int argc, char **argv) {
   char *clean_path;
   int command_index;
   int standalone_compose;
+  int signal_after_compose_success = 0;
 
   if (pm_resolve_invocation(argv, runtime, sizeof(runtime), runtime_executable, sizeof(runtime_executable), &standalone_compose) != 0) {
     fprintf(stderr, "portmanager-docker-shim: invoke through docker, podman, docker-compose, or podman-compose symlink\n");
@@ -2855,6 +3054,7 @@ int main(int argc, char **argv) {
   command_index = pm_first_command_index(argc, argv);
   pm_debug("command_index=%d standalone_compose=%d", command_index, standalone_compose);
   if (standalone_compose || (command_index >= 0 && strcmp(argv[command_index], "compose") == 0)) {
+    signal_after_compose_success = pm_compose_command_may_change_endpoints(argc, argv, command_index, standalone_compose);
     if (pm_find_compose_route(runtime, argc, argv, attached_project, sizeof(attached_project), original_project, sizeof(original_project)) == 0) {
       override_file[0] = '\0';
       (void)pm_compose_override_for_project(attached_project, override_file, sizeof(override_file));
@@ -2888,6 +3088,10 @@ int main(int argc, char **argv) {
     for (int index = 0; next_argv[index] != NULL; index++) {
       pm_debug("exec_argv[%d]=%s", index, next_argv[index]);
     }
+  }
+
+  if (signal_after_compose_success) {
+    return pm_spawn_and_signal_on_success(real_runtime_path, next_argv);
   }
 
   execv(real_runtime_path, next_argv);

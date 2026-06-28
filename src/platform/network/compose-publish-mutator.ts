@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type {
@@ -464,6 +465,48 @@ export class ComposePublishMutator {
   }
 
   /**
+   * Recreates the generated override for a persisted mutation when VS Code's
+   * globalStorage was cleaned while the hidden compose project kept running.
+   *
+   * The persisted mutation is the source of truth for the attached project name,
+   * selected services, cloned volumes, and container-name lineage. Static compose
+   * service discovery is repeated so no-port services with global container_name
+   * values are still disabled in the restored override.
+   */
+  async restoreHiddenPortsOverride(state: ComposePortMutationState): Promise<string> {
+    if (await fileIsReadable(state.overrideFile)) {
+      return state.overrideFile;
+    }
+
+    const sourceContext: ComposeCommandContext = {
+      runtime: state.runtime,
+      projectName: state.originalProjectName,
+      workingDirectory: state.workingDirectory,
+      composeFiles: state.composeFiles,
+    };
+    const definedServices = await this.listDefinedComposeServices(sourceContext).catch(() => []);
+    const overrideServices = buildRestoredOverrideServices(state, definedServices);
+    const disabledServices = buildRestoredDisabledOverrideServices(state, overrideServices);
+    const createsHiddenProject = state.mode === "clone" || state.mode === "copy";
+
+    await this.writeHiddenPortsOverride(
+      state.attachedProjectName,
+      overrideServices,
+      state.originalPorts,
+      buildServiceMountsFromPersistedCloneVolumes(state.clonedVolumes),
+      {
+        resetContainerName: createsHiddenProject,
+        cloneContainerNames: buildCloneContainerNameMapFromMutation(state),
+        isolatedNetwork: createsHiddenProject ? "pm_isolated" : undefined,
+        disabledServices,
+        overrideFile: state.overrideFile,
+      },
+    );
+
+    return state.overrideFile;
+  }
+
+  /**
    * Recreates an existing hidden clone under a new Compose project name.
    *
    * Compose project names are runtime identity, not a mutable label, so rename
@@ -703,10 +746,11 @@ export class ComposePublishMutator {
       readonly cloneContainerNames?: ReadonlyMap<string, string>;
       readonly isolatedNetwork?: string;
       readonly disabledServices?: readonly string[];
+      readonly overrideFile?: string;
     },
   ): Promise<string> {
     await fs.mkdir(this.storageDirectory, { recursive: true });
-    const overrideFile = this.getHiddenPortsOverridePath(attachedProjectName);
+    const overrideFile = options.overrideFile ?? this.getHiddenPortsOverridePath(attachedProjectName);
     const portsByService = groupPortsByService(ports);
     const disabledServices = new Set(options.disabledServices ?? []);
     const lines = ["services:"];
@@ -1336,6 +1380,69 @@ function buildRenamedMutationState(
     ...(state.clonedVolumeNames !== undefined ? { clonedVolumeNames: state.clonedVolumeNames } : {}),
     ...(state.clonedVolumes !== undefined ? { clonedVolumes: state.clonedVolumes } : {}),
   };
+}
+
+function buildRestoredOverrideServices(
+  state: ComposePortMutationState,
+  definedServices: readonly string[],
+): readonly string[] {
+  if (state.mode === "in-place") {
+    return uniqueStrings(state.services);
+  }
+
+  return uniqueStrings([...definedServices, ...state.services]);
+}
+
+function buildRestoredDisabledOverrideServices(
+  state: ComposePortMutationState,
+  overrideServices: readonly string[],
+): readonly string[] {
+  if (state.mode === "in-place") {
+    return [];
+  }
+
+  const attachedServices = new Set(state.services);
+  return overrideServices.filter((service) => !attachedServices.has(service));
+}
+
+function buildCloneContainerNameMapFromMutation(
+  state: ComposePortMutationState,
+): ReadonlyMap<string, string> {
+  const cloneContainerNames = new Map<string, string>();
+
+  for (const mapping of state.containerMappings ?? []) {
+    if (
+      mapping.serviceName.startsWith("__portmanager_alias__:") ||
+      mapping.attachedContainerName.trim().length === 0
+    ) {
+      continue;
+    }
+
+    cloneContainerNames.set(mapping.serviceName, mapping.attachedContainerName);
+  }
+
+  return cloneContainerNames;
+}
+
+function buildServiceMountsFromPersistedCloneVolumes(
+  clonedVolumes: readonly ComposeVolumeMutationMapping[] | undefined,
+): ReadonlyMap<string, readonly ComposeServiceMount[]> {
+  const serviceMounts = new Map<string, ComposeServiceMount[]>();
+
+  for (const mapping of clonedVolumes ?? []) {
+    const mounts = serviceMounts.get(mapping.serviceName) ?? [];
+    mounts.push({
+      type: "volume",
+      sourceKey: buildVolumeSourceKey(mapping.targetVolumeName),
+      volumeName: mapping.targetVolumeName,
+      originalVolumeName: mapping.sourceName,
+      target: mapping.containerPath,
+      readOnly: mapping.readOnly,
+    });
+    serviceMounts.set(mapping.serviceName, mounts);
+  }
+
+  return serviceMounts;
 }
 
 function buildCloneContainerNames(
@@ -2291,6 +2398,15 @@ function assertNonEmptyString(value: string, label: string): string {
 async function fileExists(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function fileIsReadable(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath, fsConstants.R_OK);
     return true;
   } catch {
     return false;

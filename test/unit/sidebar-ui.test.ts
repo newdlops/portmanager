@@ -40,7 +40,10 @@ test("diagnostics exposes stale routing repair and recent activity", () => {
   assert.equal(networkServiceSource.includes("await this.convergeDaemonAndRoutingState();"), true);
   assert.equal(commandsSource.includes('"portManager.fixStaleRouting"'), true);
   assert.equal(commandsSource.includes("this.dependencies.networkService.fixStaleRouting()"), true);
+  assert.equal(commandsSource.includes('"portManager.clearGlobalStorageFiles"'), true);
+  assert.equal(commandsSource.includes("this.dependencies.networkService.clearGlobalStorageFiles()"), true);
   assert.equal(source.includes('"Fix Stale Routing"'), true);
+  assert.equal(source.includes('"Clear Global Storage Files"'), true);
   assert.equal(source.includes("class RoutingTimelineGroupTreeItem"), true);
   assert.equal(source.includes('"Recent Routing Activity"'), true);
   assert.equal(source.includes("buildRoutingTimelineRows(snapshot, agentSnapshot)"), true);
@@ -50,7 +53,15 @@ test("diagnostics exposes stale routing repair and recent activity", () => {
     true,
   );
   assert.equal(
+    manifest.contributes?.commands?.some((item) => item.command === "portManager.clearGlobalStorageFiles"),
+    true,
+  );
+  assert.equal(
     menuItems.some((item) => item.command === "portManager.fixStaleRouting" && item.when?.includes("section.daemon")),
+    true,
+  );
+  assert.equal(
+    menuItems.some((item) => item.command === "portManager.clearGlobalStorageFiles" && item.when?.includes("section.daemon")),
     true,
   );
 });

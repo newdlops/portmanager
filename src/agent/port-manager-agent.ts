@@ -389,6 +389,25 @@ export class PortManagerAgent implements DisposableLike {
   }
 
   /**
+   * Returns daemon metadata without scanning OS listeners.
+   * Shell startup probes use this path so opening a terminal is not coupled to
+   * lsof/netstat latency.
+   */
+  daemonStatus(): AgentDaemonStatus {
+    const routes = this.buildCurrentLogicalRoutes();
+
+    return buildDaemonStatus({
+      agentPid: this.agentPid,
+      updatedAt: this.now().toISOString(),
+      startedAt: this.startedAt,
+      routeTablePath: this.routeTablePath,
+      agentMainPath: this.agentMainPath,
+      listenerCount: this.listenerScanCache?.listeners.length ?? 0,
+      routeCount: routes.length,
+    });
+  }
+
+  /**
    * Allocates an actual port for an external wrapper before it launches.
    * The pending route is short-lived so abandoned CLI attempts do not leave
    * stale logical mappings in the shared route table.
@@ -826,11 +845,10 @@ export class PortManagerAgent implements DisposableLike {
     return undefined;
   }
 
-  /** Refreshes the snapshot and broadcasts the resulting state to all clients. */
+  /** Refreshes the snapshot and broadcasts it only when routing/listener state changed. */
   async refreshSnapshot(): Promise<AgentSnapshot> {
     const snapshot = await this.buildSnapshot({ allowRecentListenerCache: true });
-    this.lastSnapshotSignature = buildSnapshotSignature(snapshot);
-    this.broadcastSnapshot(snapshot);
+    this.broadcastSnapshotIfChanged(snapshot);
     return snapshot;
   }
 
@@ -920,6 +938,8 @@ export class PortManagerAgent implements DisposableLike {
   /** Routes request methods to their domain operation. */
   private async dispatchRequest(request: AgentRequestMessage): Promise<unknown> {
     switch (request.method) {
+      case "daemonStatus":
+        return this.daemonStatus();
       case "listSnapshot":
         return this.listSnapshot();
       case "allocateRoute":
@@ -980,6 +1000,18 @@ export class PortManagerAgent implements DisposableLike {
     }
   }
 
+  /** Skips broadcast fan-out when a refresh only updates volatile timestamps. */
+  private broadcastSnapshotIfChanged(snapshot: AgentSnapshot): void {
+    const nextSignature = buildSnapshotSignature(snapshot);
+
+    if (this.clients.size > 0 && nextSignature !== this.lastSnapshotSignature) {
+      this.broadcastSnapshot(snapshot);
+      return;
+    }
+
+    this.lastSnapshotSignature = nextSignature;
+  }
+
   /**
    * Schedules an async snapshot broadcast after registry changes. Failures are
    * surfaced through the server error channel because clients cannot be tied to
@@ -991,7 +1023,7 @@ export class PortManagerAgent implements DisposableLike {
     }
 
     void this.buildSnapshot({ allowRecentListenerCache: true })
-      .then((snapshot) => this.broadcastSnapshot(snapshot))
+      .then((snapshot) => this.broadcastSnapshotIfChanged(snapshot))
       .catch((error: unknown) => {
         this.serverErrors.emit(error instanceof Error ? error : new Error(String(error)));
       });
@@ -1046,13 +1078,7 @@ export class PortManagerAgent implements DisposableLike {
 
     try {
       const snapshot = await this.buildSnapshot({ reconcileExternalListeners: true, allowRecentListenerCache: true });
-      const nextSignature = buildSnapshotSignature(snapshot);
-
-      if (this.clients.size > 0 && nextSignature !== this.lastSnapshotSignature) {
-        this.broadcastSnapshot(snapshot);
-      } else {
-        this.lastSnapshotSignature = nextSignature;
-      }
+      this.broadcastSnapshotIfChanged(snapshot);
     } catch (error) {
       this.serverErrors.emit(error instanceof Error ? error : new Error(String(error)));
     } finally {

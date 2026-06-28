@@ -83,11 +83,16 @@ test("recognizes external route allocation request methods", () => {
     id: "request-shutdown",
     method: "shutdownDaemon",
   } as const;
+  const daemonStatusMessage = {
+    id: "request-daemon-status",
+    method: "daemonStatus",
+  } as const;
 
   assert.equal(isAgentRequestMessage(allocateMessage), true);
   assert.equal(isAgentRequestMessage(releaseMessage), true);
   assert.equal(isAgentRequestMessage(releaseProcessRouteMessage), true);
   assert.equal(isAgentRequestMessage(shutdownMessage), true);
+  assert.equal(isAgentRequestMessage(daemonStatusMessage), true);
 });
 
 test("snapshot merge keeps managed route context and adds external listeners", () => {

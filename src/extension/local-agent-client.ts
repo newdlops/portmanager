@@ -12,6 +12,7 @@ import type {
   AgentDaemonStatus,
   AgentSnapshot,
   DisposableLike,
+  LogicalPortRoute,
   ManagedProcess,
   ManagedProcessStartInput,
   PortManagerSettings,
@@ -28,6 +29,7 @@ import type { PortManagerProcessService } from "./process-service";
  */
 
 type AgentMethod =
+  | "daemonStatus"
   | "listSnapshot"
   | "refreshSnapshot"
   | "shutdownDaemon"
@@ -90,6 +92,9 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Last snapshot received from the agent; tree reads are served from here. */
   private snapshot: AgentSnapshot = createEmptySnapshot();
 
+  /** Content signature for suppressing timestamp-only snapshot refresh events. */
+  private snapshotSignature = buildClientSnapshotSignature(this.snapshot);
+
   /** Active socket connected to the local agent. */
   private socket: net.Socket | undefined;
 
@@ -119,10 +124,12 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Connects to the agent and loads the initial snapshot. */
   async start(): Promise<void> {
     await this.ensureConnected();
-    await this.refresh();
+    await this.loadDaemonStatusForStartup();
     if (this.snapshot.daemon.restartRequired) {
       await this.restartDaemon();
+      return;
     }
+    this.refreshInBackground();
   }
 
   /** Stops the singleton local agent and resets the extension-side snapshot. */
@@ -153,6 +160,7 @@ export class LocalAgentClient implements PortManagerProcessService {
     this.socket = undefined;
     this.childProcess = undefined;
     this.snapshot = createEmptySnapshot();
+    this.snapshotSignature = buildClientSnapshotSignature(this.snapshot);
     this.changeEvents.emit();
   }
 
@@ -163,11 +171,13 @@ export class LocalAgentClient implements PortManagerProcessService {
     await this.stopDaemon();
     await this.waitForPreviousDaemonExit(previousPid);
     await this.ensureConnected();
-    await this.refresh();
+    await this.loadDaemonStatus();
 
     if (this.snapshot.daemon.restartRequired) {
       throw new Error("Port Manager daemon restarted, but it still does not match the active extension build.");
     }
+
+    this.refreshInBackground();
   }
 
   /**
@@ -247,6 +257,42 @@ export class LocalAgentClient implements PortManagerProcessService {
     this.applySnapshot(snapshot);
   }
 
+  /**
+   * Loads daemon metadata without forcing the expensive listener scan. Extension
+   * activation only needs to know whether the singleton daemon is compatible
+   * with the active extension build; process rows can arrive later.
+   */
+  private async loadDaemonStatus(): Promise<void> {
+    const daemon = await this.request<AgentDaemonStatus>("daemonStatus");
+    this.applyDaemonStatus(daemon);
+  }
+
+  /**
+   * Keeps extension activation resilient when a live daemon is busy with a slow
+   * listener refresh. Older daemons that do not support daemonStatus are
+   * restarted, but transient status timeouts become a warning instead of a
+   * startup failure.
+   */
+  private async loadDaemonStatusForStartup(): Promise<void> {
+    try {
+      await this.loadDaemonStatus();
+    } catch (error) {
+      if (isUnsupportedDaemonStatusError(error)) {
+        await this.restartDaemon();
+        return;
+      }
+
+      this.applyDaemonStatusError(error);
+    }
+  }
+
+  /** Refreshes process/listener rows without making extension activation fail. */
+  private refreshInBackground(): void {
+    void this.refresh().catch((error: unknown) => {
+      this.applyDaemonStatusError(error);
+    });
+  }
+
   /** Starts a managed process through the agent's centralized routing service. */
   async startManagedProcess(
     input: ManagedProcessStartInput,
@@ -268,7 +314,8 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Registers an existing external process with the agent. */
   async registerExistingProcess(input: RegisteredProcessInput): Promise<ManagedProcess> {
     const process = await this.request<ManagedProcess>("registerExistingProcess", input);
-    await this.refresh();
+    this.upsertKnownProcess(process);
+    this.refreshInBackground();
 
     return process;
   }
@@ -647,8 +694,78 @@ export class LocalAgentClient implements PortManagerProcessService {
 
   /** Stores a new snapshot and notifies tree subscribers. */
   private applySnapshot(snapshot: AgentSnapshot): void {
-    this.snapshot = annotateDaemonCompatibility(normalizeAgentSnapshot(snapshot), this.getAgentMainPath());
+    const nextSnapshot = annotateDaemonCompatibility(normalizeAgentSnapshot(snapshot), this.getAgentMainPath());
+    const nextSignature = buildClientSnapshotSignature(nextSnapshot);
+
+    /*
+     * Agent refreshes can arrive from request responses and cross-window
+     * broadcasts. Only content changes should repaint the status bar/sidebar;
+     * updatedAt churn would otherwise look like an endless state refresh.
+     */
+    if (nextSignature === this.snapshotSignature) {
+      this.snapshot = nextSnapshot;
+      return;
+    }
+
+    this.snapshot = nextSnapshot;
+    this.snapshotSignature = nextSignature;
     this.changeEvents.emit();
+  }
+
+  /**
+   * Route registration has already rewritten the daemon route table before the
+   * response returns. Keep the extension snapshot in step immediately, while the
+   * slower OS listener scan catches up in the background.
+   */
+  private upsertKnownProcess(process: ManagedProcess): void {
+    const updatedAt = new Date().toISOString();
+    const processes = upsertManagedProcess(this.snapshot.processes, process);
+    const routes = upsertLogicalRouteForProcess(this.snapshot.routes, process);
+
+    this.snapshot = annotateDaemonCompatibility(
+      normalizeAgentSnapshot({
+        ...this.snapshot,
+        processes,
+        routes,
+        updatedAt,
+        daemon: {
+          ...this.snapshot.daemon,
+          routeCount: routes.length,
+          updatedAt,
+        },
+      }),
+      this.getAgentMainPath(),
+    );
+    this.snapshotSignature = buildClientSnapshotSignature(this.snapshot);
+    this.changeEvents.emit();
+  }
+
+  /** Stores lightweight daemon metadata while preserving the last known rows. */
+  private applyDaemonStatus(daemon: AgentDaemonStatus): void {
+    const updatedAt = daemon.updatedAt ?? new Date().toISOString();
+    this.applySnapshot({
+      ...this.snapshot,
+      agentPid: daemon.pid,
+      daemon,
+      updatedAt,
+    });
+  }
+
+  /** Records a non-fatal daemon refresh/status error on the current snapshot. */
+  private applyDaemonStatusError(error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    const updatedAt = new Date().toISOString();
+    const connected = this.socket !== undefined && !this.socket.destroyed;
+    this.applySnapshot({
+      ...this.snapshot,
+      daemon: {
+        ...this.snapshot.daemon,
+        status: connected ? "running" : "error",
+        updatedAt,
+        errorMessage: appendDaemonWarning(this.snapshot.daemon.errorMessage, message),
+      },
+      updatedAt,
+    });
   }
 
   /** Rejects every pending command when the socket becomes unusable. */
@@ -680,6 +797,156 @@ function createEmptySnapshot(): AgentSnapshot {
     routes: [],
     updatedAt,
   };
+}
+
+/**
+ * Builds the UI-visible snapshot identity. Snapshot timestamps are intentionally
+ * excluded because background refreshes may only confirm the same daemon state.
+ */
+function buildClientSnapshotSignature(snapshot: AgentSnapshot): string {
+  const daemon = snapshot.daemon;
+  const daemonRow = [
+    daemon.status,
+    daemon.pid,
+    daemon.startedAt ?? "",
+    daemon.routeTablePath ?? "",
+    daemon.agentMainPath ?? "",
+    daemon.expectedAgentMainPath ?? "",
+    daemon.versionStatus ?? "",
+    daemon.restartRequired === true,
+    daemon.listenerCount,
+    daemon.routeCount,
+    daemon.monitoringAllListeners,
+    daemon.errorMessage ?? "",
+  ];
+  const listenerRows = snapshot.listeners
+    .map((listener) => [
+      listener.id,
+      listener.protocol,
+      listener.localAddress,
+      listener.port,
+      listener.pid ?? "",
+      listener.processName ?? "",
+      listener.command ?? "",
+      listener.source,
+    ])
+    .sort(compareSnapshotSignatureRows);
+  const processRows = snapshot.processes
+    .map((process) => [
+      process.id,
+      process.pid,
+      process.name,
+      process.command,
+      process.cwd,
+      process.networkId ?? "",
+      process.requestedPort,
+      process.actualPort,
+      process.status,
+      process.startedAt,
+      process.stoppedAt ?? "",
+      process.url ?? "",
+      process.errorMessage ?? "",
+      process.source ?? "",
+    ])
+    .sort(compareSnapshotSignatureRows);
+
+  return JSON.stringify({
+    agentPid: snapshot.agentPid,
+    daemon: daemonRow,
+    listeners: listenerRows,
+    processes: processRows,
+    routes: buildClientRouteSignatureRows(snapshot.routes),
+  });
+}
+
+/** Normalizes route rows so equal routing state has one stable signature. */
+function buildClientRouteSignatureRows(routes: readonly LogicalPortRoute[]): readonly (readonly unknown[])[] {
+  return routes
+    .map((route) => [
+      route.logicalPort,
+      route.actualPort,
+      normalizeClientRouteDirection(route.routeDirection),
+      route.host,
+      route.cwd ?? "",
+      route.networkId ?? "",
+      route.processId ?? "",
+      route.processName ?? "",
+      route.status,
+      route.source,
+    ])
+    .sort(compareSnapshotSignatureRows);
+}
+
+function normalizeClientRouteDirection(routeDirection: LogicalPortRoute["routeDirection"]): "listen" | "send" {
+  return routeDirection === "send" ? "send" : "listen";
+}
+
+/** Sorts signature rows by serialized content for stable comparisons. */
+function compareSnapshotSignatureRows(left: readonly unknown[], right: readonly unknown[]): number {
+  return JSON.stringify(left).localeCompare(JSON.stringify(right));
+}
+
+function upsertManagedProcess(processes: readonly ManagedProcess[], process: ManagedProcess): readonly ManagedProcess[] {
+  const nextProcesses = processes.filter(
+    (existingProcess) =>
+      existingProcess.id !== process.id &&
+      !(
+        existingProcess.source === "detected" &&
+        existingProcess.pid === process.pid &&
+        existingProcess.actualPort === process.actualPort
+      ),
+  );
+
+  return [...nextProcesses, { ...process }];
+}
+
+function upsertLogicalRouteForProcess(
+  routes: readonly LogicalPortRoute[],
+  process: ManagedProcess,
+): readonly LogicalPortRoute[] {
+  const route = buildLogicalRouteForProcess(process);
+  const nextRoutes = routes.filter(
+    (existingRoute) =>
+      existingRoute.processId !== process.id &&
+      (route === undefined || buildLogicalRouteIdentity(existingRoute) !== buildLogicalRouteIdentity(route)),
+  );
+
+  return route === undefined ? nextRoutes : [...nextRoutes, route];
+}
+
+function buildLogicalRouteForProcess(process: ManagedProcess): LogicalPortRoute | undefined {
+  if (process.status !== "running" || process.source === "detected") {
+    return undefined;
+  }
+
+  return {
+    logicalPort: process.requestedPort,
+    actualPort: process.actualPort,
+    routeDirection: "listen",
+    host: routeHostFromUrl(process.url),
+    cwd: process.cwd,
+    ...(process.networkId ? { networkId: process.networkId } : {}),
+    processId: process.id,
+    processName: process.name,
+    status: process.status,
+    source: process.source ?? "managed",
+  };
+}
+
+function buildLogicalRouteIdentity(route: Pick<LogicalPortRoute, "networkId" | "logicalPort" | "routeDirection">): string {
+  return `${route.networkId ?? ""}:${route.logicalPort}:${route.routeDirection === "send" ? "send" : "listen"}`;
+}
+
+function routeHostFromUrl(url: string | undefined): string {
+  if (url === undefined) {
+    return "localhost";
+  }
+
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "localhost";
+  }
 }
 
 /**
@@ -814,6 +1081,12 @@ function appendDaemonWarning(existingMessage: string | undefined, warning: strin
   }
 
   return `${existingMessage} ${warning}`;
+}
+
+/** Detects stale daemons old enough not to implement the lightweight status method. */
+function isUnsupportedDaemonStatusError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\bUnknown\b/.test(message) && message.includes("daemonStatus");
 }
 
 function isFileExistsError(error: unknown): boolean {

@@ -166,6 +166,7 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.showDaemonStatus", () => this.showDaemonStatus());
     this.registerCommand(context, "portManager.fixStaleRouting", () => this.fixStaleRouting());
     this.registerCommand(context, "portManager.clearRoutingFiles", () => this.clearRoutingFiles());
+    this.registerCommand(context, "portManager.clearGlobalStorageFiles", () => this.clearGlobalStorageFiles());
     this.registerCommand(context, "portManager.resetRouting", () => this.clearRoutingFiles());
     this.registerCommand(context, "portManager.clearNetworkCache", (argument) =>
       this.clearNetworkCache(argument),
@@ -1056,7 +1057,7 @@ export class PortManagerCommandController implements DisposableLike {
       summary.failedFileCount > 0 ? ` ${summary.failedFileCount} file(s) could not be removed.` : "";
 
     await vscode.window.showInformationMessage(
-      `Fixed routing state: removed ${summary.removedFileCount} generated file(s), ${summary.removedMarkerCount} stale marker(s), restored ${summary.restoredComposeRouteCount} compose route(s), ${summary.routeCount} active route(s).${daemonText}${failureText}`,
+      `Fixed routing state: removed ${summary.removedFileCount} generated file(s), ${summary.removedMarkerCount} stale marker(s), restored ${summary.restoredComposeOverrideCount} compose override(s), ${summary.restoredComposeRouteCount} compose route(s), ${summary.routeCount} active route(s).${daemonText}${failureText}`,
     );
   }
 
@@ -1079,7 +1080,30 @@ export class PortManagerCommandController implements DisposableLike {
     const failureText =
       summary.failedFileCount > 0 ? ` ${summary.failedFileCount} file(s) could not be removed.` : "";
     await vscode.window.showInformationMessage(
-      `Cleared ${summary.removedFileCount} routing file(s) and restored ${summary.restoredComposeRouteCount} compose route(s).${failureText}`,
+      `Cleared ${summary.removedFileCount} routing file(s) and restored ${summary.restoredComposeOverrideCount} compose override(s), ${summary.restoredComposeRouteCount} compose route(s).${failureText}`,
+    );
+  }
+
+  /** Clears VS Code globalStorage files for the extension and rewrites current durable state. */
+  private async clearGlobalStorageFiles(): Promise<void> {
+    const selection = await vscode.window.showWarningMessage(
+      "Clear all Port Manager files under VS Code globalStorage? The current in-memory networks and attachments will be written back immediately, but stale terminal environments should be reattached.",
+      { modal: true },
+      "Clear Global Storage Files",
+    );
+
+    if (selection !== "Clear Global Storage Files") {
+      return;
+    }
+
+    const summary = await this.dependencies.networkService.clearGlobalStorageFiles();
+    await this.dependencies.processService.refresh().catch(() => undefined);
+    this.dependencies.treeProvider.refresh();
+
+    const failureText =
+      summary.failedFileCount > 0 ? ` ${summary.failedFileCount} item(s) could not be removed.` : "";
+    await vscode.window.showInformationMessage(
+      `Cleared ${summary.removedFileCount} globalStorage item(s) and restored ${summary.restoredComposeOverrideCount} compose override(s), ${summary.restoredComposeRouteCount} compose route(s).${failureText}`,
     );
   }
 
@@ -1107,7 +1131,7 @@ export class PortManagerCommandController implements DisposableLike {
     const failureText =
       summary.failedFileCount > 0 ? ` ${summary.failedFileCount} file(s) could not be removed.` : "";
     await vscode.window.showInformationMessage(
-      `Cleared ${summary.removedFileCount} routing file(s) for "${network.name}" and restored ${summary.restoredComposeRouteCount} compose route(s).${failureText}`,
+      `Cleared ${summary.removedFileCount} routing file(s) for "${network.name}" and restored ${summary.restoredComposeOverrideCount} compose override(s), ${summary.restoredComposeRouteCount} compose route(s).${failureText}`,
     );
   }
 
@@ -3064,15 +3088,23 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     'function finish(code,remove){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.destroy();}catch{}if(remove)removeSocket();process.exit(code);}',
     'function shutdownStale(){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.end(JSON.stringify({id:"probe-shutdown",method:"shutdownDaemon"})+"\\n");}catch{}setTimeout(()=>process.exit(2),75);}',
     'let buffer="";',
-    'timer=setTimeout(()=>finish(1,false),700);',
+    'timer=setTimeout(()=>finish(1,false),350);',
     'socket.setEncoding("utf8");',
-    'socket.once("connect",()=>{socket.write(JSON.stringify({id:"probe",method:"listSnapshot"})+"\\n");});',
+    'socket.once("connect",()=>{socket.write(JSON.stringify({id:"probe",method:"daemonStatus"})+"\\n");});',
     'socket.once("error",()=>finish(1,false));',
-    'socket.on("data",(chunk)=>{buffer+=chunk;const lineEnd=buffer.indexOf("\\n");if(lineEnd<0)return;try{const message=JSON.parse(buffer.slice(0,lineEnd));const daemon=message&&message.payload&&message.payload.daemon;const actual=normalize(daemon&&daemon.agentMainPath);const expectedPath=normalize(expected);if(!actual||actual!==expectedPath||isOlder(daemon&&daemon.startedAt,expected)){shutdownStale();return;}finish(0,false);}catch{finish(1,true);}});',
+    'socket.on("data",(chunk)=>{buffer+=chunk;const lineEnd=buffer.indexOf("\\n");if(lineEnd<0)return;try{const message=JSON.parse(buffer.slice(0,lineEnd));const daemon=message&&message.payload;const actual=normalize(daemon&&daemon.agentMainPath);const expectedPath=normalize(expected);if(!actual||actual!==expectedPath||isOlder(daemon&&daemon.startedAt,expected)){shutdownStale();return;}finish(0,false);}catch{finish(1,true);}});',
+  ].join("");
+  const staleLockScript = [
+    'const fs=require("node:fs");',
+    'const lock=process.argv[1];',
+    'try{const age=Date.now()-fs.statSync(lock).mtimeMs;process.exit(age>15000?0:1);}catch{process.exit(1);}',
   ].join("");
   const probeCommand = `${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
     nodeProbeScript,
   )}" "$PORT_MANAGER_AGENT_SOCKET" "$PORT_MANAGER_AGENT_MAIN"`;
+  const staleLockCommand = `${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
+    staleLockScript,
+  )}" "$__pm_agent_lock"`;
 
   return `# Port Manager shell hook
 # This file is generated by the VS Code Port Manager extension.
@@ -3119,13 +3151,33 @@ if [ -n "\${PORT_MANAGER_NETWORK_NAME:-}" ]; then
   printf '\\033]0;%s\\007' "Port Manager: \${PORT_MANAGER_NETWORK_NAME}" 2>/dev/null || true
 fi
 
+__pm_networks_file_path() {
+  for __pm_candidate in "\${PORT_MANAGER_NETWORKS_FILE:-}" "${escapedTerminalNetworkSelectionFilePath}" "$HOME/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/terminal-networks.tsv" "$HOME/Library/Application Support/Code - Insiders/User/globalStorage/newdlops.portmanager/terminal-networks.tsv" "$HOME/.config/Code/User/globalStorage/newdlops.portmanager/terminal-networks.tsv" "$HOME/.config/Code - Insiders/User/globalStorage/newdlops.portmanager/terminal-networks.tsv"; do
+    if [ -n "$__pm_candidate" ] && [ -s "$__pm_candidate" ]; then
+      export PORT_MANAGER_NETWORKS_FILE="$__pm_candidate"
+      printf '%s\n' "$__pm_candidate"
+      unset __pm_candidate
+      return 0
+    fi
+  done
+
+  if [ -n "\${PORT_MANAGER_NETWORKS_FILE:-}" ]; then
+    printf '%s\n' "$PORT_MANAGER_NETWORKS_FILE"
+  else
+    printf '%s\n' "${escapedTerminalNetworkSelectionFilePath}"
+  fi
+  unset __pm_candidate
+  return 1
+}
+
 pm() {
   if [ "\${1:-}" = "help" ] || [ "\${1:-}" = "--help" ] || [ "\${1:-}" = "-h" ]; then
-    printf '%s\n' 'Usage: pm [current|status|doctor|routes|detach|network-number|network-name|network-id]' >&2
+    printf '%s\n' 'Usage: pm [current|status|doctor|routes|repair|detach|network-number|network-name|network-id]' >&2
     printf '%s\n' 'Run without arguments to choose a Port Manager logical network for this shell.' >&2
     printf '%s\n' 'Run "pm current" to print the network currently attached to this shell.' >&2
     printf '%s\n' 'Run "pm doctor" to inspect shell routing files and daemon readiness.' >&2
     printf '%s\n' 'Run "pm routes" to print routes visible to this shell.' >&2
+    printf '%s\n' 'Run "pm repair" to remove stale daemon startup state and reapply this shell network.' >&2
     printf '%s\n' 'Run "pm detach" to remove Port Manager routing from this shell.' >&2
     return 0
   fi
@@ -3136,7 +3188,7 @@ pm() {
     if [ -z "$__pm_current_id" ]; then __pm_current_id="\${PORT_MANAGER_BORROWED_NETWORK_ID:-}"; fi
     __pm_current_name="\${PORT_MANAGER_NETWORK_NAME:-}"
     __pm_routes_file="\${PORT_MANAGER_ROUTES_FILE:-\${PORT_MANAGER_GLOBAL_ROUTES_FILE:-}}"
-    __pm_networks_file="\${PORT_MANAGER_NETWORKS_FILE:-}"
+    __pm_networks_file="$(__pm_networks_file_path 2>/dev/null || true)"
     __pm_host_access_file="\${PORT_MANAGER_HOST_ACCESS_FILE:-}"
     if [ -n "$__pm_current_id" ] && [ -z "$__pm_current_name" ] && [ -n "$__pm_networks_file" ] && [ -s "$__pm_networks_file" ]; then
       __pm_current_name="$(awk -F '	' -v q="$__pm_current_id" 'NF >= 3 && $1 == q { print $2; exit }' "$__pm_networks_file")"
@@ -3193,6 +3245,11 @@ pm() {
     return 0
   fi
 
+  if [ "\${1:-}" = "repair" ]; then
+    __pm_repair
+    return $?
+  fi
+
   if [ "\${1:-}" = "routes" ]; then
     __pm_current_id="\${PORT_MANAGER_NETWORK_ID:-}"
     if [ -z "$__pm_current_id" ]; then __pm_current_id="\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-}"; fi
@@ -3233,7 +3290,7 @@ pm() {
     ${escapedRuntimeShimDirectory !== undefined ? `export PATH="\${PATH#${shellPatternLiteral(`${options.runtimeShimDirectory}:`)}}"
     unset ${RUNTIME_SHIM_DIRECTORY_ENV}
     hash -r 2>/dev/null || true` : ""}
-    unset -f docker podman docker-compose podman-compose /usr/local/bin/docker /opt/homebrew/bin/docker /usr/bin/docker /bin/docker /Applications/Docker.app/Contents/Resources/bin/docker /usr/local/bin/podman /opt/homebrew/bin/podman /usr/bin/podman /bin/podman /usr/local/bin/docker-compose /opt/homebrew/bin/docker-compose /usr/bin/docker-compose /bin/docker-compose /Applications/Docker.app/Contents/Resources/bin/docker-compose /usr/local/bin/podman-compose /opt/homebrew/bin/podman-compose /usr/bin/podman-compose /bin/podman-compose __port_manager_runtime_first_command __port_manager_runtime_container_subcommand __port_manager_network_id __port_manager_normalize_compose_file_path __port_manager_same_compose_file_path __port_manager_compose_args_reference_file __port_manager_compose_route_for_runtime __port_manager_cwd_matches_workdir __port_manager_container_target_for_runtime __port_manager_shell_quote __port_manager_runtime_command_may_reference_container __port_manager_run_runtime_with_container_routing __port_manager_run_compose_command_with_routing __port_manager_run_standalone_compose_with_routing __port_manager_define_absolute_runtime_function 2>/dev/null || true
+    unset -f docker podman docker-compose podman-compose /usr/local/bin/docker /opt/homebrew/bin/docker /usr/bin/docker /bin/docker /Applications/Docker.app/Contents/Resources/bin/docker /usr/local/bin/podman /opt/homebrew/bin/podman /usr/bin/podman /bin/podman /usr/local/bin/docker-compose /opt/homebrew/bin/docker-compose /usr/bin/docker-compose /bin/docker-compose /Applications/Docker.app/Contents/Resources/bin/docker-compose /usr/local/bin/podman-compose /opt/homebrew/bin/podman-compose /usr/bin/podman-compose /bin/podman-compose __port_manager_runtime_first_command __port_manager_runtime_container_subcommand __port_manager_network_id __port_manager_normalize_compose_file_path __port_manager_same_compose_file_path __port_manager_compose_args_reference_file __port_manager_compose_route_for_runtime __port_manager_cwd_matches_workdir __port_manager_container_target_for_runtime __port_manager_shell_quote __port_manager_signal_terminal_attachment_changed __port_manager_compose_command_may_change_endpoints __port_manager_runtime_command_may_reference_container __port_manager_run_runtime_with_container_routing __port_manager_run_compose_command_with_routing __port_manager_run_standalone_compose_with_routing __port_manager_define_absolute_runtime_function 2>/dev/null || true
     unset __pm_tty __pm_pid __pm_marker_key
     printf '%s\n' 'Port Manager routing detached from this shell.'
     return 0
@@ -3244,7 +3301,7 @@ pm() {
     if [ -z "$__pm_current_id" ]; then __pm_current_id="\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-}"; fi
     if [ -z "$__pm_current_id" ]; then __pm_current_id="\${PORT_MANAGER_BORROWED_NETWORK_ID:-}"; fi
     __pm_current_name="\${PORT_MANAGER_NETWORK_NAME:-}"
-    __pm_networks_file="\${PORT_MANAGER_NETWORKS_FILE:-}"
+    __pm_networks_file="$(__pm_networks_file_path 2>/dev/null || true)"
     if [ -n "$__pm_current_id" ] && [ -z "$__pm_current_name" ] && [ -n "$__pm_networks_file" ] && [ -s "$__pm_networks_file" ]; then
       __pm_current_name="$(awk -F '	' -v q="$__pm_current_id" 'NF >= 3 && $1 == q { print $2; exit }' "$__pm_networks_file")"
     fi
@@ -3262,9 +3319,9 @@ pm() {
     return 0
   fi
 
-  __pm_networks_file="\${PORT_MANAGER_NETWORKS_FILE:-}"
+  __pm_networks_file="$(__pm_networks_file_path 2>/dev/null || true)"
   if [ -z "$__pm_networks_file" ] || [ ! -s "$__pm_networks_file" ]; then
-    printf '%s\n' 'Port Manager has no exported networks yet. Open VS Code Port Manager and create or refresh a logical network.' >&2
+    printf 'Port Manager has no exported networks in %s. Open VS Code Port Manager and create or refresh a logical network.\n' "\${__pm_networks_file:-unset}" >&2
     unset __pm_networks_file
     return 1
   fi
@@ -3299,19 +3356,33 @@ pm() {
   . "$__pm_attach_script"
   __pm_status=$?
   if [ "$__pm_status" -eq 0 ]; then
-    printf 'Port Manager shell network: %s [%s]\n' "$__pm_network_name" "$__pm_network_id" >&2
+    __pm_load_native_hook
+    if __pm_routing_ready; then
+      printf 'Port Manager shell network: %s [%s]\n' "$__pm_network_name" "$__pm_network_id" >&2
+    else
+      __pm_status=1
+      printf 'Port Manager attach did not activate routing for %s [%s]. Run "pm doctor" for details.\n' "$__pm_network_name" "$__pm_network_id" >&2
+    fi
   fi
   unset __pm_networks_file __pm_choice __pm_row __pm_network_id __pm_network_name __pm_attach_script
   return $__pm_status
 }
 
-__pm_agent_ready=0
-__pm_agent_lock="\${PORT_MANAGER_AGENT_SOCKET}.startup.lock"
-${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1
-if [ "$__pm_agent_ready" != "1" ]; then
-  if mkdir "$__pm_agent_lock" 2>/dev/null; then
+__pm_agent_ensure() {
+  __pm_agent_ready=0
+  __pm_agent_lock="\${PORT_MANAGER_AGENT_SOCKET}.startup.lock"
+  __pm_agent_lock_acquired=0
+  ${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1
+  if [ "$__pm_agent_ready" != "1" ]; then
+    if mkdir "$__pm_agent_lock" 2>/dev/null; then
+      __pm_agent_lock_acquired=1
+    elif [ -d "$__pm_agent_lock" ] && ${staleLockCommand} >/dev/null 2>&1; then
+      rmdir "$__pm_agent_lock" 2>/dev/null || true
+      mkdir "$__pm_agent_lock" 2>/dev/null && __pm_agent_lock_acquired=1
+    fi
+    if [ "$__pm_agent_lock_acquired" = "1" ]; then
     __pm_agent_wait_count=0
-    while [ $__pm_agent_wait_count -lt 50 ]; do
+    while [ $__pm_agent_wait_count -lt 2 ]; do
       ${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1 && break
       __pm_agent_wait_count=$((__pm_agent_wait_count + 1))
       sleep 0.1
@@ -3324,7 +3395,7 @@ if [ "$__pm_agent_ready" != "1" ]; then
     ${daemonRuntimePrefix} nohup "${escapedNodeExecutablePath}" "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" >/tmp/newdlops-portmanager-agent.log 2>&1 &
   fi
   __pm_agent_wait_count=0
-  while [ $__pm_agent_wait_count -lt 50 ]; do
+  while [ $__pm_agent_wait_count -lt 20 ]; do
     ${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1 && break
     __pm_agent_wait_count=$((__pm_agent_wait_count + 1))
     sleep 0.1
@@ -3333,7 +3404,7 @@ if [ "$__pm_agent_ready" != "1" ]; then
     rmdir "$__pm_agent_lock" 2>/dev/null || true
   else
     __pm_agent_wait_count=0
-    while [ $__pm_agent_wait_count -lt 60 ]; do
+    while [ $__pm_agent_wait_count -lt 20 ]; do
       ${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1 && break
       __pm_agent_wait_count=$((__pm_agent_wait_count + 1))
       sleep 0.1
@@ -3345,12 +3416,21 @@ if [ "$__pm_agent_ready" = "1" ]; then
   export PORT_MANAGER_HOOK_DAEMON_STARTED=1
 else
   export PORT_MANAGER_HOOK=0
+  export PORT_MANAGER_HOOK_DISABLED=1
   export PORT_MANAGER_HOOK_DAEMON_STARTED=0
   printf '%s\n' 'Port Manager routing unavailable: local daemon did not become ready.' >&2
 fi
-unset __pm_agent_ready __pm_agent_lock
+unset __pm_agent_ready __pm_agent_lock __pm_agent_lock_acquired
+if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" = "1" ]; then
+  return 0
+fi
+return 1
+}
 
-if [ "\${PORT_MANAGER_HOOK:-0}" = "1" ] && [ -f "${escapedHookLibraryPath}" ]; then
+__pm_load_native_hook() {
+  if [ "\${PORT_MANAGER_HOOK:-0}" != "1" ] || [ ! -f "${escapedHookLibraryPath}" ]; then
+    return 0
+  fi
   case "$(uname -s)" in
     Darwin)
       case ":\${DYLD_INSERT_LIBRARIES:-}:" in
@@ -3365,6 +3445,89 @@ if [ "\${PORT_MANAGER_HOOK:-0}" = "1" ] && [ -f "${escapedHookLibraryPath}" ]; t
       esac
       ;;
   esac
+}
+
+__pm_current_network_id() {
+  if [ -n "\${PORT_MANAGER_NETWORK_ID:-}" ]; then printf '%s\n' "$PORT_MANAGER_NETWORK_ID"; return 0; fi
+  if [ -n "\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-}" ]; then printf '%s\n' "$PORT_MANAGER_ROUTE_TABLE_NETWORK_ID"; return 0; fi
+  if [ -n "\${PORT_MANAGER_BORROWED_NETWORK_ID:-}" ]; then printf '%s\n' "$PORT_MANAGER_BORROWED_NETWORK_ID"; return 0; fi
+  if [ -n "\${NEWDLOPS_PM_NETWORK_ID:-}" ]; then printf '%s\n' "$NEWDLOPS_PM_NETWORK_ID"; return 0; fi
+  if [ -n "\${NEWDLOPS_PM_BORROWED_NETWORK_ID:-}" ]; then printf '%s\n' "$NEWDLOPS_PM_BORROWED_NETWORK_ID"; return 0; fi
+  return 1
+}
+
+__pm_routing_ready() {
+  __pm_ready_network_id="$(__pm_current_network_id 2>/dev/null || true)"
+  if [ -z "$__pm_ready_network_id" ]; then
+    unset __pm_ready_network_id
+    return 1
+  fi
+  if [ "\${PORT_MANAGER_HOOK:-0}" != "1" ] || [ "\${PORT_MANAGER_HOOK_DISABLED:-0}" = "1" ] || [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" != "1" ]; then
+    unset __pm_ready_network_id
+    return 1
+  fi
+  unset __pm_ready_network_id
+  return 0
+}
+
+__pm_repair() {
+  __pm_current_id="$(__pm_current_network_id 2>/dev/null || true)"
+  if [ -z "$__pm_current_id" ]; then
+    printf '%s\n' 'Port Manager repair cannot reapply routing because this shell is not attached to a network.' >&2
+    __pm_networks_file="$(__pm_networks_file_path 2>/dev/null || true)"
+    if [ -n "$__pm_networks_file" ] && [ -s "$__pm_networks_file" ]; then
+      printf '%s\n' 'Run "pm" to choose a network, or "pm <network-name>" to attach this shell first.' >&2
+    else
+      printf '%s\n' 'Open VS Code Port Manager and create or refresh a logical network first.' >&2
+    fi
+    unset __pm_current_id __pm_networks_file
+    return 1
+  fi
+
+  if [ -n "$__pm_current_id" ]; then
+    unset PORT_MANAGER_HOOK_DISABLED
+    export PORT_MANAGER_HOOK=1
+    __pm_networks_file="$(__pm_networks_file_path 2>/dev/null || true)"
+    if [ -n "$__pm_networks_file" ] && [ -s "$__pm_networks_file" ]; then
+      __pm_row="$(awk -F '	' -v q="$__pm_current_id" 'NF >= 3 && $1 == q { print; exit }' "$__pm_networks_file")"
+      __pm_network_name="$(printf '%s\n' "$__pm_row" | awk -F '	' '{ print $2 }')"
+      __pm_attach_script="$(printf '%s\n' "$__pm_row" | awk -F '	' '{ print $3 }')"
+      if [ -n "$__pm_attach_script" ] && [ -f "$__pm_attach_script" ]; then
+        . "$__pm_attach_script"
+        __pm_status=$?
+        if [ "$__pm_status" -eq 0 ]; then
+          __pm_load_native_hook
+          if __pm_routing_ready; then
+            printf 'Port Manager repair complete for %s [%s].\n' "\${__pm_network_name:-$__pm_current_id}" "$__pm_current_id"
+          else
+            __pm_status=1
+            printf 'Port Manager repair did not activate routing for %s [%s]. Run "pm doctor" for details.\n' "\${__pm_network_name:-$__pm_current_id}" "$__pm_current_id" >&2
+          fi
+        fi
+        unset __pm_current_id __pm_networks_file __pm_row __pm_network_name __pm_attach_script
+        return $__pm_status
+      fi
+    fi
+  fi
+
+  __pm_agent_ensure
+  __pm_status=$?
+  if [ "$__pm_status" -eq 0 ]; then
+    __pm_load_native_hook
+    if __pm_routing_ready; then
+      printf 'Port Manager repair complete for %s.\n' "$__pm_current_id"
+    else
+      __pm_status=1
+      printf 'Port Manager repair did not activate routing for %s. Run "pm %s" to reattach this shell.\n' "$__pm_current_id" "$__pm_current_id" >&2
+    fi
+  fi
+  unset __pm_current_id __pm_networks_file __pm_row __pm_network_name __pm_attach_script
+  return $__pm_status
+}
+
+if [ "\${PORT_MANAGER_HOOK:-0}" = "1" ]; then
+  __pm_agent_ensure
+  __pm_load_native_hook
 fi
 `;
 }

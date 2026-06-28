@@ -844,6 +844,69 @@ __port_manager_shell_quote() {
   printf "'"
 }
 
+__port_manager_signal_terminal_attachment_changed() {
+  [ -n "\${PORT_MANAGER_TERMINAL_ATTACHMENT_DIR:-}" ] || return 0
+  __pm_signal_network="$(__port_manager_network_id)"
+  [ -n "\${__pm_signal_network}" ] || { unset __pm_signal_network; return 0; }
+  mkdir -p "\${PORT_MANAGER_TERMINAL_ATTACHMENT_DIR}" 2>/dev/null || true
+  __pm_signal_tty="$(tty 2>/dev/null || true)"
+  __pm_signal_tty="\${__pm_signal_tty#/dev/}"
+  if [ "\${__pm_signal_tty}" = "not a tty" ]; then __pm_signal_tty=""; fi
+  __pm_signal_pid="$$"
+  __pm_signal_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d " " || true)"
+  __pm_signal_key="$(printf '%s' "\${__pm_signal_tty:-pid-$__pm_signal_pid}" | sed 's#[^A-Za-z0-9._-]#_#g')"
+  printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "\${__pm_signal_network}" "\${__pm_signal_tty}" "\${__pm_signal_pid}" "\${__pm_signal_pgid}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%SZ')" > "\${PORT_MANAGER_TERMINAL_ATTACHMENT_DIR}/\${__pm_signal_key}.tsv" 2>/dev/null || true
+  unset __pm_signal_network __pm_signal_tty __pm_signal_pid __pm_signal_pgid __pm_signal_key
+}
+
+__port_manager_compose_command_may_change_endpoints() {
+  __pm_standalone="$1"
+  shift
+  __pm_seen_compose="\${__pm_standalone}"
+  __pm_skip_next=0
+
+  for __pm_arg in "$@"; do
+    if [ "\${__pm_skip_next}" = "1" ]; then
+      __pm_skip_next=0
+      continue
+    fi
+
+    if [ "\${__pm_seen_compose}" = "0" ]; then
+      if [ "\${__pm_arg}" = "compose" ]; then
+        __pm_seen_compose=1
+      fi
+      continue
+    fi
+
+    case "\${__pm_arg}" in
+      -f|--file|-p|--project-name|--profile|--env-file|--project-directory|--parallel|--progress|--ansi)
+        __pm_skip_next=1
+        continue
+        ;;
+      -f?*|--file=*|-p?*|--project-name=*|--profile=*|--env-file=*|--project-directory=*|--parallel=*|--progress=*|--ansi=*)
+        continue
+        ;;
+      --compatibility|--dry-run|--verbose|--help|-h|--all-resources)
+        continue
+        ;;
+      -*)
+        continue
+        ;;
+      up|start|restart|create|run|down|stop|rm|kill)
+        unset __pm_standalone __pm_seen_compose __pm_skip_next __pm_arg
+        return 0
+        ;;
+      *)
+        unset __pm_standalone __pm_seen_compose __pm_skip_next __pm_arg
+        return 1
+        ;;
+    esac
+  done
+
+  unset __pm_standalone __pm_seen_compose __pm_skip_next __pm_arg
+  return 1
+}
+
 __port_manager_compose_should_detach_up() {
   __pm_standalone="$1"
   shift
@@ -1083,7 +1146,12 @@ __port_manager_run_compose_command_with_routing() {
   __pm_override_seen_compose="\${__pm_standalone_compose}"
   __pm_override_skip_next=0
   __pm_override_waiting_subcommand=1
-  if [ -n "\${__pm_override_file}" ] && [ -r "\${__pm_override_file}" ]; then
+  if [ -n "\${__pm_override_file}" ] && [ ! -r "\${__pm_override_file}" ]; then
+    printf 'Port Manager compose routing unavailable: generated override file is missing or unreadable: %s\\n' "\${__pm_override_file}" >&2
+    printf '%s\\n' 'Refresh VS Code Port Manager or run Port Manager: Fix Stale Routing before running docker compose.' >&2
+    return 1
+  fi
+  if [ -n "\${__pm_override_file}" ]; then
     if ! __port_manager_compose_args_reference_file "\${__pm_override_file}" "$@"; then
       __pm_override_enabled=1
     fi
@@ -1186,6 +1254,11 @@ __port_manager_run_compose_command_with_routing() {
   fi
 
   (COMPOSE_PROJECT_NAME="\${__pm_attached_project}"; export COMPOSE_PROJECT_NAME; eval "command \${__pm_command}\${__pm_args}")
+  __pm_status=$?
+  if [ "\${__pm_status}" = "0" ] && __port_manager_compose_command_may_change_endpoints "\${__pm_standalone_compose}" "$@"; then
+    __port_manager_signal_terminal_attachment_changed
+  fi
+  return "\${__pm_status}"
 }
 
 __port_manager_run_runtime_with_compose_routing() {

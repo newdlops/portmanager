@@ -20,11 +20,12 @@
 #define PM_EXTERNAL_LISTENER_MISSING_SCAN_THRESHOLD 2
 /*
  * VS Code windows can request snapshots concurrently, and macOS lsof scans can
- * be expensive when Docker Desktop is active. This cache keeps UI/background
- * reads from spawning repeated lsof processes while state-changing paths below
- * explicitly invalidate it before publishing the next snapshot.
+ * be expensive when Docker Desktop or endpoint security agents are active.
+ * This cache keeps UI/background reads from spawning repeated lsof processes
+ * while state-changing paths below explicitly invalidate it before publishing
+ * the next snapshot.
  */
-#define PM_LISTENER_SCAN_CACHE_SECONDS 60
+#define PM_LISTENER_SCAN_CACHE_SECONDS 300
 
 typedef struct {
   char *data;
@@ -198,6 +199,7 @@ int pm_state_start_process(pm_agent_state *state, const pm_start_input *input, p
 int pm_state_stop_process(pm_agent_state *state, const char *id, const char *signal_name, pm_buffer *payload);
 int pm_state_restart_process(pm_agent_state *state, const char *id, const char *signal_name, pm_buffer *payload);
 int pm_state_remove_process(pm_agent_state *state, const char *id, pm_buffer *payload);
+int pm_state_daemon_status(pm_agent_state *state, pm_buffer *payload);
 int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload);
 int pm_state_refresh_snapshot(pm_agent_state *state, pm_buffer *payload);
 int pm_state_reap_children(pm_agent_state *state);

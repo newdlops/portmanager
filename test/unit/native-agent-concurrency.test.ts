@@ -5,7 +5,7 @@ import net from "node:net";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 
-import { getRouteTablePathForLogicalPort } from "../../src/agent/route-table";
+import { getNetworkRouteTablePath, getRouteTablePathForLogicalPort } from "../../src/agent/route-table";
 
 /**
  * Black-box concurrency coverage for the native daemon.
@@ -30,9 +30,10 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   const allocationEnd = source.indexOf("static void pm_remove_pending_allocation", allocationStart);
   const allocationBody = source.slice(allocationStart, allocationEnd);
 
-  assert.equal(header.includes("PM_LISTENER_SCAN_CACHE_SECONDS 60"), true);
+  assert.equal(header.includes("PM_LISTENER_SCAN_CACHE_SECONDS 300"), true);
+  assert.equal(header.includes("endpoint security agents"), true);
   assert.equal(header.includes("pm_listener *listener_cache_items;"), true);
-  assert.equal(agentSource.includes("PM_LISTENER_POLL_INTERVAL_SECONDS 60"), true);
+  assert.equal(agentSource.includes("PM_LISTENER_POLL_INTERVAL_SECONDS 300"), true);
   assert.equal(source.includes("static int pm_scan_lsof_cached"), true);
   assert.equal(source.includes("pm_state_needs_external_listener_fresh_scan(state)"), true);
   assert.equal(source.includes("pm_listener_cache_invalidate(state);"), true);
@@ -120,6 +121,7 @@ if (!fs.existsSync(nativeAgentPath)) {
 
     const logicalPort = 8204;
     const networkId = "network-native-release";
+    const networkRouteTablePath = getNetworkRouteTablePath(networkId, fixture.routeTablePath);
     const routeEntryPath = getRouteTablePathForLogicalPort(logicalPort, networkId, fixture.routeTablePath);
     const allocation = await requestOnce<{
       readonly allocationId: string;
@@ -145,7 +147,9 @@ if (!fs.existsSync(nativeAgentPath)) {
     });
 
     await waitForFile(routeEntryPath);
-    assert.equal(readRouteTable(routeEntryPath).routes.length, 1);
+    await waitForFile(networkRouteTablePath);
+    assert.equal(readRouteTable(fixture.routeTablePath).routes.length, 1);
+    assert.deepEqual(readRouteTable(routeEntryPath).routes, readRouteTable(networkRouteTablePath).routes);
 
     const released = await requestOnce<boolean>(fixture.socketPath, {
       id: `hook-${process.pid}-release-done`,
@@ -462,10 +466,14 @@ interface AgentResponse<T> {
 }
 
 async function startNativeAgent(context: TestContext): Promise<NativeAgentFixture | undefined> {
-  const testDirectory = path.join(projectRoot, ".tmp", "native-agent-tests");
+  const baseDirectory = path.join(projectRoot, ".tmp", "native-agent-tests");
+  const testDirectory = path.join(
+    baseDirectory,
+    `run-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`,
+  );
   fs.mkdirSync(testDirectory, { recursive: true });
-  const socketPath = path.join(testDirectory, `agent-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`);
-  const routeTablePath = path.join(testDirectory, `routes-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+  const socketPath = path.join(testDirectory, "agent.sock");
+  const routeTablePath = path.join(testDirectory, "routes.json");
   const stderrChunks: Buffer[] = [];
   const agent = spawn(nativeAgentPath, [
     "--socket",
@@ -475,6 +483,10 @@ async function startNativeAgent(context: TestContext): Promise<NativeAgentFixtur
     "--agent-main",
     path.join(projectRoot, "out", "src", "agent", "agent-main.js"),
   ], {
+    env: {
+      ...process.env,
+      PORT_MANAGER_AGENT_DISABLE_HOOK_RECOVERY: "1",
+    },
     stdio: ["ignore", "ignore", "pipe"],
   });
   agent.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
@@ -484,6 +496,7 @@ async function startNativeAgent(context: TestContext): Promise<NativeAgentFixtur
     await fs.promises.rm(socketPath, { force: true }).catch(() => undefined);
     await fs.promises.rm(routeTablePath, { force: true }).catch(() => undefined);
     await removeRouteTableSiblings(routeTablePath);
+    await fs.promises.rm(testDirectory, { recursive: true, force: true }).catch(() => undefined);
   });
 
   try {

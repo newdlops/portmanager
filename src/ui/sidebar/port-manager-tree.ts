@@ -1014,6 +1014,12 @@ function buildDaemonChildren(
 ): PortManagerTreeItem[] {
   const children: PortManagerTreeItem[] = [
     new ActionTreeItem("Fix Stale Routing", "portManager.fixStaleRouting", "debug-rerun", "Converge daemon and routes"),
+    new ActionTreeItem(
+      "Clear Global Storage Files",
+      "portManager.clearGlobalStorageFiles",
+      "clear-all",
+      "Remove extension storage files",
+    ),
     new RoutingTimelineGroupTreeItem(buildRoutingTimelineRows(snapshot, agentSnapshot)),
     ...buildBrowserDnsDiagnosticRows(browserDns),
     new DaemonStatusTreeItem("Status", daemon.status, daemon.status === "running" ? "pass" : "warning"),

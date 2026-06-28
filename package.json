@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8",
+  "version": "0.0.8016",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -73,6 +73,7 @@
     "onCommand:portManager.showDaemonStatus",
     "onCommand:portManager.fixStaleRouting",
     "onCommand:portManager.clearRoutingFiles",
+    "onCommand:portManager.clearGlobalStorageFiles",
     "onCommand:portManager.resetRouting",
     "onCommand:portManager.clearNetworkCache",
     "onCommand:portManager.clearNetworkRoutingFiles",
@@ -318,6 +319,12 @@
       {
         "command": "portManager.clearRoutingFiles",
         "title": "Port Manager: Clear All Routing Cache",
+        "category": "Port Manager",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "portManager.clearGlobalStorageFiles",
+        "title": "Port Manager: Clear Global Storage Files",
         "category": "Port Manager",
         "icon": "$(clear-all)"
       },
@@ -676,6 +683,11 @@
           "command": "portManager.clearRoutingFiles",
           "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
           "group": "daemon@5"
+        },
+        {
+          "command": "portManager.clearGlobalStorageFiles",
+          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
+          "group": "daemon@6"
         },
         {
           "command": "portManager.openRoutedUrl",

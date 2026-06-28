@@ -22,3 +22,13 @@ test("docker shim skips hard-linked Port Manager aliases while resolving the rea
   assert.equal(source.includes("pm_find_runtime_on_path(runtime_executable, resolved_self_path"), true);
   assert.equal(source.includes("pm_path_without_shim_directory(runtime_executable, resolved_self_path)"), true);
 });
+
+test("docker shim refreshes terminal markers after compose lifecycle commands", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/docker-shim/portmanager_docker_shim.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+
+  assert.equal(source.includes("PM_TERMINAL_ATTACHMENT_DIR_ENV"), true);
+  assert.equal(source.includes("pm_compose_command_may_change_endpoints"), true);
+  assert.equal(source.includes("pm_spawn_and_signal_on_success"), true);
+  assert.equal(source.includes("pm_signal_terminal_attachment_changed();"), true);
+});

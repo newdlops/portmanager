@@ -120,6 +120,37 @@ export class ContainerServiceDiscoveryAdapter {
   }
 
   /**
+   * Returns only endpoints that currently exist in running runtime rows.
+   *
+   * Persisted compose attachments describe desired routing, but daemon routes
+   * must be created only for containers that are actually up. Missing services
+   * are returned as absent rather than falling back to stale stored ports.
+   */
+  async listLiveComposePublishedPorts(
+    settings: ContainerRuntimeSettings,
+    projectName: string,
+    composeFiles: readonly string[],
+    ports: readonly ComposePublishedPort[],
+  ): Promise<readonly ComposePublishedPort[]> {
+    if (ports.length === 0 || projectName.trim().length === 0) {
+      return [];
+    }
+
+    for (const executable of runtimeCandidates(settings.containerRuntime)) {
+      try {
+        const runningRows = await this.listRuntimeRows(executable, false);
+        const contextRows = await this.listRuntimeRows(executable, true).catch(() => runningRows);
+        const candidates = parseContainerRows(executable, runningRows, contextRows);
+        return selectLivePortsFromCandidates(projectName, composeFiles, ports, candidates);
+      } catch {
+        // Try the next configured runtime.
+      }
+    }
+
+    return [];
+  }
+
+  /**
    * Refreshes service-to-container rewrites for a hidden compose clone.
    *
    * Docker gives recreated containers a new id. The shell-side Docker wrapper
@@ -774,6 +805,38 @@ function refreshPortsFromCandidates(
   ports: readonly ComposePublishedPort[],
   candidates: readonly ContainerServiceCandidate[],
 ): readonly ComposePublishedPort[] {
+  const livePortsByKey = buildLivePortsByKey(projectName, composeFiles, candidates);
+
+  return ports.map((port) => {
+    const livePort = livePortsByKey.get(buildComposeEndpointKey(port));
+    return livePort === undefined ? port : toRefreshedComposePort(port, livePort);
+  });
+}
+
+function selectLivePortsFromCandidates(
+  projectName: string,
+  composeFiles: readonly string[],
+  ports: readonly ComposePublishedPort[],
+  candidates: readonly ContainerServiceCandidate[],
+): readonly ComposePublishedPort[] {
+  const livePortsByKey = buildLivePortsByKey(projectName, composeFiles, candidates);
+  const livePorts: ComposePublishedPort[] = [];
+
+  for (const port of ports) {
+    const livePort = livePortsByKey.get(buildComposeEndpointKey(port));
+    if (livePort !== undefined) {
+      livePorts.push(toRefreshedComposePort(port, livePort));
+    }
+  }
+
+  return livePorts;
+}
+
+function buildLivePortsByKey(
+  projectName: string,
+  composeFiles: readonly string[],
+  candidates: readonly ContainerServiceCandidate[],
+): ReadonlyMap<string, ComposePublishedPort | undefined> {
   const livePortsByKey = new Map<string, ComposePublishedPort | undefined>();
 
   for (const candidate of candidates) {
@@ -796,22 +859,22 @@ function refreshPortsFromCandidates(
     }
   }
 
-  return ports.map((port) => {
-    const livePort = livePortsByKey.get(buildComposeEndpointKey(port));
-    if (livePort === undefined) {
-      return port;
-    }
+  return livePortsByKey;
+}
 
-    return {
-      ...port,
-      logicalPort: resolveRefreshedLogicalPort(port, livePort),
-      actualHostAddress: livePort.actualHostAddress,
-      actualHostPort: livePort.actualHostPort,
-      ...(port.protocolName === undefined && livePort.protocolName !== undefined
-        ? { protocolName: livePort.protocolName }
-        : {}),
-    };
-  });
+function toRefreshedComposePort(
+  storedPort: ComposePublishedPort,
+  livePort: ComposePublishedPort,
+): ComposePublishedPort {
+  return {
+    ...storedPort,
+    logicalPort: resolveRefreshedLogicalPort(storedPort, livePort),
+    actualHostAddress: livePort.actualHostAddress,
+    actualHostPort: livePort.actualHostPort,
+    ...(storedPort.protocolName === undefined && livePort.protocolName !== undefined
+      ? { protocolName: livePort.protocolName }
+      : {}),
+  };
 }
 
 function refreshContainerMappingsFromIdentities(

@@ -167,6 +167,8 @@ export interface TerminalNetworkResetSummary {
 interface BackgroundRefreshOptions {
   /** True when called from the low-frequency repair loop instead of a user action. */
   readonly background?: boolean;
+  /** True when a terminal-side signal observed user activity that can change routes. */
+  readonly force?: boolean;
   /** Internal flag used when one outer Docker refresh already owns the shared lock. */
   readonly sharedRefreshAcquired?: boolean;
 }
@@ -183,7 +185,9 @@ export interface RoutingFileCleanupSummary {
   readonly removedFileCount: number;
   /** Files that could not be removed because the filesystem rejected cleanup. */
   readonly failedFileCount: number;
-  /** Compose endpoint routes re-registered into the singleton daemon afterward. */
+  /** Generated compose overrides recreated from persisted mutation state. */
+  readonly restoredComposeOverrideCount: number;
+  /** Live compose endpoint routes registered into the singleton daemon afterward. */
   readonly restoredComposeRouteCount: number;
 }
 
@@ -264,16 +268,7 @@ interface TerminalAttachmentMarkerCandidate {
   readonly markerPath: string;
 }
 
-interface ComposeRouteRestoreOptions {
-  /**
-   * Reconcile calls this after it has refreshed Docker-published endpoints. The
-   * normal path waits for an in-flight reconcile first so stale port snapshots
-   * cannot overwrite fresher Docker state.
-   */
-  readonly allowDuringComposeReconcile?: boolean;
-}
-
-/**
+/** 
  * Extension-side application service for the Logical Network mode.
  *
  * The service owns VS Code persistence and composes platform adapters, while
@@ -324,8 +319,11 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Current VS Code window/workspace default network for newly opened terminals. */
   private vscodeWindowTerminalBinding: VscodeWindowTerminalBinding | undefined;
 
-  /** Guards daemon route rehydration so snapshot events cannot recursively register compose routes. */
-  private composeRouteRestoreInFlight: Promise<void> | undefined;
+  /** Serializes compose project map rewrites so shells never observe a partial TSV set. */
+  private composeProjectRoutingWriteInFlight: Promise<void> | undefined;
+
+  /** Requests one more compose project map rewrite after the current publish completes. */
+  private composeProjectRoutingWriteQueued = false;
 
   /** Guards live compose endpoint refreshes while Docker is recreating hidden containers. */
   private composeAttachmentReconcileInFlight: Promise<void> | undefined;
@@ -473,7 +471,6 @@ export class PortManagerNetworkService implements DisposableLike {
         this.processService.onDidChange(() => {
           void this.syncLogicalPortRouters();
           void this.syncBrowserNetworkProxies();
-          void this.restorePersistedComposeRoutesIfMissing();
           void this.writeTerminalNetworkSelectionFile();
           this.localChangeEvents.emit();
         }),
@@ -535,13 +532,12 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
     await this.repairPersistedPortManagerCloneComposeAttachments();
-    await this.reconcileComposeAttachmentPublishedPorts({ background: true });
+    await this.reconcileComposeAttachmentPublishedPorts({ force: true });
     await this.writeComposeProjectRoutingFile();
     await this.writeTerminalNetworkSelectionFile();
     await this.startBrowserDnsServer();
     this.syncBrowserDnsRecords();
     void this.maybeAutoInstallBrowserDnsResolvers();
-    await this.restorePersistedComposeRoutesIfMissing();
     await this.refreshTerminals();
     void this.refreshContainerServices({ background: true });
     await this.convergeDaemonAndRoutingState();
@@ -807,6 +803,7 @@ export class PortManagerNetworkService implements DisposableLike {
   ): Promise<readonly ContainerServiceCandidate[]> {
     if (
       options.background === true &&
+      options.force !== true &&
       this.lastContainerServiceRefreshAtMs > 0 &&
       Date.now() - this.lastContainerServiceRefreshAtMs < BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS
     ) {
@@ -847,9 +844,6 @@ export class PortManagerNetworkService implements DisposableLike {
 
     this.lastContainerServiceRefreshAtMs = Date.now();
     this.registry.setContainerServiceCandidates(candidates);
-    void this.reconcileComposeAttachmentPublishedPorts(
-      options.background === true ? { background: true, sharedRefreshAcquired: options.sharedRefreshAcquired } : {},
-    );
     return this.registry.getSnapshot().containerServiceCandidates;
   }
 
@@ -1300,7 +1294,6 @@ export class PortManagerNetworkService implements DisposableLike {
               workingDirectory: attachment.workingDirectory,
             })
           : equivalentAttachment;
-      await this.restorePersistedComposeRoutes([refreshedAttachment]);
       await this.convergeAfterComposeAttachmentChange([refreshedAttachment]);
       return this.getComposeAttachment(refreshedAttachment.id) ?? refreshedAttachment;
     }
@@ -1355,23 +1348,23 @@ export class PortManagerNetworkService implements DisposableLike {
       }
 
       registeredAttachment = this.registry.addComposeAttachment(registeredAttachment);
-      await this.processService.start();
-
-      const ports: ComposePublishedPort[] = [];
-      for (const port of registeredAttachment.ports) {
-        const process = await this.processService.registerExistingProcess(
-          buildComposeRegisteredProcessInput(
-            registeredAttachment,
-            port,
-            composeAttachmentWorkingDirectory(registeredAttachment),
-          ),
-        );
-
-        registeredProcessIds.push(process.id);
-        ports.push({
-          ...port,
-          processId: process.id,
-        });
+      const settings = readContainerRuntimeSettings();
+      const livePorts = await this.containerServiceDiscovery
+        .listLiveComposePublishedPorts(
+          settings,
+          composeRuntimeProjectName(registeredAttachment),
+          registeredAttachment.composeFiles,
+          registeredAttachment.ports,
+        )
+        .catch(() => []);
+      const ports = mergeComposePortsWithLiveRoutes(
+        registeredAttachment.ports,
+        await this.replaceComposeRouteProcesses(registeredAttachment, livePorts),
+      );
+      for (const port of ports) {
+        if (port.processId !== undefined) {
+          registeredProcessIds.push(port.processId);
+        }
       }
 
       const updatedAttachment = this.registry.updateComposeAttachment({
@@ -1528,9 +1521,7 @@ export class PortManagerNetworkService implements DisposableLike {
         mutation,
         attachedProjectName,
       );
-      await this.processService.start();
-      await this.removeComposeRouteProcesses(attachment, attachment.ports);
-      const updatedAttachment = this.registry.updateComposeAttachment({
+      const nextAttachment = {
         ...attachment,
         projectName: mutationResult.state.attachedProjectName,
         composeFiles: mutationResult.state.composeFiles,
@@ -1538,9 +1529,23 @@ export class PortManagerNetworkService implements DisposableLike {
         mutation: mutationResult.state,
         status: "attached",
         errorMessage: undefined,
+      } satisfies ComposeAttachment;
+      const settings = readContainerRuntimeSettings();
+      const livePorts = await this.containerServiceDiscovery
+        .listLiveComposePublishedPorts(
+          settings,
+          composeRuntimeProjectName(nextAttachment),
+          nextAttachment.composeFiles,
+          nextAttachment.ports,
+        )
+        .catch(() => []);
+      const updatedAttachment = this.registry.updateComposeAttachment({
+        ...nextAttachment,
+        ports: mergeComposePortsWithLiveRoutes(
+          nextAttachment.ports,
+          await this.replaceComposeRouteProcesses(nextAttachment, livePorts),
+        ),
       });
-
-      await this.restorePersistedComposeRoutes([updatedAttachment]);
       void this.syncLogicalPortRouters();
 
       return this.getComposeAttachment(attachmentId) ?? updatedAttachment;
@@ -1711,6 +1716,28 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
+   * Removes every file under the extension globalStorage directory, then writes
+   * the current in-memory durable state and disposable route files back out.
+   *
+   * This is intentionally stronger than stale-route cleanup. It is useful after
+   * manual extension reinstall tests, but it must immediately persist the current
+   * registry snapshot so the next extension host does not boot empty.
+   */
+  async clearGlobalStorageFiles(): Promise<RoutingFileCleanupSummary> {
+    const cleanupPaths = await this.collectGlobalStorageCleanupPaths();
+    const summary = await removeFileSystemPaths(cleanupPaths, { recursive: true });
+    const attachments = this.registry
+      .getSnapshot()
+      .composeAttachments.filter(isRestorableComposeAttachment);
+
+    await fs.mkdir(this.context.globalStorageUri.fsPath, { recursive: true });
+    await fs.mkdir(this.getTerminalAttachmentMarkerDirectoryPath(), { recursive: true }).catch(() => undefined);
+    this.saveState({ force: true });
+
+    return this.rehydrateRoutingFiles(summary, attachments);
+  }
+
+  /**
    * Removes only generated route/cache files scoped to one logical network.
    *
    * Docker state and durable registry rows are preserved. The network's compose
@@ -1822,14 +1849,14 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /** Persists durable logical network state. */
-  private saveState(): void {
+  private saveState(options: { readonly force?: boolean } = {}): void {
     if (this.applyingSharedNetworkState) {
       return;
     }
 
     const state = this.registry.getPersistedState();
     const signature = stringifyPersistedNetworkState(state);
-    if (signature === this.persistedNetworkStateSignature) {
+    if (options.force !== true && signature === this.persistedNetworkStateSignature) {
       return;
     }
 
@@ -1862,10 +1889,8 @@ export class PortManagerNetworkService implements DisposableLike {
 
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
-    await this.reconcileComposeAttachmentPublishedPorts({ background: true });
     await this.writeComposeProjectRoutingFile();
     await this.writeTerminalNetworkSelectionFile();
-    await this.restorePersistedComposeRoutesIfMissing();
     await this.syncLogicalPortRouters();
   }
 
@@ -2071,42 +2096,6 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * Rehydrates persisted compose attachments into the singleton daemon.
-   *
-   * Compose attachment rows live in VS Code globalState, while route rows live in
-   * the shared daemon. A daemon restart can therefore leave hidden clone
-   * containers running with an empty route table. Re-registering the endpoints is
-   * idempotent because the daemon upserts compose routes by network/logical/actual
-   * port identity.
-   */
-  private async restorePersistedComposeRoutesIfMissing(options: ComposeRouteRestoreOptions = {}): Promise<void> {
-    if (!options.allowDuringComposeReconcile && this.composeAttachmentReconcileInFlight !== undefined) {
-      await this.composeAttachmentReconcileInFlight.catch(() => undefined);
-    }
-
-    if (this.composeRouteRestoreInFlight !== undefined) {
-      return this.composeRouteRestoreInFlight;
-    }
-
-    const attachments = this.registry
-      .getSnapshot()
-      .composeAttachments.filter(isRestorableComposeAttachment);
-    if (
-      attachments.length === 0 ||
-      this.processService === undefined ||
-      !this.hasMissingPersistedComposeRoutes(attachments)
-    ) {
-      return;
-    }
-
-    this.composeRouteRestoreInFlight = this.restorePersistedComposeRoutes(attachments).finally(() => {
-      this.composeRouteRestoreInFlight = undefined;
-    });
-
-    return this.composeRouteRestoreInFlight;
-  }
-
-  /**
    * Repairs clone attachments that were accidentally registered from the clone.
    *
    * When a Port Manager-generated compose project is attached as-is, Docker's
@@ -2126,7 +2115,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     const settings = readContainerRuntimeSettings();
-    for (const attachment of attachments) {
+    for (const attachment of attachments.filter(isRestorableComposeAttachment)) {
       const recoveredPorts = await this.containerServiceDiscovery
         .recoverPortManagerClonePorts(settings, attachment.composeFiles, attachment.ports)
         .catch(() => attachment.ports);
@@ -2157,7 +2146,7 @@ export class PortManagerNetworkService implements DisposableLike {
    *
    * File watchers and terminal events are best effort, and Docker can recreate
    * hidden containers without an extension event. This loop reconciles terminal
-   * markers, container candidates, compose endpoint routes, and then lets
+   * markers, container candidates, generated routing files, and then lets
    * registry events refresh the UI only when the observed state changed.
    */
   private startRoutingSignalRefreshLoop(): void {
@@ -2188,7 +2177,6 @@ export class PortManagerNetworkService implements DisposableLike {
       this.refreshTerminals().catch(() => []),
       this.refreshContainerServices({ background: true }).catch(() => []),
     ]);
-    await this.reconcileComposeAttachmentPublishedPorts({ background: true }).catch(() => undefined);
     await this.convergeDaemonAndRoutingState();
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
   }
@@ -2208,7 +2196,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     await this.writeComposeProjectRoutingFile().catch(() => undefined);
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
-    await this.restorePersistedComposeRoutesIfMissing().catch(() => undefined);
+    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
     await this.convergeDaemonAndRoutingState();
     await this.refreshContainerServices().catch(() => []);
     this.localChangeEvents.emit();
@@ -2240,18 +2228,13 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.writeHostAccessBindingsFile().catch(() => undefined);
     await this.writeComposeProjectRoutingFile().catch(() => undefined);
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
-    await this.restorePersistedComposeRoutesIfMissing().catch(() => undefined);
 
-    if (this.processService !== undefined && tryAcquireLogicalRouterOwnerLease()) {
-      /*
-       * The daemon refresh path rewrites its route-table files from the current
-       * snapshot. Only the cross-window router owner performs this expensive
-       * listener scan; other windows consume the agent's event snapshots and
-       * close any local routers they still own below.
-       */
-      await this.processService.refresh().catch(() => undefined);
-    }
-
+    /*
+     * The agent owns periodic OS listener polling. Background convergence should
+     * not force an additional full listener scan every minute; it only rewrites
+     * generated route files when contents changed and reconciles local routers
+     * from the latest snapshot already delivered by the daemon.
+     */
     await this.syncLogicalPortRouters().catch(() => undefined);
   }
 
@@ -2344,6 +2327,7 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   private async runTerminalAttachmentRefreshBurstStep(): Promise<void> {
+    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
     await this.refreshTerminals().catch(() => []);
     if (Date.now() < this.terminalAttachmentRefreshBurstUntilMs) {
       this.scheduleTerminalAttachmentRefresh(TERMINAL_ATTACHMENT_REFRESH_BURST_INTERVAL_MS);
@@ -2388,12 +2372,9 @@ export class PortManagerNetworkService implements DisposableLike {
   private async reconcileComposeAttachmentPublishedPorts(
     options: BackgroundRefreshOptions = {},
   ): Promise<void> {
-    if (this.composeRouteRestoreInFlight !== undefined) {
-      await this.composeRouteRestoreInFlight.catch(() => undefined);
-    }
-
     if (
       options.background === true &&
+      options.force !== true &&
       this.lastComposeAttachmentReconcileAtMs > 0 &&
       Date.now() - this.lastComposeAttachmentReconcileAtMs < BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS
     ) {
@@ -2413,7 +2394,7 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
-    this.composeAttachmentReconcileInFlight = this.reconcileComposeAttachmentPublishedPortsExclusive().finally(() => {
+    this.composeAttachmentReconcileInFlight = this.reconcileComposeAttachmentPublishedPortsExclusive(options).finally(() => {
       this.composeAttachmentReconcileInFlight = undefined;
       releaseSharedRefresh?.();
     });
@@ -2422,7 +2403,7 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /** Performs one serialized live compose endpoint reconciliation pass. */
-  private async reconcileComposeAttachmentPublishedPortsExclusive(): Promise<void> {
+  private async reconcileComposeAttachmentPublishedPortsExclusive(options: BackgroundRefreshOptions = {}): Promise<void> {
     this.lastComposeAttachmentReconcileAtMs = Date.now();
 
     if (this.processService === undefined) {
@@ -2437,50 +2418,90 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     const settings = readContainerRuntimeSettings();
-    const restoredAttachments: ComposeAttachment[] = [];
-
     for (const attachment of attachments) {
-      const refreshedPorts = await this.containerServiceDiscovery
-        .refreshComposePublishedPorts(
-          settings,
-          composeRuntimeProjectName(attachment),
-          attachment.composeFiles,
-          attachment.ports,
-        )
-        .catch(() => attachment.ports);
-      const refreshedMutation = await this.refreshComposeContainerMappings(attachment, settings);
-      const portsChanged = composePortsChanged(attachment.ports, refreshedPorts);
-      const mappingsChanged = composeContainerMappingsChanged(
-        attachment.mutation?.containerMappings ?? [],
-        refreshedMutation?.containerMappings ?? [],
-      );
+      const shouldRefreshPorts = shouldRefreshComposePublishedPortsFromRuntime(attachment, options);
+      const livePorts = shouldRefreshPorts
+        ? await this.containerServiceDiscovery
+            .listLiveComposePublishedPorts(
+              settings,
+              composeRuntimeProjectName(attachment),
+              attachment.composeFiles,
+              attachment.ports,
+            )
+            .catch(() => [])
+        : [];
+      const refreshedMutation = shouldRefreshComposeContainerMappingsFromRuntime(attachment, options)
+        ? await this.refreshComposeContainerMappings(attachment, settings)
+        : attachment.mutation;
+      const ports = shouldRefreshPorts
+        ? mergeComposePortsWithLiveRoutes(
+            attachment.ports,
+            await this.replaceComposeRouteProcesses(attachment, livePorts),
+          )
+        : attachment.ports;
+      const nextAttachment = {
+        ...attachment,
+        ports,
+        ...(refreshedMutation !== undefined ? { mutation: refreshedMutation } : {}),
+        status: "attached" as const,
+        errorMessage: undefined,
+      };
 
-      if (!portsChanged && !mappingsChanged) {
+      if (!composeAttachmentRuntimeStateChanged(attachment, nextAttachment)) {
         continue;
       }
 
-      if (portsChanged) {
-        await this.processService.start();
-        await this.removeComposeRouteProcesses(attachment, attachment.ports);
-      }
-
-      restoredAttachments.push(
-        this.registry.updateComposeAttachment({
-          ...attachment,
-          ports: portsChanged ? refreshedPorts.map(dropComposeProcessId) : attachment.ports,
-          ...(refreshedMutation !== undefined ? { mutation: refreshedMutation } : {}),
-          status: "attached",
-          errorMessage: undefined,
-        }),
-      );
+      this.registry.updateComposeAttachment(nextAttachment);
     }
 
-    if (restoredAttachments.length > 0) {
-      await this.restorePersistedComposeRoutes(restoredAttachments);
-    }
-
-    await this.restorePersistedComposeRoutesIfMissing({ allowDuringComposeReconcile: true });
     void this.syncLogicalPortRouters();
+  }
+
+  /**
+   * Replaces daemon compose rows from the live runtime endpoint set.
+   *
+   * Persisted attachment rows are desired routing state, not proof that a
+   * container is up. Clearing old daemon rows before registering live ports
+   * prevents stopped compose services from leaving stale routes behind.
+   */
+  private async replaceComposeRouteProcesses(
+    attachment: ComposeAttachment,
+    livePorts: readonly ComposePublishedPort[],
+  ): Promise<readonly ComposePublishedPort[]> {
+    if (this.processService === undefined) {
+      return livePorts.map(dropComposeProcessId);
+    }
+
+    await this.removeComposeRouteProcesses(attachment, attachment.ports);
+    if (livePorts.length === 0) {
+      return [];
+    }
+
+    await this.processService.start();
+    const cwd = composeAttachmentWorkingDirectory(attachment);
+    const registeredPorts: ComposePublishedPort[] = [];
+
+    try {
+      for (const port of livePorts) {
+        const process = await this.processService.registerExistingProcess(
+          buildComposeRegisteredProcessInput(attachment, port, cwd),
+        );
+
+        registeredPorts.push({
+          ...port,
+          processId: process.id,
+        });
+      }
+    } catch (error) {
+      for (const port of registeredPorts) {
+        if (port.processId !== undefined) {
+          await this.processService.removeProcess(port.processId).catch(() => undefined);
+        }
+      }
+      throw error;
+    }
+
+    return registeredPorts;
   }
 
   /** Refreshes clone container id rewrites without changing attach policy state. */
@@ -2541,80 +2562,6 @@ export class PortManagerNetworkService implements DisposableLike {
     await Promise.all(
       [...processIds].map((processId) => this.processService!.removeProcess(processId).catch(() => undefined)),
     );
-  }
-
-  /** Returns true when at least one persisted compose endpoint is absent from the daemon snapshot. */
-  private hasMissingPersistedComposeRoutes(attachments: readonly ComposeAttachment[]): boolean {
-    if (this.processService === undefined) {
-      return false;
-    }
-
-    const snapshot = this.processService.getSnapshot();
-    return attachments.some((attachment) =>
-      attachment.ports.some((port) => {
-        const hasRuntimeListener = hasComposePublishedPortListener(snapshot.listeners, attachment, port);
-        const hasRoute = hasComposeRoute(snapshot.routes, attachment.networkId, port);
-
-        if (!hasRuntimeListener) {
-          return hasRoute || port.processId !== undefined;
-        }
-
-        return attachment.status !== "attached" || attachment.errorMessage !== undefined || !hasRoute;
-      }),
-    );
-  }
-
-  /** Registers every persisted compose endpoint and updates stale process ids. */
-  private async restorePersistedComposeRoutes(attachments: readonly ComposeAttachment[]): Promise<void> {
-    if (this.processService === undefined) {
-      return;
-    }
-
-    await this.processService.start();
-
-    for (const attachment of attachments) {
-      const ports: ComposePublishedPort[] = [];
-
-      try {
-        const cwd = composeAttachmentWorkingDirectory(attachment);
-        const snapshot = this.processService.getSnapshot();
-        for (const port of attachment.ports) {
-          const hasRuntimeListener = hasComposePublishedPortListener(snapshot.listeners, attachment, port);
-          const hasRoute = hasComposeRoute(snapshot.routes, attachment.networkId, port);
-
-          if (!hasRuntimeListener) {
-            if (hasRoute || port.processId !== undefined) {
-              await this.removeComposeRouteProcesses(attachment, [port]);
-            }
-
-            ports.push(dropComposeProcessId(port));
-            continue;
-          }
-
-          const process = await this.processService.registerExistingProcess(
-            buildComposeRegisteredProcessInput(attachment, port, cwd),
-          );
-
-          ports.push({
-            ...port,
-            processId: process.id,
-          });
-        }
-
-        this.registry.updateComposeAttachment({
-          ...attachment,
-          ports,
-          status: "attached",
-          errorMessage: undefined,
-        });
-      } catch (error) {
-        this.registry.updateComposeAttachment({
-          ...attachment,
-          status: "error",
-          errorMessage: formatError(error),
-        });
-      }
-    }
   }
 
   /**
@@ -3006,19 +2953,23 @@ export class PortManagerNetworkService implements DisposableLike {
       .getSnapshot()
       .hostAccessBindings.filter((binding) => binding.status === "active" && binding.protocol === "tcp");
     const filePath = getDefaultHostAccessBindingsPath();
+    const previousDocument = await readHostAccessBindingsDocument(filePath);
+    const updatedAt =
+      previousDocument !== undefined && JSON.stringify(previousDocument.bindings) === JSON.stringify(bindings)
+        ? previousDocument.updatedAt
+        : new Date().toISOString();
 
     await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.writeFile(
+    await writeTextFileAtomically(
       filePath,
       JSON.stringify(
         {
-          updatedAt: new Date().toISOString(),
+          updatedAt,
           bindings,
         },
         null,
         2,
       ),
-      "utf8",
     );
   }
 
@@ -3028,27 +2979,73 @@ export class PortManagerNetworkService implements DisposableLike {
    * the project before any application socket can be intercepted.
    */
   private async writeComposeProjectRoutingFile(): Promise<void> {
+    if (this.composeProjectRoutingWriteInFlight !== undefined) {
+      this.composeProjectRoutingWriteQueued = true;
+      return this.composeProjectRoutingWriteInFlight;
+    }
+
+    this.composeProjectRoutingWriteInFlight = this.writeComposeProjectRoutingFileSerially().finally(() => {
+      this.composeProjectRoutingWriteInFlight = undefined;
+    });
+
+    return this.composeProjectRoutingWriteInFlight;
+  }
+
+  /** Re-runs if a registry/process event arrived while compose routing files were being published. */
+  private async writeComposeProjectRoutingFileSerially(): Promise<void> {
+    do {
+      this.composeProjectRoutingWriteQueued = false;
+      await this.writeComposeProjectRoutingFileExclusive();
+    } while (this.composeProjectRoutingWriteQueued);
+  }
+
+  /** Writes a complete compose routing TSV generation with atomic replaces. */
+  private async writeComposeProjectRoutingFileExclusive(): Promise<void> {
+    await this.restoreMissingComposeOverrideFiles();
+
     const rows = buildComposeProjectRoutingRows(this.registry.getSnapshot().composeAttachments);
     const snapshot = this.registry.getSnapshot();
     const globalFilePath = this.getComposeProjectRoutingFilePath();
     const currentScopedPaths = new Set<string>();
 
     await fs.mkdir(path.dirname(globalFilePath), { recursive: true });
-    await fs.writeFile(globalFilePath, "", "utf8");
+    await writeTextFileAtomically(globalFilePath, "");
 
     for (const network of snapshot.networks) {
       const scopedFilePath = this.getComposeProjectRoutingFilePath(network.id);
       currentScopedPaths.add(scopedFilePath);
-      await fs.writeFile(scopedFilePath, "", "utf8");
+      await writeTextFileAtomically(scopedFilePath, "");
     }
 
     for (const row of rows) {
       const scopedFilePath = this.getComposeProjectRoutingFilePath(row.networkId, composeProjectRoutingRowScope(row));
       currentScopedPaths.add(scopedFilePath);
-      await fs.writeFile(scopedFilePath, serializeComposeProjectRoutingRows([row]), "utf8");
+      await writeTextFileAtomically(scopedFilePath, serializeComposeProjectRoutingRows([row]));
     }
 
     await this.removeStaleComposeProjectRoutingFiles(currentScopedPaths);
+  }
+
+  /** Recreates generated compose overrides that globalStorage cleanup removed. */
+  private async restoreMissingComposeOverrideFiles(
+    attachments: readonly ComposeAttachment[] = this.registry.getSnapshot().composeAttachments,
+  ): Promise<number> {
+    let restoredCount = 0;
+
+    for (const attachment of attachments) {
+      const mutation = attachment.mutation;
+      if (mutation === undefined) {
+        continue;
+      }
+
+      const alreadyReadable = await fileIsReadable(mutation.overrideFile);
+      await this.composePublishMutator.restoreHiddenPortsOverride(mutation);
+      if (!alreadyReadable) {
+        restoredCount++;
+      }
+    }
+
+    return restoredCount;
   }
 
   /** Stable path read by shell wrappers installed into network-attached terminals. */
@@ -3114,6 +3111,27 @@ export class PortManagerNetworkService implements DisposableLike {
     return filePaths;
   }
 
+  /** Collects every direct child of VS Code's extension globalStorage directory. */
+  private async collectGlobalStorageCleanupPaths(): Promise<ReadonlySet<string>> {
+    const filePaths = new Set<string>();
+    let entries: readonly Dirent[];
+
+    try {
+      entries = await fs.readdir(this.context.globalStorageUri.fsPath, { withFileTypes: true });
+    } catch (error) {
+      if (isNodeErrorWithCode(error, "ENOENT")) {
+        return filePaths;
+      }
+      throw error;
+    }
+
+    for (const entry of entries) {
+      filePaths.add(path.join(this.context.globalStorageUri.fsPath, entry.name));
+    }
+
+    return filePaths;
+  }
+
   /** Collects generated routing files that are scoped to one logical network. */
   private async collectNetworkRoutingFileCleanupPaths(networkId: string): Promise<ReadonlySet<string>> {
     const filePaths = new Set<string>();
@@ -3142,23 +3160,27 @@ export class PortManagerNetworkService implements DisposableLike {
     return filePaths;
   }
 
-  /** Rewrites generated route files and daemon compose rows after cleanup. */
+  /** Rewrites generated route files and reconciles daemon compose rows from live containers after cleanup. */
   private async rehydrateRoutingFiles(
     summary: FileCleanupSummary,
     attachments: readonly ComposeAttachment[],
   ): Promise<RoutingFileCleanupSummary> {
+    const attachmentIds = new Set(attachments.map((attachment) => attachment.id));
+    const restoredComposeOverrideCount = await this.restoreMissingComposeOverrideFiles(attachments);
     await this.writeHostAccessBindingsFile().catch(() => undefined);
     await this.writeComposeProjectRoutingFile().catch(() => undefined);
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
-
-    const restoredComposeRouteCount =
-      this.processService === undefined ? 0 : attachments.reduce((sum, attachment) => sum + attachment.ports.length, 0);
-    await this.restorePersistedComposeRoutes(attachments);
+    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
     await this.syncLogicalPortRouters();
+    const restoredComposeRouteCount = this.registry
+      .getSnapshot()
+      .composeAttachments.filter((attachment) => attachmentIds.has(attachment.id))
+      .reduce((sum, attachment) => sum + attachment.ports.filter((port) => port.processId !== undefined).length, 0);
 
     return {
       removedFileCount: summary.removedFileCount,
       failedFileCount: summary.failedFileCount,
+      restoredComposeOverrideCount,
       restoredComposeRouteCount,
     };
   }
@@ -3374,10 +3396,16 @@ export class PortManagerNetworkService implements DisposableLike {
   private writeTerminalHookScript(fileName: string, contents: string): string {
     const directoryPath = this.getTerminalHookScriptDirectoryPath();
     const scriptPath = path.join(directoryPath, fileName);
+    const nextContents = `${contents.trimEnd()}\n`;
 
     syncFs.mkdirSync(directoryPath, { recursive: true });
-    syncFs.writeFileSync(scriptPath, `${contents.trimEnd()}\n`, { encoding: "utf8", mode: 0o700 });
-    syncFs.chmodSync(scriptPath, 0o700);
+    if (syncTextFileAlreadyMatches(scriptPath, nextContents)) {
+      ensureExecutableScriptMode(scriptPath);
+      return scriptPath;
+    }
+
+    syncFs.writeFileSync(scriptPath, nextContents, { encoding: "utf8", mode: 0o700 });
+    ensureExecutableScriptMode(scriptPath);
     return scriptPath;
   }
 
@@ -3482,8 +3510,6 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath()),
       shellExport("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath()),
       shellExport("PORT_MANAGER_TERMINAL_ATTACHMENT_DIR", this.getTerminalAttachmentMarkerDirectoryPath()),
-      buildTerminalTitleShell(buildPortManagerTerminalTitle(networkName)),
-      buildTerminalAttachmentMarkerWriteShell(),
       buildComposeProjectRoutingShell(this.getComposeProjectRoutingFilePath(networkId), nativeContainerMapPath),
       shellExport("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange)),
       shellExport("PORT_MANAGER_ROUTING_MODE", settings.routingMode),
@@ -3495,6 +3521,7 @@ export class PortManagerNetworkService implements DisposableLike {
     ];
     commands.push(buildLoopbackAddressRoutingShell(loopbackAddressForNetwork(networkId), resolveLoopbackAddressRoutingMode(settings)));
     commands.push(buildAgentDaemonEnsureShell(process.execPath));
+    commands.push(`if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" != "1" ]; then return 1 2>/dev/null || exit 1; fi`);
 
     if (process.platform === "darwin" && shellEnvRestorePath !== undefined) {
       commands.push(
@@ -3513,7 +3540,9 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     commands.push(
-        `if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" = "1" ]; then printf '%s\\n' ${shellQuote(
+      buildTerminalAttachmentMarkerWriteShell(),
+      buildTerminalTitleShell(buildPortManagerTerminalTitle(networkName)),
+      `if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" = "1" ]; then printf '%s\\n' ${shellQuote(
         `Port Manager routing active for ${networkName} (${networkId}). Restart servers launched before attach.`,
       )}; fi`,
     );
@@ -3593,7 +3622,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     commands.push(
-      "unset -f docker podman docker-compose podman-compose /usr/local/bin/docker /opt/homebrew/bin/docker /usr/bin/docker /bin/docker /Applications/Docker.app/Contents/Resources/bin/docker /usr/local/bin/podman /opt/homebrew/bin/podman /usr/bin/podman /bin/podman /usr/local/bin/docker-compose /opt/homebrew/bin/docker-compose /usr/bin/docker-compose /bin/docker-compose /Applications/Docker.app/Contents/Resources/bin/docker-compose /usr/local/bin/podman-compose /opt/homebrew/bin/podman-compose /usr/bin/podman-compose /bin/podman-compose __port_manager_runtime_first_command __port_manager_runtime_container_subcommand __port_manager_network_id __port_manager_normalize_compose_file_path __port_manager_same_compose_file_path __port_manager_compose_args_reference_file __port_manager_compose_route_for_runtime __port_manager_cwd_matches_workdir __port_manager_container_target_for_runtime __port_manager_shell_quote __port_manager_runtime_command_may_reference_container __port_manager_run_runtime_with_container_routing __port_manager_run_compose_command_with_routing __port_manager_run_standalone_compose_with_routing __port_manager_define_absolute_runtime_function 2>/dev/null || true",
+      "unset -f docker podman docker-compose podman-compose /usr/local/bin/docker /opt/homebrew/bin/docker /usr/bin/docker /bin/docker /Applications/Docker.app/Contents/Resources/bin/docker /usr/local/bin/podman /opt/homebrew/bin/podman /usr/bin/podman /bin/podman /usr/local/bin/docker-compose /opt/homebrew/bin/docker-compose /usr/bin/docker-compose /bin/docker-compose /Applications/Docker.app/Contents/Resources/bin/docker-compose /usr/local/bin/podman-compose /opt/homebrew/bin/podman-compose /usr/bin/podman-compose /bin/podman-compose __port_manager_runtime_first_command __port_manager_runtime_container_subcommand __port_manager_network_id __port_manager_normalize_compose_file_path __port_manager_same_compose_file_path __port_manager_compose_args_reference_file __port_manager_compose_route_for_runtime __port_manager_cwd_matches_workdir __port_manager_container_target_for_runtime __port_manager_shell_quote __port_manager_signal_terminal_attachment_changed __port_manager_compose_command_may_change_endpoints __port_manager_runtime_command_may_reference_container __port_manager_run_runtime_with_container_routing __port_manager_run_compose_command_with_routing __port_manager_run_standalone_compose_with_routing __port_manager_define_absolute_runtime_function 2>/dev/null || true",
     );
     commands.push(`printf '%s\\n' ${shellQuote("Port Manager routing detached from this shell.")}`);
 
@@ -3989,7 +4018,7 @@ function stringifyPersistedNetworkState(state: LogicalNetworkRegistryState): str
   return JSON.stringify(state);
 }
 
-/** True when a persisted compose row should keep participating in route recovery. */
+/** True when a persisted compose row should keep participating in live endpoint reconciliation. */
 function isRestorableComposeAttachment(attachment: ComposeAttachment): boolean {
   return (
     (attachment.status === "attached" || attachment.status === "error") &&
@@ -3997,92 +4026,39 @@ function isRestorableComposeAttachment(attachment: ComposeAttachment): boolean {
   );
 }
 
-/** Checks whether the daemon already owns the persisted compose endpoint route. */
-function hasComposeRoute(
-  routes: readonly LogicalPortRoute[],
-  networkId: string,
-  port: ComposePublishedPort,
-): boolean {
-  return routes.some(
-    (route) =>
-      route.source === "compose" &&
-      route.networkId === networkId &&
-      route.logicalPort === port.logicalPort &&
-      route.actualPort === port.actualHostPort &&
-      route.host === port.actualHostAddress &&
-      isListenRoute(route),
-  );
-}
-
-/** True when Docker/Podman still exposes the host-side endpoint for a compose route. */
-function hasComposePublishedPortListener(
-  listeners: readonly ListeningPort[],
-  attachment: ComposeAttachment,
-  port: ComposePublishedPort,
-): boolean {
-  if (port.protocol !== "tcp") {
-    return false;
-  }
-
-  return listeners.some(
-    (listener) =>
-      listener.protocol === "tcp" &&
-      listener.port === port.actualHostPort &&
-      listenerAddressMatchesHost(listener.localAddress, port.actualHostAddress) &&
-      isComposeRuntimeListener(listener, attachment.runtime ?? attachment.mutation?.runtime),
-  );
-}
-
-function isComposeRuntimeListener(listener: ListeningPort, runtime: "docker" | "podman" | undefined): boolean {
-  const owner = `${listener.processName ?? ""} ${listener.command ?? ""}`.toLowerCase();
-
-  if (owner.trim().length === 0) {
-    return false;
-  }
-
-  if (runtime === "docker") {
-    return owner.includes("docker") || owner.includes("vpnkit");
-  }
-
-  if (runtime === "podman") {
-    return owner.includes("podman") || owner.includes("gvproxy") || owner.includes("conmon");
-  }
-
-  return (
-    owner.includes("docker") ||
-    owner.includes("podman") ||
-    owner.includes("vpnkit") ||
-    owner.includes("gvproxy") ||
-    owner.includes("conmon") ||
-    owner.includes("rootlesskit") ||
-    owner.includes("slirp4netns")
-  );
-}
-
-function listenerAddressMatchesHost(listenerAddress: string, host: string): boolean {
-  const normalizedListener = listenerAddress.trim().toLowerCase();
-  const normalizedHost = host.trim().toLowerCase();
-
-  if (normalizedListener === "*" || normalizedListener === "0.0.0.0" || normalizedListener === "::") {
-    return true;
-  }
-
-  if (normalizedHost === "" || normalizedHost === "*" || normalizedHost === "0.0.0.0" || normalizedHost === "::") {
-    return true;
-  }
-
-  if (
-    (normalizedHost === "localhost" || normalizedHost === "127.0.0.1" || normalizedHost === "::1") &&
-    (normalizedListener === "localhost" || normalizedListener === "127.0.0.1" || normalizedListener === "::1")
-  ) {
-    return true;
-  }
-
-  return normalizedListener === normalizedHost;
-}
-
 function composeRuntimeProjectName(attachment: ComposeAttachment): string {
   return attachment.mutation?.attachedProjectName ?? attachment.projectName;
+}
+
+/**
+ * Background convergence should not poll or recreate compose endpoint routes.
+ *
+ * Compose attachments declare desired routing, but the actual daemon route is
+ * valid only after Docker/Podman reports a running published endpoint. Startup,
+ * lifecycle marker bursts, and explicit repair use force/foreground refreshes.
+ */
+function shouldRefreshComposePublishedPortsFromRuntime(
+  attachment: ComposeAttachment,
+  options: BackgroundRefreshOptions,
+): boolean {
+  void attachment;
+  return options.force === true || options.background !== true;
+}
+
+/**
+ * Container id/name rewrites are only runtime-sensitive after compose lifecycle
+ * commands or explicit repair. Polling them in the quiet background path adds
+ * Docker CLI churn without changing the logical port contract.
+ */
+function shouldRefreshComposeContainerMappingsFromRuntime(
+  attachment: ComposeAttachment,
+  options: BackgroundRefreshOptions,
+): boolean {
+  if (attachment.mutation === undefined) {
+    return false;
+  }
+
+  return options.force === true || options.background !== true;
 }
 
 function composeRouteCopyFiles(attachment: ComposeAttachment): readonly string[] {
@@ -4124,9 +4100,35 @@ function composePortsChanged(
         port.actualHostPort !== nextPort.actualHostPort ||
         port.containerPort !== nextPort.containerPort ||
         port.protocol !== nextPort.protocol ||
-        port.serviceName !== nextPort.serviceName
+        port.serviceName !== nextPort.serviceName ||
+        port.protocolName !== nextPort.protocolName ||
+        port.processId !== nextPort.processId
       );
     })
+  );
+}
+
+function mergeComposePortsWithLiveRoutes(
+  currentPorts: readonly ComposePublishedPort[],
+  livePorts: readonly ComposePublishedPort[],
+): readonly ComposePublishedPort[] {
+  const livePortsByKey = new Map(livePorts.map((port) => [composeServiceRouteKey(port), port]));
+
+  return currentPorts.map((port) => livePortsByKey.get(composeServiceRouteKey(port)) ?? dropComposeProcessId(port));
+}
+
+function composeAttachmentRuntimeStateChanged(
+  current: ComposeAttachment,
+  next: ComposeAttachment,
+): boolean {
+  return (
+    current.status !== next.status ||
+    current.errorMessage !== next.errorMessage ||
+    composePortsChanged(current.ports, next.ports) ||
+    composeContainerMappingsChanged(
+      current.mutation?.containerMappings ?? [],
+      next.mutation?.containerMappings ?? [],
+    )
   );
 }
 
@@ -4177,13 +4179,20 @@ function isGeneratedHostAccessFile(entryName: string, baseHostAccessPath: string
 }
 
 async function removeRoutingFilePaths(filePaths: ReadonlySet<string>): Promise<FileCleanupSummary> {
+  return removeFileSystemPaths(filePaths, { recursive: false });
+}
+
+async function removeFileSystemPaths(
+  filePaths: ReadonlySet<string>,
+  options: { readonly recursive: boolean },
+): Promise<FileCleanupSummary> {
   let removedFileCount = 0;
   let failedFileCount = 0;
 
   await Promise.all(
     [...filePaths].map(async (filePath) => {
       try {
-        await fs.rm(filePath, { force: true });
+        await fs.rm(filePath, { force: true, recursive: options.recursive });
         removedFileCount++;
       } catch {
         failedFileCount++;
@@ -4469,6 +4478,10 @@ function serializeTerminalNetworkSelectionCell(value: string): string {
 }
 
 async function writeTextFileAtomically(filePath: string, contents: string): Promise<void> {
+  if (await textFileAlreadyMatches(filePath, contents)) {
+    return;
+  }
+
   const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
 
   await fs.writeFile(tempPath, contents, "utf8");
@@ -4476,6 +4489,79 @@ async function writeTextFileAtomically(filePath: string, contents: string): Prom
     await fs.rm(tempPath, { force: true }).catch(() => undefined);
     throw error;
   });
+}
+
+/** Avoids touching watcher-observed generated files when convergence found no real change. */
+async function textFileAlreadyMatches(filePath: string, contents: string): Promise<boolean> {
+  try {
+    return (await fs.readFile(filePath, "utf8")) === contents;
+  } catch (error) {
+    if (isNodeErrorWithCode(error, "ENOENT")) {
+      return false;
+    }
+
+    throw error;
+  }
+}
+
+/** Synchronous version used while building terminal command snippets. */
+function syncTextFileAlreadyMatches(filePath: string, contents: string): boolean {
+  try {
+    return syncFs.readFileSync(filePath, "utf8") === contents;
+  } catch (error) {
+    if (isNodeErrorWithCode(error, "ENOENT")) {
+      return false;
+    }
+
+    throw error;
+  }
+}
+
+function ensureExecutableScriptMode(filePath: string): void {
+  try {
+    const executableMode = 0o700;
+    if ((syncFs.statSync(filePath).mode & 0o777) !== executableMode) {
+      syncFs.chmodSync(filePath, executableMode);
+    }
+  } catch (error) {
+    if (!isNodeErrorWithCode(error, "ENOENT")) {
+      throw error;
+    }
+  }
+}
+
+async function readHostAccessBindingsDocument(
+  filePath: string,
+): Promise<{ readonly updatedAt: string; readonly bindings: readonly HostAccessBinding[] } | undefined> {
+  let raw: string;
+
+  try {
+    raw = await fs.readFile(filePath, "utf8");
+  } catch (error) {
+    if (isNodeErrorWithCode(error, "ENOENT")) {
+      return undefined;
+    }
+
+    throw error;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<{
+      readonly updatedAt: unknown;
+      readonly bindings: unknown;
+    }>;
+
+    if (typeof parsed.updatedAt === "string" && Array.isArray(parsed.bindings)) {
+      return {
+        updatedAt: parsed.updatedAt,
+        bindings: parsed.bindings as readonly HostAccessBinding[],
+      };
+    }
+  } catch {
+    // Invalid generated files are rewritten by the next convergence pass.
+  }
+
+  return undefined;
 }
 
 /**
@@ -5625,24 +5711,39 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     'function finish(code,remove){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.destroy();}catch{}if(remove)removeSocket();process.exit(code);}',
     'function shutdownStale(){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.end(JSON.stringify({id:"probe-shutdown",method:"shutdownDaemon"})+"\\n");}catch{}setTimeout(()=>process.exit(2),75);}',
     'let buffer="";',
-    'timer=setTimeout(()=>finish(1,false),700);',
+    'timer=setTimeout(()=>finish(1,false),350);',
     'socket.setEncoding("utf8");',
-    'socket.once("connect",()=>{socket.write(JSON.stringify({id:"probe",method:"listSnapshot"})+"\\n");});',
+    'socket.once("connect",()=>{socket.write(JSON.stringify({id:"probe",method:"daemonStatus"})+"\\n");});',
     'socket.once("error",()=>finish(1,false));',
-    'socket.on("data",(chunk)=>{buffer+=chunk;const lineEnd=buffer.indexOf("\\n");if(lineEnd<0)return;try{const message=JSON.parse(buffer.slice(0,lineEnd));const daemon=message&&message.payload&&message.payload.daemon;const actual=normalize(daemon&&daemon.agentMainPath);const expectedPath=normalize(expected);if(!actual||actual!==expectedPath||isOlder(daemon&&daemon.startedAt,expected)){shutdownStale();return;}finish(0,false);}catch{finish(1,true);}});',
+    'socket.on("data",(chunk)=>{buffer+=chunk;const lineEnd=buffer.indexOf("\\n");if(lineEnd<0)return;try{const message=JSON.parse(buffer.slice(0,lineEnd));const daemon=message&&message.payload;const actual=normalize(daemon&&daemon.agentMainPath);const expectedPath=normalize(expected);if(!actual||actual!==expectedPath||isOlder(daemon&&daemon.startedAt,expected)){shutdownStale();return;}finish(0,false);}catch{finish(1,true);}});',
+  ].join("");
+  const staleLockScript = [
+    'const fs=require("node:fs");',
+    'const lock=process.argv[1];',
+    'try{const age=Date.now()-fs.statSync(lock).mtimeMs;process.exit(age>15000?0:1);}catch{process.exit(1);}',
   ].join("");
   const probeCommand = `${daemonRuntimePrefix} ${shellQuote(nodeExecutablePath)} -e ${shellQuote(
     nodeProbeScript,
   )} "$PORT_MANAGER_AGENT_SOCKET" "$PORT_MANAGER_AGENT_MAIN"`;
+  const staleLockCommand = `${daemonRuntimePrefix} ${shellQuote(nodeExecutablePath)} -e ${shellQuote(
+    staleLockScript,
+  )} "$__pm_agent_lock"`;
 
   return [
     `__pm_agent_ready=0`,
     `__pm_agent_lock="\${PORT_MANAGER_AGENT_SOCKET}.startup.lock"`,
+    `__pm_agent_lock_acquired=0`,
     `${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1`,
     `if [ "$__pm_agent_ready" != "1" ]; then`,
     `if mkdir "$__pm_agent_lock" 2>/dev/null; then`,
+    `__pm_agent_lock_acquired=1`,
+    `elif [ -d "$__pm_agent_lock" ] && ${staleLockCommand} >/dev/null 2>&1; then`,
+    `rmdir "$__pm_agent_lock" 2>/dev/null || true`,
+    `mkdir "$__pm_agent_lock" 2>/dev/null && __pm_agent_lock_acquired=1`,
+    `fi`,
+    `if [ "$__pm_agent_lock_acquired" = "1" ]; then`,
     `__pm_agent_wait_count=0`,
-    `while [ $__pm_agent_wait_count -lt 50 ]; do`,
+    `while [ $__pm_agent_wait_count -lt 2 ]; do`,
     `${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1 && break`,
     `__pm_agent_wait_count=$((__pm_agent_wait_count + 1))`,
     `sleep 0.1`,
@@ -5657,7 +5758,7 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     )} "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" >/tmp/newdlops-portmanager-agent.log 2>&1 &`,
     `fi`,
     `__pm_agent_wait_count=0`,
-    `while [ $__pm_agent_wait_count -lt 50 ]; do`,
+    `while [ $__pm_agent_wait_count -lt 20 ]; do`,
     `${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1 && break`,
     `__pm_agent_wait_count=$((__pm_agent_wait_count + 1))`,
     `sleep 0.1`,
@@ -5666,7 +5767,7 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     `rmdir "$__pm_agent_lock" 2>/dev/null || true`,
     `else`,
     `__pm_agent_wait_count=0`,
-    `while [ $__pm_agent_wait_count -lt 60 ]; do`,
+    `while [ $__pm_agent_wait_count -lt 20 ]; do`,
     `${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1 && break`,
     `__pm_agent_wait_count=$((__pm_agent_wait_count + 1))`,
     `sleep 0.1`,
@@ -5682,7 +5783,7 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     `export PORT_MANAGER_HOOK_DAEMON_STARTED=0`,
     `printf '%s\\n' 'Port Manager routing unavailable: local daemon did not become ready.' >&2`,
     `fi`,
-    `unset __pm_agent_ready __pm_agent_lock`,
+    `unset __pm_agent_ready __pm_agent_lock __pm_agent_lock_acquired`,
   ].join("\n");
 }
 
@@ -6087,6 +6188,15 @@ function appleScriptString(value: string): string {
 
 function isNodeErrorWithCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+async function fileIsReadable(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath, syncFs.constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const BASE_RUNTIMES: readonly NetworkRuntimeDescriptor[] = [

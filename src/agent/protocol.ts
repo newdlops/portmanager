@@ -1,5 +1,6 @@
 import type {
   AgentAllocateRouteRequest,
+  AgentDaemonStatus,
   AgentSnapshot,
   AgentStartManagedProcessRequest,
   ManagedProcess,
@@ -20,6 +21,7 @@ import type {
  */
 
 export type AgentRequestMethod =
+  | "daemonStatus"
   | "listSnapshot"
   | "allocateRoute"
   | "releaseRouteAllocation"
@@ -130,6 +132,7 @@ export interface ReleaseProcessRoutePayload {
 }
 
 export type AgentRequestPayloadByMethod = {
+  readonly daemonStatus: undefined;
   readonly listSnapshot: undefined;
   readonly allocateRoute: AgentAllocateRouteRequest;
   readonly releaseRouteAllocation: ReleaseRouteAllocationPayload;
@@ -144,6 +147,7 @@ export type AgentRequestPayloadByMethod = {
 };
 
 export type AgentResponsePayloadByMethod = {
+  readonly daemonStatus: AgentDaemonStatus;
   readonly listSnapshot: AgentSnapshot;
   readonly allocateRoute: PortRouteAllocation;
   readonly releaseRouteAllocation: boolean;
@@ -256,6 +260,7 @@ export function createErrorResponse(
 /** Validates the small finite set of protocol request methods. */
 function isAgentRequestMethod(value: unknown): value is AgentRequestMethod {
   return (
+    value === "daemonStatus" ||
     value === "listSnapshot" ||
     value === "allocateRoute" ||
     value === "releaseRouteAllocation" ||

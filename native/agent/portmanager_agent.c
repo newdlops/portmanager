@@ -16,7 +16,7 @@
 #define PM_CLIENT_BUFFER 262144
 #define PM_LISTEN_BACKLOG 256
 #define PM_LISTENER_POLL_IDLE_GRACE_SECONDS 2
-#define PM_LISTENER_POLL_INTERVAL_SECONDS 60
+#define PM_LISTENER_POLL_INTERVAL_SECONDS 300
 
 typedef struct {
   int fd;
@@ -248,6 +248,9 @@ static int pm_dispatch(pm_agent_state *state, const pm_request *request, pm_buff
 
   if (strcmp(request->method, "listSnapshot") == 0) {
     return pm_state_snapshot(state, payload);
+  }
+  if (strcmp(request->method, "daemonStatus") == 0) {
+    return pm_state_daemon_status(state, payload);
   }
   if (strcmp(request->method, "refreshSnapshot") == 0) {
     return pm_state_refresh_snapshot(state, payload);

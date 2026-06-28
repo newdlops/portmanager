@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import test, { type TestContext } from "node:test";
 
 import { PortManagerAgent } from "../../src/agent/port-manager-agent";
+import { encodeAgentMessage, NdjsonMessageBuffer } from "../../src/agent/protocol";
 import { getNetworkRouteTablePath, getRouteTablePathForLogicalPort } from "../../src/agent/route-table";
 import type { ListeningPort, PortAvailabilityProvider, ProcessLauncher } from "../../src/shared/types";
 
@@ -1474,6 +1476,49 @@ test("coalesces concurrent listener snapshot scans", async (context) => {
   assert.equal(second.listeners[0]?.port, 3000);
 });
 
+test("skips socket snapshot broadcasts for unchanged refresh requests", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const socketPath = path.join(os.tmpdir(), `portmanager-agent-socket-${process.pid}-${Date.now()}.sock`);
+  const listeners: readonly ListeningPort[] = [
+    createListener({
+      id: "tcp:127.0.0.1:3000:4321",
+      port: 3000,
+      pid: 4321,
+      processName: "node",
+    }),
+  ];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => {
+    agent.dispose();
+    fs.rmSync(socketPath, { force: true });
+  });
+
+  await agent.listen(socketPath);
+  const socket = await openAgentSocket(socketPath);
+  const messages = collectAgentMessages(socket);
+  context.after(() => socket.destroy());
+
+  socket.write(encodeAgentMessage({ id: "first-refresh", method: "refreshSnapshot" }));
+  await waitForAgentMessage(messages, (message) => isResponseForRequest(message, "first-refresh"));
+  assert.equal(messages.filter(isSnapshotEvent).length, 1);
+
+  messages.splice(0, messages.length);
+  socket.write(encodeAgentMessage({ id: "second-refresh", method: "refreshSnapshot" }));
+  await waitForAgentMessage(messages, (message) => isResponseForRequest(message, "second-refresh"));
+  await delay(80);
+
+  assert.equal(messages.filter(isSnapshotEvent).length, 0);
+});
+
 function createFakeLauncher(): ProcessLauncher {
   return {
     launch: async () => ({ pid: 1234, command: "node server.js" }),
@@ -1525,6 +1570,65 @@ function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value
 async function waitOneTurn(): Promise<void> {
   await new Promise<void>((resolve) => {
     setImmediate(resolve);
+  });
+}
+
+async function openAgentSocket(socketPath: string): Promise<net.Socket> {
+  return new Promise<net.Socket>((resolve, reject) => {
+    const socket = net.createConnection(socketPath);
+    socket.once("connect", () => resolve(socket));
+    socket.once("error", (error) => {
+      socket.destroy();
+      reject(error);
+    });
+  });
+}
+
+function collectAgentMessages(socket: net.Socket): unknown[] {
+  const messages: unknown[] = [];
+  const buffer = new NdjsonMessageBuffer();
+
+  socket.on("data", (chunk) => {
+    messages.push(...buffer.push(chunk));
+  });
+
+  return messages;
+}
+
+async function waitForAgentMessage(
+  messages: readonly unknown[],
+  predicate: (message: unknown) => boolean,
+): Promise<unknown> {
+  const deadlineMs = Date.now() + 1_000;
+
+  while (Date.now() < deadlineMs) {
+    const message = messages.find(predicate);
+    if (message !== undefined) {
+      return message;
+    }
+
+    await delay(10);
+  }
+
+  throw new Error("Timed out waiting for Port Manager agent protocol message.");
+}
+
+function isResponseForRequest(message: unknown, id: string): boolean {
+  return (
+    typeof message === "object" &&
+    message !== null &&
+    (message as { type?: unknown }).type === "response" &&
+    (message as { id?: unknown }).id === id
+  );
+}
+
+function isSnapshotEvent(message: unknown): boolean {
+  return typeof message === "object" && message !== null && (message as { type?: unknown }).type === "snapshot";
+}
+
+async function delay(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
   });
 }
 
