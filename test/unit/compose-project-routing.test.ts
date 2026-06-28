@@ -34,6 +34,21 @@ test("serializes compose clone routing rows for shell lookup", () => {
   );
 });
 
+test("shell compose router prefers scoped route table network over stale compose routing file", () => {
+  const shell = buildComposeProjectRoutingShell("/tmp/compose-project-routing-network-a.tsv");
+  const networkStart = shell.indexOf("__port_manager_network_id()");
+  const networkEnd = shell.indexOf("__port_manager_normalize_compose_file_path", networkStart);
+  const networkBody = shell.slice(networkStart, networkEnd);
+
+  assert.notEqual(networkStart, -1);
+  assert.equal(
+    networkBody.indexOf('PORT_MANAGER_ROUTES_FILE:-') <
+      networkBody.indexOf('PORT_MANAGER_COMPOSE_ROUTING_FILE:-'),
+    true,
+    "current scoped route table must outrank an inherited stale compose TSV",
+  );
+});
+
 test("docker compose wrapper targets the attached clone project by cwd and network", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-routing-"));
   const projectDir = path.join(tempDir, "workspace", "app");
@@ -2963,6 +2978,82 @@ test(
           PORT_MANAGER_ROUTES_FILE: staleRouteTableFile,
           PORT_MANAGER_GLOBAL_ROUTES_FILE: globalRouteTableFile,
           PORT_MANAGER_NETWORK_ID: "network-b",
+          PORT_MANAGER_BORROWED_NETWORK_ID: "",
+          NEWDLOPS_PM_NETWORK_ID: "",
+          NEWDLOPS_PM_BORROWED_NETWORK_ID: "",
+        },
+      });
+
+      assert.equal(
+        output,
+        [
+          "env=network-b-app-5678",
+          "<compose>",
+          "<-p>",
+          "<network-b-app-5678>",
+          "<-f>",
+          "<./docker/development.yaml>",
+          "<stop>",
+          "<db>",
+          "",
+        ].join("\n"),
+      );
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "native docker PATH shim prefers scoped route table over stale compose routing file",
+  { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
+  () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-stale-compose-file-scope-"));
+    const projectDir = path.join(tempDir, "workspace", "app");
+    const composeDir = path.join(projectDir, "docker");
+    const shimDir = path.join(tempDir, "shim");
+    const realBinDir = path.join(tempDir, "real-bin");
+    const staleRoutingFile = path.join(tempDir, "compose-project-routing-network-a.tsv");
+    const currentRouteTableFile = path.join(tempDir, "newdlops-portmanager-routes-501-network-b.json");
+
+    fs.mkdirSync(composeDir, { recursive: true });
+    fs.mkdirSync(shimDir, { recursive: true });
+    fs.mkdirSync(realBinDir, { recursive: true });
+    fs.writeFileSync(
+      staleRoutingFile,
+      serializeComposeProjectRoutingRows([
+        {
+          networkId: "network-a",
+          runtime: "docker",
+          workingDirectory: composeDir,
+          attachedProjectName: "network-a-app-1234",
+          originalProjectName: "docker",
+        },
+      ]),
+      "utf8",
+    );
+    fs.writeFileSync(currentRouteTableFile, createRouteTableJson(composeDir, "network-b", "network-b-app-5678"), "utf8");
+    fs.symlinkSync(getNativeDockerShimPath(), path.join(shimDir, "docker"));
+    fs.writeFileSync(
+      path.join(realBinDir, "docker"),
+      "#!/bin/sh\nprintf 'env=%s\\n' \"${COMPOSE_PROJECT_NAME:-}\"\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n",
+      {
+        encoding: "utf8",
+        mode: 0o700,
+      },
+    );
+
+    try {
+      const output = execFileSync("docker", ["compose", "-p", "docker", "-f", "./docker/development.yaml", "stop", "db"], {
+        cwd: projectDir,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${shimDir}${path.delimiter}${realBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          PORT_MANAGER_RUNTIME_SHIM_DIR: shimDir,
+          PORT_MANAGER_COMPOSE_ROUTING_FILE: staleRoutingFile,
+          PORT_MANAGER_ROUTES_FILE: currentRouteTableFile,
+          PORT_MANAGER_NETWORK_ID: "",
           PORT_MANAGER_BORROWED_NETWORK_ID: "",
           NEWDLOPS_PM_NETWORK_ID: "",
           NEWDLOPS_PM_BORROWED_NETWORK_ID: "",

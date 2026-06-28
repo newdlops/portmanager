@@ -137,6 +137,13 @@ interface RuntimeContainerMount {
   readonly RW?: boolean;
 }
 
+interface RuntimeNameReservations {
+  /** Docker/Podman container names are global and block explicit clone names. */
+  readonly containerNames: ReadonlySet<string>;
+  /** Compose project names already materialized in the runtime, even if their override file was deleted. */
+  readonly composeProjectNames: ReadonlySet<string>;
+}
+
 type ComposeServiceMount = ComposeVolumeMount | ComposeBindMount | ComposeTmpfsMount;
 
 interface ComposeVolumeMount {
@@ -218,14 +225,6 @@ export class ComposePublishMutator {
       createsHiddenProject
         ? await this.resolveAttachedProjectSourceName(requestedProjectName, input.workingDirectory, composeFiles)
         : originalProjectName;
-    const attachedProjectName =
-      !createsHiddenProject
-        ? originalProjectName
-        : requestedAttachedProjectName ??
-          (await this.resolveGeneratedAttachedProjectName(
-            buildAttachedProjectName(input.networkName, attachedProjectSourceName, input.networkId),
-            originalProjectName,
-          ));
     const requestedServices = uniqueStrings(input.ports.map((port) => port.serviceName));
 
     const originalContext: ComposeCommandContext = {
@@ -281,13 +280,26 @@ export class ComposePublishMutator {
       );
     }
     const statefulServiceNames = new Set(statefulCloneServices);
+    const runtimeReservations =
+      createsHiddenProject
+        ? await this.readRuntimeNameReservations(input.runtime)
+        : emptyRuntimeNameReservations();
+    const attachedProjectName =
+      !createsHiddenProject
+        ? originalProjectName
+        : requestedAttachedProjectName ??
+          (await this.resolveGeneratedAttachedProjectName(
+            buildAttachedProjectName(input.networkName, attachedProjectSourceName, input.networkId),
+            originalProjectName,
+            runtimeReservations.composeProjectNames,
+          ));
     const volumeClonePlan =
       createsHiddenProject
         ? await buildVolumeClonePlan(attachedProjectName, randomUUID().slice(0, 8), originalServiceMounts, statefulServiceNames)
         : { serviceMounts: originalServiceMounts, volumeClones: [], volumeMappings: [] };
     const occupiedContainerNames =
       createsHiddenProject
-        ? await this.findOccupiedCloneContainerNames(input.runtime, originalContainers, serviceContainerNameSot)
+        ? await this.findOccupiedCloneContainerNames(input.runtime, originalContainers, serviceContainerNameSot, runtimeReservations)
         : new Set<string>();
     const cloneContainerNames =
       createsHiddenProject
@@ -558,10 +570,12 @@ export class ComposePublishMutator {
     const definedServices = await this.listDefinedComposeServices(sourceContext);
     const overrideServices = definedServices.length > 0 ? definedServices : state.services;
     const disabledOverrideServices = overrideServices.filter((service) => !state.services.includes(service));
+    const runtimeReservations = await this.readRuntimeNameReservations(state.runtime);
     const occupiedContainerNames = await this.findOccupiedCloneContainerNames(
       state.runtime,
       originalContainerSources,
       serviceContainerNameSot,
+      runtimeReservations,
     );
     const cloneContainerNames = buildCloneContainerNames(
       state.originalProjectName,
@@ -708,14 +722,18 @@ export class ComposePublishMutator {
    * can share the same deterministic base name, so collisions receive a short
    * per-copy suffix while explicit user-supplied project names remain exact.
    */
-  private async resolveGeneratedAttachedProjectName(baseName: string, originalProjectName: string): Promise<string> {
-    if (!(await this.generatedAttachedProjectNameCollides(baseName, originalProjectName))) {
+  private async resolveGeneratedAttachedProjectName(
+    baseName: string,
+    originalProjectName: string,
+    runtimeComposeProjectNames: ReadonlySet<string>,
+  ): Promise<string> {
+    if (!(await this.generatedAttachedProjectNameCollides(baseName, originalProjectName, runtimeComposeProjectNames))) {
       return baseName;
     }
 
     for (let attempt = 0; attempt < 16; attempt += 1) {
       const candidate = buildAttachedProjectCollisionName(baseName, randomUUID().replace(/-/g, "").slice(0, 8));
-      if (!(await this.generatedAttachedProjectNameCollides(candidate, originalProjectName))) {
+      if (!(await this.generatedAttachedProjectNameCollides(candidate, originalProjectName, runtimeComposeProjectNames))) {
         return candidate;
       }
     }
@@ -723,8 +741,16 @@ export class ComposePublishMutator {
     return buildAttachedProjectCollisionName(baseName, randomUUID().replace(/-/g, "").slice(0, 12));
   }
 
-  private async generatedAttachedProjectNameCollides(projectName: string, originalProjectName: string): Promise<boolean> {
+  private async generatedAttachedProjectNameCollides(
+    projectName: string,
+    originalProjectName: string,
+    runtimeComposeProjectNames: ReadonlySet<string>,
+  ): Promise<boolean> {
     if (projectName === originalProjectName) {
+      return true;
+    }
+
+    if (runtimeComposeProjectNames.has(projectName)) {
       return true;
     }
 
@@ -1072,8 +1098,9 @@ export class ComposePublishMutator {
     runtime: "docker" | "podman",
     sourceContainers: readonly ComposeServiceContainer[],
     serviceContainerNameSot: ReadonlyMap<string, string>,
+    reservations: RuntimeNameReservations,
   ): Promise<ReadonlySet<string>> {
-    const occupiedNames = await this.listReservedRuntimeContainerNames(runtime);
+    const occupiedNames = new Set(reservations.containerNames);
     for (const container of sourceContainers) {
       const containerName = normalizeContainerNameText(container.name);
       if (containerName.length > 0) {
@@ -1107,32 +1134,37 @@ export class ComposePublishMutator {
   }
 
   /**
-   * Reads Docker/Podman's global container-name reservation table.
+   * Reads Docker/Podman's global name reservation table.
    *
-   * Runtime container names are global even when Compose projects and networks
-   * differ. Clone overrides must therefore avoid names held by stopped originals
-   * and other Port Manager clones, not just the selected source containers.
+   * Container names are globally reserved, while Compose project names can
+   * remain materialized in Docker/Podman after Port Manager's generated override
+   * file was deleted. Both identities must be treated as collisions before a
+   * new hidden clone writes its override and starts containers.
    */
-  private async listReservedRuntimeContainerNames(runtime: "docker" | "podman"): Promise<Set<string>> {
+  private async readRuntimeNameReservations(runtime: "docker" | "podman"): Promise<RuntimeNameReservations> {
     try {
       const result = await this.runCommand(
         runtime,
         ["container", "ps", "--all", "--no-trunc", "--format", "{{json .}}"],
         { timeoutMs: LIST_TIMEOUT_MS },
       );
+      const rows = result.stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .map(parseRuntimeContainerRow)
+        .filter((row): row is RuntimeContainerRow => row !== undefined);
 
-      return new Set(
-        result.stdout
-          .split(/\r?\n/)
-          .map((line) => line.trim())
-          .filter((line) => line.length > 0)
-          .map(parseRuntimeContainerRow)
-          .filter((row): row is RuntimeContainerRow => row !== undefined)
-          .map(readRuntimeContainerName)
-          .filter((name): name is string => name !== undefined),
-      );
+      return {
+        containerNames: new Set(rows.map(readRuntimeContainerName).filter((name): name is string => name !== undefined)),
+        composeProjectNames: new Set(
+          rows
+            .map((row) => readRuntimeLabel(parseRuntimeLabels(row.Labels), "com.docker.compose.project", "io.podman.compose.project"))
+            .filter((name): name is string => name !== undefined),
+        ),
+      };
     } catch {
-      return new Set();
+      return emptyRuntimeNameReservations();
     }
   }
 
@@ -2264,6 +2296,13 @@ function filterRuntimeRowsForComposeServices(
 function readRuntimeContainerName(row: RuntimeContainerRow): string | undefined {
   const name = normalizeContainerNameText(row.Names ?? row.Name ?? "");
   return name.length === 0 ? undefined : name;
+}
+
+function emptyRuntimeNameReservations(): RuntimeNameReservations {
+  return {
+    containerNames: new Set(),
+    composeProjectNames: new Set(),
+  };
 }
 
 function parseComposeServiceContainerRows(

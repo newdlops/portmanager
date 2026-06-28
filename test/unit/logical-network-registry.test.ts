@@ -4,6 +4,7 @@ import test from "node:test";
 import { LogicalNetworkRegistry } from "../../src/core/networks/logical-network-registry";
 import type {
   ComposeAttachment,
+  ComposePortMutationState,
   ContainerServiceCandidate,
   HostAccessBinding,
   HostPortExposure,
@@ -84,6 +85,21 @@ function createComposeAttachment(overrides: Partial<ComposeAttachment> = {}): Co
     ],
     status: "attached",
     attachedAt: "2026-06-22T00:04:00.000Z",
+    ...overrides,
+  };
+}
+
+function createComposeMutation(overrides: Partial<ComposePortMutationState> = {}): ComposePortMutationState {
+  return {
+    mode: "clone",
+    runtime: "docker",
+    originalProjectName: "workspace",
+    attachedProjectName: "portmanager-network-1-workspace",
+    composeFiles: [],
+    services: ["postgres"],
+    overrideFile: "/tmp/portmanager-compose.override.yml",
+    originalPorts: [],
+    hiddenPorts: [],
     ...overrides,
   };
 }
@@ -392,6 +408,65 @@ test("rejects duplicate compose routes in the same logical network", () => {
   assert.throws(
     () => registry.addComposeAttachment(createComposeAttachment({ id: "compose-2", projectName: "other" })),
     /Compose route already exists/,
+  );
+});
+
+test("rejects one runtime compose project attached to multiple logical networks", () => {
+  const registry = new LogicalNetworkRegistry([runtime]);
+  registry.addNetwork(createNetwork());
+  registry.addNetwork(createNetwork({ id: "network-2", name: "B app" }));
+  registry.addComposeAttachment(
+    createComposeAttachment({
+      mutation: createComposeMutation({ attachedProjectName: "portmanager-shared-workspace" }),
+    }),
+  );
+
+  assert.throws(
+    () =>
+      registry.addComposeAttachment(
+        createComposeAttachment({
+          id: "compose-2",
+          networkId: "network-2",
+          projectName: "workspace-b",
+          mutation: createComposeMutation({
+            originalProjectName: "workspace-b",
+            attachedProjectName: "portmanager-shared-workspace",
+          }),
+        }),
+      ),
+    /already attached to another logical network/,
+  );
+});
+
+test("deduplicates persisted compose runtime owners with the newest owner winning", () => {
+  const registry = new LogicalNetworkRegistry([runtime], {
+    networks: [createNetwork(), createNetwork({ id: "network-2", name: "B app" })],
+    attachments: [],
+    exposures: [],
+    hostAccessBindings: [],
+    composeAttachments: [
+      createComposeAttachment({
+        id: "compose-old",
+        networkId: "network-1",
+        mutation: createComposeMutation({ attachedProjectName: "portmanager-shared-workspace" }),
+        attachedAt: "2026-06-22T00:04:00.000Z",
+      }),
+      createComposeAttachment({
+        id: "compose-new",
+        networkId: "network-2",
+        projectName: "workspace-b",
+        mutation: createComposeMutation({
+          originalProjectName: "workspace-b",
+          attachedProjectName: "portmanager-shared-workspace",
+        }),
+        attachedAt: "2026-06-22T00:05:00.000Z",
+      }),
+    ],
+  });
+
+  assert.deepEqual(
+    registry.getSnapshot().composeAttachments.map((attachment) => attachment.id),
+    ["compose-new"],
   );
 });
 

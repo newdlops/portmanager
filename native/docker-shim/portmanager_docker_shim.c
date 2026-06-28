@@ -596,11 +596,11 @@ static const char *pm_network_id(void) {
   }
 
   if (network_id == NULL || network_id[0] == '\0') {
-    network_id = pm_network_id_from_compose_routing_file();
+    network_id = pm_network_id_from_route_table_path();
   }
 
   if (network_id == NULL || network_id[0] == '\0') {
-    network_id = pm_network_id_from_route_table_path();
+    network_id = pm_network_id_from_compose_routing_file();
   }
 
   return network_id;
@@ -1486,7 +1486,7 @@ static int pm_route_network_matches(const char *route_json, const char *network_
   char route_network[PM_MAX_FIELD];
 
   if (network_id == NULL || network_id[0] == '\0') {
-    return 1;
+    return 0;
   }
 
   if (pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0) {

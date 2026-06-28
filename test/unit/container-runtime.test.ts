@@ -1860,6 +1860,101 @@ test("suffixes generated compose clone project names when copying again into the
   assert.equal(result.ports[0]?.actualHostPort, 57002);
 });
 
+test("suffixes generated compose clone project names when the runtime project remains without an override file", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-mutator-runtime-project-collision-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const existingProjectName = "a-app-workspace-c0445d38";
+  fs.writeFileSync(composeFile, "name: workspace\nservices:\n  postgres:\n    image: postgres:16\n", "utf8");
+  let lastStartedProject = "";
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config")) {
+        return { stdout: "postgres\n", stderr: "" };
+      }
+      if (args[0] === "compose" && args.includes("up")) {
+        lastStartedProject = args[args.indexOf("-p") + 1] ?? "";
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "container" && (args[1] === "ls" || args[1] === "ps")) {
+        const projectFilter = args.find((arg) => arg.startsWith("label=com.docker.compose.project="));
+        const filteredProject = projectFilter?.slice("label=com.docker.compose.project=".length);
+        if (filteredProject === "workspace") {
+          return {
+            stdout: JSON.stringify({
+              ID: "source123",
+              Names: "workspace-postgres-1",
+              Ports: "127.0.0.1:15432->5432/tcp",
+              Labels: "com.docker.compose.project=workspace,com.docker.compose.service=postgres",
+            }),
+            stderr: "",
+          };
+        }
+        if (filteredProject === lastStartedProject) {
+          return {
+            stdout: JSON.stringify({
+              ID: "hidden123",
+              Names: `${lastStartedProject}-postgres-1`,
+              Ports: "127.0.0.1:57002->5432/tcp",
+              Labels: `com.docker.compose.project=${lastStartedProject},com.docker.compose.service=postgres`,
+            }),
+            stderr: "",
+          };
+        }
+
+        return {
+          stdout: JSON.stringify({
+            ID: "existing-hidden123",
+            Names: `${existingProjectName}-postgres-1`,
+            Ports: "",
+            Labels: `com.docker.compose.project=${existingProjectName},com.docker.compose.service=postgres`,
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({
+              Id: id,
+              Config: { Labels: { "com.docker.compose.service": "postgres" } },
+              Mounts: [],
+            })),
+          ),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    runtime: "docker",
+    networkName: "A app",
+    networkId: "network-a",
+    originalProjectName: "workspace",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    ports: [
+      {
+        serviceName: "postgres",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 15432,
+        containerPort: 5432,
+        protocol: "tcp",
+      },
+    ],
+  });
+
+  assert.match(result.state.attachedProjectName, /^a-app-workspace-c0445d38-[a-f0-9]{8}$/);
+  assert.notEqual(result.state.attachedProjectName, existingProjectName);
+  assert.equal(result.state.overrideFile, path.join(tempDir, `${result.state.attachedProjectName}.ports.override.yaml`));
+  assert.equal(result.ports[0]?.actualHostPort, 57002);
+});
+
 test("mutates compose clone container names by replacing the compose project prefix", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-name-prefix-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));

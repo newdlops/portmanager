@@ -306,6 +306,20 @@ __port_manager_network_id() {
       ;;
   esac
 
+  __pm_routes_path="\${PORT_MANAGER_ROUTES_FILE:-}"
+  __pm_routes_base="\${__pm_routes_path##*/}"
+  __pm_routes_base="\${__pm_routes_base%.json}"
+  case "\${__pm_routes_base}" in
+    newdlops-portmanager-routes-*-*)
+      __pm_routes_network="\${__pm_routes_base#newdlops-portmanager-routes-}"
+      __pm_routes_network="\${__pm_routes_network#*-}"
+      if [ -n "\${__pm_routes_network}" ]; then
+        printf '%s\\n' "\${__pm_routes_network}"
+        return 0
+      fi
+      ;;
+  esac
+
   __pm_compose_routes_path="\${PORT_MANAGER_COMPOSE_ROUTING_FILE:-}"
   __pm_compose_routes_base="\${__pm_compose_routes_path##*/}"
   __pm_compose_routes_base="\${__pm_compose_routes_base%.tsv}"
@@ -317,20 +331,6 @@ __port_manager_network_id() {
       esac
       if [ -n "\${__pm_compose_routes_network}" ]; then
         printf '%s\\n' "\${__pm_compose_routes_network}"
-        return 0
-      fi
-      ;;
-  esac
-
-  __pm_routes_path="\${PORT_MANAGER_ROUTES_FILE:-}"
-  __pm_routes_base="\${__pm_routes_path##*/}"
-  __pm_routes_base="\${__pm_routes_base%.json}"
-  case "\${__pm_routes_base}" in
-    newdlops-portmanager-routes-*-*)
-      __pm_routes_network="\${__pm_routes_base#newdlops-portmanager-routes-}"
-      __pm_routes_network="\${__pm_routes_network#*-}"
-      if [ -n "\${__pm_routes_network}" ]; then
-        printf '%s\\n' "\${__pm_routes_network}"
         return 0
       fi
       ;;

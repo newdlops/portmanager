@@ -32,3 +32,25 @@ test("docker shim refreshes terminal markers after compose lifecycle commands", 
   assert.equal(source.includes("pm_spawn_and_signal_on_success"), true);
   assert.equal(source.includes("pm_signal_terminal_attachment_changed();"), true);
 });
+
+test("docker shim prefers scoped route table network over stale compose routing file", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/docker-shim/portmanager_docker_shim.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const networkStart = source.indexOf("static const char *pm_network_id(void)");
+  const networkEnd = source.indexOf("static void pm_default_global_route_table_path", networkStart);
+  const networkBody = source.slice(networkStart, networkEnd);
+  const matcherStart = source.indexOf("static int pm_route_network_matches");
+  const matcherEnd = source.indexOf("static int pm_find_compose_route_from_route_table", matcherStart);
+  const matcherBody = source.slice(matcherStart, matcherEnd);
+
+  assert.notEqual(networkStart, -1);
+  assert.notEqual(matcherStart, -1);
+  assert.equal(
+    networkBody.indexOf("pm_network_id_from_route_table_path()") <
+      networkBody.indexOf("pm_network_id_from_compose_routing_file()"),
+    true,
+    "current scoped route table must outrank an inherited stale compose TSV",
+  );
+  assert.equal(matcherBody.includes("return 1;"), false);
+  assert.equal(matcherBody.includes("return 0;"), true);
+});

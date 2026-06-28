@@ -432,6 +432,7 @@ test("background routing refresh polls terminals and containers", () => {
   );
   assert.equal(source.includes("this.refreshContainerServices({ background: true }).catch(() => [])"), true);
   assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts({ background: true }).catch(() => undefined);"), false);
+  assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts({ background: true, force: true }).catch(() => undefined);"), true);
   assert.equal(source.includes("await this.convergeDaemonAndRoutingState();"), true);
   assert.equal(source.includes("ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 60_000"), true);
   assert.equal(source.includes("BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS = 60_000"), true);
@@ -637,6 +638,7 @@ test("compose route reconciliation does not rehydrate persisted attachment route
   assert.equal(source.includes("private async restorePersistedComposeRoutesIfMissing"), false);
   assert.equal(source.includes("private async restorePersistedComposeRoutes("), false);
   assert.equal(source.includes("attachment.ports.length > 0"), true);
+  assert.equal(source.includes("process.actualPort === port.actualHostPort"), false);
   assert.equal(source.includes("await this.processService.registerExistingProcess("), true);
   assert.equal(source.includes("function hasComposePublishedPortListener"), false);
   assert.equal(source.includes("const hasRuntimeListener = hasComposePublishedPortListener"), false);
@@ -649,11 +651,15 @@ test("compose project routing files are published as a serialized atomic generat
   const writeStart = source.indexOf("private async writeComposeProjectRoutingFile(): Promise<void>");
   const writeEnd = source.indexOf("private async restoreMissingComposeOverrideFiles", writeStart);
   const writeBody = source.slice(writeStart, writeEnd);
+  const rowStart = source.indexOf("function buildComposeProjectRoutingRows");
+  const rowEnd = source.indexOf("function mergeComposeRoutingContainerMappings", rowStart);
+  const rowBody = source.slice(rowStart, rowEnd);
 
   assert.equal(source.includes("private composeProjectRoutingWriteInFlight"), true);
   assert.equal(source.includes("private composeProjectRoutingWriteQueued = false;"), true);
   assert.equal(source.includes("private async writeComposeProjectRoutingFileSerially(): Promise<void>"), true);
   assert.equal(source.includes("private async writeComposeProjectRoutingFileExclusive(): Promise<void>"), true);
+  assert.equal(rowBody.includes("!isRestorableComposeAttachment(attachment)"), true);
   assert.equal(writeBody.includes("this.composeProjectRoutingWriteQueued = true;"), true);
   assert.equal(writeBody.includes("await this.restoreMissingComposeOverrideFiles();"), true);
   assert.equal(writeBody.includes('await writeTextFileAtomically(globalFilePath, "");'), true);
@@ -841,4 +847,59 @@ test("logical router classifies clients by process tree label before hook enviro
     findClientCwdRouteForRouter.includes(".attachments.filter((attachment) => attachment.status === \"attached\")"),
     false,
   );
+});
+
+test("compose reconciliation removes orphan daemon route rows before runtime refresh", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const reconcileStart = source.indexOf("private async reconcileComposeAttachmentPublishedPortsExclusive");
+  const reconcileEnd = source.indexOf("private async removeOrphanComposeRouteProcesses", reconcileStart);
+  const reconcileBody = source.slice(reconcileStart, reconcileEnd);
+  const cleanupStart = source.indexOf("private async removeOrphanComposeRouteProcesses");
+  const cleanupEnd = source.indexOf("private async replaceComposeRouteProcesses", cleanupStart);
+  const cleanupBody = source.slice(cleanupStart, cleanupEnd);
+
+  assert.notEqual(reconcileStart, -1);
+  assert.notEqual(cleanupStart, -1);
+  assert.equal(source.includes("private async refreshComposeRouteProcessSnapshot(): Promise<void>"), true);
+  assert.equal(reconcileBody.includes("await this.refreshComposeRouteProcessSnapshot();"), true);
+  assert.equal(
+    reconcileBody.indexOf("await this.refreshComposeRouteProcessSnapshot();") <
+      reconcileBody.indexOf("await this.removeOrphanComposeRouteProcesses(attachments);"),
+    true,
+    "daemon snapshot must be loaded before stale compose process rows are removed",
+  );
+  assert.equal(source.includes("await this.processService.start().catch(() => undefined);"), true);
+  assert.equal(source.includes("await this.processService.refresh().catch(() => undefined);"), true);
+  assert.equal(reconcileBody.includes("await this.removeOrphanComposeRouteProcesses(attachments);"), true);
+  assert.equal(
+    reconcileBody.indexOf("await this.removeOrphanComposeRouteProcesses(attachments);") <
+      reconcileBody.indexOf("if (attachments.length === 0)"),
+    true,
+    "stale compose daemon rows must be removed even when no persisted compose attachment remains",
+  );
+  assert.equal(cleanupBody.includes('process.source === "compose"'), true);
+  assert.equal(cleanupBody.includes("composeRouteProcessKey(process.networkId, process.requestedPort)"), true);
+  assert.equal(cleanupBody.includes("this.processService!.removeProcess(processId)"), true);
+});
+
+test("logical network service persists registry-normalized shared state", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const constructorStart = source.indexOf("constructor(");
+  const constructorEnd = source.indexOf("  /** Loads terminal candidates", constructorStart);
+  const constructorBody = source.slice(constructorStart, constructorEnd);
+  const reloadStart = source.indexOf("private async reloadSharedNetworkState");
+  const reloadEnd = source.indexOf("private loadVscodeWindowTerminalBinding", reloadStart);
+  const reloadBody = source.slice(reloadStart, reloadEnd);
+  const helperStart = source.indexOf("private saveNormalizedPersistedStateIfChanged");
+  const helperEnd = source.indexOf("private async reloadSharedNetworkState", helperStart);
+  const helperBody = source.slice(helperStart, helperEnd);
+
+  assert.notEqual(helperStart, -1);
+  assert.equal(constructorBody.includes("const loadedState = this.loadState();"), true);
+  assert.equal(constructorBody.includes("this.saveNormalizedPersistedStateIfChanged();"), true);
+  assert.equal(reloadBody.includes("this.saveNormalizedPersistedStateIfChanged();"), true);
+  assert.equal(helperBody.includes("this.registry.getPersistedState()"), true);
+  assert.equal(helperBody.includes("this.saveState({ force: true });"), true);
 });

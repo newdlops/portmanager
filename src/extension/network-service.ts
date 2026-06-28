@@ -450,8 +450,12 @@ export class PortManagerNetworkService implements DisposableLike {
     this.processEnvironmentProvider = new NodeProcessEnvironmentProvider({
       nativeLookupPath: nativeProcessLookupPath,
     });
-    this.registry = new LogicalNetworkRegistry(BASE_RUNTIMES, this.loadState());
-    this.persistedNetworkStateSignature = stringifyPersistedNetworkState(this.registry.getPersistedState());
+    const loadedState = this.loadState();
+    this.registry = new LogicalNetworkRegistry(BASE_RUNTIMES, loadedState);
+    this.persistedNetworkStateSignature = stringifyPersistedNetworkState(
+      loadedState ?? this.registry.getPersistedState(),
+    );
+    this.saveNormalizedPersistedStateIfChanged();
     this.vscodeWindowTerminalBinding = this.loadVscodeWindowTerminalBinding();
     this.disposables.push(
       this.registry.onDidChange(() => {
@@ -1866,6 +1870,14 @@ export class PortManagerNetworkService implements DisposableLike {
     void this.context.globalState.update(NETWORK_STATE_KEY, state);
   }
 
+  /** Persists registry-normalized state after legacy/shared files converge in memory. */
+  private saveNormalizedPersistedStateIfChanged(): void {
+    const normalizedSignature = stringifyPersistedNetworkState(this.registry.getPersistedState());
+    if (normalizedSignature !== this.persistedNetworkStateSignature) {
+      this.saveState({ force: true });
+    }
+  }
+
   /** Applies durable logical network state written by another VS Code window. */
   private async reloadSharedNetworkState(): Promise<void> {
     const document = this.sharedNetworkStateStore.load();
@@ -1886,9 +1898,11 @@ export class PortManagerNetworkService implements DisposableLike {
     } finally {
       this.applyingSharedNetworkState = false;
     }
+    this.saveNormalizedPersistedStateIfChanged();
 
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
+    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
     await this.writeComposeProjectRoutingFile();
     await this.writeTerminalNetworkSelectionFile();
     await this.syncLogicalPortRouters();
@@ -2177,6 +2191,7 @@ export class PortManagerNetworkService implements DisposableLike {
       this.refreshTerminals().catch(() => []),
       this.refreshContainerServices({ background: true }).catch(() => []),
     ]);
+    await this.reconcileComposeAttachmentPublishedPorts({ background: true, force: true }).catch(() => undefined);
     await this.convergeDaemonAndRoutingState();
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
   }
@@ -2410,9 +2425,12 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
+    await this.refreshComposeRouteProcessSnapshot();
     const attachments = this.registry
       .getSnapshot()
       .composeAttachments.filter(isRestorableComposeAttachment);
+    await this.removeOrphanComposeRouteProcesses(attachments);
+
     if (attachments.length === 0) {
       return;
     }
@@ -2455,6 +2473,58 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     void this.syncLogicalPortRouters();
+  }
+
+  /**
+   * Loads the daemon snapshot before compose route cleanup runs.
+   *
+   * The daemon registry is disposable runtime state and may already contain
+   * stale compose rows from an older extension session. Startup must inspect it
+   * before writing route files or opening routers, otherwise old cross-network
+   * lifecycle routes can survive until a later background refresh.
+   */
+  private async refreshComposeRouteProcessSnapshot(): Promise<void> {
+    if (this.processService === undefined) {
+      return;
+    }
+
+    await this.processService.start().catch(() => undefined);
+    await this.processService.refresh().catch(() => undefined);
+  }
+
+  /**
+   * Removes daemon compose rows that no longer have a persisted attachment.
+   *
+   * Native Docker/Podman shims can recover compose routing from the daemon
+   * route table when their scoped TSV file is missing. That fallback must not
+   * resurrect stale rows from a logical network that no longer owns the runtime
+   * compose project, otherwise lifecycle commands can hit another network's
+   * clone.
+   */
+  private async removeOrphanComposeRouteProcesses(attachments: readonly ComposeAttachment[]): Promise<void> {
+    if (this.processService === undefined) {
+      return;
+    }
+
+    const activeRouteKeys = new Set<string>();
+    for (const attachment of attachments) {
+      for (const port of attachment.ports) {
+        activeRouteKeys.add(composeRouteProcessKey(attachment.networkId, port.logicalPort));
+      }
+    }
+
+    const snapshot = this.processService.getSnapshot();
+    const orphanProcessIds = snapshot.processes
+      .filter(
+        (process) =>
+          process.source === "compose" &&
+          !activeRouteKeys.has(composeRouteProcessKey(process.networkId, process.requestedPort)),
+      )
+      .map((process) => process.id);
+
+    await Promise.all(
+      orphanProcessIds.map((processId) => this.processService!.removeProcess(processId).catch(() => undefined)),
+    );
   }
 
   /**
@@ -3920,7 +3990,7 @@ function buildComposeProjectRoutingRows(
 ): readonly ComposeProjectRoutingRow[] {
   return attachments.flatMap((attachment) => {
     const mutation = attachment.mutation;
-    if (attachment.status !== "attached") {
+    if (!isRestorableComposeAttachment(attachment)) {
       return [];
     }
 
@@ -4031,11 +4101,12 @@ function composeRuntimeProjectName(attachment: ComposeAttachment): string {
 }
 
 /**
- * Background convergence should not poll or recreate compose endpoint routes.
+ * Quiet daemon convergence should not poll or recreate compose endpoint routes.
  *
  * Compose attachments declare desired routing, but the actual daemon route is
  * valid only after Docker/Podman reports a running published endpoint. Startup,
- * lifecycle marker bursts, and explicit repair use force/foreground refreshes.
+ * lifecycle marker bursts, explicit repair, and the background signal refresh
+ * use force/foreground refreshes; unchanged file-only convergence does not.
  */
 function shouldRefreshComposePublishedPortsFromRuntime(
   attachment: ComposeAttachment,
@@ -4079,10 +4150,13 @@ function isComposeProcessForPort(
 ): boolean {
   return (
     process.source === "compose" &&
-    process.networkId === attachment.networkId &&
-    process.requestedPort === port.logicalPort &&
-    process.actualPort === port.actualHostPort
+    composeRouteProcessKey(process.networkId, process.requestedPort) ===
+      composeRouteProcessKey(attachment.networkId, port.logicalPort)
   );
+}
+
+function composeRouteProcessKey(networkId: string | undefined, logicalPort: number): string {
+  return `${networkId ?? ""}:${logicalPort}`;
 }
 
 function composePortsChanged(

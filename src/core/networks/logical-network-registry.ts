@@ -70,8 +70,8 @@ export class LogicalNetworkRegistry implements DisposableLike {
       this.hostAccessBindings.set(binding.id, binding);
     }
 
-    for (const attachment of initialState?.composeAttachments ?? []) {
-      this.composeAttachments.set(attachment.id, attachment);
+    for (const attachment of sortComposeAttachmentsByAttachedAt(initialState?.composeAttachments ?? [])) {
+      this.setPersistedComposeAttachment(attachment);
     }
   }
 
@@ -137,8 +137,8 @@ export class LogicalNetworkRegistry implements DisposableLike {
       this.hostAccessBindings.set(binding.id, binding);
     }
 
-    for (const attachment of state.composeAttachments ?? []) {
-      this.composeAttachments.set(attachment.id, attachment);
+    for (const attachment of sortComposeAttachmentsByAttachedAt(state.composeAttachments ?? [])) {
+      this.setPersistedComposeAttachment(attachment);
     }
 
     this.emitChange();
@@ -352,6 +352,7 @@ export class LogicalNetworkRegistry implements DisposableLike {
     }
 
     this.ensureNoComposePortConflict(attachment);
+    this.ensureNoComposeRuntimeOwnerConflict(attachment);
     this.composeAttachments.set(attachment.id, attachment);
     this.emitChange();
     return attachment;
@@ -364,6 +365,7 @@ export class LogicalNetworkRegistry implements DisposableLike {
     }
 
     this.ensureNoComposePortConflict(attachment);
+    this.ensureNoComposeRuntimeOwnerConflict(attachment);
     this.composeAttachments.set(attachment.id, attachment);
     this.emitChange();
     return attachment;
@@ -411,6 +413,40 @@ export class LogicalNetworkRegistry implements DisposableLike {
   }
 
   /**
+   * Restores persisted compose rows while converging stale cross-network owners.
+   *
+   * Docker/Podman lifecycle commands operate on the real runtime project, not
+   * Port Manager's logical network id. Keeping one runtime project attached to
+   * multiple networks can make a stop/kill command in one network terminate the
+   * same hidden clone from another network. Persisted rows are loaded
+   * oldest-first so the most recent owner wins after older extension versions
+   * left duplicates behind.
+   */
+  private setPersistedComposeAttachment(attachment: ComposeAttachment): void {
+    this.removeConflictingPersistedComposeRuntimeOwners(attachment);
+    this.composeAttachments.set(attachment.id, attachment);
+  }
+
+  /** Drops older persisted owners for the same real compose runtime project. */
+  private removeConflictingPersistedComposeRuntimeOwners(attachment: ComposeAttachment): void {
+    const ownerKeys = composeRuntimeOwnerKeys(attachment);
+    if (ownerKeys.length === 0) {
+      return;
+    }
+
+    const ownerKeySet = new Set(ownerKeys);
+    for (const [attachmentId, existing] of this.composeAttachments) {
+      if (attachmentId === attachment.id || existing.networkId === attachment.networkId) {
+        continue;
+      }
+
+      if (composeRuntimeOwnerKeys(existing).some((ownerKey) => ownerKeySet.has(ownerKey))) {
+        this.composeAttachments.delete(attachmentId);
+      }
+    }
+  }
+
+  /**
    * A logical network can shadow a host port with one compose service endpoint,
    * but two active compose endpoints for the same logical port would make
    * routing nondeterministic.
@@ -440,6 +476,33 @@ export class LogicalNetworkRegistry implements DisposableLike {
         if (conflict !== undefined) {
           throw new Error(`Compose route already exists for logical port ${conflict.logicalPort}.`);
         }
+      }
+    }
+  }
+
+  /**
+   * Prevents one physical compose project from becoming active in two logical
+   * networks. This guards lifecycle commands (`stop`, `kill`, `restart`) that
+   * target Docker/Podman's project/container names instead of Port Manager's
+   * virtual network ids.
+   */
+  private ensureNoComposeRuntimeOwnerConflict(attachment: ComposeAttachment): void {
+    const ownerKeys = composeRuntimeOwnerKeys(attachment);
+    if (ownerKeys.length === 0) {
+      return;
+    }
+
+    const ownerKeySet = new Set(ownerKeys);
+    for (const existing of this.composeAttachments.values()) {
+      if (existing.id === attachment.id || existing.networkId === attachment.networkId) {
+        continue;
+      }
+
+      const conflictKey = composeRuntimeOwnerKeys(existing).find((ownerKey) => ownerKeySet.has(ownerKey));
+      if (conflictKey !== undefined) {
+        throw new Error(
+          `Compose project is already attached to another logical network: ${formatComposeRuntimeOwnerKey(conflictKey)}.`,
+        );
       }
     }
   }
@@ -523,9 +586,58 @@ function sortTerminalAttachmentsByAttachedAt(attachments: readonly TerminalAttac
   );
 }
 
+/** Applies persisted compose rows oldest-first so the newest runtime owner wins conflicts. */
+function sortComposeAttachmentsByAttachedAt(attachments: readonly ComposeAttachment[]): readonly ComposeAttachment[] {
+  return [...attachments].sort(
+    (left, right) => parseAttachmentTime(left.attachedAt) - parseAttachmentTime(right.attachedAt),
+  );
+}
+
 function parseAttachmentTime(attachedAt: string): number {
   const parsed = Date.parse(attachedAt);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * Returns the physical runtime project identities that a compose attachment can
+ * own. Old persisted rows may not have stored the runtime, so those rows are
+ * treated as ambiguous across Docker and Podman until the next runtime refresh.
+ */
+function composeRuntimeOwnerKeys(attachment: ComposeAttachment): readonly string[] {
+  if (attachment.status !== "attached" && attachment.status !== "error") {
+    return [];
+  }
+
+  const mutation = attachment.mutation;
+  if (mutation !== undefined && mutation.attachedProjectName.trim().length > 0) {
+    return [composeRuntimeOwnerKey(mutation.runtime, mutation.attachedProjectName)];
+  }
+
+  if (attachment.projectName.trim().length === 0) {
+    return [];
+  }
+
+  if (attachment.runtime !== undefined) {
+    return [composeRuntimeOwnerKey(attachment.runtime, attachment.projectName)];
+  }
+
+  return [
+    composeRuntimeOwnerKey("docker", attachment.projectName),
+    composeRuntimeOwnerKey("podman", attachment.projectName),
+  ];
+}
+
+function composeRuntimeOwnerKey(runtime: "docker" | "podman", projectName: string): string {
+  return `${runtime}:${projectName}`;
+}
+
+function formatComposeRuntimeOwnerKey(ownerKey: string): string {
+  const separatorIndex = ownerKey.indexOf(":");
+  if (separatorIndex < 0) {
+    return ownerKey;
+  }
+
+  return `${ownerKey.slice(0, separatorIndex)} compose project "${ownerKey.slice(separatorIndex + 1)}"`;
 }
 
 /** Groups noisy process-level shell candidates into user-facing terminal windows. */
