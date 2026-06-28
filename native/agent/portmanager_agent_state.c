@@ -41,6 +41,7 @@ static int pm_find_listener_for_port_host(int port, const char *host, pm_listene
 static const char *pm_listener_route_host(const pm_listener *listener, const char *fallback_host, char *buffer, size_t size);
 static void pm_remove_pending_endpoint(pm_agent_state *state, int logical_port, const char *network_id);
 static int pm_listener_is_tracked(pm_agent_state *state, const pm_listener *listener);
+static int pm_write_route_tables(pm_agent_state *state);
 
 static void pm_copy(char *target, size_t size, const char *value) {
   if (size == 0) {
@@ -254,7 +255,7 @@ static int pm_has_suffix(const char *value, const char *suffix) {
   return strcmp(value + value_length - suffix_length, suffix) == 0;
 }
 
-static void pm_clear_stale_scoped_route_files(const char *route_table_path) {
+static void pm_adopt_previous_generation_route_files(pm_agent_state *state) {
   const char *slash;
   const char *name;
   const char *dot;
@@ -264,6 +265,8 @@ static void pm_clear_stale_scoped_route_files(const char *route_table_path) {
   char stem[PM_TEXT];
   char extension[PM_SMALL];
   size_t stem_length;
+  size_t extension_length;
+  const char *route_table_path = state->route_table_path;
 
   if (pm_text_empty(route_table_path)) {
     return;
@@ -309,8 +312,12 @@ static void pm_clear_stale_scoped_route_files(const char *route_table_path) {
   }
 
   stem_length = strlen(stem);
+  extension_length = strlen(extension);
   while ((entry = readdir(directory_handle)) != NULL) {
     char file_path[PM_TEXT];
+    char scoped_name[PM_TEXT];
+    size_t file_name_length;
+    size_t scoped_length;
     int written;
 
     if (strncmp(entry->d_name, stem, stem_length) != 0 || entry->d_name[stem_length] != '-' ||
@@ -319,9 +326,10 @@ static void pm_clear_stale_scoped_route_files(const char *route_table_path) {
     }
 
     /*
-     * Scoped route tables and per-port endpoint files are generation-local.
-     * Removing them on daemon startup prevents hooks from reading stale
-     * pending routes after a restart or extension reinstall.
+     * Scoped route tables and per-port endpoint files are generation-local, but
+     * a fresh daemon does not know which ones the previous generation wrote.
+     * Adopt them into the normal cleanup sets so the first route-table write
+     * publishes empty network tables and removes stale endpoint files.
      */
     if (strcmp(directory, "/") == 0) {
       written = snprintf(file_path, sizeof(file_path), "/%s", entry->d_name);
@@ -332,7 +340,30 @@ static void pm_clear_stale_scoped_route_files(const char *route_table_path) {
       continue;
     }
 
-    unlink(file_path);
+    file_name_length = strlen(entry->d_name);
+    if (file_name_length <= stem_length + 1 + extension_length) {
+      continue;
+    }
+    scoped_length = file_name_length - stem_length - 1 - extension_length;
+    if (scoped_length >= sizeof(scoped_name)) {
+      scoped_length = sizeof(scoped_name) - 1;
+    }
+    memcpy(scoped_name, entry->d_name + stem_length + 1, scoped_length);
+    scoped_name[scoped_length] = '\0';
+
+    if (strstr(scoped_name, "-port-") != NULL) {
+      pm_string_array_add(
+        &state->written_entry_paths,
+        &state->written_entry_count,
+        &state->written_entry_capacity,
+        file_path);
+    } else if (scoped_name[0] != '\0') {
+      pm_string_array_add(
+        &state->written_network_ids,
+        &state->written_network_count,
+        &state->written_network_capacity,
+        scoped_name);
+    }
   }
 
   closedir(directory_handle);
@@ -345,12 +376,13 @@ void pm_state_init(pm_agent_state *state, const char *route_table_path, const ch
   } else {
     pm_default_route_table_path(state->route_table_path, sizeof(state->route_table_path));
   }
-  pm_clear_stale_scoped_route_files(state->route_table_path);
+  pm_adopt_previous_generation_route_files(state);
   pm_copy(state->agent_main_path, sizeof(state->agent_main_path), agent_main_path);
   pm_iso_now(state->started_at, sizeof(state->started_at));
   state->next_process_id = 1;
   state->next_allocation_id = 1;
   state->agent_pid = getpid();
+  pm_write_route_tables(state);
 }
 
 void pm_state_dispose(pm_agent_state *state) {
@@ -1784,6 +1816,7 @@ static int pm_build_allocation_payload(pm_agent_state *state, const char *alloca
 
 int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *input, pm_buffer *payload) {
   char network_id[PM_SMALL];
+  char actual_host[PM_SMALL];
   pm_allocate_input effective_input;
   pm_route active_route;
   pm_pending_route *reusable;
@@ -1812,6 +1845,7 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
     pm_write_route_tables(state);
   }
   pm_normalize_network(input->network_id, network_id, sizeof(network_id));
+  pm_copy(actual_host, sizeof(actual_host), input->actual_host[0] ? input->actual_host : input->host);
 
   /*
    * The chosen actual port must be derived from the explicit logical network
@@ -1856,6 +1890,7 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
     }
   }
 
+  pm_copy(effective_input.host, sizeof(effective_input.host), actual_host);
   actual_port = strcmp(input->routing_mode, "hashed") == 0 ? pm_route_hashed(state, &effective_input) : pm_route_nearest(state, &effective_input);
   if (actual_port <= 0) {
     return -1;
@@ -1867,7 +1902,7 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
   pending.route.logical_port = input->requested_port;
   pending.route.actual_port = actual_port;
   pm_copy(pending.route.route_direction, sizeof(pending.route.route_direction), strcmp(input->route_direction, "send") == 0 ? "send" : "listen");
-  pm_copy(pending.route.host, sizeof(pending.route.host), input->host);
+  pm_copy(pending.route.host, sizeof(pending.route.host), actual_host);
   pm_copy(pending.route.cwd, sizeof(pending.route.cwd), input->cwd);
   pm_copy(pending.route.network_id, sizeof(pending.route.network_id), network_id);
   pm_copy(pending.route.process_name, sizeof(pending.route.process_name), input->name[0] ? input->name : input->command);
@@ -1880,7 +1915,7 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
 
   state->pending_routes[state->pending_count++] = pending;
   pm_write_route_entry_file(state, input->requested_port, network_id);
-  return pm_build_allocation_payload(state, pending.id, input->requested_port, actual_port, input->host, network_id, pending.expires_at, payload);
+  return pm_build_allocation_payload(state, pending.id, input->requested_port, actual_port, actual_host, network_id, pending.expires_at, payload);
 }
 
 static void pm_remove_pending_allocation(pm_agent_state *state, const char *allocation_id) {

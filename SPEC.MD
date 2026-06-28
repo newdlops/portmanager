@@ -251,6 +251,9 @@ Port Manager agent가 관리하는 `논리 포트 -> 실제 포트` 관계이다
 - 확장은 VS Code shell integration이 제공하는 터미널 출력에서 listen/bind 실패 메시지를 감지하고 라우팅 재실행을 fallback으로 제안해야 한다.
 - 확장은 외부 터미널 hook을 쉽게 사용할 수 있도록 `Port Manager: Install Shell Hook` 명령으로 OS별 native hook 주입 스크립트를 설치할 수 있어야 한다.
 - daemon은 native hook을 위해 short-lived route allocation을 제공하고, `bind()` 성공 후 hook이 해당 프로세스를 등록할 수 있어야 한다.
+- 새 daemon 세대가 시작되면 이전 세대가 남긴 global route table, network-scoped route table,
+  per-port route entry를 현재 in-memory route snapshot 기준으로 점진적으로 정리해야 한다.
+  이전 daemon PID가 확인되면 새 세대 연결 전에 cooperative shutdown/SIGTERM 수렴을 시도해야 한다.
 - native hook은 SSH, MySQL, PostgreSQL처럼 포트 번호 자체가 프로토콜 계약인 고정 포트는 기본적으로 재매핑하지 않아야 하며, 제외 목록은 설정으로 변경할 수 있어야 한다.
 - 플랫폼별 조회 방식을 지원해야 한다.
   - macOS/Linux: `lsof`, `netstat`, `ss` 중 사용 가능한 명령
@@ -262,6 +265,11 @@ Port Manager agent가 관리하는 `논리 포트 -> 실제 포트` 관계이다
   - 요청 포트와 route scope를 해시해 가상 포트 범위 안의 실제 포트를 고른다.
   - 실제 포트가 사용 중이면 같은 가상 범위 안에서 선형 탐색한다.
   - 요청 포트는 실제 bind 포트로 사용하지 않는다.
+- native hook의 high-port 라우팅은 실제 5만번대 포트를 `127.0.0.1`에 bind하지 않고,
+  logical network별 actual loopback IP에 bind한다. 따라서 디버거와 런타임이 직접 여는
+  `127.0.0.1:5xxxx` 포트는 Port Manager의 actual-port pool과 충돌하지 않아야 한다.
+- `loopbackAddressRoutingMode`가 `loopback`이면 native hook은 high-port 할당보다 먼저
+  logical network 전용 loopback IP에 요청 포트 그대로 bind한다.
 - 호환 정책인 `nearest`에서는 요청 포트가 사용 중이면 설정된 범위 안에서 가장 가까운 사용 가능 포트를 찾는다.
 - `nearest`의 기본 탐색 정책은 증가 방향이다.
   - `3000` 사용 중이면 `3001`, `3002`, `3003` 순서로 탐색
@@ -274,6 +282,7 @@ Port Manager agent가 관리하는 `논리 포트 -> 실제 포트` 관계이다
   "portManager.scanRange": 20,
   "portManager.scanDirection": "up",
   "portManager.routingMode": "hashed",
+  "portManager.loopbackAddressRoutingMode": "high-port",
   "portManager.virtualPortRangeStart": 53000,
   "portManager.virtualPortRangeEnd": 59999
 }
@@ -394,6 +403,7 @@ OS Listening Ports:
   "portManager.scanRange": 20,
   "portManager.scanDirection": "up",
   "portManager.routingMode": "hashed",
+  "portManager.loopbackAddressRoutingMode": "high-port",
   "portManager.virtualPortRangeStart": 53000,
   "portManager.virtualPortRangeEnd": 59999,
   "portManager.preferredPorts": [3000, 3001, 5173, 8000, 8080],

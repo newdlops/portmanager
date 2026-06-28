@@ -8,7 +8,9 @@
 
 import type { LoopbackAddressRoutingMode } from "../../shared/types";
 
+export const ACTUAL_LOOPBACK_HOST_ENV = "PORT_MANAGER_ACTUAL_LOOPBACK_HOST";
 export const NETWORK_LOOPBACK_HOST_ENV = "PORT_MANAGER_NETWORK_LOOPBACK_HOST";
+const DEFAULT_LOOPBACK_ADDRESS_ROUTING_MODE: LoopbackAddressRoutingMode = "high-port";
 
 export function isLoopbackAddressRoutingEnabled(settings: {
   readonly enableLoopbackAddressRouting?: boolean;
@@ -25,7 +27,11 @@ export function resolveLoopbackAddressRoutingMode(settings: {
     return settings.loopbackAddressRoutingMode;
   }
 
-  return settings.enableLoopbackAddressRouting === true ? "auto" : "high-port";
+  if (settings.enableLoopbackAddressRouting !== undefined) {
+    return settings.enableLoopbackAddressRouting ? "auto" : "high-port";
+  }
+
+  return DEFAULT_LOOPBACK_ADDRESS_ROUTING_MODE;
 }
 
 export function loopbackAddressForNetwork(networkId: string): string {

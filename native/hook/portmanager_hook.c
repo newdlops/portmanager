@@ -43,6 +43,7 @@
 #define PM_DEFAULT_FIXED_PROTOCOL_PORTS "22,25,53,80,110,143,389,443,465,587,993,995,1433,1521,3306,33060,5432,5672,6379,9200,9300,11211,27017"
 #define PM_AGENT_ROUNDTRIP_TIMEOUT_MS 5000
 #define PM_BIND_ALLOCATION_ATTEMPTS 4
+#define PM_ACTUAL_LOOPBACK_HOST_ENV "PORT_MANAGER_ACTUAL_LOOPBACK_HOST"
 #define PM_NETWORK_LOOPBACK_HOST_ENV "PORT_MANAGER_NETWORK_LOOPBACK_HOST"
 
 typedef int (*pm_bind_fn)(int, const struct sockaddr *, socklen_t);
@@ -98,6 +99,7 @@ static int pm_route_count = 0;
 static unsigned long pm_request_sequence = 1;
 
 static void pm_release_process_routes(void);
+static const char *pm_actual_loopback_host(void);
 static const char *pm_current_network_id(void);
 static const char *pm_network_loopback_host(void);
 extern char **environ;
@@ -1675,8 +1677,8 @@ static int pm_route_host_is_wildcard_text(const char *host) {
      strcmp(host, "*") == 0);
 }
 
-static const char *pm_network_loopback_host(void) {
-  const char *host = getenv(PM_NETWORK_LOOPBACK_HOST_ENV);
+static const char *pm_non_default_loopback_host_env(const char *name) {
+  const char *host = getenv(name);
   struct in_addr address;
   uint32_t ip;
 
@@ -1694,6 +1696,14 @@ static const char *pm_network_loopback_host(void) {
   }
 
   return host;
+}
+
+static const char *pm_actual_loopback_host(void) {
+  return pm_non_default_loopback_host_env(PM_ACTUAL_LOOPBACK_HOST_ENV);
+}
+
+static const char *pm_network_loopback_host(void) {
+  return pm_non_default_loopback_host_env(PM_NETWORK_LOOPBACK_HOST_ENV);
 }
 
 static void pm_sockaddr_host(const struct sockaddr *addr, char *buffer, size_t size) {
@@ -2413,6 +2423,7 @@ static int pm_response_ok(const char *response) {
 static int pm_allocate_route(
   int logical_port,
   const char *host,
+  const char *actual_host,
   const char *route_direction,
   int *actual_port,
   char *allocation_id,
@@ -2422,6 +2433,8 @@ static int pm_allocate_route(
   char cwd_json[PM_MAX_TEXT * 2];
   char command_json[PM_MAX_TEXT * 2];
   char host_json[256];
+  char actual_host_json[256];
+  char actual_host_payload[320];
   char route_direction_json[32];
   char network_payload[PM_MAX_TEXT * 3];
   char request[PM_MAX_REQUEST];
@@ -2433,6 +2446,12 @@ static int pm_allocate_route(
   pm_json_escape(cwd, cwd_json, sizeof(cwd_json));
   pm_json_escape(command, command_json, sizeof(command_json));
   pm_json_escape(host, host_json, sizeof(host_json));
+  if (actual_host != NULL && actual_host[0] != '\0' && strcmp(actual_host, host) != 0) {
+    pm_json_escape(actual_host, actual_host_json, sizeof(actual_host_json));
+    snprintf(actual_host_payload, sizeof(actual_host_payload), ",\"actualHost\":\"%s\"", actual_host_json);
+  } else {
+    actual_host_payload[0] = '\0';
+  }
   pm_json_escape(route_direction == NULL ? "listen" : route_direction, route_direction_json, sizeof(route_direction_json));
   pm_network_scope_payload(network_payload, sizeof(network_payload));
   response[0] = '\0';
@@ -2440,7 +2459,7 @@ static int pm_allocate_route(
   snprintf(
     request,
     sizeof(request),
-    "{\"id\":\"hook-%ld-%lu\",\"method\":\"allocateRoute\",\"payload\":{\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"host\":\"%s\",\"routeDirection\":\"%s\"%s,\"scanRange\":%d,\"scanDirection\":\"up\",\"routingMode\":\"%s\",\"virtualPortRangeStart\":%d,\"virtualPortRangeEnd\":%d}}\n",
+    "{\"id\":\"hook-%ld-%lu\",\"method\":\"allocateRoute\",\"payload\":{\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"host\":\"%s\"%s,\"routeDirection\":\"%s\"%s,\"scanRange\":%d,\"scanDirection\":\"up\",\"routingMode\":\"%s\",\"virtualPortRangeStart\":%d,\"virtualPortRangeEnd\":%d}}\n",
     (long)getpid(),
     sequence,
     command_json,
@@ -2448,6 +2467,7 @@ static int pm_allocate_route(
     cwd_json,
     logical_port,
     host_json,
+    actual_host_payload,
     route_direction_json,
     network_payload,
     pm_parse_int_env("PORT_MANAGER_SCAN_RANGE", PM_DEFAULT_SCAN_RANGE),
@@ -2456,9 +2476,10 @@ static int pm_allocate_route(
     pm_parse_int_env("PORT_MANAGER_VIRTUAL_PORT_END", PM_DEFAULT_VIRTUAL_END));
 
   pm_debug(
-    "allocating route logical=%d host=%s direction=%s mode=%s",
+    "allocating route logical=%d host=%s actualHost=%s direction=%s mode=%s",
     logical_port,
     host,
+    actual_host != NULL && actual_host[0] != '\0' ? actual_host : host,
     route_direction_json,
     pm_routing_mode());
   if (pm_agent_roundtrip(request, response, sizeof(response)) != 0 || !pm_response_ok(response)) {
@@ -2909,7 +2930,9 @@ static int pm_route_table_lookup(
 static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   struct sockaddr_storage rewritten;
   char host[128];
+  char bind_host[128];
   char allocation_id[PM_MAX_TEXT];
+  const char *actual_loopback_host;
   const char *loopback_host;
   int logical_port;
   int actual_port;
@@ -2982,12 +3005,18 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
     errno = saved_errno;
   }
   allocation_id[0] = '\0';
+  actual_loopback_host = pm_actual_loopback_host();
+  if (actual_loopback_host == NULL) {
+    actual_loopback_host = loopback_host;
+  }
+
   /*
    * Sender-first reservations can be created by clients that resolve localhost
    * to ::1. The listener must reuse only the reserved actual port; its route
    * host must remain the address that bind() was asked to open.
    */
-  actual_port = pm_route_table_lookup(logical_port, 0, "send", NULL, 0, NULL);
+  bind_host[0] = '\0';
+  actual_port = pm_route_table_lookup(logical_port, 0, "send", bind_host, sizeof(bind_host), NULL);
 
   result = -1;
   for (int attempt = 0; attempt < PM_BIND_ALLOCATION_ATTEMPTS; attempt++) {
@@ -2998,7 +3027,8 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
       actual_port = logical_port;
 
       pm_hook_depth++;
-      if (pm_allocate_route(logical_port, host, "listen", &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
+      snprintf(bind_host, sizeof(bind_host), "%s", actual_loopback_host != NULL ? actual_loopback_host : host);
+      if (pm_allocate_route(logical_port, bind_host, NULL, "listen", &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
         pm_hook_depth--;
         if (attempt + 1 < PM_BIND_ALLOCATION_ATTEMPTS) {
           usleep(50000);
@@ -3009,11 +3039,15 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
       }
       pm_hook_depth--;
     } else {
-      pm_debug("bind reusing route table logical=%d actual=%d host=%s", logical_port, actual_port, host);
+      if (bind_host[0] == '\0') {
+        snprintf(bind_host, sizeof(bind_host), "%s", actual_loopback_host != NULL ? actual_loopback_host : host);
+      }
+      pm_debug("bind reusing route table logical=%d actual=%d host=%s", logical_port, actual_port, bind_host);
     }
 
     memcpy(&rewritten, addr, addrlen);
     pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
+    pm_set_sockaddr_host((struct sockaddr *)&rewritten, bind_host);
 
     result = pm_real_bind(sockfd, (struct sockaddr *)&rewritten, addrlen);
     if (result == 0) {
@@ -3043,12 +3077,12 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
     char logical_text[16];
     char actual_text[16];
 
-    pm_remember_route(logical_port, actual_port, host, allocation_id);
+    pm_remember_route(logical_port, actual_port, bind_host, allocation_id);
     snprintf(logical_text, sizeof(logical_text), "%d", logical_port);
     snprintf(actual_text, sizeof(actual_text), "%d", actual_port);
     setenv("PORT_MANAGER_LOGICAL_PORT", logical_text, 1);
     setenv("PORT_MANAGER_ACTUAL_PORT", actual_text, 1);
-    pm_register_process(logical_port, actual_port, host, allocation_id);
+    pm_register_process(logical_port, actual_port, bind_host, allocation_id);
   } else {
     pm_release_allocation(allocation_id);
   }
@@ -3059,6 +3093,7 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
 static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   struct sockaddr_storage rewritten;
   char target_host[128];
+  const char *actual_loopback_host;
   const char *loopback_host;
   int route_is_compose;
   int logical_port;
@@ -3118,15 +3153,22 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
     char allocation_id[PM_MAX_TEXT];
 
     pm_sockaddr_host(addr, target_host, sizeof(target_host));
+    actual_loopback_host = pm_actual_loopback_host();
+    if (actual_loopback_host == NULL) {
+      actual_loopback_host = pm_network_loopback_host();
+    }
     allocation_id[0] = '\0';
 
     pm_hook_depth++;
-    if (pm_allocate_route(logical_port, target_host, "send", &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
+    if (pm_allocate_route(logical_port, target_host, actual_loopback_host, "send", &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
       actual_port = 0;
     }
     pm_hook_depth--;
 
     if (actual_port > 0) {
+      if (actual_port != logical_port && actual_loopback_host != NULL) {
+        snprintf(target_host, sizeof(target_host), "%s", actual_loopback_host);
+      }
       /*
        * connect() may arrive before the server bind(). Keep the daemon's
        * pending route as the shared endpoint reservation, but do not cache it

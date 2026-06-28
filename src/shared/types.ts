@@ -645,6 +645,8 @@ export interface AgentAllocateRouteRequest {
   readonly requestedPort: number;
   /** Host used for scanning and URL generation. */
   readonly host: string;
+  /** Host where a newly allocated actual port should bind; defaults to host. */
+  readonly actualHost?: string;
   /** Logical network scope inherited from an attached terminal window. */
   readonly networkId?: string;
   /** Whether this allocation is preparing a listener bind or a sender connect. */

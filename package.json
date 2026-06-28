@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.7",
+  "version": "0.0.7002",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -758,11 +758,11 @@
             "loopback"
           ],
           "enumDescriptions": [
-            "Keep the existing high-port remapping behavior and do not create loopback aliases.",
-            "Use a per-network loopback address only when the alias already exists or can be created without prompting.",
-            "Prefer per-network loopback addresses and allow the attach script to prompt for sudo to add a missing macOS lo0 alias."
+            "Assign actual ports from the virtual high-port range on a per-network loopback address.",
+            "Use same-port per-network loopback routing only when the alias already exists or can be created without prompting; otherwise attach fails closed.",
+            "Use per-network loopback addresses and allow the attach script to prompt for sudo to add a missing macOS lo0 alias."
           ],
-          "description": "Controls whether attached terminals route sockets through high-port remapping or per-network loopback IP aliases."
+          "description": "Controls whether attached terminals keep requested ports on per-network loopback IPs or remap them to high ports on that loopback IP."
         },
         "portManager.virtualPortRangeStart": {
           "type": "number",

@@ -76,6 +76,44 @@ test("registers native hook processes as hooked managed rows", async (context) =
   listeners = [];
 });
 
+test("new agent generation clears previous network route files on startup", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const networkRouteTablePath = getNetworkRouteTablePath("network-a", routeTablePath);
+  const routeEntryPath = getRouteTablePathForLogicalPort(8000, "network-a", routeTablePath);
+  const staleRoutes = [
+    {
+      logicalPort: 8000,
+      actualPort: 58000,
+      routeDirection: "listen",
+      host: "127.0.0.1",
+      networkId: "network-a",
+      status: "running",
+      source: "hooked",
+    },
+  ];
+
+  fs.mkdirSync(path.dirname(routeTablePath), { recursive: true });
+  for (const filePath of [routeTablePath, networkRouteTablePath, routeEntryPath]) {
+    fs.writeFileSync(filePath, `${JSON.stringify({ updatedAt: fixedUpdatedAt, routes: staleRoutes }, null, 2)}\n`);
+  }
+
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  assert.deepEqual(readRouteTable(routeTablePath).routes, []);
+  assert.deepEqual(readRouteTable(networkRouteTablePath).routes, []);
+  assert.equal(fs.existsSync(routeEntryPath), false);
+});
+
 test("keeps unscoped host listeners out of cwd-matched networks", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const agent = new PortManagerAgent({
@@ -861,6 +899,75 @@ test("reuses pending route allocations for sender-first and receiver-first order
 
   assert.equal(laterSenderAllocation.allocationId, firstReceiverAllocation.allocationId);
   assert.equal(laterSenderAllocation.actualPort, firstReceiverAllocation.actualPort);
+});
+
+test("allocates new routes on actualHost without breaking same-port send detection", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const checkedHosts: string[] = [];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: {
+      check: async (port, host) => {
+        checkedHosts.push(host ?? "");
+        return { port, available: true };
+      },
+    },
+    listeningPortProvider: {
+      list: async () => [
+        createListener({
+          port: 8123,
+          localAddress: "127.0.0.1",
+          pid: 4567,
+          processName: "node",
+        }),
+      ],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const actualHost = "127.80.10.20";
+  const listenerAllocation = await agent.allocateRoute({
+    name: "vite",
+    command: "vite --host",
+    cwd: "/workspace/app",
+    requestedPort: 3004,
+    host: "127.0.0.1",
+    actualHost,
+    networkId: "network-a",
+    routeDirection: "listen",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+
+  assert.equal(listenerAllocation.host, actualHost);
+  assert.equal(listenerAllocation.logicalRoutes[0]?.host, actualHost);
+  assert.deepEqual(checkedHosts, [actualHost]);
+
+  const senderAllocation = await agent.allocateRoute({
+    name: "wait-on",
+    command: "wait-on http://localhost:8123",
+    cwd: "/workspace/app",
+    requestedPort: 8123,
+    host: "127.0.0.1",
+    actualHost,
+    networkId: "network-a",
+    routeDirection: "send",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+
+  assert.equal(senderAllocation.actualPort, 8123);
+  assert.equal(senderAllocation.host, "127.0.0.1");
+  assert.deepEqual(checkedHosts, [actualHost]);
 });
 
 test("uses same-port OS listeners for sender requests before creating a shadow route", async (context) => {

@@ -268,6 +268,7 @@ test("external pm shell function exposes doctor routes and detach diagnostics", 
   assert.equal(commandSource.includes("Daemon readiness flag:"), true);
   assert.equal(commandSource.includes("Routing mode:"), true);
   assert.equal(commandSource.includes("Network loopback host:"), true);
+  assert.equal(commandSource.includes("Actual loopback host:"), true);
   assert.equal(commandSource.includes("Route table:"), true);
   assert.equal(commandSource.includes("Route sources:"), true);
   assert.equal(commandSource.includes("Route warning: current network has no app/server route rows."), true);
@@ -276,6 +277,7 @@ test("external pm shell function exposes doctor routes and detach diagnostics", 
   assert.equal(commandSource.includes("other-network"), true);
   assert.equal(commandSource.includes("manage\\\\.py\\\\s+runserver"), true);
   assert.equal(commandSource.includes("PORT_MANAGER_NETWORK_LOOPBACK_HOST"), true);
+  assert.equal(commandSource.includes("PORT_MANAGER_ACTUAL_LOOPBACK_HOST"), true);
   assert.equal(commandSource.includes("Network selection file:"), true);
   assert.equal(commandSource.includes("Host access:"), true);
   assert.equal(commandSource.includes("Port Manager routes:"), true);
@@ -350,7 +352,9 @@ test("terminal daemon ensure serializes agent startup and preserves slow live so
 
 test("background routing refresh converges daemon version and generated route files", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const agentClientPath = path.resolve(__dirname, "../../../src/extension/local-agent-client.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
+  const agentClientSource = fs.readFileSync(agentClientPath, "utf8");
   const convergeStart = source.indexOf("private async convergeDaemonAndRoutingStateExclusive");
   const convergeEnd = source.indexOf("private async ensureCurrentProcessDaemon", convergeStart);
   const convergeBody = source.slice(convergeStart, convergeEnd);
@@ -370,6 +374,10 @@ test("background routing refresh converges daemon version and generated route fi
   assert.equal(ensureBody.includes("await this.processService.start();"), true);
   assert.equal(ensureBody.includes("daemon.restartRequired"), true);
   assert.equal(ensureBody.includes("await this.processService.restartDaemon();"), true);
+  assert.equal(agentClientSource.includes("const previousPid = this.snapshot.daemon.pid;"), true);
+  assert.equal(agentClientSource.includes("await this.waitForPreviousDaemonExit(previousPid);"), true);
+  assert.equal(agentClientSource.includes('process.kill(pid, "SIGTERM");'), true);
+  assert.equal(agentClientSource.includes("function isProcessAlive(pid: number): boolean"), true);
 });
 
 test("logical port routers use a single cross-window owner lease", () => {
@@ -496,7 +504,7 @@ test("compose route rehydration retries recoverable error attachments after rest
   assert.equal(source.includes("await this.removeComposeRouteProcesses(attachment, [port]);"), true);
 });
 
-test("terminal attach script enables loopback routing only after alias readiness", () => {
+test("terminal attach script prepares actual loopback routing only after alias readiness", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
 
@@ -504,11 +512,16 @@ test("terminal attach script enables loopback routing only after alias readiness
   assert.equal(source.includes("sudo -n ifconfig lo0 alias"), true);
   assert.equal(source.includes('sudo ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null'), true);
   assert.equal(source.includes("portManager.loopbackAddressRoutingMode"), true);
-  assert.equal(source.includes("Port Manager loopback IP routing unavailable; using high-port routing fallback."), true);
+  assert.equal(source.includes("Port Manager high-port loopback IP routing unavailable; attach aborted."), true);
   assert.equal(source.includes("Port Manager loopback IP routing unavailable; attach aborted."), true);
   assert.equal(source.includes("export PORT_MANAGER_HOOK_DISABLED=1"), true);
   assert.equal(source.includes("return 1 2>/dev/null || exit 1"), true);
+  assert.equal(source.includes("ACTUAL_LOOPBACK_HOST_ENV"), true);
   assert.equal(source.includes("NETWORK_LOOPBACK_HOST_ENV"), true);
+  assert.equal(source.includes("ensureLoopbackAddressRoutingHostReady"), true);
+  assert.equal(source.includes("refreshVscodeWindowTerminalEnvironment"), true);
+  assert.equal(source.includes('binding?.status === "attached"'), true);
+  assert.equal(source.includes("VS Code terminal default not applied."), true);
 });
 
 test("native hook preserves listener ports only for explicit overrides", () => {
@@ -518,6 +531,46 @@ test("native hook preserves listener ports only for explicit overrides", () => {
   assert.equal(source.includes("return pm_is_preserved_listen_port(logical_port);"), true);
   assert.equal(source.includes("pm_current_process_looks_like_browser_dev_server"), false);
   assert.equal(source.includes("stable browser alias"), true);
+});
+
+test("native hook binds high-port routes on dedicated actual loopback hosts", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const loopbackStart = source.indexOf("loopback_host = pm_network_loopback_host();");
+  const allocationStart = source.indexOf("pm_allocate_route(logical_port, bind_host, NULL, \"listen\"");
+  const loopbackBind = source.slice(loopbackStart, allocationStart);
+  const highPortBind = source.slice(allocationStart, source.indexOf("static int pm_connect_hook", allocationStart));
+
+  assert.notEqual(loopbackStart, -1);
+  assert.notEqual(allocationStart, -1);
+  assert.equal(loopbackStart < allocationStart, true);
+  assert.equal(loopbackBind.includes("pm_set_sockaddr_host((struct sockaddr *)&rewritten, loopback_host);"), true);
+  assert.equal(loopbackBind.includes("pm_remember_route(logical_port, logical_port, loopback_host, \"\");"), true);
+  assert.equal(loopbackBind.includes("pm_register_process(logical_port, logical_port, loopback_host, \"\");"), true);
+  assert.equal(source.includes('PM_ACTUAL_LOOPBACK_HOST_ENV "PORT_MANAGER_ACTUAL_LOOPBACK_HOST"'), true);
+  assert.equal(source.includes("actual_loopback_host = pm_actual_loopback_host();"), true);
+  assert.equal(highPortBind.includes("pm_set_sockaddr_host((struct sockaddr *)&rewritten, bind_host);"), true);
+  assert.equal(highPortBind.includes("pm_register_process(logical_port, actual_port, bind_host, allocation_id);"), true);
+  assert.equal(source.includes("actual_host_payload"), true);
+  assert.equal(source.includes('\\"actualHost\\":\\"%s\\"'), true);
+  assert.equal(source.includes('pm_allocate_route(logical_port, target_host, actual_loopback_host, "send"'), true);
+});
+
+test("native agent adopts previous route files before first startup write", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/agent/portmanager_agent_state.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const adoptStart = source.indexOf("static void pm_adopt_previous_generation_route_files");
+  const initStart = source.indexOf("void pm_state_init");
+  const initBody = source.slice(initStart, source.indexOf("void pm_state_dispose", initStart));
+  const adoptBody = source.slice(adoptStart, initStart);
+
+  assert.notEqual(adoptStart, -1);
+  assert.notEqual(initStart, -1);
+  assert.equal(adoptBody.includes("state->written_entry_paths"), true);
+  assert.equal(adoptBody.includes("state->written_network_ids"), true);
+  assert.equal(adoptBody.includes("unlink(file_path);"), false);
+  assert.equal(initBody.includes("pm_adopt_previous_generation_route_files(state);"), true);
+  assert.equal(initBody.includes("pm_write_route_tables(state);"), true);
 });
 
 test("native preload repair is opt-in at runtime shim boundaries", () => {

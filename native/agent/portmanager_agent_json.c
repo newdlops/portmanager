@@ -387,6 +387,7 @@ int pm_parse_allocate_input(const char *payload, pm_allocate_input *input) {
   pm_json_get_string(payload, "command", input->command, sizeof(input->command));
   pm_json_get_string(payload, "cwd", input->cwd, sizeof(input->cwd));
   pm_json_get_string(payload, "host", input->host, sizeof(input->host));
+  pm_json_get_string(payload, "actualHost", input->actual_host, sizeof(input->actual_host));
   pm_json_get_string(payload, "networkId", input->network_id, sizeof(input->network_id));
   pm_json_get_string(payload, "routeDirection", input->route_direction, sizeof(input->route_direction));
   pm_json_get_string(payload, "scanDirection", input->scan_direction, sizeof(input->scan_direction));
@@ -397,6 +398,7 @@ int pm_parse_allocate_input(const char *payload, pm_allocate_input *input) {
   input->virtual_end = pm_json_get_int(payload, "virtualPortRangeEnd", PM_DEFAULT_VIRTUAL_END);
   pm_default_text(input->cwd, sizeof(input->cwd), ".");
   pm_default_text(input->host, sizeof(input->host), "localhost");
+  pm_default_text(input->actual_host, sizeof(input->actual_host), input->host);
   pm_default_text(input->route_direction, sizeof(input->route_direction), "listen");
   pm_default_text(input->scan_direction, sizeof(input->scan_direction), "up");
   pm_default_text(input->routing_mode, sizeof(input->routing_mode), "nearest");

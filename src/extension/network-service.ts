@@ -19,6 +19,7 @@ import {
   type LogicalNetworkRegistryState,
 } from "../core/networks/logical-network-registry";
 import {
+  ACTUAL_LOOPBACK_HOST_ENV,
   browserLoopbackAddressForNetwork,
   isLoopbackAddressRoutingEnabled,
   loopbackAddressForNetwork,
@@ -519,9 +520,9 @@ export class PortManagerNetworkService implements DisposableLike {
         ) {
           void this.refreshRuntimeDescriptors();
           void this.refreshContainerServices({ background: true });
-          this.applyVscodeWindowTerminalEnvironment();
         }
         if (event.affectsConfiguration("portManager")) {
+          void this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
           void this.writeTerminalNetworkSelectionFile();
         }
       }),
@@ -530,7 +531,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.reloadSharedNetworkState();
     await this.refreshRuntimeDescriptors();
     this.reconcileVscodeWindowTerminalBinding();
-    this.applyVscodeWindowTerminalEnvironment();
+    await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
     await this.repairPersistedPortManagerCloneComposeAttachments();
@@ -954,6 +955,11 @@ export class PortManagerNetworkService implements DisposableLike {
       throw new Error(`Native terminal routing is not supported on ${process.platform}.`);
     }
 
+    await ensureLoopbackAddressRoutingHostReady(
+      loopbackAddressForNetwork(networkId),
+      resolveLoopbackAddressRoutingMode(settings),
+      { interactive: true },
+    );
     await this.processService?.start();
     const binding: VscodeWindowTerminalBinding = {
       id: "vscode-window",
@@ -1895,7 +1901,8 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Updates VS Code's new-terminal environment for the current window/workspace. */
   private applyVscodeWindowTerminalEnvironment(): void {
-    const networkId = this.vscodeWindowTerminalBinding?.networkId;
+    const binding = this.vscodeWindowTerminalBinding;
+    const networkId = binding?.status === "attached" ? binding.networkId : undefined;
 
     applyTerminalHookEnvironment(
       this.context,
@@ -1907,6 +1914,43 @@ export class PortManagerNetworkService implements DisposableLike {
             composeRoutingFilePath: this.getComposeProjectRoutingFilePath(networkId),
           },
     );
+  }
+
+  /**
+   * Prepares the loopback host before VS Code starts inheriting native-hook
+   * variables. Env collection alone cannot run ifconfig, so persisted window
+   * defaults fail closed instead of falling back to localhost high ports.
+   */
+  private async refreshVscodeWindowTerminalEnvironment(options: { readonly interactive: boolean }): Promise<void> {
+    const binding = this.vscodeWindowTerminalBinding;
+
+    if (binding !== undefined) {
+      const settings = readPortManagerSettings();
+      let nextBinding = binding;
+
+      if (settings.enabled && shouldInjectTerminalHook(settings)) {
+        try {
+          await ensureLoopbackAddressRoutingHostReady(
+            loopbackAddressForNetwork(binding.networkId),
+            resolveLoopbackAddressRoutingMode(settings),
+            options,
+          );
+          if (binding.status === "error") {
+            nextBinding = { ...binding, status: "attached", errorMessage: undefined };
+          }
+        } catch (error) {
+          nextBinding = { ...binding, status: "error", errorMessage: formatError(error) };
+        }
+      }
+
+      if (nextBinding !== binding) {
+        this.vscodeWindowTerminalBinding = nextBinding;
+        this.saveVscodeWindowTerminalBinding();
+        this.localChangeEvents.emit();
+      }
+    }
+
+    this.applyVscodeWindowTerminalEnvironment();
   }
 
   /** Sends the current network routing script to all already-open VS Code terminals. */
@@ -3449,9 +3493,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_PRESERVE_LISTEN_PORTS", settings.preservedListenPorts.join(",")),
       shellPrependLibrary(preloadVariable, hookLibraryPath),
     ];
-    if (isLoopbackAddressRoutingEnabled(settings)) {
-      commands.push(buildLoopbackAddressRoutingShell(loopbackAddressForNetwork(networkId), resolveLoopbackAddressRoutingMode(settings)));
-    }
+    commands.push(buildLoopbackAddressRoutingShell(loopbackAddressForNetwork(networkId), resolveLoopbackAddressRoutingMode(settings)));
     commands.push(buildAgentDaemonEnsureShell(process.execPath));
 
     if (process.platform === "darwin" && shellEnvRestorePath !== undefined) {
@@ -3521,6 +3563,7 @@ export class PortManagerNetworkService implements DisposableLike {
       "PORT_MANAGER_VIRTUAL_PORT_END",
       "PORT_MANAGER_FIXED_PROTOCOL_PORTS",
       "PORT_MANAGER_PRESERVE_LISTEN_PORTS",
+      ACTUAL_LOOPBACK_HOST_ENV,
       NETWORK_LOOPBACK_HOST_ENV,
       "PORT_MANAGER_DYLD_INSERT_LIBRARIES",
       RUNTIME_SHIM_DIRECTORY_ENV,
@@ -4732,11 +4775,8 @@ function isBrowserDnsResolverConfigured(hostname: string): boolean {
   }
 }
 
-/**
- * Browser DNS aliases return non-default 127.x.x.x addresses. On macOS those
- * addresses must exist on lo0 before the browser isolation proxy can bind them.
- */
-function isBrowserDnsLoopbackAliasConfigured(address: string): boolean {
+/** Non-default 127.x.x.x hosts must exist on macOS lo0 before local binds work. */
+function isLoopbackAddressAliasConfigured(address: string): boolean {
   if (process.platform !== "darwin") {
     return true;
   }
@@ -4747,6 +4787,81 @@ function isBrowserDnsLoopbackAliasConfigured(address: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Ensures terminal hook routing can bind actual high ports on the network's
+ * dedicated loopback host. This is a low-level macOS preparation step; routing
+ * policy decides separately whether the requested port is kept or remapped.
+ */
+async function ensureLoopbackAddressRoutingHostReady(
+  address: string,
+  mode: "auto" | "loopback" | "high-port",
+  options: { readonly interactive: boolean },
+): Promise<void> {
+  if (isLoopbackAddressAliasConfigured(address)) {
+    return;
+  }
+
+  try {
+    if (options.interactive && mode !== "auto") {
+      await runShellScriptWithAdministratorPrivileges(buildLoopbackAliasSetupScript(address));
+    } else {
+      await execFileAsync("/bin/sh", ["-c", buildNonInteractiveLoopbackAliasSetupCommand(address)], {
+        timeout: 5_000,
+        maxBuffer: 128 * 1024,
+      });
+    }
+  } catch (error) {
+    throw new Error(loopbackAddressRoutingFailureMessage(mode, "VS Code terminal default not applied."), {
+      cause: error,
+    });
+  }
+
+  if (!isLoopbackAddressAliasConfigured(address)) {
+    throw new Error(loopbackAddressRoutingFailureMessage(mode, "VS Code terminal default not applied."));
+  }
+}
+
+function buildLoopbackAliasSetupScript(address: string): string {
+  const quotedAddress = shellQuote(address);
+  const aliasPattern = shellQuote(`inet[[:space:]]+${address}([[:space:]]|$)`);
+
+  return [
+    "#!/bin/sh",
+    "set -eu",
+    `if ! ifconfig lo0 2>/dev/null | grep -E ${aliasPattern} >/dev/null 2>&1; then`,
+    `  ifconfig lo0 alias ${quotedAddress} 255.255.255.255`,
+    "fi",
+  ].join("\n");
+}
+
+function buildNonInteractiveLoopbackAliasSetupCommand(address: string): string {
+  const quotedAddress = shellQuote(address);
+  return [
+    `ifconfig lo0 alias ${quotedAddress} 255.255.255.255 >/dev/null 2>&1`,
+    `sudo -n ifconfig lo0 alias ${quotedAddress} 255.255.255.255 >/dev/null 2>&1`,
+  ].join(" || ");
+}
+
+function loopbackAddressRoutingFailureMessage(
+  mode: "auto" | "loopback" | "high-port",
+  suffix: string,
+): string {
+  const prefix =
+    mode === "high-port"
+      ? "Port Manager high-port loopback IP routing unavailable"
+      : "Port Manager loopback IP routing unavailable";
+
+  return `${prefix}; ${suffix}`;
+}
+
+/**
+ * Browser DNS aliases return non-default 127.x.x.x addresses. On macOS those
+ * addresses must exist on lo0 before the browser isolation proxy can bind them.
+ */
+function isBrowserDnsLoopbackAliasConfigured(address: string): boolean {
+  return isLoopbackAddressAliasConfigured(address);
 }
 
 function normalizeBrowserProxyTargetHost(host: string): string {
@@ -5431,52 +5546,54 @@ function shellPrependLibrary(name: string, libraryPath: string): string {
 
 /**
  * Enables loopback-address routing only after the OS can bind the generated
- * address. Auto mode keeps startup non-interactive and can fall back to high
- * ports; loopback mode may prompt for sudo and fails closed if provisioning
- * fails.
+ * address. High-port and same-port modes both depend on this host; auto mode
+ * keeps startup non-interactive, while explicit modes may prompt for sudo.
  */
 function buildLoopbackAddressRoutingShell(host: string, mode: "auto" | "loopback" | "high-port"): string {
   const quotedHost = shellQuote(host);
+  const successCommands = [
+    mode === "high-port"
+      ? `unset ${NETWORK_LOOPBACK_HOST_ENV}`
+      : `export ${NETWORK_LOOPBACK_HOST_ENV}="$__pm_loopback_host"`,
+    `export ${ACTUAL_LOOPBACK_HOST_ENV}="$__pm_loopback_host"`,
+  ];
 
-  if (mode === "high-port") {
-    return `unset ${NETWORK_LOOPBACK_HOST_ENV}`;
-  }
-
+  /*
+   * High-port routing still needs a dedicated bind host. It keeps the logical
+   * localhost listener separate from the actual 5xxxx pool so host apps remain
+   * free to use localhost high ports directly.
+   */
   if (process.platform !== "darwin") {
-    return `export ${NETWORK_LOOPBACK_HOST_ENV}=${quotedHost}`;
+    return [`__pm_loopback_host=${quotedHost}`, ...successCommands, `unset __pm_loopback_host`].join("\n");
   }
 
   const aliasCommand =
-    mode === "loopback"
-      ? `ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1 || sudo ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null`
-      : `ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1 || sudo -n ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1`;
+    mode === "auto"
+      ? `ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1 || sudo -n ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1`
+      : `ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null 2>&1 || sudo ifconfig lo0 alias "$__pm_loopback_host" 255.255.255.255 >/dev/null`;
   const failureMessage =
-    mode === "loopback"
-      ? "Port Manager loopback IP routing unavailable; attach aborted. Set portManager.loopbackAddressRoutingMode to auto or high-port to allow fallback."
-      : "Port Manager loopback IP routing unavailable; using high-port routing fallback.";
-  const failureCommands =
-    mode === "loopback"
-      ? [
-          `unset ${NETWORK_LOOPBACK_HOST_ENV}`,
-          `export PORT_MANAGER_HOOK=0`,
-          `export PORT_MANAGER_HOOK_DISABLED=1`,
-          `export PORT_MANAGER_HOOK_DAEMON_STARTED=0`,
-          `printf '%s\\n' ${shellQuote(failureMessage)} >&2`,
-          `unset __pm_loopback_host`,
-          `return 1 2>/dev/null || exit 1`,
-        ]
-      : [
-          `unset ${NETWORK_LOOPBACK_HOST_ENV}`,
-          `printf '%s\\n' ${shellQuote(failureMessage)} >&2`,
-          `unset __pm_loopback_host`,
-        ];
+    mode === "auto"
+      ? "Port Manager loopback IP routing unavailable; attach aborted. Set portManager.loopbackAddressRoutingMode to high-port or loopback to allow sudo alias setup."
+      : mode === "loopback"
+      ? "Port Manager loopback IP routing unavailable; attach aborted."
+      : "Port Manager high-port loopback IP routing unavailable; attach aborted.";
+  const failureCommands = [
+    `unset ${NETWORK_LOOPBACK_HOST_ENV}`,
+    `unset ${ACTUAL_LOOPBACK_HOST_ENV}`,
+    `export PORT_MANAGER_HOOK=0`,
+    `export PORT_MANAGER_HOOK_DISABLED=1`,
+    `export PORT_MANAGER_HOOK_DAEMON_STARTED=0`,
+    `printf '%s\\n' ${shellQuote(failureMessage)} >&2`,
+    `unset __pm_loopback_host`,
+    `return 1 2>/dev/null || exit 1`,
+  ];
 
   return [
     `__pm_loopback_host=${quotedHost}`,
     `if ifconfig lo0 2>/dev/null | grep -E "inet[[:space:]]+$__pm_loopback_host([[:space:]]|$)" >/dev/null 2>&1; then`,
-    `export ${NETWORK_LOOPBACK_HOST_ENV}="$__pm_loopback_host"`,
+    ...successCommands,
     `elif ${aliasCommand}; then`,
-    `export ${NETWORK_LOOPBACK_HOST_ENV}="$__pm_loopback_host"`,
+    ...successCommands,
     `else`,
     ...failureCommands,
     `fi`,

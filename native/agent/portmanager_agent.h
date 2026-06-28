@@ -128,6 +128,7 @@ typedef struct {
   char command[PM_TEXT];
   char cwd[PM_TEXT];
   char host[PM_SMALL];
+  char actual_host[PM_SMALL];
   char network_id[PM_SMALL];
   char route_direction[PM_DIRECTION];
   int requested_port;

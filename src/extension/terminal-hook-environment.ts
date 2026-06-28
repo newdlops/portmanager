@@ -9,6 +9,12 @@ import {
   getRouteTablePathForNetwork,
 } from "../agent/route-table";
 import { readPortManagerSettings } from "../config/vscode-settings";
+import {
+  ACTUAL_LOOPBACK_HOST_ENV,
+  isLoopbackAddressRoutingEnabled,
+  loopbackAddressForNetwork,
+  NETWORK_LOOPBACK_HOST_ENV,
+} from "../core/networks/loopback-address";
 import type { DisposableLike, PortManagerSettings } from "../shared/types";
 import {
   buildComposeProjectRoutingFunctionScript,
@@ -157,12 +163,28 @@ export function applyTerminalHookEnvironment(
     collection.replace("PORT_MANAGER_COMPOSE_ROUTING_FILE", scope.composeRoutingFilePath, TERMINAL_MUTATOR_OPTIONS);
   }
   applyRoutingSettings(collection, settings);
+  applyLoopbackRoutingHosts(collection, scope.networkId, settings);
   collection.prepend(preloadVariable, `${hookLibraryPath}${path.delimiter}`, TERMINAL_MUTATOR_OPTIONS);
   applyRuntimeShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath, runtimeCommandShimPath);
 
   if (shellEnvRestorePath !== undefined) {
     collection.replace("PORT_MANAGER_DYLD_INSERT_LIBRARIES", hookLibraryPath, TERMINAL_MUTATOR_OPTIONS);
     collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_MUTATOR_OPTIONS);
+  }
+}
+
+/** Mirrors the per-network bind hosts used by native high-port and same-port routing. */
+function applyLoopbackRoutingHosts(
+  collection: vscode.EnvironmentVariableCollection,
+  networkId: string,
+  settings: PortManagerSettings,
+): void {
+  const loopbackHost = loopbackAddressForNetwork(networkId);
+
+  collection.replace(ACTUAL_LOOPBACK_HOST_ENV, loopbackHost, TERMINAL_MUTATOR_OPTIONS);
+
+  if (isLoopbackAddressRoutingEnabled(settings)) {
+    collection.replace(NETWORK_LOOPBACK_HOST_ENV, loopbackHost, TERMINAL_MUTATOR_OPTIONS);
   }
 }
 
@@ -824,6 +846,16 @@ export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID=${shellQuote(scope.networkId)}
       : `export PORT_MANAGER_COMPOSE_ROUTING_FILE=${shellQuote(scope.composeRoutingFilePath)}`;
   const dockerShimExport =
     scope.dockerShimPath === undefined ? "" : `export ${DOCKER_SHIM_PATH_ENV}=${shellQuote(scope.dockerShimPath)}`;
+  const loopbackHost = scope.networkId === undefined ? undefined : loopbackAddressForNetwork(scope.networkId);
+  const loopbackExports =
+    loopbackHost === undefined
+      ? ""
+      : [
+          `export ${ACTUAL_LOOPBACK_HOST_ENV}=${shellQuote(loopbackHost)}`,
+          scope.settings !== undefined && isLoopbackAddressRoutingEnabled(scope.settings)
+            ? `export ${NETWORK_LOOPBACK_HOST_ENV}=${shellQuote(loopbackHost)}`
+            : `unset ${NETWORK_LOOPBACK_HOST_ENV}`,
+        ].join("\n");
   const agentExports = [
     scope.agentSocketPath === undefined ? "" : `export PORT_MANAGER_AGENT_SOCKET=${shellQuote(scope.agentSocketPath)}`,
     scope.agentMainPath === undefined ? "" : `export PORT_MANAGER_AGENT_MAIN=${shellQuote(scope.agentMainPath)}`,
@@ -859,6 +891,7 @@ ${networkScope}
 ${routeTableExports}
 ${agentExports}
 ${routingExports}
+${loopbackExports}
 ${composeRoutingExport}
 ${dockerShimExport}
 

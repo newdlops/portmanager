@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  ACTUAL_LOOPBACK_HOST_ENV,
   browserLoopbackAddressForNetwork,
   isLoopbackAddressRoutingEnabled,
   loopbackAddressForNetwork,
@@ -29,12 +30,14 @@ test("browser loopback addresses are stable and separate from app bind addresses
   assert.match(browserAddress, /^127\.(11[2-9]|12[0-9]|13[0-9]|14[0-3])\.\d{1,3}\.\d{1,3}$/);
 });
 
-test("loopback address routing mode keeps high-port as the default", () => {
+test("loopback address routing mode keeps high-port as the default actual-port policy", () => {
+  assert.equal(ACTUAL_LOOPBACK_HOST_ENV, "PORT_MANAGER_ACTUAL_LOOPBACK_HOST");
   assert.equal(NETWORK_LOOPBACK_HOST_ENV, "PORT_MANAGER_NETWORK_LOOPBACK_HOST");
   assert.equal(isLoopbackAddressRoutingEnabled({}), false);
   assert.equal(resolveLoopbackAddressRoutingMode({}), "high-port");
   assert.equal(isLoopbackAddressRoutingEnabled({ enableLoopbackAddressRouting: true }), true);
   assert.equal(resolveLoopbackAddressRoutingMode({ enableLoopbackAddressRouting: true }), "auto");
   assert.equal(isLoopbackAddressRoutingEnabled({ enableLoopbackAddressRouting: false }), false);
+  assert.equal(resolveLoopbackAddressRoutingMode({ enableLoopbackAddressRouting: false }), "high-port");
   assert.equal(resolveLoopbackAddressRoutingMode({ loopbackAddressRoutingMode: "loopback" }), "loopback");
 });

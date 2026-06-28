@@ -78,6 +78,8 @@ interface PendingRequest {
 const AGENT_STARTUP_LOCK_STALE_MS = 10_000;
 const AGENT_STARTUP_LOCK_WAIT_MS = 5_000;
 const AGENT_CONNECT_TIMEOUT_MS = 1_000;
+const AGENT_RESTART_EXIT_WAIT_MS = 2_000;
+const AGENT_RESTART_TERM_GRACE_MS = 500;
 
 /**
  * Agent-backed process service used by commands and the sidebar provider.
@@ -156,13 +158,49 @@ export class LocalAgentClient implements PortManagerProcessService {
 
   /** Restarts the singleton daemon using this extension's compiled agent. */
   async restartDaemon(): Promise<void> {
+    const previousPid = this.snapshot.daemon.pid;
+
     await this.stopDaemon();
-    await delay(150);
+    await this.waitForPreviousDaemonExit(previousPid);
     await this.ensureConnected();
     await this.refresh();
 
     if (this.snapshot.daemon.restartRequired) {
       throw new Error("Port Manager daemon restarted, but it still does not match the active extension build.");
+    }
+  }
+
+  /**
+   * Gives the previous daemon generation time to release the singleton socket.
+   * Shutdown is cooperative first; if the old process lingers, send SIGTERM and
+   * keep polling so the next connect does not accidentally reattach to it.
+   */
+  private async waitForPreviousDaemonExit(pid: number): Promise<void> {
+    if (pid <= 0 || pid === process.pid || !isProcessAlive(pid)) {
+      await delay(150);
+      return;
+    }
+
+    const startedAtMs = Date.now();
+    const termAfterMs = startedAtMs + AGENT_RESTART_TERM_GRACE_MS;
+    const deadlineMs = startedAtMs + AGENT_RESTART_EXIT_WAIT_MS;
+    let termSent = false;
+
+    while (Date.now() < deadlineMs) {
+      if (!isProcessAlive(pid)) {
+        return;
+      }
+
+      if (!termSent && Date.now() >= termAfterMs) {
+        try {
+          process.kill(pid, "SIGTERM");
+        } catch {
+          return;
+        }
+        termSent = true;
+      }
+
+      await delay(100);
     }
   }
 
@@ -790,6 +828,16 @@ function createSocketConnectTimeoutError(socketPath: string): Error {
   const error = new Error(`Timed out connecting to Port Manager agent at ${socketPath}.`) as NodeJS.ErrnoException;
   error.code = "ETIMEDOUT";
   return error;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
+    return code === "EPERM";
+  }
 }
 
 function removeStaleStartupLock(lockPath: string): void {

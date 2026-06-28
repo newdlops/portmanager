@@ -318,7 +318,8 @@ export class PortManagerAgent implements DisposableLike {
     this.defaultHost = options.defaultHost ?? "localhost";
     this.defaultCwd = options.defaultCwd ?? process.cwd();
     this.routeTablePath = options.routeTablePath ?? getDefaultRouteTablePath();
-    this.clearStaleScopedRouteTables();
+    this.adoptPreviousGenerationRouteFiles();
+    this.writeRouteTable(this.buildCurrentLogicalRoutes());
     this.agentMainPath = options.agentMainPath;
     this.listenerScanIntervalMs = normalizeListenerScanInterval(options.listenerScanIntervalMs);
     this.listenerScanCacheTtlMs = normalizeListenerScanCacheTtlMs(options.listenerScanCacheTtlMs);
@@ -406,6 +407,8 @@ export class PortManagerAgent implements DisposableLike {
         networkRouteScope === normalizeNetworkId(input.networkId)
           ? input
           : { ...input, networkId: networkRouteScope };
+      const actualHost = normalizeOptionalHost(input.actualHost) ?? input.host;
+      const actualInput = actualHost === input.host ? scopedInput : { ...scopedInput, host: actualHost };
       const routeDirection = normalizeRouteDirection(input.routeDirection);
       const activeRoute =
         routeDirection === "send" ? this.findReusableActiveRoute(input.requestedPort, networkRouteScope) : undefined;
@@ -466,7 +469,7 @@ export class PortManagerAgent implements DisposableLike {
 
       const decision = await this.routingService.route({
         requestedPort: input.requestedPort,
-        host: input.host,
+        host: actualHost,
         scanRange: input.scanRange,
         scanDirection: input.scanDirection,
         routingMode: input.routingMode,
@@ -476,7 +479,7 @@ export class PortManagerAgent implements DisposableLike {
       });
       const allocationId = `allocation:${randomUUID()}`;
       const expiresAtMs = this.now().getTime() + ROUTE_ALLOCATION_TTL_MS;
-      const route = buildAllocatedLogicalRoute(scopedInput, decision.actualPort, routeDirection);
+      const route = buildAllocatedLogicalRoute(actualInput, decision.actualPort, routeDirection);
 
       this.pendingRouteAllocations.set(allocationId, {
         id: allocationId,
@@ -492,7 +495,7 @@ export class PortManagerAgent implements DisposableLike {
         allocationId,
         requestedPort: input.requestedPort,
         actualPort: decision.actualPort,
-        host: input.host,
+        host: actualHost,
         routed: decision.routed,
         logicalRoutes,
         logicalRoutesFile: getRouteTablePathForNetwork(networkRouteScope, this.routeTablePath),
@@ -1490,22 +1493,33 @@ export class PortManagerAgent implements DisposableLike {
   }
 
   /**
-   * Removes network-scoped tables left by a previous daemon generation.
-   * The global table is overwritten by the next snapshot for backward
-   * compatibility, but scoped files are otherwise invisible until reused.
+   * Seeds cleanup tracking from files left by the previous daemon generation.
+   *
+   * A fresh daemon starts with empty in-memory route state, so it would not know
+   * which network-scoped files must be cleared. Tracking previous files lets the
+   * first route-table write publish empty per-network tables and remove stale
+   * per-port entries without relying on a manual repair command.
    */
-  private clearStaleScopedRouteTables(): void {
+  private adoptPreviousGenerationRouteFiles(): void {
     const parsedPath = path.parse(this.routeTablePath);
 
     try {
       for (const fileName of fs.readdirSync(parsedPath.dir)) {
-        if (fileName.startsWith(`${parsedPath.name}-`) && fileName.endsWith(parsedPath.ext)) {
-          fs.rmSync(path.join(parsedPath.dir, fileName), { force: true });
+        if (!fileName.startsWith(`${parsedPath.name}-`) || !fileName.endsWith(parsedPath.ext)) {
+          continue;
+        }
+
+        const routeFilePath = path.join(parsedPath.dir, fileName);
+        const scopedName = fileName.slice(parsedPath.name.length + 1, fileName.length - parsedPath.ext.length);
+        if (scopedName.includes("-port-")) {
+          this.writtenRouteTableEntryPaths.add(routeFilePath);
+        } else if (scopedName.length > 0) {
+          this.writtenRouteTableNetworkIds.add(scopedName);
         }
       }
     } catch {
-      // Stale scoped tables are best-effort cleanup; routing can still use
-      // daemon allocation responses if filesystem cleanup is unavailable.
+      // Stale scoped files are best-effort cleanup; routing can still use
+      // daemon allocation responses if filesystem discovery is unavailable.
     }
   }
 
@@ -1942,6 +1956,12 @@ function buildDetectedProcess(
 function buildUrl(host: string, actualPort: number): string {
   const normalizedHost = host.trim() || "localhost";
   return `http://${normalizedHost}:${actualPort}`;
+}
+
+/** Normalizes optional route target hosts without treating blank strings as real endpoints. */
+function normalizeOptionalHost(host: string | undefined): string | undefined {
+  const normalizedHost = host?.trim();
+  return normalizedHost === undefined || normalizedHost.length === 0 ? undefined : normalizedHost;
 }
 
 /** Extracts a route host from a stored URL without making URL parsing fatal. */

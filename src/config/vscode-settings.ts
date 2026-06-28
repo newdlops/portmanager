@@ -172,14 +172,21 @@ function readLoopbackAddressRoutingMode(config: vscode.WorkspaceConfiguration): 
     inspected?.workspaceFolderValue ??
     inspected?.workspaceValue ??
     inspected?.globalValue;
+  const legacyBoolean = config.inspect<boolean>("enableLoopbackAddressRouting");
+  const legacyConfiguredValue =
+    legacyBoolean?.workspaceFolderValue ??
+    legacyBoolean?.workspaceValue ??
+    legacyBoolean?.globalValue;
 
   if (configuredValue !== undefined && VALID_LOOPBACK_ADDRESS_ROUTING_MODES.has(configuredValue)) {
     return configuredValue;
   }
 
-  return config.get<boolean>("enableLoopbackAddressRouting", DEFAULT_SETTINGS.enableLoopbackAddressRouting ?? false)
-    ? "auto"
-    : "high-port";
+  if (legacyConfiguredValue !== undefined) {
+    return legacyConfiguredValue ? "auto" : "high-port";
+  }
+
+  return DEFAULT_SETTINGS.loopbackAddressRoutingMode;
 }
 
 /** Converts unknown container runtime settings to auto detection. */
