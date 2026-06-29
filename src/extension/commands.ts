@@ -1270,6 +1270,7 @@ export class PortManagerCommandController implements DisposableLike {
   private async showStatusMenu(): Promise<void> {
     const snapshot = this.dependencies.networkService.getSnapshot();
     const statusSummary = formatStatusMenuSummary(snapshot);
+    const ownsControlPlane = snapshot.controlPlane?.role === "owner";
     const selected = await vscode.window.showQuickPick(
       [
         {
@@ -1278,21 +1279,31 @@ export class PortManagerCommandController implements DisposableLike {
           detail: statusSummary.detail,
           action: "current" as const,
         },
-        {
-          label: "$(vm) Switch VS Code Terminal Network",
-          description: "Choose the network inherited by new terminals",
-          action: "switch" as const,
-        },
-        {
-          label: "$(debug-disconnect) Detach",
-          description: statusSummary.detachDescription,
-          action: "detach" as const,
-        },
-        {
-          label: "$(refresh) Refresh",
-          description: "Rescan terminals and services",
-          action: "refresh" as const,
-        },
+        ...(ownsControlPlane
+          ? [
+              {
+                label: "$(vm) Switch VS Code Terminal Network",
+                description: "Choose the network inherited by new terminals",
+                action: "switch" as const,
+              },
+              {
+                label: "$(debug-disconnect) Detach",
+                description: statusSummary.detachDescription,
+                action: "detach" as const,
+              },
+              {
+                label: "$(refresh) Refresh",
+                description: "Rescan terminals and services",
+                action: "refresh" as const,
+              },
+            ]
+          : [
+              {
+                label: "$(lock) Owner actions disabled",
+                description: formatStatusMenuOwnerDescription(snapshot),
+                action: "ownerOnly" as const,
+              },
+            ]),
       ],
       { title: "Port Manager", placeHolder: statusSummary.label },
     );
@@ -1318,6 +1329,8 @@ export class PortManagerCommandController implements DisposableLike {
         return;
       case "refresh":
         await this.refresh();
+        return;
+      case "ownerOnly":
         return;
     }
   }
@@ -3016,6 +3029,18 @@ function formatStatusMenuSummary(snapshot: NetworkSnapshot): StatusMenuSummary {
     detail: networkNames.join(", "),
     detachDescription: "Choose an attached terminal to detach",
   };
+}
+
+function formatStatusMenuOwnerDescription(snapshot: NetworkSnapshot): string {
+  if (snapshot.controlPlane?.role === "worker") {
+    return `Use owner window pid ${snapshot.controlPlane.ownerPid ?? "unknown"} for routing changes`;
+  }
+
+  if (snapshot.controlPlane?.role === "unowned") {
+    return "No owner is elected yet";
+  }
+
+  return "Routing changes are available only in the owner window";
 }
 
 function formatAttachedNetworkNames(

@@ -93,6 +93,11 @@ class PortManagerStatusBar implements DisposableLike {
   /** Recomputes the compact status text from the latest logical network snapshot. */
   private update(): void {
     const snapshot = this.networkService.getSnapshot();
+    void vscode.commands.executeCommand(
+      "setContext",
+      "portManager.isControlPlaneOwner",
+      snapshot.controlPlane?.role === "owner",
+    );
     this.item.text = formatStatusBarNetworkText(snapshot);
     this.item.tooltip = formatStatusBarNetworkTooltip(snapshot);
   }
@@ -105,35 +110,38 @@ class PortManagerStatusBar implements DisposableLike {
 
 /** Status text prefers the VS Code terminal default, then falls back to attached terminals. */
 function formatStatusBarNetworkText(snapshot: NetworkSnapshot): string {
+  const role = formatControlPlaneRoleLabel(snapshot);
   const windowNetwork = snapshot.networks.find(
     (network) => network.id === snapshot.vscodeWindowTerminalBinding?.networkId,
   );
   if (windowNetwork !== undefined) {
-    return `$(vm-active) Port Manager: ${windowNetwork.name}`;
+    return `$(vm-active) Port Manager ${role}: ${windowNetwork.name}`;
   }
 
   const attachedTerminals = snapshot.attachments.filter((attachment) => attachment.status === "attached");
   if (attachedTerminals.length === 0) {
-    return "$(vm-outline) Port Manager: No network";
+    return `$(vm-outline) Port Manager ${role}: No network`;
   }
 
   const networkCounts = countAttachedTerminalsByNetwork(attachedTerminals);
   if (networkCounts.size === 1) {
     const [networkId, count] = [...networkCounts.entries()][0];
     const network = snapshot.networks.find((item) => item.id === networkId);
-    return `$(plug) Port Manager: ${network?.name ?? networkId} (${count})`;
+    return `$(plug) Port Manager ${role}: ${network?.name ?? networkId} (${count})`;
   }
 
-  return `$(plug) Port Manager: ${attachedTerminals.length} terminals`;
+  return `$(plug) Port Manager ${role}: ${attachedTerminals.length} terminals`;
 }
 
 /** Tooltip expands the status bar label into the current source of routing state. */
 function formatStatusBarNetworkTooltip(snapshot: NetworkSnapshot): string {
+  const roleLine = formatControlPlaneTooltipLine(snapshot);
   const windowNetwork = snapshot.networks.find(
     (network) => network.id === snapshot.vscodeWindowTerminalBinding?.networkId,
   );
   if (windowNetwork !== undefined && snapshot.vscodeWindowTerminalBinding !== undefined) {
     return [
+      roleLine,
       `VS Code terminals use ${windowNetwork.name}.`,
       `${snapshot.vscodeWindowTerminalBinding.injectedTerminalCount} open terminal${snapshot.vscodeWindowTerminalBinding.injectedTerminalCount === 1 ? "" : "s"} updated.`,
       "Click to manage routing.",
@@ -142,12 +150,42 @@ function formatStatusBarNetworkTooltip(snapshot: NetworkSnapshot): string {
 
   const attachedTerminals = snapshot.attachments.filter((attachment) => attachment.status === "attached");
   if (attachedTerminals.length === 0) {
-    return "No Port Manager network is active for this VS Code window. Click to choose one.";
+    return `${roleLine}\nNo Port Manager network is active for this VS Code window. Click to choose one.`;
   }
 
-  const lines = ["Attached terminal routing:", ...formatAttachedTerminalSummaryLines(snapshot, attachedTerminals)];
+  const lines = [roleLine, "Attached terminal routing:", ...formatAttachedTerminalSummaryLines(snapshot, attachedTerminals)];
   lines.push("Click to manage routing.");
   return lines.join("\n");
+}
+
+function formatControlPlaneRoleLabel(snapshot: NetworkSnapshot): string {
+  switch (snapshot.controlPlane?.role) {
+    case "owner":
+      return "Owner";
+    case "worker":
+      return "Worker";
+    case "unowned":
+      return "No Owner";
+    default:
+      return "Unknown";
+  }
+}
+
+function formatControlPlaneTooltipLine(snapshot: NetworkSnapshot): string {
+  const controlPlane = snapshot.controlPlane;
+  if (controlPlane === undefined) {
+    return "Control plane: unknown";
+  }
+
+  if (controlPlane.role === "owner") {
+    return `Control plane: owner in this window, pid ${controlPlane.currentPid}.`;
+  }
+
+  if (controlPlane.role === "worker") {
+    return `Control plane: worker in this window, owner pid ${controlPlane.ownerPid ?? "unknown"}.`;
+  }
+
+  return "Control plane: no active owner.";
 }
 
 function countAttachedTerminalsByNetwork(

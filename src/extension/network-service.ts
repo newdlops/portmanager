@@ -79,6 +79,7 @@ import type {
   ComposePortMutationMode,
   ComposePortMutationState,
   ComposePublishedPort,
+  ControlPlaneStatus,
   ContainerServiceCandidate,
   DisposableLike,
   HostAccessBinding,
@@ -619,11 +620,13 @@ export class PortManagerNetworkService implements DisposableLike {
   private async startControlPlaneOwnerIfAvailableExclusive(): Promise<boolean> {
     if (!tryAcquireControlPlaneOwnerLease()) {
       this.demoteControlPlaneOwner();
+      this.localChangeEvents.emit();
       return false;
     }
 
     const becameOwner = !this.ownsControlPlaneLease;
     this.ownsControlPlaneLease = true;
+    this.localChangeEvents.emit();
 
     if (becameOwner) {
       await this.startControlPlaneOwnerWatchers();
@@ -711,6 +714,8 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Stops owner-only automatic work when another extension host owns the control plane. */
   private demoteControlPlaneOwner(): void {
+    const wasControlPlaneOwner = this.ownsControlPlaneLease;
+
     if (
       !this.ownsControlPlaneLease &&
       this.controlPlaneOwnerDisposables.length === 0 &&
@@ -746,6 +751,9 @@ export class PortManagerNetworkService implements DisposableLike {
      */
     this.context.environmentVariableCollection.clear();
     releaseControlPlaneOwnerLease();
+    if (wasControlPlaneOwner) {
+      this.localChangeEvents.emit();
+    }
   }
 
   /** Returns the latest logical network snapshot for the sidebar. */
@@ -755,6 +763,34 @@ export class PortManagerNetworkService implements DisposableLike {
       ...(this.vscodeWindowTerminalBinding !== undefined
         ? { vscodeWindowTerminalBinding: this.vscodeWindowTerminalBinding }
         : {}),
+      controlPlane: this.getControlPlaneStatus(),
+    };
+  }
+
+  /** Returns this extension host's current role in the cross-window control plane. */
+  getControlPlaneStatus(): ControlPlaneStatus {
+    const nowMs = Date.now();
+    const owner = readControlPlaneOwner();
+    const ownerActive = isActiveControlPlaneOwner(owner, nowMs);
+    const ownerUpdatedAtMs = owner === undefined ? undefined : Date.parse(owner.updatedAt);
+    const leaseExpiresAt =
+      ownerUpdatedAtMs === undefined || Number.isNaN(ownerUpdatedAtMs)
+        ? undefined
+        : new Date(ownerUpdatedAtMs + CONTROL_PLANE_OWNER_LEASE_MS).toISOString();
+    const role =
+      this.ownsControlPlaneLease && owner?.pid === process.pid && ownerActive
+        ? "owner"
+        : ownerActive
+          ? "worker"
+          : "unowned";
+
+    return {
+      role,
+      currentPid: process.pid,
+      ownerPid: owner?.pid,
+      ownerActive,
+      ownerUpdatedAt: owner?.updatedAt,
+      leaseExpiresAt,
     };
   }
 
@@ -2866,8 +2902,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Attempts ownership handoff for lease files touched by another extension host. */
   private refreshOwnerLeaseFromFileSignal(changedName: string | undefined): void {
+    const controlPlaneChanged = changedName === undefined || changedName === path.basename(CONTROL_PLANE_OWNER_PATH);
     const shouldRefreshControl =
-      (changedName === undefined || changedName === path.basename(CONTROL_PLANE_OWNER_PATH)) &&
+      controlPlaneChanged &&
       !this.ownsControlPlaneLease &&
       !isActiveControlPlaneOwner(readControlPlaneOwner(), Date.now());
     const shouldRefreshLogical =
@@ -2890,6 +2927,10 @@ export class PortManagerNetworkService implements DisposableLike {
 
     if (shouldRefreshControl) {
       void this.startControlPlaneOwnerIfAvailable();
+    }
+
+    if (controlPlaneChanged) {
+      this.localChangeEvents.emit();
     }
 
     if (shouldRefreshLogical || shouldRefreshBrowser) {

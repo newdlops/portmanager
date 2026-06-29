@@ -421,12 +421,12 @@
       "view/title": [
         {
           "command": "portManager.createLogicalNetwork",
-          "when": "view == portManager.processes",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner",
           "group": "navigation@1"
         },
         {
           "command": "portManager.refresh",
-          "when": "view == portManager.processes",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner",
           "group": "navigation@2"
         },
         {
@@ -496,92 +496,92 @@
       "view/item/context": [
         {
           "command": "portManager.createLogicalNetwork",
-          "when": "view == portManager.processes && viewItem == section.networks",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == section.networks",
           "group": "network@1"
         },
         {
           "command": "portManager.addHostPortExposure",
-          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
           "group": "network@2"
         },
         {
           "command": "portManager.addHostAccessBinding",
-          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
           "group": "network@3"
         },
         {
           "command": "portManager.addComposePublishedPort",
-          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
           "group": "network@4"
         },
         {
           "command": "portManager.attachContainerToNetwork",
-          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
           "group": "network@5"
         },
         {
           "command": "portManager.attachActiveTerminalToNetwork",
-          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
           "group": "network@6"
         },
         {
           "command": "portManager.attachProcessToNetwork",
-          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
           "group": "network@7"
         },
         {
           "command": "portManager.attachVscodeWindowTerminalsToNetwork",
-          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
           "group": "network@8"
         },
         {
           "command": "portManager.copyTerminalRoutingScript",
-          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
           "group": "network@9"
         },
         {
           "command": "portManager.saveBindingPreset",
-          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
           "group": "network@10"
         },
         {
           "command": "portManager.applyBindingPreset",
-          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
           "group": "network@11"
         },
         {
           "command": "portManager.clearNetworkCache",
-          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
           "group": "network@12"
         },
         {
           "command": "portManager.removeLogicalNetwork",
-          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
           "group": "network@13"
         },
         {
           "command": "portManager.refreshContainerServices",
-          "when": "view == portManager.processes && viewItem == section.containers",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == section.containers",
           "group": "container@1"
         },
         {
           "command": "portManager.attachContainerToNetwork",
-          "when": "view == portManager.processes && viewItem == section.containers",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == section.containers",
           "group": "container@2"
         },
         {
           "command": "portManager.attachContainerToNetwork",
-          "when": "view == portManager.processes && viewItem == containerServiceCandidate",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == containerServiceCandidate",
           "group": "container@3"
         },
         {
           "command": "portManager.attachContainerToNetwork",
-          "when": "view == portManager.processes && viewItem == composeProjectCandidate",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == composeProjectCandidate",
           "group": "container@3"
         },
         {
           "command": "portManager.refreshTerminals",
-          "when": "view == portManager.processes && viewItem == section.daemon",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == section.daemon",
           "group": "terminal@1"
         },
         {
@@ -591,32 +591,32 @@
         },
         {
           "command": "portManager.attachTerminalToNetwork",
-          "when": "view == portManager.processes && viewItem == terminalWindow",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == terminalWindow",
           "group": "terminal@2"
         },
         {
           "command": "portManager.attachVscodeWindowTerminalsToNetwork",
-          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == vscodeWindowTerminalBinding)",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == section.daemon || viewItem == vscodeWindowTerminalBinding)",
           "group": "terminal@2"
         },
         {
           "command": "portManager.resetTerminalNetworkSettings",
-          "when": "view == portManager.processes && (viewItem == terminalWindow || viewItem == terminalAttachment)",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == terminalWindow || viewItem == terminalAttachment)",
           "group": "terminal@3"
         },
         {
           "command": "portManager.detachVscodeWindowTerminalsFromNetwork",
-          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == vscodeWindowTerminalBinding)",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == section.daemon || viewItem == vscodeWindowTerminalBinding)",
           "group": "terminal@3"
         },
         {
           "command": "portManager.detachTerminalFromNetwork",
-          "when": "view == portManager.processes && viewItem == terminalAttachment",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == terminalAttachment",
           "group": "terminal@4"
         },
         {
           "command": "portManager.addHostPortExposure",
-          "when": "view == portManager.processes && viewItem == section.exposures",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == section.exposures",
           "group": "exposure@1"
         },
         {
@@ -631,12 +631,12 @@
         },
         {
           "command": "portManager.removeHostPortExposure",
-          "when": "view == portManager.processes && (viewItem == hostExposureActive || viewItem == hostExposure)",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == hostExposureActive || viewItem == hostExposure)",
           "group": "exposure@3"
         },
         {
           "command": "portManager.removeHostAccessBinding",
-          "when": "view == portManager.processes && viewItem == hostAccessBinding",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == hostAccessBinding",
           "group": "exposure@4"
         },
         {
@@ -646,27 +646,27 @@
         },
         {
           "command": "portManager.detachComposeAttachment",
-          "when": "view == portManager.processes && viewItem == composeAttachment",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == composeAttachment",
           "group": "exposure@5"
         },
         {
           "command": "portManager.removeComposeAttachment",
-          "when": "view == portManager.processes && viewItem == composeAttachment",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == composeAttachment",
           "group": "exposure@7"
         },
         {
           "command": "portManager.renameComposeAttachment",
-          "when": "view == portManager.processes && viewItem == composeAttachment",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == composeAttachment",
           "group": "exposure@6"
         },
         {
           "command": "portManager.restartDaemon",
-          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == section.daemon || viewItem == daemonStatus)",
           "group": "daemon@1"
         },
         {
           "command": "portManager.stopDaemon",
-          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == section.daemon || viewItem == daemonStatus)",
           "group": "daemon@2"
         },
         {
@@ -676,17 +676,17 @@
         },
         {
           "command": "portManager.fixStaleRouting",
-          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == section.daemon || viewItem == daemonStatus)",
           "group": "daemon@4"
         },
         {
           "command": "portManager.clearRoutingFiles",
-          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == section.daemon || viewItem == daemonStatus)",
           "group": "daemon@5"
         },
         {
           "command": "portManager.clearGlobalStorageFiles",
-          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == section.daemon || viewItem == daemonStatus)",
           "group": "daemon@6"
         },
         {
@@ -701,17 +701,17 @@
         },
         {
           "command": "portManager.stopProcess",
-          "when": "view == portManager.processes && (viewItem == managedProcessRunning || viewItem == managedProcessStarting)",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == managedProcessRunning || viewItem == managedProcessStarting)",
           "group": "managed@1"
         },
         {
           "command": "portManager.restartProcess",
-          "when": "view == portManager.processes && (viewItem == managedProcessRunning || viewItem == managedProcessStopped || viewItem == managedProcessError)",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == managedProcessRunning || viewItem == managedProcessStopped || viewItem == managedProcessError)",
           "group": "managed@2"
         },
         {
           "command": "portManager.removeProcess",
-          "when": "view == portManager.processes && (viewItem == managedProcessRunning || viewItem == managedProcessStarting || viewItem == managedProcessStopped || viewItem == managedProcessError || viewItem == detectedProcess)",
+          "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == managedProcessRunning || viewItem == managedProcessStarting || viewItem == managedProcessStopped || viewItem == managedProcessError || viewItem == detectedProcess)",
           "group": "managed@3"
         }
       ]

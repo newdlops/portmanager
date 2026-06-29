@@ -47,6 +47,8 @@ test("diagnostics exposes stale routing repair and recent activity", () => {
   assert.equal(source.includes("class RoutingTimelineGroupTreeItem"), true);
   assert.equal(source.includes('"Recent Routing Activity"'), true);
   assert.equal(source.includes("buildRoutingTimelineRows(snapshot, agentSnapshot)"), true);
+  assert.equal(source.includes('"Control Owner"'), true);
+  assert.equal(source.includes("buildControlPlaneTooltip(snapshot.controlPlane)"), true);
   assert.equal(manifest.activationEvents?.includes("onCommand:portManager.fixStaleRouting"), true);
   assert.equal(
     manifest.contributes?.commands?.some((item) => item.command === "portManager.fixStaleRouting"),
@@ -62,6 +64,73 @@ test("diagnostics exposes stale routing repair and recent activity", () => {
   );
   assert.equal(
     menuItems.some((item) => item.command === "portManager.clearGlobalStorageFiles" && item.when?.includes("section.daemon")),
+    true,
+  );
+});
+
+test("non-owner windows show owner status and disable owner actions", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/ui/sidebar/port-manager-tree.ts");
+  const activatePath = path.resolve(__dirname, "../../../src/extension/activate.ts");
+  const commandsPath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const networkServicePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const typesPath = path.resolve(__dirname, "../../../src/shared/types.ts");
+  const packagePath = path.resolve(__dirname, "../../../package.json");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const activateSource = fs.readFileSync(activatePath, "utf8");
+  const commandsSource = fs.readFileSync(commandsPath, "utf8");
+  const networkServiceSource = fs.readFileSync(networkServicePath, "utf8");
+  const typesSource = fs.readFileSync(typesPath, "utf8");
+  const manifest = JSON.parse(fs.readFileSync(packagePath, "utf8")) as {
+    contributes?: {
+      menus?: {
+        "view/title"?: Array<{ command: string; when?: string }>;
+        "view/item/context"?: Array<{ command: string; when?: string }>;
+      };
+    };
+  };
+  const viewTitleItems = manifest.contributes?.menus?.["view/title"] ?? [];
+  const menuItems = manifest.contributes?.menus?.["view/item/context"] ?? [];
+  const ownerOnlyCommands = [
+    "portManager.createLogicalNetwork",
+    "portManager.attachActiveTerminalToNetwork",
+    "portManager.attachContainerToNetwork",
+    "portManager.refreshContainerServices",
+    "portManager.attachVscodeWindowTerminalsToNetwork",
+    "portManager.restartDaemon",
+    "portManager.fixStaleRouting",
+    "portManager.clearGlobalStorageFiles",
+    "portManager.stopProcess",
+  ];
+
+  assert.equal(typesSource.includes('export type ControlPlaneRole = "owner" | "worker" | "unowned";'), true);
+  assert.equal(typesSource.includes("export interface ControlPlaneStatus"), true);
+  assert.equal(typesSource.includes("readonly controlPlane?: ControlPlaneStatus;"), true);
+  assert.equal(networkServiceSource.includes("getControlPlaneStatus(): ControlPlaneStatus"), true);
+  assert.equal(networkServiceSource.includes("controlPlane: this.getControlPlaneStatus()"), true);
+  assert.equal(activateSource.includes('"portManager.isControlPlaneOwner"'), true);
+  assert.equal(activateSource.includes('snapshot.controlPlane?.role === "owner"'), true);
+  assert.equal(source.includes("buildOwnerActionAvailability(snapshot.controlPlane)"), true);
+  assert.equal(source.includes('this.contextValue = availability.enabled ? "action" : "action.disabled";'), true);
+  assert.equal(source.includes("availability.enabled ? undefined : new vscode.ThemeColor(\"disabledForeground\")"), true);
+  assert.equal(source.includes("if (availability.enabled) {"), true);
+  assert.equal(source.includes("formatOwnerOnlyActionReason(controlPlane)"), true);
+  assert.equal(commandsSource.includes('label: "$(lock) Owner actions disabled"'), true);
+  assert.equal(commandsSource.includes('action: "ownerOnly" as const'), true);
+
+  for (const command of ownerOnlyCommands) {
+    const contextItems = menuItems.filter((item) => item.command === command);
+    assert.equal(contextItems.length > 0, true, `${command} must have context menu entries`);
+    assert.equal(
+      contextItems.every((item) => item.when?.includes("portManager.isControlPlaneOwner")),
+      true,
+      `${command} context menu entries must require owner context`,
+    );
+  }
+
+  assert.equal(
+    viewTitleItems
+      .filter((item) => item.command === "portManager.createLogicalNetwork" || item.command === "portManager.refresh")
+      .every((item) => item.when?.includes("portManager.isControlPlaneOwner")),
     true,
   );
 });
@@ -230,6 +299,7 @@ test("status bar exposes current routing quick menu", () => {
 
   assert.equal(activateSource.includes("createStatusBarItem"), true);
   assert.equal(activateSource.includes('"portManager.showStatusMenu"'), true);
+  assert.equal(activateSource.includes('"portManager.isControlPlaneOwner"'), true);
   assert.equal(activateSource.includes("vscodeWindowTerminalBinding"), true);
   assert.equal(activateSource.includes("attachedTerminals"), true);
   assert.equal(commandsSource.includes('"$(target) Current Routing"'), true);

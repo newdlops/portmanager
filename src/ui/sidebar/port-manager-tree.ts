@@ -5,6 +5,7 @@ import type {
   BrowserDnsResolverStatus,
   ComposeAttachment,
   ComposePublishedPort,
+  ControlPlaneStatus,
   ContainerServiceCandidate,
   DisposableLike,
   HostAccessBinding,
@@ -91,6 +92,13 @@ interface RoutingTimelineEntry {
   readonly color?: vscode.ThemeColor;
   /** Tooltip with the owning network and event timestamp. */
   readonly tooltip: vscode.MarkdownString;
+}
+
+interface ActionAvailability {
+  /** False removes the command from the tree row so non-owner windows cannot invoke owner work. */
+  readonly enabled: boolean;
+  /** Short reason appended to disabled action rows. */
+  readonly disabledReason?: string;
 }
 
 type PortManagerTreeItem =
@@ -198,6 +206,12 @@ export class PortManagerTreeProvider
       return;
     }
 
+    const controlPlane = this.source.getSnapshot().controlPlane;
+    if (!isControlPlaneOwner(controlPlane)) {
+      void vscode.window.showWarningMessage(formatOwnerOnlyActionReason(controlPlane));
+      return;
+    }
+
     const transferItem = dataTransfer.get(TERMINAL_WINDOW_MIME);
     const terminalWindowId = typeof transferItem?.value === "string" ? transferItem.value : undefined;
 
@@ -231,6 +245,7 @@ export class PortManagerTreeProvider
     const agentSnapshot = this.source.getAgentSnapshot();
     const daemon = this.source.getDaemonStatus();
     const browserDns = this.source.getBrowserDnsResolverStatus();
+    const ownerAction = buildOwnerActionAvailability(snapshot.controlPlane);
 
     if (element === undefined) {
       return [
@@ -275,7 +290,7 @@ export class PortManagerTreeProvider
             ]
           : []),
         ...(windowTerminalBinding !== undefined
-          ? [new VscodeWindowTerminalBindingTreeItem(windowTerminalBinding, element.network)]
+          ? [new VscodeWindowTerminalBindingTreeItem(windowTerminalBinding, element.network, ownerAction)]
           : []),
         ...attachments.map((attachment) => new TerminalAttachmentTreeItem(attachment)),
         ...composeAttachments.map((attachment) => new ComposeAttachmentTreeItem(attachment)),
@@ -299,6 +314,7 @@ export class PortManagerTreeProvider
             "terminal",
             "Use current VS Code terminal",
             element.network,
+            ownerAction,
           ),
           new ActionTreeItem(
             "Attach Terminal",
@@ -306,6 +322,7 @@ export class PortManagerTreeProvider
             "terminal",
             "Choose a terminal window",
             element.network,
+            ownerAction,
           ),
           new ActionTreeItem(
             "Use for VS Code Terminals",
@@ -313,6 +330,7 @@ export class PortManagerTreeProvider
             "terminal",
             "Make this window default",
             element.network,
+            ownerAction,
           ),
           new ActionTreeItem(
             "Attach Service",
@@ -320,6 +338,7 @@ export class PortManagerTreeProvider
             "server-environment",
             "Choose a discovered service",
             { network: element.network },
+            ownerAction,
           ),
           new ActionTreeItem(
             "Copy Terminal Script",
@@ -327,6 +346,7 @@ export class PortManagerTreeProvider
             "copy",
             "For external terminal UIs",
             element.network,
+            ownerAction,
           ),
         ];
       }
@@ -336,13 +356,21 @@ export class PortManagerTreeProvider
         (attachment) => attachment.networkId === element.network.id,
       );
       return [
-        new ActionTreeItem("Add Host Binding", "portManager.addHostPortExposure", "add", "Expose network port", element.network),
+        new ActionTreeItem(
+          "Add Host Binding",
+          "portManager.addHostPortExposure",
+          "add",
+          "Expose network port",
+          element.network,
+          ownerAction,
+        ),
         new ActionTreeItem(
           "Add Host Access",
           "portManager.addHostAccessBinding",
           "arrow-swap",
           "Reach host port from network",
           element.network,
+          ownerAction,
         ),
         new ActionTreeItem(
           "Add Compose Port",
@@ -350,6 +378,7 @@ export class PortManagerTreeProvider
           "database",
           "Manually attach published service",
           element.network,
+          ownerAction,
         ),
         ...(networkComposeAttachments.length > 0
           ? [
@@ -359,6 +388,7 @@ export class PortManagerTreeProvider
                 "copy",
                 "Duplicate existing attachment",
                 element.network,
+                ownerAction,
               ),
             ]
           : []),
@@ -368,6 +398,7 @@ export class PortManagerTreeProvider
           "debug-alt",
           "Attach existing backend PID",
           element.network,
+          ownerAction,
         ),
         new ActionTreeItem(
           "Save Binding Preset",
@@ -375,6 +406,7 @@ export class PortManagerTreeProvider
           "save",
           "Save current bindings",
           element.network,
+          ownerAction,
         ),
         new ActionTreeItem(
           "Apply Binding Preset",
@@ -382,6 +414,7 @@ export class PortManagerTreeProvider
           "cloud-download",
           "Load saved bindings",
           element.network,
+          ownerAction,
         ),
         new ActionTreeItem(
           "Clear Network Cache",
@@ -389,9 +422,10 @@ export class PortManagerTreeProvider
           "clear-all",
           "Remove generated route maps",
           element.network,
+          ownerAction,
         ),
         ...(networkAttachments.length > 0
-          ? [new ActionTreeItem("Detach Terminal", "portManager.detachTerminalFromNetwork", "debug-disconnect")]
+          ? [new ActionTreeItem("Detach Terminal", "portManager.detachTerminalFromNetwork", "debug-disconnect", undefined, undefined, ownerAction)]
           : []),
       ];
     }
@@ -418,7 +452,7 @@ export class PortManagerTreeProvider
     if (element instanceof ComposeProjectCandidateTreeItem) {
       return [
         ...buildComposeProjectCandidateDetailRows(element.aggregateCandidate),
-        ...element.candidates.map((candidate) => new ContainerServiceCandidateTreeItem(candidate)),
+        ...element.candidates.map((candidate) => new ContainerServiceCandidateTreeItem(candidate, ownerAction)),
       ];
     }
 
@@ -466,7 +500,7 @@ export class PortManagerTreeProvider
       case "containers":
         return [
           ...(snapshot.containerServiceCandidates.length > 0
-            ? buildContainerServiceTreeItems(snapshot.containerServiceCandidates)
+            ? buildContainerServiceTreeItems(snapshot.containerServiceCandidates, ownerAction)
             : [new EmptyTreeItem("No published services", "Start compose services")]),
         ];
       case "daemon":
@@ -476,6 +510,7 @@ export class PortManagerTreeProvider
                 new VscodeWindowTerminalBindingTreeItem(
                   snapshot.vscodeWindowTerminalBinding,
                   snapshot.networks.find((network) => network.id === snapshot.vscodeWindowTerminalBinding?.networkId),
+                  ownerAction,
                 ),
               ]
             : []),
@@ -490,7 +525,7 @@ export class PortManagerTreeProvider
                 ),
               ]),
           ...snapshot.runtimes.map((runtime) => new RuntimeAdapterTreeItem(runtime)),
-          ...buildDaemonChildren(daemon, snapshot, agentSnapshot, browserDns),
+          ...buildDaemonChildren(daemon, snapshot, agentSnapshot, browserDns, ownerAction),
         ];
     }
   }
@@ -508,17 +543,33 @@ export class PortManagerTreeProvider
 
 /** One clickable command row in the Actions accordion. */
 class ActionTreeItem extends vscode.TreeItem {
-  readonly contextValue = "action";
+  readonly contextValue: string;
 
-  constructor(label: string, command: string, icon: string, description?: string, argument?: unknown) {
+  constructor(
+    label: string,
+    command: string,
+    icon: string,
+    description?: string,
+    argument?: unknown,
+    availability: ActionAvailability = { enabled: true },
+  ) {
     super(label, vscode.TreeItemCollapsibleState.None);
-    this.description = description;
-    this.iconPath = new vscode.ThemeIcon(icon);
-    this.command = {
-      command,
-      title: label,
-      arguments: argument === undefined ? [] : [argument],
-    };
+    this.contextValue = availability.enabled ? "action" : "action.disabled";
+    this.description = availability.enabled
+      ? description
+      : [description, availability.disabledReason ?? "Owner window only"].filter(Boolean).join(" - ");
+    this.iconPath = new vscode.ThemeIcon(
+      availability.enabled ? icon : "circle-slash",
+      availability.enabled ? undefined : new vscode.ThemeColor("disabledForeground"),
+    );
+
+    if (availability.enabled) {
+      this.command = {
+        command,
+        title: label,
+        arguments: argument === undefined ? [] : [argument],
+      };
+    }
   }
 }
 
@@ -727,45 +778,62 @@ export class TerminalCandidateTreeItem extends vscode.TreeItem {
 
 /** Compose project row that owns one or more service/container candidates. */
 export class ComposeProjectCandidateTreeItem extends vscode.TreeItem {
-  readonly contextValue = "composeProjectCandidate";
+  readonly contextValue: string;
   readonly aggregateCandidate: ContainerServiceCandidate;
 
   constructor(
     readonly projectName: string,
     readonly runtime: ContainerServiceCandidate["runtime"],
     readonly candidates: readonly ContainerServiceCandidate[],
+    availability: ActionAvailability = { enabled: true },
   ) {
     const ports = candidates.flatMap((candidate) => [...candidate.ports]);
 
     super(projectName, vscode.TreeItemCollapsibleState.Collapsed);
     this.aggregateCandidate = buildAggregateComposeProjectCandidate(projectName, runtime, candidates);
     this.id = this.aggregateCandidate.id;
-    this.description = formatComposeProjectCandidateDescription(this.aggregateCandidate, candidates.length, ports.length);
+    this.contextValue = availability.enabled ? "composeProjectCandidate" : "composeProjectCandidate.disabled";
+    this.description = availability.enabled
+      ? formatComposeProjectCandidateDescription(this.aggregateCandidate, candidates.length, ports.length)
+      : `${formatComposeProjectCandidateDescription(this.aggregateCandidate, candidates.length, ports.length)} - ${availability.disabledReason ?? "Owner window only"}`;
     this.tooltip = buildComposeProjectCandidateTooltip(projectName, runtime, candidates);
-    this.iconPath = new vscode.ThemeIcon("server-environment");
-    this.command = {
-      command: "portManager.attachContainerToNetwork",
-      title: "Attach Compose Project to Network",
-      arguments: [{ containerService: this.aggregateCandidate }],
-    };
+    this.iconPath = new vscode.ThemeIcon(
+      availability.enabled ? "server-environment" : "circle-slash",
+      availability.enabled ? undefined : new vscode.ThemeColor("disabledForeground"),
+    );
+    if (availability.enabled) {
+      this.command = {
+        command: "portManager.attachContainerToNetwork",
+        title: "Attach Compose Project to Network",
+        arguments: [{ containerService: this.aggregateCandidate }],
+      };
+    }
   }
 }
 
 /** Docker/Podman container or compose service with host-published ports. */
 export class ContainerServiceCandidateTreeItem extends vscode.TreeItem {
-  readonly contextValue = "containerServiceCandidate";
+  readonly contextValue: string;
 
-  constructor(readonly candidate: ContainerServiceCandidate) {
+  constructor(readonly candidate: ContainerServiceCandidate, availability: ActionAvailability = { enabled: true }) {
     super(formatContainerServiceTreeLabel(candidate), vscode.TreeItemCollapsibleState.Collapsed);
     this.id = candidate.id;
-    this.description = formatContainerServiceCandidateDescription(candidate);
+    this.contextValue = availability.enabled ? "containerServiceCandidate" : "containerServiceCandidate.disabled";
+    this.description = availability.enabled
+      ? formatContainerServiceCandidateDescription(candidate)
+      : `${formatContainerServiceCandidateDescription(candidate)} - ${availability.disabledReason ?? "Owner window only"}`;
     this.tooltip = buildContainerServiceTooltip(candidate);
-    this.iconPath = new vscode.ThemeIcon(candidate.composeProject ? "server-environment" : "server-process");
-    this.command = {
-      command: "portManager.attachContainerToNetwork",
-      title: "Attach Service to Network",
-      arguments: [{ containerService: candidate }],
-    };
+    this.iconPath = new vscode.ThemeIcon(
+      availability.enabled ? (candidate.composeProject ? "server-environment" : "server-process") : "circle-slash",
+      availability.enabled ? undefined : new vscode.ThemeColor("disabledForeground"),
+    );
+    if (availability.enabled) {
+      this.command = {
+        command: "portManager.attachContainerToNetwork",
+        title: "Attach Service to Network",
+        arguments: [{ containerService: candidate }],
+      };
+    }
   }
 }
 
@@ -864,24 +932,34 @@ export class TerminalAttachmentTreeItem extends vscode.TreeItem {
 
 /** Current VS Code window-wide terminal network default. */
 export class VscodeWindowTerminalBindingTreeItem extends vscode.TreeItem {
-  readonly contextValue = "vscodeWindowTerminalBinding";
+  readonly contextValue: string;
 
   constructor(
     readonly binding: VscodeWindowTerminalBinding,
     network: LogicalNetwork | undefined,
+    availability: ActionAvailability = { enabled: true },
   ) {
     super("VS Code Window Terminals", vscode.TreeItemCollapsibleState.None);
     this.id = binding.id;
-    this.description = network?.name ?? binding.networkId;
+    this.contextValue = availability.enabled ? "vscodeWindowTerminalBinding" : "vscodeWindowTerminalBinding.disabled";
+    this.description = availability.enabled
+      ? (network?.name ?? binding.networkId)
+      : `${network?.name ?? binding.networkId} - ${availability.disabledReason ?? "Owner window only"}`;
     this.tooltip = buildVscodeWindowTerminalBindingTooltip(binding, network);
     this.iconPath = new vscode.ThemeIcon(
-      binding.status === "attached" ? "terminal" : "warning",
-      binding.status === "error" ? new vscode.ThemeColor("testing.iconFailed") : undefined,
+      availability.enabled ? (binding.status === "attached" ? "terminal" : "warning") : "circle-slash",
+      availability.enabled
+        ? binding.status === "error"
+          ? new vscode.ThemeColor("testing.iconFailed")
+          : undefined
+        : new vscode.ThemeColor("disabledForeground"),
     );
-    this.command = {
-      command: "portManager.detachVscodeWindowTerminalsFromNetwork",
-      title: "Detach VS Code Window Terminals",
-    };
+    if (availability.enabled) {
+      this.command = {
+        command: "portManager.detachVscodeWindowTerminalsFromNetwork",
+        title: "Detach VS Code Window Terminals",
+      };
+    }
   }
 }
 
@@ -937,18 +1015,18 @@ class RuntimeAdapterTreeItem extends vscode.TreeItem {
 }
 
 /** Builds multirow sidebar command access so the header toolbar stays compact. */
-function buildActionChildren(): PortManagerTreeItem[] {
+function buildActionChildren(ownerAction: ActionAvailability = { enabled: true }): PortManagerTreeItem[] {
   return [
-    new ActionTreeItem("Start Daemon", "portManager.startDaemon", "server-process"),
-    new ActionTreeItem("Restart Daemon", "portManager.restartDaemon", "debug-restart"),
-    new ActionTreeItem("Stop Daemon", "portManager.stopDaemon", "debug-disconnect"),
+    new ActionTreeItem("Start Daemon", "portManager.startDaemon", "server-process", undefined, undefined, ownerAction),
+    new ActionTreeItem("Restart Daemon", "portManager.restartDaemon", "debug-restart", undefined, undefined, ownerAction),
+    new ActionTreeItem("Stop Daemon", "portManager.stopDaemon", "debug-disconnect", undefined, undefined, ownerAction),
     new ActionTreeItem("Daemon Status", "portManager.showDaemonStatus", "pulse"),
-    new ActionTreeItem("Start Managed Process", "portManager.startManagedProcess", "run"),
-    new ActionTreeItem("Add Existing Process", "portManager.addExistingProcess", "add"),
-    new ActionTreeItem("Refresh", "portManager.refresh", "refresh"),
-    new ActionTreeItem("Install Shell Hook", "portManager.installShellHook", "plug"),
-    new ActionTreeItem("Install External CLI", "portManager.installExternalCli", "terminal"),
-    new ActionTreeItem("Stop All Processes", "portManager.stopAllProcesses", "debug-stop"),
+    new ActionTreeItem("Start Managed Process", "portManager.startManagedProcess", "run", undefined, undefined, ownerAction),
+    new ActionTreeItem("Add Existing Process", "portManager.addExistingProcess", "add", undefined, undefined, ownerAction),
+    new ActionTreeItem("Refresh", "portManager.refresh", "refresh", undefined, undefined, ownerAction),
+    new ActionTreeItem("Install Shell Hook", "portManager.installShellHook", "plug", undefined, undefined, ownerAction),
+    new ActionTreeItem("Install External CLI", "portManager.installExternalCli", "terminal", undefined, undefined, ownerAction),
+    new ActionTreeItem("Stop All Processes", "portManager.stopAllProcesses", "debug-stop", undefined, undefined, ownerAction),
     new ActionTreeItem("Open Settings", "portManager.openSettings", "settings-gear"),
   ];
 }
@@ -1027,17 +1105,34 @@ function buildDaemonChildren(
   snapshot: NetworkSnapshot,
   agentSnapshot: AgentSnapshot,
   browserDns: BrowserDnsResolverStatus,
+  ownerAction: ActionAvailability,
 ): PortManagerTreeItem[] {
   const children: PortManagerTreeItem[] = [
-    new ActionTreeItem("Fix Stale Routing", "portManager.fixStaleRouting", "debug-rerun", "Converge daemon and routes"),
+    new ActionTreeItem(
+      "Fix Stale Routing",
+      "portManager.fixStaleRouting",
+      "debug-rerun",
+      "Converge daemon and routes",
+      undefined,
+      ownerAction,
+    ),
     new ActionTreeItem(
       "Clear Global Storage Files",
       "portManager.clearGlobalStorageFiles",
       "clear-all",
       "Remove extension storage files",
+      undefined,
+      ownerAction,
     ),
     new RoutingTimelineGroupTreeItem(buildRoutingTimelineRows(snapshot, agentSnapshot)),
-    ...buildBrowserDnsDiagnosticRows(browserDns),
+    ...buildBrowserDnsDiagnosticRows(browserDns, ownerAction),
+    new DaemonStatusTreeItem(
+      "Control Owner",
+      formatControlPlaneRoleDescription(snapshot.controlPlane),
+      snapshot.controlPlane?.role === "owner" ? "workspace-trusted" : "workspace-untrusted",
+      buildControlPlaneTooltip(snapshot.controlPlane),
+    ),
+    new DaemonStatusTreeItem("This Window PID", String(snapshot.controlPlane?.currentPid ?? process.pid), "window"),
     new DaemonStatusTreeItem("Status", daemon.status, daemon.status === "running" ? "pass" : "warning"),
     new DaemonStatusTreeItem(
       "Version",
@@ -1060,7 +1155,23 @@ function buildDaemonChildren(
   return children;
 }
 
-function buildBrowserDnsDiagnosticRows(browserDns: BrowserDnsResolverStatus): PortManagerTreeItem[] {
+function buildControlPlaneTooltip(controlPlane: ControlPlaneStatus | undefined): vscode.MarkdownString {
+  const lines = [
+    `Role: ${controlPlane?.role ?? "unknown"}`,
+    `This window PID: ${controlPlane?.currentPid ?? process.pid}`,
+    `Owner PID: ${controlPlane?.ownerPid ?? "n/a"}`,
+    `Owner active: ${controlPlane?.ownerActive === true ? "yes" : "no"}`,
+    `Updated: ${controlPlane?.ownerUpdatedAt ?? "n/a"}`,
+    `Lease expires: ${controlPlane?.leaseExpiresAt ?? "n/a"}`,
+  ];
+
+  return new vscode.MarkdownString(lines.join("\n\n"));
+}
+
+function buildBrowserDnsDiagnosticRows(
+  browserDns: BrowserDnsResolverStatus,
+  ownerAction: ActionAvailability,
+): PortManagerTreeItem[] {
   if (!browserDns.supported) {
     return [new DaemonStatusTreeItem("Browser DNS", "unsupported", "circle-slash")];
   }
@@ -1074,8 +1185,22 @@ function buildBrowserDnsDiagnosticRows(browserDns: BrowserDnsResolverStatus): Po
   return [
     new DaemonStatusTreeItem("Browser DNS", `${description}, port ${browserDns.dnsPort}`, icon),
     ...browserDns.records.flatMap((record) => buildBrowserDnsRecordRows(record)),
-    new ActionTreeItem("Install Browser DNS", "portManager.installBrowserDnsResolvers", "cloud-upload", "Create aliases"),
-    new ActionTreeItem("Clean Browser DNS", "portManager.cleanupBrowserDnsResolvers", "trash", "Remove aliases"),
+    new ActionTreeItem(
+      "Install Browser DNS",
+      "portManager.installBrowserDnsResolvers",
+      "cloud-upload",
+      "Create aliases",
+      undefined,
+      ownerAction,
+    ),
+    new ActionTreeItem(
+      "Clean Browser DNS",
+      "portManager.cleanupBrowserDnsResolvers",
+      "trash",
+      "Remove aliases",
+      undefined,
+      ownerAction,
+    ),
   ];
 }
 
@@ -1275,10 +1400,48 @@ function formatDaemonSummary(daemon: AgentDaemonStatus): string {
   return daemon.pid > 0 ? `${daemon.status} pid ${daemon.pid}, ${version}` : daemon.status;
 }
 
+function isControlPlaneOwner(controlPlane: ControlPlaneStatus | undefined): boolean {
+  return controlPlane?.role === "owner";
+}
+
+function buildOwnerActionAvailability(controlPlane: ControlPlaneStatus | undefined): ActionAvailability {
+  return isControlPlaneOwner(controlPlane)
+    ? { enabled: true }
+    : { enabled: false, disabledReason: formatOwnerOnlyActionReason(controlPlane) };
+}
+
+function formatOwnerOnlyActionReason(controlPlane: ControlPlaneStatus | undefined): string {
+  if (controlPlane?.role === "worker") {
+    return `Owner window only, owner pid ${controlPlane.ownerPid ?? "unknown"}`;
+  }
+
+  if (controlPlane?.role === "unowned") {
+    return "Owner window only, no owner elected yet";
+  }
+
+  return "Owner window only";
+}
+
+function formatControlPlaneRoleDescription(controlPlane: ControlPlaneStatus | undefined): string {
+  if (controlPlane?.role === "owner") {
+    return `owner pid ${controlPlane.currentPid}`;
+  }
+
+  if (controlPlane?.role === "worker") {
+    return `worker, owner pid ${controlPlane.ownerPid ?? "unknown"}`;
+  }
+
+  if (controlPlane?.role === "unowned") {
+    return "no owner";
+  }
+
+  return "owner unknown";
+}
+
 /** One-line compact summary for the collapsed diagnostics section. */
 function formatDiagnosticsSummary(daemon: AgentDaemonStatus, snapshot: NetworkSnapshot): string {
   const daemonSummary = daemon.restartRequired ? "daemon stale" : daemon.status;
-  return `${daemonSummary}, ${snapshot.terminalWindows.length} terminals, ${snapshot.runtimes.length} runtimes`;
+  return `${formatControlPlaneRoleDescription(snapshot.controlPlane)}, ${daemonSummary}, ${snapshot.terminalWindows.length} terminals, ${snapshot.runtimes.length} runtimes`;
 }
 
 /** One-line current routing summary for the root section. */
@@ -2247,6 +2410,7 @@ function buildServiceDetailTooltip(label: string, value: string): vscode.Markdow
 /** Groups compose service containers under their compose project while keeping raw containers flat. */
 function buildContainerServiceTreeItems(
   candidates: readonly ContainerServiceCandidate[],
+  availability: ActionAvailability = { enabled: true },
 ): Array<ComposeProjectCandidateTreeItem | ContainerServiceCandidateTreeItem> {
   const composeGroups = new Map<string, ContainerServiceCandidate[]>();
   const rawCandidates: ContainerServiceCandidate[] = [];
@@ -2269,9 +2433,9 @@ function buildContainerServiceTreeItems(
   return [
     ...[...composeGroups.values()].map((group) => {
       const first = group[0]!;
-      return new ComposeProjectCandidateTreeItem(first.composeProject!, first.runtime, group);
+      return new ComposeProjectCandidateTreeItem(first.composeProject!, first.runtime, group, availability);
     }),
-    ...rawCandidates.map((candidate) => new ContainerServiceCandidateTreeItem(candidate)),
+    ...rawCandidates.map((candidate) => new ContainerServiceCandidateTreeItem(candidate, availability)),
   ];
 }
 

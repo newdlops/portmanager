@@ -46,6 +46,8 @@ export type ContainerRuntimePreference = "auto" | "docker" | "podman";
 
 export type ComposePortMutationMode = "clone" | "in-place" | "copy";
 
+export type ControlPlaneRole = "owner" | "worker" | "unowned";
+
 /**
  * A user-facing network scope where duplicated app-internal ports remain
  * meaningful. Runtime adapters decide whether this is backed by a container,
@@ -425,8 +427,32 @@ export interface NetworkSnapshot {
   readonly containerServiceCandidates: readonly ContainerServiceCandidate[];
   /** Runtime adapters available on this platform/build. */
   readonly runtimes: readonly NetworkRuntimeDescriptor[];
+  /** Current VS Code window's relationship to the single automatic control-plane owner. */
+  readonly controlPlane?: ControlPlaneStatus;
   /** ISO timestamp for this snapshot. */
   readonly updatedAt: string;
+}
+
+/**
+ * Cross-window owner lease state for automatic routing work.
+ *
+ * The single owner runs Docker/Compose reconciliation, terminal marker polling,
+ * generated route-file repair, and terminal env collection refresh. Other
+ * windows render as workers and should only react to user commands.
+ */
+export interface ControlPlaneStatus {
+  /** Role of this VS Code extension host in the cross-window control plane. */
+  readonly role: ControlPlaneRole;
+  /** PID of this VS Code extension host. */
+  readonly currentPid: number;
+  /** PID recorded in the active or recently stale owner lease, if any. */
+  readonly ownerPid?: number;
+  /** True when the owner lease is fresh and its PID is still alive. */
+  readonly ownerActive: boolean;
+  /** Last owner lease renewal time. */
+  readonly ownerUpdatedAt?: string;
+  /** Time when the current owner lease becomes stealable without renewal. */
+  readonly leaseExpiresAt?: string;
 }
 
 export interface TerminalCandidateProvider {
