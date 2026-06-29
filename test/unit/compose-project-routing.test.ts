@@ -308,6 +308,109 @@ test("docker wrapper maps as-is clone container names inferred from generated ov
   }
 });
 
+test("docker wrapper recovers hardcoded container names when restored overrides reset them", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-reset-container-map-"));
+  const projectDir = path.join(tempDir, "workspace", "captain");
+  const composeFile = path.join(projectDir, "docker-compose.yaml");
+  const overrideFile = path.join(tempDir, "alpha1-docker-438006b8-c03b354d.ports.override.yaml");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "compose-project-routing-alpha1.tsv");
+  const attachedProjectName = "alpha1-docker-438006b8-c03b354d";
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    composeFile,
+    [
+      "services:",
+      "  db:",
+      "    container_name: captain_db",
+      "  document_converter:",
+      "    container_name: captain_document_converter",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  fs.writeFileSync(
+    overrideFile,
+    [
+      "services:",
+      "  'db':",
+      "    container_name: !reset null",
+      "    ports: !override",
+      "      - '127.0.0.1::5432/tcp'",
+      "  'document_converter':",
+      "    container_name: !reset null",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const routingFiles = splitGeneratedComposeRoutingFiles([composeFile, overrideFile]);
+  const containerMappings = inferContainerMappingsFromComposeRoutingFiles({
+    attachedProjectName,
+    composeFiles: [composeFile, overrideFile],
+    serviceNames: ["db"],
+  });
+  const routingText = serializeComposeProjectRoutingRows([
+    {
+      networkId: "alpha1",
+      runtime: "docker",
+      workingDirectory: projectDir,
+      composeFiles: routingFiles.composeFiles,
+      originalProjectName: "captain",
+      attachedProjectName,
+      overrideFile: routingFiles.overrideFile,
+      containerMappings,
+    },
+  ]);
+
+  assert.deepEqual(containerMappings, [
+    {
+      serviceName: "db",
+      originalContainerId: "captain_db",
+      originalContainerName: "captain_db",
+      attachedContainerId: "alpha1-docker-438006b8-c03b354d-db-1",
+      attachedContainerName: "alpha1-docker-438006b8-c03b354d-db-1",
+    },
+    {
+      serviceName: "document_converter",
+      originalContainerId: "captain_document_converter",
+      originalContainerName: "captain_document_converter",
+      attachedContainerId: "alpha1-docker-438006b8-c03b354d-document_converter-1",
+      attachedContainerName: "alpha1-docker-438006b8-c03b354d-document_converter-1",
+    },
+  ]);
+  assert.equal(routingText.includes("!reset"), false);
+
+  fs.writeFileSync(routingFile, routingText, "utf8");
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=alpha1",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker exec captain_db pg_isready",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output, "<exec>\n<alpha1-docker-438006b8-c03b354d-db-1>\n<pg_isready>\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("docker compose wrapper targets clone project by compose file outside the project cwd", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-file-routing-"));
   const projectDir = path.join(tempDir, "workspace", "app");
@@ -1040,6 +1143,158 @@ test("docker wrapper rewrites stale clone hashes to the current clone hash", () 
     );
 
     assert.equal(output, "<stop>\n<network-a-app-postgres-1>\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("docker wrapper prefers fresh alias targets over stale scoped canonical rows", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-container-stale-scoped-routing-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "compose-project-routing-network-a.tsv");
+  const staleScopedFile = path.join(tempDir, "compose-project-routing-network-a.compose-stale.tsv");
+  const freshScopedFile = path.join(tempDir, "compose-project-routing-network-a.compose-fresh.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(routingFile, "", "utf8");
+  fs.writeFileSync(
+    staleScopedFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        attachedProjectName: "network-a-app-old",
+        containerMappings: [
+          {
+            serviceName: "postgres",
+            originalContainerId: "abc1234567890000",
+            originalContainerName: "workspace-postgres-1",
+            attachedContainerId: "olddef9876543210",
+            attachedContainerName: "olddef9876543210",
+          },
+        ],
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(
+    freshScopedFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        attachedProjectName: "network-a-app-1234",
+        containerMappings: [
+          {
+            serviceName: "__portmanager_alias__:postgres",
+            originalContainerId: "olddef9876543210",
+            originalContainerName: "olddef9876543210",
+            attachedContainerId: "newdef9876543210",
+            attachedContainerName: "network-a-app-postgres-1",
+          },
+        ],
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker stop olddef9876543210",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output, "<stop>\n<network-a-app-postgres-1>\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("docker wrapper resolves stopped TSV targets through the current compose service", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-container-stopped-target-routing-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        attachedProjectName: "network-a-app-1234",
+        containerMappings: [
+          {
+            serviceName: "db",
+            originalContainerId: "abc1234567890000",
+            originalContainerName: "workspace-db-1",
+            attachedContainerId: "olddef9876543210",
+            attachedContainerName: "olddef9876543210",
+          },
+        ],
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(binDir, "docker"),
+    [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"inspect\" ] && [ \"$2\" = \"--format\" ] && [ \"$3\" = \"{{.State.Running}}\" ] && [ \"$4\" = \"olddef9876543210\" ]; then",
+      "  printf 'false\\n'",
+      "  exit 0",
+      "fi",
+      "if [ \"$1\" = \"compose\" ] && [ \"$2\" = \"-p\" ] && [ \"$3\" = \"network-a-app-1234\" ] && [ \"$4\" = \"ps\" ] && [ \"$5\" = \"-q\" ] && [ \"$6\" = \"db\" ]; then",
+      "  printf 'newdef9876543210\\n'",
+      "  exit 0",
+      "fi",
+      "for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done",
+      "",
+    ].join("\n"),
+    {
+      encoding: "utf8",
+      mode: 0o700,
+    },
+  );
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker exec olddef9876543210 psql",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output, "<exec>\n<newdef9876543210>\n<psql>\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -2075,6 +2330,71 @@ test("docker wrapper prefers native container mapper when available", () => {
     );
 
     assert.equal(output, "<kill>\n<native-def987>\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("docker wrapper prefers TSV current aliases over stale native helper output", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-container-map-stale-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+  const helperPath = path.join(tempDir, "portmanager_container_map");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        attachedProjectName: "network-a-app-1234",
+        containerMappings: [
+          {
+            serviceName: "__portmanager_alias__:postgres",
+            originalContainerId: "olddef9876543210",
+            originalContainerName: "olddef9876543210",
+            attachedContainerId: "newdef9876543210",
+            attachedContainerName: "network-a-app-postgres-1",
+          },
+        ],
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(
+    helperPath,
+    "#!/bin/sh\nif [ \"$4\" = \"olddef9876543210\" ]; then printf '%s\\n' olddef9876543210; exit 0; fi\nexit 1\n",
+    {
+      encoding: "utf8",
+      mode: 0o700,
+    },
+  );
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile, helperPath),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker stop olddef9876543210",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output, "<stop>\n<network-a-app-postgres-1>\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -3689,6 +4009,98 @@ test(
           PORT_MANAGER_COMPOSE_ROUTING_FILE: routingFile,
           PORT_MANAGER_ROUTES_FILE: routeTableFile,
           PORT_MANAGER_NETWORK_ID: "",
+          PORT_MANAGER_BORROWED_NETWORK_ID: "",
+          NEWDLOPS_PM_NETWORK_ID: "",
+          NEWDLOPS_PM_BORROWED_NETWORK_ID: "",
+        },
+      });
+
+      assert.equal(output, "<exec>\n<current-db-222222>\n<psql>\n");
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "native docker PATH shim prefers fresh alias targets over stale scoped canonical rows",
+  { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
+  () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-stale-scoped-route-"));
+    const projectDir = path.join(tempDir, "workspace", "app");
+    const shimDir = path.join(tempDir, "shim");
+    const realBinDir = path.join(tempDir, "real-bin");
+    const routingFile = path.join(tempDir, "compose-project-routing-network-a.tsv");
+    const staleScopedFile = path.join(tempDir, "compose-project-routing-network-a.compose-stale.tsv");
+    const freshScopedFile = path.join(tempDir, "compose-project-routing-network-a.compose-fresh.tsv");
+
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.mkdirSync(shimDir, { recursive: true });
+    fs.mkdirSync(realBinDir, { recursive: true });
+    fs.writeFileSync(routingFile, "", "utf8");
+    fs.writeFileSync(
+      staleScopedFile,
+      serializeComposeProjectRoutingRows([
+        {
+          networkId: "network-a",
+          runtime: "docker",
+          workingDirectory: projectDir,
+          attachedProjectName: "network-a-app-old",
+          containerMappings: [
+            {
+              serviceName: "db",
+              originalContainerId: "original-db-123456",
+              originalContainerName: "captain_db",
+              attachedContainerId: "stale-db-111111",
+              attachedContainerName: "stale-db-111111",
+            },
+          ],
+        },
+      ]),
+      "utf8",
+    );
+    fs.writeFileSync(
+      freshScopedFile,
+      serializeComposeProjectRoutingRows([
+        {
+          networkId: "network-a",
+          runtime: "docker",
+          workingDirectory: projectDir,
+          attachedProjectName: "network-a-app-1234",
+          containerMappings: [
+            {
+              serviceName: "__portmanager_alias__:db",
+              originalContainerId: "stale-db-111111",
+              originalContainerName: "stale-db-111111",
+              attachedContainerId: "current-db-222222",
+              attachedContainerName: "current-db-222222",
+            },
+          ],
+        },
+      ]),
+      "utf8",
+    );
+    fs.symlinkSync(getNativeDockerShimPath(), path.join(shimDir, "docker"));
+    fs.writeFileSync(
+      path.join(realBinDir, "docker"),
+      "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n",
+      {
+        encoding: "utf8",
+        mode: 0o700,
+      },
+    );
+
+    try {
+      const output = execFileSync("docker", ["exec", "stale-db-111111", "psql"], {
+        cwd: projectDir,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${shimDir}${path.delimiter}${realBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          PORT_MANAGER_RUNTIME_SHIM_DIR: shimDir,
+          PORT_MANAGER_COMPOSE_ROUTING_FILE: routingFile,
+          PORT_MANAGER_ROUTES_FILE: "",
+          PORT_MANAGER_NETWORK_ID: "network-a",
           PORT_MANAGER_BORROWED_NETWORK_ID: "",
           NEWDLOPS_PM_NETWORK_ID: "",
           NEWDLOPS_PM_BORROWED_NETWORK_ID: "",

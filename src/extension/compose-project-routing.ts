@@ -115,26 +115,32 @@ export function splitGeneratedComposeRoutingFiles(composeFiles: readonly string[
 
 /**
  * Recovers container-name rewrites for persisted clone/as-is attachments that
- * have no mutation state. The generated override contains the attached
- * container names; removing the project suffix recovers explicit names such as
- * captain_db, while service names cover default Compose names like
- * project-rabbitmq-1.
+ * have no mutation state. The generated override either contains an explicit
+ * attached name or resets a source container_name so Compose can generate the
+ * hidden project-scoped name. Source compose files preserve hardcoded names
+ * such as captain_db so direct Docker commands can keep using them.
  */
 export function inferContainerMappingsFromComposeRoutingFiles(input: {
   readonly attachedProjectName: string;
   readonly composeFiles: readonly string[];
   readonly serviceNames: readonly string[];
 }): readonly ComposeContainerRoutingMapping[] {
-  const overrideContainerNames = readGeneratedOverrideContainerNames(input.composeFiles);
-  const serviceNames = uniqueStrings(input.serviceNames);
-  if (serviceNames.length === 0 || overrideContainerNames.size === 0) {
+  const overrideContainerNames = readGeneratedOverrideContainerNameState(input.composeFiles);
+  const sourceContainerNames = readSourceComposeContainerNames(input.composeFiles);
+  const serviceNames = uniqueStrings([
+    ...input.serviceNames,
+    ...overrideContainerNames.names.keys(),
+    ...sourceContainerNames.keys(),
+  ]);
+  if (serviceNames.length === 0 || overrideContainerNames.names.size === 0) {
     return [];
   }
 
   return serviceNames.map((serviceName) => {
     const attachedContainerName =
-      overrideContainerNames.get(serviceName) ?? `${input.attachedProjectName}-${serviceName}-1`;
+      overrideContainerNames.names.get(serviceName) ?? defaultComposeContainerName(input.attachedProjectName, serviceName);
     const originalContainerName =
+      sourceContainerNames.get(serviceName) ??
       inferOriginalContainerName(attachedContainerName, input.attachedProjectName) ?? serviceName;
 
     return {
@@ -768,17 +774,41 @@ __port_manager_container_target_scan_file_for_runtime() {
     fi
 
     if [ "\${__pm_matched}" = "1" ]; then
+      __pm_next_service="\${__pm_service_name}"
+      __pm_next_priority=1
+      case "\${__pm_next_service}" in
+        __portmanager_alias__:*)
+          __pm_next_service="\${__pm_next_service#__portmanager_alias__:}"
+          __pm_next_priority=3
+          ;;
+      esac
       if [ -n "\${__pm_attached_name}" ]; then
-        __pm_next_target="\${__pm_attached_name}\${__pm_scan_suffix}"
+        __pm_next_target_base="\${__pm_attached_name}"
       else
-        __pm_next_target="\${__pm_attached_id}\${__pm_scan_suffix}"
+        __pm_next_target_base="\${__pm_attached_id}"
       fi
+      __pm_next_target="\${__pm_next_target_base}\${__pm_scan_suffix}"
       if [ -z "\${__pm_target}" ]; then
         __pm_target="\${__pm_next_target}"
+        __pm_target_base="\${__pm_next_target_base}"
+        __pm_target_service="\${__pm_next_service}"
+        __pm_target_priority="\${__pm_next_priority}"
         __pm_matches=$((__pm_matches + 1))
+      elif [ "\${__pm_next_priority}" -gt "\${__pm_target_priority:-0}" ] 2>/dev/null; then
+        __pm_target="\${__pm_next_target}"
+        __pm_target_base="\${__pm_next_target_base}"
+        __pm_target_service="\${__pm_next_service}"
+        __pm_target_priority="\${__pm_next_priority}"
+        __pm_matches=1
+      elif [ "\${__pm_next_priority}" -lt "\${__pm_target_priority:-0}" ] 2>/dev/null; then
+        :
       elif [ "\${__pm_target}" != "\${__pm_next_target}" ]; then
         __pm_target="\${__pm_next_target}"
+        __pm_target_base="\${__pm_next_target_base}"
+        __pm_target_service="\${__pm_next_service}"
         __pm_matches=$((__pm_matches + 1))
+      elif [ -z "\${__pm_target_service}" ] && [ -n "\${__pm_next_service}" ]; then
+        __pm_target_service="\${__pm_next_service}"
       fi
     fi
   done < "\${__pm_scan_file}"
@@ -795,10 +825,74 @@ __port_manager_container_target_helper_scan_file_for_runtime() {
   [ -n "\${__pm_helper}" ] && [ -x "\${__pm_helper}" ] && [ -r "\${__pm_scan_file}" ] || return 1
   __pm_mapped="$("\${__pm_helper}" "\${__pm_scan_file}" "\${__pm_scan_network}" "\${__pm_scan_runtime}" "\${__pm_scan_token}" 2>/dev/null || true)"
   if [ -n "\${__pm_mapped}" ]; then
-    __pm_helper_matches=$((__pm_helper_matches + 1))
-    __pm_helper_target="\${__pm_mapped}"
+    if [ -z "\${__pm_helper_target}" ]; then
+      __pm_helper_matches=1
+      __pm_helper_target="\${__pm_mapped}"
+    elif [ "\${__pm_helper_target}" != "\${__pm_mapped}" ]; then
+      __pm_helper_matches=$((__pm_helper_matches + 1))
+      __pm_helper_target="\${__pm_mapped}"
+    fi
   fi
 
+  return 0
+}
+
+__port_manager_container_target_is_running() {
+  __pm_running_runtime="$1"
+  __pm_running_target="$2"
+  [ -n "\${__pm_running_runtime}" ] && [ -n "\${__pm_running_target}" ] || { unset __pm_running_runtime __pm_running_target; return 1; }
+  __pm_running_state="$(command "\${__pm_running_runtime}" inspect --format '{{.State.Running}}' "\${__pm_running_target}" 2>/dev/null | sed -n '1p' || true)"
+  [ "\${__pm_running_state}" = "true" ]
+  __pm_running_status=$?
+  unset __pm_running_runtime __pm_running_target __pm_running_state
+  return \${__pm_running_status}
+}
+
+__port_manager_compose_service_live_container() {
+  __pm_service_runtime="$1"
+  __pm_service_project="$2"
+  __pm_service_name="$3"
+  [ -n "\${__pm_service_runtime}" ] && [ -n "\${__pm_service_project}" ] && [ -n "\${__pm_service_name}" ] || {
+    unset __pm_service_runtime __pm_service_project __pm_service_name
+    return 1
+  }
+  __pm_service_output="$(command "\${__pm_service_runtime}" compose -p "\${__pm_service_project}" ps -q "\${__pm_service_name}" 2>/dev/null | sed -n '/./p' | sed -n '1,2p' || true)"
+  __pm_service_first="$(printf '%s\\n' "\${__pm_service_output}" | sed -n '1p')"
+  __pm_service_second="$(printf '%s\\n' "\${__pm_service_output}" | sed -n '2p')"
+  if [ -n "\${__pm_service_first}" ] && [ -z "\${__pm_service_second}" ]; then
+    printf '%s\\n' "\${__pm_service_first}"
+    unset __pm_service_runtime __pm_service_project __pm_service_name __pm_service_output __pm_service_first __pm_service_second
+    return 0
+  fi
+  unset __pm_service_runtime __pm_service_project __pm_service_name __pm_service_output __pm_service_first __pm_service_second
+  return 1
+}
+
+__port_manager_print_live_container_target() {
+  __pm_live_runtime="$1"
+  __pm_live_target="$2"
+  __pm_live_suffix="$3"
+  __pm_live_service="$4"
+  shift 4
+  [ -n "\${__pm_live_target}" ] || { unset __pm_live_runtime __pm_live_target __pm_live_suffix __pm_live_service; return 1; }
+  if __port_manager_container_target_is_running "\${__pm_live_runtime}" "\${__pm_live_target}"; then
+    printf '%s%s\\n' "\${__pm_live_target}" "\${__pm_live_suffix}"
+    unset __pm_live_runtime __pm_live_target __pm_live_suffix __pm_live_service
+    return 0
+  fi
+  __pm_live_route="$(__port_manager_compose_route_for_runtime "\${__pm_live_runtime}" "$@" 2>/dev/null || true)"
+  if [ -n "\${__pm_live_route}" ] && [ -n "\${__pm_live_service}" ]; then
+    __pm_live_tab="$(printf '\\t')"
+    __pm_live_project="\${__pm_live_route%%\${__pm_live_tab}*}"
+    __pm_live_current="$(__port_manager_compose_service_live_container "\${__pm_live_runtime}" "\${__pm_live_project}" "\${__pm_live_service}" 2>/dev/null || true)"
+    if [ -n "\${__pm_live_current}" ]; then
+      printf '%s%s\\n' "\${__pm_live_current}" "\${__pm_live_suffix}"
+      unset __pm_live_runtime __pm_live_target __pm_live_suffix __pm_live_service __pm_live_route __pm_live_tab __pm_live_project __pm_live_current
+      return 0
+    fi
+  fi
+  printf '%s%s\\n' "\${__pm_live_target}" "\${__pm_live_suffix}"
+  unset __pm_live_runtime __pm_live_target __pm_live_suffix __pm_live_service __pm_live_route __pm_live_tab __pm_live_project __pm_live_current
   return 0
 }
 
@@ -810,6 +904,9 @@ __port_manager_container_target_for_runtime() {
   __pm_network="$(__port_manager_network_id)"
   __pm_matches=0
   __pm_target=""
+  __pm_target_base=""
+  __pm_target_service=""
+  __pm_target_priority=0
   __pm_token_length=\${#__pm_token}
 
   if [ -z "\${__pm_file}" ] || [ -z "\${__pm_network}" ] || [ -z "\${__pm_token}" ]; then
@@ -852,13 +949,13 @@ __port_manager_container_target_for_runtime() {
   esac
 
   if [ "\${__pm_context_files}" != "0" ]; then
-    if [ "\${__pm_helper_matches}" = "1" ] && [ -n "\${__pm_helper_target}" ]; then
-      printf '%s%s\\n' "\${__pm_helper_target}" "\${__pm_token_suffix}"
-      return 0
-    fi
     if [ "\${__pm_matches}" = "1" ] && [ -n "\${__pm_target}" ]; then
-      printf '%s\\n' "\${__pm_target}"
-      return 0
+      __port_manager_print_live_container_target "\${__pm_runtime}" "\${__pm_target_base}" "\${__pm_token_suffix}" "\${__pm_target_service}" "$@"
+      return $?
+    fi
+    if [ "\${__pm_helper_matches}" = "1" ] && [ -n "\${__pm_helper_target}" ]; then
+      __port_manager_print_live_container_target "\${__pm_runtime}" "\${__pm_helper_target}" "\${__pm_token_suffix}" "\${__pm_target_service}" "$@"
+      return $?
     fi
     return 1
   fi
@@ -866,6 +963,9 @@ __port_manager_container_target_for_runtime() {
   if [ "\${__pm_scoped_files}" = "1" ]; then
     __pm_matches=0
     __pm_target=""
+    __pm_target_base=""
+    __pm_target_service=""
+    __pm_target_priority=0
     __pm_helper_matches=0
     __pm_helper_target=""
     for __pm_scoped_file in "\${__pm_file_dir}/\${__pm_file_stem}.compose-"*.tsv; do
@@ -878,14 +978,14 @@ __port_manager_container_target_for_runtime() {
     __port_manager_container_target_scan_file_for_runtime "\${__pm_file}" "\${__pm_runtime}" "\${__pm_network}" "\${__pm_token}" "\${__pm_token_length}" "\${__pm_token_suffix}" || return 1
   fi
 
-  if [ "\${__pm_helper_matches}" = "1" ] && [ -n "\${__pm_helper_target}" ]; then
-    printf '%s%s\\n' "\${__pm_helper_target}" "\${__pm_token_suffix}"
-    return 0
+  if [ "\${__pm_matches}" = "1" ] && [ -n "\${__pm_target}" ]; then
+    __port_manager_print_live_container_target "\${__pm_runtime}" "\${__pm_target_base}" "\${__pm_token_suffix}" "\${__pm_target_service}" "$@"
+    return $?
   fi
 
-  if [ "\${__pm_matches}" = "1" ] && [ -n "\${__pm_target}" ]; then
-    printf '%s\\n' "\${__pm_target}"
-    return 0
+  if [ "\${__pm_helper_matches}" = "1" ] && [ -n "\${__pm_helper_target}" ]; then
+    __port_manager_print_live_container_target "\${__pm_runtime}" "\${__pm_helper_target}" "\${__pm_token_suffix}" "\${__pm_target_service}" "$@"
+    return $?
   fi
 
   return 1
@@ -1453,8 +1553,10 @@ function isGeneratedComposeRoutingOverrideFile(composeFile: string): boolean {
   return composeFile.trim().endsWith(".ports.override.yaml");
 }
 
-function readGeneratedOverrideContainerNames(composeFiles: readonly string[]): ReadonlyMap<string, string> {
-  const names = new Map<string, string>();
+function readGeneratedOverrideContainerNameState(composeFiles: readonly string[]): {
+  readonly names: ReadonlyMap<string, string | undefined>;
+} {
+  const names = new Map<string, string | undefined>();
 
   for (const composeFile of composeFiles) {
     if (!isGeneratedComposeRoutingOverrideFile(composeFile)) {
@@ -1467,12 +1569,30 @@ function readGeneratedOverrideContainerNames(composeFiles: readonly string[]): R
     }
 
     for (const [serviceName, containerName] of parseComposeServiceContainerNames(text)) {
-      if (containerName === undefined) {
-        names.delete(serviceName);
-        continue;
-      }
-
       names.set(serviceName, containerName);
+    }
+  }
+
+  return { names };
+}
+
+function readSourceComposeContainerNames(composeFiles: readonly string[]): ReadonlyMap<string, string> {
+  const names = new Map<string, string>();
+
+  for (const composeFile of composeFiles) {
+    if (isGeneratedComposeRoutingOverrideFile(composeFile)) {
+      continue;
+    }
+
+    const text = readTextFile(composeFile);
+    if (text === undefined) {
+      continue;
+    }
+
+    for (const [serviceName, containerName] of parseComposeServiceContainerNames(text)) {
+      if (containerName !== undefined) {
+        names.set(serviceName, containerName);
+      }
     }
   }
 
@@ -1552,6 +1672,15 @@ function parseYamlScalarString(value: string): string | undefined {
     return scalar.slice(1, -1);
   }
 
+  if (/^!reset(?:\s|$)/u.test(scalar)) {
+    return undefined;
+  }
+  const tagMatch = /^![^\s]+(?:\s+(.+))?$/u.exec(scalar);
+  if (tagMatch !== null) {
+    const taggedValue = tagMatch[1]?.trim();
+    return taggedValue === undefined || taggedValue.length === 0 ? undefined : parseYamlScalarString(taggedValue);
+  }
+
   return scalar;
 }
 
@@ -1583,6 +1712,10 @@ function inferOriginalContainerName(attachedContainerName: string, attachedProje
   }
 
   return undefined;
+}
+
+function defaultComposeContainerName(attachedProjectName: string, serviceName: string): string {
+  return `${attachedProjectName}-${serviceName}-1`;
 }
 
 function uniqueStrings(values: readonly string[]): readonly string[] {

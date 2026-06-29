@@ -1072,6 +1072,169 @@ test("mutates compose services into a hidden network-scoped project", async (con
   assert.equal(calls[4]?.cwd, tempDir);
 });
 
+test("clone attach carries running internal compose services without stopping their originals", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-internal-service-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: captain",
+      "services:",
+      "  app:",
+      "    image: app:latest",
+      "    ports:",
+      "      - 18000:8000",
+      "  rabbitmq:",
+      "    image: rabbitmq:3-management",
+      "    volumes:",
+      "      - rabbitmq_data:/var/lib/rabbitmq",
+      "volumes:",
+      "  rabbitmq_data:",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
+  let hiddenStarted = false;
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (executable, args) => {
+      calls.push({ executable, args });
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "app\nrabbitmq\n", stderr: "" };
+      }
+      if (args[0] === "compose" && args.includes("up")) {
+        hiddenStarted = true;
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "container" && (args[1] === "ls" || args[1] === "ps")) {
+        const rows = [
+          {
+            ID: "source-app",
+            Names: "captain-app-1",
+            Status: "Up 10 minutes",
+            Ports: "127.0.0.1:18000->8000/tcp",
+            Labels: "com.docker.compose.project=captain,com.docker.compose.service=app",
+          },
+          {
+            ID: "source-rabbit",
+            Names: "captain-rabbitmq-1",
+            Status: "Up 10 minutes",
+            Ports: "",
+            Labels: "com.docker.compose.project=captain,com.docker.compose.service=rabbitmq",
+          },
+          ...(hiddenStarted
+            ? [
+                {
+                  ID: "hidden-app",
+                  Names: "alpha-captain-app-1",
+                  Status: "Up 1 second",
+                  Ports: "127.81.154.127:57000->8000/tcp",
+                  Labels: "com.docker.compose.project=alpha-captain,com.docker.compose.service=app",
+                },
+                {
+                  ID: "hidden-rabbit",
+                  Names: "alpha-captain-rabbitmq-1",
+                  Status: "Up 1 second",
+                  Ports: "",
+                  Labels: "com.docker.compose.project=alpha-captain,com.docker.compose.service=rabbitmq",
+                },
+              ]
+            : []),
+        ];
+        return { stdout: rows.map((row) => JSON.stringify(row)).join("\n"), stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        const services = new Map([
+          ["source-app", "app"],
+          ["source-rabbit", "rabbitmq"],
+          ["hidden-app", "app"],
+          ["hidden-rabbit", "rabbitmq"],
+        ]);
+        const names = new Map([
+          ["source-app", "captain-app-1"],
+          ["source-rabbit", "captain-rabbitmq-1"],
+          ["hidden-app", "alpha-captain-app-1"],
+          ["hidden-rabbit", "alpha-captain-rabbitmq-1"],
+        ]);
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({
+              Id: id,
+              Name: `/${names.get(id) ?? id}`,
+              Config: {
+                Labels: {
+                  "com.docker.compose.service": services.get(id) ?? "",
+                },
+              },
+              Mounts:
+                id === "source-rabbit"
+                  ? [
+                      {
+                        Type: "volume",
+                        Name: "captain_rabbitmq_data",
+                        Source: "/var/lib/docker/volumes/captain_rabbitmq_data/_data",
+                        Destination: "/var/lib/rabbitmq",
+                        RW: true,
+                      },
+                    ]
+                  : [],
+            })),
+          ),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    allowStatefulClone: true,
+    attachedProjectName: "alpha-captain",
+    runtime: "docker",
+    networkName: "alpha",
+    hiddenHostAddress: "127.81.154.127",
+    originalProjectName: "captain",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    ports: [
+      {
+        serviceName: "app",
+        logicalPort: 18000,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 18000,
+        containerPort: 8000,
+        protocol: "tcp",
+      },
+    ],
+  });
+
+  const composeCalls = calls.filter((call) => call.args[0] === "compose").map((call) => call.args);
+  const stopCall = composeCalls.find((args) => args.includes("stop"));
+  const upCall = composeCalls.find((args) => args.includes("up"));
+
+  assert.deepEqual(stopCall?.slice(stopCall.indexOf("stop")), ["stop", "app"]);
+  assert.equal(upCall?.includes("app"), true);
+  assert.equal(upCall?.includes("rabbitmq"), true);
+  assert.deepEqual(result.state.services, ["app", "rabbitmq"]);
+  assert.deepEqual(
+    result.state.containerMappings?.map((mapping) => mapping.serviceName),
+    ["app", "rabbitmq"],
+  );
+  assert.equal(result.ports.length, 1);
+  assert.equal(result.ports[0]?.serviceName, "app");
+  assert.equal(result.state.clonedVolumes?.[0]?.serviceName, "rabbitmq");
+
+  const overrideText = fs.readFileSync(result.state.overrideFile, "utf8");
+  assert.match(overrideText, /'rabbitmq':/);
+  assert.doesNotMatch(overrideText, /'rabbitmq':\n    container_name: !reset null\n    network_mode: !reset null\n    links: !reset \[\]\n    external_links: !reset \[\]\n    profiles: !override/);
+  assert.match(overrideText, /target: '\/var\/lib\/rabbitmq'/);
+  assert.match(overrideText, /name: 'pm-alpha-captain-[a-f0-9]{12}-[a-f0-9]{8}'/);
+});
+
 test("copy mode creates stopped langgraph_server discovered from compose ps", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-copy-stopped-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
@@ -3361,7 +3524,10 @@ test("recreates missing compose clone override from persisted mutation state", a
   });
 
   const overrideText = fs.readFileSync(overrideFile, "utf8");
-  assert.deepEqual(calls.map((call) => call.args), [["compose", "-p", "workspace", "-f", composeFile, "config", "--services"]]);
+  assert.deepEqual(
+    calls.filter((call) => call.args[0] === "compose").map((call) => call.args),
+    [["compose", "-p", "workspace", "-f", composeFile, "config", "--services"]],
+  );
   assert.match(overrideText, /'db':\n    container_name: 'captain_db-network'/);
   assert.match(overrideText, /127\.81\.154\.127::5432\/tcp/);
   assert.match(overrideText, /'langgraph_server':\n    container_name: !reset null/);
@@ -3439,7 +3605,10 @@ test("recovers compose clone overrides into the current storage directory", asyn
   assert.equal(overrideFile, path.join(storageDir, "network-workspace.ports.override.yaml"));
   assert.equal(fs.existsSync(overrideFile), true);
   assert.equal(fs.existsSync(oldOverrideFile), false);
-  assert.deepEqual(calls.map((call) => call.args), [["compose", "-p", "workspace", "-f", composeFile, "config", "--services"]]);
+  assert.deepEqual(
+    calls.filter((call) => call.args[0] === "compose").map((call) => call.args),
+    [["compose", "-p", "workspace", "-f", composeFile, "config", "--services"]],
+  );
 });
 
 test("force-recreates stale compose clone overrides without original container names", async (context) => {
@@ -3519,10 +3688,92 @@ test("force-recreates stale compose clone overrides without original container n
   );
 
   const overrideText = fs.readFileSync(overrideFile, "utf8");
-  assert.deepEqual(calls.map((call) => call.args), [["compose", "-p", "captain", "-f", composeFile, "config", "--services"]]);
+  assert.deepEqual(
+    calls.filter((call) => call.args[0] === "compose").map((call) => call.args),
+    [["compose", "-p", "captain", "-f", composeFile, "config", "--services"]],
+  );
   assert.match(overrideText, /'chrome':\n    container_name: !reset null/);
   assert.doesNotMatch(overrideText, /container_name: 'captain_chrome'/);
   assert.match(overrideText, /127\.81\.154\.127::5900\/tcp/);
+});
+
+test("restored compose clone overrides do not write container hashes as names", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-hash-name-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const overrideFile = path.join(tempDir, "production1-captain.ports.override.yaml");
+  const leakedHash = "c4f68ffea4b60637e7884f0cafdda83cd4efea76b4fb425906664b3bd77eb326";
+
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: captain",
+      "services:",
+      "  db:",
+      "    image: postgres:16",
+      "    container_name: captain_db",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await mutator.restoreHiddenPortsOverride(
+    {
+      mode: "clone",
+      runtime: "docker",
+      originalProjectName: "captain",
+      attachedProjectName: "production1-captain-79b2163a",
+      workingDirectory: tempDir,
+      composeFiles: [composeFile],
+      services: ["db"],
+      overrideFile,
+      originalPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 15432,
+          actualHostAddress: "127.0.0.1",
+          actualHostPort: 15432,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+      hiddenPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 15432,
+          actualHostAddress: "127.81.154.127",
+          actualHostPort: 57032,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+      containerMappings: [
+        {
+          serviceName: "db",
+          originalContainerId: "source-db",
+          originalContainerName: "captain_db",
+          attachedContainerId: leakedHash,
+          attachedContainerName: leakedHash,
+        },
+      ],
+    },
+    { force: true },
+  );
+
+  const overrideText = fs.readFileSync(overrideFile, "utf8");
+  assert.match(overrideText, /'db':\n    container_name: !reset null/);
+  assert.doesNotMatch(overrideText, new RegExp(leakedHash));
 });
 
 test("clone override resets source container names even when compose config omits a service", async (context) => {
@@ -3696,6 +3947,380 @@ test("restore override resets source container names even when compose config om
   assert.match(overrideText, /'document_converter':\n    container_name: !reset null/);
   assert.match(overrideText, /profiles: !override\n      - 'pm_unattached'/);
   assert.doesNotMatch(overrideText, /container_name: 'captain_document_converter'/);
+});
+
+test("restore override trusts live generated clone names without persisting stale explicit names", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-live-generated-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const overrideFile = path.join(tempDir, "production1-captain.ports.override.yaml");
+
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: captain",
+      "services:",
+      "  db:",
+      "    image: postgres:16",
+      "    container_name: captain_db",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls" && args.includes("label=com.docker.compose.project=production1-captain-79b2163a")) {
+        return {
+          stdout: JSON.stringify({
+            ID: "live-db",
+            Names: "production1-captain-79b2163a-db-1",
+            Ports: "127.81.154.127:57032->5432/tcp",
+            Labels: "com.docker.compose.project=production1-captain-79b2163a,com.docker.compose.service=db",
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify([
+            {
+              Id: "live-db",
+              Name: "/production1-captain-79b2163a-db-1",
+              Config: {
+                Labels: {
+                  "com.docker.compose.project": "production1-captain-79b2163a",
+                  "com.docker.compose.service": "db",
+                },
+              },
+              Mounts: [],
+            },
+          ]),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await mutator.restoreHiddenPortsOverride(
+    {
+      mode: "clone",
+      runtime: "docker",
+      originalProjectName: "captain",
+      attachedProjectName: "production1-captain-79b2163a",
+      workingDirectory: tempDir,
+      composeFiles: [composeFile],
+      services: ["db"],
+      overrideFile,
+      originalPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 15432,
+          actualHostAddress: "127.0.0.1",
+          actualHostPort: 15432,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+      hiddenPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 15432,
+          actualHostAddress: "127.81.154.127",
+          actualHostPort: 57032,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+      containerMappings: [
+        {
+          serviceName: "db",
+          originalContainerId: "source-db",
+          originalContainerName: "captain_db",
+          attachedContainerId: "stale-db",
+          attachedContainerName: "captain_db-production1-captain-79b2163a",
+        },
+      ],
+    },
+    { force: true },
+  );
+
+  const overrideText = fs.readFileSync(overrideFile, "utf8");
+  assert.match(overrideText, /'db':\n    container_name: !reset null/);
+  assert.doesNotMatch(overrideText, /container_name: 'captain_db-production1-captain-79b2163a'/);
+});
+
+test("restore override suffixes persisted clone names reserved by another container", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-reserved-name-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const overrideFile = path.join(tempDir, "production1-captain.ports.override.yaml");
+
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: captain",
+      "services:",
+      "  db:",
+      "    image: postgres:16",
+      "    container_name: captain_db",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls" && args.includes("--filter")) {
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ps") {
+        return {
+          stdout: JSON.stringify({
+            ID: "other-db",
+            Names: "captain_db-production1-captain-79b2163a",
+            Labels: "com.docker.compose.project=other-project,com.docker.compose.service=db",
+          }),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await mutator.restoreHiddenPortsOverride(
+    {
+      mode: "clone",
+      runtime: "docker",
+      originalProjectName: "captain",
+      attachedProjectName: "production1-captain-79b2163a",
+      workingDirectory: tempDir,
+      composeFiles: [composeFile],
+      services: ["db"],
+      overrideFile,
+      originalPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 15432,
+          actualHostAddress: "127.0.0.1",
+          actualHostPort: 15432,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+      hiddenPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 15432,
+          actualHostAddress: "127.81.154.127",
+          actualHostPort: 57032,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+      containerMappings: [
+        {
+          serviceName: "db",
+          originalContainerId: "source-db",
+          originalContainerName: "captain_db",
+          attachedContainerId: "stale-db",
+          attachedContainerName: "captain_db-production1-captain-79b2163a",
+        },
+      ],
+    },
+    { force: true },
+  );
+
+  const overrideText = fs.readFileSync(overrideFile, "utf8");
+  assert.match(overrideText, /'db':\n    container_name: 'captain_db-production1-captain-79b2163a-2'/);
+  assert.doesNotMatch(overrideText, /container_name: 'captain_db-production1-captain-79b2163a'\n/);
+});
+
+test("restore override treats globally reserved same-project names as live hidden containers", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-global-owner-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const overrideFile = path.join(tempDir, "production1-captain.ports.override.yaml");
+
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: captain",
+      "services:",
+      "  db:",
+      "    image: postgres:16",
+      "    container_name: captain_db",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ps") {
+        return {
+          stdout: JSON.stringify({
+            ID: "current-db",
+            Names: "captain_db-production1-captain-79b2163a",
+            Labels: "com.docker.compose.project=production1-captain-79b2163a,com.docker.compose.service=db",
+          }),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await mutator.restoreHiddenPortsOverride(
+    {
+      mode: "clone",
+      runtime: "docker",
+      originalProjectName: "captain",
+      attachedProjectName: "production1-captain-79b2163a",
+      workingDirectory: tempDir,
+      composeFiles: [composeFile],
+      services: ["db"],
+      overrideFile,
+      originalPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 15432,
+          actualHostAddress: "127.0.0.1",
+          actualHostPort: 15432,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+      hiddenPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 15432,
+          actualHostAddress: "127.81.154.127",
+          actualHostPort: 57032,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+      containerMappings: [
+        {
+          serviceName: "db",
+          originalContainerId: "source-db",
+          originalContainerName: "captain_db",
+          attachedContainerId: "current-db",
+          attachedContainerName: "captain_db-production1-captain-79b2163a",
+        },
+      ],
+    },
+    { force: true },
+  );
+
+  const overrideText = fs.readFileSync(overrideFile, "utf8");
+  assert.match(overrideText, /'db':\n    container_name: 'captain_db-production1-captain-79b2163a'/);
+  assert.doesNotMatch(overrideText, /container_name: 'captain_db-production1-captain-79b2163a-2'/);
+});
+
+test("restore override fails closed before writing persisted names without reservations", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-reservation-fail-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const overrideFile = path.join(tempDir, "production1-captain.ports.override.yaml");
+
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: captain",
+      "services:",
+      "  db:",
+      "    image: postgres:16",
+      "    container_name: captain_db",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ps") {
+        throw new Error("docker unavailable");
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await assert.rejects(
+    () =>
+      mutator.restoreHiddenPortsOverride(
+        {
+          mode: "clone",
+          runtime: "docker",
+          originalProjectName: "captain",
+          attachedProjectName: "production1-captain-79b2163a",
+          workingDirectory: tempDir,
+          composeFiles: [composeFile],
+          services: ["db"],
+          overrideFile,
+          originalPorts: [
+            {
+              serviceName: "db",
+              logicalPort: 15432,
+              actualHostAddress: "127.0.0.1",
+              actualHostPort: 15432,
+              containerPort: 5432,
+              protocol: "tcp",
+            },
+          ],
+          hiddenPorts: [
+            {
+              serviceName: "db",
+              logicalPort: 15432,
+              actualHostAddress: "127.81.154.127",
+              actualHostPort: 57032,
+              containerPort: 5432,
+              protocol: "tcp",
+            },
+          ],
+          containerMappings: [
+            {
+              serviceName: "db",
+              originalContainerId: "source-db",
+              originalContainerName: "captain_db",
+              attachedContainerId: "stale-db",
+              attachedContainerName: "captain_db-production1-captain-79b2163a",
+            },
+          ],
+        },
+        { force: true },
+      ),
+    /failed to verify runtime container name reservations/,
+  );
+  assert.equal(fs.existsSync(overrideFile), false);
 });
 
 test("fails closed when hidden compose override restore cannot list all services", async (context) => {

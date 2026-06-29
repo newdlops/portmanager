@@ -2481,6 +2481,7 @@ typedef struct {
   int require_context;
   int context_files;
   int matches;
+  int target_priority;
   char target[PM_MAX_FIELD];
 } pm_container_target_search;
 
@@ -2535,6 +2536,7 @@ static int pm_container_target_scan_file(const char *file_path, void *context) {
 
     if (matched) {
       char next_target[PM_MAX_FIELD];
+      int next_priority = pm_has_prefix(row.service_name, "__portmanager_alias__:") ? 3 : 1;
 
       snprintf(
         next_target,
@@ -2544,11 +2546,23 @@ static int pm_container_target_scan_file(const char *file_path, void *context) {
         search->suffix == NULL ? "" : search->suffix
       );
 
+      if (search->target[0] != '\0' && next_priority > search->target_priority) {
+        search->matches = 1;
+        search->target_priority = next_priority;
+        pm_copy(search->target, sizeof(search->target), next_target);
+        continue;
+      }
+
+      if (search->target[0] != '\0' && next_priority < search->target_priority) {
+        continue;
+      }
+
       if (search->target[0] != '\0' && strcmp(search->target, next_target) == 0) {
         continue;
       }
 
       search->matches++;
+      search->target_priority = next_priority;
       pm_copy(search->target, sizeof(search->target), next_target);
     }
   }

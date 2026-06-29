@@ -561,11 +561,13 @@ test("background routing refresh converges daemon version and generated route fi
   const ensureBody = source.slice(ensureStart, ensureEnd);
 
   assert.equal(source.includes("DAEMON_RESTART_BACKOFF_MS = 30_000"), true);
+  assert.equal(convergeBody.includes("this.ensureSharedNetworkStateFileMaterialized();"), true);
   assert.equal(convergeBody.includes("await this.ensureCurrentProcessDaemon().catch(() => undefined);"), true);
   assert.equal(convergeBody.includes("await this.writeHostAccessBindingsFile().catch(() => undefined);"), true);
   assert.equal(convergeBody.includes("await this.writeComposeProjectRoutingFile().catch(() => undefined);"), true);
   assert.equal(convergeBody.includes("restorePersistedComposeRoutesIfMissing"), false);
   assert.equal(convergeBody.includes("not force an additional full listener scan every minute"), true);
+  assert.equal(convergeBody.includes("await this.ensureDaemonRouteTablesMaterialized().catch(() => undefined);"), true);
   assert.equal(convergeBody.includes("await this.processService.refresh().catch(() => undefined);"), false);
   assert.equal(convergeBody.includes("await this.syncLogicalPortRouters().catch(() => undefined);"), true);
   assert.equal(ensureBody.includes('daemon.status !== "running"'), true);
@@ -576,6 +578,49 @@ test("background routing refresh converges daemon version and generated route fi
   assert.equal(agentClientSource.includes("await this.waitForPreviousDaemonExit(previousPid);"), true);
   assert.equal(agentClientSource.includes('process.kill(pid, "SIGTERM");'), true);
   assert.equal(agentClientSource.includes("function isProcessAlive(pid: number): boolean"), true);
+});
+
+test("global storage cleanup rehydrates generated routing from live attachment state", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const rehydrateStart = source.indexOf("private async rehydrateRoutingFiles");
+  const rehydrateEnd = source.indexOf("private async collectMatchingFiles", rehydrateStart);
+  const rehydrateBody = source.slice(rehydrateStart, rehydrateEnd);
+  const materializeStart = source.indexOf("private async ensureDaemonRouteTablesMaterialized");
+  const materializeEnd = source.indexOf("private async reapplyRoutingToAttachedTerminalWindows", materializeStart);
+  const materializeBody = source.slice(materializeStart, materializeEnd);
+  const reapplyStart = source.indexOf("private async reapplyRoutingToAttachedTerminalWindows");
+  const reapplyEnd = source.indexOf("private watchTerminalAttachmentMarkers", reapplyStart);
+  const reapplyBody = source.slice(reapplyStart, reapplyEnd);
+
+  assert.notEqual(rehydrateStart, -1);
+  assert.notEqual(materializeStart, -1);
+  assert.notEqual(reapplyStart, -1);
+  assert.equal(rehydrateBody.includes("this.ensureSharedNetworkStateFileMaterialized();"), true);
+  assert.equal(
+    rehydrateBody.indexOf("await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);") <
+      rehydrateBody.indexOf("await this.ensureDaemonRouteTablesMaterialized({"),
+    true,
+  );
+  assert.equal(
+    rehydrateBody.indexOf("await this.ensureDaemonRouteTablesMaterialized({") <
+      rehydrateBody.indexOf(
+        "await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);",
+      ),
+    true,
+  );
+  assert.equal(rehydrateBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);"), true);
+  assert.equal(rehydrateBody.includes("await this.reapplyRoutingToAttachedTerminalWindows().catch(() => 0);"), true);
+  assert.equal(materializeBody.includes("getDefaultRouteTablePath()"), true);
+  assert.equal(materializeBody.includes("getRouteTablePathForNetwork(networkId)"), true);
+  assert.equal(materializeBody.includes("new Set(["), true);
+  assert.equal(materializeBody.includes("Promise.all(routeTablePaths.map((routeTablePath) => fileIsReadable(routeTablePath)))"), true);
+  assert.equal(materializeBody.includes("await this.processService.start();"), true);
+  assert.equal(materializeBody.includes("await this.processService.refresh();"), true);
+  assert.equal(source.includes("missing marker"), true);
+  assert.equal(reapplyBody.includes('network?.runtimeKind !== "nativeHelper"'), true);
+  assert.equal(reapplyBody.includes("this.injectRoutingIntoTerminalWindow("), true);
+  assert.equal(reapplyBody.includes("await this.refreshTerminals()"), false);
 });
 
 test("logical port routers use a single cross-window owner lease", () => {
@@ -630,7 +675,18 @@ test("compose attach waits for routing convergence before returning", () => {
   );
   assert.equal(convergeBody.includes("await this.writeTerminalNetworkSelectionFile().catch(() => undefined);"), true);
   assert.equal(convergeBody.includes("await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);"), true);
+  assert.equal(
+    convergeBody.indexOf("await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);") <
+      convergeBody.indexOf(
+        "await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);",
+      ),
+    true,
+  );
+  assert.equal(convergeBody.includes("await this.ensureDaemonRouteTablesMaterialized({"), true);
+  assert.equal(convergeBody.includes("networkIds: attachments.map((attachment) => attachment.networkId),"), true);
   assert.equal(convergeBody.includes("await this.convergeDaemonAndRoutingState();"), true);
+  assert.equal(convergeBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);"), true);
+  assert.equal(convergeBody.includes("await this.reapplyRoutingToAttachedTerminalWindows().catch(() => 0);"), true);
   assert.equal(convergeBody.includes("await this.refreshContainerServices().catch(() => []);"), true);
   assert.equal(convergeBody.includes("this.localChangeEvents.emit();"), true);
 });
@@ -642,18 +698,36 @@ test("compose routing rows merge explicit and inferred container mappings", () =
   assert.equal(source.includes("function mergeComposeRoutingContainerMappings"), true);
   assert.equal(source.includes("const inferredContainerMappings = inferContainerMappingsFromComposeRoutingFiles"), true);
   assert.equal(source.includes("const containerMappings = mergeComposeRoutingContainerMappings("), true);
-  assert.equal(source.includes("!serviceNames.has(mapping.serviceName)"), true);
+  assert.equal(source.includes("composeFiles: [mutation.overrideFile, ...mutation.composeFiles]"), true);
+  assert.equal(source.includes("mergeComposeContainerMappingLineage(primaryMappings, fallbackMappings)"), true);
+  assert.equal(source.includes("CONTAINER_ALIAS_SERVICE_PREFIX"), true);
+  assert.equal(source.includes("function composeRoutingContainerMappingTargetServiceName"), true);
 });
 
 test("terminal hook markers refresh attached UI state without manual refresh", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
+  const refreshStart = source.indexOf("private async refreshTerminalsExclusive");
+  const refreshEnd = source.indexOf("async refreshContainerServices", refreshStart);
+  const refreshBody = source.slice(refreshStart, refreshEnd);
+  const restoreStart = source.indexOf("private async restoreMissingManualTerminalAttachmentMarkers");
+  const restoreEnd = source.indexOf("private syncProcessAttachmentLiveness", restoreStart);
+  const restoreBody = source.slice(restoreStart, restoreEnd);
 
   assert.equal(source.includes("TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500"), true);
   assert.equal(source.includes("private watchTerminalAttachmentMarkers(directoryPath: string): DisposableLike"), true);
   assert.equal(source.includes("syncFs.watch(directoryPath"), true);
   assert.equal(source.includes("private scheduleTerminalAttachmentRefreshBurst(): void"), true);
   assert.equal(source.includes("private async refreshTerminalAttachmentsWhenMarkersChanged(): Promise<void>"), true);
+  assert.notEqual(restoreStart, -1);
+  assert.equal(
+    refreshBody.indexOf("await this.restoreMissingManualTerminalAttachmentMarkers(processRows).catch(() => undefined);") <
+      refreshBody.indexOf("await this.syncManualTerminalAttachmentMarkers(processRows).catch(() => undefined);"),
+    true,
+  );
+  assert.equal(restoreBody.includes("attachment.id.startsWith(MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX)"), true);
+  assert.equal(restoreBody.includes("writeManualTerminalAttachmentMarker"), true);
+  assert.equal(restoreBody.includes("await writeTextFileAtomically(markerPath"), true);
   assert.equal(source.includes("selectLatestTerminalAttachmentMarkerCandidates"), true);
   assert.equal(source.includes("terminalAttachmentsShareIdentity"), true);
   assert.equal(source.includes("selectedMarkerPaths"), true);
@@ -740,7 +814,11 @@ test("compose project routing files are published as a serialized atomic generat
   assert.equal(writeBody.includes("await this.reconcileComposeOverrideFiles(undefined, {"), true);
   assert.equal(writeBody.includes('await writeTextFileAtomically(globalFilePath, "");'), true);
   assert.equal(writeBody.includes('await writeTextFileAtomically(scopedFilePath, "");'), true);
-  assert.equal(writeBody.includes("await writeTextFileAtomically(scopedFilePath, serializeComposeProjectRoutingRows([row]));"), true);
+  assert.equal(writeBody.includes("const rowsByScopedFilePath = new Map<string, ComposeProjectRoutingRow[]>();"), true);
+  assert.equal(writeBody.includes("rowsByScopedFilePath.set(scopedFilePath, [row]);"), true);
+  assert.equal(writeBody.includes("scopedRows.push(row);"), true);
+  assert.equal(writeBody.includes("await writeTextFileAtomically(scopedFilePath, serializeComposeProjectRoutingRows(scopedRows));"), true);
+  assert.equal(writeBody.includes("serializeComposeProjectRoutingRows([row])"), false);
   assert.equal(writeBody.includes("await fs.writeFile(scopedFilePath"), false);
   assert.equal(source.includes("COMPOSE_PROJECT_ROUTING_WRITE_LOCK_STALE_MS"), true);
   assert.equal(source.includes("function acquireSharedFileGenerationLock"), true);
@@ -811,6 +889,23 @@ test("manual refresh commands reconcile generated network routing state", () => 
   assert.equal(refreshServicesBody.includes("await this.dependencies.networkService.refreshNetworkRoutingState();"), true);
   assert.equal(refreshBody.includes("this.dependencies.networkService.refreshContainerServices()"), true);
   assert.equal(refreshBody.includes("await this.dependencies.networkService.refreshNetworkRoutingState();"), true);
+});
+
+test("container attach resolves candidates from a fresh Docker discovery pass", () => {
+  const commandsPath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const commandsSource = fs.readFileSync(commandsPath, "utf8");
+  const attachStart = commandsSource.indexOf("private async attachContainerToNetwork");
+  const attachEnd = commandsSource.indexOf("  /** Attaches published ports", attachStart);
+  const attachBody = commandsSource.slice(attachStart, attachEnd);
+  const resolveStart = commandsSource.indexOf("private async resolveContainerServiceCandidateArgument");
+  const resolveEnd = commandsSource.indexOf("  /** Resolves a terminal attachment", resolveStart);
+  const resolveBody = commandsSource.slice(resolveStart, resolveEnd);
+
+  assert.equal(attachBody.includes("directInput?.containerService === undefined"), true);
+  assert.equal(attachBody.includes("directInput.containerService,"), true);
+  assert.equal(resolveBody.includes("await this.dependencies.networkService.refreshContainerServices({ force: true });"), true);
+  assert.equal(resolveBody.includes("return resolveLatestContainerServiceCandidate(candidates, candidate);"), true);
+  assert.equal(resolveBody.includes("getSnapshot().containerServiceCandidates"), false);
 });
 
 test("background routing convergence does not rewrite unchanged generated files", () => {

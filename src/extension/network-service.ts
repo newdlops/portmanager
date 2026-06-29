@@ -36,6 +36,10 @@ import {
   runContainerCommand,
 } from "../platform/network/container-runtime";
 import { BrowserDnsServer, browserDnsPort, normalizeBrowserDnsHostname } from "../platform/network/browser-dns-server";
+import {
+  CONTAINER_ALIAS_SERVICE_PREFIX,
+  mergeComposeContainerMappingLineage,
+} from "../platform/network/compose-container-mappings";
 import { ComposePublishMutator } from "../platform/network/compose-publish-mutator";
 import { ContainerServiceDiscoveryAdapter } from "../platform/network/container-service-discovery";
 import { SharedLogicalNetworkStateStore } from "../platform/network/shared-network-state-store";
@@ -813,6 +817,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const candidates = [...vscodeCandidates, ...osCandidates];
     this.registry.setTerminalCandidates(candidates);
     this.syncProcessAttachmentLiveness(processRows);
+    await this.restoreMissingManualTerminalAttachmentMarkers(processRows).catch(() => undefined);
     await this.syncManualTerminalAttachmentMarkers(processRows).catch(() => undefined);
 
     return this.registry.getSnapshot().terminalWindows;
@@ -1477,8 +1482,16 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const removedAttachment = this.registry.removeComposeAttachment(attachmentId);
     await this.removeComposeRouteProcesses(attachment, attachment.ports);
+    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
     await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
+    await this.ensureDaemonRouteTablesMaterialized({ force: true, networkIds: [attachment.networkId] }).catch(
+      () => undefined,
+    );
+    await this.convergeDaemonAndRoutingState();
+    await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);
+    await this.reapplyRoutingToAttachedTerminalWindows().catch(() => 0);
+    this.localChangeEvents.emit();
     return removedAttachment;
   }
 
@@ -2307,10 +2320,16 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     await this.reconcileComposeOverrideFiles(attachments, { force: true }).catch(() => undefined);
+    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
     await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
-    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
+    await this.ensureDaemonRouteTablesMaterialized({
+      force: true,
+      networkIds: attachments.map((attachment) => attachment.networkId),
+    }).catch(() => undefined);
     await this.convergeDaemonAndRoutingState();
+    await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);
+    await this.reapplyRoutingToAttachedTerminalWindows().catch(() => 0);
     await this.refreshContainerServices().catch(() => []);
     this.localChangeEvents.emit();
   }
@@ -2334,8 +2353,10 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     await this.reconcileComposeOverrideFiles(attachments, { force: true });
-    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
     await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
+    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
+    await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
+    await this.ensureDaemonRouteTablesMaterialized({ force: true, networkIds: [networkId] }).catch(() => undefined);
   }
 
   /**
@@ -2360,6 +2381,7 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   private async convergeDaemonAndRoutingStateExclusive(): Promise<void> {
+    this.ensureSharedNetworkStateFileMaterialized();
     await this.ensureCurrentProcessDaemon().catch(() => undefined);
     await this.writeHostAccessBindingsFile().catch(() => undefined);
     await this.writeComposeProjectRoutingFile().catch(() => undefined);
@@ -2367,10 +2389,11 @@ export class PortManagerNetworkService implements DisposableLike {
 
     /*
      * The agent owns periodic OS listener polling. Background convergence should
-     * not force an additional full listener scan every minute; it only rewrites
-     * generated route files when contents changed and reconciles local routers
-     * from the latest snapshot already delivered by the daemon.
+     * not force an additional full listener scan every minute. The only
+     * exception is a missing route-table file, which means generated storage was
+     * cleaned and the daemon must write its current snapshot back to disk.
      */
+    await this.ensureDaemonRouteTablesMaterialized().catch(() => undefined);
     await this.syncLogicalPortRouters().catch(() => undefined);
   }
 
@@ -2404,6 +2427,94 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.processService.restartDaemon();
     this.daemonRestartBackoffUntilMs = 0;
     this.localChangeEvents.emit();
+  }
+
+  /** Recreates the shared durable state document when globalStorage was cleaned under a live extension host. */
+  private ensureSharedNetworkStateFileMaterialized(): void {
+    try {
+      if (syncFs.existsSync(this.sharedNetworkStateStore.filePath)) {
+        return;
+      }
+    } catch {
+      // If stat itself fails, saving the current in-memory registry is the safer recovery path.
+    }
+
+    this.saveState({ force: true });
+  }
+
+  /**
+   * Forces the daemon to rewrite route-table JSON after cleanup, while keeping
+   * normal background convergence cheap when the generated files still exist.
+   */
+  private async ensureDaemonRouteTablesMaterialized(
+    options: { readonly force?: boolean; readonly networkIds?: readonly string[] } = {},
+  ): Promise<void> {
+    if (this.processService === undefined) {
+      return;
+    }
+
+    const routeTablePaths = [
+      ...new Set([
+        getDefaultRouteTablePath(),
+        ...(options.networkIds ?? []).map((networkId) => getRouteTablePathForNetwork(networkId)),
+      ]),
+    ];
+    if (
+      options.force !== true &&
+      (await Promise.all(routeTablePaths.map((routeTablePath) => fileIsReadable(routeTablePath)))).every(Boolean)
+    ) {
+      return;
+    }
+
+    await this.processService.start();
+    await this.processService.refresh();
+  }
+
+  /**
+   * Re-sources native routing into already attached terminals after globalStorage
+   * cleanup. This intentionally avoids refreshTerminals first: missing marker
+   * files would otherwise delete manual attachments before the script can
+   * recreate their marker and shim paths.
+   */
+  private async reapplyRoutingToAttachedTerminalWindows(): Promise<number> {
+    const settings = readPortManagerSettings();
+    if (!settings.enabled || !shouldInjectTerminalHook(settings)) {
+      return 0;
+    }
+
+    const snapshot = this.registry.getSnapshot();
+    const terminalWindowIds = new Set(snapshot.terminalWindows.map((terminalWindow) => terminalWindow.id));
+    const attachmentByTerminalWindowId = new Map<string, TerminalAttachment>();
+
+    for (const attachment of snapshot.attachments) {
+      const terminalWindowId = attachment.terminalWindowId;
+      const network = this.registry.getNetwork(attachment.networkId);
+
+      if (
+        attachment.status !== "attached" ||
+        terminalWindowId === undefined ||
+        network?.runtimeKind !== "nativeHelper" ||
+        !terminalWindowIds.has(terminalWindowId)
+      ) {
+        continue;
+      }
+
+      attachmentByTerminalWindowId.set(terminalWindowId, attachment);
+    }
+
+    let injectedCount = 0;
+    for (const attachment of attachmentByTerminalWindowId.values()) {
+      const result = await this.injectRoutingIntoTerminalWindow(
+        attachment.terminalWindowId!,
+        attachment.networkId,
+        settings,
+      ).catch(() => undefined);
+      if (result?.injected === true) {
+        injectedCount++;
+      }
+    }
+
+    return injectedCount;
   }
 
   /**
@@ -3245,6 +3356,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const snapshot = this.registry.getSnapshot();
     const globalFilePath = this.getComposeProjectRoutingFilePath();
     const currentScopedPaths = new Set<string>();
+    const rowsByScopedFilePath = new Map<string, ComposeProjectRoutingRow[]>();
 
     await fs.mkdir(path.dirname(globalFilePath), { recursive: true });
     await writeTextFileAtomically(globalFilePath, "");
@@ -3258,7 +3370,16 @@ export class PortManagerNetworkService implements DisposableLike {
     for (const row of rows) {
       const scopedFilePath = this.getComposeProjectRoutingFilePath(row.networkId, composeProjectRoutingRowScope(row));
       currentScopedPaths.add(scopedFilePath);
-      await writeTextFileAtomically(scopedFilePath, serializeComposeProjectRoutingRows([row]));
+      const scopedRows = rowsByScopedFilePath.get(scopedFilePath);
+      if (scopedRows === undefined) {
+        rowsByScopedFilePath.set(scopedFilePath, [row]);
+      } else {
+        scopedRows.push(row);
+      }
+    }
+
+    for (const [scopedFilePath, scopedRows] of rowsByScopedFilePath) {
+      await writeTextFileAtomically(scopedFilePath, serializeComposeProjectRoutingRows(scopedRows));
     }
 
     await this.removeStaleComposeProjectRoutingFiles(currentScopedPaths);
@@ -3547,11 +3668,18 @@ export class PortManagerNetworkService implements DisposableLike {
     attachments: readonly ComposeAttachment[],
   ): Promise<RoutingFileCleanupSummary> {
     const attachmentIds = new Set(attachments.map((attachment) => attachment.id));
+    this.ensureSharedNetworkStateFileMaterialized();
     const restoredComposeOverrideCount = await this.reconcileComposeOverrideFiles(attachments, { force: true });
     await this.writeHostAccessBindingsFile().catch(() => undefined);
-    await this.writeComposeProjectRoutingFile().catch(() => undefined);
-    await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
     await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
+    await this.ensureDaemonRouteTablesMaterialized({
+      force: true,
+      networkIds: attachments.map((attachment) => attachment.networkId),
+    }).catch(() => undefined);
+    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
+    await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
+    await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);
+    await this.reapplyRoutingToAttachedTerminalWindows().catch(() => 0);
     await this.syncLogicalPortRouters();
     const restoredComposeRouteCount = this.registry
       .getSnapshot()
@@ -3662,6 +3790,76 @@ export class PortManagerNetworkService implements DisposableLike {
     for (const markerPath of staleMarkerPaths) {
       await fs.rm(markerPath, { force: true }).catch(() => undefined);
     }
+  }
+
+  /**
+   * Recreates marker files for persisted manual attachments after generated
+   * storage cleanup. Marker sync removes manual rows when no marker exists, so a
+   * live terminal window must be re-seeded before the normal sync pass runs.
+   */
+  private async restoreMissingManualTerminalAttachmentMarkers(
+    processRows: readonly ProcessTableRow[],
+  ): Promise<number> {
+    const snapshot = this.registry.getSnapshot();
+    const manualAttachments = snapshot.attachments.filter(
+      (attachment) =>
+        attachment.status === "attached" &&
+        attachment.terminalWindowId !== undefined &&
+        attachment.id.startsWith(MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX),
+    );
+
+    if (manualAttachments.length === 0) {
+      return 0;
+    }
+
+    const markers = await this.readManualTerminalAttachmentMarkers();
+    const terminalWindowsById = new Map(snapshot.terminalWindows.map((terminalWindow) => [terminalWindow.id, terminalWindow]));
+    const terminalRowsByPid = new Map(processRows.map((row) => [row.pid, row]));
+    let restoredCount = 0;
+
+    for (const attachment of manualAttachments) {
+      const terminalWindowId = attachment.terminalWindowId;
+      const network = this.registry.getNetwork(attachment.networkId);
+      const terminalWindow = terminalWindowId === undefined ? undefined : terminalWindowsById.get(terminalWindowId);
+
+      if (network === undefined || terminalWindow === undefined) {
+        continue;
+      }
+
+      if (markers.some((marker) => marker.networkId === network.id && isTerminalWindowMarkerMatch(marker, terminalWindow))) {
+        continue;
+      }
+
+      await this.writeManualTerminalAttachmentMarker(attachment, terminalWindow, terminalRowsByPid);
+      restoredCount++;
+    }
+
+    return restoredCount;
+  }
+
+  /** Writes the shell marker format used by copied routing scripts from persisted attachment state. */
+  private async writeManualTerminalAttachmentMarker(
+    attachment: TerminalAttachment,
+    terminalWindow: TerminalWindow,
+    terminalRowsByPid: ReadonlyMap<number, ProcessTableRow>,
+  ): Promise<void> {
+    const terminalId = normalizeProcessTerminalId(terminalWindow.terminalId) ?? "";
+    const processGroupId =
+      terminalWindow.processGroupId ?? terminalRowsByPid.get(terminalWindow.rootPid)?.processGroupId;
+    const markerKey = sanitizeTerminalAttachmentMarkerKey(
+      terminalId.length > 0 ? terminalId : `pid-${terminalWindow.rootPid}`,
+    );
+    const markerPath = path.join(this.getTerminalAttachmentMarkerDirectoryPath(), `${markerKey}.tsv`);
+    const markerRow = [
+      attachment.networkId,
+      terminalId,
+      String(terminalWindow.rootPid),
+      processGroupId === undefined ? "" : String(processGroupId),
+      attachment.attachedAt,
+    ].join("\t");
+
+    await fs.mkdir(path.dirname(markerPath), { recursive: true });
+    await writeTextFileAtomically(markerPath, `${markerRow}\n`);
   }
 
   /** Removes process-only attachments after their owner PID exits. */
@@ -4414,7 +4612,7 @@ function buildComposeProjectRoutingRows(
     const routingFiles = splitGeneratedComposeRoutingFiles(mutation.composeFiles);
     const inferredContainerMappings = inferContainerMappingsFromComposeRoutingFiles({
       attachedProjectName: mutation.attachedProjectName,
-      composeFiles: mutation.composeFiles,
+      composeFiles: [mutation.overrideFile, ...mutation.composeFiles],
       serviceNames: mutation.services,
     });
     const containerMappings = mergeComposeRoutingContainerMappings(
@@ -4441,11 +4639,34 @@ function mergeComposeRoutingContainerMappings(
   primaryMappings: readonly ComposeContainerMutationMapping[],
   fallbackMappings: readonly ComposeContainerMutationMapping[],
 ): readonly ComposeContainerMutationMapping[] {
-  const serviceNames = new Set(primaryMappings.map((mapping) => mapping.serviceName));
+  if (fallbackMappings.length === 0) {
+    return primaryMappings;
+  }
+  if (primaryMappings.length === 0) {
+    return fallbackMappings;
+  }
+
+  const fallbackServiceNames = new Set(fallbackMappings.map((mapping) => mapping.serviceName));
+  const primaryMappingsWithoutFallback = primaryMappings.filter((mapping) => {
+    const serviceName = composeRoutingContainerMappingTargetServiceName(mapping);
+    return serviceName === undefined || !fallbackServiceNames.has(serviceName);
+  });
+
   return [
-    ...primaryMappings,
-    ...fallbackMappings.filter((mapping) => !serviceNames.has(mapping.serviceName)),
+    ...primaryMappingsWithoutFallback,
+    ...mergeComposeContainerMappingLineage(primaryMappings, fallbackMappings),
   ];
+}
+
+function composeRoutingContainerMappingTargetServiceName(
+  mapping: ComposeContainerMutationMapping,
+): string | undefined {
+  if (mapping.serviceName.startsWith(CONTAINER_ALIAS_SERVICE_PREFIX)) {
+    const serviceName = mapping.serviceName.slice(CONTAINER_ALIAS_SERVICE_PREFIX.length);
+    return serviceName.length > 0 ? serviceName : undefined;
+  }
+
+  return mapping.serviceName.length > 0 ? mapping.serviceName : undefined;
 }
 
 function composeAttachmentRuntimes(attachment: ComposeAttachment): ReadonlyArray<"docker" | "podman"> {
@@ -5995,6 +6216,12 @@ function isVscodeTerminalProcessMatch(
 function normalizeProcessTerminalId(value: string | undefined): string | undefined {
   const normalized = value?.trim().replace(/^\/dev\//, "");
   return normalized === undefined || normalized.length === 0 || normalized === "?" ? undefined : normalized;
+}
+
+/** Mirrors the shell marker key sanitizer used when an attached terminal writes its own TSV. */
+function sanitizeTerminalAttachmentMarkerKey(value: string): string {
+  const sanitized = value.replace(/[^A-Za-z0-9._-]/g, "_");
+  return sanitized.length > 0 ? sanitized : "terminal";
 }
 
 /** Finds the visible terminal window that corresponds to a manually executed routing script. */

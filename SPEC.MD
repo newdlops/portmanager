@@ -68,6 +68,8 @@ Docker/Podman Compose attachment가 clone 방식이든 as-is 방식이든 Port M
 
 VS Code 확장 시작, shared network state reload, 사용자가 실행하는 stale routing repair, 그리고 network refresh 계열 작업은 durable registry, Docker/Podman의 live container 상태, generated Compose override YAML, compose routing TSV, agent route table의 정합성을 함께 점검해야 한다. registry에 없는 daemon route row나 scoped route table은 제거하고, registry에 남아 있는 Compose mutation은 override YAML과 routing table을 현재 상태에서 재생성해야 한다. generated 파일이 오래되었거나 누락된 경우에는 이전 세대의 routing을 계속 사용하지 말고 현재 network 상태에서 재작성하거나 실패 상태로 드러내야 한다.
 
+globalStorage 또는 그 아래 generated routing 파일이 삭제된 상태에서 확장 host가 계속 살아 있으면, 복구는 in-memory/shared durable attachment 상태와 daemon의 live snapshot을 기준으로 shared network state 문서, route table JSON, host-access binding, compose routing TSV, terminal network selection, terminal hook script/runtime shim을 다시 생성해야 한다. 이미 attach된 native terminal은 marker 파일이 사라진 뒤 refresh로 attachment를 잃기 전에 현재 network script를 다시 source할 수 있어야 하며, 복구된 TSV는 live Compose route reconciliation 이후의 최신 route row를 기준으로 써야 한다.
+
 Compose attachment를 non-destructive detach한 뒤 같은 hidden clone을 다시 attach하는 경로도 동일한 복구 지점이다. reattach는 기존 runtime container를 새로 mutate하지 않더라도 generated override YAML을 현재 globalStorage의 canonical `compose-overrides` 경로로 재생성하고, compose routing TSV와 daemon route row를 새 override 경로 기준으로 다시 써야 한다.
 
 Docker/Podman discovery나 `docker compose config`가 일시적으로 실패하면 해당 Compose attachment는 durable registry에 남아 다음 refresh에서 재시도되어야 한다. 단, 실패한 attachment의 missing/stale generated override 경로는 shell wrapper나 native shim이 읽는 routing TSV에 배포하지 않아야 하며, 다음 성공적인 refresh는 error 상태를 해제하고 override YAML, TSV, daemon route row를 함께 복구해야 한다.

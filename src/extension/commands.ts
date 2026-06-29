@@ -449,8 +449,12 @@ export class PortManagerCommandController implements DisposableLike {
   private async attachContainerToNetwork(argument: unknown): Promise<void> {
     const directInput = getAttachContainerInput(argument);
     const candidate =
-      directInput?.containerService ??
-      (await this.resolveContainerServiceCandidateArgument(argument, "Attach Service to Network"));
+      directInput?.containerService === undefined
+        ? await this.resolveContainerServiceCandidateArgument(argument, "Attach Service to Network")
+        : await this.resolveContainerServiceCandidateArgument(
+            directInput.containerService,
+            "Attach Service to Network",
+          );
     if (candidate === undefined) {
       return;
     }
@@ -1849,15 +1853,12 @@ export class PortManagerCommandController implements DisposableLike {
     title: string,
   ): Promise<ContainerServiceCandidate | undefined> {
     const candidate = getContainerServiceCandidateFromCommandArgument(argument);
+    const candidates = await this.dependencies.networkService.refreshContainerServices({ force: true });
 
     if (candidate !== undefined) {
-      return resolveLatestContainerServiceCandidate(
-        this.dependencies.networkService.getSnapshot().containerServiceCandidates,
-        candidate,
-      );
+      return resolveLatestContainerServiceCandidate(candidates, candidate);
     }
 
-    const candidates = this.dependencies.networkService.getSnapshot().containerServiceCandidates;
     if (candidates.length === 0) {
       await vscode.window.showInformationMessage("No published container services discovered.");
       return undefined;

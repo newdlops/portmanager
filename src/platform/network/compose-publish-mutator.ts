@@ -26,8 +26,9 @@ import {
  * truly hide a published port by editing Port Manager route tables alone. This
  * adapter creates a temporary compose override that replaces service `ports`
  * with Docker-allocated localhost ports, starts a hidden clone under a project
- * name derived from the logical network, and then stops the original project
- * services so the host port can be reused.
+ * name derived from the logical network. Only services that own selected host
+ * ports are stopped in the original project; already-running internal services
+ * are cloned into the hidden project so brokers and caches stay network-local.
  */
 
 const COMPOSE_TIMEOUT_MS = 60_000;
@@ -144,6 +145,15 @@ interface RuntimeNameReservations {
   readonly containerNames: ReadonlySet<string>;
   /** Compose project names already materialized in the runtime, even if their override file was deleted. */
   readonly composeProjectNames: ReadonlySet<string>;
+  /** Per-name ownership lets restore distinguish this hidden project from an unrelated collision. */
+  readonly containersByName: ReadonlyMap<string, readonly RuntimeContainerReservation[]>;
+}
+
+interface RuntimeContainerReservation {
+  readonly id: string;
+  readonly name: string;
+  readonly composeProjectName?: string;
+  readonly composeServiceName?: string;
 }
 
 type ComposeServiceMount = ComposeVolumeMount | ComposeBindMount | ComposeTmpfsMount;
@@ -239,8 +249,8 @@ export class ComposePublishMutator {
     const serviceContainerNameSot =
       createsHiddenProject ? await readComposeServiceContainerNames(composeFiles) : new Map<string, string>();
     const configuredContainerNameServices = [...serviceContainerNameSot.keys()];
-    const copyStoppedServices = createsHiddenProject && input.copyStoppedServices === true;
     const definedServices = await this.listDefinedComposeServices(originalContext);
+    const copyStoppedServices = createsHiddenProject && input.copyStoppedServices === true;
     const existingServices =
       copyStoppedServices
         ? await this.listExistingComposeServices(originalContext).catch(() => [])
@@ -251,36 +261,56 @@ export class ComposePublishMutator {
       requestedServices,
       availableServices,
     );
-    const copiedServices = copyStoppedServices ? availableServices : requestedRouteServices;
-    const originalContainerList = await this.listComposeServiceContainers(input.runtime, originalProjectName, copiedServices, {
-      includeStopped: copyStoppedServices,
-    });
+    const overrideServices = createsHiddenProject
+      ? uniqueStrings([...definedServices, ...configuredContainerNameServices])
+      : requestedRouteServices;
+    const originalContainerServices = createsHiddenProject
+      ? copyStoppedServices
+        ? availableServices
+        : overrideServices
+      : requestedRouteServices;
+    const originalContainerList = await this.listComposeServiceContainers(
+      input.runtime,
+      originalProjectName,
+      originalContainerServices,
+      {
+        includeStopped: copyStoppedServices,
+      },
+    );
     const originalContainers = originalContainerList.containers;
     const runningOriginalServices = new Set(
       originalContainers
         .filter(isRunningComposeServiceContainer)
         .map((container) => container.serviceName),
     );
-    const services =
+    const activeHiddenServices =
+      createsHiddenProject
+        ? mode === "copy" && copyStoppedServices
+          ? requestedRouteServices.filter((service) => runningOriginalServices.has(service))
+          : uniqueStrings([
+              ...requestedRouteServices,
+              ...overrideServices.filter((service) => runningOriginalServices.has(service)),
+            ])
+        : requestedRouteServices;
+    const lifecycleServices =
+      createsHiddenProject && copyStoppedServices
+        ? availableServices
+        : activeHiddenServices;
+    const routeServices =
       mode === "copy" && copyStoppedServices
         ? requestedRouteServices.filter((service) => runningOriginalServices.has(service))
         : requestedRouteServices;
-    const ports = input.ports.filter((port) => services.includes(port.serviceName));
-    const overrideServices = createsHiddenProject
-      ? copyStoppedServices
-        ? copiedServices
-        : uniqueStrings([...definedServices, ...configuredContainerNameServices])
-      : services;
+    const ports = input.ports.filter((port) => routeServices.includes(port.serviceName));
     const disabledOverrideServices =
       mode === "clone" && !copyStoppedServices
-        ? overrideServices.filter((service) => !services.includes(service))
+        ? overrideServices.filter((service) => !activeHiddenServices.includes(service))
         : [];
     const originalServiceMounts = await this.inspectServiceMounts(
       input.runtime,
       originalContainers,
       originalContainerList.inspectedRows,
     );
-    const statefulCloneServices = findStatefulCloneServices(ports, originalServiceMounts);
+    const statefulCloneServices = findStatefulCloneServices(lifecycleServices, ports, originalServiceMounts);
     if (createsHiddenProject && statefulCloneServices.length > 0 && input.allowStatefulClone !== true) {
       throw new Error(
         `Clone attach includes stateful service${statefulCloneServices.length === 1 ? "" : "s"} with persistent mounts: ${statefulCloneServices.join(", ")}. Confirm stateful clone explicitly or use Attach as-is.`,
@@ -354,21 +384,21 @@ export class ComposePublishMutator {
     let clonedVolumesCreated = false;
 
     try {
-      if (mode === "clone" && services.length > 0) {
-        await this.runCompose(originalContext, ["stop", ...services]);
+      if (mode === "clone" && routeServices.length > 0) {
+        await this.runCompose(originalContext, ["stop", ...routeServices]);
         originalStopped = true;
       }
       if (createsHiddenProject) {
         await this.copyVolumes(input.runtime, volumeClonePlan.volumeClones);
         clonedVolumesCreated = true;
       }
-      if (services.length > 0) {
+      if (activeHiddenServices.length > 0) {
         hiddenProjectTouched = createsHiddenProject;
-        await this.runCompose(hiddenContext, ["up", "-d", "--force-recreate", "--no-deps", ...services]);
+        await this.runCompose(hiddenContext, ["up", "-d", "--force-recreate", "--no-deps", ...activeHiddenServices]);
         hiddenStarted = true;
       }
       const stoppedCopyServices = copyStoppedServices
-        ? copiedServices.filter((service) => !services.includes(service))
+        ? lifecycleServices.filter((service) => !activeHiddenServices.includes(service))
         : [];
       if (stoppedCopyServices.length > 0) {
         await this.runCompose(hiddenContext, ["create", "--no-recreate", ...stoppedCopyServices]);
@@ -380,7 +410,7 @@ export class ComposePublishMutator {
       assertHiddenPortsAreIsolated(hiddenPorts, ports);
       const hiddenContainerList =
         createsHiddenProject
-          ? await this.listComposeServiceContainers(input.runtime, attachedProjectName, copiedServices, {
+          ? await this.listComposeServiceContainers(input.runtime, attachedProjectName, lifecycleServices, {
               includeStopped: copyStoppedServices,
             })
           : { containers: [], inspectedRows: [] };
@@ -402,7 +432,7 @@ export class ComposePublishMutator {
           attachedProjectName,
           ...(input.workingDirectory !== undefined ? { workingDirectory: input.workingDirectory } : {}),
           composeFiles,
-          services: copiedServices,
+          services: lifecycleServices,
           overrideFile,
           originalPorts: ports.map((port) => ({ ...port })),
           hiddenPorts,
@@ -416,10 +446,10 @@ export class ComposePublishMutator {
         await this.runCompose(hiddenContext, ["down", "--remove-orphans"]).catch(() => undefined);
       }
       if (hiddenStarted && mode === "in-place") {
-        await this.runCompose(originalContext, ["up", "-d", "--force-recreate", "--no-deps", ...services]).catch(() => undefined);
+        await this.runCompose(originalContext, ["up", "-d", "--force-recreate", "--no-deps", ...routeServices]).catch(() => undefined);
       }
       if (originalStopped) {
-        await this.runCompose(originalContext, ["up", "-d", ...services]).catch(() => undefined);
+        await this.runCompose(originalContext, ["up", "-d", ...routeServices]).catch(() => undefined);
       }
       if (clonedVolumesCreated) {
         await this.removeVolumes(input.runtime, volumeClonePlan.volumeClones.map((volume) => volume.targetVolumeName));
@@ -536,14 +566,20 @@ export class ComposePublishMutator {
       }
       definedServices = [];
     }
+    const serviceContainerNameSot = createsHiddenProject
+      ? await readComposeServiceContainerNames(sourceComposeFiles)
+      : new Map<string, string>();
     const configuredContainerNameServices = createsHiddenProject
-      ? [...(await readComposeServiceContainerNames(sourceComposeFiles)).keys()]
+      ? [...serviceContainerNameSot.keys()]
       : [];
     const overrideServices = buildRestoredOverrideServices(
       state,
       uniqueStrings([...definedServices, ...configuredContainerNameServices]),
     );
     const disabledServices = buildRestoredDisabledOverrideServices(state, overrideServices);
+    const restoredCloneContainerNames = createsHiddenProject
+      ? await this.resolveRestoredCloneContainerNames(state, serviceContainerNameSot)
+      : undefined;
 
     await this.writeHiddenPortsOverride(
       state.attachedProjectName,
@@ -552,7 +588,7 @@ export class ComposePublishMutator {
       buildServiceMountsFromPersistedCloneVolumes(state.clonedVolumes),
       {
         resetContainerName: createsHiddenProject,
-        cloneContainerNames: buildCloneContainerNameMapFromMutation(state),
+        cloneContainerNames: restoredCloneContainerNames,
         isolatedNetwork: createsHiddenProject ? "pm_isolated" : undefined,
         disabledServices,
         overrideFile,
@@ -561,6 +597,43 @@ export class ComposePublishMutator {
     );
 
     return overrideFile;
+  }
+
+  /**
+   * Rebuilds clone container-name overrides from the live runtime first.
+   *
+   * globalStorage cleanup can remove the generated override while Docker still
+   * has the hidden compose project. In that case the live container name is the
+   * current SOT. If only persisted mappings remain, the name is checked against
+   * Docker's global reservation table before it is written back into Compose.
+   */
+  private async resolveRestoredCloneContainerNames(
+    state: ComposePortMutationState,
+    serviceContainerNameSot: ReadonlyMap<string, string>,
+  ): Promise<ReadonlyMap<string, string>> {
+    const preferredNames = buildCloneContainerNameMapFromMutation(state);
+    const liveContainers = await this.listComposeServiceContainers(state.runtime, state.attachedProjectName, state.services, {
+      includeStopped: true,
+    }).catch((): ComposeServiceContainerList => ({ containers: [], inspectedRows: [] }));
+    let reservations: RuntimeNameReservations;
+    try {
+      reservations = await this.readRuntimeNameReservations(state.runtime);
+    } catch (error) {
+      if (restoreNeedsRuntimeNameReservations(state, preferredNames, liveContainers.containers)) {
+        throw new Error(
+          `Cannot recreate generated Compose override for ${state.attachedProjectName}: failed to verify runtime container name reservations. ${formatUnknownError(error)}`,
+        );
+      }
+      reservations = emptyRuntimeNameReservations();
+    }
+
+    return buildRestoredCloneContainerNames(
+      state,
+      serviceContainerNameSot,
+      preferredNames,
+      liveContainers.containers,
+      reservations,
+    );
   }
 
   /**
@@ -1057,7 +1130,7 @@ export class ComposePublishMutator {
     return matchedServices;
   }
 
-  /** Copies Docker volumes after the source service has been stopped. */
+  /** Copies Docker volumes before the hidden service starts so clone traffic has isolated state. */
   private async copyVolumes(runtime: "docker" | "podman", volumeClones: readonly VolumeClonePlan[]): Promise<void> {
     for (const volume of volumeClones) {
       const sourceMount = volume.sourceKind === "volume" ? `${volume.sourceName}:/from:ro` : `${volume.sourceName}:/from:ro`;
@@ -1209,13 +1282,39 @@ export class ComposePublishMutator {
       .map(parseRuntimeContainerRow)
       .filter((row): row is RuntimeContainerRow => row !== undefined);
 
+    const containersByName = new Map<string, RuntimeContainerReservation[]>();
+    const composeProjectNames = new Set<string>();
+    const containerNames = new Set<string>();
+
+    for (const row of rows) {
+      const name = readRuntimeContainerName(row);
+      const id = readRuntimeContainerId(row);
+      const labels = parseRuntimeLabels(row.Labels);
+      const composeProjectName = readRuntimeLabel(labels, "com.docker.compose.project", "io.podman.compose.project");
+      const composeServiceName = readRuntimeLabel(labels, "com.docker.compose.service", "io.podman.compose.service");
+
+      if (composeProjectName !== undefined) {
+        composeProjectNames.add(composeProjectName);
+      }
+      if (name === undefined || id === undefined) {
+        continue;
+      }
+
+      containerNames.add(name);
+      const reservations = containersByName.get(name) ?? [];
+      reservations.push({
+        id,
+        name,
+        ...(composeProjectName !== undefined ? { composeProjectName } : {}),
+        ...(composeServiceName !== undefined ? { composeServiceName } : {}),
+      });
+      containersByName.set(name, reservations);
+    }
+
     return {
-      containerNames: new Set(rows.map(readRuntimeContainerName).filter((name): name is string => name !== undefined)),
-      composeProjectNames: new Set(
-        rows
-          .map((row) => readRuntimeLabel(parseRuntimeLabels(row.Labels), "com.docker.compose.project", "io.podman.compose.project"))
-          .filter((name): name is string => name !== undefined),
-      ),
+      containerNames,
+      composeProjectNames,
+      containersByName,
     };
   }
 
@@ -1495,11 +1594,13 @@ function buildCloneContainerNameMapFromMutation(
 
   for (const mapping of state.containerMappings ?? []) {
     const attachedContainerName = normalizeContainerNameText(mapping.attachedContainerName);
+    const attachedContainerId = normalizeContainerNameText(mapping.attachedContainerId);
     const originalContainerName = normalizeContainerNameText(mapping.originalContainerName);
     if (
       mapping.serviceName.startsWith("__portmanager_alias__:") ||
       attachedContainerName.length === 0 ||
-      attachedContainerName === originalContainerName
+      attachedContainerName === originalContainerName ||
+      isContainerIdLikeContainerName(attachedContainerName, attachedContainerId)
     ) {
       continue;
     }
@@ -1508,6 +1609,149 @@ function buildCloneContainerNameMapFromMutation(
   }
 
   return cloneContainerNames;
+}
+
+function buildRestoredCloneContainerNames(
+  state: ComposePortMutationState,
+  serviceContainerNameSot: ReadonlyMap<string, string>,
+  preferredNames: ReadonlyMap<string, string>,
+  liveContainers: readonly ComposeServiceContainer[],
+  reservations: RuntimeNameReservations,
+): ReadonlyMap<string, string> {
+  const names = new Map<string, string>();
+  const occupiedNames = new Set([...reservations.containerNames].map((name) => normalizeContainerNameText(name)));
+  const liveByService = groupBy(liveContainers, (container) => container.serviceName);
+
+  for (const serviceName of state.services) {
+    const liveContainerName =
+      selectUniqueLiveContainerName(liveByService.get(serviceName) ?? []) ??
+      selectReservedContainerNameForService(reservations, state.attachedProjectName, serviceName);
+    if (liveContainerName !== undefined) {
+      occupiedNames.add(liveContainerName);
+      if (!isGeneratedComposeContainerName(liveContainerName, state.attachedProjectName)) {
+        names.set(serviceName, liveContainerName);
+      }
+      continue;
+    }
+
+    const preferredName = normalizeContainerNameText(preferredNames.get(serviceName) ?? "");
+    if (preferredName.length === 0 || isGeneratedComposeContainerName(preferredName, state.attachedProjectName)) {
+      continue;
+    }
+
+    if (!occupiedNames.has(preferredName)) {
+      names.set(serviceName, preferredName);
+      occupiedNames.add(preferredName);
+      continue;
+    }
+
+    const fallbackBaseName = restoredCloneContainerNameBase(serviceName, state, serviceContainerNameSot);
+    if (fallbackBaseName === undefined) {
+      continue;
+    }
+
+    const nextName = buildAvailableConflictingCloneContainerName(
+      fallbackBaseName,
+      state.attachedProjectName,
+      occupiedNames,
+    );
+    names.set(serviceName, nextName);
+    occupiedNames.add(nextName);
+  }
+
+  return names;
+}
+
+function restoreNeedsRuntimeNameReservations(
+  state: ComposePortMutationState,
+  preferredNames: ReadonlyMap<string, string>,
+  liveContainers: readonly ComposeServiceContainer[],
+): boolean {
+  const liveByService = groupBy(liveContainers, (container) => container.serviceName);
+
+  for (const serviceName of state.services) {
+    const preferredName = normalizeContainerNameText(preferredNames.get(serviceName) ?? "");
+    if (preferredName.length === 0) {
+      continue;
+    }
+    if (selectUniqueLiveContainerName(liveByService.get(serviceName) ?? []) !== undefined) {
+      continue;
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+function selectReservedContainerNameForService(
+  reservations: RuntimeNameReservations,
+  attachedProjectName: string,
+  serviceName: string,
+): string | undefined {
+  const matches: RuntimeContainerReservation[] = [];
+
+  for (const reservationList of reservations.containersByName.values()) {
+    for (const reservation of reservationList) {
+      if (
+        reservation.composeProjectName === attachedProjectName &&
+        reservation.composeServiceName === serviceName
+      ) {
+        matches.push(reservation);
+      }
+    }
+  }
+
+  if (matches.length !== 1) {
+    return undefined;
+  }
+
+  return normalizeContainerNameText(matches[0]!.name);
+}
+
+function selectUniqueLiveContainerName(containers: readonly ComposeServiceContainer[]): string | undefined {
+  if (containers.length !== 1) {
+    return undefined;
+  }
+
+  const containerName = normalizeContainerNameText(containers[0]!.name);
+  return containerName.length === 0 ? undefined : containerName;
+}
+
+function restoredCloneContainerNameBase(
+  serviceName: string,
+  state: ComposePortMutationState,
+  serviceContainerNameSot: ReadonlyMap<string, string>,
+): string | undefined {
+  const sotName = normalizeContainerNameText(serviceContainerNameSot.get(serviceName) ?? "");
+  if (sotName.length > 0) {
+    return sotName;
+  }
+
+  const mapping = state.containerMappings?.find(
+    (candidate) =>
+      candidate.serviceName === serviceName &&
+      !candidate.serviceName.startsWith("__portmanager_alias__:"),
+  );
+  const originalContainerName = normalizeContainerNameText(mapping?.originalContainerName ?? "");
+  return originalContainerName.length === 0 ? undefined : originalContainerName;
+}
+
+function isContainerIdLikeContainerName(containerName: string, containerId: string): boolean {
+  if (containerName.length === 0) {
+    return false;
+  }
+
+  // Recovered mappings can contain a Docker id where a Compose container name
+  // should be. Never write that id back into a generated override.
+  if (
+    containerId.length > 0 &&
+    (containerId.startsWith(containerName) || containerName.startsWith(containerId))
+  ) {
+    return true;
+  }
+
+  return /^[a-f0-9]{12,64}$/i.test(containerName);
 }
 
 function buildServiceMountsFromPersistedCloneVolumes(
@@ -2078,19 +2322,21 @@ function buildClonedVolumeName(attachedProjectName: string, originalVolumeName: 
 }
 
 function findStatefulCloneServices(
+  serviceNames: readonly string[],
   ports: readonly ComposePublishedPort[],
   serviceMounts: ReadonlyMap<string, readonly ComposeServiceMount[]>,
 ): readonly string[] {
   const riskyServices = new Set<string>();
+  const portsByService = groupBy(ports, (port) => port.serviceName);
 
-  for (const port of ports) {
-    const mounts = serviceMounts.get(port.serviceName) ?? [];
+  for (const serviceName of serviceNames) {
+    const mounts = serviceMounts.get(serviceName) ?? [];
     if (mounts.length === 0) {
       continue;
     }
 
-    if (looksStatefulService(port)) {
-      riskyServices.add(port.serviceName);
+    if (looksStatefulServiceName(serviceName) || (portsByService.get(serviceName) ?? []).some(looksStatefulService)) {
+      riskyServices.add(serviceName);
     }
   }
 
@@ -2152,7 +2398,6 @@ function formatLeakedPort(port: ComposePublishedPort): string {
 }
 
 function looksStatefulService(port: ComposePublishedPort): boolean {
-  const serviceName = port.serviceName.toLowerCase();
   const protocolName = port.protocolName?.toLowerCase();
   const statefulProtocols = new Set([
     "postgresql",
@@ -2170,12 +2415,16 @@ function looksStatefulService(port: ComposePublishedPort): boolean {
   const statefulPorts = new Set([5432, 3306, 33060, 6379, 5672, 15672, 27017, 9200, 9300, 7000, 8080, 50051]);
 
   return (
+    looksStatefulServiceName(port.serviceName) ||
     (protocolName !== undefined && statefulProtocols.has(protocolName)) ||
-    /\b(db|database|postgres|postgresql|mysql|mariadb|redis|rabbitmq|mongo|mongodb|weaviate|elastic|opensearch)\b/.test(
-      serviceName.replace(/[-_]+/g, " "),
-    ) ||
     statefulPorts.has(port.containerPort) ||
     statefulPorts.has(port.logicalPort)
+  );
+}
+
+function looksStatefulServiceName(serviceName: string): boolean {
+  return /\b(db|database|postgres|postgresql|mysql|mariadb|redis|rabbitmq|mongo|mongodb|weaviate|elastic|opensearch)\b/.test(
+    serviceName.toLowerCase().replace(/[-_]+/g, " "),
   );
 }
 
@@ -2377,6 +2626,7 @@ function emptyRuntimeNameReservations(): RuntimeNameReservations {
   return {
     containerNames: new Set(),
     composeProjectNames: new Set(),
+    containersByName: new Map(),
   };
 }
 
