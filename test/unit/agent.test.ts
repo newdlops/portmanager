@@ -1660,7 +1660,9 @@ test("skips extension socket snapshot broadcasts for unchanged refresh requests"
     fs.rmSync(socketPath, { force: true });
   });
 
-  await agent.listen(socketPath);
+  if (!(await listenAgentOrSkip(context, agent, socketPath))) {
+    return;
+  }
   const socket = await openAgentSocket(socketPath);
   const messages = collectAgentMessages(socket);
   context.after(() => socket.destroy());
@@ -1704,7 +1706,9 @@ test("keeps hook sockets out of snapshot event fan-out", async (context) => {
     fs.rmSync(socketPath, { force: true });
   });
 
-  await agent.listen(socketPath);
+  if (!(await listenAgentOrSkip(context, agent, socketPath))) {
+    return;
+  }
   const socket = await openAgentSocket(socketPath);
   const messages = collectAgentMessages(socket);
   context.after(() => socket.destroy());
@@ -1781,6 +1785,20 @@ async function openAgentSocket(socketPath: string): Promise<net.Socket> {
   });
 }
 
+async function listenAgentOrSkip(context: TestContext, agent: PortManagerAgent, socketPath: string): Promise<boolean> {
+  try {
+    await agent.listen(socketPath);
+    return true;
+  } catch (error) {
+    if (isUnixSocketBindBlocked(error)) {
+      context.skip("agent socket bind is not permitted in this sandbox");
+      return false;
+    }
+
+    throw error;
+  }
+}
+
 function collectAgentMessages(socket: net.Socket): unknown[] {
   const messages: unknown[] = [];
   const buffer = new NdjsonMessageBuffer();
@@ -1821,6 +1839,14 @@ function isResponseForRequest(message: unknown, id: string): boolean {
 
 function isSnapshotEvent(message: unknown): boolean {
   return typeof message === "object" && message !== null && (message as { type?: unknown }).type === "snapshot";
+}
+
+function isUnixSocketBindBlocked(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    ((error as { code?: unknown }).code === "EPERM" || (error as { code?: unknown }).code === "EACCES")
+  );
 }
 
 async function delay(ms: number): Promise<void> {

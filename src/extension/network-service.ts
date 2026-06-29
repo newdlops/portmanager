@@ -701,7 +701,7 @@ export class PortManagerNetworkService implements DisposableLike {
     void this.syncBrowserNetworkProxies();
   }
 
-  /** Stops owner-only watchers/listeners when another extension host owns the control plane. */
+  /** Stops owner-only automatic work when another extension host owns the control plane. */
   private demoteControlPlaneOwner(): void {
     if (
       !this.ownsControlPlaneLease &&
@@ -730,16 +730,14 @@ export class PortManagerNetworkService implements DisposableLike {
       disposable.dispose();
     }
 
+    /*
+     * Demotion can happen during a normal cross-window owner handoff or a
+     * transient lease-write failure. Keep already-bound data-plane brokers alive
+     * under their own leases so browser aliases, host exposures, and logical
+     * routers do not drop every connection while another window takes over.
+     */
     this.context.environmentVariableCollection.clear();
-    void this.proxyManager.dispose();
-    void this.browserNetworkProxy.dispose();
-    this.browserDnsServer.dispose();
-    this.logicalPortRouter.dispose();
     releaseControlPlaneOwnerLease();
-    releaseLogicalRouterOwnerLease();
-    releaseBrowserNetworkProxyOwnerLease();
-    this.ownsLogicalRouterLease = false;
-    this.ownsBrowserNetworkProxyLease = false;
   }
 
   /** Returns the latest logical network snapshot for the sidebar. */

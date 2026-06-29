@@ -944,6 +944,13 @@ test("automatic control plane side effects use a single cross-window owner lease
   assert.equal(demoteBody.includes("for (const disposable of this.controlPlaneOwnerDisposables.splice(0))"), true);
   assert.equal(demoteBody.includes("this.context.environmentVariableCollection.clear();"), true);
   assert.equal(demoteBody.includes("releaseControlPlaneOwnerLease();"), true);
+  assert.equal(demoteBody.includes("this.proxyManager.dispose();"), false);
+  assert.equal(demoteBody.includes("this.browserNetworkProxy.dispose();"), false);
+  assert.equal(demoteBody.includes("this.browserDnsServer.dispose();"), false);
+  assert.equal(demoteBody.includes("this.logicalPortRouter.dispose();"), false);
+  assert.equal(demoteBody.includes("releaseLogicalRouterOwnerLease();"), false);
+  assert.equal(demoteBody.includes("releaseBrowserNetworkProxyOwnerLease();"), false);
+  assert.equal(source.includes("data-plane brokers alive"), true);
   assert.equal(source.includes("Another Port Manager window owns terminal routing control."), true);
   assert.equal(source.includes("Another Port Manager window owns Compose routing control."), true);
 });
