@@ -3682,6 +3682,15 @@ export class PortManagerNetworkService implements DisposableLike {
   ): Promise<RoutingFileCleanupSummary> {
     const attachmentIds = new Set(attachments.map((attachment) => attachment.id));
     this.ensureSharedNetworkStateFileMaterialized();
+
+    /*
+     * Existing attached shells keep the runtime shim directory at the front of
+     * PATH. Recreate those shell-facing files before slower Docker/daemon
+     * reconciliation so package-manager commands do not hit a deleted shim
+     * path while globalStorage recovery is still in progress.
+     */
+    await this.rehydrateTerminalHookFiles().catch(() => undefined);
+
     const restoredComposeOverrideCount = await this.reconcileComposeOverrideFiles(attachments, { force: true });
     await this.writeHostAccessBindingsFile().catch(() => undefined);
     await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
@@ -3692,7 +3701,6 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
     await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);
-    await this.reapplyRoutingToAttachedTerminalWindows().catch(() => 0);
     await this.syncLogicalPortRouters();
     const restoredComposeRouteCount = this.registry
       .getSnapshot()
@@ -3705,6 +3713,17 @@ export class PortManagerNetworkService implements DisposableLike {
       restoredComposeOverrideCount,
       restoredComposeRouteCount,
     };
+  }
+
+  /**
+   * Restores the files and PATH shims read directly by already-open shells.
+   * This is intentionally separate from Compose route convergence because it
+   * protects command lookup immediately after generated globalStorage is wiped.
+   */
+  private async rehydrateTerminalHookFiles(): Promise<void> {
+    await this.writeTerminalNetworkSelectionFile();
+    await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
+    await this.reapplyRoutingToAttachedTerminalWindows();
   }
 
   /** Lists generated files in one directory without letting cleanup fail on missing folders. */

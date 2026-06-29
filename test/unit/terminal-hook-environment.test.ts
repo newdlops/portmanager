@@ -595,6 +595,9 @@ test("global storage cleanup rehydrates generated routing from live attachment s
   const rehydrateStart = source.indexOf("private async rehydrateRoutingFiles");
   const rehydrateEnd = source.indexOf("private async collectMatchingFiles", rehydrateStart);
   const rehydrateBody = source.slice(rehydrateStart, rehydrateEnd);
+  const terminalRehydrateStart = source.indexOf("private async rehydrateTerminalHookFiles");
+  const terminalRehydrateEnd = source.indexOf("private async collectMatchingFiles", terminalRehydrateStart);
+  const terminalRehydrateBody = source.slice(terminalRehydrateStart, terminalRehydrateEnd);
   const materializeStart = source.indexOf("private async ensureDaemonRouteTablesMaterialized");
   const materializeEnd = source.indexOf("private async reapplyRoutingToAttachedTerminalWindows", materializeStart);
   const materializeBody = source.slice(materializeStart, materializeEnd);
@@ -603,9 +606,16 @@ test("global storage cleanup rehydrates generated routing from live attachment s
   const reapplyBody = source.slice(reapplyStart, reapplyEnd);
 
   assert.notEqual(rehydrateStart, -1);
+  assert.notEqual(terminalRehydrateStart, -1);
   assert.notEqual(materializeStart, -1);
   assert.notEqual(reapplyStart, -1);
   assert.equal(rehydrateBody.includes("this.ensureSharedNetworkStateFileMaterialized();"), true);
+  assert.equal(rehydrateBody.includes("await this.rehydrateTerminalHookFiles().catch(() => undefined);"), true);
+  assert.equal(
+    rehydrateBody.indexOf("await this.rehydrateTerminalHookFiles().catch(() => undefined);") <
+      rehydrateBody.indexOf("const restoredComposeOverrideCount = await this.reconcileComposeOverrideFiles"),
+    true,
+  );
   assert.equal(
     rehydrateBody.indexOf("await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);") <
       rehydrateBody.indexOf("await this.ensureDaemonRouteTablesMaterialized({"),
@@ -619,7 +629,9 @@ test("global storage cleanup rehydrates generated routing from live attachment s
     true,
   );
   assert.equal(rehydrateBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);"), true);
-  assert.equal(rehydrateBody.includes("await this.reapplyRoutingToAttachedTerminalWindows().catch(() => 0);"), true);
+  assert.equal(terminalRehydrateBody.includes("await this.writeTerminalNetworkSelectionFile();"), true);
+  assert.equal(terminalRehydrateBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });"), true);
+  assert.equal(terminalRehydrateBody.includes("await this.reapplyRoutingToAttachedTerminalWindows();"), true);
   assert.equal(materializeBody.includes("getDefaultRouteTablePath()"), true);
   assert.equal(materializeBody.includes("getRouteTablePathForNetwork(networkId)"), true);
   assert.equal(materializeBody.includes("new Set(["), true);
