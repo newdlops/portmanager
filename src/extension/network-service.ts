@@ -154,6 +154,8 @@ const TERMINAL_ATTACHMENT_REFRESH_BURST_WINDOW_MS = 2_000;
 const TERMINAL_ATTACHMENT_REFRESH_BURST_INTERVAL_MS = 250;
 const FORCED_COMPOSE_RECONCILE_COALESCE_MS = 750;
 const TERMINAL_NETWORK_SERVICE_ENTRY_SEPARATOR = " || ";
+const BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS = 5_000;
+const BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS = 1_000;
 const execFileAsync = promisify(execFile);
 
 export interface BindingPresetSummary {
@@ -293,6 +295,13 @@ interface TerminalAttachmentMarkerCandidate {
   readonly markerPath: string;
 }
 
+interface BrowserProxyCommandTextCacheEntry {
+  /** Cached process argv text used only for browser-entrypoint classification. */
+  readonly commandText: string | undefined;
+  /** Wall-clock deadline; process command text is cheap to refresh but noisy in bursts. */
+  readonly expiresAtMs: number;
+}
+
 /** 
  * Extension-side application service for the Logical Network mode.
  *
@@ -388,6 +397,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Hot-path index for browser proxy requests; rebuilt when the daemon snapshot object changes. */
   private browserProxyRouteTargetByEndpointId = new Map<string, BrowserNetworkProxyTarget>();
+
+  /** Short-lived PID command cache used by browser proxy sync classification. */
+  private readonly browserProxyProcessCommandTextCache = new Map<number, BrowserProxyCommandTextCacheEntry>();
 
   /** Guards privileged resolver installation so duplicate UI/registry events cannot stack prompts. */
   private browserDnsResolverInstallInFlight: Promise<BrowserDnsResolverStatus> | undefined;
@@ -3218,6 +3230,7 @@ export class PortManagerNetworkService implements DisposableLike {
   private async readBrowserProxyProcessCommandTexts(
     processes: readonly ManagedProcess[],
   ): Promise<ReadonlyMap<number, string>> {
+    const nowMs = Date.now();
     const candidates = processes.filter(
       (process): process is ManagedProcess & { readonly pid: number; readonly networkId: string; readonly url: string } =>
         process.pid !== undefined &&
@@ -3226,14 +3239,37 @@ export class PortManagerNetworkService implements DisposableLike {
         process.url !== undefined &&
         !isPublicWebEntrypointProcess(process),
     );
+    const candidatePids = new Set(candidates.map((process) => process.pid));
+    this.pruneBrowserProxyProcessCommandTextCache(candidatePids, nowMs);
+
     const entries = await Promise.all(
       candidates.map(async (process) => {
+        const cached = this.browserProxyProcessCommandTextCache.get(process.pid);
+        if (cached !== undefined && cached.expiresAtMs > nowMs) {
+          return cached.commandText === undefined ? undefined : ([process.pid, cached.commandText] as const);
+        }
+
         const command = await this.processEnvironmentProvider.readProcessCommand(process.pid).catch(() => undefined);
+        this.browserProxyProcessCommandTextCache.set(process.pid, {
+          commandText: command,
+          expiresAtMs:
+            Date.now() +
+            (command === undefined ? BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS : BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS),
+        });
         return command === undefined ? undefined : ([process.pid, command] as const);
       }),
     );
 
     return new Map(entries.filter((entry): entry is readonly [number, string] => entry !== undefined));
+  }
+
+  /** Drops command-cache rows for disappeared processes and expired burst windows. */
+  private pruneBrowserProxyProcessCommandTextCache(candidatePids: ReadonlySet<number>, nowMs: number): void {
+    for (const [pid, entry] of this.browserProxyProcessCommandTextCache) {
+      if (!candidatePids.has(pid) || entry.expiresAtMs <= nowMs) {
+        this.browserProxyProcessCommandTextCache.delete(pid);
+      }
+    }
   }
 
   /**

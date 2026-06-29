@@ -743,6 +743,9 @@ test("logical port routers use a single cross-window owner lease", () => {
   const browserSyncStart = source.indexOf("private async syncBrowserNetworkProxiesExclusive(): Promise<void>");
   const browserSyncEnd = source.indexOf("private async readBrowserProxyProcessCommandTexts", browserSyncStart);
   const browserSyncBody = source.slice(browserSyncStart, browserSyncEnd);
+  const browserCommandCacheStart = source.indexOf("private async readBrowserProxyProcessCommandTexts");
+  const browserCommandCacheEnd = source.indexOf("private pruneBrowserProxyProcessCommandTextCache", browserCommandCacheStart);
+  const browserCommandCacheBody = source.slice(browserCommandCacheStart, browserCommandCacheEnd);
 
   assert.equal(source.includes("Owner lease must outlive the routing refresh interval"), true);
   assert.equal(source.includes("LOGICAL_ROUTER_OWNER_LEASE_MS = 120_000"), true);
@@ -763,6 +766,20 @@ test("logical port routers use a single cross-window owner lease", () => {
   assert.equal(browserSyncBody.includes("if (!tryAcquireBrowserNetworkProxyOwnerLease())"), true);
   assert.equal(browserSyncBody.includes("await this.browserNetworkProxy.sync([]).catch(() => undefined);"), true);
   assert.equal(browserSyncBody.includes("await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);"), true);
+  assert.equal(source.includes("BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS = 5_000"), true);
+  assert.equal(source.includes("BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS = 1_000"), true);
+  assert.equal(source.includes("browserProxyProcessCommandTextCache"), true);
+  assert.equal(source.includes("pruneBrowserProxyProcessCommandTextCache"), true);
+  assert.equal(
+    browserCommandCacheBody.indexOf("this.browserProxyProcessCommandTextCache.get(process.pid)") <
+      browserCommandCacheBody.indexOf("this.processEnvironmentProvider.readProcessCommand(process.pid)"),
+    true,
+    "browser proxy command classification must reuse burst-local process command reads before polling the OS again",
+  );
+  assert.match(
+    browserCommandCacheBody,
+    /command === undefined \? BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS : BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS/,
+  );
   assert.equal(source.includes("releaseBrowserNetworkProxyOwnerLease();"), true);
 });
 
@@ -1224,8 +1241,8 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   const allocationStart = source.indexOf("pm_allocate_route(logical_port, bind_host, NULL, \"listen\"");
   const loopbackBind = source.slice(loopbackStart, allocationStart);
   const highPortBind = source.slice(allocationStart, source.indexOf("static int pm_connect_hook", allocationStart));
-  const matchLevelStart = source.indexOf("static int pm_route_network_match_level");
-  const matchLevelEnd = source.indexOf("static int pm_route_is_compose", matchLevelStart);
+  const matchLevelStart = source.indexOf("static int pm_cached_route_network_match_level");
+  const matchLevelEnd = source.indexOf("static int pm_cached_route_matches_cwd", matchLevelStart);
   const matchLevelBody = source.slice(matchLevelStart, matchLevelEnd);
   const connectStart = source.indexOf("static int pm_connect_hook");
   const connectEnd = source.indexOf("static int pm_getsockname_hook", connectStart);
@@ -1237,7 +1254,7 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   assert.notEqual(connectStart, -1);
   assert.equal(
     matchLevelBody.includes(
-      'return pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0 ? 2 : 0;',
+      "return route->has_network_id ? 0 : 2;",
     ),
     true,
     "the native connect hook must fail closed when scoped network identity is missing",

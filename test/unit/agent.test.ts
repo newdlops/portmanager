@@ -1612,6 +1612,28 @@ test("coalesces concurrent listener snapshot scans", async (context) => {
   assert.equal(second.listeners[0]?.port, 3000);
 });
 
+test("listSnapshot does not publish route tables when route state is unchanged", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const initialSequence = readRouteTableWriterSequence(agent);
+
+  await agent.listSnapshot();
+  await agent.listSnapshot();
+
+  assert.equal(readRouteTableWriterSequence(agent), initialSequence);
+});
+
 test("skips socket snapshot broadcasts for unchanged refresh requests", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const socketPath = path.join(os.tmpdir(), `portmanager-agent-socket-${process.pid}-${Date.now()}.sock`);
@@ -1774,6 +1796,10 @@ function readRouteTable(routeTablePath: string): { routes: readonly unknown[] } 
 
 function readRouteTableGeneration(routeTablePath: string): { readonly writerId?: string } | undefined {
   return (JSON.parse(fs.readFileSync(routeTablePath, "utf8")) as { generation?: { readonly writerId?: string } }).generation;
+}
+
+function readRouteTableWriterSequence(agent: PortManagerAgent): number {
+  return (agent as unknown as { readonly routeTableGenerationSequence: number }).routeTableGenerationSequence;
 }
 
 function createRouteTablePath(context: TestContext): string {

@@ -1185,11 +1185,16 @@ export class PortManagerAgent implements DisposableLike {
     const listeners = await this.scanListeningPorts({
       allowRecentCache: options.allowRecentListenerCache === true && this.clients.size > 0,
     });
+    let routeStateChanged = false;
+
     this.updateReservedListeningPorts(listeners);
-    this.cleanupExpiredRouteAllocations(this.reservedListeningPorts);
-    await this.recoverHookRoutesFromListeners(listeners);
+    routeStateChanged = this.cleanupExpiredRouteAllocations(this.reservedListeningPorts) || routeStateChanged;
+    routeStateChanged = (await this.recoverHookRoutesFromListeners(listeners)) || routeStateChanged;
     if (options.reconcileExternalListeners === true) {
-      this.reconcileRegisteredProcessesWithListeners(listeners);
+      routeStateChanged = this.reconcileRegisteredProcessesWithListeners(listeners) || routeStateChanged;
+    }
+    if (routeStateChanged) {
+      this.writeRouteTable(this.buildCurrentLogicalRoutes());
     }
     const snapshot = buildAgentSnapshot({
       agentPid: this.agentPid,
@@ -1205,13 +1210,13 @@ export class PortManagerAgent implements DisposableLike {
       defaultCwd: this.defaultCwd,
     });
 
-    this.writeRouteTable(snapshot.routes);
     return snapshot;
   }
 
   /** Marks hook-registered external processes stopped when their listener exits. */
-  private reconcileRegisteredProcessesWithListeners(listeners: readonly ListeningPort[]): void {
+  private reconcileRegisteredProcessesWithListeners(listeners: readonly ListeningPort[]): boolean {
     const nowMs = this.now().getTime();
+    let routeStateChanged = false;
 
     for (const process of this.registry.list()) {
       if (process.status !== "running" || !isListenerOwnedExternalProcess(process)) {
@@ -1226,7 +1231,7 @@ export class PortManagerAgent implements DisposableLike {
 
       const listenerForActualPort = findListenerForRoute(process, listeners);
       if (listenerForActualPort !== undefined) {
-        this.adoptExternalListenerOwner(process, listenerForActualPort);
+        routeStateChanged = this.adoptExternalListenerOwner(process, listenerForActualPort) || routeStateChanged;
         this.missingListenerStateByProcessId.delete(process.id);
         continue;
       }
@@ -1244,8 +1249,11 @@ export class PortManagerAgent implements DisposableLike {
       ) {
         this.registry.stop(process.id, this.now().toISOString());
         this.missingListenerStateByProcessId.delete(process.id);
+        routeStateChanged = true;
       }
     }
+
+    return routeStateChanged;
   }
 
   /** Builds active routes from registry rows and short-lived allocations. */
@@ -1259,13 +1267,14 @@ export class PortManagerAgent implements DisposableLike {
    * not know the in-memory registry disappeared, so the agent reconstructs the
    * logical requestedPort -> actualPort mapping from live listener metadata.
    */
-  private async recoverHookRoutesFromListeners(listeners: readonly ListeningPort[]): Promise<void> {
+  private async recoverHookRoutesFromListeners(listeners: readonly ListeningPort[]): Promise<boolean> {
     if (this.hookRouteRecoveryProvider === undefined) {
-      return;
+      return false;
     }
 
     const trackedListenerKeys = new Set(buildActiveTrackedListenerKeys(this.registry.list()));
     const nowMs = this.now().getTime();
+    let routeStateChanged = false;
 
     for (const listener of listeners) {
       const listenerKey = buildListenerKey(listener.pid, listener.port, listener.localAddress);
@@ -1287,7 +1296,10 @@ export class PortManagerAgent implements DisposableLike {
       this.upsertRegisteredProcess(recoveredInput, "hooked");
       this.hookRouteRecoveryMissesByListenerKey.delete(listenerKey);
       trackedListenerKeys.add(listenerKey);
+      routeStateChanged = true;
     }
+
+    return routeStateChanged;
   }
 
   /** Lists pending route rows in a stable order for snapshots and env payloads. */
@@ -1475,13 +1487,13 @@ export class PortManagerAgent implements DisposableLike {
   }
 
   /** Updates an external route owner when the listening socket moved to another PID. */
-  private adoptExternalListenerOwner(process: ManagedProcess, listener: ListeningPort): void {
+  private adoptExternalListenerOwner(process: ManagedProcess, listener: ListeningPort): boolean {
     const nextPid = listener.pid ?? process.pid;
     const nextName = listener.processName ?? process.name;
     const nextCommand = listener.command ?? process.command;
 
     if (nextPid === process.pid && nextName === process.name && nextCommand === process.command) {
-      return;
+      return false;
     }
 
     this.registry.update(process.id, {
@@ -1489,11 +1501,13 @@ export class PortManagerAgent implements DisposableLike {
       name: nextName,
       command: nextCommand,
     });
+    return true;
   }
 
   /** Removes abandoned route allocations after their TTL unless a listener owns the actual port. */
-  private cleanupExpiredRouteAllocations(activeListenerPorts: ReadonlySet<number> = this.reservedListeningPorts): void {
+  private cleanupExpiredRouteAllocations(activeListenerPorts: ReadonlySet<number> = this.reservedListeningPorts): boolean {
     const nowMs = this.now().getTime();
+    let removedRoute = false;
 
     for (const [id, allocation] of this.pendingRouteAllocations) {
       if (allocation.expiresAtMs > nowMs) {
@@ -1506,7 +1520,10 @@ export class PortManagerAgent implements DisposableLike {
       }
 
       this.pendingRouteAllocations.delete(id);
+      removedRoute = true;
     }
+
+    return removedRoute;
   }
 
   /** Writes the latest dynamic route table for active and pending logical routes. */

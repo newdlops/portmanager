@@ -24,6 +24,8 @@ export interface HostPortProxyOptions {
   readonly nativeProxyPath?: string;
   /** Startup timeout for one native host exposure listener. */
   readonly nativeStartupTimeoutMs?: number;
+  /** Short-lived target cache for bursty clients; set to 0 to resolve every socket. */
+  readonly targetCacheTtlMs?: number;
 }
 
 export interface NativeHostPortProxyQuery {
@@ -53,7 +55,15 @@ interface NodeHostPortProxyListenerHandle extends HostPortProxyListenerHandle {
   readonly sockets: Set<net.Socket>;
 }
 
+interface HostPortProxyTargetCacheEntry {
+  /** Cached in-flight or fulfilled target resolution for one exposure burst. */
+  readonly targetPromise: Promise<HostPortProxyTarget>;
+  /** Wall-clock deadline after which the next connection re-resolves the target. */
+  readonly expiresAtMs: number;
+}
+
 const DEFAULT_NATIVE_STARTUP_TIMEOUT_MS = 1500;
+const DEFAULT_TARGET_CACHE_TTL_MS = 150;
 
 /**
  * Owns local host listeners used by proxy-capable runtime adapters.
@@ -66,10 +76,18 @@ export class HostPortProxyManager {
   /** Active TCP listeners keyed by host exposure id. */
   private readonly listeners = new Map<string, HostPortProxyListenerHandle>();
 
+  /** Short-lived target cache keyed by exposure id to coalesce connection bursts. */
+  private readonly targetCache = new Map<string, HostPortProxyTargetCacheEntry>();
+
+  /** Effective cache TTL; zero keeps the original resolve-per-connection behavior. */
+  private readonly targetCacheTtlMs: number;
+
   constructor(
     private readonly targetResolver: HostPortProxyTargetResolver = STATIC_TARGET_RESOLVER,
     private readonly options: HostPortProxyOptions = {},
-  ) {}
+  ) {
+    this.targetCacheTtlMs = Math.max(0, options.targetCacheTtlMs ?? DEFAULT_TARGET_CACHE_TTL_MS);
+  }
 
   /**
    * Opens a host listener and forwards each connection to the exposure target.
@@ -110,6 +128,7 @@ export class HostPortProxyManager {
     }
 
     this.listeners.delete(exposureId);
+    this.targetCache.delete(exposureId);
     await listener.close();
   }
 
@@ -117,6 +136,7 @@ export class HostPortProxyManager {
   async dispose(): Promise<void> {
     const listeners = [...this.listeners.entries()];
     this.listeners.clear();
+    this.targetCache.clear();
     await Promise.all(listeners.map(([, listener]) => listener.close()));
   }
 
@@ -130,7 +150,9 @@ export class HostPortProxyManager {
     const proxy = new NativeHostPortProxyProcess(
       exposure,
       nativeProxyPath,
-      this.targetResolver,
+      {
+        resolve: (currentExposure) => this.resolveTarget(currentExposure),
+      },
       this.options.nativeStartupTimeoutMs ?? DEFAULT_NATIVE_STARTUP_TIMEOUT_MS,
     );
 
@@ -152,7 +174,7 @@ export class HostPortProxyManager {
     let target: HostPortProxyTarget;
 
     try {
-      target = await this.targetResolver.resolve(exposure);
+      target = await this.resolveTarget(exposure);
     } catch {
       incoming.destroy();
       return;
@@ -174,6 +196,31 @@ export class HostPortProxyManager {
     outgoing.on("error", () => incoming.destroy());
     incoming.pipe(outgoing);
     outgoing.pipe(incoming);
+  }
+
+  /** Resolves dynamic exposure targets while coalescing short connection bursts. */
+  private resolveTarget(exposure: HostPortExposure): Promise<HostPortProxyTarget> {
+    if (this.targetCacheTtlMs === 0) {
+      return Promise.resolve(this.targetResolver.resolve(exposure));
+    }
+
+    const nowMs = Date.now();
+    const cached = this.targetCache.get(exposure.id);
+    if (cached !== undefined && cached.expiresAtMs > nowMs) {
+      return cached.targetPromise;
+    }
+
+    const targetPromise = Promise.resolve(this.targetResolver.resolve(exposure)).catch((error) => {
+      if (this.targetCache.get(exposure.id)?.targetPromise === targetPromise) {
+        this.targetCache.delete(exposure.id);
+      }
+      throw error;
+    });
+    this.targetCache.set(exposure.id, {
+      targetPromise,
+      expiresAtMs: nowMs + this.targetCacheTtlMs,
+    });
+    return targetPromise;
   }
 }
 

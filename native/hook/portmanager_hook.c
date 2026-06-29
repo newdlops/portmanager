@@ -38,6 +38,8 @@
 #define PM_MAX_SHEBANG 4096
 #define PM_MAX_SCRIPT_LINE 4096
 #define PM_MAX_ROUTES 32768
+#define PM_MAX_ROUTE_OBJECT 8192
+#define PM_ROUTE_FILE_CACHE_CAPACITY 64
 #define PM_DEFAULT_SCAN_RANGE 20
 #define PM_DEFAULT_VIRTUAL_START 53000
 #define PM_DEFAULT_VIRTUAL_END 59999
@@ -78,6 +80,28 @@ typedef struct {
   char network_id[PM_MAX_TEXT];
 } pm_route_mapping;
 
+typedef struct {
+  char path[PM_MAX_PATH];
+  time_t mtime_sec;
+  long mtime_nsec;
+  off_t size;
+  struct pm_cached_route *routes;
+  size_t route_count;
+  unsigned long last_used;
+} pm_route_file_cache_entry;
+
+typedef struct pm_cached_route {
+  int logical_port;
+  int actual_port;
+  int has_network_id;
+  int has_cwd;
+  int is_compose;
+  char host[128];
+  char network_id[PM_MAX_TEXT];
+  char cwd[PM_MAX_TEXT];
+  char route_direction[32];
+} pm_cached_route;
+
 #if defined(__APPLE__)
 static pm_bind_fn pm_real_bind = bind;
 static pm_connect_fn pm_real_connect = connect;
@@ -100,8 +124,11 @@ static pm_posix_spawnp_fn pm_real_posix_spawnp = NULL;
 static __thread int pm_hook_depth = 0;
 static pm_route_mapping pm_routes[PM_MAX_ROUTES];
 static int pm_route_count = 0;
+static pm_route_file_cache_entry pm_route_file_cache[PM_ROUTE_FILE_CACHE_CAPACITY];
 static unsigned long pm_request_sequence = 1;
+static unsigned long pm_route_file_cache_tick = 1;
 static pthread_mutex_t pm_route_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t pm_route_file_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void pm_release_process_routes(void);
 static const char *pm_actual_loopback_host(void);
@@ -2101,21 +2128,6 @@ static int pm_path_contains_or_equals(const char *candidate, const char *root) {
   return strncmp(candidate, root, root_length) == 0 && (root[root_length - 1] == '/' || candidate[root_length] == '/');
 }
 
-static int pm_route_matches_cwd(const char *route_json, const char *current_cwd) {
-  char route_cwd[PM_MAX_TEXT];
-
-  if (pm_json_string(route_json, "cwd", route_cwd, sizeof(route_cwd)) != 0) {
-    return 0;
-  }
-
-  /*
-   * Route cwd is usually the project root, while some launchers run from a
-   * package subdirectory. Accept either direction so worktree identity survives
-   * those launcher hops without leaking across sibling checkouts.
-   */
-  return pm_path_contains_or_equals(current_cwd, route_cwd) || pm_path_contains_or_equals(route_cwd, current_cwd);
-}
-
 static const char *pm_current_network_id(void) {
   const char *network_id = getenv("PORT_MANAGER_NETWORK_ID");
 
@@ -2215,51 +2227,308 @@ static int pm_route_matches_network(const char *route_json) {
   return strcmp(route_network, network_id) == 0;
 }
 
-static int pm_route_direction_matches(const char *route_json, const char *required_direction) {
-  char route_direction[32];
+static time_t pm_stat_mtime_sec(const struct stat *stat_buffer) {
+#if defined(__APPLE__)
+  return stat_buffer->st_mtimespec.tv_sec;
+#else
+  return stat_buffer->st_mtim.tv_sec;
+#endif
+}
 
+static long pm_stat_mtime_nsec(const struct stat *stat_buffer) {
+#if defined(__APPLE__)
+  return stat_buffer->st_mtimespec.tv_nsec;
+#else
+  return stat_buffer->st_mtim.tv_nsec;
+#endif
+}
+
+static void pm_clear_route_file_cache_entry(pm_route_file_cache_entry *entry) {
+  if (entry == NULL) {
+    return;
+  }
+
+  free(entry->routes);
+  memset(entry, 0, sizeof(*entry));
+}
+
+static int pm_route_file_cache_entry_matches(
+  const pm_route_file_cache_entry *entry,
+  const char *path,
+  const struct stat *stat_buffer) {
+  return entry != NULL &&
+    entry->path[0] != '\0' &&
+    strcmp(entry->path, path) == 0 &&
+    entry->size == stat_buffer->st_size &&
+    entry->mtime_sec == pm_stat_mtime_sec(stat_buffer) &&
+    entry->mtime_nsec == pm_stat_mtime_nsec(stat_buffer);
+}
+
+static int pm_copy_cached_routes(
+  const pm_cached_route *routes,
+  size_t route_count,
+  pm_cached_route **routes_out,
+  size_t *route_count_out) {
+  pm_cached_route *copy = NULL;
+
+  if (routes_out == NULL || route_count_out == NULL) {
+    return -1;
+  }
+
+  *routes_out = NULL;
+  *route_count_out = 0;
+  if (route_count == 0) {
+    return 0;
+  }
+
+  copy = (pm_cached_route *)malloc(route_count * sizeof(pm_cached_route));
+  if (copy == NULL) {
+    return -1;
+  }
+
+  memcpy(copy, routes, route_count * sizeof(pm_cached_route));
+  *routes_out = copy;
+  *route_count_out = route_count;
+  return 0;
+}
+
+static int pm_get_cached_route_file(
+  const char *path,
+  const struct stat *stat_buffer,
+  pm_cached_route **routes_out,
+  size_t *route_count_out) {
+  int found = 0;
+
+  pthread_mutex_lock(&pm_route_file_cache_mutex);
+  for (int index = 0; index < PM_ROUTE_FILE_CACHE_CAPACITY; index++) {
+    pm_route_file_cache_entry *entry = &pm_route_file_cache[index];
+    if (!pm_route_file_cache_entry_matches(entry, path, stat_buffer)) {
+      continue;
+    }
+
+    entry->last_used = pm_route_file_cache_tick++;
+    found = pm_copy_cached_routes(entry->routes, entry->route_count, routes_out, route_count_out) == 0;
+    break;
+  }
+  pthread_mutex_unlock(&pm_route_file_cache_mutex);
+
+  return found ? 0 : -1;
+}
+
+static pm_route_file_cache_entry *pm_select_route_file_cache_slot(void) {
+  pm_route_file_cache_entry *oldest = &pm_route_file_cache[0];
+
+  for (int index = 0; index < PM_ROUTE_FILE_CACHE_CAPACITY; index++) {
+    pm_route_file_cache_entry *entry = &pm_route_file_cache[index];
+    if (entry->path[0] == '\0') {
+      return entry;
+    }
+    if (entry->last_used < oldest->last_used) {
+      oldest = entry;
+    }
+  }
+
+  return oldest;
+}
+
+static void pm_store_route_file_cache(
+  const char *path,
+  const struct stat *stat_buffer,
+  const pm_cached_route *routes,
+  size_t route_count) {
+  pm_route_file_cache_entry *entry;
+  pm_cached_route *copy = NULL;
+
+  if (route_count > 0) {
+    copy = (pm_cached_route *)malloc(route_count * sizeof(pm_cached_route));
+    if (copy == NULL) {
+      return;
+    }
+    memcpy(copy, routes, route_count * sizeof(pm_cached_route));
+  }
+
+  pthread_mutex_lock(&pm_route_file_cache_mutex);
+  entry = pm_select_route_file_cache_slot();
+  pm_clear_route_file_cache_entry(entry);
+  snprintf(entry->path, sizeof(entry->path), "%s", path);
+  entry->mtime_sec = pm_stat_mtime_sec(stat_buffer);
+  entry->mtime_nsec = pm_stat_mtime_nsec(stat_buffer);
+  entry->size = stat_buffer->st_size;
+  entry->routes = copy;
+  entry->route_count = route_count;
+  entry->last_used = pm_route_file_cache_tick++;
+  pthread_mutex_unlock(&pm_route_file_cache_mutex);
+}
+
+static int pm_append_cached_route(
+  pm_cached_route **routes,
+  size_t *route_count,
+  size_t *capacity,
+  const char *route_json) {
+  pm_cached_route *next_routes;
+  pm_cached_route *route;
+  char source[32];
+
+  if (*route_count >= *capacity) {
+    size_t next_capacity = *capacity == 0 ? 16 : *capacity * 2;
+    next_routes = (pm_cached_route *)realloc(*routes, next_capacity * sizeof(pm_cached_route));
+    if (next_routes == NULL) {
+      return -1;
+    }
+    *routes = next_routes;
+    *capacity = next_capacity;
+  }
+
+  route = &(*routes)[(*route_count)++];
+  memset(route, 0, sizeof(*route));
+  route->logical_port = pm_json_int(route_json, "logicalPort", 0);
+  route->actual_port = pm_json_int(route_json, "actualPort", 0);
+  if (pm_json_string(route_json, "host", route->host, sizeof(route->host)) != 0) {
+    route->host[0] = '\0';
+  }
+  route->has_network_id = pm_json_string(route_json, "networkId", route->network_id, sizeof(route->network_id)) == 0;
+  route->has_cwd = pm_json_string(route_json, "cwd", route->cwd, sizeof(route->cwd)) == 0;
+  if (pm_json_string(route_json, "routeDirection", route->route_direction, sizeof(route->route_direction)) != 0) {
+    route->route_direction[0] = '\0';
+  }
+  route->is_compose = pm_json_string(route_json, "source", source, sizeof(source)) == 0 && strcmp(source, "compose") == 0;
+  return 0;
+}
+
+static int pm_parse_route_file_buffer(char *buffer, pm_cached_route **routes_out, size_t *route_count_out) {
+  pm_cached_route *routes = NULL;
+  size_t route_count = 0;
+  size_t capacity = 0;
+  char *cursor = buffer;
+
+  if (routes_out == NULL || route_count_out == NULL) {
+    return -1;
+  }
+
+  *routes_out = NULL;
+  *route_count_out = 0;
+  while ((cursor = strchr(cursor, '{')) != NULL) {
+    char *object_start = cursor;
+    char *object_end = strchr(cursor, '}');
+    char object_end_saved;
+    int logical;
+    int actual;
+
+    if (object_end == NULL) {
+      break;
+    }
+
+    object_end_saved = *object_end;
+    *object_end = '\0';
+    logical = pm_json_int(object_start, "logicalPort", 0);
+    actual = pm_json_int(object_start, "actualPort", 0);
+    if (logical > 0 && actual > 0 && pm_append_cached_route(&routes, &route_count, &capacity, object_start) != 0) {
+      *object_end = object_end_saved;
+      free(routes);
+      return -1;
+    }
+    *object_end = object_end_saved;
+    cursor = object_end + 1;
+  }
+
+  *routes_out = routes;
+  *route_count_out = route_count;
+  return 0;
+}
+
+static int pm_load_route_file_routes(const char *path, pm_cached_route **routes_out, size_t *route_count_out) {
+  pm_cached_route *routes = NULL;
+  size_t route_count = 0;
+  char *buffer;
+  int fd;
+  struct stat stat_buffer;
+  ssize_t read_count;
+
+  if (routes_out == NULL || route_count_out == NULL) {
+    return -1;
+  }
+
+  *routes_out = NULL;
+  *route_count_out = 0;
+  fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    return -1;
+  }
+
+  if (fstat(fd, &stat_buffer) != 0 || stat_buffer.st_size <= 0 || stat_buffer.st_size > 1024 * 1024) {
+    close(fd);
+    return -1;
+  }
+
+  if (pm_get_cached_route_file(path, &stat_buffer, routes_out, route_count_out) == 0) {
+    close(fd);
+    return 0;
+  }
+
+  buffer = (char *)malloc((size_t)stat_buffer.st_size + 1);
+  if (buffer == NULL) {
+    close(fd);
+    return -1;
+  }
+
+  read_count = read(fd, buffer, (size_t)stat_buffer.st_size);
+  close(fd);
+  if (read_count <= 0) {
+    free(buffer);
+    return -1;
+  }
+
+  buffer[read_count] = '\0';
+  if (pm_parse_route_file_buffer(buffer, &routes, &route_count) != 0) {
+    free(buffer);
+    return -1;
+  }
+  free(buffer);
+
+  pm_store_route_file_cache(path, &stat_buffer, routes, route_count);
+  *routes_out = routes;
+  *route_count_out = route_count;
+  return 0;
+}
+
+static int pm_cached_route_network_match_level(const pm_cached_route *route) {
+  const char *network_id = pm_current_network_id();
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    return route->has_network_id ? 0 : 2;
+  }
+
+  if (!route->has_network_id) {
+    return 1;
+  }
+
+  return strcmp(route->network_id, network_id) == 0 ? 2 : 0;
+}
+
+static int pm_cached_route_matches_cwd(const pm_cached_route *route, const char *current_cwd) {
+  if (!route->has_cwd) {
+    return 0;
+  }
+
+  return pm_path_contains_or_equals(current_cwd, route->cwd) || pm_path_contains_or_equals(route->cwd, current_cwd);
+}
+
+static int pm_cached_route_direction_matches(const pm_cached_route *route, const char *required_direction) {
   if (required_direction == NULL || required_direction[0] == '\0') {
     return 1;
   }
 
-  if (pm_json_string(route_json, "routeDirection", route_direction, sizeof(route_direction)) != 0) {
+  if (route->route_direction[0] == '\0') {
     return strcmp(required_direction, "listen") == 0;
   }
 
-  return strcmp(route_direction, required_direction) == 0;
+  return strcmp(route->route_direction, required_direction) == 0;
 }
 
-static int pm_route_network_match_level(const char *route_json) {
+static int pm_cached_route_is_foreign_to_current_network(const pm_cached_route *route) {
   const char *network_id = pm_current_network_id();
-  char route_network[PM_MAX_TEXT];
 
-  if (network_id == NULL || network_id[0] == '\0') {
-    /*
-     * Network identity is an isolation boundary, not a hint. If protected
-     * launcher hops lose PORT_MANAGER_NETWORK_ID, fail closed to unscoped routes
-     * instead of inferring a scoped route from cwd or stale file names.
-     */
-    return pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0 ? 2 : 0;
-  }
-
-  if (pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0) {
-    return 1;
-  }
-
-  return strcmp(route_network, network_id) == 0 ? 2 : 0;
-}
-
-static int pm_route_is_compose(const char *route_json) {
-  char source[32];
-
-  return pm_json_string(route_json, "source", source, sizeof(source)) == 0 && strcmp(source, "compose") == 0;
-}
-
-static int pm_route_is_foreign_to_current_network(const char *route_json) {
-  const char *network_id = pm_current_network_id();
-  char route_network[PM_MAX_TEXT];
-
-  if (pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0) {
+  if (!route->has_network_id) {
     return 0;
   }
 
@@ -2267,7 +2536,7 @@ static int pm_route_is_foreign_to_current_network(const char *route_json) {
     return 1;
   }
 
-  return strcmp(route_network, network_id) != 0;
+  return strcmp(route->network_id, network_id) != 0;
 }
 
 static int pm_host_access_lookup(int logical_port, char *target_host, size_t target_host_size) {
@@ -2630,11 +2899,8 @@ static int pm_route_table_lookup_file(
   char *target_host,
   size_t target_host_size,
   int *is_compose_route) {
-  char *buffer;
-  int fd;
-  struct stat stat_buffer;
-  ssize_t read_count;
-  char *cursor;
+  pm_cached_route *routes;
+  size_t route_count;
   int fallback_port = 0;
   int fallback_is_compose = 0;
   char fallback_host[128];
@@ -2644,60 +2910,25 @@ static int pm_route_table_lookup_file(
     *is_compose_route = 0;
   }
 
-  fd = open(path, O_RDONLY);
-  if (fd < 0) {
+  if (pm_load_route_file_routes(path, &routes, &route_count) != 0) {
     return 0;
   }
 
-  if (fstat(fd, &stat_buffer) != 0 || stat_buffer.st_size <= 0 || stat_buffer.st_size > 1024 * 1024) {
-    close(fd);
-    return 0;
-  }
-
-  buffer = (char *)malloc((size_t)stat_buffer.st_size + 1);
-  if (buffer == NULL) {
-    close(fd);
-    return 0;
-  }
-
-  read_count = read(fd, buffer, (size_t)stat_buffer.st_size);
-  close(fd);
-  if (read_count <= 0) {
-    free(buffer);
-    return 0;
-  }
-
-  buffer[read_count] = '\0';
-  cursor = buffer;
   fallback_host[0] = '\0';
   pm_cwd(current_cwd, sizeof(current_cwd));
 
-  while ((cursor = pm_find_json_int_key(cursor, source_is_actual ? "actualPort" : "logicalPort", source_port)) != NULL) {
-    char *object_start = cursor;
-    char *object_end = strchr(cursor, '}');
-    char object_end_saved;
-    int logical;
-    int actual;
+  for (size_t index = 0; index < route_count; index++) {
+    const pm_cached_route *route = &routes[index];
     int match_level;
     int route_matches_cwd;
 
-    while (object_start > buffer && *object_start != '{') {
-      object_start--;
+    if ((source_is_actual && route->actual_port != source_port) || (!source_is_actual && route->logical_port != source_port)) {
+      continue;
     }
 
-    if (object_end == NULL) {
-      break;
-    }
-
-    object_end_saved = *object_end;
-    *object_end = '\0';
-    logical = pm_json_int(object_start, "logicalPort", 0);
-    actual = pm_json_int(object_start, "actualPort", 0);
-    match_level = pm_route_network_match_level(object_start);
-    route_matches_cwd = pm_route_matches_cwd(object_start, current_cwd);
-    if (!pm_route_direction_matches(object_start, required_direction)) {
-      *object_end = object_end_saved;
-      cursor = object_end + 1;
+    match_level = pm_cached_route_network_match_level(route);
+    route_matches_cwd = pm_cached_route_matches_cwd(route, current_cwd);
+    if (!pm_cached_route_direction_matches(route, required_direction)) {
       continue;
     }
 
@@ -2709,53 +2940,48 @@ static int pm_route_table_lookup_file(
      * route; package launchers sometimes preserve the preload while losing the
      * explicit network id.
      */
-    if (pm_route_is_compose(object_start) && match_level < 2 && !route_matches_cwd) {
-      *object_end = object_end_saved;
-      cursor = object_end + 1;
+    if (route->is_compose && match_level < 2 && !route_matches_cwd) {
       continue;
     }
 
-    if (source_is_actual && actual == source_port && match_level > 0) {
+    if (source_is_actual && match_level > 0) {
       if (match_level == 2) {
         if (is_compose_route != NULL) {
-          *is_compose_route = pm_route_is_compose(object_start);
+          *is_compose_route = route->is_compose;
         }
-        free(buffer);
-        return logical;
+        fallback_port = route->logical_port;
+        free(routes);
+        return fallback_port;
       }
 
       if (fallback_port == 0 && (source_is_actual || route_matches_cwd)) {
-        fallback_port = logical;
-        fallback_is_compose = pm_route_is_compose(object_start);
+        fallback_port = route->logical_port;
+        fallback_is_compose = route->is_compose;
       }
     }
 
-    if (!source_is_actual && logical == source_port && match_level > 0) {
+    if (!source_is_actual && match_level > 0) {
       if (match_level == 2) {
-        if (target_host != NULL && target_host_size > 0 && pm_json_string(object_start, "host", target_host, target_host_size) != 0) {
-          snprintf(target_host, target_host_size, "127.0.0.1");
+        if (target_host != NULL && target_host_size > 0) {
+          snprintf(target_host, target_host_size, "%s", route->host[0] == '\0' ? "127.0.0.1" : route->host);
         }
         if (is_compose_route != NULL) {
-          *is_compose_route = pm_route_is_compose(object_start);
+          *is_compose_route = route->is_compose;
         }
-        free(buffer);
-        return actual;
+        fallback_port = route->actual_port;
+        free(routes);
+        return fallback_port;
       }
 
       if (fallback_port == 0 && route_matches_cwd) {
-        fallback_port = actual;
-        fallback_is_compose = pm_route_is_compose(object_start);
-        if (pm_json_string(object_start, "host", fallback_host, sizeof(fallback_host)) != 0) {
-          snprintf(fallback_host, sizeof(fallback_host), "127.0.0.1");
-        }
+        fallback_port = route->actual_port;
+        fallback_is_compose = route->is_compose;
+        snprintf(fallback_host, sizeof(fallback_host), "%s", route->host[0] == '\0' ? "127.0.0.1" : route->host);
       }
     }
-
-    *object_end = object_end_saved;
-    cursor = object_end + 1;
   }
 
-  free(buffer);
+  free(routes);
   if (fallback_port > 0) {
     if (!source_is_actual && target_host != NULL && target_host_size > 0) {
       snprintf(target_host, target_host_size, "%s", fallback_host[0] == '\0' ? "127.0.0.1" : fallback_host);
@@ -2772,73 +2998,31 @@ static int pm_route_table_lookup_file(
 static int pm_compose_claim_blocks_port(int port) {
   char path[PM_MAX_PATH];
   char base_path[PM_MAX_PATH];
-  char *buffer;
-  int fd;
-  struct stat stat_buffer;
-  ssize_t read_count;
-  char *cursor;
+  pm_cached_route *routes;
+  size_t route_count;
+  int blocks_port = 0;
 
   pm_default_global_route_table_path(base_path, sizeof(base_path));
   pm_route_compose_claim_path(base_path, port, path, sizeof(path));
-  fd = open(path, O_RDONLY);
-  if (fd < 0) {
+  if (pm_load_route_file_routes(path, &routes, &route_count) != 0) {
     return 0;
   }
 
-  if (fstat(fd, &stat_buffer) != 0 || stat_buffer.st_size <= 0 || stat_buffer.st_size > 1024 * 1024) {
-    close(fd);
-    return 0;
-  }
-
-  buffer = (char *)malloc((size_t)stat_buffer.st_size + 1);
-  if (buffer == NULL) {
-    close(fd);
-    return 0;
-  }
-
-  read_count = read(fd, buffer, (size_t)stat_buffer.st_size);
-  close(fd);
-  if (read_count <= 0) {
-    free(buffer);
-    return 0;
-  }
-
-  buffer[read_count] = '\0';
-  cursor = buffer;
-
-  while ((cursor = strchr(cursor, '{')) != NULL) {
-    char *object_start = cursor;
-    char *object_end = strchr(cursor, '}');
-    char object_end_saved;
-    int logical;
-    int actual;
-
-    if (object_end == NULL) {
+  for (size_t index = 0; index < route_count; index++) {
+    const pm_cached_route *route = &routes[index];
+    if (
+      (route->logical_port == port || route->actual_port == port) &&
+      route->is_compose &&
+      pm_cached_route_direction_matches(route, "listen") &&
+      pm_cached_route_is_foreign_to_current_network(route)
+    ) {
+      blocks_port = 1;
       break;
     }
-
-    object_end_saved = *object_end;
-    *object_end = '\0';
-    logical = pm_json_int(object_start, "logicalPort", 0);
-    actual = pm_json_int(object_start, "actualPort", 0);
-
-    if (
-      (logical == port || actual == port) &&
-      pm_route_is_compose(object_start) &&
-      pm_route_direction_matches(object_start, "listen") &&
-      pm_route_is_foreign_to_current_network(object_start)
-    ) {
-      *object_end = object_end_saved;
-      free(buffer);
-      return 1;
-    }
-
-    *object_end = object_end_saved;
-    cursor = object_end + 1;
   }
 
-  free(buffer);
-  return 0;
+  free(routes);
+  return blocks_port;
 }
 
 static int pm_route_table_lookup(

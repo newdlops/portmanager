@@ -17,7 +17,7 @@ test("rewrites browser alias HTTP requests as localhost upstream requests", asyn
     response.writeHead(302, {
       "access-control-allow-origin": "http://localhost:3004",
       location: "http://localhost:3004/login",
-      "set-cookie": "sessionid=abc; Domain=localhost; Path=/; HttpOnly",
+      "set-cookie": ["sessionid=abc; Domain=localhost; Path=/; HttpOnly", "theme=light; Path=/; SameSite=Lax"],
     });
     response.end("redirect");
   });
@@ -55,6 +55,7 @@ test("rewrites browser alias HTTP requests as localhost upstream requests", asyn
     assert.equal(response.headers.location, `${publicOrigin}/login`);
     assert.equal(response.headers["access-control-allow-origin"], publicOrigin);
     assert.equal(response.headers["set-cookie"]?.[0], "sessionid=abc; Path=/; HttpOnly");
+    assert.equal(response.headers["set-cookie"]?.[1], "theme=light; Path=/; SameSite=Lax");
     assert.equal(formatBrowserNetworkProxyUrl(activeEndpoint), `${publicOrigin}/`);
   } finally {
     await proxy.dispose();

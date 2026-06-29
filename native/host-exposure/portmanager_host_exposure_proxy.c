@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PM_HOST_PROXY_BACKLOG 128
@@ -18,6 +19,7 @@
 #define PM_HOST_PROXY_HOST_SIZE 256
 #define PM_HOST_PROXY_LINE_SIZE 1024
 #define PM_HOST_PROXY_MAX_LISTENERS 8
+#define PM_HOST_PROXY_ROUTE_RESPONSE_TIMEOUT_MS 5000
 
 typedef struct pending_route {
   uint64_t id;
@@ -207,14 +209,29 @@ static int pm_send_route_request(const accepted_connection_t *connection, uint64
   return pm_write_protocol_line(line);
 }
 
+static void pm_add_milliseconds(struct timespec *deadline, long timeout_ms) {
+  deadline->tv_sec += timeout_ms / 1000;
+  deadline->tv_nsec += (timeout_ms % 1000) * 1000000L;
+  if (deadline->tv_nsec >= 1000000000L) {
+    deadline->tv_sec += deadline->tv_nsec / 1000000000L;
+    deadline->tv_nsec = deadline->tv_nsec % 1000000000L;
+  }
+}
+
 static int pm_resolve_route(const accepted_connection_t *connection, char *host, size_t host_size, int *port) {
   pending_route_t route;
+  struct timespec deadline;
 
   memset(&route, 0, sizeof(route));
   route.id = pm_allocate_route_id();
   if (pthread_cond_init(&route.condition, NULL) != 0) {
     return -1;
   }
+  if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+    pthread_cond_destroy(&route.condition);
+    return -1;
+  }
+  pm_add_milliseconds(&deadline, PM_HOST_PROXY_ROUTE_RESPONSE_TIMEOUT_MS);
 
   pm_add_pending_route(&route);
   if (pm_send_route_request(connection, route.id) != 0) {
@@ -225,12 +242,14 @@ static int pm_resolve_route(const accepted_connection_t *connection, char *host,
 
   pthread_mutex_lock(&pm_pending_mutex);
   while (!route.resolved) {
-    pthread_cond_wait(&route.condition, &pm_pending_mutex);
+    if (pthread_cond_timedwait(&route.condition, &pm_pending_mutex, &deadline) == ETIMEDOUT) {
+      break;
+    }
   }
   pthread_mutex_unlock(&pm_pending_mutex);
 
   pm_remove_pending_route(&route);
-  if (route.failed || route.port <= 0 || route.host[0] == '\0') {
+  if (!route.resolved || route.failed || route.port <= 0 || route.host[0] == '\0') {
     pthread_cond_destroy(&route.condition);
     return -1;
   }

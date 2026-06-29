@@ -38,6 +38,20 @@ test("native hook memory route cache is scoped by logical network", () => {
   );
 });
 
+test("native hook route file cache is invalidated by path size and high-resolution mtime", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+
+  assert.equal(source.includes("pm_route_file_cache_entry"), true);
+  assert.equal(source.includes("PM_ROUTE_FILE_CACHE_CAPACITY"), true);
+  assert.equal(source.includes("entry->size == stat_buffer->st_size"), true);
+  assert.equal(source.includes("entry->mtime_sec == pm_stat_mtime_sec(stat_buffer)"), true);
+  assert.equal(source.includes("entry->mtime_nsec == pm_stat_mtime_nsec(stat_buffer)"), true);
+  assert.equal(source.includes("pm_cached_route_matches_cwd(route, current_cwd)"), true);
+  assert.equal(source.includes("pm_cached_route_network_match_level(route)"), true);
+  assert.equal(source.includes("pm_remember_route(logical_port, actual_port, target_host"), false);
+});
+
 if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
   test("native hook allows current-network same-port compose routes", { skip: "native hook library is not built for this platform" }, () => undefined);
 } else {

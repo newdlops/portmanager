@@ -73,6 +73,54 @@ test("resolves host exposure targets when each inbound connection starts", async
   await closeServer(target);
 });
 
+test("reuses host exposure target resolutions during short connection bursts", async () => {
+  let resolveCalls = 0;
+  const target = net.createServer((socket) => {
+    socket.once("data", (chunk) => {
+      socket.end(`cached:${chunk.toString("utf8")}`);
+    });
+  });
+
+  await listen(target, 0, "127.0.0.1");
+  const originalDateNow = Date.now;
+  let nowMs = 1_000;
+  const targetPort = getServerPort(target);
+  const hostPort = await getAvailablePort();
+  const proxy = new HostPortProxyManager(
+    {
+      resolve: (exposure) => {
+        resolveCalls += 1;
+        return {
+          host: exposure.targetAddress,
+          port: targetPort,
+        };
+      },
+    },
+    {
+      targetCacheTtlMs: 60,
+    },
+  );
+  const exposure = createExposure({ hostPort, targetPort: 3004 });
+
+  try {
+    Date.now = () => nowMs;
+    await proxy.open(exposure);
+
+    assert.equal(await sendTcpMessage(exposure.hostPort, "127.0.0.1", "first"), "cached:first");
+    assert.equal(await sendTcpMessage(exposure.hostPort, "127.0.0.1", "second"), "cached:second");
+    assert.equal(resolveCalls, 1);
+
+    nowMs += 61;
+
+    assert.equal(await sendTcpMessage(exposure.hostPort, "127.0.0.1", "third"), "cached:third");
+    assert.equal(resolveCalls, 2);
+  } finally {
+    Date.now = originalDateNow;
+    await proxy.dispose();
+    await closeServer(target);
+  }
+});
+
 test("parses native host exposure connection query lines", () => {
   assert.deepEqual(parseNativeHostProxyQueryLine("CONNECT\t7\t127.0.0.1\t3000\t127.0.0.1\t49152"), {
     id: "7",
@@ -87,6 +135,19 @@ test("parses native host exposure connection query lines", () => {
     localAddress: "127.0.0.1",
     remoteAddress: "127.0.0.1",
   });
+});
+
+test("native host exposure pending route requests time out instead of blocking forever", () => {
+  const root = path.resolve(__dirname, "../../..");
+  const hostProxySource = fs.readFileSync(
+    path.join(root, "native/host-exposure/portmanager_host_exposure_proxy.c"),
+    "utf8",
+  );
+
+  assert.equal(hostProxySource.includes("PM_HOST_PROXY_ROUTE_RESPONSE_TIMEOUT_MS 5000"), true);
+  assert.equal(hostProxySource.includes("clock_gettime(CLOCK_REALTIME, &deadline)"), true);
+  assert.equal(hostProxySource.includes("pthread_cond_timedwait(&route.condition, &pm_pending_mutex, &deadline)"), true);
+  assert.equal(hostProxySource.includes("if (!route.resolved || route.failed"), true);
 });
 
 test(

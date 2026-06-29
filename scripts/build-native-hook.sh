@@ -28,7 +28,7 @@ case "$(uname -s)" in
     cc -Wall -Wextra -O2 -dynamiclib "$HOOK_SOURCE_FILE" -o "$OUTPUT_DIR/libportmanager_hook.dylib"
     cc -Wall -Wextra -O2 "$ASDF_SHIM_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_asdf_shim"
     cc -Wall -Wextra -O2 "$TTY_INPUT_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tty_input"
-    cc -Wall -Wextra -O2 "$TCP_ROUTER_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tcp_router"
+    cc -Wall -Wextra -O2 -pthread "$TCP_ROUTER_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tcp_router"
     cc -Wall -Wextra -O2 -pthread "$HOST_EXPOSURE_PROXY_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_host_exposure_proxy"
     cc -Wall -Wextra -O2 "$PROCESS_LOOKUP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_lookup"
     cc -Wall -Wextra -O2 "$CONTAINER_MAP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_container_map"
@@ -52,7 +52,7 @@ case "$(uname -s)" in
   Linux)
     cc -Wall -Wextra -O2 -fPIC -shared "$HOOK_SOURCE_FILE" -ldl -o "$OUTPUT_DIR/libportmanager_hook.so"
     cc -Wall -Wextra -O2 "$TTY_INPUT_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tty_input"
-    cc -Wall -Wextra -O2 "$TCP_ROUTER_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tcp_router"
+    cc -Wall -Wextra -O2 -pthread "$TCP_ROUTER_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tcp_router"
     cc -Wall -Wextra -O2 -pthread "$HOST_EXPOSURE_PROXY_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_host_exposure_proxy"
     cc -Wall -Wextra -O2 "$PROCESS_LOOKUP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_lookup"
     cc -Wall -Wextra -O2 "$CONTAINER_MAP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_container_map"

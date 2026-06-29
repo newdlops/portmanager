@@ -119,6 +119,18 @@ test("native logical router helper starts without inherited hook environment", a
   }
 });
 
+test("native logical router pending route requests time out instead of blocking forever", () => {
+  const root = path.resolve(__dirname, "../../..");
+  const routerSource = fs.readFileSync(path.join(root, "native/router/portmanager_tcp_router.c"), "utf8");
+  const buildScript = fs.readFileSync(path.join(root, "scripts/build-native-hook.sh"), "utf8");
+
+  assert.equal(routerSource.includes("PM_ROUTER_ROUTE_RESPONSE_TIMEOUT_MS 5000"), true);
+  assert.equal(routerSource.includes("clock_gettime(CLOCK_REALTIME, &deadline)"), true);
+  assert.equal(routerSource.includes("pthread_cond_timedwait(&route.condition, &pm_pending_mutex, &deadline)"), true);
+  assert.equal(routerSource.includes("if (!route.resolved || route.failed"), true);
+  assert.match(buildScript, /-pthread "\$TCP_ROUTER_SOURCE_FILE"/);
+});
+
 test("keeps opening later logical routers when one desired port is already owned", async () => {
   const occupied = await occupyRouterPort();
   const targetServer = net.createServer((socket) => {

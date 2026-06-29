@@ -69,6 +69,13 @@ const DEFAULT_RETRY_DELAY_MS = 30_000;
 const LOCALHOST_UPSTREAM_HOST = "localhost";
 const UPSTREAM_KEEP_ALIVE_MAX_SOCKETS = 64;
 const UPSTREAM_KEEP_ALIVE_MAX_FREE_SOCKETS = 16;
+const RESPONSE_ORIGIN_REWRITE_HEADER_NAMES = new Set([
+  "location",
+  "content-location",
+  "refresh",
+  "access-control-allow-origin",
+  "link",
+]);
 
 /**
  * Development-only browser isolation proxy.
@@ -373,12 +380,16 @@ function rewriteResponseHeaders(headers: http.IncomingHttpHeaders, metadata: Bro
       continue;
     }
 
-    if (name.toLowerCase() === "set-cookie") {
+    const normalizedName = name.toLowerCase();
+    if (normalizedName === "set-cookie") {
       nextHeaders[name] = rewriteSetCookieHeader(value);
       continue;
     }
 
-    nextHeaders[name] = rewriteResponseHeaderValue(value, metadata);
+    nextHeaders[name] =
+      RESPONSE_ORIGIN_REWRITE_HEADER_NAMES.has(normalizedName) || headerValueIncludesAny(value, metadata.upstreamOrigins)
+        ? rewriteResponseHeaderValue(value, metadata)
+        : value;
   }
 
   return nextHeaders;
@@ -410,10 +421,10 @@ function rewriteResponseHeaderString(value: string, metadata: BrowserNetworkProx
 
 function rewriteSetCookieHeader(value: string | string[]): string | string[] {
   if (Array.isArray(value)) {
-    return value.map(rewriteSetCookie);
+    return value.map((item) => (setCookieHasDomainAttribute(item) ? rewriteSetCookie(item) : item));
   }
 
-  return rewriteSetCookie(value);
+  return setCookieHasDomainAttribute(value) ? rewriteSetCookie(value) : value;
 }
 
 function rewriteSetCookie(value: string): string {
@@ -421,6 +432,22 @@ function rewriteSetCookie(value: string): string {
     .split(";")
     .filter((part) => !part.trim().toLowerCase().startsWith("domain="))
     .join(";");
+}
+
+function headerValueIncludesAny(value: string | string[], needles: readonly string[]): boolean {
+  if (Array.isArray(value)) {
+    return value.some((item) => stringIncludesAny(item, needles));
+  }
+
+  return stringIncludesAny(value, needles);
+}
+
+function stringIncludesAny(value: string, needles: readonly string[]): boolean {
+  return needles.some((needle) => value.includes(needle));
+}
+
+function setCookieHasDomainAttribute(value: string): boolean {
+  return value.toLowerCase().includes("domain=");
 }
 
 function rewriteHeaderOrigin(
