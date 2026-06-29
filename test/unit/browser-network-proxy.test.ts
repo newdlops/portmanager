@@ -104,6 +104,51 @@ test("uses a fallback browser port when the logical port is already occupied", a
   }
 });
 
+test("clears bind retry backoff when an owner handoff frees the browser proxy port", async () => {
+  const occupied = http.createServer((_request, response) => {
+    response.end("occupied");
+  });
+  await listen(occupied, 0, "127.0.0.1");
+  let occupiedClosed = false;
+
+  const upstream = http.createServer((_request, response) => {
+    response.end("target");
+  });
+  await listen(upstream, 0, "127.0.0.1");
+
+  const proxyPort = getServerPort(occupied);
+  const proxy = new BrowserNetworkProxyManager(
+    {
+      resolve: () => ({
+        host: "127.0.0.1",
+        port: getServerPort(upstream),
+      }),
+    },
+    { retryDelayMs: 60_000 },
+  );
+  const endpoint = createEndpoint({ listenPorts: [proxyPort] });
+
+  try {
+    await proxy.sync([endpoint]);
+    assert.equal(proxy.get("network-1", 3004), undefined);
+
+    await closeServer(occupied);
+    occupiedClosed = true;
+    await proxy.sync([endpoint]);
+    assert.equal(proxy.get("network-1", 3004), undefined);
+
+    proxy.retryFailedEndpointsNow();
+    await proxy.sync([endpoint]);
+    assert.equal(proxy.get("network-1", 3004)?.listenPort, proxyPort);
+  } finally {
+    await proxy.dispose();
+    await closeServer(upstream);
+    if (!occupiedClosed) {
+      await closeServer(occupied);
+    }
+  }
+});
+
 test("reuses upstream HTTP connections for repeated browser proxy requests", async () => {
   let upstreamConnectionCount = 0;
   const upstream = http.createServer((request, response) => {

@@ -225,6 +225,14 @@ test("terminal attach and detach commands source generated script files", () => 
 
   assert.equal(source.includes('const TERMINAL_HOOK_SCRIPT_DIRECTORY_NAME = "terminal-hook-scripts";'), true);
   assert.equal(source.includes("private writeTerminalHookScript(fileName: string, contents: string): string"), true);
+  assert.equal(
+    source.includes('private buildTerminalHookScriptFileName(kind: "attach" | "detach", scope: string, contents: string): string'),
+    true,
+  );
+  assert.equal(source.includes('return `${kind}-${sanitizeRouteFileScope(scope)}-${hash}.sh`;'), true);
+  assert.equal(source.includes('this.buildTerminalHookScriptFileName("attach", network.id, scriptBody)'), true);
+  assert.equal(source.includes('this.buildTerminalHookScriptFileName("detach", "global", scriptBody)'), true);
+  assert.equal(source.includes('writeTerminalHookScript("detach.sh"'), false);
   assert.equal(source.includes("return `. ${shellQuote(scriptPath)}`;"), true);
   assert.equal(
     source.includes("return commands.join(\"; \");"),
@@ -502,6 +510,9 @@ test("background routing refresh polls terminals and containers", () => {
   const burstStart = source.indexOf("private async runTerminalAttachmentRefreshBurstStep");
   const burstEnd = source.indexOf("private async readTerminalAttachmentMarkerSignature", burstStart);
   const burstBody = source.slice(burstStart, burstEnd);
+  const refreshStart = source.indexOf("private async refreshRoutingSignalsExclusive");
+  const refreshEnd = source.indexOf("private async convergeAfterComposeAttachmentChange", refreshStart);
+  const refreshBody = source.slice(refreshStart, refreshEnd);
 
   assert.equal(source.includes("private startRoutingSignalRefreshLoop(): void"), true);
   assert.equal(source.includes("this.refreshTerminals().catch(() => [])"), true);
@@ -529,6 +540,8 @@ test("background routing refresh polls terminals and containers", () => {
   assert.equal(source.includes("FORCED_COMPOSE_RECONCILE_COALESCE_MS = 750"), true);
   assert.equal(source.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);"), true);
   assert.equal(source.includes("await this.convergeDaemonAndRoutingState();"), true);
+  assert.equal(refreshBody.includes("this.syncLogicalPortRouters().catch(() => undefined),"), true);
+  assert.equal(refreshBody.includes("this.syncBrowserNetworkProxies().catch(() => undefined),"), true);
   assert.equal(source.includes("ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 60_000"), true);
   assert.equal(source.includes("BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS = 60_000"), true);
   assert.equal(source.includes("tryAcquireSharedBackgroundContainerRefreshSlot()"), true);
@@ -746,25 +759,53 @@ test("logical port routers use a single cross-window owner lease", () => {
   const browserCommandCacheStart = source.indexOf("private async readBrowserProxyProcessCommandTexts");
   const browserCommandCacheEnd = source.indexOf("private pruneBrowserProxyProcessCommandTextCache", browserCommandCacheStart);
   const browserCommandCacheBody = source.slice(browserCommandCacheStart, browserCommandCacheEnd);
+  const ownerWatchStart = source.indexOf("private watchOwnerLeaseFiles(): DisposableLike");
+  const ownerWatchEnd = source.indexOf("private refreshOwnerLeaseFromFileSignal", ownerWatchStart);
+  const ownerWatchBody = source.slice(ownerWatchStart, ownerWatchEnd);
+  const ownerSignalStart = source.indexOf("private refreshOwnerLeaseFromFileSignal");
+  const ownerSignalEnd = source.indexOf("private startTerminalAttachmentMarkerPolling", ownerSignalStart);
+  const ownerSignalBody = source.slice(ownerSignalStart, ownerSignalEnd);
 
   assert.equal(source.includes("Owner lease must outlive the routing refresh interval"), true);
   assert.equal(source.includes("LOGICAL_ROUTER_OWNER_LEASE_MS = 120_000"), true);
   assert.equal(source.includes("LOGICAL_ROUTER_OWNER_LOCK_STALE_MS = 30_000"), true);
+  assert.equal(source.includes("OWNER_LEASE_HANDOFF_RETRY_DELAY_MS = 1_000"), true);
   assert.equal(source.includes('function buildLogicalRouterOwnerControlPath(kind: "owner" | "lock"): string'), true);
   assert.equal(source.includes("function tryAcquireLogicalRouterOwnerLease(): boolean"), true);
   assert.equal(source.includes("function isActiveLogicalRouterOwner"), true);
   assert.equal(source.includes("return isProcessAlive(owner.pid);"), true);
+  assert.equal(source.includes("private ownsLogicalRouterLease = false;"), true);
+  assert.notEqual(ownerWatchStart, -1);
+  assert.equal(source.includes("this.watchOwnerLeaseFiles()"), true);
+  assert.equal(ownerWatchBody.includes("LOGICAL_ROUTER_OWNER_PATH"), true);
+  assert.equal(ownerWatchBody.includes("BROWSER_NETWORK_PROXY_OWNER_PATH"), true);
+  assert.equal(ownerWatchBody.includes("syncFs.watch(directoryPath"), true);
+  assert.equal(ownerSignalBody.includes("!this.ownsLogicalRouterLease"), true);
+  assert.equal(ownerSignalBody.includes("!isActiveLogicalRouterOwner(readLogicalRouterOwner(), Date.now())"), true);
+  assert.equal(ownerSignalBody.includes("void this.syncLogicalPortRouters();"), true);
+  assert.equal(ownerSignalBody.includes("this.scheduleOwnerLeaseHandoffRetry(shouldRefreshLogical, shouldRefreshBrowser);"), true);
+  assert.equal(ownerSignalBody.includes("private scheduleOwnerLeaseHandoffRetry"), true);
+  assert.equal(ownerSignalBody.includes("setTimeout(() =>"), true);
   assert.equal(syncBody.includes("this.logicalRouterSyncInFlight !== undefined"), true);
   assert.equal(syncBody.includes("this.logicalRouterSyncQueued = true;"), true);
   assert.equal(syncBody.includes("if (!tryAcquireLogicalRouterOwnerLease())"), true);
-  assert.equal(syncBody.includes("await this.logicalPortRouter.sync([]).catch(() => undefined);"), true);
+  assert.equal(syncBody.includes("if (this.ownsLogicalRouterLease)"), true);
+  assert.equal(syncBody.includes("this.ownsLogicalRouterLease = false;"), true);
+  assert.equal(syncBody.includes("this.ownsLogicalRouterLease = true;"), true);
   assert.equal(syncBody.includes("await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);"), true);
   assert.equal(source.includes("releaseLogicalRouterOwnerLease();"), true);
   assert.equal(source.includes("BROWSER_NETWORK_PROXY_OWNER_LEASE_MS = 120_000"), true);
   assert.equal(source.includes('function buildBrowserNetworkProxyOwnerControlPath(kind: "owner" | "lock"): string'), true);
   assert.equal(source.includes("function tryAcquireBrowserNetworkProxyOwnerLease(): boolean"), true);
+  assert.equal(source.includes("private ownsBrowserNetworkProxyLease = false;"), true);
+  assert.equal(ownerSignalBody.includes("!this.ownsBrowserNetworkProxyLease"), true);
+  assert.equal(ownerSignalBody.includes("!isActiveBrowserNetworkProxyOwner(readBrowserNetworkProxyOwner(), Date.now())"), true);
+  assert.equal(ownerSignalBody.includes("this.browserNetworkProxy.retryFailedEndpointsNow();"), true);
+  assert.equal(ownerSignalBody.includes("void this.syncBrowserNetworkProxies();"), true);
   assert.equal(browserSyncBody.includes("if (!tryAcquireBrowserNetworkProxyOwnerLease())"), true);
-  assert.equal(browserSyncBody.includes("await this.browserNetworkProxy.sync([]).catch(() => undefined);"), true);
+  assert.equal(browserSyncBody.includes("if (this.ownsBrowserNetworkProxyLease)"), true);
+  assert.equal(browserSyncBody.includes("this.ownsBrowserNetworkProxyLease = false;"), true);
+  assert.equal(browserSyncBody.includes("this.ownsBrowserNetworkProxyLease = true;"), true);
   assert.equal(browserSyncBody.includes("await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);"), true);
   assert.equal(source.includes("BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS = 5_000"), true);
   assert.equal(source.includes("BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS = 1_000"), true);

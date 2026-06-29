@@ -155,6 +155,11 @@ export class BrowserNetworkProxyManager {
     return this.listeners.get(browserNetworkProxyEndpointId(networkId, logicalPort))?.endpoint;
   }
 
+  /** Clears bind retry throttles when an external owner handoff may have freed the socket. */
+  retryFailedEndpointsNow(): void {
+    this.retryAfterById.clear();
+  }
+
   /** Closes one browser proxy endpoint. */
   async close(endpointId: string): Promise<void> {
     const listener = this.listeners.get(endpointId);

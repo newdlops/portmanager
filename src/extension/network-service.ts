@@ -147,6 +147,7 @@ const BROWSER_NETWORK_PROXY_OWNER_LEASE_MS = 120_000;
 const BROWSER_NETWORK_PROXY_OWNER_LOCK_STALE_MS = 30_000;
 const BROWSER_NETWORK_PROXY_OWNER_PATH = buildBrowserNetworkProxyOwnerControlPath("owner");
 const BROWSER_NETWORK_PROXY_OWNER_LOCK_PATH = buildBrowserNetworkProxyOwnerControlPath("lock");
+const OWNER_LEASE_HANDOFF_RETRY_DELAY_MS = 1_000;
 const DAEMON_RESTART_BACKOFF_MS = 30_000;
 const TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500;
 const TERMINAL_ATTACHMENT_REFRESH_DEBOUNCE_MS = 50;
@@ -386,11 +387,26 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Requests one more router reconciliation after the current sync sees an older snapshot. */
   private logicalRouterSyncQueued = false;
 
+  /** True only after this extension host acquired the cross-window logical router owner lease. */
+  private ownsLogicalRouterLease = false;
+
+  /** Delays one retry after owner release so sockets closing in the old window can settle. */
+  private ownerLeaseHandoffRetryTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Whether the delayed owner handoff retry should refresh logical routers. */
+  private ownerLeaseHandoffRetryLogicalQueued = false;
+
+  /** Whether the delayed owner handoff retry should refresh browser proxies. */
+  private ownerLeaseHandoffRetryBrowserQueued = false;
+
   /** Guards browser proxy reconciliation so process snapshot bursts do not overlap. */
   private browserProxySyncInFlight: Promise<void> | undefined;
 
   /** Requests one more browser proxy reconciliation after the current sync completes. */
   private browserProxySyncQueued = false;
+
+  /** True only after this extension host acquired the cross-window browser proxy owner lease. */
+  private ownsBrowserNetworkProxyLease = false;
 
   /** Snapshot object used to build the browser proxy route target index. */
   private browserProxyRouteTargetSnapshot: AgentSnapshot | undefined;
@@ -542,6 +558,7 @@ export class PortManagerNetworkService implements DisposableLike {
       this.sharedNetworkStateStore.watch(() => {
         void this.reloadSharedNetworkState();
       }),
+      this.watchOwnerLeaseFiles(),
       terminalAttachmentMarkerWatcher,
       nativeTerminalAttachmentMarkerWatcher,
       terminalAttachmentMarkerWatcher.onDidCreate(() => {
@@ -592,6 +609,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.refreshTerminals();
     void this.refreshContainerServices({ background: true });
     await this.convergeDaemonAndRoutingState();
+    await this.syncLogicalPortRouters();
     await this.syncBrowserNetworkProxies();
     this.startRoutingSignalRefreshLoop();
     this.startTerminalAttachmentMarkerPolling();
@@ -1949,6 +1967,10 @@ export class PortManagerNetworkService implements DisposableLike {
       clearTimeout(this.terminalAttachmentRefreshTimer);
       this.terminalAttachmentRefreshTimer = undefined;
     }
+    if (this.ownerLeaseHandoffRetryTimer !== undefined) {
+      clearTimeout(this.ownerLeaseHandoffRetryTimer);
+      this.ownerLeaseHandoffRetryTimer = undefined;
+    }
 
     for (const disposable of this.disposables.splice(0)) {
       disposable.dispose();
@@ -1962,6 +1984,8 @@ export class PortManagerNetworkService implements DisposableLike {
     this.logicalPortRouter.dispose();
     releaseLogicalRouterOwnerLease();
     releaseBrowserNetworkProxyOwnerLease();
+    this.ownsLogicalRouterLease = false;
+    this.ownsBrowserNetworkProxyLease = false;
   }
 
   /** Reads persisted logical network state from VS Code global storage. */
@@ -2327,6 +2351,10 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.reconcileComposeAttachmentPublishedPorts({ background: true, force: true }).catch(() => undefined);
     await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
     await this.convergeDaemonAndRoutingState();
+    await Promise.all([
+      this.syncLogicalPortRouters().catch(() => undefined),
+      this.syncBrowserNetworkProxies().catch(() => undefined),
+    ]);
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
   }
 
@@ -2587,6 +2615,103 @@ export class PortManagerNetworkService implements DisposableLike {
         dispose: () => undefined,
       };
     }
+  }
+
+  /**
+   * Watches cross-window owner lease files so surviving windows can take over
+   * immediately when the current owner releases its lease during shutdown.
+   */
+  private watchOwnerLeaseFiles(): DisposableLike {
+    const watchedFilesByDirectory = new Map<string, Set<string>>();
+    for (const ownerPath of [LOGICAL_ROUTER_OWNER_PATH, BROWSER_NETWORK_PROXY_OWNER_PATH]) {
+      const directoryPath = path.dirname(ownerPath);
+      const fileName = path.basename(ownerPath);
+      const fileNames = watchedFilesByDirectory.get(directoryPath) ?? new Set<string>();
+      fileNames.add(fileName);
+      watchedFilesByDirectory.set(directoryPath, fileNames);
+    }
+
+    const watchers: syncFs.FSWatcher[] = [];
+    for (const [directoryPath, watchedFileNames] of watchedFilesByDirectory.entries()) {
+      try {
+        syncFs.mkdirSync(directoryPath, { recursive: true });
+        const watcher = syncFs.watch(directoryPath, { persistent: false }, (_eventType, fileName) => {
+          const changedName = fileName === undefined || fileName === null ? undefined : path.basename(String(fileName));
+          if (changedName !== undefined && !watchedFileNames.has(changedName)) {
+            return;
+          }
+
+          this.refreshOwnerLeaseFromFileSignal(changedName);
+        });
+        watcher.on("error", () => undefined);
+        watchers.push(watcher);
+      } catch {
+        // The background refresh loop still repairs stale ownership if file watching is unavailable.
+      }
+    }
+
+    return {
+      dispose: () => {
+        for (const watcher of watchers) {
+          watcher.close();
+        }
+      },
+    };
+  }
+
+  /** Attempts ownership handoff for lease files touched by another extension host. */
+  private refreshOwnerLeaseFromFileSignal(changedName: string | undefined): void {
+    const shouldRefreshLogical =
+      (changedName === undefined || changedName === path.basename(LOGICAL_ROUTER_OWNER_PATH)) &&
+      !this.ownsLogicalRouterLease &&
+      !isActiveLogicalRouterOwner(readLogicalRouterOwner(), Date.now());
+    const shouldRefreshBrowser =
+      (changedName === undefined || changedName === path.basename(BROWSER_NETWORK_PROXY_OWNER_PATH)) &&
+      !this.ownsBrowserNetworkProxyLease &&
+      !isActiveBrowserNetworkProxyOwner(readBrowserNetworkProxyOwner(), Date.now());
+
+    if (shouldRefreshLogical) {
+      void this.syncLogicalPortRouters();
+    }
+
+    if (shouldRefreshBrowser) {
+      this.browserNetworkProxy.retryFailedEndpointsNow();
+      void this.syncBrowserNetworkProxies();
+    }
+
+    if (shouldRefreshLogical || shouldRefreshBrowser) {
+      this.scheduleOwnerLeaseHandoffRetry(shouldRefreshLogical, shouldRefreshBrowser);
+    }
+  }
+
+  /**
+   * Retries shortly after a handoff signal because the old owner may release
+   * its lease before every async listener close has fully freed the port.
+   */
+  private scheduleOwnerLeaseHandoffRetry(refreshLogical: boolean, refreshBrowser: boolean): void {
+    this.ownerLeaseHandoffRetryLogicalQueued ||= refreshLogical;
+    this.ownerLeaseHandoffRetryBrowserQueued ||= refreshBrowser;
+
+    if (this.ownerLeaseHandoffRetryTimer !== undefined) {
+      return;
+    }
+
+    this.ownerLeaseHandoffRetryTimer = setTimeout(() => {
+      const shouldRefreshLogical = this.ownerLeaseHandoffRetryLogicalQueued;
+      const shouldRefreshBrowser = this.ownerLeaseHandoffRetryBrowserQueued;
+      this.ownerLeaseHandoffRetryTimer = undefined;
+      this.ownerLeaseHandoffRetryLogicalQueued = false;
+      this.ownerLeaseHandoffRetryBrowserQueued = false;
+
+      if (shouldRefreshLogical) {
+        void this.syncLogicalPortRouters();
+      }
+
+      if (shouldRefreshBrowser) {
+        this.browserNetworkProxy.retryFailedEndpointsNow();
+        void this.syncBrowserNetworkProxies();
+      }
+    }, OWNER_LEASE_HANDOFF_RETRY_DELAY_MS);
   }
 
   /** Starts a stat-only fallback poll for terminal hook marker changes. */
@@ -3176,10 +3301,14 @@ export class PortManagerNetworkService implements DisposableLike {
     const logicalPorts = collectLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? []);
 
     if (!tryAcquireLogicalRouterOwnerLease()) {
-      await this.logicalPortRouter.sync([]).catch(() => undefined);
+      if (this.ownsLogicalRouterLease) {
+        this.ownsLogicalRouterLease = false;
+        await this.logicalPortRouter.sync([]).catch(() => undefined);
+      }
       return;
     }
 
+    this.ownsLogicalRouterLease = true;
     await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);
   }
 
@@ -3211,10 +3340,14 @@ export class PortManagerNetworkService implements DisposableLike {
     this.syncBrowserDnsRecordsForNetworks(networks);
 
     if (!tryAcquireBrowserNetworkProxyOwnerLease()) {
-      await this.browserNetworkProxy.sync([]).catch(() => undefined);
+      if (this.ownsBrowserNetworkProxyLease) {
+        this.ownsBrowserNetworkProxyLease = false;
+        await this.browserNetworkProxy.sync([]).catch(() => undefined);
+      }
       return;
     }
 
+    this.ownsBrowserNetworkProxyLease = true;
     const processCommandTextByPid = await this.readBrowserProxyProcessCommandTexts(snapshot?.processes ?? []);
     const endpoints = collectBrowserProxyEndpoints(
       snapshot?.processes ?? [],
@@ -4157,6 +4290,12 @@ export class PortManagerNetworkService implements DisposableLike {
     return scriptPath;
   }
 
+  /** Names helper scripts by their body so multi-window settings cannot overwrite live shell paths. */
+  private buildTerminalHookScriptFileName(kind: "attach" | "detach", scope: string, contents: string): string {
+    const hash = createHash("sha1").update(contents).digest("hex").slice(0, 12);
+    return `${kind}-${sanitizeRouteFileScope(scope)}-${hash}.sh`;
+  }
+
   /**
    * Writes the network picker file consumed by the external `pm` shell function.
    *
@@ -4190,9 +4329,10 @@ export class PortManagerNetworkService implements DisposableLike {
     const settings = readPortManagerSettings();
     const snapshot = this.registry.getSnapshot();
     const rows = snapshot.networks.map((network) => {
+      const scriptBody = this.buildTerminalRoutingScriptBody(network.id, network.name, settings);
       const scriptPath = this.writeTerminalHookScript(
-        `attach-${sanitizeRouteFileScope(network.id)}.sh`,
-        this.buildTerminalRoutingScriptBody(network.id, network.name, settings),
+        this.buildTerminalHookScriptFileName("attach", network.id, scriptBody),
+        scriptBody,
       );
       const serviceSummary = buildTerminalNetworkServiceSummary(network.id, snapshot);
 
@@ -4206,9 +4346,10 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Builds a one-line command that makes later child processes join one logical network scope. */
   private buildTerminalRoutingScript(network: Pick<LogicalNetwork, "id" | "name">, settings: PortManagerSettings): string {
+    const scriptBody = this.buildTerminalRoutingScriptBody(network.id, network.name, settings);
     const scriptPath = this.writeTerminalHookScript(
-      `attach-${sanitizeRouteFileScope(network.id)}.sh`,
-      this.buildTerminalRoutingScriptBody(network.id, network.name, settings),
+      this.buildTerminalHookScriptFileName("attach", network.id, scriptBody),
+      scriptBody,
     );
 
     return `. ${shellQuote(scriptPath)}`;
@@ -4306,7 +4447,11 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Builds a one-line shell command that removes native routing variables from the current shell. */
   private buildTerminalDetachScript(): string {
-    const scriptPath = this.writeTerminalHookScript("detach.sh", this.buildTerminalDetachScriptBody());
+    const scriptBody = this.buildTerminalDetachScriptBody();
+    const scriptPath = this.writeTerminalHookScript(
+      this.buildTerminalHookScriptFileName("detach", "global", scriptBody),
+      scriptBody,
+    );
     return `. ${shellQuote(scriptPath)}`;
   }
 
