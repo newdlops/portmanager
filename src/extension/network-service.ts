@@ -41,7 +41,10 @@ import {
   mergeComposeContainerMappingLineage,
 } from "../platform/network/compose-container-mappings";
 import { ComposePublishMutator } from "../platform/network/compose-publish-mutator";
-import { ContainerServiceDiscoveryAdapter } from "../platform/network/container-service-discovery";
+import {
+  ContainerServiceDiscoveryAdapter,
+  type ContainerServiceDiscoverySession,
+} from "../platform/network/container-service-discovery";
 import { SharedLogicalNetworkStateStore } from "../platform/network/shared-network-state-store";
 import {
   BrowserNetworkProxyManager,
@@ -149,6 +152,7 @@ const TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500;
 const TERMINAL_ATTACHMENT_REFRESH_DEBOUNCE_MS = 50;
 const TERMINAL_ATTACHMENT_REFRESH_BURST_WINDOW_MS = 2_000;
 const TERMINAL_ATTACHMENT_REFRESH_BURST_INTERVAL_MS = 250;
+const FORCED_COMPOSE_RECONCILE_COALESCE_MS = 750;
 const TERMINAL_NETWORK_SERVICE_ENTRY_SEPARATOR = " || ";
 const execFileAsync = promisify(execFile);
 
@@ -179,6 +183,8 @@ interface BackgroundRefreshOptions {
   readonly force?: boolean;
   /** Internal flag used when one outer Docker refresh already owns the shared lock. */
   readonly sharedRefreshAcquired?: boolean;
+  /** Internal flag for marker bursts; keeps the first forced scan immediate but drops rapid repeats. */
+  readonly coalesceForce?: boolean;
 }
 
 interface ComposeProjectRoutingWriteOptions {
@@ -2597,7 +2603,7 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   private async runTerminalAttachmentRefreshBurstStep(): Promise<void> {
-    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
+    await this.reconcileComposeAttachmentPublishedPorts({ force: true, coalesceForce: true }).catch(() => undefined);
     await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
     await this.refreshTerminals().catch(() => []);
     if (Date.now() < this.terminalAttachmentRefreshBurstUntilMs) {
@@ -2652,18 +2658,26 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
+    if (
+      options.coalesceForce === true &&
+      options.force === true &&
+      this.lastComposeAttachmentReconcileAtMs > 0 &&
+      Date.now() - this.lastComposeAttachmentReconcileAtMs < FORCED_COMPOSE_RECONCILE_COALESCE_MS
+    ) {
+      return;
+    }
+
     if (this.composeAttachmentReconcileInFlight !== undefined) {
       return this.composeAttachmentReconcileInFlight;
     }
 
     const releaseSharedRefresh =
-      options.background === true && options.force !== true && options.sharedRefreshAcquired !== true
+      options.background === true && options.sharedRefreshAcquired !== true
         ? tryAcquireSharedBackgroundContainerRefreshSlot()
         : undefined;
 
     if (
       options.background === true &&
-      options.force !== true &&
       options.sharedRefreshAcquired !== true &&
       releaseSharedRefresh === undefined
     ) {
@@ -2697,25 +2711,42 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     const settings = readContainerRuntimeSettings();
+    const discoverySessions = new Map<string, Promise<ContainerServiceDiscoverySession | undefined>>();
+    const getDiscoverySession = (
+      runtimeSettings: ReturnType<typeof readContainerRuntimeSettings>,
+    ): Promise<ContainerServiceDiscoverySession | undefined> => {
+      const key = `${runtimeSettings.containerRuntime}\0${runtimeSettings.containerImage}`;
+      let session = discoverySessions.get(key);
+      if (session === undefined) {
+        session = this.containerServiceDiscovery.createSession(runtimeSettings).catch(() => undefined);
+        discoverySessions.set(key, session);
+      }
+
+      return session;
+    };
+
     for (const attachment of attachments) {
       const shouldRefreshPorts = shouldRefreshComposePublishedPortsFromRuntime(attachment, options);
+      const shouldRefreshMappings = shouldRefreshComposeContainerMappingsFromRuntime(attachment, options);
       const runtimeSettings = containerRuntimeSettingsForAttachment(settings, attachment);
+      const discoverySession = shouldRefreshPorts || shouldRefreshMappings
+        ? await getDiscoverySession(runtimeSettings)
+        : undefined;
       let livePorts: readonly ComposePublishedPort[] | undefined;
       let liveDiscoveryError: string | undefined;
       if (shouldRefreshPorts) {
         try {
-          livePorts = await this.containerServiceDiscovery.listLiveComposePublishedPorts(
-            runtimeSettings,
+          livePorts = discoverySession?.listLiveComposePublishedPorts(
             composeRuntimeProjectName(attachment),
             attachment.composeFiles,
             attachment.ports,
-          );
+          ) ?? [];
         } catch (error) {
           liveDiscoveryError = error instanceof Error ? error.message : String(error);
         }
       }
-      const refreshedMutation = shouldRefreshComposeContainerMappingsFromRuntime(attachment, options)
-        ? await this.refreshComposeContainerMappings(attachment, runtimeSettings)
+      const refreshedMutation = shouldRefreshMappings
+        ? await this.refreshComposeContainerMappings(attachment, discoverySession)
         : attachment.mutation;
       const overrideRestoredAttachment = await this.reconcileComposeOverrideFileForAttachment(
         {
@@ -2865,7 +2896,7 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Refreshes clone container id rewrites without changing attach policy state. */
   private async refreshComposeContainerMappings(
     attachment: ComposeAttachment,
-    settings: ReturnType<typeof readContainerRuntimeSettings>,
+    discoverySession: ContainerServiceDiscoverySession | undefined,
   ): Promise<ComposePortMutationState | undefined> {
     const mutation = attachment.mutation;
     if (
@@ -2877,9 +2908,12 @@ export class PortManagerNetworkService implements DisposableLike {
       return mutation;
     }
 
-    const containerMappings = await this.containerServiceDiscovery
+    if (discoverySession === undefined) {
+      return mutation;
+    }
+
+    const containerMappings = await discoverySession
       .refreshComposeContainerMappings(
-        settings,
         mutation.originalProjectName,
         mutation.attachedProjectName,
         mutation.composeFiles,

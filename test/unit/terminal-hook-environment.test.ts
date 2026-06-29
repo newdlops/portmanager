@@ -503,13 +503,16 @@ test("background routing refresh polls terminals and containers", () => {
 
   assert.equal(source.includes("private startRoutingSignalRefreshLoop(): void"), true);
   assert.equal(source.includes("this.refreshTerminals().catch(() => [])"), true);
-  assert.equal(burstBody.includes("await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);"), true);
+  assert.equal(
+    burstBody.includes("await this.reconcileComposeAttachmentPublishedPorts({ force: true, coalesceForce: true }).catch(() => undefined);"),
+    true,
+  );
   assert.equal(
     burstBody.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);"),
     true,
   );
   assert.equal(
-    burstBody.indexOf("await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);") <
+    burstBody.indexOf("await this.reconcileComposeAttachmentPublishedPorts({ force: true, coalesceForce: true }).catch(() => undefined);") <
       burstBody.indexOf("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);"),
     true,
   );
@@ -521,6 +524,7 @@ test("background routing refresh polls terminals and containers", () => {
   assert.equal(source.includes("this.refreshContainerServices({ background: true }).catch(() => [])"), true);
   assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts({ background: true }).catch(() => undefined);"), false);
   assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts({ background: true, force: true }).catch(() => undefined);"), true);
+  assert.equal(source.includes("FORCED_COMPOSE_RECONCILE_COALESCE_MS = 750"), true);
   assert.equal(source.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);"), true);
   assert.equal(source.includes("await this.convergeDaemonAndRoutingState();"), true);
   assert.equal(source.includes("ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 60_000"), true);
@@ -551,12 +555,15 @@ test("compose reconcile registers only live runtime endpoints", () => {
   const staleRemoveIndex = replaceBody.indexOf("await this.removeComposeRouteProcesses(attachment, attachment.ports, registeredProcessIds);");
 
   assert.equal(reconcileBody.includes("shouldRefreshComposePublishedPortsFromRuntime(attachment, options)"), true);
+  assert.equal(reconcileBody.includes("this.containerServiceDiscovery.createSession(runtimeSettings)"), true);
   assert.equal(reconcileBody.includes(".listLiveComposePublishedPorts("), true);
+  assert.equal(reconcileBody.includes("this.containerServiceDiscovery.listLiveComposePublishedPorts("), false);
   assert.equal(reconcileBody.includes("reconcileComposeOverrideFileForAttachment("), true);
   assert.equal(reconcileBody.includes('if (overrideRestoredAttachment.status === "error")'), true);
   assert.equal(reconcileBody.includes("replaceComposeRouteProcesses(overrideRestoredAttachment, livePorts)"), true);
   assert.equal(reconcileBody.includes("mergeComposePortsWithLiveRoutes("), true);
   assert.equal(reconcileBody.includes("shouldRefreshComposeContainerMappingsFromRuntime(attachment, options)"), true);
+  assert.equal(reconcileBody.includes("refreshComposeContainerMappings(attachment, discoverySession)"), true);
   assert.equal(reconcileBody.includes(": attachment.mutation;"), true);
   assert.equal(publishedPortPolicyBody.includes("return options.force === true || options.background !== true;"), true);
   assert.equal(publishedPortPolicyBody.includes("isContainerStyleComposeAttachment"), false);

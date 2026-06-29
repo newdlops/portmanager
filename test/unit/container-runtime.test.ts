@@ -743,6 +743,87 @@ test("refreshes clone container mappings with inspect names when list rows omit 
   });
 });
 
+test("reuses compose discovery rows within one refresh session", async () => {
+  const cloneConfigFiles =
+    "/workspace/compose.yaml,/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml";
+  const runningRows = [
+    JSON.stringify({
+      ID: "newclone987",
+      Names: "network-workspace-postgres-1",
+      Ports: "127.0.0.1:51612->5432/tcp",
+      Labels:
+        `com.docker.compose.project=network-workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=${cloneConfigFiles},` +
+        "newdlops.portmanager.compose-clone-service=1,newdlops.portmanager.logical-port.5432.tcp=15432",
+    }),
+  ].join("\n");
+  const allRows = [
+    runningRows,
+    JSON.stringify({
+      ID: "original123",
+      Names: "workspace-postgres-1",
+      Ports: "",
+      Labels: "com.docker.compose.project=workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml",
+    }),
+  ].join("\n");
+  const mutableCalls: string[][] = [];
+  const adapter = new ContainerServiceDiscoveryAdapter({
+    runCommand: async (_executable, args) => {
+      mutableCalls.push([...args]);
+      if (args.includes("-a")) {
+        return { stdout: allRows, stderr: "" };
+      }
+
+      return { stdout: runningRows, stderr: "" };
+    },
+  });
+
+  const session = await adapter.createSession({ containerRuntime: "docker", containerImage: "alpine:3.20" });
+  assert.ok(session);
+
+  const livePorts = session.listLiveComposePublishedPorts(
+    "network-workspace",
+    ["/workspace/compose.yaml"],
+    [
+      {
+        serviceName: "db",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 63816,
+        containerPort: 5432,
+        protocol: "tcp",
+        protocolName: "postgresql",
+      },
+    ],
+  );
+  const mappings = await session.refreshComposeContainerMappings(
+    "workspace",
+    "network-workspace",
+    [
+      "/workspace/compose.yaml",
+      "/Users/lky/Library/Application Support/Code/User/globalStorage/newdlops.portmanager/compose-overrides/network-workspace.ports.override.yaml",
+    ],
+    ["db"],
+    [
+      {
+        serviceName: "db",
+        originalContainerId: "original123",
+        originalContainerName: "workspace-postgres-1",
+        attachedContainerId: "oldclone123",
+        attachedContainerName: "network-workspace-postgres-1",
+      },
+    ],
+  );
+
+  assert.deepEqual(mutableCalls, [
+    ["container", "ls", "--format", "{{json .}}"],
+    ["container", "ls", "-a", "--format", "{{json .}}"],
+  ]);
+  assert.equal(livePorts[0]?.actualHostPort, 51612);
+  assert.equal(livePorts[0]?.logicalPort, 15432);
+  assert.equal(mappings[0]?.attachedContainerId, "newclone987");
+  assert.equal(mappings[0]?.attachedContainerName, "network-workspace-postgres-1");
+});
+
 test("mutates compose services with inspect container names when list rows omit names", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-mutator-inspect-names-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
