@@ -1482,16 +1482,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const removedAttachment = this.registry.removeComposeAttachment(attachmentId);
     await this.removeComposeRouteProcesses(attachment, attachment.ports);
-    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
-    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
-    await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
-    await this.ensureDaemonRouteTablesMaterialized({ force: true, networkIds: [attachment.networkId] }).catch(
-      () => undefined,
-    );
-    await this.convergeDaemonAndRoutingState();
-    await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);
-    await this.reapplyRoutingToAttachedTerminalWindows().catch(() => 0);
-    this.localChangeEvents.emit();
+    await this.convergeAfterComposeAttachmentRemoval([attachment.networkId]);
     return removedAttachment;
   }
 
@@ -1537,8 +1528,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const removedAttachment = this.registry.removeComposeAttachment(attachmentId);
     await this.removeComposeRouteProcesses(attachmentToRemove, attachmentToRemove.ports);
-    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
-    await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
+    await this.convergeAfterComposeAttachmentRemoval([attachmentToRemove.networkId]);
     return removedAttachment;
   }
 
@@ -2334,6 +2324,28 @@ export class PortManagerNetworkService implements DisposableLike {
     this.localChangeEvents.emit();
   }
 
+  /**
+   * Rebuilds generated state after a compose attachment has already been
+   * removed from the registry. The removed attachment only contributes its
+   * network id; every file and daemon row is regenerated from the current
+   * registry snapshot so stale yaml/routing entries cannot survive detach.
+   */
+  private async convergeAfterComposeAttachmentRemoval(networkIds: readonly string[]): Promise<void> {
+    const uniqueNetworkIds = [...new Set(networkIds)];
+
+    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
+    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
+    await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
+    await this.ensureDaemonRouteTablesMaterialized({ force: true, networkIds: uniqueNetworkIds }).catch(
+      () => undefined,
+    );
+    await this.convergeDaemonAndRoutingState();
+    await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);
+    await this.reapplyRoutingToAttachedTerminalWindows().catch(() => 0);
+    await this.refreshContainerServices().catch(() => []);
+    this.localChangeEvents.emit();
+  }
+
   /** Ensures an attached hidden Compose project has its generated override before wrappers can route to it. */
   private async restoreComposeAttachmentOverrideBeforeRouting(
     attachment: ComposeAttachment,
@@ -2348,13 +2360,14 @@ export class PortManagerNetworkService implements DisposableLike {
       .getSnapshot()
       .composeAttachments.filter((attachment) => attachment.networkId === networkId && isRestorableComposeAttachment(attachment));
 
-    if (attachments.length === 0) {
-      return;
+    if (attachments.length > 0) {
+      await this.reconcileComposeOverrideFiles(attachments, { force: true });
+      await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
     }
 
-    await this.reconcileComposeOverrideFiles(attachments, { force: true });
-    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
-    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
+    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: attachments.length > 0 }).catch(
+      () => undefined,
+    );
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
     await this.ensureDaemonRouteTablesMaterialized({ force: true, networkIds: [networkId] }).catch(() => undefined);
   }

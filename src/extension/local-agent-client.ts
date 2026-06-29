@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
@@ -170,6 +170,7 @@ export class LocalAgentClient implements PortManagerProcessService {
 
     await this.stopDaemon();
     await this.waitForPreviousDaemonExit(previousPid);
+    await this.terminateSiblingAgentProcesses(new Set([previousPid]));
     await this.ensureConnected();
     await this.loadDaemonStatus();
 
@@ -551,6 +552,7 @@ export class LocalAgentClient implements PortManagerProcessService {
     }
 
     const socketPath = getAgentSocketPath();
+    this.terminateSiblingAgentProcessesSync(new Set());
     removeStaleSocketFile(socketPath);
 
     const nativeAgentPath = this.getNativeAgentPath();
@@ -594,6 +596,43 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Returns the packaged native daemon binary for macOS/Linux builds. */
   private getNativeAgentPath(): string {
     return this.context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
+  }
+
+  /**
+   * Stops detached agent generations that still advertise the singleton socket.
+   * VS Code extension upgrades can leave old native agents alive after the
+   * socket file has moved or been recreated; those stale siblings can continue
+   * rewriting route tables even after the active daemon has restarted.
+   */
+  private async terminateSiblingAgentProcesses(exemptPids: ReadonlySet<number>): Promise<void> {
+    const terminatedPids = this.terminateSiblingAgentProcessesSync(exemptPids);
+
+    if (terminatedPids.length === 0) {
+      return;
+    }
+
+    const deadline = Date.now() + AGENT_RESTART_EXIT_WAIT_MS;
+    while (Date.now() < deadline && terminatedPids.some((pid) => isProcessAlive(pid))) {
+      await delay(100);
+    }
+  }
+
+  /** Best-effort synchronous sibling cleanup used before creating a new socket owner. */
+  private terminateSiblingAgentProcessesSync(exemptPids: ReadonlySet<number>): readonly number[] {
+    const socketPath = getAgentSocketPath();
+    const siblingPids = findSiblingAgentProcessIds(socketPath, exemptPids);
+    const terminatedPids: number[] = [];
+
+    for (const pid of siblingPids) {
+      try {
+        process.kill(pid, "SIGTERM");
+        terminatedPids.push(pid);
+      } catch {
+        // Treat already-exited sibling agents as successfully cleaned up.
+      }
+    }
+
+    return terminatedPids;
   }
 
   /** Wires line-delimited JSON handling for one socket connection. */
@@ -1119,6 +1158,56 @@ function isProcessAlive(pid: number): boolean {
     const code = typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
     return code === "EPERM";
   }
+}
+
+/** Finds detached Port Manager agent processes that still target the singleton socket. */
+function findSiblingAgentProcessIds(socketPath: string, exemptPids: ReadonlySet<number>): readonly number[] {
+  if (process.platform === "win32") {
+    return [];
+  }
+
+  let output: string;
+  try {
+    output = execFileSync("ps", ["-Ao", "pid=,command="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    return [];
+  }
+
+  const siblingPids: number[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s+([\s\S]+)$/.exec(line);
+    if (match === null) {
+      continue;
+    }
+
+    const pid = Number.parseInt(match[1], 10);
+    const command = match[2];
+    if (
+      !Number.isInteger(pid) ||
+      pid <= 0 ||
+      pid === process.pid ||
+      exemptPids.has(pid) ||
+      !isPortManagerAgentCommandForSocket(command, socketPath)
+    ) {
+      continue;
+    }
+
+    siblingPids.push(pid);
+  }
+
+  return siblingPids;
+}
+
+/** Matches only agent daemons, not extension hosts or user commands that merely mention Port Manager. */
+function isPortManagerAgentCommandForSocket(command: string, socketPath: string): boolean {
+  if (!command.includes(socketPath) || !command.includes("--socket")) {
+    return false;
+  }
+
+  return /(?:^|[/\s])portmanager_agent(?:\s|$)/.test(command) || /\bagent-main\.js\b/.test(command);
 }
 
 function removeStaleStartupLock(lockPath: string): void {

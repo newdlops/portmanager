@@ -72,6 +72,8 @@ test("native agent matches loopback listeners by host as well as port", () => {
 
 test("native agent recovers restarted hook routes from process environment", () => {
   const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
+  const header = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.h"), "utf8");
+  const tsAgent = fs.readFileSync(path.join(projectRoot, "src", "agent", "port-manager-agent.ts"), "utf8");
 
   assert.equal(source.includes("pm_recover_untracked_hooked_listeners"), true);
   assert.equal(source.includes("pm_read_process_environment_text"), true);
@@ -81,6 +83,8 @@ test("native agent recovers restarted hook routes from process environment", () 
   assert.equal(source.includes("NEWDLOPS_PM_NETWORK_ID"), true);
   assert.equal(source.includes("requested_port == listener->port"), true);
   assert.equal(source.includes("pm_remove_pending_endpoint(state, process->requested_port, network_id)"), true);
+  assert.equal(header.includes("#define PM_ROUTE_TTL_SECONDS 300"), true);
+  assert.equal(tsAgent.includes("const ROUTE_ALLOCATION_TTL_MS = 300_000;"), true);
 });
 
 if (!fs.existsSync(nativeAgentPath)) {

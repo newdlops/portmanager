@@ -576,7 +576,16 @@ test("background routing refresh converges daemon version and generated route fi
   assert.equal(ensureBody.includes("await this.processService.restartDaemon();"), true);
   assert.equal(agentClientSource.includes("const previousPid = this.snapshot.daemon.pid;"), true);
   assert.equal(agentClientSource.includes("await this.waitForPreviousDaemonExit(previousPid);"), true);
+  assert.equal(agentClientSource.includes("await this.terminateSiblingAgentProcesses(new Set([previousPid]));"), true);
+  assert.equal(agentClientSource.includes("this.terminateSiblingAgentProcessesSync(new Set());"), true);
+  assert.equal(agentClientSource.includes("function findSiblingAgentProcessIds("), true);
+  assert.equal(agentClientSource.includes("function isPortManagerAgentCommandForSocket("), true);
+  assert.equal(agentClientSource.includes('execFileSync("ps", ["-Ao", "pid=,command="]'), true);
+  assert.equal(agentClientSource.includes('!command.includes(socketPath) || !command.includes("--socket")'), true);
+  assert.equal(agentClientSource.includes('/(?:^|[/\\s])portmanager_agent(?:\\s|$)/.test(command)'), true);
+  assert.equal(agentClientSource.includes('/\\bagent-main\\.js\\b/.test(command)'), true);
   assert.equal(agentClientSource.includes('process.kill(pid, "SIGTERM");'), true);
+  assert.equal(agentClientSource.includes('process.kill(pid, "SIGKILL");'), false);
   assert.equal(agentClientSource.includes("function isProcessAlive(pid: number): boolean"), true);
 });
 
@@ -873,6 +882,80 @@ test("compose override yaml is force-refreshed on attach startup and repair", ()
   assert.equal(helperBody.includes("status: \"error\""), true);
   assert.equal(helperBody.includes("await this.removeComposeRouteProcesses(nextAttachment, nextAttachment.ports).catch(() => undefined);"), true);
   assert.equal(helperBody.includes("this.registry.updateComposeAttachment({"), true);
+});
+
+test("compose detach and remove regenerate yaml and routing artifacts from the latest registry", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const detachStart = source.indexOf("async detachComposeAttachment(attachmentId: string)");
+  const detachEnd = source.indexOf("async removeComposeAttachment", detachStart);
+  const detachBody = source.slice(detachStart, detachEnd);
+  const removeStart = source.indexOf("async removeComposeAttachment(attachmentId: string)");
+  const removeEnd = source.indexOf("  /** Returns one compose attachment", removeStart);
+  const removeBody = source.slice(removeStart, removeEnd);
+  const removalConvergeStart = source.indexOf("private async convergeAfterComposeAttachmentRemoval");
+  const removalConvergeEnd = source.indexOf("  /** Ensures an attached hidden Compose project", removalConvergeStart);
+  const removalConvergeBody = source.slice(removalConvergeStart, removalConvergeEnd);
+  const artifactStart = source.indexOf("private async ensureNetworkComposeRoutingArtifacts");
+  const artifactEnd = source.indexOf("private async convergeDaemonAndRoutingState", artifactStart);
+  const artifactBody = source.slice(artifactStart, artifactEnd);
+
+  assert.notEqual(detachStart, -1);
+  assert.notEqual(removeStart, -1);
+  assert.notEqual(removalConvergeStart, -1);
+  assert.notEqual(removalConvergeEnd, -1);
+  assert.notEqual(artifactStart, -1);
+  assert.notEqual(artifactEnd, -1);
+  assert.equal(detachBody.includes("await this.convergeAfterComposeAttachmentRemoval([attachment.networkId]);"), true);
+  assert.equal(
+    removeBody.includes("await this.convergeAfterComposeAttachmentRemoval([attachmentToRemove.networkId]);"),
+    true,
+  );
+  assert.equal(removalConvergeBody.includes("const uniqueNetworkIds = [...new Set(networkIds)];"), true);
+  assert.equal(
+    removalConvergeBody.includes("await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);"),
+    true,
+  );
+  assert.equal(
+    removalConvergeBody.includes(
+      "await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);",
+    ),
+    true,
+  );
+  assert.equal(removalConvergeBody.includes("await this.writeTerminalNetworkSelectionFile().catch(() => undefined);"), true);
+  assert.equal(
+    removalConvergeBody.includes("await this.ensureDaemonRouteTablesMaterialized({ force: true, networkIds: uniqueNetworkIds }).catch("),
+    true,
+  );
+  assert.equal(removalConvergeBody.includes("await this.convergeDaemonAndRoutingState();"), true);
+  assert.equal(
+    removalConvergeBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);"),
+    true,
+  );
+  assert.equal(removalConvergeBody.includes("await this.reapplyRoutingToAttachedTerminalWindows().catch(() => 0);"), true);
+  assert.equal(removalConvergeBody.includes("await this.refreshContainerServices().catch(() => []);"), true);
+  assert.equal(removalConvergeBody.includes("this.localChangeEvents.emit();"), true);
+  assert.equal(artifactBody.includes("if (attachments.length === 0) {\n      return;\n    }"), false);
+  assert.equal(artifactBody.includes("if (attachments.length > 0) {"), true);
+  assert.equal(
+    artifactBody.includes("await this.reconcileComposeOverrideFiles(attachments, { force: true });"),
+    true,
+  );
+  assert.equal(
+    artifactBody.includes("await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);"),
+    true,
+  );
+  assert.equal(
+    artifactBody.includes(
+      "await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: attachments.length > 0 }).catch(",
+    ),
+    true,
+  );
+  assert.equal(artifactBody.includes("await this.writeTerminalNetworkSelectionFile().catch(() => undefined);"), true);
+  assert.equal(
+    artifactBody.includes("await this.ensureDaemonRouteTablesMaterialized({ force: true, networkIds: [networkId] }).catch(() => undefined);"),
+    true,
+  );
 });
 
 test("manual refresh commands reconcile generated network routing state", () => {
