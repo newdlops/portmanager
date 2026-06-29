@@ -383,6 +383,12 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Requests one more browser proxy reconciliation after the current sync completes. */
   private browserProxySyncQueued = false;
 
+  /** Snapshot object used to build the browser proxy route target index. */
+  private browserProxyRouteTargetSnapshot: AgentSnapshot | undefined;
+
+  /** Hot-path index for browser proxy requests; rebuilt when the daemon snapshot object changes. */
+  private browserProxyRouteTargetByEndpointId = new Map<string, BrowserNetworkProxyTarget>();
+
   /** Guards privileged resolver installation so duplicate UI/registry events cannot stack prompts. */
   private browserDnsResolverInstallInFlight: Promise<BrowserDnsResolverStatus> | undefined;
 
@@ -2991,6 +2997,11 @@ export class PortManagerNetworkService implements DisposableLike {
   private async resolveBrowserNetworkProxyTarget(
     endpoint: Pick<BrowserNetworkProxyEndpoint, "networkId" | "logicalPort">,
   ): Promise<BrowserNetworkProxyTarget> {
+    const indexedTarget = this.findBrowserProxyRouteTarget(endpoint.networkId, endpoint.logicalPort);
+    if (indexedTarget !== undefined) {
+      return indexedTarget;
+    }
+
     const route = await this.findNetworkRoute(endpoint.networkId, endpoint.logicalPort);
     if (route === undefined || !isLiveListenRoute(route)) {
       const fallbackTarget = await this.findBrowserProxyFallbackListenerTarget(endpoint.networkId, endpoint.logicalPort);
@@ -3005,6 +3016,21 @@ export class PortManagerNetworkService implements DisposableLike {
       host: route.host,
       port: route.actualPort,
     };
+  }
+
+  /** Resolves the common browser proxy path from the current daemon snapshot without async refresh work. */
+  private findBrowserProxyRouteTarget(networkId: string, logicalPort: number): BrowserNetworkProxyTarget | undefined {
+    const snapshot = this.processService?.getSnapshot();
+    if (snapshot === undefined) {
+      return undefined;
+    }
+
+    if (snapshot !== this.browserProxyRouteTargetSnapshot) {
+      this.browserProxyRouteTargetSnapshot = snapshot;
+      this.browserProxyRouteTargetByEndpointId = buildBrowserProxyRouteTargetIndex(snapshot.routes);
+    }
+
+    return this.browserProxyRouteTargetByEndpointId.get(browserNetworkProxyEndpointId(networkId, logicalPort));
   }
 
   /**
@@ -5670,6 +5696,30 @@ function findMatchingRoute(
       route.logicalPort === logicalPort &&
       isLiveListenRoute(route),
   );
+}
+
+/** Builds a stable first-match index matching findMatchingRoute's route precedence. */
+function buildBrowserProxyRouteTargetIndex(
+  routes: readonly LogicalPortRoute[],
+): Map<string, BrowserNetworkProxyTarget> {
+  const targets = new Map<string, BrowserNetworkProxyTarget>();
+  for (const route of routes) {
+    if (route.networkId === undefined || !isLiveListenRoute(route)) {
+      continue;
+    }
+
+    const endpointId = browserNetworkProxyEndpointId(route.networkId, route.logicalPort);
+    if (targets.has(endpointId)) {
+      continue;
+    }
+
+    targets.set(endpointId, {
+      host: route.host,
+      port: route.actualPort,
+    });
+  }
+
+  return targets;
 }
 
 /**

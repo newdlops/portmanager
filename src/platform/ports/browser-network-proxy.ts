@@ -44,14 +44,31 @@ export interface BrowserNetworkProxyOptions {
 interface BrowserNetworkProxyListener {
   /** Active endpoint including the concrete listen port. */
   readonly endpoint: ActiveBrowserNetworkProxyEndpoint;
+  /** Precomputed host/origin strings reused by every request on this endpoint. */
+  readonly metadata: BrowserNetworkProxyEndpointMetadata;
   /** HTTP/WebSocket server that owns the browser-facing socket. */
   readonly server: http.Server;
+  /** Upstream HTTP connection pool scoped to this browser-facing endpoint. */
+  readonly agent: http.Agent;
   /** Client and upstream sockets closed together during reconciliation. */
   readonly sockets: Set<net.Socket>;
 }
 
+interface BrowserNetworkProxyEndpointMetadata {
+  /** Browser-facing origin used in response rewrites. */
+  readonly publicOrigin: string;
+  /** Localhost origin presented to development servers. */
+  readonly upstreamOrigin: string;
+  /** Host header value sent to development servers. */
+  readonly upstreamHostHeader: string;
+  /** Localhost variants that may appear in redirect/CORS headers. */
+  readonly upstreamOrigins: readonly string[];
+}
+
 const DEFAULT_RETRY_DELAY_MS = 30_000;
 const LOCALHOST_UPSTREAM_HOST = "localhost";
+const UPSTREAM_KEEP_ALIVE_MAX_SOCKETS = 64;
+const UPSTREAM_KEEP_ALIVE_MAX_FREE_SOCKETS = 16;
 
 /**
  * Development-only browser isolation proxy.
@@ -145,6 +162,7 @@ export class BrowserNetworkProxyManager {
       socket.destroy();
     }
     listener.sockets.clear();
+    listener.agent.destroy();
 
     await closeServer(listener.server);
   }
@@ -165,9 +183,15 @@ export class BrowserNetworkProxyManager {
         ...endpoint,
         listenPort,
       };
+      const metadata = buildEndpointMetadata(activeEndpoint);
+      const agent = new http.Agent({
+        keepAlive: true,
+        maxSockets: UPSTREAM_KEEP_ALIVE_MAX_SOCKETS,
+        maxFreeSockets: UPSTREAM_KEEP_ALIVE_MAX_FREE_SOCKETS,
+      });
       const sockets = new Set<net.Socket>();
       const server = http.createServer((request, response) => {
-        void this.forwardHttp(activeEndpoint, request, response, sockets);
+        void this.forwardHttp(activeEndpoint, metadata, agent, request, response);
       });
 
       server.on("connection", (socket) => {
@@ -175,14 +199,15 @@ export class BrowserNetworkProxyManager {
         socket.once("close", () => sockets.delete(socket));
       });
       server.on("upgrade", (request, socket, head) => {
-        void this.forwardUpgrade(activeEndpoint, request, socket as net.Socket, head, sockets);
+        void this.forwardUpgrade(activeEndpoint, metadata, request, socket as net.Socket, head, sockets);
       });
 
       try {
         await listen(server, listenPort, endpoint.listenHost);
-        this.listeners.set(endpoint.id, { endpoint: activeEndpoint, server, sockets });
+        this.listeners.set(endpoint.id, { endpoint: activeEndpoint, metadata, server, agent, sockets });
         return activeEndpoint;
       } catch (error) {
+        agent.destroy();
         await closeServer(server).catch(() => undefined);
         errors.push(error instanceof Error ? error : new Error(String(error)));
       }
@@ -194,9 +219,10 @@ export class BrowserNetworkProxyManager {
   /** Proxies one HTTP request while presenting localhost metadata upstream. */
   private async forwardHttp(
     endpoint: ActiveBrowserNetworkProxyEndpoint,
+    metadata: BrowserNetworkProxyEndpointMetadata,
+    agent: http.Agent,
     request: http.IncomingMessage,
     response: http.ServerResponse,
-    sockets: Set<net.Socket>,
   ): Promise<void> {
     let target: BrowserNetworkProxyTarget;
 
@@ -211,24 +237,21 @@ export class BrowserNetworkProxyManager {
       {
         host: normalizeTargetHost(target.host),
         port: target.port,
+        agent,
         method: request.method,
         path: request.url ?? "/",
-        headers: rewriteRequestHeaders(request.headers, endpoint),
+        headers: rewriteRequestHeaders(request.headers, metadata),
       },
       (upstreamResponse) => {
         response.writeHead(
           upstreamResponse.statusCode ?? 502,
           upstreamResponse.statusMessage,
-          rewriteResponseHeaders(upstreamResponse.headers, endpoint),
+          rewriteResponseHeaders(upstreamResponse.headers, metadata),
         );
         upstreamResponse.pipe(response);
       },
     );
 
-    upstreamRequest.once("socket", (upstreamSocket) => {
-      sockets.add(upstreamSocket);
-      upstreamSocket.once("close", () => sockets.delete(upstreamSocket));
-    });
     upstreamRequest.once("error", () => writeGatewayError(response));
     request.pipe(upstreamRequest);
   }
@@ -236,6 +259,7 @@ export class BrowserNetworkProxyManager {
   /** Proxies a WebSocket upgrade after rewriting the handshake headers. */
   private async forwardUpgrade(
     endpoint: ActiveBrowserNetworkProxyEndpoint,
+    metadata: BrowserNetworkProxyEndpointMetadata,
     request: http.IncomingMessage,
     socket: net.Socket,
     head: Buffer,
@@ -266,7 +290,7 @@ export class BrowserNetworkProxyManager {
     upstream.once("error", destroyBoth);
     socket.once("close", () => upstream.destroy());
     upstream.once("connect", () => {
-      upstream.write(buildUpgradeRequest(request, endpoint));
+      upstream.write(buildUpgradeRequest(request, metadata));
       if (head.length > 0) {
         upstream.write(head);
       }
@@ -294,7 +318,7 @@ export function browserNetworkProxyFallbackPort(logicalPort: number): number {
 }
 
 export function formatBrowserNetworkProxyUrl(endpoint: ActiveBrowserNetworkProxyEndpoint): string {
-  return `${publicOrigin(endpoint)}/`;
+  return `${buildEndpointMetadata(endpoint).publicOrigin}/`;
 }
 
 function normalizeEndpoint(endpoint: BrowserNetworkProxyEndpoint): BrowserNetworkProxyEndpoint {
@@ -323,17 +347,14 @@ function isEndpointCurrent(
   );
 }
 
-function rewriteRequestHeaders(
-  headers: http.IncomingHttpHeaders,
-  endpoint: ActiveBrowserNetworkProxyEndpoint,
-): http.OutgoingHttpHeaders {
+function rewriteRequestHeaders(headers: http.IncomingHttpHeaders, metadata: BrowserNetworkProxyEndpointMetadata): http.OutgoingHttpHeaders {
   const nextHeaders: http.OutgoingHttpHeaders = {
     ...headers,
-    host: `${LOCALHOST_UPSTREAM_HOST}:${endpoint.logicalPort}`,
+    host: metadata.upstreamHostHeader,
   };
 
-  const origin = rewriteHeaderOrigin(headers.origin, publicOrigin(endpoint), upstreamOrigin(endpoint));
-  const referer = rewriteHeaderOrigin(headers.referer, publicOrigin(endpoint), upstreamOrigin(endpoint));
+  const origin = rewriteHeaderOrigin(headers.origin, metadata.publicOrigin, metadata.upstreamOrigin);
+  const referer = rewriteHeaderOrigin(headers.referer, metadata.publicOrigin, metadata.upstreamOrigin);
   if (origin !== undefined) {
     nextHeaders.origin = origin;
   }
@@ -344,10 +365,7 @@ function rewriteRequestHeaders(
   return nextHeaders;
 }
 
-function rewriteResponseHeaders(
-  headers: http.IncomingHttpHeaders,
-  endpoint: ActiveBrowserNetworkProxyEndpoint,
-): http.OutgoingHttpHeaders {
+function rewriteResponseHeaders(headers: http.IncomingHttpHeaders, metadata: BrowserNetworkProxyEndpointMetadata): http.OutgoingHttpHeaders {
   const nextHeaders: http.OutgoingHttpHeaders = {};
 
   for (const [name, value] of Object.entries(headers)) {
@@ -360,7 +378,7 @@ function rewriteResponseHeaders(
       continue;
     }
 
-    nextHeaders[name] = rewriteResponseHeaderValue(value, endpoint);
+    nextHeaders[name] = rewriteResponseHeaderValue(value, metadata);
   }
 
   return nextHeaders;
@@ -368,22 +386,26 @@ function rewriteResponseHeaders(
 
 function rewriteResponseHeaderValue(
   value: string | string[],
-  endpoint: ActiveBrowserNetworkProxyEndpoint,
+  metadata: BrowserNetworkProxyEndpointMetadata,
 ): string | string[] {
   if (Array.isArray(value)) {
-    return value.map((item) => rewriteResponseHeaderString(item, endpoint));
+    return value.map((item) => rewriteResponseHeaderString(item, metadata));
   }
 
-  return rewriteResponseHeaderString(value, endpoint);
+  return rewriteResponseHeaderString(value, metadata);
 }
 
-function rewriteResponseHeaderString(value: string, endpoint: ActiveBrowserNetworkProxyEndpoint): string {
-  const publicValue = publicOrigin(endpoint);
+function rewriteResponseHeaderString(value: string, metadata: BrowserNetworkProxyEndpointMetadata): string {
+  if (!metadata.upstreamOrigins.some((origin) => value.includes(origin))) {
+    return value;
+  }
 
-  return value
-    .replaceAll(upstreamOrigin(endpoint), publicValue)
-    .replaceAll(`http://127.0.0.1:${endpoint.logicalPort}`, publicValue)
-    .replaceAll(`http://[::1]:${endpoint.logicalPort}`, publicValue);
+  let rewritten = value;
+  for (const origin of metadata.upstreamOrigins) {
+    rewritten = rewritten.replaceAll(origin, metadata.publicOrigin);
+  }
+
+  return rewritten;
 }
 
 function rewriteSetCookieHeader(value: string | string[]): string | string[] {
@@ -413,12 +435,9 @@ function rewriteHeaderOrigin(
   return value.replaceAll(fromOrigin, toOrigin);
 }
 
-function buildUpgradeRequest(
-  request: http.IncomingMessage,
-  endpoint: ActiveBrowserNetworkProxyEndpoint,
-): string {
+function buildUpgradeRequest(request: http.IncomingMessage, metadata: BrowserNetworkProxyEndpointMetadata): string {
   const lines = [`${request.method ?? "GET"} ${request.url ?? "/"} HTTP/${request.httpVersion}`];
-  const headers = rewriteRequestHeaders(request.headers, endpoint);
+  const headers = rewriteRequestHeaders(request.headers, metadata);
 
   for (const [name, value] of Object.entries(headers)) {
     appendHeaderLines(lines, name, value);
@@ -442,12 +461,21 @@ function appendHeaderLines(lines: string[], name: string, value: number | string
   lines.push(`${name}: ${value}`);
 }
 
-function publicOrigin(endpoint: ActiveBrowserNetworkProxyEndpoint): string {
-  return `http://${formatHostForUrl(endpoint.publicHost ?? endpoint.listenHost)}:${endpoint.listenPort}`;
-}
+function buildEndpointMetadata(endpoint: ActiveBrowserNetworkProxyEndpoint): BrowserNetworkProxyEndpointMetadata {
+  const publicOrigin = `http://${formatHostForUrl(endpoint.publicHost ?? endpoint.listenHost)}:${endpoint.listenPort}`;
+  const upstreamHostHeader = `${LOCALHOST_UPSTREAM_HOST}:${endpoint.logicalPort}`;
+  const upstreamOrigin = `http://${upstreamHostHeader}`;
 
-function upstreamOrigin(endpoint: ActiveBrowserNetworkProxyEndpoint): string {
-  return `http://${LOCALHOST_UPSTREAM_HOST}:${endpoint.logicalPort}`;
+  return {
+    publicOrigin,
+    upstreamOrigin,
+    upstreamHostHeader,
+    upstreamOrigins: [
+      upstreamOrigin,
+      `http://127.0.0.1:${endpoint.logicalPort}`,
+      `http://[::1]:${endpoint.logicalPort}`,
+    ],
+  };
 }
 
 function normalizeTargetHost(host: string): string {

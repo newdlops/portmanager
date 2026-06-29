@@ -579,6 +579,31 @@ test("compose reconcile registers only live runtime endpoints", () => {
   assert.equal(source.includes("private async restorePersistedComposeRoutes("), false);
 });
 
+test("browser proxy target resolution uses a snapshot route index before refresh fallback", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const resolveStart = source.indexOf("private async resolveBrowserNetworkProxyTarget");
+  const resolveEnd = source.indexOf("  /** Resolves the common browser proxy path", resolveStart);
+  const resolveBody = source.slice(resolveStart, resolveEnd);
+  const indexStart = source.indexOf("private findBrowserProxyRouteTarget");
+  const indexEnd = source.indexOf("  /**\n   * Package managers sometimes launch dev servers", indexStart);
+  const indexBody = source.slice(indexStart, indexEnd);
+
+  assert.notEqual(resolveStart, -1);
+  assert.notEqual(indexStart, -1);
+  assert.equal(source.includes("private browserProxyRouteTargetSnapshot: AgentSnapshot | undefined;"), true);
+  assert.equal(source.includes("private browserProxyRouteTargetByEndpointId = new Map<string, BrowserNetworkProxyTarget>();"), true);
+  assert.equal(
+    resolveBody.indexOf("const indexedTarget = this.findBrowserProxyRouteTarget(endpoint.networkId, endpoint.logicalPort);") <
+      resolveBody.indexOf("const route = await this.findNetworkRoute(endpoint.networkId, endpoint.logicalPort);"),
+    true,
+  );
+  assert.equal(resolveBody.includes("await this.findBrowserProxyFallbackListenerTarget(endpoint.networkId, endpoint.logicalPort)"), true);
+  assert.equal(indexBody.includes("snapshot !== this.browserProxyRouteTargetSnapshot"), true);
+  assert.equal(indexBody.includes("buildBrowserProxyRouteTargetIndex(snapshot.routes)"), true);
+  assert.equal(source.includes("function buildBrowserProxyRouteTargetIndex("), true);
+});
+
 test("terminal daemon ensure serializes agent startup and preserves slow live sockets", () => {
   const networkServicePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const commandsPath = path.resolve(__dirname, "../../../src/extension/commands.ts");

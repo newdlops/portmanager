@@ -103,6 +103,96 @@ test("uses a fallback browser port when the logical port is already occupied", a
   }
 });
 
+test("reuses upstream HTTP connections for repeated browser proxy requests", async () => {
+  let upstreamConnectionCount = 0;
+  const upstream = http.createServer((request, response) => {
+    response.end(`target:${request.url ?? "/"}`);
+  });
+  upstream.on("connection", () => {
+    upstreamConnectionCount += 1;
+  });
+  await listen(upstream, 0, "127.0.0.1");
+
+  const proxyPort = await getAvailablePort();
+  const proxy = new BrowserNetworkProxyManager({
+    resolve: () => ({
+      host: "127.0.0.1",
+      port: getServerPort(upstream),
+    }),
+  });
+
+  try {
+    const activeEndpoint = await proxy.ensure(createEndpoint({ listenPorts: [proxyPort] }));
+    assert.ok(activeEndpoint);
+
+    const first = await requestHttp({
+      host: "127.0.0.1",
+      port: activeEndpoint.listenPort,
+      path: "/first",
+      headers: { connection: "keep-alive" },
+    });
+    const second = await requestHttp({
+      host: "127.0.0.1",
+      port: activeEndpoint.listenPort,
+      path: "/second",
+      headers: { connection: "keep-alive" },
+    });
+
+    assert.equal(first.body, "target:/first");
+    assert.equal(second.body, "target:/second");
+    assert.equal(upstreamConnectionCount, 1);
+  } finally {
+    await proxy.dispose();
+    await closeServer(upstream);
+  }
+});
+
+test("routes browser proxy requests to updated upstream targets with keep-alive enabled", async () => {
+  const firstUpstream = http.createServer((_request, response) => {
+    response.end("first-target");
+  });
+  const secondUpstream = http.createServer((_request, response) => {
+    response.end("second-target");
+  });
+  await listen(firstUpstream, 0, "127.0.0.1");
+  await listen(secondUpstream, 0, "127.0.0.1");
+
+  let targetPort = getServerPort(firstUpstream);
+  const proxyPort = await getAvailablePort();
+  const proxy = new BrowserNetworkProxyManager({
+    resolve: () => ({
+      host: "127.0.0.1",
+      port: targetPort,
+    }),
+  });
+
+  try {
+    const activeEndpoint = await proxy.ensure(createEndpoint({ listenPorts: [proxyPort] }));
+    assert.ok(activeEndpoint);
+
+    const first = await requestHttp({
+      host: "127.0.0.1",
+      port: activeEndpoint.listenPort,
+      path: "/",
+      headers: { connection: "keep-alive" },
+    });
+    targetPort = getServerPort(secondUpstream);
+    const second = await requestHttp({
+      host: "127.0.0.1",
+      port: activeEndpoint.listenPort,
+      path: "/",
+      headers: { connection: "keep-alive" },
+    });
+
+    assert.equal(first.body, "first-target");
+    assert.equal(second.body, "second-target");
+  } finally {
+    await proxy.dispose();
+    await closeServer(firstUpstream);
+    await closeServer(secondUpstream);
+  }
+});
+
 test("refreshes active browser proxy metadata when the DNS alias changes", async () => {
   const upstreamRequests: http.IncomingHttpHeaders[] = [];
   const upstream = http.createServer((request, response) => {
