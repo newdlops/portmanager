@@ -227,22 +227,84 @@ static int pm_envp_value_is(char *const envp[], const char *name, const char *ex
   return value != NULL && strcmp(value, expected) == 0;
 }
 
-static int pm_colon_list_contains(const char *list, const char *entry) {
-  size_t entry_length;
+static int pm_preload_value_is_normalized(const char *value, const char *hook_path) {
+  size_t hook_length;
   const char *cursor;
+  int segment_index = 0;
+  int saw_hook = 0;
 
-  if (list == NULL || entry == NULL || entry[0] == '\0') {
+  if (value == NULL || value[0] == '\0' || hook_path == NULL || hook_path[0] == '\0') {
     return 0;
   }
 
-  entry_length = strlen(entry);
-  cursor = list;
+  hook_length = strlen(hook_path);
+  cursor = value;
   while (*cursor != '\0') {
     const char *end = strchr(cursor, ':');
     size_t segment_length = end == NULL ? strlen(cursor) : (size_t)(end - cursor);
+    int is_hook = segment_length == hook_length && strncmp(cursor, hook_path, segment_length) == 0;
 
-    if (segment_length == entry_length && strncmp(cursor, entry, segment_length) == 0) {
-      return 1;
+    if (segment_length == 0) {
+      return 0;
+    }
+
+    if (is_hook) {
+      if (segment_index != 0 || saw_hook) {
+        return 0;
+      }
+      saw_hook = 1;
+    } else if (segment_index == 0) {
+      return 0;
+    }
+
+    if (end == NULL) {
+      break;
+    }
+    if (end[1] == '\0') {
+      return 0;
+    }
+
+    cursor = end + 1;
+    segment_index++;
+  }
+
+  return saw_hook;
+}
+
+static char *pm_make_preload_assignment(const char *hook_path, const char *current_value) {
+  char *assignment;
+  size_t size;
+  size_t offset;
+  size_t hook_length;
+  const char *cursor;
+
+  if (hook_path == NULL || hook_path[0] == '\0') {
+    return NULL;
+  }
+
+  hook_length = strlen(hook_path);
+  size = strlen(PM_PRELOAD_ENV) + hook_length + (current_value == NULL ? 0 : strlen(current_value)) + 3;
+  assignment = malloc(size);
+  if (assignment == NULL) {
+    return NULL;
+  }
+
+  offset = (size_t)snprintf(assignment, size, "%s=%s", PM_PRELOAD_ENV, hook_path);
+  if (current_value == NULL || current_value[0] == '\0') {
+    return assignment;
+  }
+
+  cursor = current_value;
+  while (*cursor != '\0') {
+    const char *end = strchr(cursor, ':');
+    size_t segment_length = end == NULL ? strlen(cursor) : (size_t)(end - cursor);
+    int is_hook = segment_length == hook_length && strncmp(cursor, hook_path, segment_length) == 0;
+
+    if (segment_length > 0 && !is_hook) {
+      assignment[offset++] = ':';
+      memcpy(assignment + offset, cursor, segment_length);
+      offset += segment_length;
+      assignment[offset] = '\0';
     }
 
     if (end == NULL) {
@@ -252,35 +314,6 @@ static int pm_colon_list_contains(const char *list, const char *entry) {
     cursor = end + 1;
   }
 
-  return 0;
-}
-
-static char *pm_make_preload_assignment(const char *hook_path, const char *current_value) {
-  char *assignment;
-  size_t size;
-
-  if (hook_path == NULL || hook_path[0] == '\0') {
-    return NULL;
-  }
-
-  if (current_value == NULL || current_value[0] == '\0') {
-    size = strlen(PM_PRELOAD_ENV) + strlen(hook_path) + 2;
-    assignment = malloc(size);
-    if (assignment == NULL) {
-      return NULL;
-    }
-
-    snprintf(assignment, size, "%s=%s", PM_PRELOAD_ENV, hook_path);
-    return assignment;
-  }
-
-  size = strlen(PM_PRELOAD_ENV) + strlen(hook_path) + strlen(current_value) + 3;
-  assignment = malloc(size);
-  if (assignment == NULL) {
-    return NULL;
-  }
-
-  snprintf(assignment, size, "%s=%s:%s", PM_PRELOAD_ENV, hook_path, current_value);
   return assignment;
 }
 
@@ -310,7 +343,7 @@ static pm_child_environment pm_prepare_child_environment(char *const envp[]) {
 
   hook_path = pm_envp_value(envp, PM_PRELOAD_HINT_ENV);
   current_preload = pm_envp_value(envp, PM_PRELOAD_ENV);
-  if (hook_path == NULL || hook_path[0] == '\0' || pm_colon_list_contains(current_preload, hook_path)) {
+  if (hook_path == NULL || hook_path[0] == '\0' || pm_preload_value_is_normalized(current_preload, hook_path)) {
     return prepared;
   }
 
@@ -1239,7 +1272,30 @@ static int pm_has_current_network_scope(void) {
   return network_id != NULL && network_id[0] != '\0';
 }
 
+static void pm_normalize_process_preload_env(void) {
+  const char *hook_path = getenv(PM_PRELOAD_HINT_ENV);
+  const char *current_preload = getenv(PM_PRELOAD_ENV);
+  char *assignment;
+  char *value;
+
+  if (hook_path == NULL || hook_path[0] == '\0' || pm_preload_value_is_normalized(current_preload, hook_path)) {
+    return;
+  }
+
+  assignment = pm_make_preload_assignment(hook_path, current_preload);
+  if (assignment == NULL) {
+    return;
+  }
+
+  value = strchr(assignment, '=');
+  if (value != NULL) {
+    setenv(PM_PRELOAD_ENV, value + 1, 1);
+  }
+  free(assignment);
+}
+
 __attribute__((constructor)) static void pm_hook_loaded(void) {
+  pm_normalize_process_preload_env();
   pm_debug("loaded");
 }
 

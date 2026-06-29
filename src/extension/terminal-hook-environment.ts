@@ -148,6 +148,7 @@ export function applyTerminalHookEnvironment(
     dockerShimPath: runtimeCommandShimPath,
   });
   const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
+  const preloadHintVariable = process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD";
 
   collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
@@ -182,11 +183,15 @@ export function applyTerminalHookEnvironment(
   collection.replace("PORT_MANAGER_COMPOSE_LOGICAL_PORTS", composeLogicalPorts, TERMINAL_MUTATOR_OPTIONS);
   applyRoutingSettings(collection, settings);
   applyLoopbackRoutingHosts(collection, scope.networkId, settings);
-  collection.prepend(preloadVariable, `${hookLibraryPath}${path.delimiter}`, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace(
+    preloadVariable,
+    prependUniquePathListEntry(hookLibraryPath, process.env[preloadVariable]),
+    TERMINAL_MUTATOR_OPTIONS,
+  );
+  collection.replace(preloadHintVariable, hookLibraryPath, TERMINAL_MUTATOR_OPTIONS);
   applyRuntimeShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath, runtimeCommandShimPath);
 
   if (shellEnvRestorePath !== undefined) {
-    collection.replace("PORT_MANAGER_DYLD_INSERT_LIBRARIES", hookLibraryPath, TERMINAL_MUTATOR_OPTIONS);
     collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_MUTATOR_OPTIONS);
   }
 }
@@ -238,6 +243,20 @@ function applyRoutingSettings(
 /** True when the current terminal platform can do pre-bind hook routing. */
 export function shouldInjectTerminalHook(settings: PortManagerSettings): boolean {
   return settings.enabled && isNativeTerminalHookSupported();
+}
+
+/**
+ * VS Code can merge terminal env mutators from more than one live extension
+ * host. Static preload entries therefore use replace with a normalized list
+ * instead of prepend, otherwise opening N windows can put the same native hook
+ * path into DYLD_INSERT_LIBRARIES/LD_PRELOAD N times.
+ */
+function prependUniquePathListEntry(entry: string, currentValue: string | undefined): string {
+  const existingEntries = (currentValue ?? "")
+    .split(path.delimiter)
+    .filter((value) => value.length > 0 && value !== entry);
+
+  return [entry, ...existingEntries].join(path.delimiter);
 }
 
 /**
@@ -658,10 +677,7 @@ __pm_target="$(__pm_find_next_command)" || {
 export PORT_MANAGER_PRELOAD_REPAIR=1
 
 if [ -n "\${PORT_MANAGER_DYLD_INSERT_LIBRARIES:-}" ]; then
-  case ":\${DYLD_INSERT_LIBRARIES:-}:" in
-    *:"\${PORT_MANAGER_DYLD_INSERT_LIBRARIES}":*) ;;
-    *) export DYLD_INSERT_LIBRARIES="\${PORT_MANAGER_DYLD_INSERT_LIBRARIES}\${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}" ;;
-  esac
+${buildShellPrependVariablePathListEntry("DYLD_INSERT_LIBRARIES", "PORT_MANAGER_DYLD_INSERT_LIBRARIES")}
 fi
 
 ${buildPreloadNodeEntrypointBypassShell()}
@@ -800,10 +816,7 @@ __pm_script_text="$(__pm_package_script_text "\${__pm_script_name}" 2>/dev/null 
 if __pm_package_manager_command_runs_project_code "$@" || __pm_text_looks_like_dev_server "$*" "\${npm_lifecycle_script:-}" "\${__pm_script_text}"; then
   export PORT_MANAGER_PRELOAD_REPAIR=1
   if [ -n "\${PORT_MANAGER_DYLD_INSERT_LIBRARIES:-}" ]; then
-    case ":\${DYLD_INSERT_LIBRARIES:-}:" in
-      *:"\${PORT_MANAGER_DYLD_INSERT_LIBRARIES}":*) ;;
-      *) export DYLD_INSERT_LIBRARIES="\${PORT_MANAGER_DYLD_INSERT_LIBRARIES}\${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}" ;;
-    esac
+${buildShellPrependVariablePathListEntry("DYLD_INSERT_LIBRARIES", "PORT_MANAGER_DYLD_INSERT_LIBRARIES")}
   fi
   ${buildPreloadNodeEntrypointBypassShell()}
 else
@@ -957,10 +970,7 @@ if [ -z "\${PORT_MANAGER_HOST_ACCESS_FILE:-}" ]; then
 fi
 
 if [ "\${PORT_MANAGER_HOOK_DISABLED:-}" != "1" ] && [ "\${PORT_MANAGER_HOOK:-1}" != "0" ] && [ "\${PORT_MANAGER_PRELOAD_REPAIR:-}" = "1" ] && [ -n "\${PORT_MANAGER_DYLD_INSERT_LIBRARIES:-}" ]; then
-  case ":\${DYLD_INSERT_LIBRARIES:-}:" in
-    *:"\${PORT_MANAGER_DYLD_INSERT_LIBRARIES}":*) ;;
-    *) export DYLD_INSERT_LIBRARIES="\${PORT_MANAGER_DYLD_INSERT_LIBRARIES}\${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}" ;;
-  esac
+${buildShellPrependVariablePathListEntry("DYLD_INSERT_LIBRARIES", "PORT_MANAGER_DYLD_INSERT_LIBRARIES")}
 fi
 
 if [ -n "\${PORT_MANAGER_RUNTIME_SHIM_DIR:-}" ]; then
@@ -991,6 +1001,27 @@ fi
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function buildShellPrependVariablePathListEntry(targetVariableName: string, entryVariableName: string): string {
+  return [
+    '  __pm_path_rest=""',
+    '  __pm_old_ifs="${IFS}"',
+    "  IFS=:",
+    `  for __pm_path_entry in \${${targetVariableName}:-}; do`,
+    `    if [ -z "$__pm_path_entry" ] || [ "$__pm_path_entry" = "$${entryVariableName}" ]; then`,
+    "      continue",
+    "    fi",
+    '    if [ -z "$__pm_path_rest" ]; then',
+    '      __pm_path_rest="$__pm_path_entry"',
+    "    else",
+    '      __pm_path_rest="$__pm_path_rest:$__pm_path_entry"',
+    "    fi",
+    "  done",
+    '  IFS="${__pm_old_ifs}"',
+    `  export ${targetVariableName}="$${entryVariableName}\${__pm_path_rest:+:$__pm_path_rest}"`,
+    "  unset __pm_path_entry __pm_path_rest __pm_old_ifs",
+  ].join("\n");
 }
 
 function serializeTcpPortList(ports: readonly number[] | undefined): string {

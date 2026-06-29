@@ -137,6 +137,8 @@ interface AgentClientConnection {
   readonly socket: Socket;
   /** Per-client decoder because frames can be split differently per socket. */
   readonly buffer: NdjsonMessageBuffer;
+  /** True only for long-lived VS Code extension clients that can accept events. */
+  wantsEvents: boolean;
 }
 
 interface PendingRouteAllocation {
@@ -936,6 +938,7 @@ export class PortManagerAgent implements DisposableLike {
     const client: AgentClientConnection = {
       socket,
       buffer: new NdjsonMessageBuffer(),
+      wantsEvents: false,
     };
     this.clients.add(client);
 
@@ -978,6 +981,16 @@ export class PortManagerAgent implements DisposableLike {
     if (!isAgentRequestMessage(message)) {
       client.socket.destroy(new Error("Invalid Port Manager agent request message."));
       return;
+    }
+
+    if (!client.wantsEvents && agentRequestIdWantsEvents(message.id)) {
+      client.wantsEvents = true;
+      /*
+       * Opening several VS Code windows should create one daemon-owned snapshot
+       * fan-out, not one refresh request per window. Hook clients never use the
+       * extension-* id prefix, so they continue to receive only responses.
+       */
+      this.queueSnapshotBroadcast();
     }
 
     void this.dispatchRequest(message)
@@ -1049,6 +1062,9 @@ export class PortManagerAgent implements DisposableLike {
         this.clients.delete(client);
         continue;
       }
+      if (!client.wantsEvents) {
+        continue;
+      }
 
       client.socket.write(message);
     }
@@ -1058,7 +1074,7 @@ export class PortManagerAgent implements DisposableLike {
   private broadcastSnapshotIfChanged(snapshot: AgentSnapshot): void {
     const nextSignature = buildSnapshotSignature(snapshot);
 
-    if (this.clients.size > 0 && nextSignature !== this.lastSnapshotSignature) {
+    if (this.hasEventClients() && nextSignature !== this.lastSnapshotSignature) {
       this.broadcastSnapshot(snapshot);
       return;
     }
@@ -1072,7 +1088,7 @@ export class PortManagerAgent implements DisposableLike {
    * a specific failed background scan.
    */
   private queueSnapshotBroadcast(): void {
-    if (this.clients.size === 0) {
+    if (!this.hasEventClients()) {
       this.snapshotBroadcastPending = false;
       return;
     }
@@ -1095,8 +1111,8 @@ export class PortManagerAgent implements DisposableLike {
    * pass so late state is not hidden behind the coalesced broadcast.
    */
   private async flushQueuedSnapshotBroadcast(): Promise<void> {
-    if (this.clients.size === 0 || this.snapshotBroadcastInFlight) {
-      if (this.clients.size === 0) {
+    if (!this.hasEventClients() || this.snapshotBroadcastInFlight) {
+      if (!this.hasEventClients()) {
         this.snapshotBroadcastPending = false;
       }
       return;
@@ -1114,9 +1130,20 @@ export class PortManagerAgent implements DisposableLike {
       this.snapshotBroadcastInFlight = false;
     }
 
-    if (this.snapshotBroadcastPending && this.clients.size > 0) {
+    if (this.snapshotBroadcastPending && this.hasEventClients()) {
       this.queueSnapshotBroadcast();
     }
+  }
+
+  /** True when at least one live extension client can consume snapshot events. */
+  private hasEventClients(): boolean {
+    for (const client of this.clients) {
+      if (!client.socket.destroyed && client.wantsEvents) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /**
@@ -1183,7 +1210,7 @@ export class PortManagerAgent implements DisposableLike {
    */
   private async buildSnapshot(options: BuildSnapshotRuntimeOptions = {}): Promise<AgentSnapshot> {
     const listeners = await this.scanListeningPorts({
-      allowRecentCache: options.allowRecentListenerCache === true && this.clients.size > 0,
+      allowRecentCache: options.allowRecentListenerCache === true && this.hasEventClients(),
     });
     let routeStateChanged = false;
 
@@ -2323,6 +2350,11 @@ function normalizeExternalListenerMissingScanThreshold(threshold: number | undef
   }
 
   return Math.max(1, Math.trunc(threshold));
+}
+
+/** Extension clients keep sockets open for events; hook/socket clients do not. */
+function agentRequestIdWantsEvents(id: AgentRequestMessage["id"]): boolean {
+  return typeof id === "string" && id.startsWith("extension-");
 }
 
 /**

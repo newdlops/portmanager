@@ -133,7 +133,11 @@ export class LocalAgentClient implements PortManagerProcessService {
       await this.restartDaemon();
       return;
     }
-    this.refreshInBackground();
+    /*
+     * Opening several VS Code windows must not make every UI client request an
+     * immediate listener scan. The daemon marks extension sockets as event
+     * clients through daemonStatus and publishes coalesced snapshots itself.
+     */
   }
 
   /** Stops the singleton local agent and resets the extension-side snapshot. */

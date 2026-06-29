@@ -1634,7 +1634,7 @@ test("listSnapshot does not publish route tables when route state is unchanged",
   assert.equal(readRouteTableWriterSequence(agent), initialSequence);
 });
 
-test("skips socket snapshot broadcasts for unchanged refresh requests", async (context) => {
+test("skips extension socket snapshot broadcasts for unchanged refresh requests", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const socketPath = path.join(os.tmpdir(), `portmanager-agent-socket-${process.pid}-${Date.now()}.sock`);
   const listeners: readonly ListeningPort[] = [
@@ -1665,13 +1665,52 @@ test("skips socket snapshot broadcasts for unchanged refresh requests", async (c
   const messages = collectAgentMessages(socket);
   context.after(() => socket.destroy());
 
-  socket.write(encodeAgentMessage({ id: "first-refresh", method: "refreshSnapshot" }));
-  await waitForAgentMessage(messages, (message) => isResponseForRequest(message, "first-refresh"));
+  socket.write(encodeAgentMessage({ id: "extension-first-refresh", method: "refreshSnapshot" }));
+  await waitForAgentMessage(messages, (message) => isResponseForRequest(message, "extension-first-refresh"));
+  await waitForAgentMessage(messages, isSnapshotEvent);
   assert.equal(messages.filter(isSnapshotEvent).length, 1);
 
+  await delay(80);
   messages.splice(0, messages.length);
-  socket.write(encodeAgentMessage({ id: "second-refresh", method: "refreshSnapshot" }));
-  await waitForAgentMessage(messages, (message) => isResponseForRequest(message, "second-refresh"));
+  socket.write(encodeAgentMessage({ id: "extension-second-refresh", method: "refreshSnapshot" }));
+  await waitForAgentMessage(messages, (message) => isResponseForRequest(message, "extension-second-refresh"));
+  await delay(80);
+
+  assert.equal(messages.filter(isSnapshotEvent).length, 0);
+});
+
+test("keeps hook sockets out of snapshot event fan-out", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const socketPath = path.join(os.tmpdir(), `portmanager-agent-hook-socket-${process.pid}-${Date.now()}.sock`);
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [
+        createListener({
+          id: "tcp:127.0.0.1:3000:4321",
+          port: 3000,
+          pid: 4321,
+          processName: "node",
+        }),
+      ],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => {
+    agent.dispose();
+    fs.rmSync(socketPath, { force: true });
+  });
+
+  await agent.listen(socketPath);
+  const socket = await openAgentSocket(socketPath);
+  const messages = collectAgentMessages(socket);
+  context.after(() => socket.destroy());
+
+  socket.write(encodeAgentMessage({ id: "hook-refresh", method: "refreshSnapshot" }));
+  await waitForAgentMessage(messages, (message) => isResponseForRequest(message, "hook-refresh"));
   await delay(80);
 
   assert.equal(messages.filter(isSnapshotEvent).length, 0);

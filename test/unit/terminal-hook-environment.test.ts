@@ -34,6 +34,45 @@ test("BASH_ENV restore script promotes runtime shims ahead of inherited PATH ent
   );
 });
 
+test("terminal hook preload entries are normalized across multiple VS Code windows", () => {
+  const terminalHookEnvironmentPath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
+  const networkServicePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const nativeHookPath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
+  const nativeAsdfShimPath = path.resolve(__dirname, "../../../native/asdf-shim/portmanager_asdf_shim.c");
+  const terminalHookEnvironmentSource = fs.readFileSync(terminalHookEnvironmentPath, "utf8");
+  const networkServiceSource = fs.readFileSync(networkServicePath, "utf8");
+  const nativeHookSource = fs.readFileSync(nativeHookPath, "utf8");
+  const nativeAsdfShimSource = fs.readFileSync(nativeAsdfShimPath, "utf8");
+  const applyStart = terminalHookEnvironmentSource.indexOf("export function applyTerminalHookEnvironment");
+  const applyEnd = terminalHookEnvironmentSource.indexOf("/** Mirrors the per-network bind hosts", applyStart);
+  const applyBody = terminalHookEnvironmentSource.slice(applyStart, applyEnd);
+  const attachStart = networkServiceSource.indexOf("private buildTerminalRoutingScriptBody");
+  const detachStart = networkServiceSource.indexOf("private buildTerminalDetachScriptBody");
+  const attachBody = networkServiceSource.slice(attachStart, detachStart);
+  const detachBody = networkServiceSource.slice(detachStart, networkServiceSource.indexOf("export interface", detachStart));
+
+  assert.equal(applyBody.includes("collection.prepend(preloadVariable"), false);
+  assert.equal(applyBody.includes("prependUniquePathListEntry(hookLibraryPath, process.env[preloadVariable])"), true);
+  assert.equal(applyBody.includes("collection.replace(preloadHintVariable, hookLibraryPath"), true);
+  assert.equal(terminalHookEnvironmentSource.includes('process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD"'), true);
+  assert.equal(terminalHookEnvironmentSource.includes("function prependUniquePathListEntry"), true);
+  assert.equal(terminalHookEnvironmentSource.includes("function buildShellPrependVariablePathListEntry"), true);
+  assert.equal(attachBody.includes("shellPrependLibrary(preloadVariable, hookLibraryPath)"), true);
+  assert.equal(attachBody.includes("shellPrependPathListEntry(\"PATH\", runtimeShimDirectory)"), true);
+  assert.equal(detachBody.includes("shellRemovePathListEntry(preloadVariable, hookLibraryPath)"), true);
+  assert.equal(detachBody.includes("shellRemovePathListEntry(\"PATH\", runtimeShimDirectory)"), true);
+  assert.equal(networkServiceSource.includes("function shellPrependPathListEntry"), true);
+  assert.equal(networkServiceSource.includes("function shellRemovePathListEntry"), true);
+  assert.equal(networkServiceSource.includes('"PORT_MANAGER_LD_PRELOAD"'), true);
+  assert.equal(nativeHookSource.includes("static int pm_preload_value_is_normalized"), true);
+  assert.equal(nativeHookSource.includes("static void pm_normalize_process_preload_env"), true);
+  assert.equal(nativeHookSource.includes("pm_normalize_process_preload_env();"), true);
+  assert.equal(nativeHookSource.includes("pm_preload_value_is_normalized(current_preload, hook_path)"), true);
+  assert.equal(nativeAsdfShimSource.includes("static int pm_preload_value_is_normalized"), true);
+  assert.equal(nativeAsdfShimSource.includes("static char *pm_make_preload_value"), true);
+  assert.equal(nativeAsdfShimSource.includes("setenv(PM_PRELOAD_ENV, merged, 1);"), true);
+});
+
 test("package command shims rerun client tools without native runtime alias semantics", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
@@ -206,11 +245,17 @@ test("global shell hook keeps no-network shells out of native preload routing", 
   assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK_DISABLED=1"), true);
   assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK_DAEMON_STARTED=0"), true);
   assert.equal(hookTemplate.includes("unset PORT_MANAGER_DYLD_INSERT_LIBRARIES"), true);
+  assert.equal(hookTemplate.includes("PORT_MANAGER_LD_PRELOAD"), true);
   const preloadRepairExport = hookTemplate.indexOf("export PORT_MANAGER_DYLD_INSERT_LIBRARIES");
   assert.notEqual(preloadRepairExport, -1);
   assert.notEqual(hookTemplate.lastIndexOf('if [ "\\${PORT_MANAGER_HOOK:-0}" = "1" ]; then', preloadRepairExport), -1);
   assert.equal(hookTemplate.includes("__pm_load_native_hook()"), true);
   assert.equal(hookTemplate.includes('if [ "\\${PORT_MANAGER_HOOK:-0}" != "1" ] || [ ! -f "${escapedHookLibraryPath}" ]; then'), true);
+  assert.equal(hookTemplate.includes('shellPrependPathListEntry("DYLD_INSERT_LIBRARIES", options.hookLibraryPath)'), true);
+  assert.equal(hookTemplate.includes('shellPrependPathListEntry("LD_PRELOAD", options.hookLibraryPath)'), true);
+  assert.equal(hookTemplate.includes("removeNativeHookPreloadScript"), true);
+  assert.equal(source.includes('shellRemovePathListEntry("DYLD_INSERT_LIBRARIES", options.hookLibraryPath)'), true);
+  assert.equal(source.includes('shellRemovePathListEntry("LD_PRELOAD", options.hookLibraryPath)'), true);
   assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK=1\nexport PORT_MANAGER_AGENT_SOCKET"), false);
   assert.equal(
     hookTemplate.includes('if [ "\\${PORT_MANAGER_HOOK:-0}" = "1" ]; then\n  __pm_agent_ensure'),
@@ -408,7 +453,8 @@ test("external pm shell function exposes doctor routes and detach diagnostics", 
   assert.equal(commandSource.includes("Port Manager: detached"), true);
   assert.equal(commandSource.includes('rm -f "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR/$__pm_marker_key.tsv"'), true);
   assert.equal(commandSource.includes("Port Manager routing detached from this shell."), true);
-  assert.equal(commandSource.includes("shellPatternLiteral"), true);
+  assert.equal(commandSource.includes("shellPrependPathListEntry"), true);
+  assert.equal(commandSource.includes("shellRemovePathListEntry"), true);
 });
 
 test("extension auto-refreshes shell hook assets without auto-mutating profiles", () => {
@@ -441,9 +487,12 @@ test("agent client startup avoids blocking on full listener refresh", () => {
   assert.equal(startBody.includes("await this.ensureConnected();"), true);
   assert.equal(startBody.includes("await this.loadDaemonStatusForStartup();"), true);
   assert.equal(startBody.includes("await this.refresh();"), false);
-  assert.equal(startBody.includes("this.refreshInBackground();"), true);
+  assert.equal(startBody.includes("this.refreshInBackground();"), false);
+  assert.equal(startBody.includes("immediate listener scan"), true);
+  assert.equal(startBody.includes("daemonStatus"), true);
   assert.equal(source.includes('const daemon = await this.request<AgentDaemonStatus>("daemonStatus");'), true);
   assert.equal(source.includes('const snapshot = await this.request<AgentSnapshot>("refreshSnapshot");'), true);
+  assert.equal(source.includes("const id = `extension-${process.pid}-${this.nextRequestId++}`;"), true);
   assert.equal(refreshBody.includes("void this.refresh().catch"), true);
   assert.equal(registerBody.includes('await this.request<ManagedProcess>("registerExistingProcess", input);'), true);
   assert.equal(registerBody.includes("this.upsertKnownProcess(process);"), true);
@@ -822,6 +871,81 @@ test("logical port routers use a single cross-window owner lease", () => {
     /command === undefined \? BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS : BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS/,
   );
   assert.equal(source.includes("releaseBrowserNetworkProxyOwnerLease();"), true);
+});
+
+test("automatic control plane side effects use a single cross-window owner lease", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const startStart = source.indexOf("async start(): Promise<void>");
+  const startEnd = source.indexOf("  /** Attempts to become the single automatic control-plane owner", startStart);
+  const startBody = source.slice(startStart, startEnd);
+  const ownerServicesStart = source.indexOf("private async startControlPlaneOwnerServices(): Promise<void>");
+  const ownerServicesEnd = source.indexOf("  /** Runs registry side effects only", ownerServicesStart);
+  const ownerServicesBody = source.slice(ownerServicesStart, ownerServicesEnd);
+  const ownerWatcherStart = source.indexOf("private async startControlPlaneOwnerWatchers(): Promise<void>");
+  const ownerWatcherEnd = source.indexOf("  /** Runs startup convergence only", ownerWatcherStart);
+  const ownerWatcherBody = source.slice(ownerWatcherStart, ownerWatcherEnd);
+  const registrySideEffectStart = source.indexOf("private async runControlPlaneRegistrySideEffects(): Promise<void>");
+  const registrySideEffectEnd = source.indexOf("  /** Stops owner-only watchers", registrySideEffectStart);
+  const registrySideEffectBody = source.slice(registrySideEffectStart, registrySideEffectEnd);
+  const demoteStart = source.indexOf("private demoteControlPlaneOwner(): void");
+  const demoteEnd = source.indexOf("  /** Returns the latest logical network snapshot", demoteStart);
+  const demoteBody = source.slice(demoteStart, demoteEnd);
+  const applyStart = source.indexOf("private applyVscodeWindowTerminalEnvironment(): void");
+  const applyEnd = source.indexOf("  /**\n   * Prepares the loopback host", applyStart);
+  const applyBody = source.slice(applyStart, applyEnd);
+  const refreshRuntimeStart = source.indexOf("private async refreshRuntimeDescriptors(");
+  const refreshRuntimeEnd = source.indexOf("  /** Looks up the latest route", refreshRuntimeStart);
+  const refreshRuntimeBody = source.slice(refreshRuntimeStart, refreshRuntimeEnd);
+  const refreshContainerStart = source.indexOf("async refreshContainerServices(");
+  const refreshContainerEnd = source.indexOf("  /** Forces generated network routing artifacts", refreshContainerStart);
+  const refreshContainerBody = source.slice(refreshContainerStart, refreshContainerEnd);
+  const reconcileComposeStart = source.indexOf("private async reconcileComposeAttachmentPublishedPorts(");
+  const reconcileComposeEnd = source.indexOf("private async reconcileComposeAttachmentPublishedPortsSerially", reconcileComposeStart);
+  const reconcileComposeBody = source.slice(reconcileComposeStart, reconcileComposeEnd);
+  const ownerSignalStart = source.indexOf("private refreshOwnerLeaseFromFileSignal");
+  const ownerSignalEnd = source.indexOf("private startTerminalAttachmentMarkerPolling", ownerSignalStart);
+  const ownerSignalBody = source.slice(ownerSignalStart, ownerSignalEnd);
+
+  assert.equal(source.includes("CONTROL_PLANE_OWNER_LEASE_MS = 120_000"), true);
+  assert.equal(source.includes("CONTROL_PLANE_OWNER_LOCK_STALE_MS = 30_000"), true);
+  assert.equal(source.includes('function buildControlPlaneOwnerControlPath(kind: "owner" | "lock"): string'), true);
+  assert.equal(source.includes("function tryAcquireControlPlaneOwnerLease(): boolean"), true);
+  assert.equal(source.includes("function isActiveControlPlaneOwner"), true);
+  assert.equal(source.includes("private ownsControlPlaneLease = false;"), true);
+  assert.equal(source.includes("private readonly controlPlaneOwnerDisposables"), true);
+  assert.equal(source.includes("private controlPlaneOwnerStartupInFlight: Promise<boolean> | undefined;"), true);
+  assert.equal(source.includes("void this.runControlPlaneRegistrySideEffects();"), true);
+  assert.equal(source.includes("if (this.ownsControlPlaneLease) {\n            void this.syncLogicalPortRouters();"), true);
+  assert.equal(startBody.includes("this.watchOwnerLeaseFiles()"), true);
+  assert.equal(startBody.includes("await this.refreshRuntimeDescriptors({ includeContainerRuntime: false });"), true);
+  assert.equal(startBody.includes("this.applyVscodeWindowTerminalEnvironment();"), true);
+  assert.equal(startBody.includes("await this.startControlPlaneOwnerIfAvailable();"), true);
+  assert.equal(startBody.includes("this.startRoutingSignalRefreshLoop();"), false);
+  assert.equal(startBody.includes("this.startTerminalAttachmentMarkerPolling();"), false);
+  assert.equal(ownerWatcherBody.includes("vscode.workspace.createFileSystemWatcher"), true);
+  assert.equal(ownerWatcherBody.includes("this.controlPlaneOwnerDisposables.push("), true);
+  assert.equal(ownerServicesBody.includes("await this.refreshRuntimeDescriptors({ includeContainerRuntime: true });"), true);
+  assert.equal(ownerServicesBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });"), true);
+  assert.equal(ownerServicesBody.includes("void this.refreshContainerServices({ background: true });"), true);
+  assert.equal(ownerServicesBody.includes("await this.convergeDaemonAndRoutingState();"), true);
+  assert.equal(ownerServicesBody.includes("this.startRoutingSignalRefreshLoop();"), true);
+  assert.equal(ownerServicesBody.includes("this.startTerminalAttachmentMarkerPolling();"), true);
+  assert.equal(registrySideEffectBody.includes("!this.ownsControlPlaneLease || !tryAcquireControlPlaneOwnerLease()"), true);
+  assert.equal(registrySideEffectBody.includes("void this.writeHostAccessBindingsFile();"), true);
+  assert.equal(applyBody.includes("if (!this.ownsControlPlaneLease)"), true);
+  assert.equal(applyBody.includes("applyTerminalHookEnvironment(this.context, undefined);"), true);
+  assert.equal(refreshRuntimeBody.includes("options.includeContainerRuntime !== false"), true);
+  assert.equal(refreshRuntimeBody.includes("this.containerRuntime.getDescriptor()"), true);
+  assert.equal(refreshContainerBody.includes("options.background === true && !this.ownsControlPlaneLease"), true);
+  assert.equal(reconcileComposeBody.includes("options.background === true && !this.ownsControlPlaneLease"), true);
+  assert.equal(ownerSignalBody.includes("CONTROL_PLANE_OWNER_PATH"), true);
+  assert.equal(ownerSignalBody.includes("void this.startControlPlaneOwnerIfAvailable();"), true);
+  assert.equal(demoteBody.includes("for (const disposable of this.controlPlaneOwnerDisposables.splice(0))"), true);
+  assert.equal(demoteBody.includes("this.context.environmentVariableCollection.clear();"), true);
+  assert.equal(demoteBody.includes("releaseControlPlaneOwnerLease();"), true);
+  assert.equal(source.includes("Another Port Manager window owns terminal routing control."), true);
+  assert.equal(source.includes("Another Port Manager window owns Compose routing control."), true);
 });
 
 test("compose attach waits for routing convergence before returning", () => {

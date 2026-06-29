@@ -58,11 +58,103 @@ static const char *pm_basename(const char *path) {
   return name;
 }
 
-static void pm_restore_dyld(void) {
-  const char *hook = getenv("PORT_MANAGER_DYLD_INSERT_LIBRARIES");
-  const char *current = getenv("DYLD_INSERT_LIBRARIES");
-  char *merged;
+static int pm_preload_value_is_normalized(const char *value, const char *hook_path) {
+  size_t hook_length;
+  const char *cursor;
+  int segment_index = 0;
+  int saw_hook = 0;
+
+  if (value == NULL || value[0] == '\0' || hook_path == NULL || hook_path[0] == '\0') {
+    return 0;
+  }
+
+  hook_length = strlen(hook_path);
+  cursor = value;
+  while (*cursor != '\0') {
+    const char *end = strchr(cursor, ':');
+    size_t segment_length = end == NULL ? strlen(cursor) : (size_t)(end - cursor);
+    int is_hook = segment_length == hook_length && strncmp(cursor, hook_path, segment_length) == 0;
+
+    if (segment_length == 0) {
+      return 0;
+    }
+
+    if (is_hook) {
+      if (segment_index != 0 || saw_hook) {
+        return 0;
+      }
+      saw_hook = 1;
+    } else if (segment_index == 0) {
+      return 0;
+    }
+
+    if (end == NULL) {
+      break;
+    }
+    if (end[1] == '\0') {
+      return 0;
+    }
+
+    cursor = end + 1;
+    segment_index++;
+  }
+
+  return saw_hook;
+}
+
+static char *pm_make_preload_value(const char *hook_path, const char *current_value) {
+  char *value;
   size_t size;
+  size_t offset;
+  size_t hook_length;
+  const char *cursor;
+
+  if (hook_path == NULL || hook_path[0] == '\0') {
+    return NULL;
+  }
+
+  hook_length = strlen(hook_path);
+  size = hook_length + (current_value == NULL ? 0 : strlen(current_value)) + 2;
+  value = malloc(size);
+  if (value == NULL) {
+    return NULL;
+  }
+
+  memcpy(value, hook_path, hook_length);
+  offset = hook_length;
+  value[offset] = '\0';
+
+  if (current_value == NULL || current_value[0] == '\0') {
+    return value;
+  }
+
+  cursor = current_value;
+  while (*cursor != '\0') {
+    const char *end = strchr(cursor, ':');
+    size_t segment_length = end == NULL ? strlen(cursor) : (size_t)(end - cursor);
+    int is_hook = segment_length == hook_length && strncmp(cursor, hook_path, segment_length) == 0;
+
+    if (segment_length > 0 && !is_hook) {
+      value[offset++] = ':';
+      memcpy(value + offset, cursor, segment_length);
+      offset += segment_length;
+      value[offset] = '\0';
+    }
+
+    if (end == NULL) {
+      break;
+    }
+
+    cursor = end + 1;
+  }
+
+  return value;
+}
+
+static void pm_restore_dyld(void) {
+  const char *hook = getenv(PM_PRELOAD_HINT_ENV);
+  const char *current = getenv(PM_PRELOAD_ENV);
+  char *merged;
 
   if (hook == NULL || hook[0] == '\0') {
     return;
@@ -76,23 +168,16 @@ static void pm_restore_dyld(void) {
    */
   setenv("PORT_MANAGER_PRELOAD_REPAIR", "1", 1);
 
-  if (current != NULL && strstr(current, hook) != NULL) {
+  if (pm_preload_value_is_normalized(current, hook)) {
     return;
   }
 
-  if (current == NULL || current[0] == '\0') {
-    setenv("DYLD_INSERT_LIBRARIES", hook, 1);
-    return;
-  }
-
-  size = strlen(hook) + strlen(current) + 2;
-  merged = malloc(size);
+  merged = pm_make_preload_value(hook, current);
   if (merged == NULL) {
     return;
   }
 
-  snprintf(merged, size, "%s:%s", hook, current);
-  setenv("DYLD_INSERT_LIBRARIES", merged, 1);
+  setenv(PM_PRELOAD_ENV, merged, 1);
   free(merged);
 }
 

@@ -147,6 +147,14 @@ const BROWSER_NETWORK_PROXY_OWNER_LEASE_MS = 120_000;
 const BROWSER_NETWORK_PROXY_OWNER_LOCK_STALE_MS = 30_000;
 const BROWSER_NETWORK_PROXY_OWNER_PATH = buildBrowserNetworkProxyOwnerControlPath("owner");
 const BROWSER_NETWORK_PROXY_OWNER_LOCK_PATH = buildBrowserNetworkProxyOwnerControlPath("lock");
+// The control-plane owner is the only VS Code extension host allowed to run
+// automatic Docker/terminal discovery, generated-file repair, and hook env
+// collection refresh. Other windows stay read-only unless the user triggers an
+// explicit command in that window.
+const CONTROL_PLANE_OWNER_LEASE_MS = 120_000;
+const CONTROL_PLANE_OWNER_LOCK_STALE_MS = 30_000;
+const CONTROL_PLANE_OWNER_PATH = buildControlPlaneOwnerControlPath("owner");
+const CONTROL_PLANE_OWNER_LOCK_PATH = buildControlPlaneOwnerControlPath("lock");
 const OWNER_LEASE_HANDOFF_RETRY_DELAY_MS = 1_000;
 const DAEMON_RESTART_BACKOFF_MS = 30_000;
 const TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500;
@@ -408,6 +416,15 @@ export class PortManagerNetworkService implements DisposableLike {
   /** True only after this extension host acquired the cross-window browser proxy owner lease. */
   private ownsBrowserNetworkProxyLease = false;
 
+  /** True only while this extension host owns automatic control-plane side effects. */
+  private ownsControlPlaneLease = false;
+
+  /** Disposables that must exist only in the current control-plane owner window. */
+  private readonly controlPlaneOwnerDisposables: DisposableLike[] = [];
+
+  /** Guards owner startup so concurrent activation/configuration signals do not duplicate loops. */
+  private controlPlaneOwnerStartupInFlight: Promise<boolean> | undefined;
+
   /** Snapshot object used to build the browser proxy route target index. */
   private browserProxyRouteTargetSnapshot: AgentSnapshot | undefined;
 
@@ -522,22 +539,18 @@ export class PortManagerNetworkService implements DisposableLike {
     this.disposables.push(
       this.registry.onDidChange(() => {
         this.saveState();
-        void this.writeHostAccessBindingsFile();
-        void this.writeComposeProjectRoutingFile();
-        void this.writeTerminalNetworkSelectionFile();
-        void this.syncBrowserDnsRecords();
-        void this.maybeAutoInstallBrowserDnsResolvers();
-        void this.syncLogicalPortRouters();
-        void this.syncBrowserNetworkProxies();
+        void this.runControlPlaneRegistrySideEffects();
         this.reconcileVscodeWindowTerminalBinding();
       }),
     );
     if (this.processService !== undefined) {
       this.disposables.push(
         this.processService.onDidChange(() => {
-          void this.syncLogicalPortRouters();
-          void this.syncBrowserNetworkProxies();
-          void this.writeTerminalNetworkSelectionFile();
+          if (this.ownsControlPlaneLease) {
+            void this.syncLogicalPortRouters();
+            void this.syncBrowserNetworkProxies();
+            void this.writeTerminalNetworkSelectionFile();
+          }
           this.localChangeEvents.emit();
         }),
       );
@@ -546,6 +559,86 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Loads terminal candidates and reopens persisted host exposures. */
   async start(): Promise<void> {
+    this.disposables.push(
+      this.sharedNetworkStateStore.watch(() => {
+        void this.reloadSharedNetworkState();
+      }),
+      this.watchOwnerLeaseFiles(),
+      vscode.window.onDidOpenTerminal((terminal) => {
+        if (this.ownsControlPlaneLease) {
+          this.scheduleVscodeTerminalTitleRefresh(terminal);
+          void this.refreshTerminals();
+        }
+      }),
+      vscode.window.onDidCloseTerminal(() => {
+        if (this.ownsControlPlaneLease) {
+          void this.refreshTerminals();
+        }
+      }),
+      vscode.workspace.onDidChangeConfiguration((event) => {
+        if (
+          event.affectsConfiguration("portManager.containerRuntime") ||
+          event.affectsConfiguration("portManager.enabled")
+        ) {
+          if (this.ownsControlPlaneLease) {
+            void this.refreshRuntimeDescriptors();
+            void this.refreshContainerServices({ background: true });
+          }
+        }
+        if (event.affectsConfiguration("portManager")) {
+          if (this.ownsControlPlaneLease) {
+            void this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
+            void this.writeTerminalNetworkSelectionFile();
+          } else {
+            this.applyVscodeWindowTerminalEnvironment();
+          }
+        }
+      }),
+    );
+
+    await this.reloadSharedNetworkState();
+    await this.refreshRuntimeDescriptors({ includeContainerRuntime: false });
+    this.reconcileVscodeWindowTerminalBinding();
+    this.applyVscodeWindowTerminalEnvironment();
+    await this.startControlPlaneOwnerIfAvailable();
+  }
+
+  /** Attempts to become the single automatic control-plane owner for this OS user. */
+  private async startControlPlaneOwnerIfAvailable(): Promise<boolean> {
+    if (this.controlPlaneOwnerStartupInFlight !== undefined) {
+      return this.controlPlaneOwnerStartupInFlight;
+    }
+
+    this.controlPlaneOwnerStartupInFlight = this.startControlPlaneOwnerIfAvailableExclusive().finally(() => {
+      this.controlPlaneOwnerStartupInFlight = undefined;
+    });
+
+    return this.controlPlaneOwnerStartupInFlight;
+  }
+
+  private async startControlPlaneOwnerIfAvailableExclusive(): Promise<boolean> {
+    if (!tryAcquireControlPlaneOwnerLease()) {
+      this.demoteControlPlaneOwner();
+      return false;
+    }
+
+    const becameOwner = !this.ownsControlPlaneLease;
+    this.ownsControlPlaneLease = true;
+
+    if (becameOwner) {
+      await this.startControlPlaneOwnerWatchers();
+      await this.startControlPlaneOwnerServices();
+    }
+
+    return true;
+  }
+
+  /** Creates file watchers that would otherwise duplicate terminal refresh work in every window. */
+  private async startControlPlaneOwnerWatchers(): Promise<void> {
+    if (this.controlPlaneOwnerDisposables.length > 0) {
+      return;
+    }
+
     const terminalAttachmentMarkerDirectory = this.getTerminalAttachmentMarkerDirectoryPath();
     await fs.mkdir(terminalAttachmentMarkerDirectory, { recursive: true }).catch(() => undefined);
     const terminalAttachmentMarkerWatcher = vscode.workspace.createFileSystemWatcher(
@@ -554,11 +647,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const nativeTerminalAttachmentMarkerWatcher =
       this.watchTerminalAttachmentMarkers(terminalAttachmentMarkerDirectory);
 
-    this.disposables.push(
-      this.sharedNetworkStateStore.watch(() => {
-        void this.reloadSharedNetworkState();
-      }),
-      this.watchOwnerLeaseFiles(),
+    this.controlPlaneOwnerDisposables.push(
       terminalAttachmentMarkerWatcher,
       nativeTerminalAttachmentMarkerWatcher,
       terminalAttachmentMarkerWatcher.onDidCreate(() => {
@@ -570,31 +659,12 @@ export class PortManagerNetworkService implements DisposableLike {
       terminalAttachmentMarkerWatcher.onDidDelete(() => {
         this.scheduleTerminalAttachmentRefreshBurst();
       }),
-      vscode.window.onDidOpenTerminal((terminal) => {
-        this.scheduleVscodeTerminalTitleRefresh(terminal);
-        void this.refreshTerminals();
-      }),
-      vscode.window.onDidCloseTerminal(() => {
-        void this.refreshTerminals();
-      }),
-      vscode.workspace.onDidChangeConfiguration((event) => {
-        if (
-          event.affectsConfiguration("portManager.containerRuntime") ||
-          event.affectsConfiguration("portManager.enabled")
-        ) {
-          void this.refreshRuntimeDescriptors();
-          void this.refreshContainerServices({ background: true });
-        }
-        if (event.affectsConfiguration("portManager")) {
-          void this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
-          void this.writeTerminalNetworkSelectionFile();
-        }
-      }),
     );
+  }
 
-    await this.reloadSharedNetworkState();
-    await this.refreshRuntimeDescriptors();
-    this.reconcileVscodeWindowTerminalBinding();
+  /** Runs startup convergence only in the elected owner window. */
+  private async startControlPlaneOwnerServices(): Promise<void> {
+    await this.refreshRuntimeDescriptors({ includeContainerRuntime: true });
     await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
@@ -613,6 +683,63 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.syncBrowserNetworkProxies();
     this.startRoutingSignalRefreshLoop();
     this.startTerminalAttachmentMarkerPolling();
+  }
+
+  /** Runs registry side effects only in the control-plane owner window. */
+  private async runControlPlaneRegistrySideEffects(): Promise<void> {
+    if (!this.ownsControlPlaneLease || !tryAcquireControlPlaneOwnerLease()) {
+      this.demoteControlPlaneOwner();
+      return;
+    }
+
+    void this.writeHostAccessBindingsFile();
+    void this.writeComposeProjectRoutingFile();
+    void this.writeTerminalNetworkSelectionFile();
+    this.syncBrowserDnsRecords();
+    void this.maybeAutoInstallBrowserDnsResolvers();
+    void this.syncLogicalPortRouters();
+    void this.syncBrowserNetworkProxies();
+  }
+
+  /** Stops owner-only watchers/listeners when another extension host owns the control plane. */
+  private demoteControlPlaneOwner(): void {
+    if (
+      !this.ownsControlPlaneLease &&
+      this.controlPlaneOwnerDisposables.length === 0 &&
+      this.routingSignalRefreshTimer === undefined &&
+      this.terminalAttachmentMarkerPollTimer === undefined
+    ) {
+      return;
+    }
+
+    this.ownsControlPlaneLease = false;
+    if (this.routingSignalRefreshTimer !== undefined) {
+      clearInterval(this.routingSignalRefreshTimer);
+      this.routingSignalRefreshTimer = undefined;
+    }
+    if (this.terminalAttachmentMarkerPollTimer !== undefined) {
+      clearInterval(this.terminalAttachmentMarkerPollTimer);
+      this.terminalAttachmentMarkerPollTimer = undefined;
+    }
+    if (this.terminalAttachmentRefreshTimer !== undefined) {
+      clearTimeout(this.terminalAttachmentRefreshTimer);
+      this.terminalAttachmentRefreshTimer = undefined;
+    }
+
+    for (const disposable of this.controlPlaneOwnerDisposables.splice(0)) {
+      disposable.dispose();
+    }
+
+    this.context.environmentVariableCollection.clear();
+    void this.proxyManager.dispose();
+    void this.browserNetworkProxy.dispose();
+    this.browserDnsServer.dispose();
+    this.logicalPortRouter.dispose();
+    releaseControlPlaneOwnerLease();
+    releaseLogicalRouterOwnerLease();
+    releaseBrowserNetworkProxyOwnerLease();
+    this.ownsLogicalRouterLease = false;
+    this.ownsBrowserNetworkProxyLease = false;
   }
 
   /** Returns the latest logical network snapshot for the sidebar. */
@@ -784,6 +911,10 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Creates a network row for the runtime adapter selected at creation time. */
   async createNetwork(name: string, runtimeKind?: NetworkRuntimeKind): Promise<LogicalNetwork> {
+    if (!(await this.startControlPlaneOwnerIfAvailable())) {
+      throw new Error("Another Port Manager window owns network control. Try the command from that window.");
+    }
+
     const runtimes = this.registry.getSnapshot().runtimes;
     const selectedRuntimeKind = runtimeKind ?? runtimes.find(isContainerLevelRuntime)?.kind;
 
@@ -811,6 +942,10 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Removes a network and closes any host exposures that belonged to it. */
   async removeNetwork(networkId: string): Promise<LogicalNetwork | undefined> {
+    if (!(await this.startControlPlaneOwnerIfAvailable())) {
+      throw new Error("Another Port Manager window owns network control. Try the command from that window.");
+    }
+
     const snapshot = this.registry.getSnapshot();
     const network = snapshot.networks.find((item) => item.id === networkId);
     const exposures = snapshot.exposures.filter((exposure) => exposure.networkId === networkId);
@@ -879,6 +1014,10 @@ export class PortManagerNetworkService implements DisposableLike {
   async refreshContainerServices(
     options: BackgroundRefreshOptions = {},
   ): Promise<readonly ContainerServiceCandidate[]> {
+    if (options.background === true && !this.ownsControlPlaneLease) {
+      return this.registry.getSnapshot().containerServiceCandidates;
+    }
+
     if (
       options.background === true &&
       options.force !== true &&
@@ -952,6 +1091,10 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Attaches a user-facing terminal window by resolving it to its root process. */
   async attachTerminalWindow(networkId: string, terminalWindowId: string): Promise<TerminalAttachment> {
+    if (!(await this.startControlPlaneOwnerIfAvailable())) {
+      throw new Error("Another Port Manager window owns terminal routing control. Try the command from that window.");
+    }
+
     const network = requireNetwork(this.registry.getNetwork(networkId), networkId);
     const runtime = requireRuntime(this.registry.getSnapshot().runtimes, network.runtimeKind);
     requireContainerLevelRuntime(runtime);
@@ -1031,6 +1174,10 @@ export class PortManagerNetworkService implements DisposableLike {
    * changes retroactively.
    */
   async attachVscodeWindowTerminalsToNetwork(networkId: string): Promise<VscodeWindowTerminalAttachSummary> {
+    if (!(await this.startControlPlaneOwnerIfAvailable())) {
+      throw new Error("Another Port Manager window owns terminal routing control. Try the command from that window.");
+    }
+
     const network = requireNetwork(this.registry.getNetwork(networkId), networkId);
     const runtime = requireRuntime(this.registry.getSnapshot().runtimes, network.runtimeKind);
     requireNativeHelperRuntime(runtime);
@@ -1234,6 +1381,10 @@ export class PortManagerNetworkService implements DisposableLike {
     networkId: string,
     settings: PortManagerSettings,
   ): Promise<TerminalRoutingInjectionResult> {
+    if (!this.ownsControlPlaneLease && !(await this.startControlPlaneOwnerIfAvailable())) {
+      return { injected: false, reason: "Another Port Manager window owns terminal routing control." };
+    }
+
     requireNetwork(this.registry.getNetwork(networkId), networkId);
 
     const terminalWindow = this.registry
@@ -1277,6 +1428,10 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Creates and opens a host TCP exposure through the concrete proxy runtime. */
   async createExposure(input: HostPortExposureInput): Promise<HostPortExposure> {
+    if (!(await this.startControlPlaneOwnerIfAvailable())) {
+      throw new Error("Another Port Manager window owns host exposure control. Try the command from that window.");
+    }
+
     const network = requireNetwork(this.registry.getNetwork(input.networkId), input.networkId);
     const runtime = requireRuntime(this.registry.getSnapshot().runtimes, network.runtimeKind);
 
@@ -1312,6 +1467,10 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Closes and removes one host exposure. */
   async removeExposure(exposureId: string): Promise<HostPortExposure | undefined> {
+    if (!(await this.startControlPlaneOwnerIfAvailable())) {
+      throw new Error("Another Port Manager window owns host exposure control. Try the command from that window.");
+    }
+
     await this.proxyManager.close(exposureId);
     return this.registry.removeExposure(exposureId);
   }
@@ -1357,6 +1516,10 @@ export class PortManagerNetworkService implements DisposableLike {
    * the same host port; removing the attachment restores host fallback.
    */
   async attachComposePublishedPorts(input: ComposePublishedPortsInput): Promise<ComposeAttachment> {
+    if (!(await this.startControlPlaneOwnerIfAvailable())) {
+      throw new Error("Another Port Manager window owns Compose routing control. Try the command from that window.");
+    }
+
     const network = requireNetwork(this.registry.getNetwork(input.networkId), input.networkId);
     if (this.processService === undefined) {
       throw new Error("Compose published ports require the Port Manager daemon.");
@@ -1524,6 +1687,10 @@ export class PortManagerNetworkService implements DisposableLike {
    * released so the logical network no longer owns those ports.
    */
   async detachComposeAttachment(attachmentId: string): Promise<ComposeAttachment | undefined> {
+    if (!(await this.startControlPlaneOwnerIfAvailable())) {
+      throw new Error("Another Port Manager window owns Compose routing control. Try the command from that window.");
+    }
+
     const attachment = this.registry
       .getSnapshot()
       .composeAttachments.find((candidate) => candidate.id === attachmentId);
@@ -1540,6 +1707,10 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Removes a compose route attachment and restores Docker/Podman state when Port Manager mutated it. */
   async removeComposeAttachment(attachmentId: string): Promise<ComposeAttachment | undefined> {
+    if (!(await this.startControlPlaneOwnerIfAvailable())) {
+      throw new Error("Another Port Manager window owns Compose routing control. Try the command from that window.");
+    }
+
     const attachment = this.registry
       .getSnapshot()
       .composeAttachments.find((candidate) => candidate.id === attachmentId);
@@ -1596,6 +1767,10 @@ export class PortManagerNetworkService implements DisposableLike {
    * sharing the currently published endpoints.
    */
   async copyComposeAttachment(input: ComposeAttachmentCopyInput): Promise<ComposeAttachment | undefined> {
+    if (!(await this.startControlPlaneOwnerIfAvailable())) {
+      throw new Error("Another Port Manager window owns Compose routing control. Try the command from that window.");
+    }
+
     const source = this.getComposeAttachment(input.attachmentId);
     if (source === undefined) {
       return undefined;
@@ -1650,6 +1825,10 @@ export class PortManagerNetworkService implements DisposableLike {
     attachmentId: string,
     attachedProjectName: string,
   ): Promise<ComposeAttachment | undefined> {
+    if (!(await this.startControlPlaneOwnerIfAvailable())) {
+      throw new Error("Another Port Manager window owns Compose routing control. Try the command from that window.");
+    }
+
     if (this.processService === undefined) {
       throw new Error("Compose project rename requires the Port Manager daemon.");
     }
@@ -1971,6 +2150,9 @@ export class PortManagerNetworkService implements DisposableLike {
       clearTimeout(this.ownerLeaseHandoffRetryTimer);
       this.ownerLeaseHandoffRetryTimer = undefined;
     }
+    for (const disposable of this.controlPlaneOwnerDisposables.splice(0)) {
+      disposable.dispose();
+    }
 
     for (const disposable of this.disposables.splice(0)) {
       disposable.dispose();
@@ -1982,8 +2164,10 @@ export class PortManagerNetworkService implements DisposableLike {
     void this.browserNetworkProxy.dispose();
     this.browserDnsServer.dispose();
     this.logicalPortRouter.dispose();
+    releaseControlPlaneOwnerLease();
     releaseLogicalRouterOwnerLease();
     releaseBrowserNetworkProxyOwnerLease();
+    this.ownsControlPlaneLease = false;
     this.ownsLogicalRouterLease = false;
     this.ownsBrowserNetworkProxyLease = false;
   }
@@ -2054,13 +2238,17 @@ export class PortManagerNetworkService implements DisposableLike {
     }
     this.saveNormalizedPersistedStateIfChanged();
 
-    await this.reopenPersistedExposures();
-    await this.writeHostAccessBindingsFile();
-    await this.reconcileComposeOverrideFiles(undefined, { force: true });
-    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
-    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });
-    await this.writeTerminalNetworkSelectionFile();
-    await this.syncLogicalPortRouters();
+    if (this.ownsControlPlaneLease && tryAcquireControlPlaneOwnerLease()) {
+      await this.reopenPersistedExposures();
+      await this.writeHostAccessBindingsFile();
+      await this.reconcileComposeOverrideFiles(undefined, { force: true });
+      await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
+      await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });
+      await this.writeTerminalNetworkSelectionFile();
+      await this.syncLogicalPortRouters();
+    } else if (this.ownsControlPlaneLease) {
+      this.demoteControlPlaneOwner();
+    }
   }
 
   /** Reads the current VS Code workspace/window terminal default. */
@@ -2095,6 +2283,11 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Updates VS Code's new-terminal environment for the current window/workspace. */
   private applyVscodeWindowTerminalEnvironment(): void {
+    if (!this.ownsControlPlaneLease) {
+      applyTerminalHookEnvironment(this.context, undefined);
+      return;
+    }
+
     const binding = this.vscodeWindowTerminalBinding;
     const networkId = binding?.status === "attached" ? binding.networkId : undefined;
 
@@ -2328,6 +2521,7 @@ export class PortManagerNetworkService implements DisposableLike {
     this.routingSignalRefreshTimer = setInterval(() => {
       void this.refreshRoutingSignals();
     }, ROUTING_SIGNAL_REFRESH_INTERVAL_MS);
+    this.routingSignalRefreshTimer.unref?.();
   }
 
   /** Performs one serialized background refresh of terminals and container-backed routes. */
@@ -2344,6 +2538,11 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   private async refreshRoutingSignalsExclusive(): Promise<void> {
+    if (!this.ownsControlPlaneLease || !tryAcquireControlPlaneOwnerLease()) {
+      this.demoteControlPlaneOwner();
+      return;
+    }
+
     await Promise.all([
       this.refreshTerminals().catch(() => []),
       this.refreshContainerServices({ background: true }).catch(() => []),
@@ -2623,7 +2822,7 @@ export class PortManagerNetworkService implements DisposableLike {
    */
   private watchOwnerLeaseFiles(): DisposableLike {
     const watchedFilesByDirectory = new Map<string, Set<string>>();
-    for (const ownerPath of [LOGICAL_ROUTER_OWNER_PATH, BROWSER_NETWORK_PROXY_OWNER_PATH]) {
+    for (const ownerPath of [LOGICAL_ROUTER_OWNER_PATH, BROWSER_NETWORK_PROXY_OWNER_PATH, CONTROL_PLANE_OWNER_PATH]) {
       const directoryPath = path.dirname(ownerPath);
       const fileName = path.basename(ownerPath);
       const fileNames = watchedFilesByDirectory.get(directoryPath) ?? new Set<string>();
@@ -2661,6 +2860,10 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Attempts ownership handoff for lease files touched by another extension host. */
   private refreshOwnerLeaseFromFileSignal(changedName: string | undefined): void {
+    const shouldRefreshControl =
+      (changedName === undefined || changedName === path.basename(CONTROL_PLANE_OWNER_PATH)) &&
+      !this.ownsControlPlaneLease &&
+      !isActiveControlPlaneOwner(readControlPlaneOwner(), Date.now());
     const shouldRefreshLogical =
       (changedName === undefined || changedName === path.basename(LOGICAL_ROUTER_OWNER_PATH)) &&
       !this.ownsLogicalRouterLease &&
@@ -2677,6 +2880,10 @@ export class PortManagerNetworkService implements DisposableLike {
     if (shouldRefreshBrowser) {
       this.browserNetworkProxy.retryFailedEndpointsNow();
       void this.syncBrowserNetworkProxies();
+    }
+
+    if (shouldRefreshControl) {
+      void this.startControlPlaneOwnerIfAvailable();
     }
 
     if (shouldRefreshLogical || shouldRefreshBrowser) {
@@ -2792,6 +2999,10 @@ export class PortManagerNetworkService implements DisposableLike {
   private async reconcileComposeAttachmentPublishedPorts(
     options: BackgroundRefreshOptions = {},
   ): Promise<void> {
+    if (options.background === true && !this.ownsControlPlaneLease) {
+      return;
+    }
+
     if (
       options.background === true &&
       options.force !== true &&
@@ -3514,12 +3725,15 @@ export class PortManagerNetworkService implements DisposableLike {
     return resolveProcessTreeNetworkLabel(this.registry.getSnapshot().attachments, processRows, pid)?.networkId;
   }
 
-  /** Rebuilds runtime descriptors from native hook support and installed container tools. */
-  private async refreshRuntimeDescriptors(): Promise<void> {
+  /** Rebuilds runtime descriptors, probing container CLIs only in the control-plane owner. */
+  private async refreshRuntimeDescriptors(
+    options: { readonly includeContainerRuntime?: boolean } = { includeContainerRuntime: true },
+  ): Promise<void> {
     const nativeDescriptor = buildNativeHookRuntimeDescriptor(readPortManagerSettings());
-    const containerDescriptor = await this.containerRuntime
-      .detect(readContainerRuntimeSettings())
-      .catch(() => undefined);
+    const containerDescriptor =
+      options.includeContainerRuntime !== false
+        ? await this.containerRuntime.detect(readContainerRuntimeSettings()).catch(() => undefined)
+        : this.containerRuntime.getDescriptor();
     this.registry.setRuntimes([
       ...(nativeDescriptor === undefined ? [] : [nativeDescriptor]),
       ...(containerDescriptor === undefined ? [] : [containerDescriptor]),
@@ -4383,7 +4597,12 @@ export class PortManagerNetworkService implements DisposableLike {
       dockerShimPath: runtimeCommandShimPath,
     });
     const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
+    const preloadHintVariable = process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD";
     const commands = [
+      buildTerminalAttachmentMarkerRemoveShell(),
+      shellRemovePathListEntry(preloadVariable, hookLibraryPath),
+      ...(runtimeShimDirectory === undefined ? [] : [shellRemovePathListEntry("PATH", runtimeShimDirectory)]),
+      "unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID",
       "unset PORT_MANAGER_HOOK_DISABLED",
       shellExport("PORT_MANAGER_HOOK", "1"),
       shellExport("PORT_MANAGER_NETWORK_ID", networkId),
@@ -4398,6 +4617,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath),
       shellExport(DOCKER_SHIM_PATH_ENV, runtimeCommandShimPath),
       shellExport("PORT_MANAGER_PRELOAD_REPAIR", "1"),
+      shellExport(preloadHintVariable, hookLibraryPath),
       shellExport("PORT_MANAGER_ROUTES_FILE", getRouteTablePathForNetwork(networkId)),
       shellExport("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath()),
       shellExport("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath()),
@@ -4420,7 +4640,6 @@ export class PortManagerNetworkService implements DisposableLike {
 
     if (process.platform === "darwin" && shellEnvRestorePath !== undefined) {
       commands.push(
-        shellExport("PORT_MANAGER_DYLD_INSERT_LIBRARIES", hookLibraryPath),
         `export PORT_MANAGER_PREV_BASH_ENV="\${BASH_ENV:-}"`,
         shellExport("BASH_ENV", shellEnvRestorePath),
       );
@@ -4429,7 +4648,7 @@ export class PortManagerNetworkService implements DisposableLike {
     if (runtimeShimDirectory !== undefined) {
       commands.push(
         shellExport(RUNTIME_SHIM_DIRECTORY_ENV, runtimeShimDirectory),
-        `export PATH=${shellQuote(runtimeShimDirectory)}:"$PATH"`,
+        shellPrependPathListEntry("PATH", runtimeShimDirectory),
         "hash -r 2>/dev/null || true",
       );
     }
@@ -4501,6 +4720,7 @@ export class PortManagerNetworkService implements DisposableLike {
       ACTUAL_LOOPBACK_HOST_ENV,
       NETWORK_LOOPBACK_HOST_ENV,
       "PORT_MANAGER_DYLD_INSERT_LIBRARIES",
+      "PORT_MANAGER_LD_PRELOAD",
       RUNTIME_SHIM_DIRECTORY_ENV,
     ];
     const commands = [
@@ -4519,12 +4739,10 @@ export class PortManagerNetworkService implements DisposableLike {
       );
     }
 
-    commands.push(
-      `if [ "\${${preloadVariable}:-}" = ${shellQuote(hookLibraryPath)} ]; then unset ${preloadVariable}; else export ${preloadVariable}="\${${preloadVariable}#${shellPatternLiteral(`${hookLibraryPath}:`)}}"; fi`,
-    );
+    commands.push(shellRemovePathListEntry(preloadVariable, hookLibraryPath));
 
     if (runtimeShimDirectory !== undefined) {
-      commands.push(`export PATH="\${PATH#${shellPatternLiteral(`${runtimeShimDirectory}:`)}}"`, "hash -r 2>/dev/null || true");
+      commands.push(shellRemovePathListEntry("PATH", runtimeShimDirectory), "hash -r 2>/dev/null || true");
     }
 
     commands.push(
@@ -6950,7 +7168,49 @@ function shellExport(name: string, value: string): string {
 }
 
 function shellPrependLibrary(name: string, libraryPath: string): string {
-  return `export ${name}=${shellQuote(libraryPath)}\${${name}:+":$${name}"}`;
+  return shellPrependPathListEntry(name, libraryPath);
+}
+
+function shellPrependPathListEntry(name: string, entry: string): string {
+  return [
+    '__pm_path_rest=""',
+    '__pm_old_ifs="${IFS}"',
+    "IFS=:",
+    `for __pm_path_entry in \${${name}:-}; do`,
+    `  if [ -z "$__pm_path_entry" ] || [ "$__pm_path_entry" = ${shellQuote(entry)} ]; then`,
+    "    continue",
+    "  fi",
+    '  if [ -z "$__pm_path_rest" ]; then',
+    '    __pm_path_rest="$__pm_path_entry"',
+    "  else",
+    '    __pm_path_rest="$__pm_path_rest:$__pm_path_entry"',
+    "  fi",
+    "done",
+    'IFS="${__pm_old_ifs}"',
+    `export ${name}=${shellQuote(entry)}\${__pm_path_rest:+:$__pm_path_rest}`,
+    "unset __pm_path_entry __pm_path_rest __pm_old_ifs",
+  ].join("\n");
+}
+
+function shellRemovePathListEntry(name: string, entry: string): string {
+  return [
+    '__pm_path_rest=""',
+    '__pm_old_ifs="${IFS}"',
+    "IFS=:",
+    `for __pm_path_entry in \${${name}:-}; do`,
+    `  if [ -z "$__pm_path_entry" ] || [ "$__pm_path_entry" = ${shellQuote(entry)} ]; then`,
+    "    continue",
+    "  fi",
+    '  if [ -z "$__pm_path_rest" ]; then',
+    '    __pm_path_rest="$__pm_path_entry"',
+    "  else",
+    '    __pm_path_rest="$__pm_path_rest:$__pm_path_entry"',
+    "  fi",
+    "done",
+    'IFS="${__pm_old_ifs}"',
+    `if [ -n "$__pm_path_rest" ]; then export ${name}="$__pm_path_rest"; else unset ${name}; fi`,
+    "unset __pm_path_entry __pm_path_rest __pm_old_ifs",
+  ].join("\n");
 }
 
 /**
@@ -7132,6 +7392,126 @@ function buildBrowserNetworkProxyOwnerControlPath(kind: "owner" | "lock"): strin
   return path.join(parsedPath.dir, `${parsedPath.name.replace("routes", "browser-network-proxy-owner")}.${kind}`);
 }
 
+function buildControlPlaneOwnerControlPath(kind: "owner" | "lock"): string {
+  const routeTablePath = getDefaultRouteTablePath();
+  const parsedPath = path.parse(routeTablePath);
+  return path.join(parsedPath.dir, `${parsedPath.name.replace("routes", "control-plane-owner")}.${kind}`);
+}
+
+/**
+ * Elects one VS Code extension host to run automatic control-plane side effects.
+ * This keeps Docker/Podman discovery, terminal marker polling, generated-file
+ * repair, and terminal env collection refresh from multiplying by window count.
+ */
+function tryAcquireControlPlaneOwnerLease(): boolean {
+  const nowMs = Date.now();
+  const owner = readControlPlaneOwner();
+  if (owner?.pid === process.pid) {
+    return writeControlPlaneOwnerLease(nowMs);
+  }
+
+  if (isActiveControlPlaneOwner(owner, nowMs)) {
+    return false;
+  }
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let lockFd: number | undefined;
+
+    try {
+      ensureControlPlaneOwnerControlDirectory();
+      lockFd = syncFs.openSync(CONTROL_PLANE_OWNER_LOCK_PATH, "wx");
+      syncFs.writeFileSync(lockFd, `${process.pid}\n${new Date(nowMs).toISOString()}\n`, "utf8");
+    } catch (error) {
+      if (lockFd !== undefined) {
+        closeFileDescriptor(lockFd);
+      }
+
+      if (isNodeErrorWithCode(error, "EEXIST")) {
+        removeStaleControlPlaneOwnerLock();
+        continue;
+      }
+
+      return false;
+    }
+
+    try {
+      const currentOwner = readControlPlaneOwner();
+      if (currentOwner?.pid !== process.pid && isActiveControlPlaneOwner(currentOwner, nowMs)) {
+        return false;
+      }
+
+      return writeControlPlaneOwnerLease(nowMs);
+    } finally {
+      closeFileDescriptor(lockFd);
+      try {
+        syncFs.rmSync(CONTROL_PLANE_OWNER_LOCK_PATH, { force: true });
+      } catch {
+        // A stale lock will be removed by a later owner election attempt.
+      }
+    }
+  }
+
+  return false;
+}
+
+function releaseControlPlaneOwnerLease(): void {
+  const owner = readControlPlaneOwner();
+  if (owner?.pid !== process.pid) {
+    return;
+  }
+
+  try {
+    syncFs.rmSync(CONTROL_PLANE_OWNER_PATH, { force: true });
+  } catch {
+    // Stale owner leases expire naturally when another window refreshes routing.
+  }
+}
+
+function readControlPlaneOwner(): LogicalRouterOwnerDocument | undefined {
+  return readOwnerDocument(CONTROL_PLANE_OWNER_PATH);
+}
+
+function writeControlPlaneOwnerLease(nowMs: number): boolean {
+  try {
+    ensureControlPlaneOwnerControlDirectory();
+    syncFs.writeFileSync(
+      CONTROL_PLANE_OWNER_PATH,
+      `${JSON.stringify({ pid: process.pid, updatedAt: new Date(nowMs).toISOString() })}\n`,
+      "utf8",
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isActiveControlPlaneOwner(owner: LogicalRouterOwnerDocument | undefined, nowMs: number): boolean {
+  if (owner === undefined) {
+    return false;
+  }
+
+  if (nowMs - Date.parse(owner.updatedAt) >= CONTROL_PLANE_OWNER_LEASE_MS) {
+    return false;
+  }
+
+  return isProcessAlive(owner.pid);
+}
+
+function removeStaleControlPlaneOwnerLock(): void {
+  try {
+    const stats = syncFs.statSync(CONTROL_PLANE_OWNER_LOCK_PATH);
+    if (Date.now() - stats.mtimeMs >= CONTROL_PLANE_OWNER_LOCK_STALE_MS) {
+      syncFs.rmSync(CONTROL_PLANE_OWNER_LOCK_PATH, { force: true });
+    }
+  } catch {
+    // Missing lock files are expected between owner election attempts.
+  }
+}
+
+function ensureControlPlaneOwnerControlDirectory(): void {
+  syncFs.mkdirSync(path.dirname(CONTROL_PLANE_OWNER_PATH), { recursive: true });
+}
+
 /**
  * Elects one VS Code extension host to own localhost logical router processes.
  * Logical routers bind fixed localhost ports, so letting every window reconcile
@@ -7270,10 +7650,10 @@ function releaseBrowserNetworkProxyOwnerLease(): void {
   }
 }
 
-function readBrowserNetworkProxyOwner(): LogicalRouterOwnerDocument | undefined {
+function readOwnerDocument(filePath: string): LogicalRouterOwnerDocument | undefined {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(syncFs.readFileSync(BROWSER_NETWORK_PROXY_OWNER_PATH, "utf8"));
+    parsed = JSON.parse(syncFs.readFileSync(filePath, "utf8"));
   } catch {
     return undefined;
   }
@@ -7291,6 +7671,10 @@ function readBrowserNetworkProxyOwner(): LogicalRouterOwnerDocument | undefined 
   }
 
   return { pid: owner.pid, updatedAt: owner.updatedAt };
+}
+
+function readBrowserNetworkProxyOwner(): LogicalRouterOwnerDocument | undefined {
+  return readOwnerDocument(BROWSER_NETWORK_PROXY_OWNER_PATH);
 }
 
 function writeBrowserNetworkProxyOwnerLease(nowMs: number): boolean {
@@ -7335,26 +7719,7 @@ function ensureBrowserNetworkProxyOwnerControlDirectory(): void {
 }
 
 function readLogicalRouterOwner(): LogicalRouterOwnerDocument | undefined {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(syncFs.readFileSync(LOGICAL_ROUTER_OWNER_PATH, "utf8"));
-  } catch {
-    return undefined;
-  }
-
-  if (typeof parsed !== "object" || parsed === null) {
-    return undefined;
-  }
-
-  const owner = parsed as Partial<LogicalRouterOwnerDocument>;
-  if (typeof owner.pid !== "number" || !Number.isInteger(owner.pid) || owner.pid <= 0) {
-    return undefined;
-  }
-  if (typeof owner.updatedAt !== "string" || Number.isNaN(Date.parse(owner.updatedAt))) {
-    return undefined;
-  }
-
-  return { pid: owner.pid, updatedAt: owner.updatedAt };
+  return readOwnerDocument(LOGICAL_ROUTER_OWNER_PATH);
 }
 
 function writeLogicalRouterOwnerLease(nowMs: number): boolean {
