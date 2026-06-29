@@ -906,6 +906,23 @@ test("automatic control plane side effects use a single cross-window owner lease
   const ownerSignalStart = source.indexOf("private refreshOwnerLeaseFromFileSignal");
   const ownerSignalEnd = source.indexOf("private startTerminalAttachmentMarkerPolling", ownerSignalStart);
   const ownerSignalBody = source.slice(ownerSignalStart, ownerSignalEnd);
+  const routingConvergeIndex = ownerServicesBody.indexOf("await this.convergeDaemonAndRoutingState();");
+  const runtimeRefreshIndex = ownerServicesBody.indexOf(
+    "await this.refreshRuntimeDescriptors({ includeContainerRuntime: true });",
+  );
+  const terminalEnvironmentRefreshIndex = ownerServicesBody.indexOf(
+    "await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });",
+  );
+  const persistedExposureIndex = ownerServicesBody.indexOf("await this.reopenPersistedExposures();");
+  const composeRepairIndex = ownerServicesBody.indexOf(
+    "await this.repairPersistedPortManagerCloneComposeAttachments();",
+  );
+  const composePublishedPortsIndex = ownerServicesBody.indexOf(
+    "await this.reconcileComposeAttachmentPublishedPorts({ force: true });",
+  );
+  const containerRefreshIndex = ownerServicesBody.indexOf("void this.refreshContainerServices({ background: true });");
+  const routingSignalIndex = ownerServicesBody.indexOf("this.startRoutingSignalRefreshLoop();");
+  const markerPollingIndex = ownerServicesBody.indexOf("this.startTerminalAttachmentMarkerPolling();");
 
   assert.equal(source.includes("CONTROL_PLANE_OWNER_LEASE_MS = 120_000"), true);
   assert.equal(source.includes("CONTROL_PLANE_OWNER_LOCK_STALE_MS = 30_000"), true);
@@ -931,6 +948,17 @@ test("automatic control plane side effects use a single cross-window owner lease
   assert.equal(ownerServicesBody.includes("await this.convergeDaemonAndRoutingState();"), true);
   assert.equal(ownerServicesBody.includes("this.startRoutingSignalRefreshLoop();"), true);
   assert.equal(ownerServicesBody.includes("this.startTerminalAttachmentMarkerPolling();"), true);
+  assert.equal(ownerServicesBody.includes("Terminal hook agent calls have a short startup budget."), true);
+  assert.equal(routingConvergeIndex < runtimeRefreshIndex, true);
+  assert.equal(routingSignalIndex < runtimeRefreshIndex, true);
+  assert.equal(markerPollingIndex < runtimeRefreshIndex, true);
+  assert.equal(runtimeRefreshIndex < terminalEnvironmentRefreshIndex, true);
+  assert.equal(routingConvergeIndex < persistedExposureIndex, true);
+  assert.equal(routingConvergeIndex < composeRepairIndex, true);
+  assert.equal(routingConvergeIndex < composePublishedPortsIndex, true);
+  assert.equal(routingSignalIndex < composeRepairIndex, true);
+  assert.equal(markerPollingIndex < composeRepairIndex, true);
+  assert.equal(composePublishedPortsIndex < containerRefreshIndex, true);
   assert.equal(registrySideEffectBody.includes("!this.ownsControlPlaneLease || !tryAcquireControlPlaneOwnerLease()"), true);
   assert.equal(registrySideEffectBody.includes("void this.writeHostAccessBindingsFile();"), true);
   assert.equal(applyBody.includes("if (!this.ownsControlPlaneLease)"), true);

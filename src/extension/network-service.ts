@@ -664,6 +664,17 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Runs startup convergence only in the elected owner window. */
   private async startControlPlaneOwnerServices(): Promise<void> {
+    /*
+     * Terminal hook agent calls have a short startup budget. Bring up the daemon,
+     * generated route files, and localhost routers before Docker runtime probing
+     * and Compose repair work so a cold VS Code launch can route immediately
+     * instead of waiting for the slower control-plane reconciliation path.
+     */
+    await this.convergeDaemonAndRoutingState();
+    await this.syncLogicalPortRouters();
+    this.startRoutingSignalRefreshLoop();
+    this.startTerminalAttachmentMarkerPolling();
+
     await this.refreshRuntimeDescriptors({ includeContainerRuntime: true });
     await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
     await this.reopenPersistedExposures();
@@ -678,11 +689,8 @@ export class PortManagerNetworkService implements DisposableLike {
     void this.maybeAutoInstallBrowserDnsResolvers();
     await this.refreshTerminals();
     void this.refreshContainerServices({ background: true });
-    await this.convergeDaemonAndRoutingState();
     await this.syncLogicalPortRouters();
     await this.syncBrowserNetworkProxies();
-    this.startRoutingSignalRefreshLoop();
-    this.startTerminalAttachmentMarkerPolling();
   }
 
   /** Runs registry side effects only in the control-plane owner window. */
