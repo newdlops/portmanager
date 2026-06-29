@@ -343,6 +343,30 @@ test("moves a terminal attachment when the same terminal joins another network",
   assert.equal(attachments[0]?.networkId, "network-2");
 });
 
+test("keeps terminal attachments distinct when attach sessions differ", () => {
+  const registry = new LogicalNetworkRegistry([runtime]);
+  registry.addNetwork(createNetwork());
+  registry.addNetwork(createNetwork({ id: "network-2", name: "B app" }));
+
+  registry.addAttachment(createTerminalAttachment({ terminalSessionId: "session-alpha" }));
+  registry.addAttachment(
+    createTerminalAttachment({
+      id: "attachment-2",
+      networkId: "network-2",
+      terminalSessionId: "session-production",
+      attachedAt: "2026-06-22T00:05:00.000Z",
+    }),
+  );
+
+  const attachments = registry.getSnapshot().attachments;
+
+  assert.equal(attachments.length, 2);
+  assert.deepEqual(
+    attachments.map((attachment) => attachment.networkId).sort(),
+    ["network-1", "network-2"],
+  );
+});
+
 test("loads persisted duplicate terminal attachments as one latest row", () => {
   const registry = new LogicalNetworkRegistry([runtime], {
     networks: [createNetwork(), createNetwork({ id: "network-2", name: "B app" })],

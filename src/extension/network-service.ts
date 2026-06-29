@@ -124,6 +124,7 @@ const COMPOSE_PROJECT_ROUTING_COMPOSE_SEPARATOR = ".compose-";
 const TERMINAL_ATTACHMENT_MARKER_DIRECTORY_NAME = "terminal-attachments";
 const TERMINAL_HOOK_SCRIPT_DIRECTORY_NAME = "terminal-hook-scripts";
 const TERMINAL_NETWORK_SELECTION_FILE_NAME = "terminal-networks.tsv";
+const RUNTIME_SHIM_DIRECTORY_NAME = "runtime-shims";
 const MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX = "manual-terminal:";
 const PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX = "process-terminal:";
 const ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 60_000;
@@ -273,6 +274,7 @@ interface BindingPresetHostAccess {
 
 interface TerminalAttachmentMarker {
   readonly networkId: string;
+  readonly terminalSessionId?: string;
   readonly terminalId?: string;
   readonly pid?: number;
   readonly processGroupId?: number;
@@ -3623,7 +3625,14 @@ export class PortManagerNetworkService implements DisposableLike {
     return filePaths;
   }
 
-  /** Collects every direct child of VS Code's extension globalStorage directory. */
+  /**
+   * Collects globalStorage children that can be removed without breaking live shells.
+   *
+   * Existing terminals keep hashed command paths and BASH_ENV/script paths from
+   * the moment they were attached. Removing those hook assets makes the next
+   * `yarn`/`docker` lookup fail before Port Manager can repair the environment,
+   * so cleanup preserves them and refreshes their contents during rehydration.
+   */
   private async collectGlobalStorageCleanupPaths(): Promise<ReadonlySet<string>> {
     const filePaths = new Set<string>();
     let entries: readonly Dirent[];
@@ -3638,6 +3647,10 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     for (const entry of entries) {
+      if (isLiveTerminalHookStorageEntry(entry.name)) {
+        continue;
+      }
+
       filePaths.add(path.join(this.context.globalStorageUri.fsPath, entry.name));
     }
 
@@ -3789,8 +3802,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
       nextAttachmentCandidates.push({
         attachment: {
-          id: createManualTerminalAttachmentId(marker.networkId, terminalWindow.id),
+          id: createManualTerminalAttachmentId(marker.networkId, terminalWindow.id, marker.terminalSessionId),
           networkId: network.id,
+          ...(marker.terminalSessionId !== undefined ? { terminalSessionId: marker.terminalSessionId } : {}),
           rootPid: terminalWindow.rootPid,
           processGroupId: terminalWindow.processGroupId ?? marker.processGroupId,
           terminalWindowId: terminalWindow.id,
@@ -3879,7 +3893,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const processGroupId =
       terminalWindow.processGroupId ?? terminalRowsByPid.get(terminalWindow.rootPid)?.processGroupId;
     const markerKey = sanitizeTerminalAttachmentMarkerKey(
-      terminalId.length > 0 ? terminalId : `pid-${terminalWindow.rootPid}`,
+      attachment.terminalSessionId ?? (terminalId.length > 0 ? terminalId : `pid-${terminalWindow.rootPid}`),
     );
     const markerPath = path.join(this.getTerminalAttachmentMarkerDirectoryPath(), `${markerKey}.tsv`);
     const markerRow = [
@@ -3888,6 +3902,7 @@ export class PortManagerNetworkService implements DisposableLike {
       String(terminalWindow.rootPid),
       processGroupId === undefined ? "" : String(processGroupId),
       attachment.attachedAt,
+      attachment.terminalSessionId ?? "",
     ].join("\t");
 
     await fs.mkdir(path.dirname(markerPath), { recursive: true });
@@ -4138,6 +4153,7 @@ export class PortManagerNetworkService implements DisposableLike {
     commands.push(buildLoopbackAddressRoutingShell(loopbackAddressForNetwork(networkId), resolveLoopbackAddressRoutingMode(settings)));
     commands.push(buildAgentDaemonEnsureShell(process.execPath));
     commands.push(`if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" != "1" ]; then return 1 2>/dev/null || exit 1; fi`);
+    commands.push(buildTerminalSessionIsolationShell());
 
     if (process.platform === "darwin" && shellEnvRestorePath !== undefined) {
       commands.push(
@@ -4192,6 +4208,9 @@ export class PortManagerNetworkService implements DisposableLike {
       "PORT_MANAGER_BORROWED_NETWORK_ID",
       "NEWDLOPS_PM_NETWORK_ID",
       "NEWDLOPS_PM_BORROWED_NETWORK_ID",
+      "PORT_MANAGER_TERMINAL_SESSION_ID",
+      "PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID",
+      "PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID",
       "PORT_MANAGER_AGENT_SOCKET",
       "PORT_MANAGER_AGENT_MAIN",
       "PORT_MANAGER_AGENT_EXECUTABLE",
@@ -5074,6 +5093,14 @@ function isGeneratedRouteTableFile(entryName: string, baseRouteTablePath: string
   const extension = parsedPath.ext.length > 0 ? parsedPath.ext : ".json";
 
   return entryName === parsedPath.base || (entryName.startsWith(`${parsedPath.name}-`) && entryName.endsWith(extension));
+}
+
+function isLiveTerminalHookStorageEntry(entryName: string): boolean {
+  return (
+    entryName === RUNTIME_SHIM_DIRECTORY_NAME ||
+    entryName === TERMINAL_HOOK_SCRIPT_DIRECTORY_NAME ||
+    entryName.startsWith("portmanager-bash-env")
+  );
 }
 
 function isGeneratedHostAccessFile(entryName: string, baseHostAccessPath: string): boolean {
@@ -6284,10 +6311,15 @@ function isTerminalWindowMarkerMatch(marker: TerminalAttachmentMarker, terminalW
 }
 
 /** Keeps manual attachment ids deterministic so refresh can update them idempotently. */
-function createManualTerminalAttachmentId(networkId: string, terminalWindowId: string): string {
+function createManualTerminalAttachmentId(
+  networkId: string,
+  terminalWindowId: string,
+  terminalSessionId: string | undefined,
+): string {
+  const sessionSuffix = terminalSessionId === undefined ? "" : `:${encodeURIComponent(terminalSessionId)}`;
   return `${MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX}${encodeURIComponent(networkId)}:${encodeURIComponent(
     terminalWindowId,
-  )}`;
+  )}${sessionSuffix}`;
 }
 
 /** Keeps explicit process attachments stable across repeated user actions. */
@@ -6336,8 +6368,10 @@ function parseTerminalAttachmentMarker(contents: string, filePath: string): Term
     return undefined;
   }
 
-  const [networkIdText, terminalIdText, pidText, processGroupIdText, attachedAtText] = line.split("\t");
+  const [networkIdText, terminalIdText, pidText, processGroupIdText, attachedAtText, terminalSessionIdText] =
+    line.split("\t");
   const networkId = networkIdText?.trim();
+  const terminalSessionId = normalizeTerminalSessionId(terminalSessionIdText);
 
   if (networkId === undefined || networkId.length === 0) {
     return undefined;
@@ -6350,12 +6384,18 @@ function parseTerminalAttachmentMarker(contents: string, filePath: string): Term
 
   return {
     networkId,
+    ...(terminalSessionId !== undefined ? { terminalSessionId } : {}),
     terminalId: normalizeProcessTerminalId(terminalIdText),
     pid: parseOptionalPositiveInteger(pidText),
     processGroupId: parseOptionalPositiveInteger(processGroupIdText),
     attachedAt,
     filePath,
   };
+}
+
+function normalizeTerminalSessionId(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed === undefined || trimmed.length === 0 ? undefined : trimmed;
 }
 
 /** Parses optional shell marker ids without treating blanks as zero. */
@@ -6565,6 +6605,23 @@ function buildTerminalTitleShell(title: string): string {
   return `printf '\\033]0;%s\\007' ${shellQuote(title)} 2>/dev/null || true`;
 }
 
+/** Shell fragment that starts a new Port Manager terminal attachment generation. */
+function buildTerminalSessionIsolationShell(): string {
+  return [
+    '__pm_tty="$(tty 2>/dev/null || true)"',
+    '__pm_tty="${__pm_tty#/dev/}"',
+    'if [ "$__pm_tty" = "not a tty" ]; then __pm_tty=""; fi',
+    '__pm_pid="$$"',
+    '__pm_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d " " || true)"',
+    '__pm_session_time="$(date -u \'+%Y%m%dT%H%M%SZ\' 2>/dev/null || date \'+%Y%m%dT%H%M%SZ\')"',
+    '__pm_session_source="${PORT_MANAGER_NETWORK_ID}:${__pm_tty:-pid-$__pm_pid}:${__pm_pgid:-pgid-unknown}:$__pm_pid:$__pm_session_time"',
+    'export PORT_MANAGER_TERMINAL_SESSION_ID="$(printf \'%s\' "$__pm_session_source" | sed \'s#[^A-Za-z0-9._-]#_#g\')"',
+    'export PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID="$PORT_MANAGER_NETWORK_ID"',
+    'if [ -n "$__pm_pgid" ]; then export PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID="$__pm_pgid"; else unset PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID; fi',
+    "unset __pm_tty __pm_pid __pm_pgid __pm_session_time __pm_session_source",
+  ].join("; ");
+}
+
 /** Shell fragment that records a manually routed shell for later sidebar refresh. */
 function buildTerminalAttachmentMarkerWriteShell(): string {
   return [
@@ -6574,9 +6631,10 @@ function buildTerminalAttachmentMarkerWriteShell(): string {
     'if [ "$__pm_tty" = "not a tty" ]; then __pm_tty=""; fi',
     '__pm_pid="$$"',
     '__pm_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d " " || true)"',
-    '__pm_marker_key="$(printf \'%s\' "${__pm_tty:-pid-$__pm_pid}" | sed \'s#[^A-Za-z0-9._-]#_#g\')"',
-    'printf \'%s\\t%s\\t%s\\t%s\\t%s\\n\' "$PORT_MANAGER_NETWORK_ID" "$__pm_tty" "$__pm_pid" "$__pm_pgid" "$(date -u \'+%Y-%m-%dT%H:%M:%SZ\' 2>/dev/null || date \'+%Y-%m-%dT%H:%M:%SZ\')" > "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR/$__pm_marker_key.tsv" 2>/dev/null || true',
-    "unset __pm_tty __pm_pid __pm_pgid __pm_marker_key",
+    '__pm_marker_identity="${PORT_MANAGER_TERMINAL_SESSION_ID:-${__pm_tty:-pid-$__pm_pid}}"',
+    '__pm_marker_key="$(printf \'%s\' "$__pm_marker_identity" | sed \'s#[^A-Za-z0-9._-]#_#g\')"',
+    'printf \'%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\' "$PORT_MANAGER_NETWORK_ID" "$__pm_tty" "$__pm_pid" "$__pm_pgid" "$(date -u \'+%Y-%m-%dT%H:%M:%SZ\' 2>/dev/null || date \'+%Y-%m-%dT%H:%M:%SZ\')" "${PORT_MANAGER_TERMINAL_SESSION_ID:-}" > "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR/$__pm_marker_key.tsv" 2>/dev/null || true',
+    "unset __pm_tty __pm_pid __pm_pgid __pm_marker_identity __pm_marker_key",
   ].join("; ");
 }
 
@@ -6588,9 +6646,10 @@ function buildTerminalAttachmentMarkerRemoveShell(): string {
     '__pm_tty="${__pm_tty#/dev/}"',
     'if [ "$__pm_tty" = "not a tty" ]; then __pm_tty=""; fi',
     '__pm_pid="$$"',
-    '__pm_marker_key="$(printf \'%s\' "${__pm_tty:-pid-$__pm_pid}" | sed \'s#[^A-Za-z0-9._-]#_#g\')"',
+    '__pm_marker_identity="${PORT_MANAGER_TERMINAL_SESSION_ID:-${__pm_tty:-pid-$__pm_pid}}"',
+    '__pm_marker_key="$(printf \'%s\' "$__pm_marker_identity" | sed \'s#[^A-Za-z0-9._-]#_#g\')"',
     'rm -f "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR/$__pm_marker_key.tsv" 2>/dev/null || true',
-    "unset __pm_tty __pm_pid __pm_marker_key",
+    "unset __pm_tty __pm_pid __pm_marker_identity __pm_marker_key",
     "fi",
   ].join("\n");
 }

@@ -179,6 +179,18 @@ test("runtime shim directory removes reverted clean-run artifacts before rewriti
   assert.equal(staleCheckBody.includes('"__pm_exec_without_port_manager_preload"'), true);
 });
 
+test("global storage cleanup preserves live terminal hook assets", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+
+  assert.equal(source.includes('const RUNTIME_SHIM_DIRECTORY_NAME = "runtime-shims";'), true);
+  assert.equal(source.includes("function isLiveTerminalHookStorageEntry"), true);
+  assert.equal(source.includes("entryName === RUNTIME_SHIM_DIRECTORY_NAME"), true);
+  assert.equal(source.includes("entryName === TERMINAL_HOOK_SCRIPT_DIRECTORY_NAME"), true);
+  assert.equal(source.includes('entryName.startsWith("portmanager-bash-env")'), true);
+  assert.equal(source.includes("if (isLiveTerminalHookStorageEntry(entry.name))"), true);
+});
+
 test("global shell hook keeps no-network shells out of native preload routing", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/commands.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
@@ -227,6 +239,40 @@ test("terminal attach and detach commands source generated script files", () => 
     true,
     "detach marker removal must be multiline so `then` is not followed by an invalid semicolon",
   );
+});
+
+test("terminal attach markers are scoped by terminal session id", () => {
+  const networkServicePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const composeRoutingPath = path.resolve(__dirname, "../../../src/extension/compose-project-routing.ts");
+  const registryPath = path.resolve(__dirname, "../../../src/core/networks/logical-network-registry.ts");
+  const commandSourcePath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const networkServiceSource = fs.readFileSync(networkServicePath, "utf8");
+  const composeRoutingSource = fs.readFileSync(composeRoutingPath, "utf8");
+  const registrySource = fs.readFileSync(registryPath, "utf8");
+  const commandSource = fs.readFileSync(commandSourcePath, "utf8");
+
+  assert.equal(networkServiceSource.includes("function buildTerminalSessionIsolationShell(): string"), true);
+  assert.equal(networkServiceSource.includes("PORT_MANAGER_TERMINAL_SESSION_ID"), true);
+  assert.equal(networkServiceSource.includes("PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID"), true);
+  assert.equal(networkServiceSource.includes("buildTerminalSessionIsolationShell()"), true);
+  assert.equal(
+    networkServiceSource.includes(
+      "printf \\'%s\\\\t%s\\\\t%s\\\\t%s\\\\t%s\\\\t%s\\\\n\\' \"$PORT_MANAGER_NETWORK_ID\"",
+    ),
+    true,
+  );
+  assert.equal(networkServiceSource.includes('attachment.terminalSessionId ?? (terminalId.length > 0'), true);
+  assert.equal(networkServiceSource.includes("normalizeTerminalSessionId"), true);
+  assert.equal(composeRoutingSource.includes("__pm_signal_identity=\"\\${PORT_MANAGER_TERMINAL_SESSION_ID:-"), true);
+  assert.equal(composeRoutingSource.includes("printf '%s\\\\t%s\\\\t%s\\\\t%s\\\\t%s\\\\t%s\\\\n'"), true);
+  assert.equal(
+    registrySource.includes(
+      "if (left.terminalSessionId !== undefined || right.terminalSessionId !== undefined)",
+    ),
+    true,
+  );
+  assert.equal(commandSource.includes("__pm_marker_identity=\"\\${PORT_MANAGER_TERMINAL_SESSION_ID:-"), true);
+  assert.equal(commandSource.includes("PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID"), true);
 });
 
 test("external pm shell function selects a network and sources its attach script", () => {

@@ -1007,9 +1007,10 @@ __port_manager_signal_terminal_attachment_changed() {
   if [ "\${__pm_signal_tty}" = "not a tty" ]; then __pm_signal_tty=""; fi
   __pm_signal_pid="$$"
   __pm_signal_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d " " || true)"
-  __pm_signal_key="$(printf '%s' "\${__pm_signal_tty:-pid-$__pm_signal_pid}" | sed 's#[^A-Za-z0-9._-]#_#g')"
-  printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "\${__pm_signal_network}" "\${__pm_signal_tty}" "\${__pm_signal_pid}" "\${__pm_signal_pgid}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%SZ')" > "\${PORT_MANAGER_TERMINAL_ATTACHMENT_DIR}/\${__pm_signal_key}.tsv" 2>/dev/null || true
-  unset __pm_signal_network __pm_signal_tty __pm_signal_pid __pm_signal_pgid __pm_signal_key
+  __pm_signal_identity="\${PORT_MANAGER_TERMINAL_SESSION_ID:-\${__pm_signal_tty:-pid-$__pm_signal_pid}}"
+  __pm_signal_key="$(printf '%s' "\${__pm_signal_identity}" | sed 's#[^A-Za-z0-9._-]#_#g')"
+  printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "\${__pm_signal_network}" "\${__pm_signal_tty}" "\${__pm_signal_pid}" "\${__pm_signal_pgid}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%SZ')" "\${PORT_MANAGER_TERMINAL_SESSION_ID:-}" > "\${PORT_MANAGER_TERMINAL_ATTACHMENT_DIR}/\${__pm_signal_key}.tsv" 2>/dev/null || true
+  unset __pm_signal_network __pm_signal_tty __pm_signal_pid __pm_signal_pgid __pm_signal_identity __pm_signal_key
 }
 
 __port_manager_route_table_generation() {

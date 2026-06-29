@@ -568,6 +568,10 @@ function sameJsonList<T>(left: readonly T[], right: readonly T[]): boolean {
  * pasted hook scripts, and process-only attach rows converge to one network.
  */
 export function terminalAttachmentsShareIdentity(left: TerminalAttachment, right: TerminalAttachment): boolean {
+  if (left.terminalSessionId !== undefined || right.terminalSessionId !== undefined) {
+    return left.terminalSessionId !== undefined && left.terminalSessionId === right.terminalSessionId;
+  }
+
   if (left.terminalWindowId !== undefined && left.terminalWindowId === right.terminalWindowId) {
     return true;
   }

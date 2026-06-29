@@ -3119,6 +3119,7 @@ else
   export PORT_MANAGER_HOOK_DISABLED=1
   export PORT_MANAGER_HOOK_DAEMON_STARTED=0
   unset PORT_MANAGER_DYLD_INSERT_LIBRARIES
+  unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID
   ${escapedShellEnvRestorePath !== undefined ? `if [ -n "\${PORT_MANAGER_PREV_BASH_ENV:-}" ] && [ "\${BASH_ENV:-}" = "${escapedShellEnvRestorePath}" ]; then export BASH_ENV="\${PORT_MANAGER_PREV_BASH_ENV}"; elif [ "\${BASH_ENV:-}" = "${escapedShellEnvRestorePath}" ]; then unset BASH_ENV; fi` : ""}
   unset PORT_MANAGER_PREV_BASH_ENV
   if [ "\${DYLD_INSERT_LIBRARIES:-}" = "${escapedHookLibraryPath}" ]; then unset DYLD_INSERT_LIBRARIES; else export DYLD_INSERT_LIBRARIES="\${DYLD_INSERT_LIBRARIES#${shellPatternLiteral(`${options.hookLibraryPath}:`)}}"; fi
@@ -3277,12 +3278,13 @@ pm() {
       __pm_tty="\${__pm_tty#/dev/}"
       if [ "$__pm_tty" = "not a tty" ]; then __pm_tty=""; fi
       __pm_pid="$$"
-      __pm_marker_key="$(printf '%s' "\${__pm_tty:-pid-$__pm_pid}" | sed 's#[^A-Za-z0-9._-]#_#g')"
+      __pm_marker_identity="\${PORT_MANAGER_TERMINAL_SESSION_ID:-\${__pm_tty:-pid-$__pm_pid}}"
+      __pm_marker_key="$(printf '%s' "$__pm_marker_identity" | sed 's#[^A-Za-z0-9._-]#_#g')"
       rm -f "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR/$__pm_marker_key.tsv" 2>/dev/null || true
     fi
     printf '\\033]0;%s\\007' 'Port Manager: detached' 2>/dev/null || true
     if [ -n "\${PORT_MANAGER_GLOBAL_ROUTES_FILE:-}" ]; then export PORT_MANAGER_ROUTES_FILE="$PORT_MANAGER_GLOBAL_ROUTES_FILE"; else unset PORT_MANAGER_ROUTES_FILE; fi
-    unset PORT_MANAGER_HOOK PORT_MANAGER_HOOK_DISABLED PORT_MANAGER_NETWORK_ID PORT_MANAGER_NETWORK_NAME PORT_MANAGER_ROUTE_TABLE_NETWORK_ID PORT_MANAGER_BORROWED_NETWORK_ID NEWDLOPS_PM_NETWORK_ID NEWDLOPS_PM_BORROWED_NETWORK_ID PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_COMPOSE_LOGICAL_PORTS PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS PORT_MANAGER_TERMINAL_ATTACHMENT_DIR PORT_MANAGER_SCAN_RANGE PORT_MANAGER_ROUTING_MODE PORT_MANAGER_VIRTUAL_PORT_START PORT_MANAGER_VIRTUAL_PORT_END PORT_MANAGER_FIXED_PROTOCOL_PORTS PORT_MANAGER_PRESERVE_LISTEN_PORTS ${ACTUAL_LOOPBACK_HOST_ENV} PORT_MANAGER_NETWORK_LOOPBACK_HOST PORT_MANAGER_DYLD_INSERT_LIBRARIES
+    unset PORT_MANAGER_HOOK PORT_MANAGER_HOOK_DISABLED PORT_MANAGER_NETWORK_ID PORT_MANAGER_NETWORK_NAME PORT_MANAGER_ROUTE_TABLE_NETWORK_ID PORT_MANAGER_BORROWED_NETWORK_ID NEWDLOPS_PM_NETWORK_ID NEWDLOPS_PM_BORROWED_NETWORK_ID PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_COMPOSE_LOGICAL_PORTS PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS PORT_MANAGER_TERMINAL_ATTACHMENT_DIR PORT_MANAGER_SCAN_RANGE PORT_MANAGER_ROUTING_MODE PORT_MANAGER_VIRTUAL_PORT_START PORT_MANAGER_VIRTUAL_PORT_END PORT_MANAGER_FIXED_PROTOCOL_PORTS PORT_MANAGER_PRESERVE_LISTEN_PORTS ${ACTUAL_LOOPBACK_HOST_ENV} PORT_MANAGER_NETWORK_LOOPBACK_HOST PORT_MANAGER_DYLD_INSERT_LIBRARIES
     export PORT_MANAGER_HOOK=0
     export PORT_MANAGER_HOOK_DISABLED=1
     export PORT_MANAGER_HOOK_DAEMON_STARTED=0
@@ -3294,7 +3296,7 @@ pm() {
     unset ${RUNTIME_SHIM_DIRECTORY_ENV}
     hash -r 2>/dev/null || true` : ""}
     unset -f docker podman docker-compose podman-compose /usr/local/bin/docker /opt/homebrew/bin/docker /usr/bin/docker /bin/docker /Applications/Docker.app/Contents/Resources/bin/docker /usr/local/bin/podman /opt/homebrew/bin/podman /usr/bin/podman /bin/podman /usr/local/bin/docker-compose /opt/homebrew/bin/docker-compose /usr/bin/docker-compose /bin/docker-compose /Applications/Docker.app/Contents/Resources/bin/docker-compose /usr/local/bin/podman-compose /opt/homebrew/bin/podman-compose /usr/bin/podman-compose /bin/podman-compose __port_manager_runtime_first_command __port_manager_runtime_container_subcommand __port_manager_network_id __port_manager_normalize_compose_file_path __port_manager_same_compose_file_path __port_manager_compose_args_reference_file __port_manager_compose_route_for_runtime __port_manager_cwd_matches_workdir __port_manager_container_target_for_runtime __port_manager_shell_quote __port_manager_signal_terminal_attachment_changed __port_manager_compose_command_may_change_endpoints __port_manager_runtime_command_may_reference_container __port_manager_run_runtime_with_container_routing __port_manager_run_compose_command_with_routing __port_manager_run_standalone_compose_with_routing __port_manager_define_absolute_runtime_function 2>/dev/null || true
-    unset __pm_tty __pm_pid __pm_marker_key
+    unset __pm_tty __pm_pid __pm_marker_identity __pm_marker_key
     printf '%s\n' 'Port Manager routing detached from this shell.'
     return 0
   fi

@@ -151,6 +151,8 @@ export interface TerminalAttachment {
   readonly id: string;
   /** Logical network that descendant processes should join. */
   readonly networkId: string;
+  /** Shell attach generation id used to keep repeated network attaches in one tty distinct. */
+  readonly terminalSessionId?: string;
   /** Selected terminal candidate root PID. */
   readonly rootPid: number;
   /** Process group used to apply runtime context where supported. */
