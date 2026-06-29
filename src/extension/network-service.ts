@@ -3784,6 +3784,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }).catch(() => undefined);
     await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
+    await this.rehydrateBrowserDnsAndProxies().catch(() => undefined);
     await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);
     await this.syncLogicalPortRouters();
     const restoredComposeRouteCount = this.registry
@@ -3808,6 +3809,20 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.writeTerminalNetworkSelectionFile();
     await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
     await this.reapplyRoutingToAttachedTerminalWindows();
+  }
+
+  /**
+   * Restores browser-facing DNS/proxy state after generated storage cleanup.
+   *
+   * Resolver files live outside globalStorage, but DNS records and browser proxy
+   * listeners are in-memory data plane state. Re-sync them here so browser aliases
+   * recover with the same command that rebuilds route tables and terminal shims.
+   */
+  private async rehydrateBrowserDnsAndProxies(): Promise<void> {
+    await this.startBrowserDnsServer().catch(() => undefined);
+    this.syncBrowserDnsRecords();
+    this.maybeAutoInstallBrowserDnsResolvers();
+    await this.syncBrowserNetworkProxies().catch(() => undefined);
   }
 
   /** Lists generated files in one directory without letting cleanup fail on missing folders. */

@@ -1354,9 +1354,27 @@ function inferProtocolName(port: number): string | undefined {
     case 6379:
     case 16379:
       return "redis";
+    case 5671:
+      return "amqps";
     case 5672:
+      return "amqp";
     case 15672:
-      return "rabbitmq";
+      return "rabbitmq-management";
+    case 1883:
+      return "mqtt";
+    case 4222:
+      return "nats";
+    case 50051:
+      return "grpc";
+    case 8883:
+      return "mqtts";
+    case 9092:
+      return "kafka";
+    case 27017:
+      return "mongodb";
+    case 9200:
+    case 9300:
+      return "elasticsearch";
     default:
       return undefined;
   }

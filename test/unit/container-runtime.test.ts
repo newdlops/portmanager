@@ -178,6 +178,35 @@ test("parses compose containers with published TCP ports as attach candidates", 
   );
 });
 
+test("infers common broker and RPC protocol labels from published compose ports", () => {
+  const candidates = parseContainerRows("docker", [
+    {
+      ID: "mq123",
+      Names: "workspace-rabbitmq-1",
+      Image: "rabbitmq:3-management",
+      Status: "Up 2 minutes",
+      Ports:
+        "127.0.0.1:5671->5671/tcp, 127.0.0.1:5672->5672/tcp, 127.0.0.1:15672->15672/tcp, " +
+        "127.0.0.1:1883->1883/tcp, 127.0.0.1:4222->4222/tcp, 127.0.0.1:9092->9092/tcp, " +
+        "127.0.0.1:50051->50051/tcp",
+      Labels:
+        "com.docker.compose.project=workspace,com.docker.compose.service=rabbitmq,com.docker.compose.project.config_files=/workspace/compose.yaml",
+    },
+  ]);
+
+  const portsByContainerPort = new Map(
+    candidates[0]?.ports.map((port) => [port.containerPort, port.protocolName] as const),
+  );
+
+  assert.equal(portsByContainerPort.get(5671), "amqps");
+  assert.equal(portsByContainerPort.get(5672), "amqp");
+  assert.equal(portsByContainerPort.get(15672), "rabbitmq-management");
+  assert.equal(portsByContainerPort.get(1883), "mqtt");
+  assert.equal(portsByContainerPort.get(4222), "nats");
+  assert.equal(portsByContainerPort.get(9092), "kafka");
+  assert.equal(portsByContainerPort.get(50051), "grpc");
+});
+
 test("parses Port Manager clone logical-port labels instead of hidden host ports", () => {
   const candidates = parseContainerRows("docker", [
     {

@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8041",
+  "version": "0.0.8042",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -821,20 +821,27 @@
             995,
             1433,
             1521,
+            1883,
             3306,
             33060,
+            4222,
             5432,
+            5671,
             5672,
             6379,
+            8883,
+            9092,
             9200,
             9300,
             11211,
-            27017
+            15672,
+            27017,
+            50051
           ],
           "items": {
             "type": "number"
           },
-          "description": "TCP ports that the native terminal hook leaves untouched because the port number itself identifies a fixed protocol such as SSH, MySQL, or PostgreSQL."
+          "description": "TCP ports that the native terminal hook leaves untouched because the port number itself identifies a fixed protocol such as SSH, MySQL, PostgreSQL, AMQP, MQTT, Kafka, or gRPC."
         },
         "portManager.preservedListenPorts": {
           "type": "array",

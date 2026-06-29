@@ -2474,14 +2474,40 @@ function looksStatefulService(port: ComposePublishedPort): boolean {
     "mysql",
     "mariadb",
     "redis",
+    "amqp",
+    "amqps",
     "rabbitmq",
+    "rabbitmq-management",
+    "mqtt",
+    "mqtts",
+    "kafka",
+    "nats",
     "mongodb",
     "mongo",
+    "grpc",
     "weaviate",
     "elasticsearch",
     "opensearch",
   ]);
-  const statefulPorts = new Set([5432, 3306, 33060, 6379, 5672, 15672, 27017, 9200, 9300, 7000, 8080, 50051]);
+  const statefulPorts = new Set([
+    5432,
+    3306,
+    33060,
+    6379,
+    5671,
+    5672,
+    15672,
+    1883,
+    4222,
+    8883,
+    9092,
+    27017,
+    9200,
+    9300,
+    7000,
+    8080,
+    50051,
+  ]);
 
   return (
     looksStatefulServiceName(port.serviceName) ||
@@ -2492,7 +2518,7 @@ function looksStatefulService(port: ComposePublishedPort): boolean {
 }
 
 function looksStatefulServiceName(serviceName: string): boolean {
-  return /\b(db|database|postgres|postgresql|mysql|mariadb|redis|rabbitmq|mongo|mongodb|weaviate|elastic|opensearch)\b/.test(
+  return /\b(db|database|postgres|postgresql|mysql|mariadb|redis|amqp|rabbitmq|mqtt|kafka|nats|mongo|mongodb|weaviate|elastic|opensearch)\b/.test(
     serviceName.toLowerCase().replace(/[-_]+/g, " "),
   );
 }

@@ -2427,17 +2427,46 @@ function inferStatefulComposeServices(candidate: ContainerServiceCandidate): rea
     const protocolName = port.protocolName?.toLowerCase();
     const statefulProtocol =
       protocolName !== undefined &&
-      ["postgresql", "postgres", "mysql", "mariadb", "redis", "rabbitmq", "mongodb", "mongo"].includes(
-        protocolName,
-      );
-    const statefulPort = [5432, 3306, 33060, 6379, 5672, 15672, 27017, 9200, 9300, 50051].includes(
-      port.containerPort,
-    );
+      [
+        "postgresql",
+        "postgres",
+        "mysql",
+        "mariadb",
+        "redis",
+        "amqp",
+        "amqps",
+        "rabbitmq",
+        "rabbitmq-management",
+        "mqtt",
+        "mqtts",
+        "kafka",
+        "nats",
+        "mongodb",
+        "mongo",
+        "grpc",
+      ].includes(protocolName);
+    const statefulPort = [
+      5432,
+      3306,
+      33060,
+      6379,
+      5671,
+      5672,
+      15672,
+      1883,
+      4222,
+      8883,
+      9092,
+      27017,
+      9200,
+      9300,
+      50051,
+    ].includes(port.containerPort);
 
     if (
       statefulProtocol ||
       statefulPort ||
-      /\b(db|database|postgres|postgresql|mysql|mariadb|redis|rabbitmq|mongo|mongodb|weaviate|elastic|opensearch)\b/.test(
+      /\b(db|database|postgres|postgresql|mysql|mariadb|redis|amqp|rabbitmq|mqtt|kafka|nats|mongo|mongodb|weaviate|elastic|opensearch)\b/.test(
         serviceName,
       )
     ) {
@@ -2554,8 +2583,27 @@ function inferProtocolName(port: number): string {
     case 16379:
     case 6379:
       return "redis";
+    case 5671:
+      return "amqps";
+    case 5672:
+      return "amqp";
     case 15672:
-      return "rabbitmq";
+      return "rabbitmq-management";
+    case 1883:
+      return "mqtt";
+    case 4222:
+      return "nats";
+    case 50051:
+      return "grpc";
+    case 8883:
+      return "mqtts";
+    case 9092:
+      return "kafka";
+    case 27017:
+      return "mongodb";
+    case 9200:
+    case 9300:
+      return "elasticsearch";
     default:
       return "";
   }

@@ -417,7 +417,7 @@ OS Listening Ports:
   "portManager.virtualPortRangeStart": 53000,
   "portManager.virtualPortRangeEnd": 59999,
   "portManager.preferredPorts": [3000, 3001, 5173, 8000, 8080],
-  "portManager.fixedProtocolPorts": [22, 25, 53, 80, 110, 143, 389, 443, 465, 587, 993, 995, 1433, 1521, 3306, 33060, 5432, 5672, 6379, 9200, 9300, 11211, 27017],
+  "portManager.fixedProtocolPorts": [22, 25, 53, 80, 110, 143, 389, 443, 465, 587, 993, 995, 1433, 1521, 1883, 3306, 33060, 4222, 5432, 5671, 5672, 6379, 8883, 9092, 9200, 9300, 11211, 15672, 27017, 50051],
   "portManager.autoOpenBrowser": false,
   "portManager.showConflictNotification": true,
   "portManager.watchPreferredPorts": true,

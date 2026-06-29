@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import test from "node:test";
 
+import { DEFAULT_PORT_MANAGER_SETTINGS } from "../../src/shared/default-settings";
+
 /**
  * Regression checks for terminal hook shell bootstrap generation.
  *
@@ -706,6 +708,16 @@ test("global storage cleanup rehydrates generated routing from live attachment s
       ),
     true,
   );
+  assert.equal(
+    rehydrateBody.indexOf("await this.writeTerminalNetworkSelectionFile().catch(() => undefined);") <
+      rehydrateBody.indexOf("await this.rehydrateBrowserDnsAndProxies().catch(() => undefined);"),
+    true,
+  );
+  assert.equal(source.includes("private async rehydrateBrowserDnsAndProxies(): Promise<void>"), true);
+  assert.equal(source.includes("await this.startBrowserDnsServer().catch(() => undefined);"), true);
+  assert.equal(source.includes("this.syncBrowserDnsRecords();"), true);
+  assert.equal(source.includes("this.maybeAutoInstallBrowserDnsResolvers();"), true);
+  assert.equal(source.includes("await this.syncBrowserNetworkProxies().catch(() => undefined);"), true);
   assert.equal(rehydrateBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);"), true);
   assert.equal(terminalRehydrateBody.includes("await this.writeTerminalNetworkSelectionFile();"), true);
   assert.equal(terminalRehydrateBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });"), true);
@@ -1179,10 +1191,30 @@ test("terminal attach does not require durable compose routes before reporting a
 test("native hook preserves listener ports only for explicit overrides", () => {
   const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
   const source = fs.readFileSync(sourcePath, "utf8");
+  const defaultPorts = source
+    .match(/#define PM_DEFAULT_FIXED_PROTOCOL_PORTS "([^"]+)"/)?.[1]
+    ?.split(",")
+    .map((value) => Number(value));
+  const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../../../package.json"), "utf8")) as {
+    contributes?: {
+      configuration?: {
+        properties?: {
+          "portManager.fixedProtocolPorts"?: {
+            default?: readonly number[];
+          };
+        };
+      };
+    };
+  };
 
   assert.equal(source.includes("return pm_is_preserved_listen_port(logical_port);"), true);
   assert.equal(source.includes("pm_current_process_looks_like_browser_dev_server"), false);
   assert.equal(source.includes("stable browser alias"), true);
+  assert.deepEqual(defaultPorts, DEFAULT_PORT_MANAGER_SETTINGS.fixedProtocolPorts);
+  assert.deepEqual(
+    manifest.contributes?.configuration?.properties?.["portManager.fixedProtocolPorts"]?.default,
+    DEFAULT_PORT_MANAGER_SETTINGS.fixedProtocolPorts,
+  );
 });
 
 test("native hook binds high-port routes on dedicated actual loopback hosts", () => {
