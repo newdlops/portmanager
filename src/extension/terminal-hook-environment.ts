@@ -451,6 +451,11 @@ function applyRuntimeShimLauncherPath(
 
   if (launcherDirectory !== undefined) {
     collection.replace(RUNTIME_SHIM_DIRECTORY_ENV, launcherDirectory, TERMINAL_MUTATOR_OPTIONS);
+    /*
+     * Preserve the terminal shell's real PATH. Replacing PATH from the extension
+     * host environment can hide Docker/Compose/runtime entries and bypass the
+     * lifecycle-signal shims; attach and BASH_ENV scripts normalize duplicates.
+     */
     collection.prepend("PATH", `${launcherDirectory}${path.delimiter}`, TERMINAL_MUTATOR_OPTIONS);
   }
 }

@@ -54,6 +54,11 @@ test("terminal hook preload entries are normalized across multiple VS Code windo
   assert.equal(applyBody.includes("collection.prepend(preloadVariable"), false);
   assert.equal(applyBody.includes("prependUniquePathListEntry(hookLibraryPath, process.env[preloadVariable])"), true);
   assert.equal(applyBody.includes("collection.replace(preloadHintVariable, hookLibraryPath"), true);
+  assert.equal(terminalHookEnvironmentSource.includes('collection.replace(\n      "PATH"'), false);
+  assert.equal(
+    terminalHookEnvironmentSource.includes('collection.prepend("PATH", `${launcherDirectory}${path.delimiter}`, TERMINAL_MUTATOR_OPTIONS);'),
+    true,
+  );
   assert.equal(terminalHookEnvironmentSource.includes('process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD"'), true);
   assert.equal(terminalHookEnvironmentSource.includes("function prependUniquePathListEntry"), true);
   assert.equal(terminalHookEnvironmentSource.includes("function buildShellPrependVariablePathListEntry"), true);

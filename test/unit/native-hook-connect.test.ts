@@ -381,6 +381,120 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.equal(result.stderr, "");
   });
 
+  test("native hook reuses sender-first route reservations without daemon roundtrip", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-connect-"));
+    const server = net.createServer((socket) => {
+      socket.end("ok\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-send-first-route";
+    const logicalPort = await chooseUnusedTcpPort(address.port);
+    const routeTablePath = path.join(tempDir, `newdlops-portmanager-routes-${process.getuid?.() ?? "user"}-${networkId}.json`);
+    fs.writeFileSync(
+      routeTablePath,
+      JSON.stringify({
+        updatedAt: "2026-06-29T00:00:00.000Z",
+        routes: [
+          {
+            logicalPort,
+            actualPort: address.port,
+            routeDirection: "send",
+            host: "127.0.0.1",
+            cwd: projectRoot,
+            networkId,
+            processName: "wait-on",
+            status: "starting",
+            source: "allocated",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const result = await runHookedNodeClient(logicalPort, routeTablePath, networkId, {
+      env: {
+        PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
+        PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
+        PORT_MANAGER_AGENT_ROUNDTRIP_TIMEOUT_MS: "50",
+      },
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "ok\n");
+    assert.equal(result.stderr, "");
+  });
+
+  test("native hook waits for sender-first route publication", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-connect-"));
+    const server = net.createServer((socket) => {
+      socket.end("ok\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-send-first-race";
+    const logicalPort = await chooseUnusedTcpPort(address.port);
+    const routeTablePath = path.join(tempDir, `newdlops-portmanager-routes-${process.getuid?.() ?? "user"}-${networkId}.json`);
+    fs.writeFileSync(routeTablePath, JSON.stringify({ updatedAt: "2026-06-29T00:00:00.000Z", routes: [] }), "utf8");
+
+    const resultPromise = runHookedNodeClient(logicalPort, routeTablePath, networkId, {
+      env: {
+        PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
+        PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "2000",
+        PORT_MANAGER_AGENT_ROUNDTRIP_TIMEOUT_MS: "50",
+      },
+    });
+
+    setTimeout(() => {
+      fs.writeFileSync(
+        routeTablePath,
+        JSON.stringify({
+          updatedAt: "2026-06-29T00:00:01.000Z",
+          routes: [
+            {
+              logicalPort,
+              actualPort: address.port,
+              routeDirection: "send",
+              host: "127.0.0.1",
+              cwd: projectRoot,
+              networkId,
+              processName: "wait-on",
+              status: "starting",
+              source: "allocated",
+            },
+          ],
+        }),
+        "utf8",
+      );
+    }, 100);
+
+    const result = await resultPromise;
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "ok\n");
+    assert.equal(result.stderr, "");
+  });
+
   test("native hook honors allocated route host over the environment actual host", async (context) => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-connect-"));
     const routeTablePath = path.join(tempDir, "routes.json");

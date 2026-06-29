@@ -3127,6 +3127,21 @@ static int pm_route_table_lookup(
     is_compose_route);
 }
 
+static int pm_connect_route_table_lookup(int logical_port, char *target_host, size_t target_host_size, int *is_compose_route) {
+  int actual_port = pm_route_table_lookup(logical_port, 0, "listen", target_host, target_host_size, is_compose_route);
+
+  if (actual_port > 0 || pm_is_compose_logical_port(logical_port)) {
+    return actual_port;
+  }
+
+  /*
+   * Sender-first clients publish a short-lived route before the listener has
+   * completed bind/register. Later senders should converge through the same
+   * endpoint reservation immediately instead of round-tripping to the daemon.
+   */
+  return pm_route_table_lookup(logical_port, 0, "send", target_host, target_host_size, is_compose_route);
+}
+
 static int pm_wait_for_route(
   int logical_port,
   const char *timeout_env,
@@ -3150,6 +3165,38 @@ static int pm_wait_for_route(
     usleep(50000);
     waited_ms += 50;
     actual_port = pm_route_table_lookup(logical_port, 0, "listen", target_host, target_host_size, is_compose_route);
+    if (actual_port > 0) {
+      pm_debug("connect %s route became ready logical=%d actual=%d wait_ms=%d", reason, logical_port, actual_port, waited_ms);
+      return actual_port;
+    }
+  }
+
+  return 0;
+}
+
+static int pm_wait_for_connect_route(
+  int logical_port,
+  const char *timeout_env,
+  int default_wait_ms,
+  const char *reason,
+  char *target_host,
+  size_t target_host_size,
+  int *is_compose_route) {
+  int wait_ms = pm_parse_int_env(timeout_env, default_wait_ms);
+  int waited_ms = 0;
+  int actual_port;
+
+  if (wait_ms <= 0) {
+    return 0;
+  }
+  if (wait_ms > 60000) {
+    wait_ms = 60000;
+  }
+
+  while (waited_ms < wait_ms) {
+    usleep(50000);
+    waited_ms += 50;
+    actual_port = pm_connect_route_table_lookup(logical_port, target_host, target_host_size, is_compose_route);
     if (actual_port > 0) {
       pm_debug("connect %s route became ready logical=%d actual=%d wait_ms=%d", reason, logical_port, actual_port, waited_ms);
       return actual_port;
@@ -3367,7 +3414,7 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
   route_is_compose = 0;
   actual_port = pm_memory_actual_for_logical(logical_port, target_host, sizeof(target_host));
   if (actual_port == 0) {
-    actual_port = pm_route_table_lookup(logical_port, 0, "listen", target_host, sizeof(target_host), &route_is_compose);
+    actual_port = pm_connect_route_table_lookup(logical_port, target_host, sizeof(target_host), &route_is_compose);
   }
 
   if (actual_port == 0 && pm_is_compose_logical_port(logical_port)) {
@@ -3437,7 +3484,7 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
      * sender-first reservation, but still allow ordinary dynamic routes to be
      * allocated when no listener appears.
      */
-    actual_port = pm_wait_for_route(
+    actual_port = pm_wait_for_connect_route(
       logical_port,
       "PORT_MANAGER_CONNECT_ROUTE_WAIT_MS",
       PM_CONNECT_ROUTE_WAIT_MS,

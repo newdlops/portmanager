@@ -1346,20 +1346,16 @@ export class PortManagerAgent implements DisposableLike {
     networkId: string | undefined,
     actualHost: string | undefined,
   ): LogicalPortRoute | undefined {
-    const routeIdentity = buildLogicalRouteIdentity({
+    const endpointIdentity = buildLogicalEndpointIdentity({
       logicalPort,
-      actualPort: logicalPort,
-      routeDirection: "listen",
-      host: this.defaultHost,
       ...(networkId ? { networkId } : {}),
-      status: "running",
-      source: "hooked",
     });
     const expectedHost = normalizeOptionalHost(actualHost);
 
     return buildLogicalRoutes(this.registry.list(), []).find(
       (route) =>
-        buildLogicalRouteIdentity(route) === routeIdentity &&
+        buildLogicalEndpointIdentity(route) === endpointIdentity &&
+        normalizeRouteDirection(route.routeDirection) === "listen" &&
         (expectedHost === undefined || normalizeOptionalHost(route.host) === expectedHost),
     );
   }
