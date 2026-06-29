@@ -258,6 +258,7 @@ export class PortManagerCommandController implements DisposableLike {
   /** Refreshes Docker/Podman containers with host-published ports. */
   private async refreshContainerServices(): Promise<void> {
     const candidates = await this.dependencies.networkService.refreshContainerServices();
+    await this.dependencies.networkService.refreshNetworkRoutingState();
     this.dependencies.treeProvider.refresh();
     await vscode.window.showInformationMessage(`Discovered ${candidates.length} container services.`);
   }
@@ -1257,6 +1258,7 @@ export class PortManagerCommandController implements DisposableLike {
       this.dependencies.networkService.refreshTerminals(),
       this.dependencies.networkService.refreshContainerServices(),
     ]);
+    await this.dependencies.networkService.refreshNetworkRoutingState();
     this.dependencies.treeProvider.refresh();
   }
 
@@ -3042,7 +3044,7 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     'function cleanCommand(command){return String(command||"").replace(/\\s[A-Za-z_][A-Za-z0-9_]*=[^\\s]*/g,"").replace(/\\s+/g," ").trim().slice(0,140);}',
     'function hostKey(value){const host=String(value||"").toLowerCase();return host==="localhost"?"127.0.0.1":host;}',
     'function portFromLine(line){for(const name of ["PORT","VITE_CLIENT_PORT","VITE_PORT","DJANGO_PORT"]){const value=Number(envValue(line,name));if(Number.isInteger(value)&&value>0)return value;}let match=line.match(/(?:--port|-p)\\s+(\\d{2,5})(?:\\s|$)/);if(match)return Number(match[1]);match=line.match(/runserver(?:\\s+[0-9A-Fa-f:.]+:)?(\\d{2,5})(?:\\s|$)/);if(match)return Number(match[1]);match=line.match(/(?:^|\\s)(\\d{2,5})(?:\\s|$)/);return match?Number(match[1]):undefined;}',
-    'function serverLike(line){return /manage\\.py\\s+runserver|(?:^|[\\/\\s])vite(?:$|[\\s.-])|uvicorn|gunicorn|daphne|webpack-dev-server|next\\s+dev|nuxt\\s+dev|astro\\s+dev|remix\\s+dev|rails\\s+server|bin\\/rails\\s+s|docker\\s+compose/i.test(line);}',
+    'function serverLike(line){return /manage\\.py\\s+runserver|(?:^|[\\/\\s])vite(?:$|[\\s.-])|uvicorn|gunicorn|daphne|celery|webpack-dev-server|next\\s+dev|nuxt\\s+dev|astro\\s+dev|remix\\s+dev|rails\\s+server|bin\\/rails\\s+s|docker\\s+compose/i.test(line);}',
     'const routeTable=readJson(routeFile);',
     'const allRoutes=Array.isArray(routeTable&&routeTable.routes)?routeTable.routes:[];',
     'const routes=currentNetwork?allRoutes.filter((route)=>!route.networkId||route.networkId===currentNetwork):allRoutes;',
@@ -3279,7 +3281,7 @@ pm() {
     fi
     printf '\\033]0;%s\\007' 'Port Manager: detached' 2>/dev/null || true
     if [ -n "\${PORT_MANAGER_GLOBAL_ROUTES_FILE:-}" ]; then export PORT_MANAGER_ROUTES_FILE="$PORT_MANAGER_GLOBAL_ROUTES_FILE"; else unset PORT_MANAGER_ROUTES_FILE; fi
-    unset PORT_MANAGER_HOOK PORT_MANAGER_HOOK_DISABLED PORT_MANAGER_NETWORK_ID PORT_MANAGER_NETWORK_NAME PORT_MANAGER_ROUTE_TABLE_NETWORK_ID PORT_MANAGER_BORROWED_NETWORK_ID NEWDLOPS_PM_NETWORK_ID NEWDLOPS_PM_BORROWED_NETWORK_ID PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_TERMINAL_ATTACHMENT_DIR PORT_MANAGER_SCAN_RANGE PORT_MANAGER_ROUTING_MODE PORT_MANAGER_VIRTUAL_PORT_START PORT_MANAGER_VIRTUAL_PORT_END PORT_MANAGER_FIXED_PROTOCOL_PORTS PORT_MANAGER_PRESERVE_LISTEN_PORTS ${ACTUAL_LOOPBACK_HOST_ENV} PORT_MANAGER_NETWORK_LOOPBACK_HOST PORT_MANAGER_DYLD_INSERT_LIBRARIES
+    unset PORT_MANAGER_HOOK PORT_MANAGER_HOOK_DISABLED PORT_MANAGER_NETWORK_ID PORT_MANAGER_NETWORK_NAME PORT_MANAGER_ROUTE_TABLE_NETWORK_ID PORT_MANAGER_BORROWED_NETWORK_ID NEWDLOPS_PM_NETWORK_ID NEWDLOPS_PM_BORROWED_NETWORK_ID PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_COMPOSE_LOGICAL_PORTS PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS PORT_MANAGER_TERMINAL_ATTACHMENT_DIR PORT_MANAGER_SCAN_RANGE PORT_MANAGER_ROUTING_MODE PORT_MANAGER_VIRTUAL_PORT_START PORT_MANAGER_VIRTUAL_PORT_END PORT_MANAGER_FIXED_PROTOCOL_PORTS PORT_MANAGER_PRESERVE_LISTEN_PORTS ${ACTUAL_LOOPBACK_HOST_ENV} PORT_MANAGER_NETWORK_LOOPBACK_HOST PORT_MANAGER_DYLD_INSERT_LIBRARIES
     export PORT_MANAGER_HOOK=0
     export PORT_MANAGER_HOOK_DISABLED=1
     export PORT_MANAGER_HOOK_DAEMON_STARTED=0
@@ -3392,7 +3394,7 @@ __pm_agent_ensure() {
   if [ -x "$PORT_MANAGER_AGENT_EXECUTABLE" ]; then
     ${daemonRuntimePrefix} nohup "$PORT_MANAGER_AGENT_EXECUTABLE" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" --agent-main "$PORT_MANAGER_AGENT_MAIN" >/tmp/newdlops-portmanager-agent.log 2>&1 &
   else
-    ${daemonRuntimePrefix} nohup "${escapedNodeExecutablePath}" "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" >/tmp/newdlops-portmanager-agent.log 2>&1 &
+    ${daemonRuntimePrefix} nohup "${escapedNodeExecutablePath}" "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" >/tmp/newdlops-portmanager-agent.log 2>&1 &
   fi
   __pm_agent_wait_count=0
   while [ $__pm_agent_wait_count -lt 20 ]; do

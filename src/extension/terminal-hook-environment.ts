@@ -68,6 +68,7 @@ const PRELOAD_PACKAGE_COMMAND_NAMES = [
   "wait-on",
   "retry",
 ];
+const COMPOSE_REFRESH_WAIT_MS = "3000";
 
 export interface TerminalHookEnvironmentScope {
   /** Logical network applied to every new VS Code terminal in this extension host. */
@@ -76,6 +77,10 @@ export interface TerminalHookEnvironmentScope {
   readonly networkName?: string;
   /** Dynamic Compose/container routing map consumed by Docker/Podman shims. */
   readonly composeRoutingFilePath?: string;
+  /** Directory where Docker/Podman shims signal lifecycle changes back to the extension. */
+  readonly terminalAttachmentMarkerDirectoryPath?: string;
+  /** Logical ports owned by Compose attachments in this network. */
+  readonly composeLogicalPorts?: readonly number[];
 }
 
 /** Applies and refreshes terminal environment variables owned by Port Manager. */
@@ -138,6 +143,8 @@ export function applyTerminalHookEnvironment(
     hostAccessFilePath: getDefaultHostAccessBindingsPath(),
     settings,
     composeRoutingFilePath: scope.composeRoutingFilePath,
+    terminalAttachmentMarkerDirectoryPath: scope.terminalAttachmentMarkerDirectoryPath,
+    composeLogicalPorts: scope.composeLogicalPorts,
     dockerShimPath: runtimeCommandShimPath,
   });
   const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
@@ -156,12 +163,23 @@ export function applyTerminalHookEnvironment(
   collection.replace("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath, TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath, TERMINAL_MUTATOR_OPTIONS);
   collection.replace(DOCKER_SHIM_PATH_ENV, runtimeCommandShimPath, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_PRELOAD_REPAIR", "1", TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_ROUTES_FILE", getRouteTablePathForNetwork(scope.networkId), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath(), TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS", COMPOSE_REFRESH_WAIT_MS, TERMINAL_MUTATOR_OPTIONS);
   if (scope.composeRoutingFilePath !== undefined) {
     collection.replace("PORT_MANAGER_COMPOSE_ROUTING_FILE", scope.composeRoutingFilePath, TERMINAL_MUTATOR_OPTIONS);
   }
+  if (scope.terminalAttachmentMarkerDirectoryPath !== undefined) {
+    collection.replace(
+      "PORT_MANAGER_TERMINAL_ATTACHMENT_DIR",
+      scope.terminalAttachmentMarkerDirectoryPath,
+      TERMINAL_MUTATOR_OPTIONS,
+    );
+  }
+  const composeLogicalPorts = serializeTcpPortList(scope.composeLogicalPorts);
+  collection.replace("PORT_MANAGER_COMPOSE_LOGICAL_PORTS", composeLogicalPorts, TERMINAL_MUTATOR_OPTIONS);
   applyRoutingSettings(collection, settings);
   applyLoopbackRoutingHosts(collection, scope.networkId, settings);
   collection.prepend(preloadVariable, `${hookLibraryPath}${path.delimiter}`, TERMINAL_MUTATOR_OPTIONS);
@@ -380,6 +398,10 @@ export interface ShellEnvRestoreScope {
   readonly settings?: PortManagerSettings;
   /** Compose/container routing map needed by Docker/Podman shims in child scripts. */
   readonly composeRoutingFilePath?: string;
+  /** Directory where Docker/Podman shims signal lifecycle changes back to the extension. */
+  readonly terminalAttachmentMarkerDirectoryPath?: string;
+  /** Logical ports owned by Compose attachments in this network. */
+  readonly composeLogicalPorts?: readonly number[];
   /** Native Docker/Podman shim used when the preload hook catches absolute runtime paths. */
   readonly dockerShimPath?: string;
 }
@@ -761,7 +783,7 @@ __pm_package_manager_command_runs_project_code() {
 __pm_text_looks_like_dev_server() {
   __pm_text="$(printf '%s' "$*" | tr '[:upper:]' '[:lower:]')"
   case "\${__pm_text}" in
-    *vite*|*next\\ dev*|*nuxt\\ dev*|*storybook\\ dev*|*webpack-dev-server*|*react-scripts\\ start*|*vue-cli-service\\ serve*|*astro\\ dev*|*svelte-kit*|*remix\\ vite:dev*|*uvicorn*|*gunicorn*|*daphne*|*runserver*|*flask\\ run*|*rails\\ server*|*php\\ -s*|*serve\\ --listen*|*http-server*|*--host*|*--port*|*" -p "*|*vite_client_port=*|*port=*)
+    *vite*|*next\\ dev*|*nuxt\\ dev*|*storybook\\ dev*|*webpack-dev-server*|*react-scripts\\ start*|*vue-cli-service\\ serve*|*astro\\ dev*|*svelte-kit*|*remix\\ vite:dev*|*celery*|*uvicorn*|*gunicorn*|*daphne*|*runserver*|*flask\\ run*|*rails\\ server*|*php\\ -s*|*serve\\ --listen*|*http-server*|*--host*|*--port*|*" -p "*|*vite_client_port=*|*port=*)
       return 0
       ;;
   esac
@@ -784,6 +806,28 @@ if __pm_package_manager_command_runs_project_code "$@" || __pm_text_looks_like_d
     esac
   fi
   ${buildPreloadNodeEntrypointBypassShell()}
+else
+  if [ -n "\${PORT_MANAGER_RUNTIME_SHIM_DIR:-}" ]; then
+    __pm_path_rest=""
+    __pm_old_ifs="\${IFS}"
+    IFS=:
+    for __pm_path_entry in \${PATH:-}; do
+      if [ "\${__pm_path_entry}" = "\${PORT_MANAGER_RUNTIME_SHIM_DIR}" ]; then
+        continue
+      fi
+      if [ -z "\${__pm_path_rest}" ]; then
+        __pm_path_rest="\${__pm_path_entry}"
+      else
+        __pm_path_rest="\${__pm_path_rest}:\${__pm_path_entry}"
+      fi
+    done
+    IFS="\${__pm_old_ifs}"
+    export PATH="\${__pm_path_rest}"
+    unset __pm_path_rest __pm_old_ifs __pm_path_entry
+  fi
+  export PORT_MANAGER_HOOK=0
+  export PORT_MANAGER_HOOK_DISABLED=1
+  unset BASH_ENV PORT_MANAGER_PRELOAD_REPAIR PORT_MANAGER_DYLD_INSERT_LIBRARIES PORT_MANAGER_LD_PRELOAD DYLD_INSERT_LIBRARIES LD_PRELOAD PORT_MANAGER_RUNTIME_SHIM_DIR PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_COMPOSE_LOGICAL_PORTS PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS PORT_MANAGER_DOCKER_SHIM
 fi
 
 exec "\${__pm_target}" "$@"
@@ -844,8 +888,17 @@ export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID=${shellQuote(scope.networkId)}
     scope.composeRoutingFilePath === undefined
       ? ""
       : `export PORT_MANAGER_COMPOSE_ROUTING_FILE=${shellQuote(scope.composeRoutingFilePath)}`;
+  const terminalAttachmentExport =
+    scope.terminalAttachmentMarkerDirectoryPath === undefined
+      ? ""
+      : `export PORT_MANAGER_TERMINAL_ATTACHMENT_DIR=${shellQuote(scope.terminalAttachmentMarkerDirectoryPath)}`;
+  const composeLogicalPorts = serializeTcpPortList(scope.composeLogicalPorts);
+  const composeLogicalPortsExport = `export PORT_MANAGER_COMPOSE_LOGICAL_PORTS=${shellQuote(composeLogicalPorts)}`;
+  const composeRefreshWaitExport =
+    scope.networkId === undefined ? "" : `export PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS=${shellQuote(COMPOSE_REFRESH_WAIT_MS)}`;
   const dockerShimExport =
     scope.dockerShimPath === undefined ? "" : `export ${DOCKER_SHIM_PATH_ENV}=${shellQuote(scope.dockerShimPath)}`;
+  const preloadRepairExport = scope.networkId === undefined ? "" : "export PORT_MANAGER_PRELOAD_REPAIR=1";
   const loopbackHost = scope.networkId === undefined ? undefined : loopbackAddressForNetwork(scope.networkId);
   const loopbackExports =
     loopbackHost === undefined
@@ -893,13 +946,17 @@ ${agentExports}
 ${routingExports}
 ${loopbackExports}
 ${composeRoutingExport}
+${terminalAttachmentExport}
+${composeLogicalPortsExport}
+${composeRefreshWaitExport}
 ${dockerShimExport}
+${preloadRepairExport}
 
 if [ -z "\${PORT_MANAGER_HOST_ACCESS_FILE:-}" ]; then
   export PORT_MANAGER_HOST_ACCESS_FILE=${shellQuote(hostAccessFilePath)}
 fi
 
-if [ "\${PORT_MANAGER_PRELOAD_REPAIR:-}" = "1" ] && [ -n "\${PORT_MANAGER_DYLD_INSERT_LIBRARIES:-}" ]; then
+if [ "\${PORT_MANAGER_HOOK_DISABLED:-}" != "1" ] && [ "\${PORT_MANAGER_HOOK:-1}" != "0" ] && [ "\${PORT_MANAGER_PRELOAD_REPAIR:-}" = "1" ] && [ -n "\${PORT_MANAGER_DYLD_INSERT_LIBRARIES:-}" ]; then
   case ":\${DYLD_INSERT_LIBRARIES:-}:" in
     *:"\${PORT_MANAGER_DYLD_INSERT_LIBRARIES}":*) ;;
     *) export DYLD_INSERT_LIBRARIES="\${PORT_MANAGER_DYLD_INSERT_LIBRARIES}\${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}" ;;
@@ -934,4 +991,19 @@ fi
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function serializeTcpPortList(ports: readonly number[] | undefined): string {
+  if (ports === undefined || ports.length === 0) {
+    return "";
+  }
+
+  const uniquePorts = new Set<number>();
+  for (const port of ports) {
+    if (Number.isInteger(port) && port > 0 && port <= 65535) {
+      uniquePorts.add(port);
+    }
+  }
+
+  return [...uniquePorts].sort((left, right) => left - right).join(",");
 }

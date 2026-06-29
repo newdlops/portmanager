@@ -2,27 +2,30 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
-#define PM_CLIENT_BUFFER 262144
-#define PM_LISTEN_BACKLOG 256
+#define PM_CLIENT_BUFFER_INITIAL 2048
+#define PM_CLIENT_BUFFER_MAX 32768
+#define PM_CLIENT_READ_CHUNK 4096
+#define PM_LISTEN_BACKLOG 16384
 #define PM_LISTENER_POLL_IDLE_GRACE_SECONDS 2
 #define PM_LISTENER_POLL_INTERVAL_SECONDS 300
 
 typedef struct {
   int fd;
   int wants_events;
-  char buffer[PM_CLIENT_BUFFER];
+  char *buffer;
   size_t length;
+  size_t capacity;
 } pm_client;
 
 typedef struct {
@@ -133,16 +136,17 @@ static int pm_write_all(int fd, const char *data, size_t length) {
         continue;
       }
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        fd_set write_set;
-        struct timeval timeout;
+        struct pollfd write_poll;
         int ready;
 
-        FD_ZERO(&write_set);
-        FD_SET(fd, &write_set);
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 100000;
-        ready = select(fd + 1, NULL, &write_set, NULL, &timeout);
-        if (ready > 0) {
+        memset(&write_poll, 0, sizeof(write_poll));
+        write_poll.fd = fd;
+        write_poll.events = POLLOUT;
+        ready = poll(&write_poll, 1, 100);
+        if (ready < 0 && errno == EINTR) {
+          continue;
+        }
+        if (ready > 0 && (write_poll.revents & POLLOUT)) {
           continue;
         }
       }
@@ -240,6 +244,40 @@ static int pm_request_wants_events(const pm_request *request) {
    * Code extension client keeps a socket open for live snapshot events.
    */
   return strncmp(request->id_raw, "\"extension-", 11) == 0;
+}
+
+static int pm_reserve_client_buffer(pm_client *client, size_t required) {
+  size_t next_capacity;
+  char *next;
+
+  if (required > PM_CLIENT_BUFFER_MAX) {
+    return -1;
+  }
+  if (required <= client->capacity) {
+    return 0;
+  }
+
+  next_capacity = client->capacity == 0 ? PM_CLIENT_BUFFER_INITIAL : client->capacity;
+  while (next_capacity < required && next_capacity < PM_CLIENT_BUFFER_MAX) {
+    next_capacity *= 2;
+  }
+  if (next_capacity > PM_CLIENT_BUFFER_MAX) {
+    next_capacity = PM_CLIENT_BUFFER_MAX;
+  }
+  if (next_capacity < required) {
+    return -1;
+  }
+
+  next = (char *)realloc(client->buffer, next_capacity);
+  if (next == NULL) {
+    return -1;
+  }
+  client->buffer = next;
+  client->capacity = next_capacity;
+  if (client->length == 0) {
+    client->buffer[0] = '\0';
+  }
+  return 0;
 }
 
 static int pm_dispatch(pm_agent_state *state, const pm_request *request, pm_buffer *payload, int *state_changed, int *shutdown_requested, char *error, size_t error_size) {
@@ -344,7 +382,7 @@ static int pm_dispatch(pm_agent_state *state, const pm_request *request, pm_buff
   return -1;
 }
 
-static void pm_handle_line(pm_client *client, pm_agent_state *state, const char *line, int *snapshot_dirty) {
+static void pm_handle_line(pm_client *client, pm_agent_state *state, const char *line, int *snapshot_dirty, int *route_tables_dirty) {
   pm_request request;
   pm_buffer payload;
   char error[PM_TEXT] = "Port Manager native daemon request failed.";
@@ -374,10 +412,12 @@ static void pm_handle_line(pm_client *client, pm_agent_state *state, const char 
   if (state_changed) {
     /*
      * Route allocations can arrive in large bind/connect bursts. Mark the state
-     * dirty here and let the event loop coalesce snapshot broadcasts after all
-     * ready clients in this select turn have received their response frames.
+     * dirty here and let the event loop coalesce snapshot broadcasts and
+     * aggregate route-table writes after all ready clients in this poll turn
+     * have received their response frames.
      */
     *snapshot_dirty = 1;
+    *route_tables_dirty = 1;
   }
   if (shutdown_requested) {
     pm_running = 0;
@@ -402,7 +442,9 @@ static int pm_add_client(pm_client **clients, size_t *count, size_t *capacity, i
 
   (*clients)[*count].fd = fd;
   (*clients)[*count].wants_events = 0;
+  (*clients)[*count].buffer = NULL;
   (*clients)[*count].length = 0;
+  (*clients)[*count].capacity = 0;
   (*count)++;
   return 0;
 }
@@ -411,16 +453,20 @@ static void pm_remove_client(pm_client *clients, size_t *count, size_t index) {
   if (clients[index].fd >= 0) {
     close(clients[index].fd);
   }
+  free(clients[index].buffer);
   memmove(&clients[index], &clients[index + 1], (*count - index - 1) * sizeof(pm_client));
   (*count)--;
 }
 
-static int pm_process_client_buffer(pm_client *client, pm_agent_state *state, int *snapshot_dirty) {
+static int pm_process_client_buffer(pm_client *client, pm_agent_state *state, int *snapshot_dirty, int *route_tables_dirty) {
   for (;;) {
     char *newline = memchr(client->buffer, '\n', client->length);
     size_t line_length;
-    char line[PM_CLIENT_BUFFER];
+    char line[PM_CLIENT_BUFFER_MAX];
 
+    if (client->length == 0) {
+      break;
+    }
     if (newline == NULL) {
       break;
     }
@@ -437,22 +483,37 @@ static int pm_process_client_buffer(pm_client *client, pm_agent_state *state, in
     client->buffer[client->length] = '\0';
 
     if (line_length > 0) {
-      pm_handle_line(client, state, line, snapshot_dirty);
+      pm_handle_line(client, state, line, snapshot_dirty, route_tables_dirty);
     }
   }
 
   return 0;
 }
 
-static int pm_read_client(pm_client *client, pm_agent_state *state, int *snapshot_dirty) {
+static int pm_read_client(pm_client *client, pm_agent_state *state, int *snapshot_dirty, int *route_tables_dirty) {
   for (;;) {
     ssize_t bytes_read;
+    size_t target_capacity;
+    size_t available;
 
-    if (client->length >= sizeof(client->buffer) - 1) {
+    if (client->length >= PM_CLIENT_BUFFER_MAX - 1) {
       return -1;
     }
 
-    bytes_read = read(client->fd, client->buffer + client->length, sizeof(client->buffer) - client->length - 1);
+    target_capacity = client->length + PM_CLIENT_READ_CHUNK + 1;
+    if (target_capacity > PM_CLIENT_BUFFER_MAX) {
+      target_capacity = PM_CLIENT_BUFFER_MAX;
+    }
+    if (pm_reserve_client_buffer(client, target_capacity) != 0) {
+      return -1;
+    }
+
+    available = client->capacity - client->length - 1;
+    if (available == 0) {
+      return -1;
+    }
+
+    bytes_read = read(client->fd, client->buffer + client->length, available);
     if (bytes_read < 0) {
       if (errno == EINTR) {
         continue;
@@ -468,7 +529,7 @@ static int pm_read_client(pm_client *client, pm_agent_state *state, int *snapsho
 
     client->length += (size_t)bytes_read;
     client->buffer[client->length] = '\0';
-    if (pm_process_client_buffer(client, state, snapshot_dirty) != 0) {
+    if (pm_process_client_buffer(client, state, snapshot_dirty, route_tables_dirty) != 0) {
       return -1;
     }
   }
@@ -476,39 +537,49 @@ static int pm_read_client(pm_client *client, pm_agent_state *state, int *snapsho
 
 static void pm_event_loop(int server_fd, pm_agent_state *state) {
   pm_client *clients = NULL;
+  struct pollfd *poll_fds = NULL;
   size_t client_count = 0;
   size_t client_capacity = 0;
+  size_t poll_capacity = 0;
   pm_buffer last_listener_signature;
   time_t next_poll = time(NULL) + 3;
   time_t last_io_at = 0;
   int snapshot_dirty = 0;
+  int route_tables_dirty = 0;
 
   pm_buffer_init(&last_listener_signature);
 
   while (pm_running) {
-    fd_set read_set;
-    int max_fd = server_fd;
-    struct timeval timeout;
+    size_t poll_count = client_count + 1;
+    size_t polled_client_count = client_count;
     int ready;
     int handled_io = 0;
 
-    FD_ZERO(&read_set);
-    FD_SET(server_fd, &read_set);
-    for (size_t index = 0; index < client_count;) {
-      if (clients[index].fd >= FD_SETSIZE) {
-        pm_remove_client(clients, &client_count, index);
-        continue;
+    if (poll_count > poll_capacity) {
+      size_t next_capacity = poll_capacity == 0 ? 64 : poll_capacity;
+      struct pollfd *next;
+
+      while (next_capacity < poll_count) {
+        next_capacity *= 2;
       }
-      FD_SET(clients[index].fd, &read_set);
-      if (clients[index].fd > max_fd) {
-        max_fd = clients[index].fd;
+
+      next = (struct pollfd *)realloc(poll_fds, next_capacity * sizeof(struct pollfd));
+      if (next == NULL) {
+        break;
       }
-      index++;
+      poll_fds = next;
+      poll_capacity = next_capacity;
     }
 
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
-    ready = select(max_fd + 1, &read_set, NULL, NULL, &timeout);
+    memset(poll_fds, 0, poll_count * sizeof(struct pollfd));
+    poll_fds[0].fd = server_fd;
+    poll_fds[0].events = POLLIN;
+    for (size_t index = 0; index < client_count; index++) {
+      poll_fds[index + 1].fd = clients[index].fd;
+      poll_fds[index + 1].events = POLLIN;
+    }
+
+    ready = poll(poll_fds, (nfds_t)poll_count, 1000);
     if (ready < 0) {
       if (errno == EINTR) {
         continue;
@@ -516,7 +587,11 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
       break;
     }
 
-    if (FD_ISSET(server_fd, &read_set)) {
+    if (ready > 0 && (poll_fds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+      break;
+    }
+
+    if (ready > 0 && (poll_fds[0].revents & POLLIN)) {
       for (;;) {
         int client_fd = accept(server_fd, NULL, NULL);
         if (client_fd < 0) {
@@ -536,15 +611,25 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
       }
     }
 
-    for (size_t index = 0; index < client_count;) {
-      if (FD_ISSET(clients[index].fd, &read_set)) {
+    for (size_t reverse = polled_client_count; reverse > 0;) {
+      size_t index = --reverse;
+      short revents;
+
+      if (index >= client_count) {
+        continue;
+      }
+
+      revents = poll_fds[index + 1].revents;
+      if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        pm_remove_client(clients, &client_count, index);
+        continue;
+      }
+      if (revents & POLLIN) {
         handled_io = 1;
-        if (pm_read_client(&clients[index], state, &snapshot_dirty) != 0) {
+        if (pm_read_client(&clients[index], state, &snapshot_dirty, &route_tables_dirty) != 0) {
           pm_remove_client(clients, &client_count, index);
-          continue;
         }
       }
-      index++;
     }
 
     if (handled_io) {
@@ -553,6 +638,7 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
 
     if (pm_state_reap_children(state)) {
       snapshot_dirty = 1;
+      route_tables_dirty = 1;
     }
 
     if (time(NULL) >= next_poll) {
@@ -590,11 +676,22 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
         snapshot_dirty = 0;
       }
     }
+
+    if (route_tables_dirty) {
+      time_t now = time(NULL);
+      if (!handled_io && (last_io_at == 0 || now - last_io_at >= PM_LISTENER_POLL_IDLE_GRACE_SECONDS)) {
+        if (pm_state_flush_route_tables(state) == 0) {
+          route_tables_dirty = 0;
+        }
+      }
+    }
   }
 
   for (size_t index = 0; index < client_count; index++) {
     close(clients[index].fd);
+    free(clients[index].buffer);
   }
+  free(poll_fds);
   free(clients);
   pm_buffer_free(&last_listener_signature);
 }

@@ -8,6 +8,7 @@ import { SimpleEventEmitter } from "../shared/events";
 import {
   getDefaultRouteTablePath,
   getNetworkRouteTablePath,
+  getRouteTablePathForComposeClaimPort,
   getRouteTablePathForLogicalPort,
   getRouteTablePathForNetwork,
 } from "./route-table";
@@ -59,6 +60,10 @@ const DEFAULT_EXTERNAL_LISTENER_GRACE_MS = 60_000;
 const DEFAULT_EXTERNAL_LISTENER_MISSING_SCAN_THRESHOLD = 3;
 const HOOK_ROUTE_RECOVERY_MISS_TTL_MS = 60_000;
 const ROUTE_ALLOCATION_TTL_MS = 30_000;
+const ROUTE_TABLE_GENERATION_LOCK_STALE_MS = 30_000;
+const ROUTE_TABLE_GENERATION_LOCK_ATTEMPTS = 100;
+const ROUTE_TABLE_GENERATION_LOCK_SLEEP_MS = 10;
+const AGENT_SOCKET_LISTEN_BACKLOG = 16384;
 
 export interface PortManagerAgentOptions {
   /** Shared registry for managed and manually registered process rows. */
@@ -95,6 +100,10 @@ export interface PortManagerAgentOptions {
   readonly externalListenerGraceMs?: number;
   /** Consecutive missing OS scans required before hook/manual rows can be stopped. */
   readonly externalListenerMissingScanThreshold?: number;
+  /** Test-only override for comparing daemon generations that share one route table. */
+  readonly routeTableWriterStartedAtMs?: number;
+  /** Test-only override for deterministic route table generation metadata. */
+  readonly routeTableWriterId?: string;
 }
 
 export interface BuildAgentSnapshotOptions {
@@ -165,6 +174,17 @@ interface ListenerScanCache {
   readonly scannedAtMs: number;
 }
 
+interface RouteTableGeneration {
+  /** Unique daemon writer identity. Used only to break same-millisecond ties. */
+  readonly writerId: string;
+  /** Wall-clock daemon start time. Newer daemons may publish over older ones. */
+  readonly writerStartedAtMs: number;
+  /** Monotonic sequence for this writer, incremented for each full generation. */
+  readonly sequence: number;
+  /** PID is diagnostic metadata for route-table doctor output. */
+  readonly pid: number;
+}
+
 /**
  * Serves Port Manager requests and broadcasts snapshots to connected clients.
  * Methods return domain objects so tests and future non-socket clients can use
@@ -231,6 +251,15 @@ export class PortManagerAgent implements DisposableLike {
   /** JSON file path that stores the latest logical routing table. */
   private readonly routeTablePath: string;
 
+  /** Writer identity persisted in route table files to reject stale daemon writes. */
+  private readonly routeTableWriterId: string;
+
+  /** Startup time for freshness comparison across daemon generations. */
+  private readonly routeTableWriterStartedAtMs: number;
+
+  /** In-process route table generation sequence. */
+  private routeTableGenerationSequence = 0;
+
   /** Compiled daemon entrypoint path for stale-daemon detection. */
   private readonly agentMainPath: string | undefined;
 
@@ -276,6 +305,9 @@ export class PortManagerAgent implements DisposableLike {
   /** Route-entry files written for individual logical endpoints. */
   private readonly writtenRouteTableEntryPaths = new Set<string>();
 
+  /** Compose claim files written for host-visible logical and published ports. */
+  private readonly writtenRouteTableClaimPaths = new Set<string>();
+
   /** Node net server once listen() has been called. */
   private server: Server | undefined;
 
@@ -318,6 +350,9 @@ export class PortManagerAgent implements DisposableLike {
     this.defaultHost = options.defaultHost ?? "localhost";
     this.defaultCwd = options.defaultCwd ?? process.cwd();
     this.routeTablePath = options.routeTablePath ?? getDefaultRouteTablePath();
+    this.routeTableWriterStartedAtMs = options.routeTableWriterStartedAtMs ?? Date.now();
+    this.routeTableWriterId =
+      options.routeTableWriterId ?? `node-agent:${process.pid}:${this.routeTableWriterStartedAtMs}:${randomUUID()}`;
     this.adoptPreviousGenerationRouteFiles();
     this.writeRouteTable(this.buildCurrentLogicalRoutes());
     this.agentMainPath = options.agentMainPath;
@@ -372,7 +407,7 @@ export class PortManagerAgent implements DisposableLike {
 
       server.once("error", onError);
       server.once("listening", onListening);
-      server.listen(socketPath);
+      server.listen(socketPath, AGENT_SOCKET_LISTEN_BACKLOG);
     });
 
     this.startListenerPolling();
@@ -426,14 +461,17 @@ export class PortManagerAgent implements DisposableLike {
         networkRouteScope === normalizeNetworkId(input.networkId)
           ? input
           : { ...input, networkId: networkRouteScope };
-      const actualHost = normalizeOptionalHost(input.actualHost) ?? input.host;
+      const requestedActualHost = normalizeOptionalHost(input.actualHost);
+      const actualHost = requestedActualHost ?? input.host;
       const actualInput = actualHost === input.host ? scopedInput : { ...scopedInput, host: actualHost };
       const routeDirection = normalizeRouteDirection(input.routeDirection);
       const activeRoute =
-        routeDirection === "send" ? this.findReusableActiveRoute(input.requestedPort, networkRouteScope) : undefined;
+        routeDirection === "send"
+          ? this.findReusableActiveRoute(input.requestedPort, networkRouteScope, requestedActualHost)
+          : undefined;
       if (activeRoute !== undefined) {
         const logicalRoutes = this.buildCurrentLogicalRoutes();
-        this.writeRouteTable(logicalRoutes);
+        this.requireRouteTablePublish(logicalRoutes);
         this.queueSnapshotBroadcast();
 
         return {
@@ -452,7 +490,7 @@ export class PortManagerAgent implements DisposableLike {
       if (reusableAllocation !== undefined) {
         const refreshedAllocation = this.refreshPendingRouteAllocation(reusableAllocation);
         const logicalRoutes = this.buildCurrentLogicalRoutes();
-        this.writeRouteTable(logicalRoutes);
+        this.requireRouteTablePublish(logicalRoutes);
         this.queueSnapshotBroadcast();
 
         return {
@@ -471,7 +509,7 @@ export class PortManagerAgent implements DisposableLike {
         routeDirection === "send" ? await this.findSamePortExternalListener(input.requestedPort) : undefined;
       if (samePortListener !== undefined) {
         const logicalRoutes = this.buildCurrentLogicalRoutes();
-        this.writeRouteTable(logicalRoutes);
+        this.requireRouteTablePublish(logicalRoutes);
         this.queueSnapshotBroadcast();
 
         return {
@@ -507,7 +545,7 @@ export class PortManagerAgent implements DisposableLike {
       });
 
       const logicalRoutes = this.buildCurrentLogicalRoutes();
-      this.writeRouteTable(logicalRoutes);
+      this.requireRouteTablePublish(logicalRoutes);
       this.queueSnapshotBroadcast();
 
       return {
@@ -696,7 +734,7 @@ export class PortManagerAgent implements DisposableLike {
     const process = this.upsertRegisteredProcess(registeredInput, normalizeRegisteredProcessSource(input.source));
     this.removePendingRouteAllocationsForIdentity(process.requestedPort, normalizeNetworkId(process.networkId));
     this.missingListenerStateByProcessId.delete(process.id);
-    this.writeRouteTable(this.buildCurrentLogicalRoutes());
+    this.requireRouteTablePublish(this.buildCurrentLogicalRoutes());
     this.queueSnapshotBroadcast();
 
     return process;
@@ -1212,7 +1250,11 @@ export class PortManagerAgent implements DisposableLike {
    * A sender whose route-file lookup missed should attach to this live mapping
    * instead of creating a new pending route that can shadow the receiver.
    */
-  private findReusableActiveRoute(logicalPort: number, networkId: string | undefined): LogicalPortRoute | undefined {
+  private findReusableActiveRoute(
+    logicalPort: number,
+    networkId: string | undefined,
+    actualHost: string | undefined,
+  ): LogicalPortRoute | undefined {
     const routeIdentity = buildLogicalRouteIdentity({
       logicalPort,
       actualPort: logicalPort,
@@ -1222,9 +1264,12 @@ export class PortManagerAgent implements DisposableLike {
       status: "running",
       source: "hooked",
     });
+    const expectedHost = normalizeOptionalHost(actualHost);
 
     return buildLogicalRoutes(this.registry.list(), []).find(
-      (route) => buildLogicalRouteIdentity(route) === routeIdentity,
+      (route) =>
+        buildLogicalRouteIdentity(route) === routeIdentity &&
+        (expectedHost === undefined || normalizeOptionalHost(route.host) === expectedHost),
     );
   }
 
@@ -1413,9 +1458,63 @@ export class PortManagerAgent implements DisposableLike {
   }
 
   /** Writes the latest dynamic route table for active and pending logical routes. */
-  private writeRouteTable(routes: readonly LogicalPortRoute[]): void {
-    this.writeRouteEntryFiles(routes);
-    this.writeRouteTableFile(this.routeTablePath, routes);
+  private writeRouteTable(routes: readonly LogicalPortRoute[]): boolean {
+    const releaseGenerationLock = acquireRouteTableGenerationLock(this.routeTablePath);
+    if (releaseGenerationLock === undefined) {
+      return false;
+    }
+
+    try {
+      const generation = this.createNextRouteTableGeneration();
+      if (!this.canPublishRouteTableGeneration(generation)) {
+        return false;
+      }
+
+      return this.writeRouteTableGeneration(routes, generation);
+    } finally {
+      releaseGenerationLock();
+    }
+  }
+
+  /** Fails request paths where returning a route without a fresh table would misroute clients. */
+  private requireRouteTablePublish(routes: readonly LogicalPortRoute[]): void {
+    if (this.writeRouteTable(routes)) {
+      return;
+    }
+
+    throw new Error("Port Manager route table publish failed; refusing to return stale routing state.");
+  }
+
+  /** Builds metadata shared by every file in one route-table publish. */
+  private createNextRouteTableGeneration(): RouteTableGeneration {
+    this.routeTableGenerationSequence += 1;
+
+    return {
+      writerId: this.routeTableWriterId,
+      writerStartedAtMs: this.routeTableWriterStartedAtMs,
+      sequence: this.routeTableGenerationSequence,
+      pid: this.agentPid,
+    };
+  }
+
+  /** Rejects this writer when a newer daemon generation already owns the table. */
+  private canPublishRouteTableGeneration(generation: RouteTableGeneration): boolean {
+    const currentGeneration = readRouteTableGeneration(this.routeTablePath);
+    return currentGeneration === undefined || !isRouteTableGenerationNewer(currentGeneration, generation);
+  }
+
+  /**
+   * Publishes global, network-scoped, and per-port route files as one generation.
+   * A cross-process lock keeps stale daemon generations from interleaving their
+   * cleanup pass with another daemon's route-file writes.
+   */
+  private writeRouteTableGeneration(
+    routes: readonly LogicalPortRoute[],
+    generation: RouteTableGeneration,
+  ): boolean {
+    let generationSucceeded = this.writeRouteEntryFiles(routes, generation);
+    generationSucceeded = this.writeComposeClaimFiles(routes, generation) && generationSucceeded;
+    generationSucceeded = this.writeRouteTableFile(this.routeTablePath, routes, generation) && generationSucceeded;
 
     const currentNetworkIds = new Set<string>();
     const routesByNetworkId = new Map<string, LogicalPortRoute[]>();
@@ -1427,7 +1526,12 @@ export class PortManagerAgent implements DisposableLike {
       }
 
       currentNetworkIds.add(networkId);
-      routesByNetworkId.set(networkId, [...(routesByNetworkId.get(networkId) ?? []), route]);
+      const networkRoutes = routesByNetworkId.get(networkId);
+      if (networkRoutes === undefined) {
+        routesByNetworkId.set(networkId, [route]);
+      } else {
+        networkRoutes.push(route);
+      }
     }
 
     /*
@@ -1441,9 +1545,11 @@ export class PortManagerAgent implements DisposableLike {
       const writeSucceeded = this.writeRouteTableFile(
         getNetworkRouteTablePath(networkId, this.routeTablePath),
         networkRoutes,
+        generation,
       );
 
       if (!writeSucceeded) {
+        generationSucceeded = false;
         continue;
       }
 
@@ -1453,12 +1559,77 @@ export class PortManagerAgent implements DisposableLike {
         this.writtenRouteTableNetworkIds.delete(networkId);
       }
     }
+
+    return generationSucceeded;
+  }
+
+  /** Writes small per-port indexes used to fail closed on foreign Compose claims. */
+  private writeComposeClaimFiles(
+    routes: readonly LogicalPortRoute[],
+    generation: RouteTableGeneration,
+  ): boolean {
+    const currentClaimPaths = new Set<string>();
+    const routesByClaimPath = new Map<string, LogicalPortRoute[]>();
+    let generationSucceeded = true;
+
+    for (const route of routes) {
+      if (route.source !== "compose") {
+        continue;
+      }
+
+      for (const port of new Set([route.logicalPort, route.actualPort])) {
+        const claimPath = getRouteTablePathForComposeClaimPort(port, this.routeTablePath);
+        const claimRoutes = routesByClaimPath.get(claimPath);
+        if (claimRoutes === undefined) {
+          routesByClaimPath.set(claimPath, [route]);
+        } else {
+          claimRoutes.push(route);
+        }
+      }
+    }
+
+    for (const [claimPath, claimRoutes] of routesByClaimPath) {
+      if (this.writeRouteTableFile(claimPath, claimRoutes, generation)) {
+        currentClaimPaths.add(claimPath);
+      } else {
+        generationSucceeded = false;
+      }
+    }
+
+    for (const staleClaimPath of this.writtenRouteTableClaimPaths) {
+      if (currentClaimPaths.has(staleClaimPath)) {
+        continue;
+      }
+
+      try {
+        if (isRouteTablePathNewerThanGeneration(staleClaimPath, generation)) {
+          generationSucceeded = false;
+          continue;
+        }
+
+        fs.rmSync(staleClaimPath, { force: true });
+        this.routeTableSignaturesByPath.delete(staleClaimPath);
+      } catch {
+        generationSucceeded = false;
+      }
+    }
+
+    this.writtenRouteTableClaimPaths.clear();
+    for (const claimPath of currentClaimPaths) {
+      this.writtenRouteTableClaimPaths.add(claimPath);
+    }
+
+    return generationSucceeded;
   }
 
   /** Writes one small route file per logical endpoint to remove shared-file polling races. */
-  private writeRouteEntryFiles(routes: readonly LogicalPortRoute[]): void {
+  private writeRouteEntryFiles(
+    routes: readonly LogicalPortRoute[],
+    generation: RouteTableGeneration,
+  ): boolean {
     const currentRouteEntryPaths = new Set<string>();
     const routesByEntryPath = new Map<string, LogicalPortRoute[]>();
+    let generationSucceeded = true;
 
     for (const route of routes) {
       const routeEntryPath = getRouteTablePathForLogicalPort(
@@ -1467,12 +1638,19 @@ export class PortManagerAgent implements DisposableLike {
         this.routeTablePath,
       );
 
-      routesByEntryPath.set(routeEntryPath, [...(routesByEntryPath.get(routeEntryPath) ?? []), route]);
+      const entryRoutes = routesByEntryPath.get(routeEntryPath);
+      if (entryRoutes === undefined) {
+        routesByEntryPath.set(routeEntryPath, [route]);
+      } else {
+        entryRoutes.push(route);
+      }
     }
 
     for (const [routeEntryPath, entryRoutes] of routesByEntryPath) {
-      if (this.writeRouteTableFile(routeEntryPath, entryRoutes)) {
+      if (this.writeRouteTableFile(routeEntryPath, entryRoutes, generation)) {
         currentRouteEntryPaths.add(routeEntryPath);
+      } else {
+        generationSucceeded = false;
       }
     }
 
@@ -1482,11 +1660,17 @@ export class PortManagerAgent implements DisposableLike {
       }
 
       try {
+        if (isRouteTablePathNewerThanGeneration(staleRouteEntryPath, generation)) {
+          generationSucceeded = false;
+          continue;
+        }
+
         fs.rmSync(staleRouteEntryPath, { force: true });
         this.routeTableSignaturesByPath.delete(staleRouteEntryPath);
       } catch {
         // Best-effort stale route cleanup. Missing files fall back to daemon
         // allocation, so route table cleanup must not fail process lifecycle.
+        generationSucceeded = false;
       }
     }
 
@@ -1494,20 +1678,30 @@ export class PortManagerAgent implements DisposableLike {
     for (const routeEntryPath of currentRouteEntryPaths) {
       this.writtenRouteTableEntryPaths.add(routeEntryPath);
     }
+
+    return generationSucceeded;
   }
 
   /** Atomically replaces one route table file when its content changed. */
-  private writeRouteTableFile(routeTablePath: string, routes: readonly LogicalPortRoute[]): boolean {
+  private writeRouteTableFile(
+    routeTablePath: string,
+    routes: readonly LogicalPortRoute[],
+    generation: RouteTableGeneration,
+  ): boolean {
     const routeTableSignature = buildRouteTableSignature(routes);
     if (routeTableSignature === this.routeTableSignaturesByPath.get(routeTablePath) && fs.existsSync(routeTablePath)) {
       return true;
     }
 
     try {
+      if (isRouteTablePathNewerThanGeneration(routeTablePath, generation)) {
+        return false;
+      }
+
       fs.mkdirSync(path.dirname(routeTablePath), { recursive: true });
       writeAtomicRouteTableFile(
         routeTablePath,
-        `${JSON.stringify({ updatedAt: this.now().toISOString(), routes }, null, 2)}\n`,
+        `${JSON.stringify({ updatedAt: this.now().toISOString(), generation, routes }, null, 2)}\n`,
       );
       this.routeTableSignaturesByPath.set(routeTablePath, routeTableSignature);
       return true;
@@ -1537,7 +1731,9 @@ export class PortManagerAgent implements DisposableLike {
 
         const routeFilePath = path.join(parsedPath.dir, fileName);
         const scopedName = fileName.slice(parsedPath.name.length + 1, fileName.length - parsedPath.ext.length);
-        if (scopedName.includes("-port-")) {
+        if (scopedName.startsWith("compose-claim-port-")) {
+          this.writtenRouteTableClaimPaths.add(routeFilePath);
+        } else if (scopedName.includes("-port-")) {
           this.writtenRouteTableEntryPaths.add(routeFilePath);
         } else if (scopedName.length > 0) {
           this.writtenRouteTableNetworkIds.add(scopedName);
@@ -2100,17 +2296,93 @@ function buildRouteTableSignature(routes: readonly LogicalPortRoute[]): string {
   return JSON.stringify(buildRouteSignatureRows(routes));
 }
 
+/** Reads route-table freshness metadata while tolerating legacy documents. */
+function readRouteTableGeneration(routeTablePath: string): RouteTableGeneration | undefined {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(routeTablePath, "utf8")) as { readonly generation?: unknown };
+    const generation = parsed.generation;
+
+    if (typeof generation !== "object" || generation === null) {
+      return undefined;
+    }
+
+    const candidate = generation as {
+      readonly writerId?: unknown;
+      readonly writerStartedAtMs?: unknown;
+      readonly sequence?: unknown;
+      readonly pid?: unknown;
+    };
+
+    if (
+      typeof candidate.writerId !== "string" ||
+      typeof candidate.writerStartedAtMs !== "number" ||
+      !Number.isFinite(candidate.writerStartedAtMs) ||
+      typeof candidate.sequence !== "number" ||
+      !Number.isFinite(candidate.sequence) ||
+      typeof candidate.pid !== "number" ||
+      !Number.isFinite(candidate.pid)
+    ) {
+      return undefined;
+    }
+
+    return {
+      writerId: candidate.writerId,
+      writerStartedAtMs: candidate.writerStartedAtMs,
+      sequence: candidate.sequence,
+      pid: candidate.pid,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** True when a file already belongs to a daemon generation newer than this write. */
+function isRouteTablePathNewerThanGeneration(routeTablePath: string, generation: RouteTableGeneration): boolean {
+  const currentGeneration = readRouteTableGeneration(routeTablePath);
+  return currentGeneration !== undefined && isRouteTableGenerationNewer(currentGeneration, generation);
+}
+
+/** Compares route-table document metadata before replacing or deleting a file. */
+function isRouteTableGenerationNewer(current: RouteTableGeneration, candidate: RouteTableGeneration): boolean {
+  if (current.writerStartedAtMs !== candidate.writerStartedAtMs) {
+    return current.writerStartedAtMs > candidate.writerStartedAtMs;
+  }
+
+  if (current.writerId !== candidate.writerId) {
+    /*
+     * Same-millisecond daemon starts are rare, but a deterministic owner avoids
+     * an overwrite loop when two fresh writers race before the socket singleton
+     * has converged.
+     */
+    return current.writerId > candidate.writerId;
+  }
+
+  return current.sequence > candidate.sequence;
+}
+
 /**
  * Replaces a route table without exposing partial JSON to native hook readers.
  * Readers either see the previous complete file or the new complete file.
  */
 function writeAtomicRouteTableFile(routeTablePath: string, content: string): void {
   const temporaryPath = `${routeTablePath}.${process.pid}.${randomUUID()}.tmp`;
+  let temporaryFileDescriptor: number | undefined;
 
   try {
-    fs.writeFileSync(temporaryPath, content, "utf8");
+    temporaryFileDescriptor = fs.openSync(temporaryPath, "w", 0o600);
+    fs.writeFileSync(temporaryFileDescriptor, content, "utf8");
+    fs.closeSync(temporaryFileDescriptor);
+    temporaryFileDescriptor = undefined;
     fs.renameSync(temporaryPath, routeTablePath);
   } catch (error) {
+    if (temporaryFileDescriptor !== undefined) {
+      try {
+        fs.closeSync(temporaryFileDescriptor);
+      } catch {
+        // The original write error is the useful failure.
+      }
+    }
+
     try {
       fs.rmSync(temporaryPath, { force: true });
     } catch {
@@ -2119,6 +2391,75 @@ function writeAtomicRouteTableFile(routeTablePath: string, content: string): voi
 
     throw error;
   }
+}
+
+function acquireRouteTableGenerationLock(routeTablePath: string): (() => void) | undefined {
+  const lockPath = `${routeTablePath}.lock`;
+
+  for (let attempt = 0; attempt < ROUTE_TABLE_GENERATION_LOCK_ATTEMPTS; attempt += 1) {
+    let lockFd: number | undefined;
+
+    try {
+      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+      lockFd = fs.openSync(lockPath, "wx");
+      fs.writeFileSync(lockFd, `${process.pid}\n${new Date().toISOString()}\n`, "utf8");
+      return () => {
+        closeRouteTableGenerationLock(lockFd);
+        try {
+          fs.rmSync(lockPath, { force: true });
+        } catch {
+          // A later generation can clear stale locks if this process exits mid-write.
+        }
+      };
+    } catch (error) {
+      if (lockFd !== undefined) {
+        closeRouteTableGenerationLock(lockFd);
+      }
+
+      if (!isNodeFileError(error, "EEXIST")) {
+        return undefined;
+      }
+
+      removeStaleRouteTableGenerationLock(lockPath);
+      if (attempt + 1 < ROUTE_TABLE_GENERATION_LOCK_ATTEMPTS) {
+        sleepSync(ROUTE_TABLE_GENERATION_LOCK_SLEEP_MS);
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function sleepSync(ms: number): void {
+  const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(waitBuffer, 0, 0, ms);
+}
+
+function removeStaleRouteTableGenerationLock(lockPath: string): void {
+  try {
+    const stats = fs.statSync(lockPath);
+    if (Date.now() - stats.mtimeMs >= ROUTE_TABLE_GENERATION_LOCK_STALE_MS) {
+      fs.rmSync(lockPath, { force: true });
+    }
+  } catch {
+    // Missing lock files are expected between daemon generations.
+  }
+}
+
+function closeRouteTableGenerationLock(fd: number | undefined): void {
+  if (fd === undefined) {
+    return;
+  }
+
+  try {
+    fs.closeSync(fd);
+  } catch {
+    // The descriptor may already be closed during process teardown.
+  }
+}
+
+function isNodeFileError(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
 }
 
 /** Normalizes route rows so snapshot and route-file signatures stay aligned. */

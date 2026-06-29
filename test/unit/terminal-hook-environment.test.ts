@@ -90,16 +90,32 @@ test("package command shims rerun client tools without native runtime alias sema
   assert.equal(source.includes("__pm_text_looks_like_dev_server()"), true);
   assert.equal(source.includes("__pm_package_script_text()"), true);
   assert.equal(source.includes("*vite*"), true);
+  assert.equal(source.includes("*celery*"), true);
   assert.equal(source.includes("*uvicorn*"), true);
   assert.equal(source.includes("removeLegacyPreloadPackageManagerShims"), true);
   assert.equal(source.includes("PRELOAD_PACKAGE_MANAGER_NAMES.includes(entry.name)"), true);
   assert.equal(source.includes("__pm_is_package_command_shim()"), true);
   assert.equal(source.includes("export PORT_MANAGER_PRELOAD_REPAIR=1"), true);
   assert.equal(
-    source.includes('if [ "\\${PORT_MANAGER_PRELOAD_REPAIR:-}" = "1" ] && [ -n "\\${PORT_MANAGER_DYLD_INSERT_LIBRARIES:-}" ]; then'),
+    source.includes('collection.replace("PORT_MANAGER_COMPOSE_LOGICAL_PORTS", composeLogicalPorts, TERMINAL_MUTATOR_OPTIONS);'),
     true,
-    "BASH_ENV must not restore DYLD for package-manager lifecycle shells unless a runtime shim opted in",
+    "terminal env collection must clear stale compose logical ports when the current network has none",
   );
+  assert.equal(
+    source.includes("const composeLogicalPortsExport = `export PORT_MANAGER_COMPOSE_LOGICAL_PORTS=${shellQuote(composeLogicalPorts)}`;"),
+    true,
+    "BASH_ENV restore must clear stale compose logical ports when the current network has none",
+  );
+  assert.equal(
+    source.includes(
+      'if [ "\\${PORT_MANAGER_HOOK_DISABLED:-}" != "1" ] && [ "\\${PORT_MANAGER_HOOK:-1}" != "0" ] && [ "\\${PORT_MANAGER_PRELOAD_REPAIR:-}" = "1" ] && [ -n "\\${PORT_MANAGER_DYLD_INSERT_LIBRARIES:-}" ]; then',
+    ),
+    true,
+    "BASH_ENV must repair DYLD only while the Port Manager hook remains enabled",
+  );
+  assert.equal(source.includes("unset BASH_ENV PORT_MANAGER_PRELOAD_REPAIR PORT_MANAGER_DYLD_INSERT_LIBRARIES"), true);
+  assert.equal(source.includes("PORT_MANAGER_COMPOSE_LOGICAL_PORTS"), true);
+  assert.equal(source.includes("PORT_MANAGER_TERMINAL_ATTACHMENT_DIR"), true);
   assert.equal(
     source.includes('if __pm_is_package_command_shim "\\${__pm_candidate}"; then'),
     true,
@@ -316,6 +332,7 @@ test("external pm shell function exposes doctor routes and detach diagnostics", 
   assert.equal(commandSource.includes("hook-disabled"), true);
   assert.equal(commandSource.includes("other-network"), true);
   assert.equal(commandSource.includes("manage\\\\.py\\\\s+runserver"), true);
+  assert.equal(commandSource.includes("uvicorn|gunicorn|daphne|celery|webpack-dev-server"), true);
   assert.equal(commandSource.includes("PORT_MANAGER_NETWORK_LOOPBACK_HOST"), true);
   assert.equal(commandSource.includes("PORT_MANAGER_ACTUAL_LOOPBACK_HOST"), true);
   assert.equal(commandSource.includes("Network selection file:"), true);
@@ -400,6 +417,22 @@ test("agent client suppresses unchanged snapshot change events", () => {
   assert.equal(signatureBody.includes("function buildClientRouteSignatureRows"), true);
 });
 
+test("agent compatibility rejects daemons with stale route table storage", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/local-agent-client.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const compatibilityStart = source.indexOf("function annotateDaemonCompatibility");
+  const compatibilityEnd = source.indexOf("function normalizeAgentMainPath", compatibilityStart);
+  const compatibilityBody = source.slice(compatibilityStart, compatibilityEnd);
+
+  assert.notEqual(compatibilityStart, -1);
+  assert.equal(compatibilityBody.includes("getDefaultRouteTablePath()"), true);
+  assert.equal(compatibilityBody.includes("routeTablePathMismatch"), true);
+  assert.equal(
+    compatibilityBody.includes("missingAgentMetadata || pathMismatch || routeTablePathMismatch || olderThanCurrentBuild"),
+    true,
+  );
+});
+
 test("network removal restores compose attachments before deleting the network", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
@@ -426,13 +459,23 @@ test("background routing refresh polls terminals and containers", () => {
   assert.equal(source.includes("this.refreshTerminals().catch(() => [])"), true);
   assert.equal(burstBody.includes("await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);"), true);
   assert.equal(
+    burstBody.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);"),
+    true,
+  );
+  assert.equal(
     burstBody.indexOf("await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);") <
+      burstBody.indexOf("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);"),
+    true,
+  );
+  assert.equal(
+    burstBody.indexOf("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);") <
       burstBody.indexOf("await this.refreshTerminals().catch(() => []);"),
     true,
   );
   assert.equal(source.includes("this.refreshContainerServices({ background: true }).catch(() => [])"), true);
   assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts({ background: true }).catch(() => undefined);"), false);
   assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts({ background: true, force: true }).catch(() => undefined);"), true);
+  assert.equal(source.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);"), true);
   assert.equal(source.includes("await this.convergeDaemonAndRoutingState();"), true);
   assert.equal(source.includes("ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 60_000"), true);
   assert.equal(source.includes("BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS = 60_000"), true);
@@ -451,6 +494,15 @@ test("compose reconcile registers only live runtime endpoints", () => {
   const mappingPolicyStart = source.indexOf("function shouldRefreshComposeContainerMappingsFromRuntime");
   const mappingPolicyEnd = source.indexOf("function composeRouteCopyFiles", mappingPolicyStart);
   const mappingPolicyBody = source.slice(mappingPolicyStart, mappingPolicyEnd);
+  const mergeStart = source.indexOf("function mergeComposePortsWithLiveRoutes");
+  const mergeEnd = source.indexOf("function composeAttachmentRuntimeStateChanged", mergeStart);
+  const mergeBody = source.slice(mergeStart, mergeEnd);
+  const replaceStart = source.indexOf("private async replaceComposeRouteProcesses");
+  const replaceEnd = source.indexOf("  /** Refreshes clone container id rewrites", replaceStart);
+  const replaceBody = source.slice(replaceStart, replaceEnd);
+  const registerIndex = replaceBody.indexOf("await this.processService.registerExistingProcess(");
+  const preserveIndex = replaceBody.indexOf("const registeredProcessIds = new Set<string>();");
+  const staleRemoveIndex = replaceBody.indexOf("await this.removeComposeRouteProcesses(attachment, attachment.ports, registeredProcessIds);");
 
   assert.equal(reconcileBody.includes("shouldRefreshComposePublishedPortsFromRuntime(attachment, options)"), true);
   assert.equal(reconcileBody.includes(".listLiveComposePublishedPorts("), true);
@@ -462,6 +514,12 @@ test("compose reconcile registers only live runtime endpoints", () => {
   assert.equal(publishedPortPolicyBody.includes("isContainerStyleComposeAttachment"), false);
   assert.equal(mappingPolicyBody.includes("if (attachment.mutation === undefined)"), true);
   assert.equal(mappingPolicyBody.includes("return options.force === true || options.background !== true;"), true);
+  assert.equal(mergeBody.includes("for (const livePort of livePorts)"), true);
+  assert.equal(mergeBody.includes("mergedPorts.push(livePort)"), true);
+  assert.equal(registerIndex >= 0, true);
+  assert.equal(preserveIndex > registerIndex, true);
+  assert.equal(staleRemoveIndex > preserveIndex, true);
+  assert.equal(replaceBody.includes("await this.removeComposeRouteProcesses(attachment, attachment.ports);\n    if (livePorts.length === 0)"), false);
   assert.equal(source.includes("private async restorePersistedComposeRoutesIfMissing"), false);
   assert.equal(source.includes("private async restorePersistedComposeRoutes("), false);
 });
@@ -562,7 +620,12 @@ test("compose attach waits for routing convergence before returning", () => {
 
   assert.equal(attachBody.includes("await this.convergeAfterComposeAttachmentChange([refreshedAttachment]);"), true);
   assert.equal(attachBody.includes("await this.convergeAfterComposeAttachmentChange([updatedAttachment]);"), true);
-  assert.equal(convergeBody.includes("await this.writeComposeProjectRoutingFile().catch(() => undefined);"), true);
+  assert.equal(
+    convergeBody.includes(
+      "await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);",
+    ),
+    true,
+  );
   assert.equal(convergeBody.includes("await this.writeTerminalNetworkSelectionFile().catch(() => undefined);"), true);
   assert.equal(convergeBody.includes("await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);"), true);
   assert.equal(convergeBody.includes("await this.convergeDaemonAndRoutingState();"), true);
@@ -628,6 +691,11 @@ test("compose route reconciliation does not rehydrate persisted attachment route
   assert.equal(source.includes('attachment.status === "attached" || attachment.status === "error"'), true);
   assert.equal(reconcileBody.includes(".composeAttachments.filter(isRestorableComposeAttachment)"), true);
   assert.equal(reconcileBody.includes(".listLiveComposePublishedPorts("), true);
+  assert.equal(reconcileBody.includes("let livePorts: readonly ComposePublishedPort[] | undefined;"), true);
+  assert.equal(reconcileBody.includes("containerRuntimeSettingsForAttachment(settings, attachment)"), true);
+  assert.equal(reconcileBody.includes("shouldRefreshPorts && livePorts !== undefined"), true);
+  assert.equal(reconcileBody.includes(".catch(() => [])"), false);
+  assert.equal(reconcileBody.includes("liveDiscoveryError"), true);
   assert.equal(reconcileBody.includes("this.replaceComposeRouteProcesses(attachment, livePorts)"), true);
   assert.equal(attachBody.includes(".listLiveComposePublishedPorts("), true);
   assert.equal(attachBody.includes("this.replaceComposeRouteProcesses(registeredAttachment, livePorts)"), true);
@@ -648,8 +716,8 @@ test("compose route reconciliation does not rehydrate persisted attachment route
 test("compose project routing files are published as a serialized atomic generation", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
-  const writeStart = source.indexOf("private async writeComposeProjectRoutingFile(): Promise<void>");
-  const writeEnd = source.indexOf("private async restoreMissingComposeOverrideFiles", writeStart);
+  const writeStart = source.indexOf("private async writeComposeProjectRoutingFile(");
+  const writeEnd = source.indexOf("private async reconcileComposeOverrideFiles", writeStart);
   const writeBody = source.slice(writeStart, writeEnd);
   const rowStart = source.indexOf("function buildComposeProjectRoutingRows");
   const rowEnd = source.indexOf("function mergeComposeRoutingContainerMappings", rowStart);
@@ -657,15 +725,72 @@ test("compose project routing files are published as a serialized atomic generat
 
   assert.equal(source.includes("private composeProjectRoutingWriteInFlight"), true);
   assert.equal(source.includes("private composeProjectRoutingWriteQueued = false;"), true);
+  assert.equal(source.includes("private composeProjectRoutingForceOverrideRefreshQueued = false;"), true);
   assert.equal(source.includes("private async writeComposeProjectRoutingFileSerially(): Promise<void>"), true);
-  assert.equal(source.includes("private async writeComposeProjectRoutingFileExclusive(): Promise<void>"), true);
+  assert.equal(source.includes("private async writeComposeProjectRoutingFileExclusive("), true);
   assert.equal(rowBody.includes("!isRestorableComposeAttachment(attachment)"), true);
+  assert.equal(rowBody.includes("inferOriginalComposeProjectNameForRouting("), true);
+  assert.equal(rowBody.includes("routingFiles.overrideFile === undefined"), true);
+  assert.equal(source.includes("function parseComposeConfiguredProjectNameForRouting"), true);
+  assert.equal(writeBody.includes("this.composeProjectRoutingForceOverrideRefreshQueued = true;"), true);
   assert.equal(writeBody.includes("this.composeProjectRoutingWriteQueued = true;"), true);
-  assert.equal(writeBody.includes("await this.restoreMissingComposeOverrideFiles();"), true);
+  assert.equal(writeBody.includes("await withSharedFileGenerationLock(this.getComposeProjectRoutingLockPath(), async () => {"), true);
+  assert.equal(writeBody.includes("await this.reconcileComposeOverrideFiles(undefined, {"), true);
   assert.equal(writeBody.includes('await writeTextFileAtomically(globalFilePath, "");'), true);
   assert.equal(writeBody.includes('await writeTextFileAtomically(scopedFilePath, "");'), true);
   assert.equal(writeBody.includes("await writeTextFileAtomically(scopedFilePath, serializeComposeProjectRoutingRows([row]));"), true);
   assert.equal(writeBody.includes("await fs.writeFile(scopedFilePath"), false);
+  assert.equal(source.includes("COMPOSE_PROJECT_ROUTING_WRITE_LOCK_STALE_MS"), true);
+  assert.equal(source.includes("function acquireSharedFileGenerationLock"), true);
+  assert.equal(source.includes("function removeStaleSharedFileGenerationLock"), true);
+});
+
+test("compose override yaml is force-refreshed on attach startup and repair", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const attachStart = source.indexOf("async attachComposePublishedPorts(input: ComposePublishedPortsInput)");
+  const attachEnd = source.indexOf("async detachComposeAttachment", attachStart);
+  const attachBody = source.slice(attachStart, attachEnd);
+  const startStart = source.indexOf("async start(): Promise<void>");
+  const startEnd = source.indexOf("  /** Returns the latest logical network snapshot", startStart);
+  const startBody = source.slice(startStart, startEnd);
+  const reloadStart = source.indexOf("private async reloadSharedNetworkState");
+  const reloadEnd = source.indexOf("private loadVscodeWindowTerminalBinding", reloadStart);
+  const reloadBody = source.slice(reloadStart, reloadEnd);
+  const repairStart = source.indexOf("async fixStaleRouting()");
+  const repairEnd = source.indexOf("  /** Releases listeners", repairStart);
+  const repairBody = source.slice(repairStart, repairEnd);
+  const helperStart = source.indexOf("private async reconcileComposeOverrideFiles");
+  const helperEnd = source.indexOf("private getComposeProjectRoutingFilePath", helperStart);
+  const helperBody = source.slice(helperStart, helperEnd);
+
+  assert.equal(attachBody.includes("force: input.composeMutation !== undefined || input.existingMutation !== undefined"), true);
+  assert.equal(attachBody.includes("await this.composePublishMutator.hidePublishedPorts({"), true);
+  assert.equal(attachBody.includes("await this.composePublishMutator.restoreHiddenPortsOverride(input.existingMutation, {"), true);
+  assert.equal(startBody.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });"), true);
+  assert.equal(reloadBody.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });"), true);
+  assert.equal(
+    repairBody.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);"),
+    true,
+  );
+  assert.equal(helperBody.includes("this.composePublishMutator.restoreHiddenPortsOverride(mutation, options)"), true);
+  assert.equal(helperBody.includes("this.registry.updateComposeAttachment({"), true);
+});
+
+test("manual refresh commands reconcile generated network routing state", () => {
+  const commandsPath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const commandsSource = fs.readFileSync(commandsPath, "utf8");
+  const refreshServicesStart = commandsSource.indexOf("private async refreshContainerServices(): Promise<void>");
+  const refreshServicesEnd = commandsSource.indexOf("  /** Attaches a selected terminal", refreshServicesStart);
+  const refreshServicesBody = commandsSource.slice(refreshServicesStart, refreshServicesEnd);
+  const refreshStart = commandsSource.indexOf("private async refresh(): Promise<void>");
+  const refreshEnd = commandsSource.indexOf("  /** Opens the status bar command menu", refreshStart);
+  const refreshBody = commandsSource.slice(refreshStart, refreshEnd);
+
+  assert.equal(refreshServicesBody.includes("this.dependencies.networkService.refreshContainerServices();"), true);
+  assert.equal(refreshServicesBody.includes("await this.dependencies.networkService.refreshNetworkRoutingState();"), true);
+  assert.equal(refreshBody.includes("this.dependencies.networkService.refreshContainerServices()"), true);
+  assert.equal(refreshBody.includes("await this.dependencies.networkService.refreshNetworkRoutingState();"), true);
 });
 
 test("background routing convergence does not rewrite unchanged generated files", () => {
@@ -689,6 +814,38 @@ test("background routing convergence does not rewrite unchanged generated files"
   assert.equal(scriptBody.includes("const nextContents = `${contents.trimEnd()}\\n`;"), true);
   assert.equal(scriptBody.includes("if (syncTextFileAlreadyMatches(scriptPath, nextContents))"), true);
   assert.equal(scriptBody.includes("ensureExecutableScriptMode(scriptPath);"), true);
+});
+
+test("route tables are stored in extension global storage and legacy temp files are cleaned", () => {
+  const activatePath = path.resolve(__dirname, "../../../src/extension/activate.ts");
+  const networkServicePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const commandsPath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const agentMainPath = path.resolve(__dirname, "../../../src/agent/agent-main.ts");
+  const agentPath = path.resolve(__dirname, "../../../src/agent/port-manager-agent.ts");
+  const activateSource = fs.readFileSync(activatePath, "utf8");
+  const networkSource = fs.readFileSync(networkServicePath, "utf8");
+  const commandsSource = fs.readFileSync(commandsPath, "utf8");
+  const agentMainSource = fs.readFileSync(agentMainPath, "utf8");
+  const agentSource = fs.readFileSync(agentPath, "utf8");
+  const cleanupStart = networkSource.indexOf("private async collectRoutingFileCleanupPaths");
+  const cleanupEnd = networkSource.indexOf("private async collectGlobalStorageCleanupPaths", cleanupStart);
+  const cleanupBody = networkSource.slice(cleanupStart, cleanupEnd);
+  const networkCleanupStart = networkSource.indexOf("private async collectNetworkRoutingFileCleanupPaths");
+  const networkCleanupEnd = networkSource.indexOf("private async rehydrateRoutingFiles", networkCleanupStart);
+  const networkCleanupBody = networkSource.slice(networkCleanupStart, networkCleanupEnd);
+
+  assert.equal(
+    activateSource.includes('configureRouteTableStorageDirectory(path.join(context.globalStorageUri.fsPath, "route-tables"))'),
+    true,
+  );
+  assert.equal(cleanupBody.includes("getLegacyDefaultRouteTablePath()"), true);
+  assert.equal(networkCleanupBody.includes("getLegacyDefaultRouteTablePath()"), true);
+  assert.equal(commandsSource.includes('--route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE"'), true);
+  assert.equal(agentMainSource.includes("parsedArguments.routeTablePath ?? process.env.PORT_MANAGER_GLOBAL_ROUTES_FILE"), true);
+  assert.equal(agentSource.includes("const releaseGenerationLock = acquireRouteTableGenerationLock(this.routeTablePath);"), true);
+  assert.equal(agentSource.includes("private writeRouteTableGeneration("), true);
+  assert.equal(agentSource.includes("generation: RouteTableGeneration"), true);
+  assert.equal(agentSource.includes("isRouteTableGenerationNewer"), true);
 });
 
 test("terminal attach script prepares actual loopback routing only after alias readiness", () => {
@@ -747,9 +904,24 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   const allocationStart = source.indexOf("pm_allocate_route(logical_port, bind_host, NULL, \"listen\"");
   const loopbackBind = source.slice(loopbackStart, allocationStart);
   const highPortBind = source.slice(allocationStart, source.indexOf("static int pm_connect_hook", allocationStart));
+  const matchLevelStart = source.indexOf("static int pm_route_network_match_level");
+  const matchLevelEnd = source.indexOf("static int pm_route_is_compose", matchLevelStart);
+  const matchLevelBody = source.slice(matchLevelStart, matchLevelEnd);
+  const connectStart = source.indexOf("static int pm_connect_hook");
+  const connectEnd = source.indexOf("static int pm_getsockname_hook", connectStart);
+  const connectBody = source.slice(connectStart, connectEnd);
 
   assert.notEqual(loopbackStart, -1);
   assert.notEqual(allocationStart, -1);
+  assert.notEqual(matchLevelStart, -1);
+  assert.notEqual(connectStart, -1);
+  assert.equal(
+    matchLevelBody.includes(
+      'return pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0 ? 2 : 0;',
+    ),
+    true,
+    "the native connect hook must fail closed when scoped network identity is missing",
+  );
   assert.equal(loopbackStart < allocationStart, true);
   assert.equal(loopbackBind.includes("pm_set_sockaddr_host((struct sockaddr *)&rewritten, loopback_host);"), true);
   assert.equal(loopbackBind.includes("pm_remember_route(logical_port, logical_port, loopback_host, \"\");"), true);
@@ -760,7 +932,13 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   assert.equal(highPortBind.includes("pm_register_process(logical_port, actual_port, bind_host, allocation_id);"), true);
   assert.equal(source.includes("actual_host_payload"), true);
   assert.equal(source.includes('\\"actualHost\\":\\"%s\\"'), true);
-  assert.equal(source.includes('pm_allocate_route(logical_port, target_host, actual_loopback_host, "send"'), true);
+  assert.equal(connectBody.includes("pm_allocate_route("), true);
+  assert.equal(connectBody.includes("actual_loopback_host,\n          \"send\""), true);
+  assert.equal(connectBody.includes("target_host,\n          sizeof(target_host)"), true);
+  assert.equal(source.includes('pm_json_string(response, "host", allocated_host, allocated_host_size)'), true);
+  assert.equal(source.includes("actual_port != logical_port && actual_loopback_host != NULL"), false);
+  assert.equal(connectBody.includes("falling back to routed allocation"), true);
+  assert.equal(connectBody.includes("loopback_connect_errno != ECONNREFUSED"), true);
 });
 
 test("native agent adopts previous route files before first startup write", () => {
@@ -778,6 +956,8 @@ test("native agent adopts previous route files before first startup write", () =
   assert.equal(adoptBody.includes("unlink(file_path);"), false);
   assert.equal(initBody.includes("pm_adopt_previous_generation_route_files(state);"), true);
   assert.equal(initBody.includes("pm_write_route_tables(state);"), true);
+  assert.equal(source.includes("pm_acquire_route_table_write_lock(state->route_table_path"), true);
+  assert.equal(source.includes("PM_ROUTE_TABLE_WRITE_LOCK_STALE_SECONDS"), true);
 });
 
 test("native preload repair is opt-in at runtime shim boundaries", () => {
@@ -821,6 +1001,9 @@ test("logical router classifies clients by process tree label before hook enviro
   const methodStart = source.indexOf("private async findClientNetworkForRouter");
   const methodEnd = source.indexOf("private async findNetworkRouteForRouter", methodStart);
   const findClientNetworkForRouter = source.slice(methodStart, methodEnd);
+  const networkRouteStart = source.indexOf("private async findNetworkRouteForRouter");
+  const networkRouteEnd = source.indexOf("private async findUniqueRouteForRouter", networkRouteStart);
+  const findNetworkRouteForRouter = source.slice(networkRouteStart, networkRouteEnd);
   const uniqueRouteStart = source.indexOf("private async findUniqueRouteForRouter");
   const uniqueRouteEnd = source.indexOf("private findClientCwdRouteForRouter", uniqueRouteStart);
   const findUniqueRouteForRouter = source.slice(uniqueRouteStart, uniqueRouteEnd);
@@ -836,6 +1019,11 @@ test("logical router classifies clients by process tree label before hook enviro
     "process tree labels must be the primary router signal; inherited hook env remains fallback",
   );
   assert.equal(findClientNetworkForRouter.includes("return environmentNetworkId;"), true);
+  assert.equal(
+    findNetworkRouteForRouter.includes("return candidates.length === 1 ? candidates[0] : undefined;"),
+    false,
+    "known-network router clients must not fall back to another network's sole route",
+  );
   assert.equal(source.includes("explicit unscoped host routes"), true);
   assert.equal(findUniqueRouteForRouter.includes("route.networkId === undefined"), true);
   assert.equal(findUniqueRouteForRouter.includes("candidates.filter((route) => !isNetworkScopedComposeRoute(route))"), false);
@@ -902,4 +1090,18 @@ test("logical network service persists registry-normalized shared state", () => 
   assert.equal(reloadBody.includes("this.saveNormalizedPersistedStateIfChanged();"), true);
   assert.equal(helperBody.includes("this.registry.getPersistedState()"), true);
   assert.equal(helperBody.includes("this.saveState({ force: true });"), true);
+});
+
+test("compose mutation publishes hidden ports on the network loopback host", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const attachStart = source.indexOf("async attachComposePublishedPorts");
+  const attachEnd = source.indexOf("private async runTerminalAttachmentRefreshBurstStep", attachStart);
+  const attachBody = source.slice(attachStart, attachEnd);
+
+  assert.notEqual(attachStart, -1);
+  assert.equal(attachBody.includes("const hiddenHostAddress = loopbackAddressForNetwork(network.id);"), true);
+  assert.equal(attachBody.includes("await ensureLoopbackAddressRoutingHostReady("), true);
+  assert.equal(attachBody.includes("resolveLoopbackAddressRoutingMode(portSettings)"), true);
+  assert.equal(attachBody.includes("hiddenHostAddress,"), true);
 });

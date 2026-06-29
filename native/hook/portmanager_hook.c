@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <spawn.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -36,13 +37,15 @@
 #define PM_MAX_PATH 1024
 #define PM_MAX_SHEBANG 4096
 #define PM_MAX_SCRIPT_LINE 4096
-#define PM_MAX_ROUTES 128
+#define PM_MAX_ROUTES 32768
 #define PM_DEFAULT_SCAN_RANGE 20
 #define PM_DEFAULT_VIRTUAL_START 53000
 #define PM_DEFAULT_VIRTUAL_END 59999
 #define PM_DEFAULT_FIXED_PROTOCOL_PORTS "22,25,53,80,110,143,389,443,465,587,993,995,1433,1521,3306,33060,5432,5672,6379,9200,9300,11211,27017"
-#define PM_AGENT_ROUNDTRIP_TIMEOUT_MS 5000
+#define PM_AGENT_ROUNDTRIP_TIMEOUT_MS 60000
 #define PM_BIND_ALLOCATION_ATTEMPTS 4
+#define PM_COMPOSE_ROUTE_WAIT_MS 10000
+#define PM_CONNECT_ROUTE_WAIT_MS 1000
 #define PM_ACTUAL_LOOPBACK_HOST_ENV "PORT_MANAGER_ACTUAL_LOOPBACK_HOST"
 #define PM_NETWORK_LOOPBACK_HOST_ENV "PORT_MANAGER_NETWORK_LOOPBACK_HOST"
 
@@ -72,6 +75,7 @@ typedef struct {
   int actual_port;
   char allocation_id[PM_MAX_TEXT];
   char host[128];
+  char network_id[PM_MAX_TEXT];
 } pm_route_mapping;
 
 #if defined(__APPLE__)
@@ -97,6 +101,7 @@ static __thread int pm_hook_depth = 0;
 static pm_route_mapping pm_routes[PM_MAX_ROUTES];
 static int pm_route_count = 0;
 static unsigned long pm_request_sequence = 1;
+static pthread_mutex_t pm_route_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void pm_release_process_routes(void);
 static const char *pm_actual_loopback_host(void);
@@ -1201,6 +1206,12 @@ static int pm_should_block_docker_socket(const struct sockaddr *addr, socklen_t 
   return network_id != NULL && network_id[0] != '\0';
 }
 
+static int pm_has_current_network_scope(void) {
+  const char *network_id = pm_current_network_id();
+
+  return network_id != NULL && network_id[0] != '\0';
+}
+
 __attribute__((constructor)) static void pm_hook_loaded(void) {
   pm_debug("loaded");
 }
@@ -1313,6 +1324,16 @@ static int pm_port_list_contains(const char *ports, int target_port) {
 static int pm_is_fixed_protocol_port(int port) {
   const char *configured_ports = getenv("PORT_MANAGER_FIXED_PROTOCOL_PORTS");
   const char *ports = configured_ports != NULL ? configured_ports : PM_DEFAULT_FIXED_PROTOCOL_PORTS;
+
+  if (ports == NULL || ports[0] == '\0') {
+    return 0;
+  }
+
+  return pm_port_list_contains(ports, port);
+}
+
+static int pm_is_compose_logical_port(int port) {
+  const char *ports = getenv("PORT_MANAGER_COMPOSE_LOGICAL_PORTS");
 
   if (ports == NULL || ports[0] == '\0') {
     return 0;
@@ -1552,6 +1573,23 @@ static void pm_route_entry_path(const char *route_table_path, int logical_port, 
   }
 
   snprintf(buffer, size, "%s-port-%d.json", route_table_path, logical_port);
+}
+
+static void pm_route_compose_claim_path(const char *route_table_path, int port, char *buffer, size_t size) {
+  const char *file_name;
+  const char *extension;
+
+  file_name = strrchr(route_table_path, '/');
+  file_name = file_name == NULL ? route_table_path : file_name + 1;
+  extension = strrchr(file_name, '.');
+
+  if (extension != NULL) {
+    size_t prefix_length = (size_t)(extension - route_table_path);
+    snprintf(buffer, size, "%.*s-compose-claim-port-%d%s", (int)prefix_length, route_table_path, port, extension);
+    return;
+  }
+
+  snprintf(buffer, size, "%s-compose-claim-port-%d.json", route_table_path, port);
 }
 
 static void pm_default_host_access_path(char *buffer, size_t size) {
@@ -1797,14 +1835,33 @@ static void pm_command_name(char *buffer, size_t size) {
 #endif
 }
 
+static long pm_now_milliseconds(void) {
+  struct timeval now;
+
+  if (gettimeofday(&now, NULL) != 0) {
+    return 0;
+  }
+
+  return (long)(now.tv_sec * 1000L + now.tv_usec / 1000L);
+}
+
+static int pm_agent_connect_error_retryable(int error_code) {
+  return error_code == ECONNREFUSED ||
+         error_code == ENOENT ||
+         error_code == EAGAIN ||
+         error_code == ECONNRESET;
+}
+
 static int pm_agent_roundtrip(const char *request, char *response, size_t response_size) {
   char socket_path[PM_MAX_PATH];
   struct sockaddr_un server_addr;
-  int fd;
+  int fd = -1;
   size_t request_len = strlen(request);
   ssize_t written;
   size_t total = 0;
   size_t scan_offset = 0;
+  int timeout_ms;
+  long deadline_ms;
 
   pm_ensure_symbols();
   if (pm_real_connect == NULL) {
@@ -1812,31 +1869,43 @@ static int pm_agent_roundtrip(const char *request, char *response, size_t respon
   }
 
   pm_default_socket_path(socket_path, sizeof(socket_path));
-  fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (fd < 0) {
-    return -1;
-  }
-
-  {
-    struct timeval timeout;
-    pm_agent_roundtrip_timeout(&timeout);
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-  }
-
   memset(&server_addr, 0, sizeof(server_addr));
   server_addr.sun_family = AF_UNIX;
   snprintf(server_addr.sun_path, sizeof(server_addr.sun_path), "%s", socket_path);
 
-  pm_hook_depth++;
-  if (pm_real_connect(fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0) {
-    int saved_errno = errno;
+  timeout_ms = pm_parse_int_env("PORT_MANAGER_AGENT_ROUNDTRIP_TIMEOUT_MS", PM_AGENT_ROUNDTRIP_TIMEOUT_MS);
+  if (timeout_ms < 100) {
+    timeout_ms = 100;
+  }
+  deadline_ms = pm_now_milliseconds() + timeout_ms;
+  for (;;) {
+    struct timeval timeout;
+    int saved_errno;
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+      return -1;
+    }
+
+    pm_agent_roundtrip_timeout(&timeout);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    pm_hook_depth++;
+    if (pm_real_connect(fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == 0) {
+      pm_hook_depth--;
+      break;
+    }
+    saved_errno = errno;
     pm_hook_depth--;
     close(fd);
-    pm_debug("agent connect failed socket=%s error=%s", socket_path, strerror(saved_errno));
-    return -1;
+    fd = -1;
+    if (!pm_agent_connect_error_retryable(saved_errno) || pm_now_milliseconds() >= deadline_ms) {
+      pm_debug("agent connect failed socket=%s error=%s", socket_path, strerror(saved_errno));
+      return -1;
+    }
+    usleep(2000);
   }
-  pm_hook_depth--;
 
   while (request_len > 0) {
     written = write(fd, request, request_len);
@@ -2047,146 +2116,6 @@ static int pm_route_matches_cwd(const char *route_json, const char *current_cwd)
   return pm_path_contains_or_equals(current_cwd, route_cwd) || pm_path_contains_or_equals(route_cwd, current_cwd);
 }
 
-static const char *pm_network_id_from_bash_env(void) {
-  const char *bash_env = getenv("BASH_ENV");
-  const char *base_name;
-  const char *prefix = "portmanager-bash-env-";
-  const char *suffix = ".sh";
-  size_t prefix_length = strlen(prefix);
-  size_t suffix_length = strlen(suffix);
-  size_t base_length;
-  size_t network_length;
-  static char network_id_from_bash_env[PM_MAX_TEXT];
-
-  /*
-   * The generated BASH_ENV file is scoped to the currently attached terminal.
-   * Prefer it over inherited variables so stale runtime children cannot keep
-   * registering routes under a previous terminal network.
-   */
-  if (bash_env == NULL || bash_env[0] == '\0') {
-    return NULL;
-  }
-
-  base_name = strrchr(bash_env, '/');
-  base_name = base_name == NULL ? bash_env : base_name + 1;
-  base_length = strlen(base_name);
-
-  if (base_length <= prefix_length + suffix_length || strncmp(base_name, prefix, prefix_length) != 0) {
-    return NULL;
-  }
-
-  if (strcmp(base_name + base_length - suffix_length, suffix) != 0) {
-    return NULL;
-  }
-
-  network_length = base_length - prefix_length - suffix_length;
-  if (network_length == 0 || network_length >= sizeof(network_id_from_bash_env)) {
-    return NULL;
-  }
-
-  memcpy(network_id_from_bash_env, base_name + prefix_length, network_length);
-  network_id_from_bash_env[network_length] = '\0';
-  return network_id_from_bash_env;
-}
-
-static const char *pm_network_id_from_route_table_path(void) {
-  const char *route_file = getenv("PORT_MANAGER_ROUTES_FILE");
-  const char *base_name;
-  const char *prefix = "newdlops-portmanager-routes-";
-  const char *suffix = ".json";
-  const char *scope_start;
-  size_t prefix_length = strlen(prefix);
-  size_t suffix_length = strlen(suffix);
-  size_t base_length;
-  size_t body_length;
-  size_t network_length;
-  static char network_id_from_route_table[PM_MAX_TEXT];
-
-  /*
-   * Some script launchers preserve PORT_MANAGER_ROUTES_FILE while dropping the
-   * explicit network variables. The scoped route-table filename is generated by
-   * route-table.ts, so it can recover the same logical-network id.
-   */
-  if (route_file == NULL || route_file[0] == '\0') {
-    return NULL;
-  }
-
-  base_name = strrchr(route_file, '/');
-  base_name = base_name == NULL ? route_file : base_name + 1;
-  base_length = strlen(base_name);
-
-  if (base_length <= prefix_length + suffix_length || strncmp(base_name, prefix, prefix_length) != 0) {
-    return NULL;
-  }
-
-  if (strcmp(base_name + base_length - suffix_length, suffix) != 0) {
-    return NULL;
-  }
-
-  body_length = base_length - prefix_length - suffix_length;
-  scope_start = memchr(base_name + prefix_length, '-', body_length);
-  if (scope_start == NULL) {
-    return NULL;
-  }
-
-  scope_start++;
-  network_length = (size_t)((base_name + prefix_length + body_length) - scope_start);
-  if (network_length == 0 || network_length >= sizeof(network_id_from_route_table)) {
-    return NULL;
-  }
-
-  memcpy(network_id_from_route_table, scope_start, network_length);
-  network_id_from_route_table[network_length] = '\0';
-  return network_id_from_route_table;
-}
-
-static const char *pm_network_id_from_compose_routing_file(void) {
-  const char *routing_file = getenv("PORT_MANAGER_COMPOSE_ROUTING_FILE");
-  const char *base_name;
-  const char *compose_separator;
-  const char *prefix = "compose-project-routing-";
-  const char *suffix = ".tsv";
-  size_t prefix_length = strlen(prefix);
-  size_t suffix_length = strlen(suffix);
-  size_t base_length;
-  size_t scoped_length;
-  size_t network_length;
-  static char network_id_from_compose_file[PM_MAX_TEXT];
-
-  /*
-   * The Compose routing file is scoped per logical network. It is a useful
-   * fallback when protected launchers preserve file env but drop network env.
-   */
-  if (routing_file == NULL || routing_file[0] == '\0') {
-    return NULL;
-  }
-
-  base_name = strrchr(routing_file, '/');
-  base_name = base_name == NULL ? routing_file : base_name + 1;
-  base_length = strlen(base_name);
-
-  if (base_length <= prefix_length + suffix_length || strncmp(base_name, prefix, prefix_length) != 0) {
-    return NULL;
-  }
-
-  if (strcmp(base_name + base_length - suffix_length, suffix) != 0) {
-    return NULL;
-  }
-
-  scoped_length = base_length - prefix_length - suffix_length;
-  compose_separator = strstr(base_name + prefix_length, ".compose-");
-  network_length = compose_separator == NULL
-    ? scoped_length
-    : (size_t)(compose_separator - (base_name + prefix_length));
-  if (network_length == 0 || network_length >= sizeof(network_id_from_compose_file)) {
-    return NULL;
-  }
-
-  memcpy(network_id_from_compose_file, base_name + prefix_length, network_length);
-  network_id_from_compose_file[network_length] = '\0';
-  return network_id_from_compose_file;
-}
-
 static const char *pm_current_network_id(void) {
   const char *network_id = getenv("PORT_MANAGER_NETWORK_ID");
 
@@ -2204,18 +2133,6 @@ static const char *pm_current_network_id(void) {
 
   if (network_id == NULL || network_id[0] == '\0') {
     network_id = getenv("NEWDLOPS_PM_BORROWED_NETWORK_ID");
-  }
-
-  if (network_id == NULL || network_id[0] == '\0') {
-    network_id = pm_network_id_from_bash_env();
-  }
-
-  if (network_id == NULL || network_id[0] == '\0') {
-    network_id = pm_network_id_from_compose_routing_file();
-  }
-
-  if (network_id == NULL || network_id[0] == '\0') {
-    network_id = pm_network_id_from_route_table_path();
   }
 
   return network_id;
@@ -2263,8 +2180,7 @@ static void pm_effective_route_table_path(char *buffer, size_t size) {
   pm_default_route_table_path(buffer, size);
 }
 
-static void pm_network_scope_payload(char *buffer, size_t size) {
-  const char *network_id = pm_current_network_id();
+static void pm_network_scope_payload_for_id(const char *network_id, char *buffer, size_t size) {
   char network_json[PM_MAX_TEXT * 2];
 
   if (size == 0) {
@@ -2278,6 +2194,10 @@ static void pm_network_scope_payload(char *buffer, size_t size) {
 
   pm_json_escape(network_id, network_json, sizeof(network_json));
   snprintf(buffer, size, ",\"networkId\":\"%s\"", network_json);
+}
+
+static void pm_network_scope_payload(char *buffer, size_t size) {
+  pm_network_scope_payload_for_id(pm_current_network_id(), buffer, size);
 }
 
 static int pm_route_matches_network(const char *route_json) {
@@ -2315,12 +2235,11 @@ static int pm_route_network_match_level(const char *route_json) {
 
   if (network_id == NULL || network_id[0] == '\0') {
     /*
-     * Some launcher chains briefly lose the scoped network env while keeping the
-     * injected hook alive. Prefer legacy unscoped rows; scoped rows are only a
-     * lower-priority fallback after the caller verifies the cwd still belongs to
-     * the same worktree.
+     * Network identity is an isolation boundary, not a hint. If protected
+     * launcher hops lose PORT_MANAGER_NETWORK_ID, fail closed to unscoped routes
+     * instead of inferring a scoped route from cwd or stale file names.
      */
-    return pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0 ? 2 : 1;
+    return pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0 ? 2 : 0;
   }
 
   if (pm_json_string(route_json, "networkId", route_network, sizeof(route_network)) != 0) {
@@ -2427,7 +2346,9 @@ static int pm_allocate_route(
   const char *route_direction,
   int *actual_port,
   char *allocation_id,
-  size_t allocation_size) {
+  size_t allocation_size,
+  char *allocated_host,
+  size_t allocated_host_size) {
   char cwd[PM_MAX_TEXT];
   char command[PM_MAX_TEXT];
   char cwd_json[PM_MAX_TEXT * 2];
@@ -2439,7 +2360,7 @@ static int pm_allocate_route(
   char network_payload[PM_MAX_TEXT * 3];
   char request[PM_MAX_REQUEST];
   char response[PM_MAX_RESPONSE];
-  unsigned long sequence = pm_request_sequence++;
+  unsigned long sequence = __sync_fetch_and_add(&pm_request_sequence, 1);
 
   pm_cwd(cwd, sizeof(cwd));
   pm_command_name(command, sizeof(command));
@@ -2459,7 +2380,7 @@ static int pm_allocate_route(
   snprintf(
     request,
     sizeof(request),
-    "{\"id\":\"hook-%ld-%lu\",\"method\":\"allocateRoute\",\"payload\":{\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"host\":\"%s\"%s,\"routeDirection\":\"%s\"%s,\"scanRange\":%d,\"scanDirection\":\"up\",\"routingMode\":\"%s\",\"virtualPortRangeStart\":%d,\"virtualPortRangeEnd\":%d}}\n",
+    "{\"id\":\"hook-%ld-%lu\",\"method\":\"allocateRoute\",\"payload\":{\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"host\":\"%s\"%s,\"routeDirection\":\"%s\"%s,\"compactResponse\":1,\"scanRange\":%d,\"scanDirection\":\"up\",\"routingMode\":\"%s\",\"virtualPortRangeStart\":%d,\"virtualPortRangeEnd\":%d}}\n",
     (long)getpid(),
     sequence,
     command_json,
@@ -2491,7 +2412,17 @@ static int pm_allocate_route(
   if (pm_json_string(response, "allocationId", allocation_id, allocation_size) != 0) {
     allocation_id[0] = '\0';
   }
-  pm_debug("allocated route logical=%d actual=%d allocation=%s", logical_port, *actual_port, allocation_id);
+  if (allocated_host != NULL && allocated_host_size > 0) {
+    if (pm_json_string(response, "host", allocated_host, allocated_host_size) != 0) {
+      snprintf(allocated_host, allocated_host_size, "%s", actual_host != NULL && actual_host[0] != '\0' ? actual_host : host);
+    }
+  }
+  pm_debug(
+    "allocated route logical=%d actual=%d host=%s allocation=%s",
+    logical_port,
+    *actual_port,
+    allocated_host != NULL && allocated_host[0] != '\0' ? allocated_host : "",
+    allocation_id);
 
   return 0;
 }
@@ -2499,7 +2430,7 @@ static int pm_allocate_route(
 static int pm_send_simple_payload(const char *method, const char *payload) {
   char request[PM_MAX_REQUEST];
   char response[PM_MAX_RESPONSE];
-  unsigned long sequence = pm_request_sequence++;
+  unsigned long sequence = __sync_fetch_and_add(&pm_request_sequence, 1);
 
   response[0] = '\0';
   snprintf(
@@ -2577,7 +2508,7 @@ static int pm_release_process_route(const pm_route_mapping *route) {
   }
 
   pm_json_escape(route->allocation_id, allocation_json, sizeof(allocation_json));
-  pm_network_scope_payload(network_payload, sizeof(network_payload));
+  pm_network_scope_payload_for_id(route->network_id, network_payload, sizeof(network_payload));
   snprintf(
     payload,
     sizeof(payload),
@@ -2591,32 +2522,53 @@ static int pm_release_process_route(const pm_route_mapping *route) {
 }
 
 static void pm_release_process_routes(void) {
+  pm_route_mapping *routes;
+  int route_count;
+
   /*
    * Listener scans are intentionally conservative, but the process that owns a
    * route knows when it is exiting. Release those rows here so endpoint route
    * files cannot keep pointing at a dead actual port until the next scan grace.
    */
-  for (int index = 0; index < pm_route_count; index++) {
-    if (pm_release_process_route(&pm_routes[index]) != 0) {
+  pthread_mutex_lock(&pm_route_mutex);
+  route_count = pm_route_count;
+  routes = route_count <= 0 ? NULL : (pm_route_mapping *)malloc((size_t)route_count * sizeof(pm_route_mapping));
+  if (routes != NULL) {
+    memcpy(routes, pm_routes, (size_t)route_count * sizeof(pm_route_mapping));
+  }
+  pthread_mutex_unlock(&pm_route_mutex);
+
+  if (route_count > 0 && routes == NULL) {
+    return;
+  }
+
+  for (int index = 0; index < route_count; index++) {
+    if (pm_release_process_route(&routes[index]) != 0) {
       break;
     }
   }
+  free(routes);
 }
 
 static void pm_remember_route(int logical_port, int actual_port, const char *host, const char *allocation_id) {
   pm_route_mapping *slot;
+  const char *network_id = pm_current_network_id();
+  const char *route_network_id = network_id == NULL ? "" : network_id;
 
+  pthread_mutex_lock(&pm_route_mutex);
   for (int index = 0; index < pm_route_count; index++) {
-    if (pm_routes[index].logical_port == logical_port) {
+    if (pm_routes[index].logical_port == logical_port && strcmp(pm_routes[index].network_id, route_network_id) == 0) {
       slot = &pm_routes[index];
       slot->actual_port = actual_port;
       snprintf(slot->host, sizeof(slot->host), "%s", host);
       snprintf(slot->allocation_id, sizeof(slot->allocation_id), "%s", allocation_id);
+      pthread_mutex_unlock(&pm_route_mutex);
       return;
     }
   }
 
   if (pm_route_count >= PM_MAX_ROUTES) {
+    pthread_mutex_unlock(&pm_route_mutex);
     return;
   }
 
@@ -2625,29 +2577,49 @@ static void pm_remember_route(int logical_port, int actual_port, const char *hos
   slot->actual_port = actual_port;
   snprintf(slot->host, sizeof(slot->host), "%s", host);
   snprintf(slot->allocation_id, sizeof(slot->allocation_id), "%s", allocation_id);
+  snprintf(slot->network_id, sizeof(slot->network_id), "%s", route_network_id);
+  pthread_mutex_unlock(&pm_route_mutex);
 }
 
 static int pm_memory_actual_for_logical(int logical_port, char *target_host, size_t target_host_size) {
+  const char *network_id = pm_current_network_id();
+  const char *route_network_id = network_id == NULL ? "" : network_id;
+  int actual_port = 0;
+  char host[128];
+
+  host[0] = '\0';
+  pthread_mutex_lock(&pm_route_mutex);
   for (int index = 0; index < pm_route_count; index++) {
-    if (pm_routes[index].logical_port == logical_port) {
-      if (target_host != NULL && target_host_size > 0) {
-        snprintf(target_host, target_host_size, "%s", pm_routes[index].host);
-      }
-      return pm_routes[index].actual_port;
+    if (pm_routes[index].logical_port == logical_port && strcmp(pm_routes[index].network_id, route_network_id) == 0) {
+      actual_port = pm_routes[index].actual_port;
+      snprintf(host, sizeof(host), "%s", pm_routes[index].host);
+      break;
     }
   }
+  pthread_mutex_unlock(&pm_route_mutex);
 
-  return 0;
+  if (actual_port > 0 && target_host != NULL && target_host_size > 0) {
+    snprintf(target_host, target_host_size, "%s", host);
+  }
+
+  return actual_port;
 }
 
 static int pm_memory_logical_for_actual(int actual_port) {
+  const char *network_id = pm_current_network_id();
+  const char *route_network_id = network_id == NULL ? "" : network_id;
+  int logical_port = 0;
+
+  pthread_mutex_lock(&pm_route_mutex);
   for (int index = 0; index < pm_route_count; index++) {
-    if (pm_routes[index].actual_port == actual_port) {
-      return pm_routes[index].logical_port;
+    if (pm_routes[index].actual_port == actual_port && strcmp(pm_routes[index].network_id, route_network_id) == 0) {
+      logical_port = pm_routes[index].logical_port;
+      break;
     }
   }
+  pthread_mutex_unlock(&pm_route_mutex);
 
-  return 0;
+  return logical_port;
 }
 
 static int pm_route_table_lookup_file(
@@ -2797,15 +2769,17 @@ static int pm_route_table_lookup_file(
   return 0;
 }
 
-static int pm_compose_claim_blocks_port_by_key(int port, const char *port_key) {
+static int pm_compose_claim_blocks_port(int port) {
   char path[PM_MAX_PATH];
+  char base_path[PM_MAX_PATH];
   char *buffer;
   int fd;
   struct stat stat_buffer;
   ssize_t read_count;
   char *cursor;
 
-  pm_default_global_route_table_path(path, sizeof(path));
+  pm_default_global_route_table_path(base_path, sizeof(base_path));
+  pm_route_compose_claim_path(base_path, port, path, sizeof(path));
   fd = open(path, O_RDONLY);
   if (fd < 0) {
     return 0;
@@ -2832,16 +2806,12 @@ static int pm_compose_claim_blocks_port_by_key(int port, const char *port_key) {
   buffer[read_count] = '\0';
   cursor = buffer;
 
-  while ((cursor = pm_find_json_int_key(cursor, port_key, port)) != NULL) {
+  while ((cursor = strchr(cursor, '{')) != NULL) {
     char *object_start = cursor;
     char *object_end = strchr(cursor, '}');
     char object_end_saved;
     int logical;
     int actual;
-
-    while (object_start > buffer && *object_start != '{') {
-      object_start--;
-    }
 
     if (object_end == NULL) {
       break;
@@ -2869,16 +2839,6 @@ static int pm_compose_claim_blocks_port_by_key(int port, const char *port_key) {
 
   free(buffer);
   return 0;
-}
-
-static int pm_compose_claim_blocks_port(int port) {
-  /*
-   * Docker keeps the host-published port open after attach. Treat both the
-   * logical service port and the actual host port as private compose claims so
-   * another logical network cannot reach either endpoint through localhost.
-   */
-  return pm_compose_claim_blocks_port_by_key(port, "logicalPort") ||
-         pm_compose_claim_blocks_port_by_key(port, "actualPort");
 }
 
 static int pm_route_table_lookup(
@@ -2922,6 +2882,53 @@ static int pm_route_table_lookup(
     source_port,
     source_is_actual,
     required_direction,
+    target_host,
+    target_host_size,
+    is_compose_route);
+}
+
+static int pm_wait_for_route(
+  int logical_port,
+  const char *timeout_env,
+  int default_wait_ms,
+  const char *reason,
+  char *target_host,
+  size_t target_host_size,
+  int *is_compose_route) {
+  int wait_ms = pm_parse_int_env(timeout_env, default_wait_ms);
+  int waited_ms = 0;
+  int actual_port;
+
+  if (wait_ms <= 0) {
+    return 0;
+  }
+  if (wait_ms > 60000) {
+    wait_ms = 60000;
+  }
+
+  while (waited_ms < wait_ms) {
+    usleep(50000);
+    waited_ms += 50;
+    actual_port = pm_route_table_lookup(logical_port, 0, "listen", target_host, target_host_size, is_compose_route);
+    if (actual_port > 0) {
+      pm_debug("connect %s route became ready logical=%d actual=%d wait_ms=%d", reason, logical_port, actual_port, waited_ms);
+      return actual_port;
+    }
+  }
+
+  return 0;
+}
+
+static int pm_wait_for_compose_route(
+  int logical_port,
+  char *target_host,
+  size_t target_host_size,
+  int *is_compose_route) {
+  return pm_wait_for_route(
+    logical_port,
+    "PORT_MANAGER_COMPOSE_ROUTE_WAIT_MS",
+    PM_COMPOSE_ROUTE_WAIT_MS,
+    "compose",
     target_host,
     target_host_size,
     is_compose_route);
@@ -3028,7 +3035,7 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
 
       pm_hook_depth++;
       snprintf(bind_host, sizeof(bind_host), "%s", actual_loopback_host != NULL ? actual_loopback_host : host);
-      if (pm_allocate_route(logical_port, bind_host, NULL, "listen", &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
+      if (pm_allocate_route(logical_port, bind_host, NULL, "listen", &actual_port, allocation_id, sizeof(allocation_id), NULL, 0) != 0) {
         pm_hook_depth--;
         if (attempt + 1 < PM_BIND_ALLOCATION_ATTEMPTS) {
           usleep(50000);
@@ -3123,6 +3130,15 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
     actual_port = pm_route_table_lookup(logical_port, 0, "listen", target_host, sizeof(target_host), &route_is_compose);
   }
 
+  if (actual_port == 0 && pm_is_compose_logical_port(logical_port)) {
+    actual_port = pm_wait_for_compose_route(logical_port, target_host, sizeof(target_host), &route_is_compose);
+    if (actual_port == 0) {
+      pm_debug("connect blocked by missing compose route logical=%d", logical_port);
+      errno = ECONNREFUSED;
+      return -1;
+    }
+  }
+
   if (actual_port == 0 && pm_compose_claim_blocks_port(logical_port)) {
     pm_debug("connect blocked by foreign compose claim logical=%d", logical_port);
     errno = ECONNREFUSED;
@@ -3142,11 +3158,53 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
 
   loopback_host = pm_network_loopback_host();
   if (actual_port == 0 && loopback_host != NULL && !pm_is_fixed_protocol_port(logical_port)) {
+    int loopback_connect_result;
+    int loopback_connect_errno;
+
     memcpy(&rewritten, addr, addrlen);
     pm_set_sockaddr_port((struct sockaddr *)&rewritten, logical_port);
     pm_set_sockaddr_host((struct sockaddr *)&rewritten, loopback_host);
     pm_debug("connect loopback-network logical=%d host=%s", logical_port, loopback_host);
-    return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
+    loopback_connect_result = pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
+    if (loopback_connect_result == 0 || errno == EINPROGRESS || errno == EALREADY) {
+      return loopback_connect_result;
+    }
+
+    loopback_connect_errno = errno;
+    if (
+      loopback_connect_errno != ECONNREFUSED &&
+      loopback_connect_errno != EADDRNOTAVAIL &&
+      loopback_connect_errno != EHOSTUNREACH &&
+      loopback_connect_errno != ENETUNREACH &&
+      loopback_connect_errno != EAFNOSUPPORT
+    ) {
+      errno = loopback_connect_errno;
+      return -1;
+    }
+
+    pm_debug(
+      "connect loopback-network unavailable logical=%d host=%s error=%s; falling back to routed allocation",
+      logical_port,
+      loopback_host,
+      strerror(loopback_connect_errno));
+    errno = loopback_connect_errno;
+  }
+
+  if (actual_port == 0 && pm_has_current_network_scope() && !pm_is_fixed_protocol_port(logical_port)) {
+    /*
+     * DBs and brokers often connect before the extension has flushed the
+     * listener row. Wait for the current network route before creating a
+     * sender-first reservation, but still allow ordinary dynamic routes to be
+     * allocated when no listener appears.
+     */
+    actual_port = pm_wait_for_route(
+      logical_port,
+      "PORT_MANAGER_CONNECT_ROUTE_WAIT_MS",
+      PM_CONNECT_ROUTE_WAIT_MS,
+      "network",
+      target_host,
+      sizeof(target_host),
+      &route_is_compose);
   }
 
   if (actual_port == 0 && !pm_is_fixed_protocol_port(logical_port)) {
@@ -3160,13 +3218,22 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
     allocation_id[0] = '\0';
 
     pm_hook_depth++;
-    if (pm_allocate_route(logical_port, target_host, actual_loopback_host, "send", &actual_port, allocation_id, sizeof(allocation_id)) != 0) {
+    if (pm_allocate_route(
+          logical_port,
+          target_host,
+          actual_loopback_host,
+          "send",
+          &actual_port,
+          allocation_id,
+          sizeof(allocation_id),
+          target_host,
+          sizeof(target_host)) != 0) {
       actual_port = 0;
     }
     pm_hook_depth--;
 
     if (actual_port > 0) {
-      if (actual_port != logical_port && actual_loopback_host != NULL) {
+      if (target_host[0] == '\0' && actual_loopback_host != NULL) {
         snprintf(target_host, sizeof(target_host), "%s", actual_loopback_host);
       }
       /*

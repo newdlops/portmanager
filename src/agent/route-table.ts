@@ -9,10 +9,31 @@ import * as path from "node:path";
  * connect targets to actual listening ports.
  */
 
+let routeTableStorageDirectory: string | undefined;
+
+/** Points extension-owned route tables at durable globalStorage instead of OS temp. */
+export function configureRouteTableStorageDirectory(storageDirectory: string): void {
+  const normalizedDirectory = storageDirectory.trim();
+  routeTableStorageDirectory = normalizedDirectory.length > 0 ? normalizedDirectory : undefined;
+}
+
 /** Builds the per-user route table file path shared by one local agent. */
 export function getDefaultRouteTablePath(): string {
+  return path.join(getRouteTableStorageDirectory(), getDefaultRouteTableFileName());
+}
+
+/** Builds the legacy temp route-table path used before extension-owned storage. */
+export function getLegacyDefaultRouteTablePath(): string {
+  return path.join(os.tmpdir(), getDefaultRouteTableFileName());
+}
+
+function getRouteTableStorageDirectory(): string {
+  return routeTableStorageDirectory ?? os.tmpdir();
+}
+
+function getDefaultRouteTableFileName(): string {
   const userId = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;
-  return path.join(os.tmpdir(), `newdlops-portmanager-routes-${userId}.json`);
+  return `newdlops-portmanager-routes-${userId}.json`;
 }
 
 /**
@@ -58,6 +79,24 @@ export function getRouteTablePathForLogicalPort(
   const extension = parsedPath.ext.length > 0 ? parsedPath.ext : ".json";
 
   return path.join(parsedPath.dir, `${parsedPath.name}-port-${logicalPort}${extension}`);
+}
+
+/**
+ * Builds the global compose claim index for one host-visible port.
+ *
+ * Compose publishes host ports outside Port Manager's socket hook. The hook
+ * checks this small per-port file before touching real localhost so a foreign
+ * network cannot reach another network's published container through either the
+ * logical service port or the Docker-assigned host port.
+ */
+export function getRouteTablePathForComposeClaimPort(
+  port: number,
+  baseRouteTablePath = getDefaultRouteTablePath(),
+): string {
+  const parsedPath = path.parse(baseRouteTablePath);
+  const extension = parsedPath.ext.length > 0 ? parsedPath.ext : ".json";
+
+  return path.join(parsedPath.dir, `${parsedPath.name}-compose-claim-port-${port}${extension}`);
 }
 
 /** Builds the per-user network-to-host binding file path shared with native hooks. */

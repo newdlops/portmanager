@@ -320,7 +320,13 @@ class AgentCliClient {
 
   /** Starts the previous Node daemon when the native binary cannot be used. */
   private startNodeAgentProcess(socketPath: string): void {
-    const child = spawn(process.execPath, [this.agentMainPath, "--socket", socketPath], {
+    const child = spawn(process.execPath, [
+      this.agentMainPath,
+      "--socket",
+      socketPath,
+      "--route-table",
+      getDefaultRouteTablePath(),
+    ], {
       detached: true,
       env: buildNodeRuntimeEnvironment(),
       stdio: "ignore",

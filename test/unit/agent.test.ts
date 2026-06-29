@@ -7,7 +7,11 @@ import test, { type TestContext } from "node:test";
 
 import { PortManagerAgent } from "../../src/agent/port-manager-agent";
 import { encodeAgentMessage, NdjsonMessageBuffer } from "../../src/agent/protocol";
-import { getNetworkRouteTablePath, getRouteTablePathForLogicalPort } from "../../src/agent/route-table";
+import {
+  getNetworkRouteTablePath,
+  getRouteTablePathForComposeClaimPort,
+  getRouteTablePathForLogicalPort,
+} from "../../src/agent/route-table";
 import type { ListeningPort, PortAvailabilityProvider, ProcessLauncher } from "../../src/shared/types";
 
 /**
@@ -114,6 +118,75 @@ test("new agent generation clears previous network route files on startup", asyn
   assert.deepEqual(readRouteTable(routeTablePath).routes, []);
   assert.deepEqual(readRouteTable(networkRouteTablePath).routes, []);
   assert.equal(fs.existsSync(routeEntryPath), false);
+});
+
+test("newer route table generation rejects stale daemon writes", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const staleAgent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+    routeTableWriterStartedAtMs: 1_000,
+    routeTableWriterId: "stale-writer",
+  });
+  context.after(() => staleAgent.dispose());
+
+  await staleAgent.registerExistingProcess({
+    pid: 1234,
+    name: "node",
+    command: "node server.js",
+    cwd: "/workspace/app",
+    requestedPort: 8000,
+    actualPort: 58000,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+
+  assert.equal(readRouteTableGeneration(routeTablePath)?.writerId, "stale-writer");
+  assert.equal(readRouteTable(routeTablePath).routes.length, 1);
+
+  const freshAgent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 888,
+    now: fixedNow,
+    routeTablePath,
+    routeTableWriterStartedAtMs: 2_000,
+    routeTableWriterId: "fresh-writer",
+  });
+  context.after(() => freshAgent.dispose());
+
+  assert.equal(readRouteTableGeneration(routeTablePath)?.writerId, "fresh-writer");
+  assert.deepEqual(readRouteTable(routeTablePath).routes, []);
+
+  await assert.rejects(
+    () =>
+      staleAgent.registerExistingProcess({
+        pid: 5678,
+        name: "node",
+        command: "node server.js",
+        cwd: "/workspace/app",
+        requestedPort: 8001,
+        actualPort: 58001,
+        host: "127.0.0.1",
+        networkId: "network-a",
+        source: "hooked",
+      }),
+    /route table publish failed/,
+  );
+
+  assert.equal(readRouteTableGeneration(routeTablePath)?.writerId, "fresh-writer");
+  assert.deepEqual(readRouteTable(routeTablePath).routes, []);
+  assert.equal(fs.existsSync(getRouteTablePathForLogicalPort(8001, "network-a", routeTablePath)), false);
 });
 
 test("keeps unscoped host listeners out of cwd-matched networks", async (context) => {
@@ -1195,6 +1268,7 @@ test("reuses active compose routes before allocating host fallback routes", asyn
     cwd: "/workspace/app",
     requestedPort: 15432,
     host: "127.0.0.1",
+    actualHost: "127.0.0.1",
     networkId: "network-a",
     routeDirection: "send",
     scanRange: 20,
@@ -1205,18 +1279,80 @@ test("reuses active compose routes before allocating host fallback routes", asyn
   });
   const routeTable = readRouteTable(getNetworkRouteTablePath("network-a", routeTablePath));
   const routeEntryTable = readRouteTable(getRouteTablePathForLogicalPort(15432, "network-a", routeTablePath));
+  const logicalClaimTable = readRouteTable(getRouteTablePathForComposeClaimPort(15432, routeTablePath));
+  const actualClaimTable = readRouteTable(getRouteTablePathForComposeClaimPort(57001, routeTablePath));
   const globalRouteTable = readRouteTable(routeTablePath);
 
   assert.equal(allocation.allocationId, "");
   assert.equal(allocation.actualPort, 57001);
+  assert.equal(allocation.host, "127.0.0.1");
   assert.deepEqual(checkedPorts, []);
   assert.equal(globalRouteTable.routes.length, 1);
   assert.equal((globalRouteTable.routes[0] as { source?: string }).source, "compose");
   assert.equal(routeTable.routes.length, 1);
   assert.equal((routeTable.routes[0] as { source?: string }).source, "compose");
+  assert.equal((routeTable.routes[0] as { host?: string }).host, "127.0.0.1");
   assert.equal((routeTable.routes[0] as { logicalPort?: number }).logicalPort, 15432);
   assert.equal((routeTable.routes[0] as { actualPort?: number }).actualPort, 57001);
   assert.deepEqual(routeEntryTable.routes, routeTable.routes);
+  assert.deepEqual(logicalClaimTable.routes, routeTable.routes);
+  assert.deepEqual(actualClaimTable.routes, routeTable.routes);
+});
+
+test("does not reuse active routes from a different actual host band", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const checkedHosts: Array<string | undefined> = [];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: {
+      check: async (port, host) => {
+        checkedHosts.push(host);
+        return {
+          port,
+          available: true,
+        };
+      },
+    },
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 0,
+    name: "workspace:postgres/postgresql",
+    command: "docker compose service workspace/postgres",
+    cwd: "/workspace/app",
+    requestedPort: 15432,
+    actualPort: 57001,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "compose",
+  });
+
+  const allocation = await agent.allocateRoute({
+    name: "psql",
+    command: "psql postgresql://localhost:15432/app",
+    cwd: "/workspace/app",
+    requestedPort: 15432,
+    host: "127.0.0.1",
+    actualHost: "127.81.154.127",
+    networkId: "network-a",
+    routeDirection: "send",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 57000,
+    virtualPortRangeEnd: 57010,
+  });
+
+  assert.notEqual(allocation.allocationId, "");
+  assert.equal(allocation.host, "127.81.154.127");
+  assert.deepEqual(checkedHosts, ["127.81.154.127"]);
 });
 
 test("does not reuse active listener routes for a new listener allocation", async (context) => {
@@ -1634,6 +1770,10 @@ async function delay(ms: number): Promise<void> {
 
 function readRouteTable(routeTablePath: string): { routes: readonly unknown[] } {
   return JSON.parse(fs.readFileSync(routeTablePath, "utf8")) as { routes: readonly unknown[] };
+}
+
+function readRouteTableGeneration(routeTablePath: string): { readonly writerId?: string } | undefined {
+  return (JSON.parse(fs.readFileSync(routeTablePath, "utf8")) as { generation?: { readonly writerId?: string } }).generation;
 }
 
 function createRouteTablePath(context: TestContext): string {

@@ -64,6 +64,10 @@ Compose route는 같은 Logical Network에서 같은 logical port의 Host Access
 
 확장은 Docker/Podman에서 실행 중인 컨테이너와 Compose service의 published port를 탐색해 UI 후보로 보여줘야 한다. 사용자는 서비스 후보를 선택하고 Logical Network를 고르면, 해당 서비스가 publish한 모든 TCP 포트가 attachment로 등록되어야 한다. 이 탐색 후보는 일시적인 UI 상태이며, 실제 route 보장은 attachment가 생성된 뒤 `ComposeAttachment`와 agent route row가 담당한다.
 
+Docker/Podman Compose attachment가 clone 방식이든 as-is 방식이든 Port Manager가 관리하는 Compose 프로젝트라면, attach 작업은 route row를 쓰기 전에 generated override YAML을 항상 새로 검증하고 갱신해야 한다. 기존 attachment를 재사용하는 경우에도 persisted mutation state를 신뢰해 파일 존재만 확인해서는 안 되며, 현재 logical network, attached project name, hidden publish host, container name rewrite가 반영된 override를 다시 생성해야 한다.
+
+VS Code 확장 시작, shared network state reload, 사용자가 실행하는 stale routing repair, 그리고 network refresh 계열 작업은 durable registry, Docker/Podman의 live container 상태, generated Compose override YAML, compose routing TSV, agent route table의 정합성을 함께 점검해야 한다. registry에 없는 daemon route row나 scoped route table은 제거하고, registry에 남아 있는 Compose mutation은 override YAML과 routing table을 현재 상태에서 재생성해야 한다. generated 파일이 오래되었거나 누락된 경우에는 이전 세대의 routing을 계속 사용하지 말고 현재 network 상태에서 재작성하거나 실패 상태로 드러내야 한다.
+
 #### Network Runtime Adapter
 
 Logical Network를 실제 시스템에서 구현하는 어댑터다. VS Code 확장만으로 모든 플랫폼에서 임의 프로세스의 network namespace를 만들 수는 없으므로, 런타임 구현은 인터페이스 뒤에 둔다.

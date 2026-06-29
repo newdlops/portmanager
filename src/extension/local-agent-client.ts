@@ -577,7 +577,7 @@ export class LocalAgentClient implements PortManagerProcessService {
 
   /** Starts the previous Node daemon implementation as a compatibility fallback. */
   private startNodeAgentProcess(agentMainPath: string, socketPath: string): void {
-    this.childProcess = spawn(process.execPath, [agentMainPath, "--socket", socketPath], {
+    this.childProcess = spawn(process.execPath, [agentMainPath, "--socket", socketPath, "--route-table", getDefaultRouteTablePath()], {
       detached: true,
       env: buildNodeRuntimeEnvironment(),
       stdio: "ignore",
@@ -991,6 +991,8 @@ function annotateDaemonCompatibility(snapshot: AgentSnapshot, expectedAgentMainP
   const daemon = snapshot.daemon;
   const expectedPath = normalizeAgentMainPath(expectedAgentMainPath);
   const actualPath = normalizeAgentMainPath(daemon.agentMainPath);
+  const expectedRouteTablePath = normalizeDaemonPath(getDefaultRouteTablePath());
+  const actualRouteTablePath = normalizeDaemonPath(daemon.routeTablePath);
 
   if (daemon.status !== "running" || daemon.pid <= 0) {
     return {
@@ -1006,15 +1008,16 @@ function annotateDaemonCompatibility(snapshot: AgentSnapshot, expectedAgentMainP
 
   const missingAgentMetadata = actualPath === undefined;
   const pathMismatch = actualPath !== undefined && actualPath !== expectedPath;
+  const routeTablePathMismatch = actualRouteTablePath !== undefined && actualRouteTablePath !== expectedRouteTablePath;
   const olderThanCurrentBuild = isDaemonOlderThanAgentMain(daemon, expectedAgentMainPath);
-  const restartRequired = missingAgentMetadata || pathMismatch || olderThanCurrentBuild;
+  const restartRequired = missingAgentMetadata || pathMismatch || routeTablePathMismatch || olderThanCurrentBuild;
+  const staleWarning = missingAgentMetadata
+    ? "Connected daemon does not expose version metadata; restart it with the active extension build."
+    : routeTablePathMismatch
+      ? "Connected daemon publishes route tables outside the active extension storage; restart required."
+      : "Connected daemon is older than the active extension build; restart required.";
   const warning = restartRequired
-    ? appendDaemonWarning(
-        daemon.errorMessage,
-        missingAgentMetadata
-          ? "Connected daemon does not expose version metadata; restart it with the active extension build."
-          : "Connected daemon is older than the active extension build; restart required.",
-      )
+    ? appendDaemonWarning(daemon.errorMessage, staleWarning)
     : daemon.errorMessage;
 
   return {
@@ -1031,14 +1034,19 @@ function annotateDaemonCompatibility(snapshot: AgentSnapshot, expectedAgentMainP
 
 /** Normalizes optional daemon paths before comparing extension instances. */
 function normalizeAgentMainPath(agentMainPath: string | undefined): string | undefined {
-  if (agentMainPath === undefined || agentMainPath.trim().length === 0) {
+  return normalizeDaemonPath(agentMainPath);
+}
+
+/** Normalizes optional daemon-owned filesystem paths before compatibility checks. */
+function normalizeDaemonPath(filePath: string | undefined): string | undefined {
+  if (filePath === undefined || filePath.trim().length === 0) {
     return undefined;
   }
 
   try {
-    return fs.realpathSync.native(agentMainPath);
+    return fs.realpathSync.native(filePath);
   } catch {
-    return path.resolve(agentMainPath);
+    return path.resolve(filePath);
   }
 }
 

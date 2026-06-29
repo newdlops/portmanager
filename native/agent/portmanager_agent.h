@@ -106,6 +106,13 @@ typedef struct {
   char **written_entry_paths;
   size_t written_entry_count;
   size_t written_entry_capacity;
+  char **written_claim_paths;
+  size_t written_claim_count;
+  size_t written_claim_capacity;
+  char **route_table_signature_paths;
+  char **route_table_signatures;
+  size_t route_table_signature_count;
+  size_t route_table_signature_capacity;
   pm_listener *listener_cache_items;
   size_t listener_cache_count;
   time_t listener_cache_expires_at;
@@ -113,6 +120,9 @@ typedef struct {
   char route_table_path[PM_TEXT];
   char agent_main_path[PM_TEXT];
   char started_at[PM_TIME];
+  char route_table_writer_id[PM_ID];
+  long route_table_writer_started_ms;
+  unsigned long route_table_sequence;
   unsigned long next_process_id;
   unsigned long next_allocation_id;
   pid_t agent_pid;
@@ -132,6 +142,7 @@ typedef struct {
   char actual_host[PM_SMALL];
   char network_id[PM_SMALL];
   char route_direction[PM_DIRECTION];
+  int compact_response;
   int requested_port;
   int scan_range;
   char scan_direction[PM_SMALL];
@@ -204,6 +215,7 @@ int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload);
 int pm_state_refresh_snapshot(pm_agent_state *state, pm_buffer *payload);
 int pm_state_reap_children(pm_agent_state *state);
 int pm_state_listener_signature(pm_agent_state *state, pm_buffer *signature);
+int pm_state_flush_route_tables(pm_agent_state *state);
 
 int pm_parse_allocate_input(const char *payload, pm_allocate_input *input);
 int pm_parse_register_input(const char *payload, pm_register_input *input);

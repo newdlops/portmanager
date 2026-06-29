@@ -1,4 +1,6 @@
 import * as vscode from "vscode";
+import * as path from "node:path";
+import { configureRouteTableStorageDirectory } from "../agent/route-table";
 import { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import { LocalAgentClient } from "./local-agent-client";
 import { PortManagerCommandController } from "./commands";
@@ -22,6 +24,7 @@ export interface PortManagerExtensionApi {
  * handlers orchestrate user workflows.
  */
 export function activate(context: vscode.ExtensionContext): PortManagerExtensionApi {
+  configureRouteTableStorageDirectory(path.join(context.globalStorageUri.fsPath, "route-tables"));
   const processService = new LocalAgentClient(context);
   const networkService = new PortManagerNetworkService(context, processService);
   const treeProvider = new PortManagerTreeProvider(networkService);

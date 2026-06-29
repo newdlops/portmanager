@@ -16,6 +16,8 @@ import { PortManagerAgent } from "./port-manager-agent";
 interface ParsedArguments {
   /** Local socket or named-pipe path where the agent should listen. */
   readonly socketPath: string;
+  /** Dynamic route table file path chosen by the extension or shell hook. */
+  readonly routeTablePath?: string;
 }
 
 void main(process.argv.slice(2));
@@ -28,12 +30,14 @@ async function main(args: readonly string[]): Promise<void> {
   try {
     disableNativeHookForCurrentProcess();
     const parsedArguments = parseArguments(args);
+    const routeTablePath =
+      parsedArguments.routeTablePath ?? process.env.PORT_MANAGER_GLOBAL_ROUTES_FILE ?? process.env.PORT_MANAGER_ROUTES_FILE;
     const agent = new PortManagerAgent({
       processLauncher: new NodeProcessLauncher(),
       portAvailabilityProvider: new NodePortScanner(),
       listeningPortProvider: new NodeListeningPortProvider(),
       hookRouteRecoveryProvider: new NodeProcessEnvironmentProvider(),
-      routeTablePath: process.env.PORT_MANAGER_ROUTES_FILE,
+      routeTablePath,
       agentMainPath: __filename,
     });
 
@@ -56,12 +60,15 @@ async function main(args: readonly string[]): Promise<void> {
 function parseArguments(args: readonly string[]): ParsedArguments {
   const socketFlagIndex = args.indexOf("--socket");
   const socketPath = socketFlagIndex >= 0 ? args[socketFlagIndex + 1] : undefined;
+  const routeTableFlagIndex = args.indexOf("--route-table");
+  const routeTablePath = routeTableFlagIndex >= 0 ? args[routeTableFlagIndex + 1] : undefined;
 
   if (socketPath === undefined || socketPath.trim().length === 0) {
-    throw new Error("Usage: port-manager-agent --socket <path>");
+    throw new Error("Usage: port-manager-agent --socket <path> [--route-table <path>]");
   }
 
   return {
     socketPath,
+    ...(routeTablePath !== undefined && routeTablePath.trim().length > 0 ? { routeTablePath } : {}),
   };
 }

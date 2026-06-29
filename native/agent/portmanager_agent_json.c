@@ -392,6 +392,7 @@ int pm_parse_allocate_input(const char *payload, pm_allocate_input *input) {
   pm_json_get_string(payload, "routeDirection", input->route_direction, sizeof(input->route_direction));
   pm_json_get_string(payload, "scanDirection", input->scan_direction, sizeof(input->scan_direction));
   pm_json_get_string(payload, "routingMode", input->routing_mode, sizeof(input->routing_mode));
+  input->compact_response = pm_json_get_int(payload, "compactResponse", 0) != 0;
   input->requested_port = pm_json_get_int(payload, "requestedPort", 0);
   input->scan_range = pm_json_get_int(payload, "scanRange", PM_DEFAULT_SCAN_RANGE);
   input->virtual_start = pm_json_get_int(payload, "virtualPortRangeStart", PM_DEFAULT_VIRTUAL_START);

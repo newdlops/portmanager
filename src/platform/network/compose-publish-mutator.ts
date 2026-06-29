@@ -51,6 +51,8 @@ export interface ComposePublishMutationInput {
   readonly networkName: string;
   /** Stable logical network identity used to separate copied networks with the same display name. */
   readonly networkId?: string;
+  /** Host interface used for hidden Docker/Podman published ports. */
+  readonly hiddenHostAddress?: string;
   /** Compose project that currently publishes the host ports. */
   readonly originalProjectName: string;
   /** Directory where compose should resolve relative paths and defaults. */
@@ -234,13 +236,16 @@ export class ComposePublishMutator {
       composeFiles,
     };
 
+    const serviceContainerNameSot =
+      createsHiddenProject ? await readComposeServiceContainerNames(composeFiles) : new Map<string, string>();
+    const configuredContainerNameServices = [...serviceContainerNameSot.keys()];
     const copyStoppedServices = createsHiddenProject && input.copyStoppedServices === true;
     const definedServices = await this.listDefinedComposeServices(originalContext);
     const existingServices =
       copyStoppedServices
         ? await this.listExistingComposeServices(originalContext).catch(() => [])
         : [];
-    const availableServices = uniqueStrings([...definedServices, ...existingServices]);
+    const availableServices = uniqueStrings([...definedServices, ...existingServices, ...configuredContainerNameServices]);
     const requestedRouteServices = this.filterAvailableComposeServices(
       originalContext.projectName,
       requestedServices,
@@ -261,18 +266,20 @@ export class ComposePublishMutator {
         ? requestedRouteServices.filter((service) => runningOriginalServices.has(service))
         : requestedRouteServices;
     const ports = input.ports.filter((port) => services.includes(port.serviceName));
-    const overrideServices = createsHiddenProject ? (copyStoppedServices ? copiedServices : definedServices) : services;
+    const overrideServices = createsHiddenProject
+      ? copyStoppedServices
+        ? copiedServices
+        : uniqueStrings([...definedServices, ...configuredContainerNameServices])
+      : services;
     const disabledOverrideServices =
       mode === "clone" && !copyStoppedServices
-        ? definedServices.filter((service) => !services.includes(service))
+        ? overrideServices.filter((service) => !services.includes(service))
         : [];
     const originalServiceMounts = await this.inspectServiceMounts(
       input.runtime,
       originalContainers,
       originalContainerList.inspectedRows,
     );
-    const serviceContainerNameSot =
-      createsHiddenProject ? await readComposeServiceContainerNames(composeFiles) : new Map<string, string>();
     const statefulCloneServices = findStatefulCloneServices(ports, originalServiceMounts);
     if (createsHiddenProject && statefulCloneServices.length > 0 && input.allowStatefulClone !== true) {
       throw new Error(
@@ -284,6 +291,16 @@ export class ComposePublishMutator {
       createsHiddenProject
         ? await this.readRuntimeNameReservations(input.runtime)
         : emptyRuntimeNameReservations();
+    if (
+      requestedAttachedProjectName !== undefined &&
+      (await this.generatedAttachedProjectNameCollides(
+        requestedAttachedProjectName,
+        originalProjectName,
+        runtimeReservations.composeProjectNames,
+      ))
+    ) {
+      throw new Error(`Compose project name "${requestedAttachedProjectName}" is already in use by ${input.runtime}.`);
+    }
     const attachedProjectName =
       !createsHiddenProject
         ? originalProjectName
@@ -321,6 +338,7 @@ export class ComposePublishMutator {
         cloneContainerNames,
         isolatedNetwork: createsHiddenProject ? "pm_isolated" : undefined,
         disabledServices: disabledOverrideServices,
+        hostAddress: input.hiddenHostAddress,
       },
     );
     const hiddenContext: ComposeCommandContext = {
@@ -331,6 +349,7 @@ export class ComposePublishMutator {
     };
     let originalStopped = false;
     let hiddenStarted = false;
+    let hiddenProjectTouched = false;
     let hiddenCreated = false;
     let clonedVolumesCreated = false;
 
@@ -344,6 +363,7 @@ export class ComposePublishMutator {
         clonedVolumesCreated = true;
       }
       if (services.length > 0) {
+        hiddenProjectTouched = createsHiddenProject;
         await this.runCompose(hiddenContext, ["up", "-d", "--force-recreate", "--no-deps", ...services]);
         hiddenStarted = true;
       }
@@ -392,7 +412,7 @@ export class ComposePublishMutator {
         },
       };
     } catch (error) {
-      if ((hiddenStarted || hiddenCreated) && createsHiddenProject) {
+      if ((hiddenProjectTouched || hiddenStarted || hiddenCreated) && createsHiddenProject) {
         await this.runCompose(hiddenContext, ["down", "--remove-orphans"]).catch(() => undefined);
       }
       if (hiddenStarted && mode === "in-place") {
@@ -485,8 +505,11 @@ export class ComposePublishMutator {
    * service discovery is repeated so no-port services with global container_name
    * values are still disabled in the restored override.
    */
-  async restoreHiddenPortsOverride(state: ComposePortMutationState): Promise<string> {
-    if (await fileIsReadable(state.overrideFile)) {
+  async restoreHiddenPortsOverride(
+    state: ComposePortMutationState,
+    options: { readonly force?: boolean } = {},
+  ): Promise<string> {
+    if (options.force !== true && (await fileIsReadable(state.overrideFile))) {
       return state.overrideFile;
     }
 
@@ -496,10 +519,26 @@ export class ComposePublishMutator {
       workingDirectory: state.workingDirectory,
       composeFiles: state.composeFiles,
     };
-    const definedServices = await this.listDefinedComposeServices(sourceContext).catch(() => []);
-    const overrideServices = buildRestoredOverrideServices(state, definedServices);
-    const disabledServices = buildRestoredDisabledOverrideServices(state, overrideServices);
     const createsHiddenProject = state.mode === "clone" || state.mode === "copy";
+    let definedServices: readonly string[];
+    try {
+      definedServices = await this.listDefinedComposeServices(sourceContext);
+    } catch (error) {
+      if (createsHiddenProject) {
+        throw new Error(
+          `Cannot recreate generated Compose override for ${state.attachedProjectName}: failed to list Compose services. ${formatUnknownError(error)}`,
+        );
+      }
+      definedServices = [];
+    }
+    const configuredContainerNameServices = createsHiddenProject
+      ? [...(await readComposeServiceContainerNames(state.composeFiles)).keys()]
+      : [];
+    const overrideServices = buildRestoredOverrideServices(
+      state,
+      uniqueStrings([...definedServices, ...configuredContainerNameServices]),
+    );
+    const disabledServices = buildRestoredDisabledOverrideServices(state, overrideServices);
 
     await this.writeHiddenPortsOverride(
       state.attachedProjectName,
@@ -512,6 +551,7 @@ export class ComposePublishMutator {
         isolatedNetwork: createsHiddenProject ? "pm_isolated" : undefined,
         disabledServices,
         overrideFile: state.overrideFile,
+        hostAddress: composeHiddenPublishHostFromState(state),
       },
     );
 
@@ -568,9 +608,15 @@ export class ComposePublishMutator {
     const serviceContainerNameSot = await readComposeServiceContainerNames(state.composeFiles);
     const originalContainerSources = buildRenameContainerNameSources(state, currentContainerList.containers);
     const definedServices = await this.listDefinedComposeServices(sourceContext);
-    const overrideServices = definedServices.length > 0 ? definedServices : state.services;
+    const overrideServices = uniqueStrings([
+      ...(definedServices.length > 0 ? definedServices : state.services),
+      ...serviceContainerNameSot.keys(),
+    ]);
     const disabledOverrideServices = overrideServices.filter((service) => !state.services.includes(service));
     const runtimeReservations = await this.readRuntimeNameReservations(state.runtime);
+    if (await this.generatedAttachedProjectNameCollides(attachedProjectName, state.originalProjectName, runtimeReservations.composeProjectNames)) {
+      throw new Error(`Compose project name "${attachedProjectName}" is already in use by ${state.runtime}.`);
+    }
     const occupiedContainerNames = await this.findOccupiedCloneContainerNames(
       state.runtime,
       originalContainerSources,
@@ -594,6 +640,7 @@ export class ComposePublishMutator {
         cloneContainerNames,
         isolatedNetwork: "pm_isolated",
         disabledServices: disabledOverrideServices,
+        hostAddress: composeHiddenPublishHostFromState(state),
       },
     );
     const nextHiddenContext: ComposeCommandContext = {
@@ -773,19 +820,22 @@ export class ComposePublishMutator {
       readonly isolatedNetwork?: string;
       readonly disabledServices?: readonly string[];
       readonly overrideFile?: string;
+      readonly hostAddress?: string;
     },
   ): Promise<string> {
     await fs.mkdir(this.storageDirectory, { recursive: true });
     const overrideFile = options.overrideFile ?? this.getHiddenPortsOverridePath(attachedProjectName);
+    const hostAddress = normalizeHiddenPublishHost(options.hostAddress);
     const portsByService = groupPortsByService(ports);
     const disabledServices = new Set(options.disabledServices ?? []);
     const lines = ["services:"];
 
     for (const serviceName of uniqueStrings(services)) {
       const servicePorts = portsByService.get(serviceName) ?? [];
+      const serviceIsDisabled = disabledServices.has(serviceName);
       lines.push(`  ${quoteYamlString(serviceName)}:`);
       if (options.resetContainerName) {
-        const cloneContainerName = options.cloneContainerNames?.get(serviceName);
+        const cloneContainerName = serviceIsDisabled ? undefined : options.cloneContainerNames?.get(serviceName);
         if (cloneContainerName === undefined) {
           lines.push("    container_name: !reset null");
         } else {
@@ -795,7 +845,7 @@ export class ComposePublishMutator {
         lines.push("    links: !reset []");
         lines.push("    external_links: !reset []");
       }
-      if (disabledServices.has(serviceName)) {
+      if (serviceIsDisabled) {
         lines.push("    profiles: !override");
         lines.push("      - 'pm_unattached'");
       }
@@ -815,7 +865,7 @@ export class ComposePublishMutator {
         }
         lines.push("    ports: !override");
         for (const port of servicePorts) {
-          lines.push(`      - ${quoteYamlString(`127.0.0.1::${port.containerPort}/${port.protocol}`)}`);
+          lines.push(`      - ${quoteYamlString(`${hostAddress}::${port.containerPort}/${port.protocol}`)}`);
         }
       }
 
@@ -1142,30 +1192,26 @@ export class ComposePublishMutator {
    * new hidden clone writes its override and starts containers.
    */
   private async readRuntimeNameReservations(runtime: "docker" | "podman"): Promise<RuntimeNameReservations> {
-    try {
-      const result = await this.runCommand(
-        runtime,
-        ["container", "ps", "--all", "--no-trunc", "--format", "{{json .}}"],
-        { timeoutMs: LIST_TIMEOUT_MS },
-      );
-      const rows = result.stdout
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0)
-        .map(parseRuntimeContainerRow)
-        .filter((row): row is RuntimeContainerRow => row !== undefined);
+    const result = await this.runCommand(
+      runtime,
+      ["container", "ps", "--all", "--no-trunc", "--format", "{{json .}}"],
+      { timeoutMs: LIST_TIMEOUT_MS },
+    );
+    const rows = result.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map(parseRuntimeContainerRow)
+      .filter((row): row is RuntimeContainerRow => row !== undefined);
 
-      return {
-        containerNames: new Set(rows.map(readRuntimeContainerName).filter((name): name is string => name !== undefined)),
-        composeProjectNames: new Set(
-          rows
-            .map((row) => readRuntimeLabel(parseRuntimeLabels(row.Labels), "com.docker.compose.project", "io.podman.compose.project"))
-            .filter((name): name is string => name !== undefined),
-        ),
-      };
-    } catch {
-      return emptyRuntimeNameReservations();
-    }
+    return {
+      containerNames: new Set(rows.map(readRuntimeContainerName).filter((name): name is string => name !== undefined)),
+      composeProjectNames: new Set(
+        rows
+          .map((row) => readRuntimeLabel(parseRuntimeLabels(row.Labels), "com.docker.compose.project", "io.podman.compose.project"))
+          .filter((name): name is string => name !== undefined),
+      ),
+    };
   }
 
   /**
@@ -1443,14 +1489,17 @@ function buildCloneContainerNameMapFromMutation(
   const cloneContainerNames = new Map<string, string>();
 
   for (const mapping of state.containerMappings ?? []) {
+    const attachedContainerName = normalizeContainerNameText(mapping.attachedContainerName);
+    const originalContainerName = normalizeContainerNameText(mapping.originalContainerName);
     if (
       mapping.serviceName.startsWith("__portmanager_alias__:") ||
-      mapping.attachedContainerName.trim().length === 0
+      attachedContainerName.length === 0 ||
+      attachedContainerName === originalContainerName
     ) {
       continue;
     }
 
-    cloneContainerNames.set(mapping.serviceName, mapping.attachedContainerName);
+    cloneContainerNames.set(mapping.serviceName, attachedContainerName);
   }
 
   return cloneContainerNames;
@@ -1496,9 +1545,11 @@ function buildCloneContainerNames(
       continue;
     }
 
-    const cloneContainerName = reservedNames.has(normalizedSotName)
-      ? buildAvailableConflictingCloneContainerName(normalizedSotName, attachedProjectName, reservedNames)
-      : normalizedSotName;
+    const cloneContainerName = buildAvailableConflictingCloneContainerName(
+      normalizedSotName,
+      attachedProjectName,
+      reservedNames,
+    );
     names.set(serviceName, cloneContainerName);
     reservedNames.add(normalizeContainerNameText(cloneContainerName));
   }
@@ -1542,9 +1593,11 @@ function buildCloneContainerName(
       return undefined;
     }
 
-    return occupiedContainerNames.has(normalizedSotName)
-      ? buildAvailableConflictingCloneContainerName(normalizedSotName, attachedProjectName, occupiedContainerNames)
-      : normalizedSotName;
+    return buildAvailableConflictingCloneContainerName(
+      normalizedSotName,
+      attachedProjectName,
+      occupiedContainerNames,
+    );
   }
 
   if (normalizedOriginalName.length === 0 || isGeneratedComposeContainerName(normalizedOriginalName, originalProjectName)) {
@@ -2074,6 +2127,19 @@ function isLocalHostAddress(host: string): boolean {
     normalized === "[::]" ||
     normalized === "::ffff:127.0.0.1"
   );
+}
+
+function composeHiddenPublishHostFromState(state: ComposePortMutationState): string {
+  return normalizeHiddenPublishHost(state.hiddenPorts.find((port) => port.actualHostAddress.trim().length > 0)?.actualHostAddress);
+}
+
+function normalizeHiddenPublishHost(host: string | undefined): string {
+  const normalized = host?.trim();
+  return normalized === undefined || normalized.length === 0 ? "127.0.0.1" : normalized;
+}
+
+function formatUnknownError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function formatLeakedPort(port: ComposePublishedPort): string {

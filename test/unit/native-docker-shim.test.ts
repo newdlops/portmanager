@@ -54,3 +54,16 @@ test("docker shim prefers scoped route table network over stale compose routing 
   assert.equal(matcherBody.includes("return 1;"), false);
   assert.equal(matcherBody.includes("return 0;"), true);
 });
+
+test("docker shim requires generated override for rewritten compose projects", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/docker-shim/portmanager_docker_shim.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+
+  assert.equal(source.includes("char override_file[PM_MAX_PATH];"), true);
+  assert.equal(source.includes('strcmp(row->kind, "project") == 0 || strcmp(row->kind, "file") == 0'), true);
+  assert.equal(source.includes("pm_copy(row->override_file, sizeof(row->override_file), fields[6]);"), true);
+  assert.equal(source.includes("pm_copy(search->override_file, search->override_size, row.override_file);"), true);
+  assert.equal(source.includes("int rewrites_project = original_project[0] != '\\0'"), true);
+  assert.equal(source.includes("missing generated Compose override for attached project"), true);
+  assert.equal(source.includes("refusing unsafe project rewrite"), true);
+});

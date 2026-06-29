@@ -123,8 +123,9 @@ export class ContainerServiceDiscoveryAdapter {
    * Returns only endpoints that currently exist in running runtime rows.
    *
    * Persisted compose attachments describe desired routing, but daemon routes
-   * must be created only for containers that are actually up. Missing services
-   * are returned as absent rather than falling back to stale stored ports.
+   * must be created only for containers that are actually up. Port Manager clone
+   * rows are allowed to rehydrate extra endpoints from live logical-port labels,
+   * because older partial attachments may not have kept every hidden port.
    */
   async listLiveComposePublishedPorts(
     settings: ContainerRuntimeSettings,
@@ -821,15 +822,63 @@ function selectLivePortsFromCandidates(
 ): readonly ComposePublishedPort[] {
   const livePortsByKey = buildLivePortsByKey(projectName, composeFiles, candidates);
   const livePorts: ComposePublishedPort[] = [];
+  const selectedKeys = new Set<string>();
 
   for (const port of ports) {
-    const livePort = livePortsByKey.get(buildComposeEndpointKey(port));
+    const key = buildComposeEndpointKey(port);
+    const livePort = livePortsByKey.get(key);
     if (livePort !== undefined) {
       livePorts.push(toRefreshedComposePort(port, livePort));
+      selectedKeys.add(key);
+    }
+  }
+
+  for (const key of collectRecoverableCloneEndpointKeys(projectName, composeFiles, candidates)) {
+    if (selectedKeys.has(key)) {
+      continue;
+    }
+
+    const livePort = livePortsByKey.get(key);
+    if (livePort !== undefined) {
+      livePorts.push(livePort);
+      selectedKeys.add(key);
     }
   }
 
   return livePorts;
+}
+
+function collectRecoverableCloneEndpointKeys(
+  projectName: string,
+  composeFiles: readonly string[],
+  candidates: readonly ContainerServiceCandidate[],
+): ReadonlySet<string> {
+  const keys = new Set<string>();
+
+  for (const candidate of candidates) {
+    if (!isRecoverablePortManagerCloneCandidate(projectName, composeFiles, candidate)) {
+      continue;
+    }
+
+    for (const port of candidate.ports) {
+      keys.add(buildComposeEndpointKey(port));
+    }
+  }
+
+  return keys;
+}
+
+function isRecoverablePortManagerCloneCandidate(
+  projectName: string,
+  composeFiles: readonly string[],
+  candidate: ContainerServiceCandidate,
+): boolean {
+  const candidateFiles = candidate.composeConfigFiles ?? [];
+  return (
+    candidate.composeProject === projectName &&
+    hasPortManagerOverrideFile(candidateFiles) &&
+    composeCandidateMatchesFiles(candidateFiles, composeFiles)
+  );
 }
 
 function buildLivePortsByKey(

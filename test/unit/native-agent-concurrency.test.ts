@@ -5,7 +5,11 @@ import net from "node:net";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 
-import { getNetworkRouteTablePath, getRouteTablePathForLogicalPort } from "../../src/agent/route-table";
+import {
+  getNetworkRouteTablePath,
+  getRouteTablePathForComposeClaimPort,
+  getRouteTablePathForLogicalPort,
+} from "../../src/agent/route-table";
 
 /**
  * Black-box concurrency coverage for the native daemon.
@@ -22,6 +26,7 @@ const nativeAgentPath = path.join(projectRoot, "media", "native", "portmanager_a
 test("native agent caches listener scans for concurrent snapshot readers", () => {
   const header = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.h"), "utf8");
   const agentSource = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.c"), "utf8");
+  const hookSource = fs.readFileSync(path.join(projectRoot, "native", "hook", "portmanager_hook.c"), "utf8");
   const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
   const snapshotStart = source.indexOf("int pm_state_snapshot");
   const snapshotEnd = source.indexOf("int pm_state_refresh_snapshot", snapshotStart);
@@ -34,7 +39,16 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(header.includes("endpoint security agents"), true);
   assert.equal(header.includes("pm_listener *listener_cache_items;"), true);
   assert.equal(agentSource.includes("PM_LISTENER_POLL_INTERVAL_SECONDS 300"), true);
+  assert.equal(agentSource.includes("PM_LISTEN_BACKLOG 16384"), true);
+  assert.equal(agentSource.includes("PM_CLIENT_BUFFER_INITIAL 2048"), true);
+  assert.equal(agentSource.includes("PM_CLIENT_BUFFER_MAX 32768"), true);
+  assert.equal(agentSource.includes("#include <poll.h>"), true);
+  assert.equal(agentSource.includes("ready = poll("), true);
+  assert.equal(hookSource.includes("PM_MAX_ROUTES 32768"), true);
+  assert.equal(hookSource.includes("\\\"compactResponse\\\":1"), true);
   assert.equal(source.includes("static int pm_scan_lsof_cached"), true);
+  assert.equal(source.includes("static int pm_write_route_table_file_if_changed"), true);
+  assert.equal(source.includes("pm_route_table_signature_for_path"), true);
   assert.equal(source.includes("pm_state_needs_external_listener_fresh_scan(state)"), true);
   assert.equal(source.includes("pm_listener_cache_invalidate(state);"), true);
   assert.equal(snapshotBody.includes("listener_scan_fresh &&"), true);
@@ -81,8 +95,9 @@ if (!fs.existsSync(nativeAgentPath)) {
     const extensionClient = await openExtensionClient(socketPath);
     context.after(() => extensionClient.destroy());
 
-    const allocationCount = 64;
-    const allocations = await Promise.all(
+    const allocationCount = 10_000;
+    const networkId = "network-native-stress";
+    const allocationResults = await Promise.allSettled(
       Array.from({ length: allocationCount }, (_, index) =>
         requestOnce<{
           readonly allocationId: string;
@@ -97,20 +112,28 @@ if (!fs.existsSync(nativeAgentPath)) {
             cwd: projectRoot,
             requestedPort: 8100 + index,
             host: "127.0.0.1",
-            networkId: "network-native-stress",
+            networkId,
             routeDirection: "listen",
-            scanRange: 128,
+            compactResponse: 1,
+            scanRange: 20_000,
             scanDirection: "up",
             routingMode: "hashed",
-            virtualPortRangeStart: 58000,
-            virtualPortRangeEnd: 59000,
+            virtualPortRangeStart: 45000,
+            virtualPortRangeEnd: 65000,
           },
-        }),
+        }, 240_000, 30_000),
       ),
     );
+    const rejectedAllocations = allocationResults.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+    const allocations = allocationResults.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
 
+    assert.equal(rejectedAllocations.length, 0, rejectedAllocations.slice(0, 20).map((result) => String(result.reason)).join("\n"));
     assert.equal(allocations.length, allocationCount);
+    assert.equal(new Set(allocations.map((allocation) => allocation.allocationId)).size, allocationCount);
     assert.equal(new Set(allocations.map((allocation) => allocation.actualPort)).size, allocationCount);
+    assert.equal(allocations.every((allocation) => allocation.actualPort >= 45000 && allocation.actualPort <= 65000), true);
+    await waitForRouteTableCount(fixture.routeTablePath, allocationCount, 120_000);
+    await waitForRouteTableCount(getNetworkRouteTablePath(networkId, fixture.routeTablePath), allocationCount, 120_000);
   });
 
   test("native agent removes endpoint route files after pending allocation release", async (context) => {
@@ -159,6 +182,40 @@ if (!fs.existsSync(nativeAgentPath)) {
 
     assert.equal(released, true);
     await waitForFileMissing(routeEntryPath);
+  });
+
+  test("native agent publishes compose claim files for logical and actual ports", async (context) => {
+    const fixture = await startNativeAgent(context);
+    if (fixture === undefined) {
+      return;
+    }
+
+    const networkId = "network-native-compose-claim";
+    const logicalPort = 15432;
+    const actualPort = 55432;
+    const logicalClaimPath = getRouteTablePathForComposeClaimPort(logicalPort, fixture.routeTablePath);
+    const actualClaimPath = getRouteTablePathForComposeClaimPort(actualPort, fixture.routeTablePath);
+
+    await requestOnce(fixture.socketPath, {
+      id: `hook-${process.pid}-compose-claim`,
+      method: "registerExistingProcess",
+      payload: {
+        pid: 0,
+        name: "postgres",
+        command: "docker compose up postgres",
+        cwd: projectRoot,
+        requestedPort: logicalPort,
+        actualPort,
+        host: "127.0.0.1",
+        networkId,
+        source: "compose",
+      },
+    });
+
+    await waitForFile(logicalClaimPath);
+    await waitForFile(actualClaimPath);
+    assert.equal(readRouteTable(logicalClaimPath).routes.length, 1);
+    assert.deepEqual(readRouteTable(actualClaimPath).routes, readRouteTable(logicalClaimPath).routes);
   });
 
   test("native agent keeps unscoped host listeners out of cwd-matched networks", async (context) => {
@@ -582,8 +639,9 @@ async function requestOnce<T = unknown>(
   socketPath: string,
   request: AgentRequest,
   timeoutMs = 10_000,
+  connectTimeoutMs = 1000,
 ): Promise<T> {
-  const socket = await connectSocket(socketPath);
+  const socket = await connectSocket(socketPath, connectTimeoutMs);
 
   return new Promise<T>((resolve, reject) => {
     let buffer = "";
@@ -643,13 +701,32 @@ async function requestOnce<T = unknown>(
   });
 }
 
-async function connectSocket(socketPath: string): Promise<net.Socket> {
+async function connectSocket(socketPath: string, timeoutMs = 1000): Promise<net.Socket> {
+  const startedAt = Date.now();
+  let lastError: unknown;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      return await connectSocketOnce(socketPath, Math.max(100, timeoutMs - (Date.now() - startedAt)));
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableConnectError(error)) {
+        throw error;
+      }
+      await delay(10);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(`Timed out connecting to native agent: ${socketPath}`);
+}
+
+function connectSocketOnce(socketPath: string, timeoutMs: number): Promise<net.Socket> {
   return new Promise<net.Socket>((resolve, reject) => {
     const socket = net.createConnection(socketPath);
     const timer = setTimeout(() => {
       socket.destroy();
       reject(new Error(`Timed out connecting to native agent: ${socketPath}`));
-    }, 1000);
+    }, timeoutMs);
 
     socket.once("connect", () => {
       clearTimeout(timer);
@@ -660,6 +737,15 @@ async function connectSocket(socketPath: string): Promise<net.Socket> {
       reject(error);
     });
   });
+}
+
+function isRetryableConnectError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return false;
+  }
+
+  const code = (error as { readonly code?: unknown }).code;
+  return code === "ECONNREFUSED" || code === "ENOENT" || code === "EAGAIN" || code === "ECONNRESET";
 }
 
 async function waitForFile(filePath: string): Promise<void> {
@@ -688,6 +774,29 @@ async function waitForFileMissing(filePath: string): Promise<void> {
   }
 
   throw new Error(`Timed out waiting for file removal: ${filePath}`);
+}
+
+async function waitForRouteTableCount(filePath: string, expectedCount: number, timeoutMs: number): Promise<void> {
+  const startedAt = Date.now();
+  let lastCount = -1;
+  let lastError: unknown;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      lastCount = readRouteTable(filePath).routes.length;
+      if (lastCount === expectedCount) {
+        return;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+
+    await delay(250);
+  }
+
+  throw new Error(
+    `Timed out waiting for route table count ${expectedCount} at ${filePath}; last count=${lastCount}; last error=${String(lastError)}`,
+  );
 }
 
 function readRouteTable(filePath: string): RouteTable {

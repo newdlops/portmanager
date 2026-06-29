@@ -516,6 +516,45 @@ __port_manager_compose_requested_project_name() {
   __port_manager_compose_project_name_from_directory "\${PWD}"
 }
 
+__port_manager_tsv_take() {
+  __pm_tsv_input="$1"
+  __pm_tsv_tab="$(printf '\\t')"
+  case "\${__pm_tsv_input}" in
+    *"\${__pm_tsv_tab}"*)
+      __pm_tsv_field="\${__pm_tsv_input%%"\${__pm_tsv_tab}"*}"
+      __pm_tsv_rest="\${__pm_tsv_input#*"\${__pm_tsv_tab}"}"
+      ;;
+    *)
+      __pm_tsv_field="\${__pm_tsv_input}"
+      __pm_tsv_rest=""
+      ;;
+  esac
+}
+
+__port_manager_parse_project_routing_row() {
+  __pm_parse_rest="$1"
+  __port_manager_tsv_take "\${__pm_parse_rest}"; __pm_row_kind="\${__pm_tsv_field}"; __pm_parse_rest="\${__pm_tsv_rest}"
+  __port_manager_tsv_take "\${__pm_parse_rest}"; __pm_row_network="\${__pm_tsv_field}"; __pm_parse_rest="\${__pm_tsv_rest}"
+  __port_manager_tsv_take "\${__pm_parse_rest}"; __pm_row_runtime="\${__pm_tsv_field}"; __pm_parse_rest="\${__pm_tsv_rest}"
+  __port_manager_tsv_take "\${__pm_parse_rest}"; __pm_workdir="\${__pm_tsv_field}"; __pm_parse_rest="\${__pm_tsv_rest}"
+  __port_manager_tsv_take "\${__pm_parse_rest}"; __pm_row_project="\${__pm_tsv_field}"; __pm_parse_rest="\${__pm_tsv_rest}"
+  __port_manager_tsv_take "\${__pm_parse_rest}"; __pm_row_original="\${__pm_tsv_field}"; __pm_parse_rest="\${__pm_tsv_rest}"
+  __pm_row_rest="\${__pm_parse_rest}"
+}
+
+__port_manager_parse_container_routing_row() {
+  __pm_parse_rest="$1"
+  __port_manager_tsv_take "\${__pm_parse_rest}"; __pm_row_kind="\${__pm_tsv_field}"; __pm_parse_rest="\${__pm_tsv_rest}"
+  __port_manager_tsv_take "\${__pm_parse_rest}"; __pm_row_network="\${__pm_tsv_field}"; __pm_parse_rest="\${__pm_tsv_rest}"
+  __port_manager_tsv_take "\${__pm_parse_rest}"; __pm_row_runtime="\${__pm_tsv_field}"; __pm_parse_rest="\${__pm_tsv_rest}"
+  __port_manager_tsv_take "\${__pm_parse_rest}"; __pm_workdir="\${__pm_tsv_field}"; __pm_parse_rest="\${__pm_tsv_rest}"
+  __port_manager_tsv_take "\${__pm_parse_rest}"; __pm_project="\${__pm_tsv_field}"; __pm_parse_rest="\${__pm_tsv_rest}"
+  __port_manager_tsv_take "\${__pm_parse_rest}"; __pm_original_name="\${__pm_tsv_field}"; __pm_parse_rest="\${__pm_tsv_rest}"
+  __port_manager_tsv_take "\${__pm_parse_rest}"; __pm_attached_id="\${__pm_tsv_field}"; __pm_parse_rest="\${__pm_tsv_rest}"
+  __port_manager_tsv_take "\${__pm_parse_rest}"; __pm_attached_name="\${__pm_tsv_field}"; __pm_parse_rest="\${__pm_tsv_rest}"
+  __pm_service_name="\${__pm_parse_rest}"
+}
+
 __port_manager_compose_route_scan_file_for_runtime() {
   __pm_scan_file="$1"
   __pm_scan_runtime="$2"
@@ -523,10 +562,16 @@ __port_manager_compose_route_scan_file_for_runtime() {
   shift 3
 
   [ -r "\${__pm_scan_file}" ] || return 1
-  while IFS="$(printf '\\t')" read -r __pm_row_kind __pm_row_network __pm_row_runtime __pm_workdir __pm_attached_project __pm_original_project __pm_rest; do
-    __pm_row_override_file="\${__pm_rest}"
+  while IFS= read -r __pm_line || [ -n "\${__pm_line}" ]; do
+    __port_manager_parse_project_routing_row "\${__pm_line}"
+    __pm_attached_project="\${__pm_row_project}"
+    __pm_original_project="\${__pm_row_original}"
+    __pm_row_override_file="\${__pm_row_rest}"
     if [ "\${__pm_row_network}" != "\${__pm_scan_network}" ] || [ "\${__pm_row_runtime}" != "\${__pm_scan_runtime}" ]; then
       continue
+    fi
+    if [ "\${__pm_row_kind}" = "project" ] && [ -z "\${__pm_original_project}" ]; then
+      __pm_original_project="$(__port_manager_compose_project_name_from_directory "\${__pm_workdir}" 2>/dev/null || true)"
     fi
 
     __pm_row_matches=0
@@ -655,9 +700,16 @@ __port_manager_compose_routing_file_matches_context() {
 
   [ -r "\${__pm_context_file}" ] || return 1
   __pm_context_project="$(__port_manager_compose_requested_project_name "$@" 2>/dev/null || true)"
-  while IFS="$(printf '\\t')" read -r __pm_row_kind __pm_row_network __pm_row_runtime __pm_workdir __pm_context_attached __pm_context_original __pm_context_rest; do
+  while IFS= read -r __pm_line || [ -n "\${__pm_line}" ]; do
+    __port_manager_parse_project_routing_row "\${__pm_line}"
+    __pm_context_attached="\${__pm_row_project}"
+    __pm_context_original="\${__pm_row_original}"
+    __pm_context_rest="\${__pm_row_rest}"
     if [ "\${__pm_row_network}" != "\${__pm_context_network}" ] || [ "\${__pm_row_runtime}" != "\${__pm_context_runtime}" ]; then
       continue
+    fi
+    if [ "\${__pm_row_kind}" = "project" ] && [ -z "\${__pm_context_original}" ]; then
+      __pm_context_original="$(__port_manager_compose_project_name_from_directory "\${__pm_workdir}" 2>/dev/null || true)"
     fi
 
     if [ "\${__pm_row_kind}" = "project" ] && __port_manager_cwd_matches_workdir "\${__pm_workdir}"; then
@@ -687,7 +739,8 @@ __port_manager_container_target_scan_file_for_runtime() {
   __pm_scan_suffix="$6"
 
   [ -r "\${__pm_scan_file}" ] || return 1
-  while IFS="$(printf '\\t')" read -r __pm_row_kind __pm_row_network __pm_row_runtime __pm_workdir __pm_project __pm_original_name __pm_attached_id __pm_attached_name __pm_service_name; do
+  while IFS= read -r __pm_line || [ -n "\${__pm_line}" ]; do
+    __port_manager_parse_container_routing_row "\${__pm_line}"
     if [ "\${__pm_row_kind}" != "container" ]; then
       continue
     fi
@@ -857,6 +910,43 @@ __port_manager_signal_terminal_attachment_changed() {
   __pm_signal_key="$(printf '%s' "\${__pm_signal_tty:-pid-$__pm_signal_pid}" | sed 's#[^A-Za-z0-9._-]#_#g')"
   printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "\${__pm_signal_network}" "\${__pm_signal_tty}" "\${__pm_signal_pid}" "\${__pm_signal_pgid}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%SZ')" > "\${PORT_MANAGER_TERMINAL_ATTACHMENT_DIR}/\${__pm_signal_key}.tsv" 2>/dev/null || true
   unset __pm_signal_network __pm_signal_tty __pm_signal_pid __pm_signal_pgid __pm_signal_key
+}
+
+__port_manager_route_table_generation() {
+  [ -n "\${1:-}" ] && [ -r "$1" ] || return 1
+  sed -n 's/.*"sequence"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' "$1" 2>/dev/null | head -n 1
+}
+
+__port_manager_route_table_has_compose_route() {
+  [ -n "\${1:-}" ] && [ -r "$1" ] || return 1
+  grep -Eq '"source"[[:space:]]*:[[:space:]]*"compose"' "$1" 2>/dev/null
+}
+
+__port_manager_wait_for_compose_route_refresh() {
+  [ -n "\${PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS+x}" ] || return 0
+  __pm_wait_file="\${PORT_MANAGER_ROUTES_FILE:-}"
+  [ -n "\${__pm_wait_file}" ] || { unset __pm_wait_file; return 0; }
+  __pm_wait_previous="\${1:-}"
+  __pm_wait_ms="\${PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS:-3000}"
+  case "\${__pm_wait_ms}" in ''|*[!0-9]*) __pm_wait_ms=3000 ;; esac
+  [ "\${__pm_wait_ms}" -gt 0 ] 2>/dev/null || { unset __pm_wait_file __pm_wait_previous __pm_wait_ms; return 0; }
+  [ "\${__pm_wait_ms}" -le 60000 ] 2>/dev/null || __pm_wait_ms=60000
+  __pm_wait_limit=$(((__pm_wait_ms + 99) / 100))
+  __pm_wait_count=0
+
+  while [ "\${__pm_wait_count}" -lt "\${__pm_wait_limit}" ]; do
+    __pm_wait_current="$(__port_manager_route_table_generation "\${__pm_wait_file}" 2>/dev/null || true)"
+    if { [ -z "\${__pm_wait_previous}" ] || [ "\${__pm_wait_current}" != "\${__pm_wait_previous}" ]; } &&
+      __port_manager_route_table_has_compose_route "\${__pm_wait_file}"; then
+      unset __pm_wait_file __pm_wait_previous __pm_wait_ms __pm_wait_limit __pm_wait_count __pm_wait_current
+      return 0
+    fi
+    __pm_wait_count=$((__pm_wait_count + 1))
+    sleep 0.1 2>/dev/null || sleep 1
+  done
+
+  unset __pm_wait_file __pm_wait_previous __pm_wait_ms __pm_wait_limit __pm_wait_count __pm_wait_current
+  return 0
 }
 
 __port_manager_compose_command_may_change_endpoints() {
@@ -1159,6 +1249,10 @@ __port_manager_run_compose_command_with_routing() {
   if __port_manager_compose_should_detach_up "\${__pm_standalone_compose}" "$@"; then
     __pm_detach_up=1
   fi
+  __pm_route_generation_before=""
+  if [ "\${__pm_detach_up}" = "1" ]; then
+    __pm_route_generation_before="$(__port_manager_route_table_generation "\${PORT_MANAGER_ROUTES_FILE:-}" 2>/dev/null || true)"
+  fi
 
   for __pm_arg in "$@"; do
     __pm_original_arg="\${__pm_arg}"
@@ -1257,7 +1351,11 @@ __port_manager_run_compose_command_with_routing() {
   __pm_status=$?
   if [ "\${__pm_status}" = "0" ] && __port_manager_compose_command_may_change_endpoints "\${__pm_standalone_compose}" "$@"; then
     __port_manager_signal_terminal_attachment_changed
+    if [ "\${__pm_detach_up}" = "1" ]; then
+      __port_manager_wait_for_compose_route_refresh "\${__pm_route_generation_before}"
+    fi
   fi
+  unset __pm_route_generation_before
   return "\${__pm_status}"
 }
 

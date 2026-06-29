@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { getRouteTablePathForComposeClaimPort } from "../../src/agent/route-table";
+
 /**
  * Native hook connect() regression tests.
  *
@@ -16,6 +18,25 @@ import test from "node:test";
 
 const projectRoot = path.resolve(__dirname, "../../..");
 const hookLibraryPath = getNativeHookLibraryPath();
+
+test("native hook memory route cache is scoped by logical network", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+
+  assert.equal(source.includes("char network_id[PM_MAX_TEXT];"), true);
+  assert.equal(source.includes("pthread_mutex_t pm_route_mutex"), true);
+  assert.equal(source.includes("pthread_mutex_lock(&pm_route_mutex);"), true);
+  assert.equal(source.includes("__sync_fetch_and_add(&pm_request_sequence, 1)"), true);
+  assert.equal(source.includes("pm_network_scope_payload_for_id(route->network_id"), true);
+  assert.equal(
+    source.includes("pm_routes[index].logical_port == logical_port && strcmp(pm_routes[index].network_id, route_network_id) == 0"),
+    true,
+  );
+  assert.equal(
+    source.includes("pm_routes[index].actual_port == actual_port && strcmp(pm_routes[index].network_id, route_network_id) == 0"),
+    true,
+  );
+});
 
 if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
   test("native hook allows current-network same-port compose routes", { skip: "native hook library is not built for this platform" }, () => undefined);
@@ -68,7 +89,56 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.equal(result.stderr, "");
   });
 
-  test("native hook allows detached cwd-matched compose routes", async (context) => {
+  test("native hook rewrites IPv6 localhost clients to current-network compose routes", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-connect-"));
+    const server = net.createServer((socket) => {
+      socket.end("ok\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-ipv6-localhost";
+    const logicalPort = chooseDifferentTcpPort(address.port);
+    const routeTablePath = path.join(tempDir, `newdlops-portmanager-routes-${process.getuid?.() ?? "user"}-${networkId}.json`);
+    fs.writeFileSync(
+      routeTablePath,
+      JSON.stringify({
+        updatedAt: "2026-06-29T00:00:00.000Z",
+        routes: [
+          {
+            logicalPort,
+            actualPort: address.port,
+            routeDirection: "listen",
+            host: "127.0.0.1",
+            cwd: projectRoot,
+            networkId,
+            processId: "managed-process-compose",
+            processName: "docker:db/postgresql",
+            status: "running",
+            source: "compose",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const result = await runHookedNodeClient(logicalPort, routeTablePath, networkId, { host: "::1" });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "ok\n");
+    assert.equal(result.stderr, "");
+  });
+
+  test("native hook blocks scoped compose routes when network identity is missing", async (context) => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-connect-"));
     const server = net.createServer((socket) => {
       socket.end("ok\n");
@@ -110,12 +180,278 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
       "utf8",
     );
 
-    const result = await runHookedNodeClient(logicalPort, routeTablePath, undefined);
+    const result = await runHookedNodeClient(logicalPort, routeTablePath, undefined, {
+      env: {
+        PORT_MANAGER_COMPOSE_LOGICAL_PORTS: String(logicalPort),
+        PORT_MANAGER_COMPOSE_ROUTE_WAIT_MS: "50",
+        PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
+      },
+    });
+
+    assert.equal(result.exitCode, 23);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "ECONNREFUSED\n");
+  });
+
+  test("native hook blocks foreign compose claim ports without reading the aggregate route table", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-connect-"));
+    const server = net.createServer((socket) => {
+      socket.end("wrong-network\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const routeTablePath = path.join(tempDir, "newdlops-portmanager-routes-test.json");
+    const claimPath = getRouteTablePathForComposeClaimPort(address.port, routeTablePath);
+    fs.writeFileSync(routeTablePath, JSON.stringify({ updatedAt: "2026-06-27T00:00:00.000Z", routes: [] }), "utf8");
+    fs.writeFileSync(
+      claimPath,
+      JSON.stringify({
+        updatedAt: "2026-06-27T00:00:00.000Z",
+        routes: [
+          {
+            logicalPort: address.port,
+            actualPort: address.port,
+            routeDirection: "listen",
+            host: "127.0.0.1",
+            cwd: projectRoot,
+            networkId: "network-a",
+            processId: "managed-process-compose",
+            processName: "docker:db/postgresql",
+            status: "running",
+            source: "compose",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const result = await runHookedNodeClient(address.port, routeTablePath, "network-b", {
+      env: {
+        PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
+        PORT_MANAGER_AGENT_TIMEOUT_MS: "50",
+      },
+    });
+
+    assert.equal(result.exitCode, 23);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "ECONNREFUSED\n");
+  });
+
+  test("native hook waits for compose-owned logical route publication", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-connect-"));
+    const server = net.createServer((socket) => {
+      socket.end("ok\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-compose-race";
+    const logicalPort = chooseDifferentTcpPort(address.port);
+    const routeTablePath = path.join(tempDir, `newdlops-portmanager-routes-${process.getuid?.() ?? "user"}-${networkId}.json`);
+    fs.writeFileSync(routeTablePath, JSON.stringify({ updatedAt: "2026-06-27T00:00:00.000Z", routes: [] }), "utf8");
+
+    const resultPromise = runHookedNodeClient(logicalPort, routeTablePath, networkId, {
+      env: {
+        PORT_MANAGER_COMPOSE_LOGICAL_PORTS: String(logicalPort),
+        PORT_MANAGER_COMPOSE_ROUTE_WAIT_MS: "2000",
+      },
+    });
+
+    setTimeout(() => {
+      fs.writeFileSync(
+        routeTablePath,
+        JSON.stringify({
+          updatedAt: "2026-06-27T00:00:01.000Z",
+          routes: [
+            {
+              logicalPort,
+              actualPort: address.port,
+              routeDirection: "listen",
+              host: "127.0.0.1",
+              cwd: projectRoot,
+              networkId,
+              processId: "managed-process-compose",
+              processName: "docker:db/postgresql",
+              status: "running",
+              source: "compose",
+            },
+          ],
+        }),
+        "utf8",
+      );
+    }, 100);
+
+    const result = await resultPromise;
 
     assert.equal(result.exitCode, 0);
     assert.equal(result.stdout, "ok\n");
     assert.equal(result.stderr, "");
   });
+
+  test("native hook waits for current-network route publication without compose port env", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-connect-"));
+    const server = net.createServer((socket) => {
+      socket.end("ok\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-connect-race";
+    const logicalPort = chooseDifferentTcpPort(address.port);
+    const routeTablePath = path.join(tempDir, `newdlops-portmanager-routes-${process.getuid?.() ?? "user"}-${networkId}.json`);
+    fs.writeFileSync(routeTablePath, JSON.stringify({ updatedAt: "2026-06-29T00:00:00.000Z", routes: [] }), "utf8");
+
+    const resultPromise = runHookedNodeClient(logicalPort, routeTablePath, networkId, {
+      env: {
+        PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "2000",
+        PORT_MANAGER_AGENT_ROUNDTRIP_TIMEOUT_MS: "50",
+      },
+    });
+
+    setTimeout(() => {
+      fs.writeFileSync(
+        routeTablePath,
+        JSON.stringify({
+          updatedAt: "2026-06-29T00:00:01.000Z",
+          routes: [
+            {
+              logicalPort,
+              actualPort: address.port,
+              routeDirection: "listen",
+              host: "127.0.0.1",
+              cwd: projectRoot,
+              networkId,
+              processId: "managed-process-compose",
+              processName: "docker:db/postgresql",
+              status: "running",
+              source: "compose",
+            },
+          ],
+        }),
+        "utf8",
+      );
+    }, 100);
+
+    const result = await resultPromise;
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "ok\n");
+    assert.equal(result.stderr, "");
+  });
+
+  test("native hook honors allocated route host over the environment actual host", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-connect-"));
+    const routeTablePath = path.join(tempDir, "routes.json");
+    const agentSocketPath = path.join("/tmp", `portmanager-hook-agent-${process.pid}-${Date.now()}.sock`);
+    const agentRequests: AgentRequest[] = [];
+    let actualPort = 0;
+    let logicalPort = 0;
+    const server = net.createServer((socket) => {
+      socket.end("ok\n");
+    });
+    const agentServer = net.createServer((socket) => {
+      let requestText = "";
+      socket.setEncoding("utf8");
+      socket.on("data", (chunk: string) => {
+        requestText += chunk;
+        const newline = requestText.indexOf("\n");
+        if (newline < 0) {
+          return;
+        }
+
+        const request = JSON.parse(requestText.slice(0, newline)) as AgentRequest;
+        agentRequests.push(request);
+        socket.end(
+          `${JSON.stringify({
+            type: "response",
+            id: request.id,
+            ok: true,
+            payload: {
+              allocationId: "allocation-1",
+              requestedPort: logicalPort,
+              actualPort,
+              host: "127.0.0.1",
+              routed: true,
+              logicalRoutes: [],
+              logicalRoutesFile: routeTablePath,
+              expiresAt: "2026-06-25T00:00:00Z",
+            },
+          })}\n`,
+        );
+      });
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await closeServer(agentServer);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+      await fs.promises.rm(agentSocketPath, { force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    actualPort = address.port;
+    logicalPort = await chooseUnusedTcpPort(actualPort);
+    fs.writeFileSync(routeTablePath, JSON.stringify({ updatedAt: "2026-06-25T00:00:00.000Z", routes: [] }), "utf8");
+    await listenOnUnixSocket(agentServer, agentSocketPath);
+
+    const result = await runHookedNodeClient(logicalPort, routeTablePath, "network-a", {
+      env: {
+        PORT_MANAGER_AGENT_SOCKET: agentSocketPath,
+        PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "127.81.154.127",
+        PORT_MANAGER_AGENT_TIMEOUT_MS: "1000",
+      },
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "ok\n");
+    assert.equal(result.stderr, "");
+    assert.equal(agentRequests.length, 1);
+    assert.equal(agentRequests[0]?.method, "allocateRoute");
+    assert.equal(agentRequests[0]?.payload.host, "127.0.0.1");
+    assert.equal(agentRequests[0]?.payload.actualHost, "127.81.154.127");
+  });
+}
+
+interface AgentRequest {
+  readonly id: string;
+  readonly method: string;
+  readonly payload: {
+    readonly host?: string;
+    readonly actualHost?: string;
+  };
 }
 
 function getNativeHookLibraryPath(): string | undefined {
@@ -137,8 +473,30 @@ async function listen(server: net.Server): Promise<void> {
   });
 }
 
+async function listenOnUnixSocket(server: net.Server, socketPath: string): Promise<void> {
+  await fs.promises.rm(socketPath, { force: true });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, () => resolve());
+  });
+}
+
 function chooseDifferentTcpPort(actualPort: number): number {
   return actualPort < 64000 ? actualPort + 1000 : actualPort - 1000;
+}
+
+async function chooseUnusedTcpPort(excludedPort: number): Promise<number> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const server = net.createServer();
+    await listen(server);
+    const address = server.address();
+    await closeServer(server);
+    if (address !== null && typeof address !== "string" && address.port !== excludedPort) {
+      return address.port;
+    }
+  }
+
+  return chooseDifferentTcpPort(excludedPort);
 }
 
 async function closeServer(server: net.Server): Promise<void> {
@@ -162,11 +520,16 @@ async function runHookedNodeClient(
   port: number,
   routeTablePath: string,
   networkId: string | undefined,
+  options: {
+    readonly env?: NodeJS.ProcessEnv;
+    readonly host?: string;
+  } = {},
 ): Promise<{ readonly exitCode: number | null; readonly stdout: string; readonly stderr: string }> {
   const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
+  const host = options.host ?? "127.0.0.1";
   const script = [
     "const net = require('node:net');",
-    `const socket = net.createConnection({ host: '127.0.0.1', port: ${port} });`,
+    `const socket = net.createConnection({ host: ${JSON.stringify(host)}, port: ${port} });`,
     "let data = '';",
     "socket.setEncoding('utf8');",
     "socket.on('data', (chunk) => { data += chunk; });",
@@ -189,6 +552,7 @@ async function runHookedNodeClient(
       PORT_MANAGER_BORROWED_NETWORK_ID: "",
       NEWDLOPS_PM_NETWORK_ID: "",
       NEWDLOPS_PM_BORROWED_NETWORK_ID: "",
+      ...options.env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

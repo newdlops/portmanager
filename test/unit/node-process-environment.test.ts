@@ -32,6 +32,14 @@ test("parses legacy borrowed-network aliases when the primary variable is absent
   assert.equal(networkId, "network-b");
 });
 
+test("parses route-table network id when primary routing env is absent", () => {
+  const networkId = parseRoutingNetworkIdFromProcessEnvironment(
+    "65402 s003 python manage.py PORT_MANAGER_ROUTE_TABLE_NETWORK_ID=network-c PORT_MANAGER_ROUTES_FILE=/tmp/routes.json",
+  );
+
+  assert.equal(networkId, "network-c");
+});
+
 test("ignores similar text that is not an environment assignment", () => {
   const networkId = parseRoutingNetworkIdFromProcessEnvironment(
     "node script-with-PORT_MANAGER_NETWORK_ID=network-c npm_package_script=PORT_MANAGER_NETWORK_ID=network-d",

@@ -34,6 +34,7 @@
 #define PM_DOCKER_SHIM_BYPASS_ENV "PORT_MANAGER_DOCKER_SHIM_BYPASS"
 #define PM_DOCKER_SHIM_DEBUG_ENV "PORT_MANAGER_DOCKER_SHIM_DEBUG"
 #define PM_TERMINAL_ATTACHMENT_DIR_ENV "PORT_MANAGER_TERMINAL_ATTACHMENT_DIR"
+#define PM_COMPOSE_REFRESH_WAIT_MS 3000
 
 typedef struct {
   char kind[16];
@@ -45,6 +46,7 @@ typedef struct {
   char attached_id[PM_MAX_FIELD];
   char attached_name[PM_MAX_FIELD];
   char service_name[PM_MAX_FIELD];
+  char override_file[PM_MAX_PATH];
 } pm_route_row;
 
 /** Debug output is opt-in because the shim sits on normal Docker PATH lookups. */
@@ -745,9 +747,13 @@ static int pm_parse_route_row(char *line, pm_route_row *row) {
   pm_copy(row->workdir, sizeof(row->workdir), fields[3]);
   pm_copy(row->project_or_original_id, sizeof(row->project_or_original_id), fields[4]);
   pm_copy(row->original_name, sizeof(row->original_name), fields[5]);
-  pm_copy(row->attached_id, sizeof(row->attached_id), fields[6]);
-  pm_copy(row->attached_name, sizeof(row->attached_name), fields[7]);
-  pm_copy(row->service_name, sizeof(row->service_name), fields[8]);
+  if (strcmp(row->kind, "project") == 0 || strcmp(row->kind, "file") == 0) {
+    pm_copy(row->override_file, sizeof(row->override_file), fields[6]);
+  } else {
+    pm_copy(row->attached_id, sizeof(row->attached_id), fields[6]);
+    pm_copy(row->attached_name, sizeof(row->attached_name), fields[7]);
+    pm_copy(row->service_name, sizeof(row->service_name), fields[8]);
+  }
   pm_trim_line_end(row->kind);
   pm_trim_line_end(row->network_id);
   pm_trim_line_end(row->runtime);
@@ -757,6 +763,7 @@ static int pm_parse_route_row(char *line, pm_route_row *row) {
   pm_trim_line_end(row->attached_id);
   pm_trim_line_end(row->attached_name);
   pm_trim_line_end(row->service_name);
+  pm_trim_line_end(row->override_file);
 
   return row->kind[0] != '\0';
 }
@@ -1482,6 +1489,60 @@ static int pm_read_file_limited(const char *path, char **buffer_out) {
   return 0;
 }
 
+static int pm_parse_int_env(const char *name, int fallback) {
+  const char *value = getenv(name);
+  char *end = NULL;
+  long parsed;
+
+  if (value == NULL || value[0] == '\0') {
+    return fallback;
+  }
+
+  parsed = strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < 0 || parsed > 60000) {
+    return fallback;
+  }
+
+  return (int)parsed;
+}
+
+static long pm_route_table_generation_sequence(void) {
+  const char *route_file = pm_effective_route_table_path();
+  char *buffer;
+  char *cursor;
+  char *end;
+  long sequence;
+
+  if (pm_read_file_limited(route_file, &buffer) != 0) {
+    return -1;
+  }
+
+  cursor = strstr(buffer, "\"sequence\"");
+  if (cursor == NULL) {
+    free(buffer);
+    return -1;
+  }
+
+  cursor = strchr(cursor, ':');
+  if (cursor == NULL) {
+    free(buffer);
+    return -1;
+  }
+
+  cursor++;
+  while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+    cursor++;
+  }
+
+  sequence = strtol(cursor, &end, 10);
+  free(buffer);
+  if (end == cursor || sequence < 0) {
+    return -1;
+  }
+
+  return sequence;
+}
+
 static int pm_route_network_matches(const char *route_json, const char *network_id) {
   char route_network[PM_MAX_FIELD];
 
@@ -1501,7 +1562,9 @@ static int pm_find_compose_route_from_route_table(
   char *attached_project,
   size_t attached_size,
   char *original_project,
-  size_t original_size
+  size_t original_size,
+  char *override_file,
+  size_t override_size
 ) {
   const char *route_file = pm_effective_route_table_path();
   const char *network_id = pm_network_id();
@@ -1568,7 +1631,82 @@ static int pm_find_compose_route_from_route_table(
   if (original_size > 0) {
     original_project[0] = '\0';
   }
+  if (override_size > 0) {
+    override_file[0] = '\0';
+  }
   return 0;
+}
+
+static int pm_route_table_has_current_compose_route(void) {
+  const char *route_file = pm_effective_route_table_path();
+  const char *network_id = pm_network_id();
+  char *buffer;
+  char *cursor;
+
+  if (pm_read_file_limited(route_file, &buffer) != 0) {
+    return 0;
+  }
+
+  cursor = buffer;
+  while ((cursor = strstr(cursor, "\"source\"")) != NULL) {
+    char *object_start = cursor;
+    char *object_end = strchr(cursor, '}');
+    char object_end_saved;
+    char source[64];
+
+    while (object_start > buffer && *object_start != '{') {
+      object_start--;
+    }
+
+    if (object_end == NULL) {
+      break;
+    }
+
+    object_end_saved = *object_end;
+    *object_end = '\0';
+    if (
+      pm_json_string(object_start, "source", source, sizeof(source)) == 0 &&
+      strcmp(source, "compose") == 0 &&
+      pm_route_network_matches(object_start, network_id)
+    ) {
+      *object_end = object_end_saved;
+      free(buffer);
+      return 1;
+    }
+
+    *object_end = object_end_saved;
+    cursor = object_end + 1;
+  }
+
+  free(buffer);
+  return 0;
+}
+
+static void pm_wait_for_compose_route_refresh(long previous_generation) {
+  const char *configured_wait_ms = getenv("PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS");
+  int wait_ms = pm_parse_int_env("PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS", PM_COMPOSE_REFRESH_WAIT_MS);
+  int waited_ms = 0;
+
+  if (configured_wait_ms == NULL || configured_wait_ms[0] == '\0') {
+    return;
+  }
+
+  if (wait_ms <= 0) {
+    return;
+  }
+
+  while (waited_ms < wait_ms) {
+    long current_generation = pm_route_table_generation_sequence();
+    if (
+      (previous_generation < 0 || current_generation != previous_generation) &&
+      pm_route_table_has_current_compose_route()
+    ) {
+      return;
+    }
+
+    usleep(100000);
+    waited_ms += 100;
+  }
 }
 
 typedef struct {
@@ -1581,11 +1719,14 @@ typedef struct {
   size_t attached_size;
   char *original_project;
   size_t original_size;
+  char *override_file;
+  size_t override_size;
   size_t best_length;
   int context_found;
   int project_match_count;
   char project_attached[PM_MAX_FIELD];
   char project_original[PM_MAX_FIELD];
+  char project_override[PM_MAX_PATH];
   int found;
 } pm_compose_route_search;
 
@@ -1609,6 +1750,7 @@ static int pm_find_compose_route_in_file(const char *file_path, void *context) {
     pm_route_row row;
     size_t workdir_length;
     int row_matches = 0;
+    char row_original_project[PM_MAX_FIELD];
 
     if (!pm_parse_route_row(line, &row)) {
       continue;
@@ -1616,6 +1758,11 @@ static int pm_find_compose_route_in_file(const char *file_path, void *context) {
 
     if (strcmp(row.network_id, search->network_id) != 0 || strcmp(row.runtime, search->runtime) != 0) {
       continue;
+    }
+
+    pm_copy(row_original_project, sizeof(row_original_project), row.original_name);
+    if (strcmp(row.kind, "project") == 0 && row_original_project[0] == '\0') {
+      (void)pm_compose_project_name_from_directory(row.workdir, row_original_project, sizeof(row_original_project));
     }
 
     workdir_length = strlen(row.workdir);
@@ -1628,16 +1775,18 @@ static int pm_find_compose_route_in_file(const char *file_path, void *context) {
     if (row_matches && workdir_length >= search->best_length) {
       search->best_length = workdir_length;
       pm_copy(search->attached_project, search->attached_size, row.project_or_original_id);
-      pm_copy(search->original_project, search->original_size, row.original_name);
+      pm_copy(search->original_project, search->original_size, row_original_project);
+      pm_copy(search->override_file, search->override_size, row.override_file);
       search->context_found = 1;
       search->found = search->attached_project[0] != '\0';
     } else if (strcmp(row.kind, "project") == 0 &&
                search->requested_project[0] != '\0' &&
-               (strcmp(search->requested_project, row.original_name) == 0 ||
+               (strcmp(search->requested_project, row_original_project) == 0 ||
                 strcmp(search->requested_project, row.project_or_original_id) == 0)) {
       search->project_match_count++;
       pm_copy(search->project_attached, sizeof(search->project_attached), row.project_or_original_id);
-      pm_copy(search->project_original, sizeof(search->project_original), row.original_name);
+      pm_copy(search->project_original, sizeof(search->project_original), row_original_project);
+      pm_copy(search->project_override, sizeof(search->project_override), row.override_file);
     }
   }
 
@@ -1647,14 +1796,32 @@ static int pm_find_compose_route_in_file(const char *file_path, void *context) {
 }
 
 /** Finds the most-specific attached compose project for cwd, compose file, runtime, and network. */
-static int pm_find_compose_route(const char *runtime, int argc, char **argv, char *attached_project, size_t attached_size, char *original_project, size_t original_size) {
+static int pm_find_compose_route(
+  const char *runtime,
+  int argc,
+  char **argv,
+  char *attached_project,
+  size_t attached_size,
+  char *original_project,
+  size_t original_size,
+  char *override_file,
+  size_t override_size
+) {
   const char *file_path = getenv(PM_COMPOSE_ROUTING_FILE_ENV);
   const char *network_id = pm_network_id();
   pm_compose_route_search search;
   int scoped_file_count = 0;
 
   if (file_path == NULL || file_path[0] == '\0' || network_id == NULL || network_id[0] == '\0') {
-    return pm_find_compose_route_from_route_table(runtime, attached_project, attached_size, original_project, original_size);
+    return pm_find_compose_route_from_route_table(
+      runtime,
+      attached_project,
+      attached_size,
+      original_project,
+      original_size,
+      override_file,
+      override_size
+    );
   }
 
   memset(&search, 0, sizeof(search));
@@ -1667,6 +1834,8 @@ static int pm_find_compose_route(const char *runtime, int argc, char **argv, cha
   search.attached_size = attached_size;
   search.original_project = original_project;
   search.original_size = original_size;
+  search.override_file = override_file;
+  search.override_size = override_size;
 
   pm_visit_scoped_compose_routing_files(file_path, pm_find_compose_route_in_file, &search, &scoped_file_count);
   if (scoped_file_count == 0) {
@@ -1676,10 +1845,19 @@ static int pm_find_compose_route(const char *runtime, int argc, char **argv, cha
   if (!search.context_found && search.project_match_count == 1 && search.project_attached[0] != '\0') {
     pm_copy(attached_project, attached_size, search.project_attached);
     pm_copy(original_project, original_size, search.project_original);
+    pm_copy(override_file, override_size, search.project_override);
     return 0;
   }
 
-  return search.found ? 0 : pm_find_compose_route_from_route_table(runtime, attached_project, attached_size, original_project, original_size);
+  return search.found ? 0 : pm_find_compose_route_from_route_table(
+    runtime,
+    attached_project,
+    attached_size,
+    original_project,
+    original_size,
+    override_file,
+    override_size
+  );
 }
 
 /** Allocates one rewritten compose project option argument. */
@@ -2259,11 +2437,17 @@ static int pm_compose_routing_file_matches_context(
 
   while (getline(&line, &line_capacity, file) >= 0) {
     pm_route_row row;
+    char row_original_project[PM_MAX_FIELD];
 
     if (!pm_parse_route_row(line, &row) ||
         strcmp(row.network_id, network_id) != 0 ||
         strcmp(row.runtime, runtime) != 0) {
       continue;
+    }
+
+    pm_copy(row_original_project, sizeof(row_original_project), row.original_name);
+    if (strcmp(row.kind, "project") == 0 && row_original_project[0] == '\0') {
+      (void)pm_compose_project_name_from_directory(row.workdir, row_original_project, sizeof(row_original_project));
     }
 
     if ((strcmp(row.kind, "project") == 0 && pm_cwd_matches_workdir(row.workdir)) ||
@@ -2274,7 +2458,7 @@ static int pm_compose_routing_file_matches_context(
 
     if (strcmp(row.kind, "project") == 0 &&
         requested_project[0] != '\0' &&
-        (strcmp(requested_project, row.original_name) == 0 ||
+        (strcmp(requested_project, row_original_project) == 0 ||
          strcmp(requested_project, row.project_or_original_id) == 0)) {
       matches = 1;
       break;
@@ -2968,9 +3152,10 @@ static void pm_signal_terminal_attachment_changed(void) {
 }
 
 /** Runs lifecycle commands as a child so the shim can refresh VS Code afterward. */
-static int pm_spawn_and_signal_on_success(const char *real_runtime_path, char **next_argv) {
+static int pm_spawn_and_signal_on_success(const char *real_runtime_path, char **next_argv, int wait_for_compose_routes) {
   pid_t child;
   int status = 0;
+  long route_generation_before = wait_for_compose_routes ? pm_route_table_generation_sequence() : -1;
 
   child = fork();
   if (child < 0) {
@@ -2993,6 +3178,9 @@ static int pm_spawn_and_signal_on_success(const char *real_runtime_path, char **
 
   if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
     pm_signal_terminal_attachment_changed();
+    if (wait_for_compose_routes) {
+      pm_wait_for_compose_route_refresh(route_generation_before);
+    }
     return 0;
   }
 
@@ -3021,6 +3209,7 @@ int main(int argc, char **argv) {
   int command_index;
   int standalone_compose;
   int signal_after_compose_success = 0;
+  int wait_for_compose_routes_after_success = 0;
 
   if (pm_resolve_invocation(argv, runtime, sizeof(runtime), runtime_executable, sizeof(runtime_executable), &standalone_compose) != 0) {
     fprintf(stderr, "portmanager-docker-shim: invoke through docker, podman, docker-compose, or podman-compose symlink\n");
@@ -3055,9 +3244,35 @@ int main(int argc, char **argv) {
   pm_debug("command_index=%d standalone_compose=%d", command_index, standalone_compose);
   if (standalone_compose || (command_index >= 0 && strcmp(argv[command_index], "compose") == 0)) {
     signal_after_compose_success = pm_compose_command_may_change_endpoints(argc, argv, command_index, standalone_compose);
-    if (pm_find_compose_route(runtime, argc, argv, attached_project, sizeof(attached_project), original_project, sizeof(original_project)) == 0) {
-      override_file[0] = '\0';
-      (void)pm_compose_override_for_project(attached_project, override_file, sizeof(override_file));
+    wait_for_compose_routes_after_success =
+      signal_after_compose_success &&
+      pm_compose_should_detach_up(argc, argv, command_index, standalone_compose);
+    if (pm_find_compose_route(
+      runtime,
+      argc,
+      argv,
+      attached_project,
+      sizeof(attached_project),
+      original_project,
+      sizeof(original_project),
+      override_file,
+      sizeof(override_file)
+    ) == 0) {
+      int rewrites_project = original_project[0] != '\0' && strcmp(attached_project, original_project) != 0;
+
+      if (override_file[0] == '\0') {
+        (void)pm_compose_override_for_project(attached_project, override_file, sizeof(override_file));
+      }
+
+      if (rewrites_project && (override_file[0] == '\0' || access(override_file, R_OK) != 0)) {
+        fprintf(
+          stderr,
+          "portmanager-docker-shim: missing generated Compose override for attached project %s; refusing unsafe project rewrite from %s\n",
+          attached_project,
+          original_project
+        );
+        return 127;
+      }
 
       setenv("COMPOSE_PROJECT_NAME", attached_project, 1);
       next_argv = pm_rewrite_compose_args(
@@ -3091,7 +3306,7 @@ int main(int argc, char **argv) {
   }
 
   if (signal_after_compose_success) {
-    return pm_spawn_and_signal_on_success(real_runtime_path, next_argv);
+    return pm_spawn_and_signal_on_success(real_runtime_path, next_argv, wait_for_compose_routes_after_success);
   }
 
   execv(real_runtime_path, next_argv);
