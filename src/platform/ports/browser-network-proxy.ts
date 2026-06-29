@@ -83,11 +83,7 @@ export class BrowserNetworkProxyManager {
 
     for (const [id, listener] of [...this.listeners]) {
       const endpoint = desired.get(id);
-      if (
-        endpoint === undefined ||
-        endpoint.listenHost !== listener.endpoint.listenHost ||
-        !endpoint.listenPorts.includes(listener.endpoint.listenPort)
-      ) {
+      if (endpoint === undefined || !isEndpointCurrent(listener.endpoint, endpoint)) {
         await this.close(id);
       }
     }
@@ -112,11 +108,7 @@ export class BrowserNetworkProxyManager {
   async ensure(endpoint: BrowserNetworkProxyEndpoint): Promise<ActiveBrowserNetworkProxyEndpoint | undefined> {
     const normalizedEndpoint = normalizeEndpoint(endpoint);
     const listener = this.listeners.get(normalizedEndpoint.id);
-    if (
-      listener !== undefined &&
-      listener.endpoint.listenHost === normalizedEndpoint.listenHost &&
-      normalizedEndpoint.listenPorts.includes(listener.endpoint.listenPort)
-    ) {
+    if (listener !== undefined && isEndpointCurrent(listener.endpoint, normalizedEndpoint)) {
       return listener.endpoint;
     }
 
@@ -311,6 +303,24 @@ function normalizeEndpoint(endpoint: BrowserNetworkProxyEndpoint): BrowserNetwor
     ...endpoint,
     listenPorts,
   };
+}
+
+function isEndpointCurrent(
+  activeEndpoint: ActiveBrowserNetworkProxyEndpoint,
+  desiredEndpoint: BrowserNetworkProxyEndpoint,
+): boolean {
+  /*
+   * Request handlers capture the active endpoint when the socket opens. Rebind
+   * whenever DNS-facing metadata changes so browser aliases do not keep stale
+   * hosts or loopback addresses after a network rename or DNS startup.
+   */
+  return (
+    activeEndpoint.networkId === desiredEndpoint.networkId &&
+    activeEndpoint.logicalPort === desiredEndpoint.logicalPort &&
+    activeEndpoint.listenHost === desiredEndpoint.listenHost &&
+    activeEndpoint.publicHost === desiredEndpoint.publicHost &&
+    desiredEndpoint.listenPorts.includes(activeEndpoint.listenPort)
+  );
 }
 
 function rewriteRequestHeaders(

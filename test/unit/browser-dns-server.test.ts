@@ -29,6 +29,22 @@ test("answers A records for configured browser aliases", async () => {
   }
 });
 
+test("replaces stale A records when browser aliases are synced again", async () => {
+  const server = new BrowserDnsServer({ port: 0 });
+  await server.start();
+  server.sync([{ hostname: "alpha1", address: "127.98.202.69" }]);
+  server.sync([{ hostname: "alpha1", address: "127.112.19.42" }]);
+
+  try {
+    const response = await queryDns(server.getPort(), buildQuery("alpha1"));
+
+    assert.equal(response.readUInt16BE(6), 1);
+    assert.deepEqual([...response.subarray(response.length - 4)], [127, 112, 19, 42]);
+  } finally {
+    server.dispose();
+  }
+});
+
 test("returns NXDOMAIN for unknown browser aliases", async () => {
   const server = new BrowserDnsServer({ port: 0 });
   await server.start();
@@ -65,6 +81,16 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(networkServiceSource.includes("readBrowserProxyProcessCommandTexts"), true);
   assert.equal(networkServiceSource.includes("readProcessCommand(process.pid)"), true);
   assert.equal(networkServiceSource.includes("processCommandTextByPid"), true);
+  const browserProxySyncStart = networkServiceSource.indexOf("private async syncBrowserNetworkProxiesExclusive");
+  const browserProxySyncEnd = networkServiceSource.indexOf(
+    "private async readBrowserProxyProcessCommandTexts",
+    browserProxySyncStart,
+  );
+  const browserProxySyncSource = networkServiceSource.slice(browserProxySyncStart, browserProxySyncEnd);
+  assert.notEqual(browserProxySyncStart, -1);
+  assert.notEqual(browserProxySyncEnd, -1);
+  assert.equal(browserProxySyncSource.includes("this.syncBrowserDnsRecordsForNetworks(networks);"), true);
+  assert.match(browserProxySyncSource, /collectBrowserProxyEndpoints\([\s\S]*networks,/);
   assert.equal(networkServiceSource.includes("isPublicWebEntrypointProcess"), true);
   assert.equal(networkServiceSource.includes("/\\bvite\\b/"), true);
   assert.equal(networkServiceSource.includes("backend ports remain"), true);

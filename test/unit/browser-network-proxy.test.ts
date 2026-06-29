@@ -103,6 +103,51 @@ test("uses a fallback browser port when the logical port is already occupied", a
   }
 });
 
+test("refreshes active browser proxy metadata when the DNS alias changes", async () => {
+  const upstreamRequests: http.IncomingHttpHeaders[] = [];
+  const upstream = http.createServer((request, response) => {
+    upstreamRequests.push(request.headers);
+    response.writeHead(200, {
+      location: "http://localhost:3004/dashboard",
+    });
+    response.end("target");
+  });
+  await listen(upstream, 0, "127.0.0.1");
+
+  const proxyPort = await getAvailablePort();
+  const proxy = new BrowserNetworkProxyManager({
+    resolve: () => ({
+      host: "127.0.0.1",
+      port: getServerPort(upstream),
+    }),
+  });
+
+  try {
+    await proxy.ensure(createEndpoint({ publicHost: "alpha1", listenPorts: [proxyPort] }));
+    const activeEndpoint = await proxy.ensure(createEndpoint({ publicHost: "alpha2", listenPorts: [proxyPort] }));
+
+    assert.ok(activeEndpoint);
+    assert.equal(activeEndpoint?.publicHost, "alpha2");
+    assert.equal(formatBrowserNetworkProxyUrl(activeEndpoint), `http://alpha2:${proxyPort}/`);
+
+    const response = await requestHttp({
+      host: "127.0.0.1",
+      port: proxyPort,
+      path: "/",
+      headers: {
+        host: `alpha2:${proxyPort}`,
+        origin: `http://alpha2:${proxyPort}`,
+      },
+    });
+
+    assert.equal(upstreamRequests.at(-1)?.origin, "http://localhost:3004");
+    assert.equal(response.headers.location, `http://alpha2:${proxyPort}/dashboard`);
+  } finally {
+    await proxy.dispose();
+    await closeServer(upstream);
+  }
+});
+
 test("rewrites WebSocket upgrade metadata before tunneling", async () => {
   let upgradeHost = "";
   let upgradeOrigin = "";

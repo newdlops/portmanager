@@ -599,12 +599,15 @@ export class PortManagerNetworkService implements DisposableLike {
    * that reject raw loopback aliases can continue to work.
    */
   async getBrowserIsolatedUrl(process: ManagedProcess): Promise<string | undefined> {
-    if (!isBrowserProxyProcess(process, this.registry.getSnapshot().networks)) {
+    const networks = this.registry.getSnapshot().networks;
+    this.syncBrowserDnsRecordsForNetworks(networks);
+
+    if (!isBrowserProxyProcess(process, networks)) {
       return undefined;
     }
 
     const endpoint = await this.browserNetworkProxy.ensure(
-      buildBrowserProxyEndpoint(process, this.registry.getSnapshot().networks, this.browserDnsServer.isRunning()),
+      buildBrowserProxyEndpoint(process, networks, this.browserDnsServer.isRunning()),
     );
     return endpoint === undefined ? undefined : formatBrowserNetworkProxyUrl(endpoint);
   }
@@ -704,7 +707,12 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Publishes current network-name aliases to the local browser DNS responder. */
   private syncBrowserDnsRecords(): void {
-    const records = buildBrowserDnsRecords(this.registry.getSnapshot().networks);
+    this.syncBrowserDnsRecordsForNetworks(this.registry.getSnapshot().networks);
+  }
+
+  /** Publishes aliases from the same snapshot used by browser proxy reconciliation. */
+  private syncBrowserDnsRecordsForNetworks(networks: readonly LogicalNetwork[]): void {
+    const records = buildBrowserDnsRecords(networks);
     this.browserDnsServer.sync(records);
   }
 
@@ -3127,6 +3135,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
   private async syncBrowserNetworkProxiesExclusive(): Promise<void> {
     const snapshot = this.processService?.getSnapshot();
+    const networks = this.registry.getSnapshot().networks;
+    this.syncBrowserDnsRecordsForNetworks(networks);
+
     if (!tryAcquireBrowserNetworkProxyOwnerLease()) {
       await this.browserNetworkProxy.sync([]).catch(() => undefined);
       return;
@@ -3135,7 +3146,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const processCommandTextByPid = await this.readBrowserProxyProcessCommandTexts(snapshot?.processes ?? []);
     const endpoints = collectBrowserProxyEndpoints(
       snapshot?.processes ?? [],
-      this.registry.getSnapshot().networks,
+      networks,
       this.browserDnsServer.isRunning(),
       processCommandTextByPid,
     );
