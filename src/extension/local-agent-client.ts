@@ -82,6 +82,7 @@ const AGENT_STARTUP_LOCK_WAIT_MS = 5_000;
 const AGENT_CONNECT_TIMEOUT_MS = 1_000;
 const AGENT_RESTART_EXIT_WAIT_MS = 2_000;
 const AGENT_RESTART_TERM_GRACE_MS = 500;
+const CLIENT_CHANGE_EVENT_DEBOUNCE_MS = 50;
 
 /**
  * Agent-backed process service used by commands and the sidebar provider.
@@ -106,6 +107,9 @@ export class LocalAgentClient implements PortManagerProcessService {
 
   /** Event channel for sidebar refreshes after snapshot changes. */
   private readonly changeEvents = new SimpleEventEmitter<void>();
+
+  /** Timer that coalesces snapshot bursts before notifying VS Code UI. */
+  private changeEventTimer: NodeJS.Timeout | undefined;
 
   /** Buffered partial line data from the socket. */
   private incomingBuffer = "";
@@ -161,7 +165,7 @@ export class LocalAgentClient implements PortManagerProcessService {
     this.childProcess = undefined;
     this.snapshot = createEmptySnapshot();
     this.snapshotSignature = buildClientSnapshotSignature(this.snapshot);
-    this.changeEvents.emit();
+    this.queueChangeEvent();
   }
 
   /** Restarts the singleton daemon using this extension's compiled agent. */
@@ -359,6 +363,10 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Closes the socket and rejects pending requests. */
   dispose(): void {
     this.disposed = true;
+    if (this.changeEventTimer !== undefined) {
+      clearTimeout(this.changeEventTimer);
+      this.changeEventTimer = undefined;
+    }
     this.changeEvents.clear();
     this.rejectAllPending(new Error("Port Manager agent client disposed."));
     this.socket?.destroy();
@@ -748,7 +756,7 @@ export class LocalAgentClient implements PortManagerProcessService {
 
     this.snapshot = nextSnapshot;
     this.snapshotSignature = nextSignature;
-    this.changeEvents.emit();
+    this.queueChangeEvent();
   }
 
   /**
@@ -776,7 +784,22 @@ export class LocalAgentClient implements PortManagerProcessService {
       this.getAgentMainPath(),
     );
     this.snapshotSignature = buildClientSnapshotSignature(this.snapshot);
-    this.changeEvents.emit();
+    this.queueChangeEvent();
+  }
+
+  /** Notifies subscribers once for a burst of snapshot updates. */
+  private queueChangeEvent(): void {
+    if (this.disposed || this.changeEventTimer !== undefined) {
+      return;
+    }
+
+    this.changeEventTimer = setTimeout(() => {
+      this.changeEventTimer = undefined;
+      if (!this.disposed) {
+        this.changeEvents.emit();
+      }
+    }, CLIENT_CHANGE_EVENT_DEBOUNCE_MS);
+    this.changeEventTimer.unref();
   }
 
   /** Stores lightweight daemon metadata while preserving the last known rows. */

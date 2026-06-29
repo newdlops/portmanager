@@ -55,6 +55,7 @@ export interface PortManagerNetworkTreeSource {
 type TreeSectionKind = "current" | "networks" | "containers" | "daemon";
 type NetworkActionGroupKind = "quick" | "advanced";
 const TERMINAL_WINDOW_MIME = "application/vnd.newdlops.portmanager.terminal-window";
+const TREE_REFRESH_DEBOUNCE_MS = 50;
 
 interface NetworkRouteConnection {
   /** Stable row id across refreshes so VS Code can preserve expansion and focus. */
@@ -147,13 +148,24 @@ export class PortManagerTreeProvider
    */
   private readonly sourceSubscription: DisposableLike;
 
+  /** Timer used to collapse rapid network/process updates into one tree repaint. */
+  private refreshTimer: NodeJS.Timeout | undefined;
+
   constructor(private readonly source: PortManagerNetworkTreeSource) {
     this.sourceSubscription = this.source.onDidChange(() => this.refresh());
   }
 
   /** Triggers a full tree refresh after process state changes or manual refresh. */
   refresh(): void {
-    this.onDidChangeTreeDataEmitter.fire(undefined);
+    if (this.refreshTimer !== undefined) {
+      return;
+    }
+
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = undefined;
+      this.onDidChangeTreeDataEmitter.fire(undefined);
+    }, TREE_REFRESH_DEBOUNCE_MS);
+    this.refreshTimer.unref();
   }
 
   /** Returns the already constructed TreeItem object. */
@@ -486,6 +498,10 @@ export class PortManagerTreeProvider
   /** Releases VS Code and registry event resources during deactivation. */
   dispose(): void {
     this.sourceSubscription.dispose();
+    if (this.refreshTimer !== undefined) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = undefined;
+    }
     this.onDidChangeTreeDataEmitter.dispose();
   }
 }

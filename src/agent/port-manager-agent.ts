@@ -64,6 +64,7 @@ const ROUTE_TABLE_GENERATION_LOCK_STALE_MS = 30_000;
 const ROUTE_TABLE_GENERATION_LOCK_ATTEMPTS = 100;
 const ROUTE_TABLE_GENERATION_LOCK_SLEEP_MS = 10;
 const AGENT_SOCKET_LISTEN_BACKLOG = 16384;
+const SNAPSHOT_BROADCAST_DEBOUNCE_MS = 50;
 
 export interface PortManagerAgentOptions {
   /** Shared registry for managed and manually registered process rows. */
@@ -295,6 +296,15 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Last broadcast signature, used to skip unchanged polling updates. */
   private lastSnapshotSignature = "";
+
+  /** Timer that coalesces route/process bursts into one client snapshot rebuild. */
+  private snapshotBroadcastTimer: NodeJS.Timeout | undefined;
+
+  /** True while an async snapshot rebuild is already preparing a broadcast. */
+  private snapshotBroadcastInFlight = false;
+
+  /** Records a state change that arrived while a rebuild was already queued/running. */
+  private snapshotBroadcastPending = false;
 
   /** Last route table content signature by file path, used to avoid timer-driven file churn. */
   private readonly routeTableSignaturesByPath = new Map<string, string>();
@@ -907,6 +917,12 @@ export class PortManagerAgent implements DisposableLike {
       this.listenerScanTimer = undefined;
     }
 
+    if (this.snapshotBroadcastTimer !== undefined) {
+      clearTimeout(this.snapshotBroadcastTimer);
+      this.snapshotBroadcastTimer = undefined;
+    }
+    this.snapshotBroadcastPending = false;
+
     while (this.subscriptions.length > 0) {
       this.subscriptions.pop()?.dispose();
     }
@@ -1057,14 +1073,50 @@ export class PortManagerAgent implements DisposableLike {
    */
   private queueSnapshotBroadcast(): void {
     if (this.clients.size === 0) {
+      this.snapshotBroadcastPending = false;
       return;
     }
 
-    void this.buildSnapshot({ allowRecentListenerCache: true })
-      .then((snapshot) => this.broadcastSnapshotIfChanged(snapshot))
-      .catch((error: unknown) => {
-        this.serverErrors.emit(error instanceof Error ? error : new Error(String(error)));
-      });
+    this.snapshotBroadcastPending = true;
+    if (this.snapshotBroadcastTimer !== undefined || this.snapshotBroadcastInFlight) {
+      return;
+    }
+
+    this.snapshotBroadcastTimer = setTimeout(() => {
+      this.snapshotBroadcastTimer = undefined;
+      void this.flushQueuedSnapshotBroadcast();
+    }, SNAPSHOT_BROADCAST_DEBOUNCE_MS);
+    this.snapshotBroadcastTimer.unref();
+  }
+
+  /**
+   * Rebuilds one snapshot for all changes accumulated in the debounce window.
+   * If another route/register event arrives during the async scan, run one more
+   * pass so late state is not hidden behind the coalesced broadcast.
+   */
+  private async flushQueuedSnapshotBroadcast(): Promise<void> {
+    if (this.clients.size === 0 || this.snapshotBroadcastInFlight) {
+      if (this.clients.size === 0) {
+        this.snapshotBroadcastPending = false;
+      }
+      return;
+    }
+
+    this.snapshotBroadcastPending = false;
+    this.snapshotBroadcastInFlight = true;
+
+    try {
+      const snapshot = await this.buildSnapshot({ allowRecentListenerCache: true });
+      this.broadcastSnapshotIfChanged(snapshot);
+    } catch (error: unknown) {
+      this.serverErrors.emit(error instanceof Error ? error : new Error(String(error)));
+    } finally {
+      this.snapshotBroadcastInFlight = false;
+    }
+
+    if (this.snapshotBroadcastPending && this.clients.size > 0) {
+      this.queueSnapshotBroadcast();
+    }
   }
 
   /**
