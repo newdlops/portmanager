@@ -3529,7 +3529,7 @@ test(
 );
 
 test(
-  "native docker PATH shim prefers the current network route table over stale route env",
+  "native docker PATH shim prefers current route-table network env over stale route env",
   { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
   () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-compose-route-network-scope-"));
@@ -3570,7 +3570,8 @@ test(
           PORT_MANAGER_COMPOSE_ROUTING_FILE: routingFile,
           PORT_MANAGER_ROUTES_FILE: staleRouteTableFile,
           PORT_MANAGER_GLOBAL_ROUTES_FILE: globalRouteTableFile,
-          PORT_MANAGER_NETWORK_ID: "network-b",
+          PORT_MANAGER_NETWORK_ID: "",
+          PORT_MANAGER_ROUTE_TABLE_NETWORK_ID: "network-b",
           PORT_MANAGER_BORROWED_NETWORK_ID: "",
           NEWDLOPS_PM_NETWORK_ID: "",
           NEWDLOPS_PM_BORROWED_NETWORK_ID: "",

@@ -586,6 +586,10 @@ static const char *pm_network_id(void) {
   const char *network_id = getenv("PORT_MANAGER_NETWORK_ID");
 
   if (network_id == NULL || network_id[0] == '\0') {
+    network_id = getenv("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID");
+  }
+
+  if (network_id == NULL || network_id[0] == '\0') {
     network_id = getenv("NEWDLOPS_PM_NETWORK_ID");
   }
 

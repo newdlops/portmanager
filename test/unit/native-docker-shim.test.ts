@@ -46,6 +46,12 @@ test("docker shim prefers scoped route table network over stale compose routing 
   assert.notEqual(networkStart, -1);
   assert.notEqual(matcherStart, -1);
   assert.equal(
+    networkBody.indexOf('getenv("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID")') <
+      networkBody.indexOf("pm_network_id_from_route_table_path()"),
+    true,
+    "explicit route-table network env must outrank a stale inherited route file",
+  );
+  assert.equal(
     networkBody.indexOf("pm_network_id_from_route_table_path()") <
       networkBody.indexOf("pm_network_id_from_compose_routing_file()"),
     true,

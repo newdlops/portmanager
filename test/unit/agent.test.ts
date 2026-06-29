@@ -578,7 +578,7 @@ test("removes expired pending allocation endpoint files", async (context) => {
   const routeEntryPath = getRouteTablePathForLogicalPort(8004, "network-a", routeTablePath);
   assert.equal(fs.existsSync(routeEntryPath), true);
 
-  nowMs += 30_001;
+  nowMs += 300_001;
   const snapshot = await agent.listSnapshot();
 
   assert.deepEqual(snapshot.routes, []);

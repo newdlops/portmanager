@@ -42,7 +42,7 @@ interface ParsedCli {
   readonly run?: RunOptions;
 }
 
-interface RunOptions {
+export interface RunOptions {
   /** Logical port the wrapped application expects to use. */
   readonly requestedPort: number;
   /** Host used for availability checks and route metadata. */
@@ -89,7 +89,9 @@ interface PendingRequest {
   readonly timer: NodeJS.Timeout;
 }
 
-void main(process.argv.slice(2));
+if (require.main === module) {
+  void main(process.argv.slice(2));
+}
 
 /** Runs the selected CLI command and maps failures to process exit codes. */
 async function main(args: readonly string[]): Promise<void> {
@@ -167,6 +169,7 @@ async function runManagedCommand(client: AgentCliClient, options: RunOptions): P
         requestedPort: allocation.requestedPort,
         actualPort: allocation.actualPort,
         host: allocation.host,
+        ...networkScopeField(resolveRunNetworkId(process.env)),
         allocationId: allocation.allocationId,
       })
       .then((process) => {
@@ -497,19 +500,55 @@ function parseRunOptions(args: readonly string[]): RunOptions {
 }
 
 /** Builds the daemon route allocation request from CLI options. */
-function buildAllocationRequest(options: RunOptions): AgentAllocateRouteRequest {
+export function buildAllocationRequest(options: RunOptions): AgentAllocateRouteRequest {
+  const networkId = resolveRunNetworkId(process.env);
+
   return {
     name: options.name,
     command: options.command,
     cwd: options.cwd,
     requestedPort: options.requestedPort,
     host: options.host,
+    ...networkScopeField(networkId),
     scanRange: options.scanRange,
     scanDirection: options.scanDirection,
     routingMode: options.routingMode,
     virtualPortRangeStart: options.virtualPortRangeStart,
     virtualPortRangeEnd: options.virtualPortRangeEnd,
   };
+}
+
+/**
+ * Recovers the logical network selected by terminal attach hooks.
+ * CLI-managed processes run outside VS Code command handlers, so the inherited
+ * environment is the only authoritative scope signal available at allocation
+ * time. Keeping the route and process row scoped prevents cleanup in one
+ * network from rewriting global route state for another network.
+ */
+export function resolveRunNetworkId(environment: NodeJS.ProcessEnv): string | undefined {
+  for (const key of [
+    "PORT_MANAGER_NETWORK_ID",
+    "PORT_MANAGER_ROUTE_TABLE_NETWORK_ID",
+    "PORT_MANAGER_BORROWED_NETWORK_ID",
+    "NEWDLOPS_PM_NETWORK_ID",
+    "NEWDLOPS_PM_BORROWED_NETWORK_ID",
+  ]) {
+    const value = normalizeNetworkId(environment[key]);
+    if (value !== undefined) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function networkScopeField(networkId: string | undefined): { readonly networkId?: string } {
+  return networkId === undefined ? {} : { networkId };
+}
+
+function normalizeNetworkId(value: string | undefined): string | undefined {
+  const normalizedValue = value?.trim();
+  return normalizedValue === undefined || normalizedValue.length === 0 ? undefined : normalizedValue;
 }
 
 /** Resolves auto injection by rewriting known requested-port occurrences. */
