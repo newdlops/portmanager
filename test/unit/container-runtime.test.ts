@@ -4238,6 +4238,350 @@ test("restore override treats globally reserved same-project names as live hidde
   assert.doesNotMatch(overrideText, /container_name: 'captain_db-production1-captain-79b2163a-2'/);
 });
 
+test("restore override recovers clone mounts from live hidden containers when mappings are missing", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-live-mounts-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const overrideFile = path.join(tempDir, "production1-captain.ports.override.yaml");
+  const initdbDir = path.join(tempDir, "initdb");
+  const clonedVolumeName = "pm-production1-captain-79b2163a-43b87f9de6aa-a1b2c3d4";
+
+  fs.mkdirSync(initdbDir);
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: captain",
+      "services:",
+      "  db:",
+      "    image: postgres:16",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (
+        args[0] === "container" &&
+        args[1] === "ls" &&
+        args.includes("label=com.docker.compose.project=production1-captain-79b2163a")
+      ) {
+        return {
+          stdout: JSON.stringify({
+            ID: "clone-db",
+            Names: "production1-captain-79b2163a-db-1",
+            Ports: "127.81.154.127:57032->5432/tcp",
+            Labels:
+              "com.docker.compose.project=production1-captain-79b2163a,com.docker.compose.service=db",
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect" && args.includes("clone-db")) {
+        return {
+          stdout: JSON.stringify([
+            {
+              Id: "clone-db",
+              Name: "/production1-captain-79b2163a-db-1",
+              Config: {
+                Labels: {
+                  "com.docker.compose.project": "production1-captain-79b2163a",
+                  "com.docker.compose.service": "db",
+                },
+              },
+              Mounts: [
+                {
+                  Type: "volume",
+                  Name: clonedVolumeName,
+                  Source: `/var/lib/docker/volumes/${clonedVolumeName}/_data`,
+                  Destination: "/var/lib/postgresql/data",
+                  RW: true,
+                },
+                {
+                  Type: "bind",
+                  Source: initdbDir,
+                  Destination: "/docker-entrypoint-initdb.d",
+                  RW: false,
+                },
+              ],
+            },
+          ]),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "ps") {
+        return { stdout: "", stderr: "" };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await mutator.restoreHiddenPortsOverride(
+    {
+      mode: "clone",
+      runtime: "docker",
+      originalProjectName: "captain",
+      attachedProjectName: "production1-captain-79b2163a",
+      workingDirectory: tempDir,
+      composeFiles: [composeFile],
+      services: ["db"],
+      overrideFile,
+      originalPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 15432,
+          actualHostAddress: "127.0.0.1",
+          actualHostPort: 15432,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+      hiddenPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 15432,
+          actualHostAddress: "127.81.154.127",
+          actualHostPort: 57032,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+    },
+    { force: true },
+  );
+
+  const overrideText = fs.readFileSync(overrideFile, "utf8");
+  assert.match(overrideText, /volumes: !override/);
+  assert.match(overrideText, /target: '\/var\/lib\/postgresql\/data'/);
+  assert.match(overrideText, new RegExp(`name: '${clonedVolumeName}'`));
+  assert.match(overrideText, /type: bind/);
+  assert.match(overrideText, /target: '\/docker-entrypoint-initdb\.d'/);
+  assert.match(overrideText, /read_only: true/);
+});
+
+test("restore override keeps persisted clone volumes while merging live passthrough mounts", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-merge-mounts-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const overrideFile = path.join(tempDir, "production1-captain.ports.override.yaml");
+  const configDir = path.join(tempDir, "config");
+  const persistedVolumeName = "pm-production1-captain-79b2163a-43b87f9de6aa-durable1";
+
+  fs.mkdirSync(configDir);
+  fs.writeFileSync(composeFile, "services:\n  db:\n    image: postgres:16\n", "utf8");
+
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (
+        args[0] === "container" &&
+        args[1] === "ls" &&
+        args.includes("label=com.docker.compose.project=production1-captain-79b2163a")
+      ) {
+        return {
+          stdout: JSON.stringify({
+            ID: "clone-db",
+            Names: "production1-captain-79b2163a-db-1",
+            Labels:
+              "com.docker.compose.project=production1-captain-79b2163a,com.docker.compose.service=db",
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect" && args.includes("clone-db")) {
+        return {
+          stdout: JSON.stringify([
+            {
+              Id: "clone-db",
+              Config: {
+                Labels: {
+                  "com.docker.compose.project": "production1-captain-79b2163a",
+                  "com.docker.compose.service": "db",
+                },
+              },
+              Mounts: [
+                {
+                  Type: "volume",
+                  Name: "captain_pgdata",
+                  Source: "/var/lib/docker/volumes/captain_pgdata/_data",
+                  Destination: "/var/lib/postgresql/data",
+                  RW: true,
+                },
+                {
+                  Type: "bind",
+                  Source: configDir,
+                  Destination: "/etc/postgres/conf.d",
+                  RW: false,
+                },
+              ],
+            },
+          ]),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "ps") {
+        return { stdout: "", stderr: "" };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await mutator.restoreHiddenPortsOverride(
+    {
+      mode: "clone",
+      runtime: "docker",
+      originalProjectName: "captain",
+      attachedProjectName: "production1-captain-79b2163a",
+      workingDirectory: tempDir,
+      composeFiles: [composeFile],
+      services: ["db"],
+      overrideFile,
+      originalPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 15432,
+          actualHostAddress: "127.0.0.1",
+          actualHostPort: 15432,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+      hiddenPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 15432,
+          actualHostAddress: "127.81.154.127",
+          actualHostPort: 57032,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+      clonedVolumes: [
+        {
+          serviceName: "db",
+          sourceKind: "volume",
+          sourceName: "captain_pgdata",
+          targetVolumeName: persistedVolumeName,
+          containerPath: "/var/lib/postgresql/data",
+          readOnly: false,
+        },
+      ],
+    },
+    { force: true },
+  );
+
+  const overrideText = fs.readFileSync(overrideFile, "utf8");
+  assert.match(overrideText, new RegExp(`name: '${persistedVolumeName}'`));
+  assert.doesNotMatch(overrideText, /name: 'captain_pgdata'/);
+  assert.match(overrideText, /type: bind/);
+  assert.match(overrideText, /target: '\/etc\/postgres\/conf\.d'/);
+});
+
+test("restore override recovers attach as-is mounts from the live project", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-in-place-mounts-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const overrideFile = path.join(tempDir, "workspace.ports.override.yaml");
+
+  fs.writeFileSync(composeFile, "services:\n  postgres:\n    image: postgres:16\n", "utf8");
+
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        throw new Error("compose config unavailable");
+      }
+      if (args[0] === "container" && args[1] === "ls" && args.includes("label=com.docker.compose.project=workspace")) {
+        return {
+          stdout: JSON.stringify({
+            ID: "postgres-live",
+            Names: "workspace-postgres-1",
+            Ports: "127.0.0.1:57001->5432/tcp",
+            Labels: "com.docker.compose.project=workspace,com.docker.compose.service=postgres",
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect" && args.includes("postgres-live")) {
+        return {
+          stdout: JSON.stringify([
+            {
+              Id: "postgres-live",
+              Config: {
+                Labels: {
+                  "com.docker.compose.project": "workspace",
+                  "com.docker.compose.service": "postgres",
+                },
+              },
+              Mounts: [
+                {
+                  Type: "volume",
+                  Name: "workspace_pgdata",
+                  Source: "/var/lib/docker/volumes/workspace_pgdata/_data",
+                  Destination: "/var/lib/postgresql/data",
+                  RW: true,
+                },
+              ],
+            },
+          ]),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await mutator.restoreHiddenPortsOverride(
+    {
+      mode: "in-place",
+      runtime: "docker",
+      originalProjectName: "workspace",
+      attachedProjectName: "workspace",
+      workingDirectory: tempDir,
+      composeFiles: [composeFile],
+      services: ["postgres"],
+      overrideFile,
+      originalPorts: [
+        {
+          serviceName: "postgres",
+          logicalPort: 15432,
+          actualHostAddress: "127.0.0.1",
+          actualHostPort: 15432,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+      hiddenPorts: [
+        {
+          serviceName: "postgres",
+          logicalPort: 15432,
+          actualHostAddress: "127.0.0.1",
+          actualHostPort: 57001,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+    },
+    { force: true },
+  );
+
+  const overrideText = fs.readFileSync(overrideFile, "utf8");
+  assert.equal(overrideText.includes("container_name: !reset null"), false);
+  assert.match(overrideText, /volumes: !override/);
+  assert.match(overrideText, /target: '\/var\/lib\/postgresql\/data'/);
+  assert.match(overrideText, /name: 'workspace_pgdata'/);
+});
+
 test("restore override fails closed before writing persisted names without reservations", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-reservation-fail-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));

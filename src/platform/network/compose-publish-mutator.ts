@@ -580,12 +580,13 @@ export class ComposePublishMutator {
     const restoredCloneContainerNames = createsHiddenProject
       ? await this.resolveRestoredCloneContainerNames(state, serviceContainerNameSot)
       : undefined;
+    const restoredServiceMounts = await this.resolveRestoredServiceMounts(state, createsHiddenProject);
 
     await this.writeHiddenPortsOverride(
       state.attachedProjectName,
       overrideServices,
       state.originalPorts,
-      buildServiceMountsFromPersistedCloneVolumes(state.clonedVolumes),
+      restoredServiceMounts,
       {
         resetContainerName: createsHiddenProject,
         cloneContainerNames: restoredCloneContainerNames,
@@ -597,6 +598,45 @@ export class ComposePublishMutator {
     );
 
     return overrideFile;
+  }
+
+  /**
+   * Recovers the exact mount set for a regenerated override.
+   *
+   * Persisted clone-volume mappings protect the known stateful copies, but they
+   * do not describe passthrough bind/tmpfs mounts. Live containers are the best
+   * source after globalStorage cleanup; durable clone mappings still win for a
+   * container target so a previous partial recovery cannot drift back to the
+   * original project volume.
+   */
+  private async resolveRestoredServiceMounts(
+    state: ComposePortMutationState,
+    createsHiddenProject: boolean,
+  ): Promise<ReadonlyMap<string, readonly ComposeServiceMount[]>> {
+    const persistedCloneMounts = buildServiceMountsFromPersistedCloneVolumes(state.clonedVolumes);
+    const liveProjectName = createsHiddenProject ? state.attachedProjectName : state.originalProjectName;
+    const liveMounts = await this.inspectRestoredServiceMounts(state, liveProjectName).catch(() => undefined);
+
+    return mergeRestoredServiceMounts(liveMounts, persistedCloneMounts);
+  }
+
+  /**
+   * Reads mounts from the project that is currently carrying the attached
+   * traffic. Missing containers are treated as an empty runtime view so restore
+   * can still fall back to compose-file mounts or persisted clone-volume state.
+   */
+  private async inspectRestoredServiceMounts(
+    state: ComposePortMutationState,
+    projectName: string,
+  ): Promise<ReadonlyMap<string, readonly ComposeServiceMount[]>> {
+    const containerList = await this.listComposeServiceContainers(state.runtime, projectName, state.services, {
+      includeStopped: true,
+    });
+    if (containerList.containers.length === 0) {
+      return new Map();
+    }
+
+    return this.inspectServiceMounts(state.runtime, containerList.containers, containerList.inspectedRows);
   }
 
   /**
@@ -1770,6 +1810,35 @@ function buildServiceMountsFromPersistedCloneVolumes(
       readOnly: mapping.readOnly,
     });
     serviceMounts.set(mapping.serviceName, mounts);
+  }
+
+  return serviceMounts;
+}
+
+function mergeRestoredServiceMounts(
+  liveMounts: ReadonlyMap<string, readonly ComposeServiceMount[]> | undefined,
+  persistedCloneMounts: ReadonlyMap<string, readonly ComposeServiceMount[]>,
+): ReadonlyMap<string, readonly ComposeServiceMount[]> {
+  if (liveMounts === undefined) {
+    return persistedCloneMounts;
+  }
+  if (persistedCloneMounts.size === 0) {
+    return liveMounts;
+  }
+
+  const serviceMounts = new Map<string, readonly ComposeServiceMount[]>();
+  const serviceNames = uniqueStrings([...liveMounts.keys(), ...persistedCloneMounts.keys()]);
+
+  for (const serviceName of serviceNames) {
+    const persistedMounts = persistedCloneMounts.get(serviceName) ?? [];
+    const persistedTargets = new Set(persistedMounts.map((mount) => mount.target));
+    const mergedMounts = [
+      ...(liveMounts.get(serviceName) ?? []).filter((mount) => !persistedTargets.has(mount.target)),
+      ...persistedMounts,
+    ];
+    if (mergedMounts.length > 0) {
+      serviceMounts.set(serviceName, mergedMounts);
+    }
   }
 
   return serviceMounts;
