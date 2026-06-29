@@ -181,6 +181,11 @@ interface ComposeProjectRoutingWriteOptions {
   readonly forceComposeOverrideRefresh?: boolean;
 }
 
+interface ComposeOverrideReconcileOptions {
+  /** Rewrite readable override YAML instead of trusting the previous contents. */
+  readonly force?: boolean;
+}
+
 interface LogicalRouterOwnerDocument {
   /** Extension host process that currently owns localhost logical router children. */
   readonly pid: number;
@@ -547,6 +552,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
     await this.repairPersistedPortManagerCloneComposeAttachments();
+    await this.reconcileComposeOverrideFiles(undefined, { force: true });
     await this.reconcileComposeAttachmentPublishedPorts({ force: true });
     await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });
     await this.writeTerminalNetworkSelectionFile();
@@ -900,6 +906,8 @@ export class PortManagerNetworkService implements DisposableLike {
       throw new Error(`Unknown terminal window: ${terminalWindowId}`);
     }
 
+    await this.ensureNetworkComposeRoutingArtifacts(networkId);
+
     if (runtime.kind === "container") {
       await this.containerRuntime.createNetwork(network, readContainerRuntimeSettings());
       const attachCommand = await this.containerRuntime.buildAttachCommand(network.id);
@@ -984,6 +992,7 @@ export class PortManagerNetworkService implements DisposableLike {
       { interactive: true },
     );
     await this.processService?.start();
+    await this.ensureNetworkComposeRoutingArtifacts(networkId);
     const binding: VscodeWindowTerminalBinding = {
       id: "vscode-window",
       networkId,
@@ -1043,6 +1052,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     await this.processService?.start();
+    await this.ensureNetworkComposeRoutingArtifacts(networkId);
     return this.buildTerminalRoutingScript(network, settings);
   }
 
@@ -1383,11 +1393,19 @@ export class PortManagerNetworkService implements DisposableLike {
       if (input.existingMutation !== undefined) {
         const overrideFile = await this.composePublishMutator.restoreHiddenPortsOverride(input.existingMutation, {
           force: true,
+          recoverToStorageDirectory: true,
         });
         mutation =
           overrideFile === input.existingMutation.overrideFile
-            ? input.existingMutation
-            : { ...input.existingMutation, overrideFile };
+            ? {
+                ...input.existingMutation,
+                composeFiles: splitGeneratedComposeRoutingFiles(input.existingMutation.composeFiles).composeFiles,
+              }
+            : {
+                ...input.existingMutation,
+                composeFiles: splitGeneratedComposeRoutingFiles(input.existingMutation.composeFiles).composeFiles,
+                overrideFile,
+              };
         registeredAttachment = {
           ...attachment,
           runtime: mutation.runtime,
@@ -1459,6 +1477,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const removedAttachment = this.registry.removeComposeAttachment(attachmentId);
     await this.removeComposeRouteProcesses(attachment, attachment.ports);
+    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
     return removedAttachment;
   }
@@ -1473,12 +1492,29 @@ export class PortManagerNetworkService implements DisposableLike {
       return undefined;
     }
 
+    let attachmentToRemove = attachment;
     if (attachment.mutation !== undefined) {
       try {
-        await this.composePublishMutator.restorePublishedPorts(attachment.mutation);
+        const overrideFile = await this.composePublishMutator.restoreHiddenPortsOverride(attachment.mutation, {
+          force: true,
+          recoverToStorageDirectory: true,
+        });
+        const mutation = {
+          ...attachment.mutation,
+          composeFiles: splitGeneratedComposeRoutingFiles(attachment.mutation.composeFiles).composeFiles,
+          overrideFile,
+        };
+        attachmentToRemove = this.registry.updateComposeAttachment({
+          ...attachment,
+          composeFiles: mutation.composeFiles,
+          mutation,
+          status: "attached",
+          errorMessage: undefined,
+        });
+        await this.composePublishMutator.restorePublishedPorts(mutation);
       } catch (error) {
         this.registry.updateComposeAttachment({
-          ...attachment,
+          ...attachmentToRemove,
           status: "error",
           errorMessage: error instanceof Error ? error.message : String(error),
         });
@@ -1487,7 +1523,8 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     const removedAttachment = this.registry.removeComposeAttachment(attachmentId);
-    await this.removeComposeRouteProcesses(attachment, attachment.ports);
+    await this.removeComposeRouteProcesses(attachmentToRemove, attachmentToRemove.ports);
+    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
     return removedAttachment;
   }
@@ -1958,6 +1995,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
+    await this.reconcileComposeOverrideFiles(undefined, { force: true });
     await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
     await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });
     await this.writeTerminalNetworkSelectionFile();
@@ -2268,6 +2306,7 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
+    await this.reconcileComposeOverrideFiles(attachments, { force: true }).catch(() => undefined);
     await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
     await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
@@ -2279,9 +2318,24 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Ensures an attached hidden Compose project has its generated override before wrappers can route to it. */
   private async restoreComposeAttachmentOverrideBeforeRouting(
     attachment: ComposeAttachment,
-    options: { readonly force?: boolean } = {},
+    options: ComposeOverrideReconcileOptions = {},
   ): Promise<void> {
     await this.reconcileComposeOverrideFiles([attachment], options);
+  }
+
+  /** Rebuilds generated Compose files/routes before a terminal receives routing env. */
+  private async ensureNetworkComposeRoutingArtifacts(networkId: string): Promise<void> {
+    const attachments = this.registry
+      .getSnapshot()
+      .composeAttachments.filter((attachment) => attachment.networkId === networkId && isRestorableComposeAttachment(attachment));
+
+    if (attachments.length === 0) {
+      return;
+    }
+
+    await this.reconcileComposeOverrideFiles(attachments, { force: true });
+    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
+    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
   }
 
   /**
@@ -2529,15 +2583,26 @@ export class PortManagerNetworkService implements DisposableLike {
       const refreshedMutation = shouldRefreshComposeContainerMappingsFromRuntime(attachment, options)
         ? await this.refreshComposeContainerMappings(attachment, runtimeSettings)
         : attachment.mutation;
+      const overrideRestoredAttachment = await this.reconcileComposeOverrideFileForAttachment(
+        {
+          ...attachment,
+          ...(refreshedMutation !== undefined ? { mutation: refreshedMutation } : {}),
+        },
+        { force: options.force === true },
+      );
+      if (overrideRestoredAttachment.status === "error") {
+        await this.removeComposeRouteProcesses(overrideRestoredAttachment, overrideRestoredAttachment.ports);
+        continue;
+      }
       const ports = shouldRefreshPorts && livePorts !== undefined
         ? mergeComposePortsWithLiveRoutes(
-            attachment.ports,
-            await this.replaceComposeRouteProcesses(attachment, livePorts),
+            overrideRestoredAttachment.ports,
+            await this.replaceComposeRouteProcesses(overrideRestoredAttachment, livePorts),
           )
-        : attachment.ports;
-      const syncedMutation = syncComposeMutationHiddenPorts(refreshedMutation, ports);
+        : overrideRestoredAttachment.ports;
+      const syncedMutation = syncComposeMutationHiddenPorts(overrideRestoredAttachment.mutation, ports);
       const nextAttachment = {
-        ...attachment,
+        ...overrideRestoredAttachment,
         ports,
         ...(syncedMutation !== undefined ? { mutation: syncedMutation } : {}),
         status: "attached" as const,
@@ -3202,32 +3267,137 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Recreates or refreshes generated compose overrides before shell wrappers can route compose commands. */
   private async reconcileComposeOverrideFiles(
     attachments: readonly ComposeAttachment[] = this.registry.getSnapshot().composeAttachments,
-    options: { readonly force?: boolean } = {},
+    options: ComposeOverrideReconcileOptions = {},
   ): Promise<number> {
     let restoredCount = 0;
 
     for (const attachment of attachments) {
-      const mutation = attachment.mutation;
-      if (mutation === undefined) {
-        continue;
-      }
+      const currentAttachment =
+        this.registry.getSnapshot().composeAttachments.find((candidate) => candidate.id === attachment.id) ??
+        attachment;
+      const beforeOverrideFile = composeAttachmentOverrideFile(currentAttachment);
+      const alreadyReadable =
+        beforeOverrideFile === undefined ? true : await fileIsReadable(beforeOverrideFile);
+      const reconciled = await this.reconcileComposeOverrideFileForAttachment(currentAttachment, options);
+      const afterOverrideFile = composeAttachmentOverrideFile(reconciled);
+      const nowReadable = afterOverrideFile === undefined ? true : await fileIsReadable(afterOverrideFile);
 
-      const alreadyReadable = await fileIsReadable(mutation.overrideFile);
-      const overrideFile = await this.composePublishMutator.restoreHiddenPortsOverride(mutation, options);
-      const nextMutation = overrideFile === mutation.overrideFile ? mutation : { ...mutation, overrideFile };
-      if (nextMutation !== mutation) {
-        this.registry.updateComposeAttachment({
-          ...attachment,
-          composeFiles: nextMutation.composeFiles,
-          mutation: nextMutation,
-        });
-      }
-      if (options.force === true || !alreadyReadable) {
+      if (
+        options.force === true ||
+        beforeOverrideFile !== afterOverrideFile ||
+        (!alreadyReadable && nowReadable)
+      ) {
         restoredCount++;
       }
     }
 
     return restoredCount;
+  }
+
+  /** Reconciles one compose override without letting one bad project abort global startup. */
+  private async reconcileComposeOverrideFileForAttachment(
+    attachment: ComposeAttachment,
+    options: ComposeOverrideReconcileOptions = {},
+  ): Promise<ComposeAttachment> {
+    if (!isRestorableComposeAttachment(attachment)) {
+      return attachment;
+    }
+
+    const mutation = attachment.mutation;
+    if (mutation === undefined) {
+      return this.reconcileMutationlessComposeOverrideFile(attachment);
+    }
+
+    try {
+      const overrideFile = await this.composePublishMutator.restoreHiddenPortsOverride(mutation, {
+        ...options,
+        recoverToStorageDirectory: true,
+      });
+      const sourceComposeFiles = splitGeneratedComposeRoutingFiles(mutation.composeFiles).composeFiles;
+      const nextMutation =
+        overrideFile === mutation.overrideFile && sameStringList(sourceComposeFiles, mutation.composeFiles)
+          ? mutation
+          : { ...mutation, composeFiles: sourceComposeFiles, overrideFile };
+      const nextAttachment = {
+        ...attachment,
+        composeFiles: nextMutation.composeFiles,
+        mutation: nextMutation,
+        status: "attached" as const,
+        errorMessage: undefined,
+      };
+
+      if (nextMutation !== mutation || composeAttachmentRuntimeStateChanged(attachment, nextAttachment)) {
+        return this.registry.updateComposeAttachment(nextAttachment);
+      }
+
+      return attachment;
+    } catch (error) {
+      const nextAttachment = this.registry.updateComposeAttachment({
+        ...attachment,
+        status: "error",
+        errorMessage: `Generated Compose override recovery failed: ${formatError(error)}`,
+      });
+      await this.removeComposeRouteProcesses(nextAttachment, nextAttachment.ports).catch(() => undefined);
+      return nextAttachment;
+    }
+  }
+
+  /** Mutationless clone rows cannot be regenerated, so missing overrides must not reach TSV routing. */
+  private async reconcileMutationlessComposeOverrideFile(attachment: ComposeAttachment): Promise<ComposeAttachment> {
+    const routingFiles = splitGeneratedComposeRoutingFiles(attachment.composeFiles);
+    if (routingFiles.overrideFile === undefined) {
+      return attachment;
+    }
+
+    if (await fileIsReadable(routingFiles.overrideFile)) {
+      if (attachment.status !== "attached" && isComposeOverrideRecoveryError(attachment.errorMessage)) {
+        return this.registry.updateComposeAttachment({
+          ...attachment,
+          status: "attached",
+          errorMessage: undefined,
+        });
+      }
+
+      return attachment;
+    }
+
+    const recoveryMutation = buildMutationlessComposeOverrideRecoveryState(attachment);
+    if (recoveryMutation !== undefined) {
+      try {
+        const overrideFile = await this.composePublishMutator.restoreHiddenPortsOverride(recoveryMutation, {
+          force: true,
+          recoverToStorageDirectory: true,
+        });
+        const nextMutation = {
+          ...recoveryMutation,
+          overrideFile,
+        };
+        return this.registry.updateComposeAttachment({
+          ...attachment,
+          runtime: nextMutation.runtime,
+          composeFiles: nextMutation.composeFiles,
+          mutation: nextMutation,
+          status: "attached",
+          errorMessage: undefined,
+        });
+      } catch (error) {
+        const nextAttachment = this.registry.updateComposeAttachment({
+          ...attachment,
+          status: "error",
+          errorMessage: `Generated Compose override recovery failed: ${formatError(error)}`,
+        });
+        await this.removeComposeRouteProcesses(nextAttachment, nextAttachment.ports).catch(() => undefined);
+        return nextAttachment;
+      }
+    }
+
+    const nextAttachment = this.registry.updateComposeAttachment({
+      ...attachment,
+      status: "error",
+      errorMessage: `Generated Compose override is missing or unreadable: ${routingFiles.overrideFile}`,
+    });
+    await this.removeComposeRouteProcesses(nextAttachment, nextAttachment.ports).catch(() => undefined);
+    return nextAttachment;
   }
 
   /** Stable path read by shell wrappers installed into network-attached terminals. */
@@ -4200,7 +4370,7 @@ function buildComposeProjectRoutingRows(
 ): readonly ComposeProjectRoutingRow[] {
   return attachments.flatMap((attachment) => {
     const mutation = attachment.mutation;
-    if (!isRestorableComposeAttachment(attachment)) {
+    if (!isRoutableComposeAttachment(attachment)) {
       return [];
     }
 
@@ -4325,8 +4495,69 @@ function isRestorableComposeAttachment(attachment: ComposeAttachment): boolean {
   );
 }
 
+/** True when a compose row is healthy enough to publish into shell/native routing files. */
+function isRoutableComposeAttachment(attachment: ComposeAttachment): boolean {
+  return attachment.status === "attached" && attachment.ports.length > 0;
+}
+
 function composeRuntimeProjectName(attachment: ComposeAttachment): string {
   return attachment.mutation?.attachedProjectName ?? attachment.projectName;
+}
+
+function composeAttachmentOverrideFile(attachment: ComposeAttachment): string | undefined {
+  const mutation = attachment.mutation;
+  if (mutation !== undefined) {
+    return mutation.overrideFile;
+  }
+
+  return splitGeneratedComposeRoutingFiles(attachment.composeFiles).overrideFile;
+}
+
+function isComposeOverrideRecoveryError(message: string | undefined): boolean {
+  return message?.startsWith("Generated Compose override") === true;
+}
+
+function buildMutationlessComposeOverrideRecoveryState(
+  attachment: ComposeAttachment,
+): ComposePortMutationState | undefined {
+  const routingFiles = splitGeneratedComposeRoutingFiles(attachment.composeFiles);
+  if (routingFiles.overrideFile === undefined || routingFiles.composeFiles.length === 0) {
+    return undefined;
+  }
+
+  const runtimes = composeAttachmentRuntimes(attachment);
+  if (runtimes.length !== 1) {
+    return undefined;
+  }
+
+  const workingDirectory = attachment.workingDirectory ?? composeWorkingDirectoryFromFiles(routingFiles.composeFiles);
+  const originalProjectName = inferOriginalComposeProjectNameForRouting(
+    workingDirectory,
+    routingFiles.composeFiles,
+    attachment.projectName,
+  );
+  if (originalProjectName === undefined || originalProjectName === attachment.projectName) {
+    return undefined;
+  }
+
+  const hiddenPorts = attachment.ports.map(dropComposeProcessId);
+  const services = uniqueComposeServiceNames(hiddenPorts.map((port) => port.serviceName));
+  if (services.length === 0) {
+    return undefined;
+  }
+
+  return {
+    mode: "clone",
+    runtime: runtimes[0]!,
+    originalProjectName,
+    attachedProjectName: attachment.projectName,
+    ...(workingDirectory !== undefined ? { workingDirectory } : {}),
+    composeFiles: routingFiles.composeFiles,
+    services,
+    overrideFile: routingFiles.overrideFile,
+    originalPorts: hiddenPorts,
+    hiddenPorts,
+  };
 }
 
 function inferOriginalComposeProjectNameForRouting(

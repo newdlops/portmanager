@@ -3368,6 +3368,80 @@ test("recreates missing compose clone override from persisted mutation state", a
   assert.match(overrideText, /profiles: !override\n      - 'pm_unattached'/);
 });
 
+test("recovers compose clone overrides into the current storage directory", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-canonical-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const storageDir = path.join(tempDir, "current", "compose-overrides");
+  const oldStorageDir = path.join(tempDir, "old", "compose-overrides");
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const oldOverrideFile = path.join(oldStorageDir, "network-workspace.ports.override.yaml");
+  const calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
+
+  fs.mkdirSync(oldStorageDir, { recursive: true });
+  fs.writeFileSync(
+    composeFile,
+    [
+      "services:",
+      "  db:",
+      "    image: postgres:16",
+      "    container_name: captain_db",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const mutator = new ComposePublishMutator({
+    storageDirectory: storageDir,
+    runCommand: async (executable, args) => {
+      calls.push({ executable, args });
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const overrideFile = await mutator.restoreHiddenPortsOverride(
+    {
+      mode: "clone",
+      runtime: "docker",
+      originalProjectName: "workspace",
+      attachedProjectName: "network-workspace",
+      workingDirectory: tempDir,
+      composeFiles: [composeFile, oldOverrideFile],
+      services: ["db"],
+      overrideFile: oldOverrideFile,
+      originalPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 5432,
+          actualHostAddress: "127.0.0.1",
+          actualHostPort: 5432,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+      hiddenPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 5432,
+          actualHostAddress: "127.81.154.127",
+          actualHostPort: 57002,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+    },
+    { force: true, recoverToStorageDirectory: true },
+  );
+
+  assert.equal(overrideFile, path.join(storageDir, "network-workspace.ports.override.yaml"));
+  assert.equal(fs.existsSync(overrideFile), true);
+  assert.equal(fs.existsSync(oldOverrideFile), false);
+  assert.deepEqual(calls.map((call) => call.args), [["compose", "-p", "workspace", "-f", composeFile, "config", "--services"]]);
+});
+
 test("force-recreates stale compose clone overrides without original container names", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-force-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));

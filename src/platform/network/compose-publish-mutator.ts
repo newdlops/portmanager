@@ -507,17 +507,22 @@ export class ComposePublishMutator {
    */
   async restoreHiddenPortsOverride(
     state: ComposePortMutationState,
-    options: { readonly force?: boolean } = {},
+    options: { readonly force?: boolean; readonly recoverToStorageDirectory?: boolean } = {},
   ): Promise<string> {
-    if (options.force !== true && (await fileIsReadable(state.overrideFile))) {
-      return state.overrideFile;
+    const overrideFile =
+      options.recoverToStorageDirectory === true
+        ? this.getHiddenPortsOverridePath(state.attachedProjectName)
+        : state.overrideFile;
+    if (options.force !== true && (await fileIsReadable(overrideFile))) {
+      return overrideFile;
     }
+    const sourceComposeFiles = this.removeGeneratedOverrideFiles(state.composeFiles);
 
     const sourceContext: ComposeCommandContext = {
       runtime: state.runtime,
       projectName: state.originalProjectName,
       workingDirectory: state.workingDirectory,
-      composeFiles: state.composeFiles,
+      composeFiles: sourceComposeFiles,
     };
     const createsHiddenProject = state.mode === "clone" || state.mode === "copy";
     let definedServices: readonly string[];
@@ -532,7 +537,7 @@ export class ComposePublishMutator {
       definedServices = [];
     }
     const configuredContainerNameServices = createsHiddenProject
-      ? [...(await readComposeServiceContainerNames(state.composeFiles)).keys()]
+      ? [...(await readComposeServiceContainerNames(sourceComposeFiles)).keys()]
       : [];
     const overrideServices = buildRestoredOverrideServices(
       state,
@@ -550,12 +555,12 @@ export class ComposePublishMutator {
         cloneContainerNames: buildCloneContainerNameMapFromMutation(state),
         isolatedNetwork: createsHiddenProject ? "pm_isolated" : undefined,
         disabledServices,
-        overrideFile: state.overrideFile,
+        overrideFile,
         hostAddress: composeHiddenPublishHostFromState(state),
       },
     );
 
-    return state.overrideFile;
+    return overrideFile;
   }
 
   /**
@@ -823,8 +828,8 @@ export class ComposePublishMutator {
       readonly hostAddress?: string;
     },
   ): Promise<string> {
-    await fs.mkdir(this.storageDirectory, { recursive: true });
     const overrideFile = options.overrideFile ?? this.getHiddenPortsOverridePath(attachedProjectName);
+    await fs.mkdir(path.dirname(overrideFile), { recursive: true });
     const hostAddress = normalizeHiddenPublishHost(options.hostAddress);
     const portsByService = groupPortsByService(ports);
     const disabledServices = new Set(options.disabledServices ?? []);
@@ -2313,12 +2318,16 @@ function trimContainerName(value: string, maxLength: number): string {
 }
 
 function isGeneratedOverridePath(normalizedFile: string | undefined, storageDirectory: string | undefined): boolean {
-  return (
-    normalizedFile !== undefined &&
-    storageDirectory !== undefined &&
-    path.dirname(normalizedFile) === storageDirectory &&
-    path.basename(normalizedFile).endsWith(".ports.override.yaml")
-  );
+  if (normalizedFile === undefined || !path.basename(normalizedFile).endsWith(".ports.override.yaml")) {
+    return false;
+  }
+
+  if (storageDirectory !== undefined && path.dirname(normalizedFile) === storageDirectory) {
+    return true;
+  }
+
+  const normalizedSegments = normalizedFile.replace(/\\/g, "/").split("/");
+  return normalizedSegments.includes("compose-overrides");
 }
 
 function quoteYamlString(value: string): string {

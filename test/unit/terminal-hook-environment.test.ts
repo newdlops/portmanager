@@ -506,7 +506,9 @@ test("compose reconcile registers only live runtime endpoints", () => {
 
   assert.equal(reconcileBody.includes("shouldRefreshComposePublishedPortsFromRuntime(attachment, options)"), true);
   assert.equal(reconcileBody.includes(".listLiveComposePublishedPorts("), true);
-  assert.equal(reconcileBody.includes("replaceComposeRouteProcesses(attachment, livePorts)"), true);
+  assert.equal(reconcileBody.includes("reconcileComposeOverrideFileForAttachment("), true);
+  assert.equal(reconcileBody.includes('if (overrideRestoredAttachment.status === "error")'), true);
+  assert.equal(reconcileBody.includes("replaceComposeRouteProcesses(overrideRestoredAttachment, livePorts)"), true);
   assert.equal(reconcileBody.includes("mergeComposePortsWithLiveRoutes("), true);
   assert.equal(reconcileBody.includes("shouldRefreshComposeContainerMappingsFromRuntime(attachment, options)"), true);
   assert.equal(reconcileBody.includes(": attachment.mutation;"), true);
@@ -696,7 +698,7 @@ test("compose route reconciliation does not rehydrate persisted attachment route
   assert.equal(reconcileBody.includes("shouldRefreshPorts && livePorts !== undefined"), true);
   assert.equal(reconcileBody.includes(".catch(() => [])"), false);
   assert.equal(reconcileBody.includes("liveDiscoveryError"), true);
-  assert.equal(reconcileBody.includes("this.replaceComposeRouteProcesses(attachment, livePorts)"), true);
+  assert.equal(reconcileBody.includes("this.replaceComposeRouteProcesses(overrideRestoredAttachment, livePorts)"), true);
   assert.equal(attachBody.includes(".listLiveComposePublishedPorts("), true);
   assert.equal(attachBody.includes("this.replaceComposeRouteProcesses(registeredAttachment, livePorts)"), true);
   assert.equal(renameBody.includes(".listLiveComposePublishedPorts("), true);
@@ -728,7 +730,7 @@ test("compose project routing files are published as a serialized atomic generat
   assert.equal(source.includes("private composeProjectRoutingForceOverrideRefreshQueued = false;"), true);
   assert.equal(source.includes("private async writeComposeProjectRoutingFileSerially(): Promise<void>"), true);
   assert.equal(source.includes("private async writeComposeProjectRoutingFileExclusive("), true);
-  assert.equal(rowBody.includes("!isRestorableComposeAttachment(attachment)"), true);
+  assert.equal(rowBody.includes("!isRoutableComposeAttachment(attachment)"), true);
   assert.equal(rowBody.includes("inferOriginalComposeProjectNameForRouting("), true);
   assert.equal(rowBody.includes("routingFiles.overrideFile === undefined"), true);
   assert.equal(source.includes("function parseComposeConfiguredProjectNameForRouting"), true);
@@ -760,6 +762,15 @@ test("compose override yaml is force-refreshed on attach startup and repair", ()
   const repairStart = source.indexOf("async fixStaleRouting()");
   const repairEnd = source.indexOf("  /** Releases listeners", repairStart);
   const repairBody = source.slice(repairStart, repairEnd);
+  const terminalAttachStart = source.indexOf("async attachTerminalWindow(networkId: string, terminalWindowId: string)");
+  const terminalAttachEnd = source.indexOf("  /** Brings a discovered terminal window", terminalAttachStart);
+  const terminalAttachBody = source.slice(terminalAttachStart, terminalAttachEnd);
+  const windowAttachStart = source.indexOf("async attachVscodeWindowTerminalsToNetwork(networkId: string)");
+  const windowAttachEnd = source.indexOf("  /** Clears the current VS Code window", windowAttachStart);
+  const windowAttachBody = source.slice(windowAttachStart, windowAttachEnd);
+  const scriptStart = source.indexOf("async createTerminalRoutingScript(networkId: string)");
+  const scriptEnd = source.indexOf("  /** Returns the shell snippet", scriptStart);
+  const scriptBody = source.slice(scriptStart, scriptEnd);
   const helperStart = source.indexOf("private async reconcileComposeOverrideFiles");
   const helperEnd = source.indexOf("private getComposeProjectRoutingFilePath", helperStart);
   const helperBody = source.slice(helperStart, helperEnd);
@@ -768,12 +779,21 @@ test("compose override yaml is force-refreshed on attach startup and repair", ()
   assert.equal(attachBody.includes("await this.composePublishMutator.hidePublishedPorts({"), true);
   assert.equal(attachBody.includes("await this.composePublishMutator.restoreHiddenPortsOverride(input.existingMutation, {"), true);
   assert.equal(startBody.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });"), true);
+  assert.equal(startBody.includes("await this.reconcileComposeOverrideFiles(undefined, { force: true });"), true);
   assert.equal(reloadBody.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });"), true);
+  assert.equal(reloadBody.includes("await this.reconcileComposeOverrideFiles(undefined, { force: true });"), true);
   assert.equal(
     repairBody.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);"),
     true,
   );
-  assert.equal(helperBody.includes("this.composePublishMutator.restoreHiddenPortsOverride(mutation, options)"), true);
+  assert.equal(terminalAttachBody.includes("await this.ensureNetworkComposeRoutingArtifacts(networkId);"), true);
+  assert.equal(windowAttachBody.includes("await this.ensureNetworkComposeRoutingArtifacts(networkId);"), true);
+  assert.equal(scriptBody.includes("await this.ensureNetworkComposeRoutingArtifacts(networkId);"), true);
+  assert.equal(helperBody.includes("private async reconcileComposeOverrideFileForAttachment("), true);
+  assert.equal(helperBody.includes("recoverToStorageDirectory: true"), true);
+  assert.equal(helperBody.includes("buildMutationlessComposeOverrideRecoveryState(attachment)"), true);
+  assert.equal(helperBody.includes("status: \"error\""), true);
+  assert.equal(helperBody.includes("await this.removeComposeRouteProcesses(nextAttachment, nextAttachment.ports).catch(() => undefined);"), true);
   assert.equal(helperBody.includes("this.registry.updateComposeAttachment({"), true);
 });
 
