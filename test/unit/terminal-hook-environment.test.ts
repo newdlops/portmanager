@@ -32,6 +32,9 @@ test("BASH_ENV restore script promotes runtime shims ahead of inherited PATH ent
     source.includes('export PATH="\\${PORT_MANAGER_RUNTIME_SHIM_DIR}\\${__pm_path_rest:+:$__pm_path_rest}"'),
     true,
   );
+  assert.equal(source.includes("export PORT_MANAGER_RUNTIME_SHIM_READY=0"), true);
+  assert.equal(source.includes("for __pm_shim_name in ${TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES.join(\" \")}"), true);
+  assert.equal(source.includes('export PATH="\\${__pm_path_rest}"'), true);
 });
 
 test("terminal hook preload entries are normalized across multiple VS Code windows", () => {
@@ -144,7 +147,7 @@ test("package command shims rerun client tools without native runtime alias sema
   assert.equal(source.includes("*vite*"), true);
   assert.equal(source.includes("*celery*"), true);
   assert.equal(source.includes("*uvicorn*"), true);
-  assert.equal(source.includes("removeLegacyPreloadPackageManagerShims"), true);
+  assert.equal(source.includes("removeLegacyPreloadPackageManagerShims"), false);
   assert.equal(source.includes("PRELOAD_PACKAGE_MANAGER_NAMES.includes(entry.name)"), true);
   assert.equal(source.includes("__pm_is_package_command_shim()"), true);
   assert.equal(source.includes("export PORT_MANAGER_PRELOAD_REPAIR=1"), true);
@@ -276,11 +279,11 @@ test("package command shims rerun client tools without native runtime alias sema
   );
 });
 
-test("runtime shim directory removes reverted clean-run artifacts before rewriting shims", () => {
+test("runtime shim directory preserves active command paths while rewriting shims", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
   const prepareStart = source.indexOf("export function prepareRuntimeShimLauncherDirectory");
-  const prepareEnd = source.indexOf("function removeLegacyPreloadPackageManagerShims", prepareStart);
+  const prepareEnd = source.indexOf("/** Compatibility wrapper", prepareStart);
   const prepareBody = source.slice(prepareStart, prepareEnd);
   const cleanupStart = source.indexOf("function removeStaleRuntimeShimArtifacts");
   const cleanupEnd = source.indexOf("function isStaleGeneratedRuntimeShim", cleanupStart);
@@ -293,7 +296,7 @@ test("runtime shim directory removes reverted clean-run artifacts before rewriti
     prepareBody.indexOf("removeStaleRuntimeShimArtifacts(targetDirectory);") <
       prepareBody.indexOf("writePreloadPackageManagerCommandShims(targetDirectory);"),
     true,
-    "stale artifacts must be removed before stable package-manager shims are rewritten",
+    "stale unrelated artifacts must be cleaned before stable package-manager shims are rewritten",
   );
   assert.equal(cleanupBody.includes('path.join(targetDirectory, ".portmanager-node")'), true);
   assert.equal(cleanupBody.includes("fs.readdirSync(targetDirectory, { withFileTypes: true })"), true);
@@ -303,6 +306,9 @@ test("runtime shim directory removes reverted clean-run artifacts before rewriti
   assert.equal(cleanupBody.includes("PRELOAD_PACKAGE_COMMAND_NAMES"), true);
   assert.equal(cleanupBody.includes("isPortManagerGeneratedRuntimeShim(shimPath)"), true);
   assert.equal(cleanupBody.includes("existingPath.isSymbolicLink()"), true);
+  assert.equal(cleanupBody.includes("Never unlink active command names"), true);
+  assert.equal(cleanupBody.includes("currentGeneratedShimNames.has(entry.name)) {\n      /*"), true);
+  assert.equal(cleanupBody.includes("isStaleGeneratedRuntimeShim(shimPath)"), false);
   assert.equal(source.includes("function temporarySiblingPath"), true);
   assert.equal(source.includes("function replacePathAtomically"), true);
   assert.equal(source.includes("fs.renameSync(tempPath, filePath)"), true);
