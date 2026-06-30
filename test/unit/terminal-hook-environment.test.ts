@@ -693,12 +693,22 @@ test("background routing refresh polls terminals and containers", () => {
 
   assert.equal(source.includes("private startRoutingSignalRefreshLoop(): void"), true);
   assert.equal(source.includes("this.refreshTerminals().catch(() => [])"), true);
+  assert.equal(source.includes("private terminalAttachmentComposeRefreshPending = false;"), true);
+  assert.equal(source.includes("this.terminalAttachmentComposeRefreshPending = true;"), true);
+  assert.equal(burstBody.includes("const shouldRefreshComposeRoutes = this.terminalAttachmentComposeRefreshPending;"), true);
+  assert.equal(burstBody.includes("this.terminalAttachmentComposeRefreshPending = false;"), true);
+  assert.equal(burstBody.includes("if (shouldRefreshComposeRoutes) {"), true);
   assert.equal(
     burstBody.includes("await this.reconcileComposeAttachmentPublishedPorts({ force: true, coalesceForce: true }).catch(() => undefined);"),
     true,
   );
   assert.equal(
     burstBody.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);"),
+    true,
+  );
+  assert.equal(
+    burstBody.indexOf("this.terminalAttachmentComposeRefreshPending = false;") <
+      burstBody.indexOf("await this.reconcileComposeAttachmentPublishedPorts({ force: true, coalesceForce: true }).catch(() => undefined);"),
     true,
   );
   assert.equal(

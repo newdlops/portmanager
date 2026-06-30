@@ -43,6 +43,8 @@ export interface LogicalPortRouterOptions {
   readonly nativeRouterPath?: string;
   /** Startup timeout for one native listener process. */
   readonly nativeStartupTimeoutMs?: number;
+  /** Grace window before closing routers that briefly disappear from route snapshots. */
+  readonly retireDelayMs?: number;
 }
 
 interface LogicalPortRouterListenerHandle {
@@ -69,6 +71,7 @@ const LOOPBACK_LISTEN_TARGETS: readonly LoopbackListenTarget[] = [
   { host: "::1", ipv6Only: true },
 ];
 const DEFAULT_NATIVE_STARTUP_TIMEOUT_MS = 1500;
+const DEFAULT_RETIRE_DELAY_MS = 30_000;
 
 /**
  * Opens real localhost listeners for logical ports and forwards per connection.
@@ -81,6 +84,9 @@ export class LogicalPortRouterManager implements DisposableLike {
   /** Active loopback listener groups keyed by logical port. */
   private readonly listeners = new Map<number, LogicalPortRouterListenerHandle>();
 
+  /** Delayed closes for ports that vanish during transient route-table refreshes. */
+  private readonly retireTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
   constructor(
     private readonly targetResolver: LogicalPortRouterTargetResolver,
     private readonly options: LogicalPortRouterOptions = {},
@@ -91,12 +97,20 @@ export class LogicalPortRouterManager implements DisposableLike {
     const desiredPorts = new Set([...logicalPorts].filter(isTcpPort));
 
     for (const [port, listener] of [...this.listeners]) {
-      if (!desiredPorts.has(port) || !listener.isActive()) {
+      if (!listener.isActive()) {
         await this.close(port);
+        continue;
+      }
+
+      if (!desiredPorts.has(port)) {
+        this.scheduleRetire(port);
+      } else {
+        this.cancelRetire(port);
       }
     }
 
     for (const port of desiredPorts) {
+      this.cancelRetire(port);
       try {
         await this.open(port);
       } catch {
@@ -146,6 +160,7 @@ export class LogicalPortRouterManager implements DisposableLike {
 
   /** Closes one logical localhost listener. */
   async close(logicalPort: number): Promise<void> {
+    this.cancelRetire(logicalPort);
     const listenerSet = this.listeners.get(logicalPort);
     if (listenerSet === undefined) {
       return;
@@ -158,7 +173,34 @@ export class LogicalPortRouterManager implements DisposableLike {
   /** Closes every listener owned by this router. */
   dispose(): void {
     const ports = [...this.listeners.keys()];
+    for (const port of [...this.retireTimers.keys()]) {
+      this.cancelRetire(port);
+    }
     void Promise.all(ports.map((port) => this.close(port)));
+  }
+
+  /** Defers destructive close so refresh gaps do not tear down active TCP streams. */
+  private scheduleRetire(logicalPort: number): void {
+    if (this.retireTimers.has(logicalPort)) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      this.retireTimers.delete(logicalPort);
+      void this.close(logicalPort).catch(() => undefined);
+    }, this.options.retireDelayMs ?? DEFAULT_RETIRE_DELAY_MS);
+    timer.unref?.();
+    this.retireTimers.set(logicalPort, timer);
+  }
+
+  private cancelRetire(logicalPort: number): void {
+    const timer = this.retireTimers.get(logicalPort);
+    if (timer === undefined) {
+      return;
+    }
+
+    clearTimeout(timer);
+    this.retireTimers.delete(logicalPort);
   }
 
   /** Builds one loopback listener for a logical port/address pair. */

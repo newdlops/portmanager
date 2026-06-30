@@ -477,6 +477,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Keeps a short refresh burst alive while a newly hooked terminal appears in the process table. */
   private terminalAttachmentRefreshBurstUntilMs = 0;
 
+  /** One pending compose refresh caused by terminal/lifecycle marker changes. */
+  private terminalAttachmentComposeRefreshPending = false;
+
   /** Last stat-level signature of terminal hook marker files. */
   private terminalAttachmentMarkerSignature = "";
 
@@ -3105,6 +3108,7 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Schedules a short refresh burst so process-table discovery can catch up to the shell marker. */
   private scheduleTerminalAttachmentRefreshBurst(): void {
     this.terminalAttachmentRefreshBurstUntilMs = Date.now() + TERMINAL_ATTACHMENT_REFRESH_BURST_WINDOW_MS;
+    this.terminalAttachmentComposeRefreshPending = true;
     this.scheduleTerminalAttachmentRefresh(TERMINAL_ATTACHMENT_REFRESH_DEBOUNCE_MS);
   }
 
@@ -3121,8 +3125,14 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   private async runTerminalAttachmentRefreshBurstStep(): Promise<void> {
-    await this.reconcileComposeAttachmentPublishedPorts({ force: true, coalesceForce: true }).catch(() => undefined);
-    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
+    const shouldRefreshComposeRoutes = this.terminalAttachmentComposeRefreshPending;
+    this.terminalAttachmentComposeRefreshPending = false;
+
+    if (shouldRefreshComposeRoutes) {
+      await this.reconcileComposeAttachmentPublishedPorts({ force: true, coalesceForce: true }).catch(() => undefined);
+      await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
+    }
+
     await this.refreshTerminals().catch(() => []);
     if (Date.now() < this.terminalAttachmentRefreshBurstUntilMs) {
       this.scheduleTerminalAttachmentRefresh(TERMINAL_ATTACHMENT_REFRESH_BURST_INTERVAL_MS);

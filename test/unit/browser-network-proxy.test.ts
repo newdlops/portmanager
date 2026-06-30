@@ -331,6 +331,52 @@ test("rewrites WebSocket upgrade metadata before tunneling", async () => {
   }
 });
 
+test("keeps in-flight browser proxy sockets across transient missing endpoint sync", async () => {
+  let upstreamResponse: http.ServerResponse | undefined;
+  let markUpstreamReceived!: () => void;
+  const upstreamReceived = new Promise<void>((resolve) => {
+    markUpstreamReceived = resolve;
+  });
+  const upstream = http.createServer((_request, response) => {
+    upstreamResponse = response;
+    markUpstreamReceived();
+  });
+  await listen(upstream, 0, "127.0.0.1");
+
+  const proxyPort = await getAvailablePort();
+  const proxy = new BrowserNetworkProxyManager(
+    {
+      resolve: () => ({
+        host: "127.0.0.1",
+        port: getServerPort(upstream),
+      }),
+    },
+    { retireDelayMs: 1000 },
+  );
+  const endpoint = createEndpoint({ listenPorts: [proxyPort] });
+
+  try {
+    const activeEndpoint = await proxy.ensure(endpoint);
+    assert.ok(activeEndpoint);
+
+    const responsePromise = requestHttp({
+      host: "127.0.0.1",
+      port: activeEndpoint.listenPort,
+      path: "/graphql",
+    });
+    await upstreamReceived;
+
+    await proxy.sync([]);
+    await proxy.sync([endpoint]);
+    upstreamResponse?.end("still-open");
+
+    assert.equal((await responsePromise).body, "still-open");
+  } finally {
+    await proxy.dispose();
+    await closeServer(upstream);
+  }
+});
+
 function createEndpoint(overrides: Partial<BrowserNetworkProxyEndpoint> = {}): BrowserNetworkProxyEndpoint {
   return {
     id: browserNetworkProxyEndpointId("network-1", 3004),

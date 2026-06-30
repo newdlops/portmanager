@@ -39,6 +39,8 @@ export interface BrowserNetworkProxyTargetResolver {
 export interface BrowserNetworkProxyOptions {
   /** Backoff after a failed bind, keeping background sync from retrying hot loops. */
   readonly retryDelayMs?: number;
+  /** Grace window before closing endpoints that briefly disappear from route snapshots. */
+  readonly retireDelayMs?: number;
 }
 
 interface BrowserNetworkProxyListener {
@@ -66,6 +68,7 @@ interface BrowserNetworkProxyEndpointMetadata {
 }
 
 const DEFAULT_RETRY_DELAY_MS = 30_000;
+const DEFAULT_RETIRE_DELAY_MS = 30_000;
 const LOCALHOST_UPSTREAM_HOST = "localhost";
 const UPSTREAM_KEEP_ALIVE_MAX_SOCKETS = 64;
 const UPSTREAM_KEEP_ALIVE_MAX_FREE_SOCKETS = 16;
@@ -91,6 +94,9 @@ export class BrowserNetworkProxyManager {
   /** Failed endpoint retries are throttled so missing macOS lo0 aliases stay cheap. */
   private readonly retryAfterById = new Map<string, number>();
 
+  /** Delayed closes for endpoints that vanished during a transient routing refresh. */
+  private readonly retireTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
   constructor(
     private readonly targetResolver: BrowserNetworkProxyTargetResolver,
     private readonly options: BrowserNetworkProxyOptions = {},
@@ -107,12 +113,19 @@ export class BrowserNetworkProxyManager {
 
     for (const [id, listener] of [...this.listeners]) {
       const endpoint = desired.get(id);
-      if (endpoint === undefined || !isEndpointCurrent(listener.endpoint, endpoint)) {
+      if (endpoint === undefined) {
+        this.scheduleRetire(id);
+        continue;
+      }
+
+      this.cancelRetire(id);
+      if (!isEndpointCurrent(listener.endpoint, endpoint)) {
         await this.close(id);
       }
     }
 
     for (const endpoint of desired.values()) {
+      this.cancelRetire(endpoint.id);
       if (this.listeners.has(endpoint.id)) {
         continue;
       }
@@ -133,6 +146,7 @@ export class BrowserNetworkProxyManager {
     const normalizedEndpoint = normalizeEndpoint(endpoint);
     const listener = this.listeners.get(normalizedEndpoint.id);
     if (listener !== undefined && isEndpointCurrent(listener.endpoint, normalizedEndpoint)) {
+      this.cancelRetire(normalizedEndpoint.id);
       return listener.endpoint;
     }
 
@@ -162,6 +176,7 @@ export class BrowserNetworkProxyManager {
 
   /** Closes one browser proxy endpoint. */
   async close(endpointId: string): Promise<void> {
+    this.cancelRetire(endpointId);
     const listener = this.listeners.get(endpointId);
     if (listener === undefined) {
       return;
@@ -182,8 +197,35 @@ export class BrowserNetworkProxyManager {
   /** Closes every browser proxy endpoint during extension shutdown. */
   async dispose(): Promise<void> {
     const ids = [...this.listeners.keys()];
+    for (const id of [...this.retireTimers.keys()]) {
+      this.cancelRetire(id);
+    }
     await Promise.all(ids.map((id) => this.close(id)));
     this.retryAfterById.clear();
+  }
+
+  /** Defers destructive close so short-lived route-table holes do not kill WebSocket streams. */
+  private scheduleRetire(endpointId: string): void {
+    if (this.retireTimers.has(endpointId)) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      this.retireTimers.delete(endpointId);
+      void this.close(endpointId).catch(() => undefined);
+    }, this.options.retireDelayMs ?? DEFAULT_RETIRE_DELAY_MS);
+    timer.unref?.();
+    this.retireTimers.set(endpointId, timer);
+  }
+
+  private cancelRetire(endpointId: string): void {
+    const timer = this.retireTimers.get(endpointId);
+    if (timer === undefined) {
+      return;
+    }
+
+    clearTimeout(timer);
+    this.retireTimers.delete(endpointId);
   }
 
   /** Opens one endpoint on the first available preferred public port. */

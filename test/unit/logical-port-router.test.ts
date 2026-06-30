@@ -154,6 +154,39 @@ test("keeps opening later logical routers when one desired port is already owned
   }
 });
 
+test("keeps logical router TCP streams across transient route gaps", async () => {
+  const targetServer = net.createServer((socket) => {
+    socket.on("data", (chunk) => {
+      socket.write(`echo:${chunk.toString("utf8")}`);
+    });
+  });
+  await listenServer(targetServer, 0, "127.0.0.1");
+  const targetPort = serverPort(targetServer);
+  const logicalPort = await findFreeLoopbackPort();
+  const manager = new LogicalPortRouterManager(
+    {
+      resolve: () => ({ host: "127.0.0.1", port: targetPort }),
+    },
+    { retireDelayMs: 1000 },
+  );
+  let socket: net.Socket | undefined;
+
+  try {
+    await manager.sync([logicalPort]);
+    socket = net.createConnection({ host: "127.0.0.1", port: logicalPort });
+    assert.equal(await writeAndReadSocket(socket, "first", "echo:first"), "echo:first");
+
+    await manager.sync([]);
+    await manager.sync([logicalPort]);
+
+    assert.equal(await writeAndReadSocket(socket, "second", "echo:second"), "echo:second");
+  } finally {
+    socket?.destroy();
+    await manager.close(logicalPort).catch(() => undefined);
+    await closeServer(targetServer).catch(() => undefined);
+  }
+});
+
 test("parses client cwd from a cwd-only lsof query", () => {
   const cwd = parseProcessCwdFromLsof(["p101", "n/Users/lky/project/fix-payroll"].join("\n"));
 
@@ -441,6 +474,47 @@ function readFromPort(port: number): Promise<string> {
     });
     socket.once("error", onError);
     socket.once("end", onEnd);
+  });
+}
+
+function writeAndReadSocket(socket: net.Socket, message: string, expected: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let output = "";
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for ${expected}.`));
+    }, 1000);
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off("connect", onConnect);
+      socket.off("data", onData);
+      socket.off("error", onError);
+    };
+    const write = () => {
+      socket.write(message);
+    };
+    const onConnect = () => {
+      write();
+    };
+    const onData = (chunk: Buffer) => {
+      output += chunk.toString("utf8");
+      if (output.includes(expected)) {
+        cleanup();
+        resolve(output);
+      }
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+
+    socket.on("data", onData);
+    socket.once("error", onError);
+    if (socket.connecting) {
+      socket.once("connect", onConnect);
+    } else {
+      write();
+    }
   });
 }
 
