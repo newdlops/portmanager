@@ -40,6 +40,7 @@
 #define PM_MAX_ROUTES 32768
 #define PM_MAX_ROUTE_OBJECT 8192
 #define PM_ROUTE_FILE_CACHE_CAPACITY 64
+#define PM_ROUTE_TABLE_TTL_SECONDS 300
 #define PM_DEFAULT_SCAN_RANGE 20
 #define PM_DEFAULT_VIRTUAL_START 53000
 #define PM_DEFAULT_VIRTUAL_END 59999
@@ -2134,6 +2135,29 @@ static int pm_json_int(const char *json, const char *key, int fallback) {
   return atoi(cursor);
 }
 
+static long pm_json_long(const char *json, const char *key, long fallback) {
+  const char *cursor = pm_find_json_key(json, key);
+  char *end = NULL;
+  long parsed;
+
+  if (cursor == NULL) {
+    return fallback;
+  }
+
+  cursor = strchr(cursor, ':');
+  if (cursor == NULL) {
+    return fallback;
+  }
+
+  cursor++;
+  while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+    cursor++;
+  }
+
+  parsed = strtol(cursor, &end, 10);
+  return end == cursor ? fallback : parsed;
+}
+
 static int pm_json_string(const char *json, const char *key, char *buffer, size_t size) {
   const char *cursor = pm_find_json_key(json, key);
   size_t used = 0;
@@ -2297,6 +2321,45 @@ static long pm_stat_mtime_nsec(const struct stat *stat_buffer) {
 #else
   return stat_buffer->st_mtim.tv_nsec;
 #endif
+}
+
+/*
+ * Legacy route files do not carry expiresAtMs, so mtime is the fail-closed TTL
+ * guard that also keeps the in-memory route-file cache from outliving the file.
+ */
+static int pm_route_file_stat_expired(const struct stat *stat_buffer) {
+  long now_ms;
+  long mtime_ms;
+
+  if (stat_buffer == NULL) {
+    return 1;
+  }
+
+  now_ms = pm_now_milliseconds();
+  mtime_ms = (long)pm_stat_mtime_sec(stat_buffer) * 1000L;
+  if (now_ms <= 0 || mtime_ms <= 0) {
+    return 0;
+  }
+
+  return now_ms - mtime_ms > PM_ROUTE_TABLE_TTL_SECONDS * 1000L;
+}
+
+/** New route-table documents expose an explicit wall-clock expiry for readers. */
+static int pm_route_file_buffer_expired(const char *buffer) {
+  long expires_at_ms;
+  long now_ms;
+
+  if (buffer == NULL) {
+    return 1;
+  }
+
+  expires_at_ms = pm_json_long(buffer, "expiresAtMs", 0);
+  if (expires_at_ms <= 0) {
+    return 0;
+  }
+
+  now_ms = pm_now_milliseconds();
+  return now_ms > 0 && now_ms >= expires_at_ms;
 }
 
 static void pm_clear_route_file_cache_entry(pm_route_file_cache_entry *entry) {
@@ -2516,6 +2579,11 @@ static int pm_load_route_file_routes(const char *path, pm_cached_route **routes_
     return -1;
   }
 
+  if (pm_route_file_stat_expired(&stat_buffer)) {
+    close(fd);
+    return -1;
+  }
+
   if (pm_get_cached_route_file(path, &stat_buffer, routes_out, route_count_out) == 0) {
     close(fd);
     return 0;
@@ -2535,6 +2603,11 @@ static int pm_load_route_file_routes(const char *path, pm_cached_route **routes_
   }
 
   buffer[read_count] = '\0';
+  if (pm_route_file_buffer_expired(buffer)) {
+    free(buffer);
+    return -1;
+  }
+
   if (pm_parse_route_file_buffer(buffer, &routes, &route_count) != 0) {
     free(buffer);
     return -1;

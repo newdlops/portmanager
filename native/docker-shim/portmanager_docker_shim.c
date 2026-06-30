@@ -36,6 +36,7 @@
 #define PM_TERMINAL_ATTACHMENT_DIR_ENV "PORT_MANAGER_TERMINAL_ATTACHMENT_DIR"
 #define PM_TERMINAL_SESSION_ID_ENV "PORT_MANAGER_TERMINAL_SESSION_ID"
 #define PM_COMPOSE_REFRESH_WAIT_MS 3000
+#define PM_ROUTE_TABLE_TTL_SECONDS 300
 
 typedef struct {
   char kind[16];
@@ -94,6 +95,27 @@ static void pm_copy(char *destination, size_t size, const char *source) {
   }
 
   snprintf(destination, size, "%s", source);
+}
+
+/*
+ * Generated route JSON and compose TSV files are disposable routing cache.
+ * Stale inherited env paths must not recover network scope or rewrite Docker
+ * commands for a previous terminal attachment.
+ */
+static int pm_generated_route_file_expired(const char *path) {
+  struct stat stats;
+  time_t now;
+
+  if (path == NULL || path[0] == '\0' || stat(path, &stats) != 0) {
+    return 1;
+  }
+
+  now = time(NULL);
+  if (now <= 0 || stats.st_mtime <= 0) {
+    return 0;
+  }
+
+  return now - stats.st_mtime > PM_ROUTE_TABLE_TTL_SECONDS;
 }
 
 /** Removes line endings left on the final TSV field after splitting a row. */
@@ -463,6 +485,10 @@ static const char *pm_network_id_from_route_table_path(void) {
     return NULL;
   }
 
+  if (pm_generated_route_file_expired(route_file)) {
+    return NULL;
+  }
+
   base_name = strrchr(route_file, '/');
   base_name = base_name == NULL ? route_file : base_name + 1;
   base_length = strlen(base_name);
@@ -508,6 +534,10 @@ static const char *pm_network_id_from_compose_routing_file(void) {
    * when launcher boundaries dropped the explicit network variables.
    */
   if (routing_file == NULL || routing_file[0] == '\0') {
+    return NULL;
+  }
+
+  if (pm_generated_route_file_expired(routing_file)) {
     return NULL;
   }
 
@@ -854,6 +884,10 @@ static int pm_visit_scoped_compose_routing_files(
     }
 
     if (snprintf(scoped_file_path, sizeof(scoped_file_path), "%s/%s", directory_path, entry->d_name) >= (int)sizeof(scoped_file_path)) {
+      continue;
+    }
+
+    if (pm_generated_route_file_expired(scoped_file_path)) {
       continue;
     }
 
@@ -1205,7 +1239,13 @@ static int pm_compose_override_for_project(const char *attached_project, char *b
   char candidate[PM_MAX_PATH];
   size_t directory_length;
 
-  if (attached_project == NULL || attached_project[0] == '\0' || routing_file == NULL || routing_file[0] == '\0') {
+  if (
+    attached_project == NULL ||
+    attached_project[0] == '\0' ||
+    routing_file == NULL ||
+    routing_file[0] == '\0' ||
+    pm_generated_route_file_expired(routing_file)
+  ) {
     return -1;
   }
 
@@ -1388,6 +1428,29 @@ static int pm_json_string(const char *json, const char *key, char *buffer, size_
   return used > 0 ? 0 : -1;
 }
 
+static long pm_json_long(const char *json, const char *key, long fallback) {
+  const char *cursor = pm_find_json_key(json, key);
+  char *end = NULL;
+  long parsed;
+
+  if (cursor == NULL) {
+    return fallback;
+  }
+
+  cursor = strchr(cursor, ':');
+  if (cursor == NULL) {
+    return fallback;
+  }
+
+  cursor++;
+  while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+    cursor++;
+  }
+
+  parsed = strtol(cursor, &end, 10);
+  return end == cursor ? fallback : parsed;
+}
+
 static int pm_extract_project_from_process_name(const char *process_name, char *buffer, size_t size) {
   const char *separator;
   size_t project_length;
@@ -1494,6 +1557,42 @@ static int pm_read_file_limited(const char *path, char **buffer_out) {
   return 0;
 }
 
+static int pm_route_table_buffer_expired(const char *buffer) {
+  long expires_at_ms;
+  long now_ms;
+
+  if (buffer == NULL) {
+    return 1;
+  }
+
+  expires_at_ms = pm_json_long(buffer, "expiresAtMs", 0);
+  if (expires_at_ms <= 0) {
+    return 0;
+  }
+
+  now_ms = (long)time(NULL) * 1000L;
+  return now_ms > 0 && now_ms >= expires_at_ms;
+}
+
+/** Reads route-table JSON only while both mtime and embedded expiresAtMs are valid. */
+static int pm_read_route_table_file_limited(const char *path, char **buffer_out) {
+  if (pm_generated_route_file_expired(path)) {
+    return -1;
+  }
+
+  if (pm_read_file_limited(path, buffer_out) != 0) {
+    return -1;
+  }
+
+  if (pm_route_table_buffer_expired(*buffer_out)) {
+    free(*buffer_out);
+    *buffer_out = NULL;
+    return -1;
+  }
+
+  return 0;
+}
+
 static int pm_parse_int_env(const char *name, int fallback) {
   const char *value = getenv(name);
   char *end = NULL;
@@ -1518,7 +1617,7 @@ static long pm_route_table_generation_sequence(void) {
   char *end;
   long sequence;
 
-  if (pm_read_file_limited(route_file, &buffer) != 0) {
+  if (pm_read_route_table_file_limited(route_file, &buffer) != 0) {
     return -1;
   }
 
@@ -1579,7 +1678,7 @@ static int pm_find_compose_route_from_route_table(
   int found = 0;
 
   (void)runtime;
-  if (pm_read_file_limited(route_file, &buffer) != 0) {
+  if (pm_read_route_table_file_limited(route_file, &buffer) != 0) {
     return -1;
   }
 
@@ -1648,7 +1747,7 @@ static int pm_route_table_has_current_compose_route(void) {
   char *buffer;
   char *cursor;
 
-  if (pm_read_file_limited(route_file, &buffer) != 0) {
+  if (pm_read_route_table_file_limited(route_file, &buffer) != 0) {
     return 0;
   }
 
@@ -1742,7 +1841,7 @@ static int pm_find_compose_route_in_file(const char *file_path, void *context) {
   char *line = NULL;
   size_t line_capacity = 0;
 
-  if (file_path == NULL || file_path[0] == '\0' || search == NULL) {
+  if (file_path == NULL || file_path[0] == '\0' || search == NULL || pm_generated_route_file_expired(file_path)) {
     return -1;
   }
 
@@ -1817,7 +1916,13 @@ static int pm_find_compose_route(
   pm_compose_route_search search;
   int scoped_file_count = 0;
 
-  if (file_path == NULL || file_path[0] == '\0' || network_id == NULL || network_id[0] == '\0') {
+  if (
+    file_path == NULL ||
+    file_path[0] == '\0' ||
+    network_id == NULL ||
+    network_id[0] == '\0' ||
+    pm_generated_route_file_expired(file_path)
+  ) {
     return pm_find_compose_route_from_route_table(
       runtime,
       attached_project,
@@ -2237,7 +2342,7 @@ static int pm_find_compose_project_for_service_from_route_table(
   char selected_project[PM_MAX_FIELD] = "";
   int found = 0;
 
-  if (service == NULL || service[0] == '\0' || pm_read_file_limited(route_file, &buffer) != 0) {
+  if (service == NULL || service[0] == '\0' || pm_read_route_table_file_limited(route_file, &buffer) != 0) {
     return -1;
   }
 
@@ -2353,7 +2458,7 @@ static int pm_find_compose_project_and_service_for_token_from_route_table(
   char selected_service[PM_MAX_FIELD] = "";
   int found = 0;
 
-  if (token == NULL || token[0] == '\0' || pm_read_file_limited(route_file, &buffer) != 0) {
+  if (token == NULL || token[0] == '\0' || pm_read_route_table_file_limited(route_file, &buffer) != 0) {
     return -1;
   }
 
@@ -2429,7 +2534,7 @@ static int pm_compose_routing_file_matches_context(
   char requested_project[PM_MAX_FIELD] = "";
   int matches = 0;
 
-  if (file_path == NULL || runtime == NULL || network_id == NULL) {
+  if (file_path == NULL || runtime == NULL || network_id == NULL || pm_generated_route_file_expired(file_path)) {
     return 0;
   }
 
@@ -2497,7 +2602,7 @@ static int pm_container_target_scan_file(const char *file_path, void *context) {
   char *line = NULL;
   size_t line_capacity = 0;
 
-  if (file_path == NULL || search == NULL) {
+  if (file_path == NULL || search == NULL || pm_generated_route_file_expired(file_path)) {
     return -1;
   }
 
@@ -2770,7 +2875,13 @@ static char *pm_container_target_for_token(
     return NULL;
   }
 
-  if (file_path == NULL || file_path[0] == '\0' || network_id == NULL || network_id[0] == '\0') {
+  if (
+    file_path == NULL ||
+    file_path[0] == '\0' ||
+    network_id == NULL ||
+    network_id[0] == '\0' ||
+    pm_generated_route_file_expired(file_path)
+  ) {
     return pm_container_target_from_route_table(runtime, real_runtime_path, token_copy, suffix);
   }
 

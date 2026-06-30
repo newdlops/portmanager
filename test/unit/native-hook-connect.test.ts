@@ -41,12 +41,24 @@ test("native hook memory route cache is scoped by logical network", () => {
 test("native hook route file cache is invalidated by path size and high-resolution mtime", () => {
   const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
   const source = fs.readFileSync(sourcePath, "utf8");
+  const loaderStart = source.indexOf("static int pm_load_route_file_routes");
+  const loaderEnd = source.indexOf("static int pm_cached_route_network_match_level", loaderStart);
+  const loaderBody = source.slice(loaderStart, loaderEnd);
 
   assert.equal(source.includes("pm_route_file_cache_entry"), true);
   assert.equal(source.includes("PM_ROUTE_FILE_CACHE_CAPACITY"), true);
+  assert.equal(source.includes("PM_ROUTE_TABLE_TTL_SECONDS 300"), true);
+  assert.equal(source.includes("pm_route_file_stat_expired"), true);
+  assert.equal(source.includes("pm_route_file_buffer_expired"), true);
   assert.equal(source.includes("entry->size == stat_buffer->st_size"), true);
   assert.equal(source.includes("entry->mtime_sec == pm_stat_mtime_sec(stat_buffer)"), true);
   assert.equal(source.includes("entry->mtime_nsec == pm_stat_mtime_nsec(stat_buffer)"), true);
+  assert.notEqual(loaderStart, -1);
+  assert.equal(
+    loaderBody.indexOf("pm_route_file_stat_expired(&stat_buffer)") <
+      loaderBody.indexOf("pm_get_cached_route_file(path, &stat_buffer"),
+    true,
+  );
   assert.equal(source.includes("pm_cached_route_matches_cwd(route, current_cwd)"), true);
   assert.equal(source.includes("pm_cached_route_network_match_level(route)"), true);
   assert.equal(source.includes("pm_remember_route(logical_port, actual_port, target_host"), false);

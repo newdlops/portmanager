@@ -930,7 +930,8 @@ test("global storage cleanup rehydrates generated routing from live attachment s
   assert.equal(materializeBody.includes("getDefaultRouteTablePath()"), true);
   assert.equal(materializeBody.includes("getRouteTablePathForNetwork(networkId)"), true);
   assert.equal(materializeBody.includes("new Set(["), true);
-  assert.equal(materializeBody.includes("Promise.all(routeTablePaths.map((routeTablePath) => fileIsReadable(routeTablePath)))"), true);
+  assert.equal(materializeBody.includes("Promise.all(routeTablePaths.map((routeTablePath) => routeTableFileIsFresh(routeTablePath)))"), true);
+  assert.equal(source.includes("async function routeTableFileIsFresh"), true);
   assert.equal(materializeBody.includes("await this.processService.start();"), true);
   assert.equal(materializeBody.includes("await this.processService.refresh();"), true);
   assert.equal(source.includes("missing marker"), true);
@@ -1289,12 +1290,13 @@ test("compose project routing files are published as a serialized atomic generat
   assert.equal(writeBody.includes("this.composeProjectRoutingWriteQueued = true;"), true);
   assert.equal(writeBody.includes("await withSharedFileGenerationLock(this.getComposeProjectRoutingLockPath(), async () => {"), true);
   assert.equal(writeBody.includes("await this.reconcileComposeOverrideFiles(undefined, {"), true);
-  assert.equal(writeBody.includes('await writeTextFileAtomically(globalFilePath, "");'), true);
-  assert.equal(writeBody.includes('await writeTextFileAtomically(scopedFilePath, "");'), true);
+  assert.equal(writeBody.includes('await writeTextFileAtomicallyOrTouch(globalFilePath, "");'), true);
+  assert.equal(writeBody.includes('await writeTextFileAtomicallyOrTouch(scopedFilePath, "");'), true);
   assert.equal(writeBody.includes("const rowsByScopedFilePath = new Map<string, ComposeProjectRoutingRow[]>();"), true);
   assert.equal(writeBody.includes("rowsByScopedFilePath.set(scopedFilePath, [row]);"), true);
   assert.equal(writeBody.includes("scopedRows.push(row);"), true);
-  assert.equal(writeBody.includes("await writeTextFileAtomically(scopedFilePath, serializeComposeProjectRoutingRows(scopedRows));"), true);
+  assert.equal(writeBody.includes("await writeTextFileAtomicallyOrTouch(scopedFilePath, serializeComposeProjectRoutingRows(scopedRows));"), true);
+  assert.equal(source.includes("async function writeTextFileAtomicallyOrTouch"), true);
   assert.equal(writeBody.includes("serializeComposeProjectRoutingRows([row])"), false);
   assert.equal(writeBody.includes("await fs.writeFile(scopedFilePath"), false);
   assert.equal(source.includes("COMPOSE_PROJECT_ROUTING_WRITE_LOCK_STALE_MS"), true);

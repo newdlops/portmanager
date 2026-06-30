@@ -11,6 +11,7 @@ import {
   getNetworkRouteTablePath,
   getRouteTablePathForComposeClaimPort,
   getRouteTablePathForLogicalPort,
+  ROUTE_TABLE_TTL_MS,
 } from "../../src/agent/route-table";
 import type { ListeningPort, PortAvailabilityProvider, ProcessLauncher } from "../../src/shared/types";
 
@@ -76,7 +77,11 @@ test("registers native hook processes as hooked managed rows", async (context) =
       source: "hooked",
     },
   ]);
-  assert.deepEqual(readRouteTable(getNetworkRouteTablePath("network-a", routeTablePath)).routes, snapshot.routes);
+  const networkRouteTable = readRouteTable(getNetworkRouteTablePath("network-a", routeTablePath));
+  assert.equal(networkRouteTable.ttlMs, ROUTE_TABLE_TTL_MS);
+  assert.equal(networkRouteTable.expiresAt, new Date(Date.parse(fixedUpdatedAt) + ROUTE_TABLE_TTL_MS).toISOString());
+  assert.equal(networkRouteTable.expiresAtMs, Date.parse(fixedUpdatedAt) + ROUTE_TABLE_TTL_MS);
+  assert.deepEqual(networkRouteTable.routes, snapshot.routes);
   assert.deepEqual(readRouteTable(getRouteTablePathForLogicalPort(8000, "network-a", routeTablePath)).routes, snapshot.routes);
 
   listeners = [];
@@ -187,6 +192,62 @@ test("newer route table generation rejects stale daemon writes", async (context)
   assert.equal(readRouteTableGeneration(routeTablePath)?.writerId, "fresh-writer");
   assert.deepEqual(readRouteTable(routeTablePath).routes, []);
   assert.equal(fs.existsSync(getRouteTablePathForLogicalPort(8001, "network-a", routeTablePath)), false);
+});
+
+test("refreshSnapshot refreshes unchanged route tables before TTL expiry", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  let nowMs = Date.parse(fixedUpdatedAt);
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: () => new Date(nowMs),
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 1234,
+    name: "node",
+    command: "node server.js",
+    cwd: "/workspace/app",
+    requestedPort: 8000,
+    actualPort: 58000,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+
+  const initialRouteTable = readRouteTable(routeTablePath);
+  assert.equal(initialRouteTable.expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
+
+  nowMs += ROUTE_TABLE_TTL_MS - 59_999;
+  await agent.refreshSnapshot();
+
+  const refreshedRouteTable = readRouteTable(routeTablePath);
+  assert.equal(refreshedRouteTable.ttlMs, ROUTE_TABLE_TTL_MS);
+  assert.equal(refreshedRouteTable.expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
+
+  fs.writeFileSync(
+    routeTablePath,
+    `${JSON.stringify(
+      {
+        updatedAt: fixedUpdatedAt,
+        generation: refreshedRouteTable.generation,
+        routes: refreshedRouteTable.routes,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  nowMs += 1_000;
+
+  await agent.refreshSnapshot();
+
+  assert.equal(readRouteTable(routeTablePath).ttlMs, ROUTE_TABLE_TTL_MS);
 });
 
 test("keeps unscoped host listeners out of cwd-matched networks", async (context) => {
@@ -2019,8 +2080,20 @@ async function delay(ms: number): Promise<void> {
   });
 }
 
-function readRouteTable(routeTablePath: string): { routes: readonly unknown[] } {
-  return JSON.parse(fs.readFileSync(routeTablePath, "utf8")) as { routes: readonly unknown[] };
+function readRouteTable(routeTablePath: string): {
+  readonly expiresAt?: string;
+  readonly expiresAtMs?: number;
+  readonly ttlMs?: number;
+  readonly generation?: unknown;
+  readonly routes: readonly unknown[];
+} {
+  return JSON.parse(fs.readFileSync(routeTablePath, "utf8")) as {
+    readonly expiresAt?: string;
+    readonly expiresAtMs?: number;
+    readonly ttlMs?: number;
+    readonly generation?: unknown;
+    readonly routes: readonly unknown[];
+  };
 }
 
 function readRouteTableGeneration(routeTablePath: string): { readonly writerId?: string } | undefined {

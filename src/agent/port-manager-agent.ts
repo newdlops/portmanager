@@ -11,6 +11,8 @@ import {
   getRouteTablePathForComposeClaimPort,
   getRouteTablePathForLogicalPort,
   getRouteTablePathForNetwork,
+  ROUTE_TABLE_REFRESH_MARGIN_MS,
+  ROUTE_TABLE_TTL_MS,
 } from "./route-table";
 import type {
   AgentAllocateRouteRequest,
@@ -907,6 +909,7 @@ export class PortManagerAgent implements DisposableLike {
   /** Refreshes the snapshot and broadcasts it only when routing/listener state changed. */
   async refreshSnapshot(): Promise<AgentSnapshot> {
     const snapshot = await this.buildSnapshot({ allowRecentListenerCache: true });
+    this.writeRouteTable(snapshot.routes);
     this.broadcastSnapshotIfChanged(snapshot);
     return snapshot;
   }
@@ -1816,8 +1819,15 @@ export class PortManagerAgent implements DisposableLike {
     generation: RouteTableGeneration,
   ): boolean {
     const routeTableSignature = buildRouteTableSignature(routes);
+    const writtenAt = this.now();
+    const writtenAtMs = writtenAt.getTime();
     if (routeTableSignature === this.routeTableSignaturesByPath.get(routeTablePath) && fs.existsSync(routeTablePath)) {
-      return true;
+      if (isRouteTablePathNewerThanGeneration(routeTablePath, generation)) {
+        return false;
+      }
+      if (!routeTableFileNeedsRefresh(routeTablePath, writtenAtMs)) {
+        return true;
+      }
     }
 
     try {
@@ -1825,10 +1835,22 @@ export class PortManagerAgent implements DisposableLike {
         return false;
       }
 
+      const expiresAtMs = writtenAtMs + ROUTE_TABLE_TTL_MS;
       fs.mkdirSync(path.dirname(routeTablePath), { recursive: true });
       writeAtomicRouteTableFile(
         routeTablePath,
-        `${JSON.stringify({ updatedAt: this.now().toISOString(), generation, routes }, null, 2)}\n`,
+        `${JSON.stringify(
+          {
+            updatedAt: writtenAt.toISOString(),
+            expiresAt: new Date(expiresAtMs).toISOString(),
+            expiresAtMs,
+            ttlMs: ROUTE_TABLE_TTL_MS,
+            generation,
+            routes,
+          },
+          null,
+          2,
+        )}\n`,
       );
       this.routeTableSignaturesByPath.set(routeTablePath, routeTableSignature);
       return true;
@@ -2466,6 +2488,20 @@ function buildSnapshotSignature(snapshot: AgentSnapshot): string {
 /** Builds a content-only route table signature for write de-duplication. */
 function buildRouteTableSignature(routes: readonly LogicalPortRoute[]): string {
   return JSON.stringify(buildRouteSignatureRows(routes));
+}
+
+/** True when an existing route table should be rewritten to extend native-reader TTL. */
+function routeTableFileNeedsRefresh(routeTablePath: string, nowMs: number): boolean {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(routeTablePath, "utf8")) as { readonly expiresAtMs?: unknown };
+    if (typeof parsed.expiresAtMs !== "number" || !Number.isFinite(parsed.expiresAtMs)) {
+      return true;
+    }
+
+    return parsed.expiresAtMs - nowMs <= ROUTE_TABLE_REFRESH_MARGIN_MS;
+  } catch {
+    return true;
+  }
 }
 
 /** Reads route-table freshness metadata while tolerating legacy documents. */

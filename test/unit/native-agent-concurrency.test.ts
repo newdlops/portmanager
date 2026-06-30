@@ -70,6 +70,25 @@ test("native agent matches loopback listeners by host as well as port", () => {
   assert.equal(source.includes("pm_find_listener_by_port("), false);
 });
 
+test("native agent route tables carry TTL and refresh unchanged files", () => {
+  const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
+  const writeStart = source.indexOf("static int pm_write_route_table_file(");
+  const writeEnd = source.indexOf("static int pm_build_route_table_signature", writeStart);
+  const writeBody = source.slice(writeStart, writeEnd);
+  const unchangedStart = source.indexOf("static int pm_write_route_table_file_if_changed");
+  const unchangedEnd = source.indexOf("static void pm_route_table_write_lock_path", unchangedStart);
+  const unchangedBody = source.slice(unchangedStart, unchangedEnd);
+
+  assert.equal(source.includes("PM_ROUTE_TABLE_TTL_SECONDS 300"), true);
+  assert.equal(source.includes("PM_ROUTE_TABLE_REFRESH_MARGIN_SECONDS 60"), true);
+  assert.equal(source.includes("static int pm_route_table_file_fresh_for_reuse"), true);
+  assert.notEqual(writeStart, -1);
+  assert.equal(writeBody.includes('\\"expiresAtMs\\":%ld,\\"ttlMs\\":%ld'), true);
+  assert.notEqual(unchangedStart, -1);
+  assert.equal(unchangedBody.includes("pm_route_table_file_fresh_for_reuse(file_path)"), true);
+  assert.equal(unchangedBody.includes("pm_write_route_table_file(state, file_path, routes, count, sequence)"), true);
+});
+
 test("native agent recovers restarted hook routes from process environment", () => {
   const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
   const header = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.h"), "utf8");

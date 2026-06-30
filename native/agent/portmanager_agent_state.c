@@ -23,6 +23,8 @@
 #define PM_ROUTE_TABLE_WRITE_LOCK_STALE_SECONDS 30
 #define PM_ROUTE_TABLE_WRITE_LOCK_ATTEMPTS 100
 #define PM_ROUTE_TABLE_WRITE_LOCK_SLEEP_US 10000
+#define PM_ROUTE_TABLE_TTL_SECONDS 300
+#define PM_ROUTE_TABLE_REFRESH_MARGIN_SECONDS 60
 
 typedef struct {
   pm_route *items;
@@ -1927,6 +1929,39 @@ static int pm_route_table_generation_is_newer(
   return current_sequence > candidate_sequence;
 }
 
+/*
+ * Unchanged route content can reuse the existing file only while native readers
+ * still consider its TTL fresh. Missing TTL metadata is treated as legacy state
+ * and rewritten into the current format.
+ */
+static int pm_route_table_file_fresh_for_reuse(const char *file_path) {
+  char buffer[4096];
+  int fd;
+  ssize_t count;
+  long expires_at_ms;
+  long now_ms;
+
+  fd = open(file_path, O_RDONLY);
+  if (fd < 0) {
+    return 0;
+  }
+
+  count = read(fd, buffer, sizeof(buffer) - 1);
+  close(fd);
+  if (count <= 0) {
+    return 0;
+  }
+
+  buffer[count] = '\0';
+  expires_at_ms = pm_json_get_long(buffer, "expiresAtMs", 0);
+  if (expires_at_ms <= 0) {
+    return 0;
+  }
+
+  now_ms = pm_epoch_milliseconds();
+  return expires_at_ms - now_ms > PM_ROUTE_TABLE_REFRESH_MARGIN_SECONDS * 1000L;
+}
+
 static int pm_unlink_route_table_file_if_not_newer(
   const pm_agent_state *state,
   const char *file_path,
@@ -1946,6 +1981,8 @@ static int pm_write_route_table_file(
   unsigned long sequence) {
   pm_buffer buffer;
   char updated_at[PM_TIME];
+  long updated_at_ms;
+  long expires_at_ms;
   int result;
 
   if (pm_route_table_generation_is_newer(state, file_path, sequence)) {
@@ -1954,8 +1991,15 @@ static int pm_write_route_table_file(
 
   pm_buffer_init(&buffer);
   pm_iso_now(updated_at, sizeof(updated_at));
+  updated_at_ms = pm_epoch_milliseconds();
+  expires_at_ms = updated_at_ms + PM_ROUTE_TABLE_TTL_SECONDS * 1000L;
   result = pm_buffer_append(&buffer, "{\"updatedAt\":") ||
            pm_json_append_string(&buffer, updated_at) ||
+           pm_buffer_appendf(
+             &buffer,
+             ",\"expiresAtMs\":%ld,\"ttlMs\":%ld",
+             expires_at_ms,
+             PM_ROUTE_TABLE_TTL_SECONDS * 1000L) ||
            pm_buffer_append(&buffer, ",\"generation\":{\"writerId\":") ||
            pm_json_append_string(&buffer, state->route_table_writer_id) ||
            pm_buffer_appendf(
@@ -1998,7 +2042,13 @@ static int pm_write_route_table_file_if_changed(
 
   previous_signature = pm_route_table_signature_for_path(state, file_path);
   if (previous_signature != NULL && strcmp(previous_signature, signature.data == NULL ? "" : signature.data) == 0 && access(file_path, F_OK) == 0) {
-    result = pm_route_table_generation_is_newer(state, file_path, sequence) ? -1 : 0;
+    if (pm_route_table_generation_is_newer(state, file_path, sequence)) {
+      result = -1;
+    } else if (pm_route_table_file_fresh_for_reuse(file_path)) {
+      result = 0;
+    } else {
+      result = pm_write_route_table_file(state, file_path, routes, count, sequence);
+    }
     pm_buffer_free(&signature);
     return result;
   }

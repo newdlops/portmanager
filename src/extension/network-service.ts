@@ -12,6 +12,8 @@ import {
   getDefaultRouteTablePath,
   getLegacyDefaultRouteTablePath,
   getRouteTablePathForNetwork,
+  ROUTE_TABLE_REFRESH_MARGIN_MS,
+  ROUTE_TABLE_TTL_MS,
 } from "../agent/route-table";
 import { readContainerRuntimeSettings, readPortManagerSettings } from "../config/vscode-settings";
 import {
@@ -2867,7 +2869,7 @@ export class PortManagerNetworkService implements DisposableLike {
     ];
     if (
       options.force !== true &&
-      (await Promise.all(routeTablePaths.map((routeTablePath) => fileIsReadable(routeTablePath)))).every(Boolean)
+      (await Promise.all(routeTablePaths.map((routeTablePath) => routeTableFileIsFresh(routeTablePath)))).every(Boolean)
     ) {
       return;
     }
@@ -4011,12 +4013,12 @@ export class PortManagerNetworkService implements DisposableLike {
     const rowsByScopedFilePath = new Map<string, ComposeProjectRoutingRow[]>();
 
     await fs.mkdir(path.dirname(globalFilePath), { recursive: true });
-    await writeTextFileAtomically(globalFilePath, "");
+    await writeTextFileAtomicallyOrTouch(globalFilePath, "");
 
     for (const network of snapshot.networks) {
       const scopedFilePath = this.getComposeProjectRoutingFilePath(network.id);
       currentScopedPaths.add(scopedFilePath);
-      await writeTextFileAtomically(scopedFilePath, "");
+      await writeTextFileAtomicallyOrTouch(scopedFilePath, "");
     }
 
     for (const row of rows) {
@@ -4031,7 +4033,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     for (const [scopedFilePath, scopedRows] of rowsByScopedFilePath) {
-      await writeTextFileAtomically(scopedFilePath, serializeComposeProjectRoutingRows(scopedRows));
+      await writeTextFileAtomicallyOrTouch(scopedFilePath, serializeComposeProjectRoutingRows(scopedRows));
     }
 
     await this.removeStaleComposeProjectRoutingFiles(currentScopedPaths);
@@ -6092,6 +6094,22 @@ async function writeTextFileAtomically(filePath: string, contents: string): Prom
   await fs.rename(tempPath, filePath).catch(async (error) => {
     await fs.rm(tempPath, { force: true }).catch(() => undefined);
     throw error;
+  });
+}
+
+/** Keeps mtime-based native TTL readers fresh without changing TSV contents. */
+async function writeTextFileAtomicallyOrTouch(filePath: string, contents: string): Promise<void> {
+  if (!(await textFileAlreadyMatches(filePath, contents))) {
+    await writeTextFileAtomically(filePath, contents);
+    return;
+  }
+
+  const refreshedAt = new Date();
+  await fs.utimes(filePath, refreshedAt, refreshedAt).catch(async (error) => {
+    if (!isNodeErrorWithCode(error, "ENOENT")) {
+      throw error;
+    }
+    await writeTextFileAtomically(filePath, contents);
   });
 }
 
@@ -8199,6 +8217,22 @@ async function fileIsReadable(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath, syncFs.constants.R_OK);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/** True when daemon route-table storage is readable and not close to reader-side TTL expiry. */
+async function routeTableFileIsFresh(filePath: string): Promise<boolean> {
+  try {
+    const [text, stat] = await Promise.all([fs.readFile(filePath, "utf8"), fs.stat(filePath)]);
+    const nowMs = Date.now();
+    const parsed = JSON.parse(text) as { readonly expiresAtMs?: unknown };
+    if (typeof parsed.expiresAtMs === "number" && Number.isFinite(parsed.expiresAtMs)) {
+      return parsed.expiresAtMs - nowMs > ROUTE_TABLE_REFRESH_MARGIN_MS;
+    }
+
+    return stat.mtimeMs + ROUTE_TABLE_TTL_MS - nowMs > ROUTE_TABLE_REFRESH_MARGIN_MS;
   } catch {
     return false;
   }

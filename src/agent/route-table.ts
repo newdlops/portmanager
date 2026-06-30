@@ -11,6 +11,12 @@ import * as path from "node:path";
 
 let routeTableStorageDirectory: string | undefined;
 
+/** Route files expire if the extension/daemon no longer refreshes generated state. */
+export const ROUTE_TABLE_TTL_MS = 300_000;
+
+/** Background convergence refreshes route files before native readers reject them. */
+export const ROUTE_TABLE_REFRESH_MARGIN_MS = 60_000;
+
 /** Points extension-owned route tables at durable globalStorage instead of OS temp. */
 export function configureRouteTableStorageDirectory(storageDirectory: string): void {
   const normalizedDirectory = storageDirectory.trim();

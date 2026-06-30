@@ -70,6 +70,31 @@ test("docker shim prefers scoped route table network over stale compose routing 
   assert.equal(matcherBody.includes("return 0;"), true);
 });
 
+test("docker shim rejects expired route-table and compose routing files", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/docker-shim/portmanager_docker_shim.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const routeTableReaderStart = source.indexOf("static int pm_read_route_table_file_limited");
+  const routeTableReaderEnd = source.indexOf("static int pm_parse_int_env", routeTableReaderStart);
+  const routeTableReaderBody = source.slice(routeTableReaderStart, routeTableReaderEnd);
+  const composeFinderStart = source.indexOf("static int pm_find_compose_route(");
+  const composeFinderEnd = source.indexOf("/** Allocates one rewritten compose project option argument.", composeFinderStart);
+  const composeFinderBody = source.slice(composeFinderStart, composeFinderEnd);
+  const containerFinderStart = source.indexOf("static char *pm_container_target_for_token(");
+  const containerFinderEnd = source.indexOf("/** Rewrites container-name arguments", containerFinderStart);
+  const containerFinderBody = source.slice(containerFinderStart, containerFinderEnd);
+
+  assert.equal(source.includes("PM_ROUTE_TABLE_TTL_SECONDS 300"), true);
+  assert.equal(source.includes("pm_generated_route_file_expired(route_file)"), true);
+  assert.equal(source.includes("pm_generated_route_file_expired(routing_file)"), true);
+  assert.notEqual(routeTableReaderStart, -1);
+  assert.equal(routeTableReaderBody.includes("pm_generated_route_file_expired(path)"), true);
+  assert.equal(routeTableReaderBody.includes("pm_route_table_buffer_expired(*buffer_out)"), true);
+  assert.notEqual(composeFinderStart, -1);
+  assert.equal(composeFinderBody.includes("pm_generated_route_file_expired(file_path)"), true);
+  assert.notEqual(containerFinderStart, -1);
+  assert.equal(containerFinderBody.includes("pm_generated_route_file_expired(file_path)"), true);
+});
+
 test("docker shim requires generated override for rewritten compose projects", () => {
   const sourcePath = path.resolve(__dirname, "../../../native/docker-shim/portmanager_docker_shim.c");
   const source = fs.readFileSync(sourcePath, "utf8");
