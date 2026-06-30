@@ -66,6 +66,8 @@ const DEFAULT_EXTERNAL_LISTENER_GRACE_MS = 60_000;
 const DEFAULT_EXTERNAL_LISTENER_MISSING_SCAN_THRESHOLD = 3;
 const HOOK_ROUTE_RECOVERY_MISS_TTL_MS = 60_000;
 const ROUTE_ALLOCATION_TTL_MS = 300_000;
+// Pre-handshake routes use a cleanup lease, not the idle TTL that starts after traffic proves both sides.
+const PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS = ROUTE_ALLOCATION_TTL_MS;
 const ROUTE_TABLE_GENERATION_LOCK_STALE_MS = 30_000;
 const ROUTE_TABLE_GENERATION_LOCK_ATTEMPTS = 100;
 const ROUTE_TABLE_GENERATION_LOCK_SLEEP_MS = 10;
@@ -205,6 +207,13 @@ interface RouteTableGeneration {
   readonly pid: number;
 }
 
+interface RouteTableTtlMetadata {
+  /** Time when native readers should reject the route table, after first handshake starts TTL. */
+  readonly expiresAtMs: number;
+  /** True while at least one route is waiting for its first bidirectional connection. */
+  readonly waitsForFirstHandshake: boolean;
+}
+
 /**
  * Serves Port Manager requests and broadcasts snapshots to connected clients.
  * Methods return domain objects so tests and future non-socket clients can use
@@ -335,8 +344,9 @@ export class PortManagerAgent implements DisposableLike {
   private readonly routeTableSignaturesByPath = new Map<string, string>();
 
   /**
-   * Endpoint ids that recently saw both sides of routing: a live listener route
-   * and a successful sender path that asked the daemon to refresh it.
+   * Endpoint ids that saw both sides of routing at least once. The value is the
+   * expiry derived from the most recent observation; expired values are retained
+   * while the route exists so TTL does not reset before another handshake.
    */
   private readonly bidirectionalRouteRefreshUntilMsByEndpoint = new Map<string, number>();
 
@@ -1275,7 +1285,9 @@ export class PortManagerAgent implements DisposableLike {
       defaultCwd: this.defaultCwd,
     });
 
-    await this.refreshEstablishedRouteObservations(snapshot.routes);
+    if (await this.refreshEstablishedRouteObservations(snapshot.routes)) {
+      this.writeRouteTable(snapshot.routes);
+    }
     return snapshot;
   }
 
@@ -1403,62 +1415,93 @@ export class PortManagerAgent implements DisposableLike {
    * Marks an endpoint as safe to extend because the daemon observed a sender
    * after a listener route existed, or the second side joined a pending route.
    */
-  private markBidirectionalRouteObserved(logicalPort: number, networkId: string | undefined): void {
+  private markBidirectionalRouteObserved(logicalPort: number, networkId: string | undefined): boolean {
     const endpointIdentity = buildLogicalEndpointIdentity({
       logicalPort,
       ...(networkId ? { networkId } : {}),
     });
-    this.bidirectionalRouteRefreshUntilMsByEndpoint.set(endpointIdentity, this.now().getTime() + this.routeTableTtlMs);
+    const refreshUntilMs = this.now().getTime() + this.routeTableTtlMs;
+    const previousRefreshUntilMs = this.bidirectionalRouteRefreshUntilMsByEndpoint.get(endpointIdentity);
+    this.bidirectionalRouteRefreshUntilMsByEndpoint.set(endpointIdentity, refreshUntilMs);
+    return previousRefreshUntilMs === undefined || refreshUntilMs > previousRefreshUntilMs;
   }
 
   /** Refreshes endpoint liveness from the OS TCP table so long-lived sockets keep their routes alive. */
-  private async refreshEstablishedRouteObservations(routes: readonly LogicalPortRoute[]): Promise<void> {
+  private async refreshEstablishedRouteObservations(routes: readonly LogicalPortRoute[]): Promise<boolean> {
     if (this.establishedConnectionProvider === undefined || routes.length === 0) {
-      return;
+      return false;
     }
 
     const establishedConnections = await this.establishedConnectionProvider.list().catch(() => []);
     if (establishedConnections.length === 0) {
-      return;
+      return false;
     }
 
+    let changed = false;
     for (const route of routes) {
       if (route.source === "compose") {
         continue;
       }
       if (routeHasEstablishedConnection(route, establishedConnections)) {
-        this.markBidirectionalRouteObserved(route.logicalPort, normalizeNetworkId(route.networkId));
+        changed = this.markBidirectionalRouteObserved(route.logicalPort, normalizeNetworkId(route.networkId)) || changed;
       }
     }
+
+    return changed;
   }
 
   /**
    * True when unchanged route content is safe to rewrite for reader TTL.
    *
-   * Running rows are already backed by live registry state. Short-lived pending
-   * allocations still need a recent two-sided observation so a never-started
-   * route cannot be kept alive by aggregate table rewrites.
+   * Before the first bidirectional observation, rewrites are a liveness lease:
+   * current registry/allocation state says the route can still handshake. After
+   * the first observation, only fresh established traffic can extend the idle TTL.
    */
   private canRefreshUnchangedRouteTable(routes: readonly LogicalPortRoute[], nowMs: number): boolean {
-    this.pruneExpiredBidirectionalRouteObservations(nowMs);
     if (routes.length === 0) {
       return false;
     }
 
     return routes.every((route) => {
-      if (route.status === "running" || route.source === "compose") {
-        return true;
-      }
-
       const endpointIdentity = buildLogicalEndpointIdentity(route);
-      return (this.bidirectionalRouteRefreshUntilMsByEndpoint.get(endpointIdentity) ?? 0) > nowMs;
+      const refreshUntilMs = this.bidirectionalRouteRefreshUntilMsByEndpoint.get(endpointIdentity);
+      return refreshUntilMs === undefined || refreshUntilMs > nowMs;
     });
   }
 
-  /** Drops expired refresh grants so a single historical connect cannot keep routes alive forever. */
-  private pruneExpiredBidirectionalRouteObservations(nowMs: number): void {
-    for (const [endpointIdentity, refreshUntilMs] of this.bidirectionalRouteRefreshUntilMsByEndpoint) {
-      if (refreshUntilMs <= nowMs) {
+  /** Builds the effective reader expiry for the current route-table generation. */
+  private routeTableTtlMetadata(routes: readonly LogicalPortRoute[], writtenAtMs: number): RouteTableTtlMetadata {
+    if (routes.length === 0) {
+      return {
+        expiresAtMs: writtenAtMs + this.routeTableTtlMs,
+        waitsForFirstHandshake: false,
+      };
+    }
+
+    let waitsForFirstHandshake = false;
+    let expiresAtMs = Number.POSITIVE_INFINITY;
+    for (const route of routes) {
+      const endpointIdentity = buildLogicalEndpointIdentity(route);
+      const refreshUntilMs = this.bidirectionalRouteRefreshUntilMsByEndpoint.get(endpointIdentity);
+      if (refreshUntilMs === undefined) {
+        waitsForFirstHandshake = true;
+        expiresAtMs = Math.min(expiresAtMs, writtenAtMs + PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS);
+      } else {
+        expiresAtMs = Math.min(expiresAtMs, refreshUntilMs);
+      }
+    }
+
+    return {
+      expiresAtMs,
+      waitsForFirstHandshake,
+    };
+  }
+
+  /** Drops handshake observations only after the logical endpoint has disappeared. */
+  private pruneBidirectionalRouteObservationsForRoutes(routes: readonly LogicalPortRoute[]): void {
+    const activeEndpointIdentities = new Set(routes.map((route) => buildLogicalEndpointIdentity(route)));
+    for (const endpointIdentity of this.bidirectionalRouteRefreshUntilMsByEndpoint.keys()) {
+      if (!activeEndpointIdentities.has(endpointIdentity)) {
         this.bidirectionalRouteRefreshUntilMsByEndpoint.delete(endpointIdentity);
       }
     }
@@ -1734,6 +1777,7 @@ export class PortManagerAgent implements DisposableLike {
     routes: readonly LogicalPortRoute[],
     generation: RouteTableGeneration,
   ): boolean {
+    this.pruneBidirectionalRouteObservationsForRoutes(routes);
     let generationSucceeded = this.writeRouteEntryFiles(routes, generation);
     generationSucceeded = this.writeComposeClaimFiles(routes, generation) && generationSucceeded;
     generationSucceeded = this.writeRouteTableFile(this.routeTablePath, routes, generation) && generationSucceeded;
@@ -1913,11 +1957,12 @@ export class PortManagerAgent implements DisposableLike {
     const routeTableSignature = buildRouteTableSignature(routes);
     const writtenAt = this.now();
     const writtenAtMs = writtenAt.getTime();
+    const ttlMetadata = this.routeTableTtlMetadata(routes, writtenAtMs);
     if (routeTableSignature === this.routeTableSignaturesByPath.get(routeTablePath) && fs.existsSync(routeTablePath)) {
       if (isRouteTablePathNewerThanGeneration(routeTablePath, generation)) {
         return false;
       }
-      if (!routeTableFileNeedsRefresh(routeTablePath, writtenAtMs, this.routeTableTtlMs)) {
+      if (!routeTableFileNeedsRefresh(routeTablePath, writtenAtMs, this.routeTableTtlMs, ttlMetadata)) {
         return true;
       }
       if (!this.canRefreshUnchangedRouteTable(routes, writtenAtMs)) {
@@ -1930,16 +1975,21 @@ export class PortManagerAgent implements DisposableLike {
         return false;
       }
 
-      const expiresAtMs = writtenAtMs + this.routeTableTtlMs;
       fs.mkdirSync(path.dirname(routeTablePath), { recursive: true });
       writeAtomicRouteTableFile(
         routeTablePath,
         `${JSON.stringify(
           {
             updatedAt: writtenAt.toISOString(),
-            expiresAt: new Date(expiresAtMs).toISOString(),
-            expiresAtMs,
+            expiresAt: new Date(ttlMetadata.expiresAtMs).toISOString(),
+            expiresAtMs: ttlMetadata.expiresAtMs,
             ttlMs: this.routeTableTtlMs,
+            ...(ttlMetadata.waitsForFirstHandshake
+              ? {
+                  ttlStartsAfterFirstHandshake: true,
+                  preHandshakeLeaseMs: PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS,
+                }
+              : {}),
             generation,
             routes,
           },
@@ -2598,11 +2648,25 @@ function buildRouteTableSignature(routes: readonly LogicalPortRoute[]): string {
 }
 
 /** True when an existing route table should be rewritten to extend native-reader TTL. */
-function routeTableFileNeedsRefresh(routeTablePath: string, nowMs: number, routeTableTtlMs = ROUTE_TABLE_TTL_MS): boolean {
+function routeTableFileNeedsRefresh(
+  routeTablePath: string,
+  nowMs: number,
+  routeTableTtlMs = ROUTE_TABLE_TTL_MS,
+  nextTtlMetadata?: RouteTableTtlMetadata,
+): boolean {
   try {
-    const parsed = JSON.parse(fs.readFileSync(routeTablePath, "utf8")) as { readonly expiresAtMs?: unknown };
+    const parsed = JSON.parse(fs.readFileSync(routeTablePath, "utf8")) as {
+      readonly expiresAtMs?: unknown;
+      readonly ttlStartsAfterFirstHandshake?: unknown;
+    };
     const refreshMarginMs = routeTableRefreshMarginMs(routeTableTtlMs);
     if (typeof parsed.expiresAtMs !== "number" || !Number.isFinite(parsed.expiresAtMs)) {
+      return true;
+    }
+    if (
+      nextTtlMetadata !== undefined &&
+      (parsed.ttlStartsAfterFirstHandshake === true) !== nextTtlMetadata.waitsForFirstHandshake
+    ) {
       return true;
     }
 

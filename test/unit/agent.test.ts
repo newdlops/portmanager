@@ -30,6 +30,7 @@ import type {
 
 const fixedUpdatedAt = "2026-06-21T10:00:00.000Z";
 const fixedNow = () => new Date(fixedUpdatedAt);
+const PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS = 300_000;
 
 test("registers native hook processes as hooked managed rows", async (context) => {
   const routeTablePath = createRouteTablePath(context);
@@ -85,8 +86,13 @@ test("registers native hook processes as hooked managed rows", async (context) =
   ]);
   const networkRouteTable = readRouteTable(getNetworkRouteTablePath("network-a", routeTablePath));
   assert.equal(networkRouteTable.ttlMs, ROUTE_TABLE_TTL_MS);
-  assert.equal(networkRouteTable.expiresAt, new Date(Date.parse(fixedUpdatedAt) + ROUTE_TABLE_TTL_MS).toISOString());
-  assert.equal(networkRouteTable.expiresAtMs, Date.parse(fixedUpdatedAt) + ROUTE_TABLE_TTL_MS);
+  assert.equal(networkRouteTable.ttlStartsAfterFirstHandshake, true);
+  assert.equal(networkRouteTable.preHandshakeLeaseMs, PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS);
+  assert.equal(
+    networkRouteTable.expiresAt,
+    new Date(Date.parse(fixedUpdatedAt) + PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS).toISOString(),
+  );
+  assert.equal(networkRouteTable.expiresAtMs, Date.parse(fixedUpdatedAt) + PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS);
   assert.deepEqual(networkRouteTable.routes, snapshot.routes);
   assert.deepEqual(readRouteTable(getRouteTablePathForLogicalPort(8000, "network-a", routeTablePath)).routes, snapshot.routes);
 
@@ -200,7 +206,7 @@ test("newer route table generation rejects stale daemon writes", async (context)
   assert.equal(fs.existsSync(getRouteTablePathForLogicalPort(8001, "network-a", routeTablePath)), false);
 });
 
-test("refreshSnapshot refreshes running unchanged route tables without requiring every route to be established", async (context) => {
+test("route-table TTL starts after the first bidirectional handshake", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   let nowMs = Date.parse(fixedUpdatedAt);
   let establishedConnections: readonly EstablishedTcpConnection[] = [];
@@ -232,29 +238,45 @@ test("refreshSnapshot refreshes running unchanged route tables without requiring
   });
 
   const initialRouteTable = readRouteTable(routeTablePath);
-  assert.equal(initialRouteTable.expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
+  assert.equal(initialRouteTable.ttlStartsAfterFirstHandshake, true);
+  assert.equal(initialRouteTable.expiresAtMs, nowMs + PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS);
 
-  nowMs += ROUTE_TABLE_TTL_MS - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
+  nowMs = initialRouteTable.expiresAtMs! - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
   await agent.refreshSnapshot();
 
   const refreshedWithoutEstablishedConnection = readRouteTable(routeTablePath);
   assert.equal(refreshedWithoutEstablishedConnection.ttlMs, ROUTE_TABLE_TTL_MS);
-  assert.equal(refreshedWithoutEstablishedConnection.expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
+  assert.equal(refreshedWithoutEstablishedConnection.ttlStartsAfterFirstHandshake, true);
+  assert.equal(refreshedWithoutEstablishedConnection.expiresAtMs, nowMs + PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS);
 
-  nowMs = refreshedWithoutEstablishedConnection.expiresAtMs - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
+  establishedConnections = [
+    {
+      localAddress: "127.0.0.1",
+      localPort: 58000,
+      remoteAddress: "127.0.0.1",
+      remotePort: 49152,
+    },
+  ];
   await agent.refreshSnapshot();
 
-  const refreshedRouteTable = readRouteTable(routeTablePath);
-  assert.equal(refreshedRouteTable.ttlMs, ROUTE_TABLE_TTL_MS);
-  assert.equal(refreshedRouteTable.expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
+  const firstHandshakeRouteTable = readRouteTable(routeTablePath);
+  assert.equal(firstHandshakeRouteTable.ttlMs, ROUTE_TABLE_TTL_MS);
+  assert.equal(firstHandshakeRouteTable.ttlStartsAfterFirstHandshake, undefined);
+  assert.equal(firstHandshakeRouteTable.expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
+
+  establishedConnections = [];
+  nowMs = firstHandshakeRouteTable.expiresAtMs! - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
+  await agent.refreshSnapshot();
+
+  assert.equal(readRouteTable(routeTablePath).expiresAtMs, firstHandshakeRouteTable.expiresAtMs);
 
   fs.writeFileSync(
     routeTablePath,
     `${JSON.stringify(
       {
         updatedAt: fixedUpdatedAt,
-        generation: refreshedRouteTable.generation,
-        routes: refreshedRouteTable.routes,
+        generation: firstHandshakeRouteTable.generation,
+        routes: firstHandshakeRouteTable.routes,
       },
       null,
       2,
@@ -267,7 +289,7 @@ test("refreshSnapshot refreshes running unchanged route tables without requiring
   assert.equal(readRouteTable(routeTablePath).ttlMs, ROUTE_TABLE_TTL_MS);
 });
 
-test("refreshSnapshot does not extend unchanged pending-only route tables without route traffic", async (context) => {
+test("refreshSnapshot extends pending pre-handshake route tables while allocation is live", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   let nowMs = Date.parse(fixedUpdatedAt);
   const agent = new PortManagerAgent({
@@ -301,10 +323,13 @@ test("refreshSnapshot does not extend unchanged pending-only route tables withou
   });
 
   const initialRouteTable = readRouteTable(routeTablePath);
-  nowMs += ROUTE_TABLE_TTL_MS - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
+  assert.equal(initialRouteTable.ttlStartsAfterFirstHandshake, true);
+  nowMs = initialRouteTable.expiresAtMs! - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
   await agent.refreshSnapshot();
 
-  assert.equal(readRouteTable(routeTablePath).expiresAtMs, initialRouteTable.expiresAtMs);
+  const refreshedRouteTable = readRouteTable(routeTablePath);
+  assert.equal(refreshedRouteTable.ttlStartsAfterFirstHandshake, true);
+  assert.equal(refreshedRouteTable.expiresAtMs, nowMs + PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS);
 });
 
 test("refreshSnapshot keeps large running route tables alive when some routes are idle", async (context) => {
@@ -342,12 +367,13 @@ test("refreshSnapshot keeps large running route tables alive when some routes ar
   const initialRouteTable = readRouteTable(routeTablePath);
   assert.equal(initialRouteTable.routes.length, 72);
 
-  nowMs += ROUTE_TABLE_TTL_MS - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
+  nowMs = initialRouteTable.expiresAtMs! - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
   await agent.refreshSnapshot();
 
   const refreshedRouteTable = readRouteTable(routeTablePath);
   assert.equal(refreshedRouteTable.routes.length, 72);
-  assert.equal(refreshedRouteTable.expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
+  assert.equal(refreshedRouteTable.ttlStartsAfterFirstHandshake, true);
+  assert.equal(refreshedRouteTable.expiresAtMs, nowMs + PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS);
 });
 
 test("keeps unscoped host listeners out of cwd-matched networks", async (context) => {
@@ -2184,6 +2210,8 @@ function readRouteTable(routeTablePath: string): {
   readonly expiresAt?: string;
   readonly expiresAtMs?: number;
   readonly ttlMs?: number;
+  readonly ttlStartsAfterFirstHandshake?: boolean;
+  readonly preHandshakeLeaseMs?: number;
   readonly generation?: unknown;
   readonly routes: readonly unknown[];
 } {
@@ -2191,6 +2219,8 @@ function readRouteTable(routeTablePath: string): {
     readonly expiresAt?: string;
     readonly expiresAtMs?: number;
     readonly ttlMs?: number;
+    readonly ttlStartsAfterFirstHandshake?: boolean;
+    readonly preHandshakeLeaseMs?: number;
     readonly generation?: unknown;
     readonly routes: readonly unknown[];
   };

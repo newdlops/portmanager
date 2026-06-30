@@ -137,6 +137,9 @@ async function stressRouteTableRefresh(count) {
       if (initialRouteTable.routes.length !== count) {
         throw new Error(`route table wrote ${initialRouteTable.routes.length}/${count} routes`);
       }
+      if (initialRouteTable.ttlStartsAfterFirstHandshake !== true || !Number.isFinite(initialRouteTable.preHandshakeLeaseMs)) {
+        throw new Error("route table did not publish pre-handshake TTL metadata");
+      }
       for (let networkIndex = 0; networkIndex < networkIds.length; networkIndex += 1) {
         const networkRouteTable = readRouteTable(getRouteTablePathForNetwork(networkIds[networkIndex], routeTablePath));
         const expectedCount = expectedRouteCountForNetwork(count, networkIndex);
@@ -144,6 +147,9 @@ async function stressRouteTableRefresh(count) {
           throw new Error(
             `network route table ${networkIds[networkIndex]} wrote ${networkRouteTable.routes.length}/${expectedCount} routes`,
           );
+        }
+        if (networkRouteTable.ttlStartsAfterFirstHandshake !== true) {
+          throw new Error(`network route table ${networkIds[networkIndex]} did not wait for first handshake`);
         }
       }
 
@@ -154,13 +160,13 @@ async function stressRouteTableRefresh(count) {
       if (refreshedRouteTable.routes.length !== count) {
         throw new Error(`route table refreshed ${refreshedRouteTable.routes.length}/${count} routes`);
       }
-      if (refreshedRouteTable.expiresAtMs !== nowMs + ROUTE_TABLE_TTL_MS) {
-        throw new Error(`route table TTL was not refreshed for ${count} running routes`);
+      if (refreshedRouteTable.expiresAtMs !== nowMs + initialRouteTable.preHandshakeLeaseMs) {
+        throw new Error(`route table pre-handshake lease was not refreshed for ${count} running routes`);
       }
       for (const networkId of networkIds) {
         const networkRouteTable = readRouteTable(getRouteTablePathForNetwork(networkId, routeTablePath));
-        if (networkRouteTable.expiresAtMs !== nowMs + ROUTE_TABLE_TTL_MS) {
-          throw new Error(`network route table TTL was not refreshed for ${networkId}`);
+        if (networkRouteTable.expiresAtMs !== nowMs + networkRouteTable.preHandshakeLeaseMs) {
+          throw new Error(`network route table pre-handshake lease was not refreshed for ${networkId}`);
         }
       }
     } finally {

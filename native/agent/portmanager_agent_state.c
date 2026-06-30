@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netdb.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -25,6 +26,8 @@
 #define PM_ROUTE_TABLE_WRITE_LOCK_SLEEP_US 10000
 #define PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"
 #define PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15
+/* Pre-handshake routes use a cleanup lease; the idle TTL starts only after bidirectional traffic. */
+#define PM_PRE_HANDSHAKE_ROUTE_TABLE_LEASE_SECONDS PM_ROUTE_TTL_SECONDS
 
 typedef struct {
   pm_route *items;
@@ -639,11 +642,29 @@ static void pm_endpoint_identity(int logical_port, const char *network_id, char 
   snprintf(buffer, size, "%s:%d", network_id == NULL ? "" : network_id, logical_port);
 }
 
-static void pm_prune_bidirectional_refreshes(pm_agent_state *state, time_t now) {
+/* Matches the logical endpoint identity used to remember whether a route has ever handshaken. */
+static int pm_route_matches_bidirectional_refresh(const pm_route *route, const pm_bidirectional_route_refresh *refresh) {
+  const char *network_id = route->network_id[0] == '\0' ? "" : route->network_id;
+
+  return refresh->logical_port == route->logical_port && strcmp(refresh->network_id, network_id) == 0;
+}
+
+/*
+ * Keeps expired observations while their route still exists. An expired value means
+ * the route is post-handshake but idle, so it must not fall back to pre-handshake lease mode.
+ */
+static void pm_prune_bidirectional_refreshes_for_routes(pm_agent_state *state, const pm_route *routes, size_t count) {
   size_t write_index = 0;
 
   for (size_t read_index = 0; read_index < state->bidirectional_refresh_count; read_index++) {
-    if (state->bidirectional_refreshes[read_index].refresh_until > now) {
+    int keep = 0;
+    for (size_t route_index = 0; route_index < count; route_index++) {
+      if (pm_route_matches_bidirectional_refresh(&routes[route_index], &state->bidirectional_refreshes[read_index])) {
+        keep = 1;
+        break;
+      }
+    }
+    if (keep) {
       if (write_index != read_index) {
         state->bidirectional_refreshes[write_index] = state->bidirectional_refreshes[read_index];
       }
@@ -658,7 +679,6 @@ static int pm_mark_bidirectional_route_observed(pm_agent_state *state, int logic
   const char *normalized_network_id = network_id == NULL ? "" : network_id;
   time_t refresh_until = time(NULL) + pm_route_table_ttl_seconds();
 
-  pm_prune_bidirectional_refreshes(state, time(NULL));
   for (size_t index = 0; index < state->bidirectional_refresh_count; index++) {
     pm_bidirectional_route_refresh *refresh = &state->bidirectional_refreshes[index];
     if (refresh->logical_port == logical_port && strcmp(refresh->network_id, normalized_network_id) == 0) {
@@ -681,20 +701,24 @@ static int pm_mark_bidirectional_route_observed(pm_agent_state *state, int logic
   return 0;
 }
 
-static int pm_route_recently_bidirectional(pm_agent_state *state, const pm_route *route, time_t now) {
-  const char *network_id = route->network_id[0] == '\0' ? "" : route->network_id;
-
-  pm_prune_bidirectional_refreshes(state, now);
+static int pm_route_bidirectional_refresh_until(pm_agent_state *state, const pm_route *route, time_t *refresh_until) {
   for (size_t index = 0; index < state->bidirectional_refresh_count; index++) {
     pm_bidirectional_route_refresh *refresh = &state->bidirectional_refreshes[index];
-    if (refresh->logical_port == route->logical_port && strcmp(refresh->network_id, network_id) == 0) {
-      return refresh->refresh_until > now;
+    if (pm_route_matches_bidirectional_refresh(route, refresh)) {
+      if (refresh_until != NULL) {
+        *refresh_until = refresh->refresh_until;
+      }
+      return 1;
     }
   }
 
   return 0;
 }
 
+/*
+ * Unobserved routes may refresh from live owner/allocation state; observed routes
+ * need a fresh bidirectional refresh grant to extend reader TTL.
+ */
 static int pm_routes_can_refresh_unchanged_table(pm_agent_state *state, const pm_route *routes, size_t count) {
   time_t now = time(NULL);
 
@@ -703,15 +727,57 @@ static int pm_routes_can_refresh_unchanged_table(pm_agent_state *state, const pm
   }
 
   for (size_t index = 0; index < count; index++) {
-    if (strcmp(routes[index].status, "running") == 0 || strcmp(routes[index].source, "compose") == 0) {
+    time_t refresh_until = 0;
+    if (!pm_route_bidirectional_refresh_until(state, &routes[index], &refresh_until)) {
       continue;
     }
-    if (!pm_route_recently_bidirectional(state, &routes[index], now)) {
+    if (refresh_until <= now) {
       return 0;
     }
   }
 
   return 1;
+}
+
+/*
+ * Computes the route table's reader expiry. Before first handshake the expiry is
+ * a cleanup lease; after handshake it is the observed traffic idle deadline.
+ */
+static long pm_route_table_expires_at_ms(
+  pm_agent_state *state,
+  const pm_route *routes,
+  size_t count,
+  long updated_at_ms,
+  int *waits_for_first_handshake) {
+  long expires_at_ms;
+
+  if (waits_for_first_handshake != NULL) {
+    *waits_for_first_handshake = 0;
+  }
+  if (count == 0) {
+    return updated_at_ms + pm_route_table_ttl_seconds() * 1000L;
+  }
+
+  expires_at_ms = LONG_MAX;
+  for (size_t index = 0; index < count; index++) {
+    time_t refresh_until = 0;
+    long candidate_expires_at_ms;
+
+    if (pm_route_bidirectional_refresh_until(state, &routes[index], &refresh_until)) {
+      candidate_expires_at_ms = (long)refresh_until * 1000L;
+    } else {
+      if (waits_for_first_handshake != NULL) {
+        *waits_for_first_handshake = 1;
+      }
+      candidate_expires_at_ms = updated_at_ms + PM_PRE_HANDSHAKE_ROUTE_TABLE_LEASE_SECONDS * 1000L;
+    }
+
+    if (candidate_expires_at_ms < expires_at_ms) {
+      expires_at_ms = candidate_expires_at_ms;
+    }
+  }
+
+  return expires_at_ms == LONG_MAX ? updated_at_ms + pm_route_table_ttl_seconds() * 1000L : expires_at_ms;
 }
 
 static int pm_route_list_add_dedupe(pm_route_list *routes, const pm_route *route) {
@@ -2191,12 +2257,13 @@ static int pm_route_table_generation_is_newer(
  * still consider its TTL fresh. Missing TTL metadata is treated as legacy state
  * and rewritten into the current format.
  */
-static int pm_route_table_file_fresh_for_reuse(const char *file_path) {
+static int pm_route_table_file_fresh_for_reuse(const char *file_path, int waits_for_first_handshake) {
   char buffer[4096];
   int fd;
   ssize_t count;
   long expires_at_ms;
   long now_ms;
+  int existing_waits_for_first_handshake;
 
   fd = open(file_path, O_RDONLY);
   if (fd < 0) {
@@ -2210,6 +2277,11 @@ static int pm_route_table_file_fresh_for_reuse(const char *file_path) {
   }
 
   buffer[count] = '\0';
+  existing_waits_for_first_handshake = strstr(buffer, "\"ttlStartsAfterFirstHandshake\":true") != NULL;
+  if (existing_waits_for_first_handshake != waits_for_first_handshake) {
+    return 0;
+  }
+
   expires_at_ms = pm_json_get_long(buffer, "expiresAtMs", 0);
   if (expires_at_ms <= 0) {
     return 0;
@@ -2231,7 +2303,7 @@ static int pm_unlink_route_table_file_if_not_newer(
 }
 
 static int pm_write_route_table_file(
-  const pm_agent_state *state,
+  pm_agent_state *state,
   const char *file_path,
   const pm_route *routes,
   size_t count,
@@ -2241,6 +2313,7 @@ static int pm_write_route_table_file(
   long updated_at_ms;
   long expires_at_ms;
   long ttl_ms;
+  int waits_for_first_handshake = 0;
   int result;
 
   if (pm_route_table_generation_is_newer(state, file_path, sequence)) {
@@ -2251,14 +2324,21 @@ static int pm_write_route_table_file(
   pm_iso_now(updated_at, sizeof(updated_at));
   updated_at_ms = pm_epoch_milliseconds();
   ttl_ms = pm_route_table_ttl_seconds() * 1000L;
-  expires_at_ms = updated_at_ms + ttl_ms;
+  expires_at_ms = pm_route_table_expires_at_ms(state, routes, count, updated_at_ms, &waits_for_first_handshake);
   result = pm_buffer_append(&buffer, "{\"updatedAt\":") ||
            pm_json_append_string(&buffer, updated_at) ||
            pm_buffer_appendf(
              &buffer,
              ",\"expiresAtMs\":%ld,\"ttlMs\":%ld",
              expires_at_ms,
-             ttl_ms) ||
+             ttl_ms);
+  if (result == 0 && waits_for_first_handshake) {
+    result = pm_buffer_appendf(
+      &buffer,
+      ",\"ttlStartsAfterFirstHandshake\":true,\"preHandshakeLeaseMs\":%ld",
+      (long)PM_PRE_HANDSHAKE_ROUTE_TABLE_LEASE_SECONDS * 1000L);
+  }
+  result = result ||
            pm_buffer_append(&buffer, ",\"generation\":{\"writerId\":") ||
            pm_json_append_string(&buffer, state->route_table_writer_id) ||
            pm_buffer_appendf(
@@ -2292,8 +2372,10 @@ static int pm_write_route_table_file_if_changed(
   unsigned long sequence) {
   pm_buffer signature;
   const char *previous_signature;
+  int waits_for_first_handshake = 0;
   int result;
 
+  (void)pm_route_table_expires_at_ms(state, routes, count, pm_epoch_milliseconds(), &waits_for_first_handshake);
   if (pm_build_route_table_signature(&signature, routes, count) != 0) {
     pm_buffer_free(&signature);
     return -1;
@@ -2303,7 +2385,7 @@ static int pm_write_route_table_file_if_changed(
   if (previous_signature != NULL && strcmp(previous_signature, signature.data == NULL ? "" : signature.data) == 0 && access(file_path, F_OK) == 0) {
     if (pm_route_table_generation_is_newer(state, file_path, sequence)) {
       result = -1;
-    } else if (pm_route_table_file_fresh_for_reuse(file_path)) {
+    } else if (pm_route_table_file_fresh_for_reuse(file_path, waits_for_first_handshake)) {
       result = 0;
     } else if (!pm_routes_can_refresh_unchanged_table(state, routes, count)) {
       result = 0;
@@ -2424,6 +2506,7 @@ static int pm_write_route_tables(pm_agent_state *state) {
   if (pm_build_routes(state, NULL, &routes) != 0) {
     return -1;
   }
+  pm_prune_bidirectional_refreshes_for_routes(state, routes.items, routes.count);
 
   lock_fd = pm_acquire_route_table_write_lock(state->route_table_path, lock_path, sizeof(lock_path));
   if (lock_fd < 0) {
