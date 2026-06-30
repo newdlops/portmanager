@@ -684,8 +684,7 @@ export class PortManagerAgent implements DisposableLike {
     let listeners: readonly ListeningPort[] = [];
 
     try {
-      listeners = await this.scanListeningPorts();
-      this.updateReservedListeningPorts(listeners);
+      listeners = await this.scanListeningPortsForPort(input.actualPort);
     } catch {
       // If listener scans fail, fall back to the explicit lifecycle signal.
     }
@@ -758,7 +757,7 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Starts a managed process while the route-decision lock is held. */
   private async startManagedProcessExclusive(input: AgentStartManagedProcessRequest): Promise<ManagedProcess> {
-    await this.refreshReservedListeningPorts();
+    await this.refreshReservedListeningPorts(input.requestedPort);
 
     const decision = await this.routingService.route({
       requestedPort: input.requestedPort,
@@ -895,7 +894,7 @@ export class PortManagerAgent implements DisposableLike {
     };
 
     return this.runExclusiveRouteOperation(async () => {
-      await this.refreshReservedListeningPorts();
+      await this.refreshReservedListeningPorts(nextProfile.requestedPort);
 
       const decision = await this.routingService.route({
         requestedPort: nextProfile.requestedPort,
@@ -1711,8 +1710,13 @@ export class PortManagerAgent implements DisposableLike {
    * route policy when a low-level availability probe is affected by preload
    * state or process-table timing and incorrectly reports a busy port as free.
    */
-  private async refreshReservedListeningPorts(): Promise<void> {
+  private async refreshReservedListeningPorts(port?: number): Promise<void> {
     try {
+      if (port !== undefined) {
+        await this.scanListeningPortsForPort(port);
+        return;
+      }
+
       this.updateReservedListeningPorts(await this.scanListeningPorts());
     } catch {
       // Availability probing remains the source of truth when lsof/netstat fail.
@@ -1763,11 +1767,46 @@ export class PortManagerAgent implements DisposableLike {
     return scanPromise;
   }
 
+  /**
+   * Reads listeners for one port without joining a global lsof/netstat scan.
+   * Route operations use this path so a slow background refresh cannot block hook
+   * allocation, release, or managed-process startup decisions.
+   */
+  private async scanListeningPortsForPort(port: number): Promise<readonly ListeningPort[]> {
+    const scopedProvider = this.listeningPortProvider.listByPort;
+    const listeners =
+      scopedProvider !== undefined
+        ? await scopedProvider.call(this.listeningPortProvider, port)
+        : await this.scanListeningPorts({ allowRecentCache: true });
+
+    this.rememberReservedListeningPorts(listeners);
+    return listeners;
+  }
+
   /** Replaces the reservation cache with one coherent listener scan. */
   private updateReservedListeningPorts(listeners: readonly ListeningPort[]): void {
     this.reservedListeningEndpoints = listeners
       .filter((listener) => Number.isInteger(listener.port) && listener.port > 0 && listener.port <= 65_535)
       .map((listener) => ({ localAddress: listener.localAddress, port: listener.port }));
+  }
+
+  /** Merges a partial listener scan into the reservation cache without erasing unrelated ports. */
+  private rememberReservedListeningPorts(listeners: readonly ListeningPort[]): void {
+    const endpointsByKey = new Map<string, ListeningPortEndpoint>();
+    for (const endpoint of this.reservedListeningEndpoints) {
+      endpointsByKey.set(`${endpoint.localAddress}:${endpoint.port}`, endpoint);
+    }
+
+    for (const listener of listeners) {
+      if (!Number.isInteger(listener.port) || listener.port <= 0 || listener.port > 65_535) {
+        continue;
+      }
+
+      const endpoint = { localAddress: listener.localAddress, port: listener.port };
+      endpointsByKey.set(`${endpoint.localAddress}:${endpoint.port}`, endpoint);
+    }
+
+    this.reservedListeningEndpoints = [...endpointsByKey.values()];
   }
 
   /**
@@ -1782,8 +1821,7 @@ export class PortManagerAgent implements DisposableLike {
     actualHost: string | undefined,
   ): Promise<ListeningPort | undefined> {
     try {
-      const listeners = await this.scanListeningPorts();
-      this.updateReservedListeningPorts(listeners);
+      const listeners = await this.scanListeningPortsForPort(logicalPort);
       return listeners.find(
         (listener) =>
           listener.port === logicalPort &&

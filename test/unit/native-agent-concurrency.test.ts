@@ -73,10 +73,14 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(source.includes("pm_listener_cache_invalidate(state);"), true);
   assert.equal(snapshotBody.includes("listener_scan_fresh &&"), true);
   assert.equal(snapshotBody.includes("pm_scan_lsof_cached(state, &listeners"), true);
-  assert.equal(allocationBody.includes("pm_scan_lsof_cached(state, &listeners"), true);
-  assert.equal(allocationBody.includes("listener_scan_fresh &&"), true);
+  assert.equal(allocationBody.includes("pm_scan_lsof_cached(state, &listeners"), false);
+  assert.equal(allocationBody.includes("listener_scan_fresh &&"), false);
   assert.equal(allocationBody.includes("pm_scan_lsof(&listeners"), false);
   assert.equal(allocationBody.includes("strcmp(input->route_direction, \"send\") == 0 && network_id[0] == '\\0'"), true);
+  assert.equal(source.includes("static int pm_scan_lsof_for_port"), true);
+  assert.equal(source.includes("lsof -nP -iTCP:%d -sTCP:LISTEN -Fpcn"), true);
+  assert.equal(source.includes("pm_scan_lsof_for_port(port, &listeners"), true);
+  assert.equal(source.includes("pm_scan_lsof_for_port(input->actual_port, &listeners"), true);
 });
 
 test("native agent matches loopback listeners by host as well as port", () => {

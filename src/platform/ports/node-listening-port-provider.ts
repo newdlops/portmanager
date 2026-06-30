@@ -85,20 +85,44 @@ export class NodeListeningPortProvider implements ListeningPortProvider {
     }
   }
 
+  /**
+   * Returns visible listeners for one TCP port using the narrowest platform
+   * command available. Route allocation paths call this instead of sharing a
+   * potentially slow global scan.
+   */
+  async listByPort(port: number): Promise<readonly ListeningPort[]> {
+    if (!isValidTcpPort(port)) {
+      return [];
+    }
+
+    const updatedAt = this.now().toISOString();
+
+    try {
+      if (this.currentPlatform === "win32") {
+        return await this.listWindows(updatedAt, port);
+      }
+
+      return await this.listPosix(updatedAt, port);
+    } catch {
+      return [];
+    }
+  }
+
   /** Runs lsof's field-output mode and parses process-scoped listener records. */
-  private async listPosix(updatedAt: string): Promise<readonly ListeningPort[]> {
-    const { stdout } = await this.runCommand("lsof", posixListeningPortArgs);
+  private async listPosix(updatedAt: string, port?: number): Promise<readonly ListeningPort[]> {
+    const args = port === undefined ? posixListeningPortArgs : ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fpcn"];
+    const { stdout } = await this.runCommand("lsof", args);
 
     return parsePosixLsofListeningPorts(toText(stdout), updatedAt);
   }
 
   /** Runs a PowerShell object query so localized netstat text never enters parsing. */
-  private async listWindows(updatedAt: string): Promise<readonly ListeningPort[]> {
+  private async listWindows(updatedAt: string, port?: number): Promise<readonly ListeningPort[]> {
     const { stdout } = await this.runCommand("powershell.exe", [
       "-NoProfile",
       "-NonInteractive",
       "-Command",
-      buildWindowsListeningPortScript(),
+      buildWindowsListeningPortScript(port),
     ]);
 
     return parseWindowsListeningPortsJson(toText(stdout), updatedAt);
@@ -272,10 +296,13 @@ async function runExecFile(file: string, args: readonly string[]): Promise<Comma
 }
 
 /** Builds the PowerShell query used to avoid locale-sensitive text parsing on Windows. */
-function buildWindowsListeningPortScript(): string {
+function buildWindowsListeningPortScript(port?: number): string {
+  const connectionQuery =
+    port === undefined ? "Get-NetTCPConnection -State Listen" : `Get-NetTCPConnection -LocalPort ${port} -State Listen`;
+
   return [
     "$ErrorActionPreference = 'SilentlyContinue'",
-    "$connections = Get-NetTCPConnection -State Listen",
+    `$connections = ${connectionQuery}`,
     "$rows = foreach ($connection in $connections) {",
     "  $process = Get-Process -Id $connection.OwningProcess",
     "  [pscustomobject]@{",

@@ -2110,6 +2110,61 @@ test("coalesces concurrent listener snapshot scans", async (context) => {
   assert.equal(second.listeners[0]?.port, 3000);
 });
 
+test("route allocation uses port-scoped listener lookup while a global scan is busy", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const scanStarted = deferred<void>();
+  const releaseScan = deferred<void>();
+  let globalScanCount = 0;
+  let scopedScanCount = 0;
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => {
+        globalScanCount += 1;
+        scanStarted.resolve();
+        await releaseScan.promise;
+        return [];
+      },
+      listByPort: async () => {
+        scopedScanCount += 1;
+        return [];
+      },
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const backgroundPoll = runListenerPoll(agent);
+  await scanStarted.promise;
+
+  const allocation = await Promise.race([
+    agent.allocateRoute({
+      name: "wait-on",
+      command: "wait-on http://localhost:8004/healthz",
+      cwd: "/workspace/app",
+      requestedPort: 8004,
+      host: "127.0.0.1",
+      routeDirection: "send",
+      scanRange: 20,
+      scanDirection: "up",
+      routingMode: "hashed",
+      virtualPortRangeStart: 58000,
+      virtualPortRangeEnd: 58000,
+    }),
+    delay(50).then(() => undefined),
+  ]);
+
+  assert.notEqual(allocation, undefined);
+  assert.equal(scopedScanCount, 1);
+  assert.equal(globalScanCount, 1);
+
+  releaseScan.resolve();
+  await backgroundPoll;
+});
+
 test("listSnapshot does not publish route tables when route state is unchanged", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const agent = new PortManagerAgent({

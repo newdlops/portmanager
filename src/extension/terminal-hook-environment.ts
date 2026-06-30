@@ -638,13 +638,67 @@ function replacePathAtomically(filePath: string, tempPath: string): void {
 }
 
 /**
+ * Vite prints every available network interface when it receives a bare or
+ * wildcard --host. In attached terminals that includes every logical loopback
+ * alias, so constrain only the unsafe host forms to the active network host.
+ */
+function buildViteHostNarrowingShell(): string {
+  return `if [ "\${__pm_name:-}" = "vite" ] && [ -n "\${PORT_MANAGER_NETWORK_LOOPBACK_HOST:-}" ]; then
+  __pm_vite_host="\${PORT_MANAGER_NETWORK_LOOPBACK_HOST}"
+  __pm_vite_args_initialized=0
+  __pm_vite_host_pending=0
+  for __pm_arg in "$@"; do
+    if [ "\${__pm_vite_args_initialized}" = "0" ]; then
+      set --
+      __pm_vite_args_initialized=1
+    fi
+
+    if [ "\${__pm_vite_host_pending}" = "1" ]; then
+      __pm_vite_host_pending=0
+      case "\${__pm_arg}" in
+        -*)
+          set -- "$@" "\${__pm_vite_host}" "\${__pm_arg}"
+          ;;
+        ""|"0.0.0.0"|"::"|"*")
+          set -- "$@" "\${__pm_vite_host}"
+          ;;
+        *)
+          set -- "$@" "\${__pm_arg}"
+          ;;
+      esac
+      continue
+    fi
+
+    case "\${__pm_arg}" in
+      --host)
+        set -- "$@" "--host"
+        __pm_vite_host_pending=1
+        ;;
+      --host=|--host=0.0.0.0|--host=::|--host=\\*)
+        set -- "$@" "--host=\${__pm_vite_host}"
+        ;;
+      *)
+        set -- "$@" "\${__pm_arg}"
+        ;;
+    esac
+  done
+
+  if [ "\${__pm_vite_host_pending}" = "1" ]; then
+    set -- "$@" "\${__pm_vite_host}"
+  fi
+  unset __pm_vite_host __pm_vite_args_initialized __pm_vite_host_pending __pm_arg
+fi`;
+}
+
+/**
  * Protected shebang launchers such as /usr/bin/env can strip DYLD before Node
  * starts. This shell fragment resolves the JavaScript entrypoint first and runs
  * it through the extension-owned runtime shim so the real runtime receives the
  * preload environment directly.
  */
 function buildPreloadNodeEntrypointBypassShell(): string {
-  return `__pm_unwrapped="\${__pm_target}"
+  return `${buildViteHostNarrowingShell()}
+__pm_unwrapped="\${__pm_target}"
 __pm_exec_target="$(sed -n 's/.*exec "\\([^"]*\\)".*/\\1/p' "\${__pm_target}" 2>/dev/null | head -n 1)"
 __pm_exec_script="$(sed -n 's/.*exec "[^"]*" "\\([^"]*\\)".*/\\1/p' "\${__pm_target}" 2>/dev/null | head -n 1)"
 case "\${__pm_exec_target##*/}:\${__pm_exec_script}" in

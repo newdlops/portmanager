@@ -589,6 +589,12 @@ export interface ListeningPortProvider {
    * Implementations live in the platform layer because they execute OS tools.
    */
   list(): Promise<readonly ListeningPort[]>;
+  /**
+   * Lists visible listeners for one TCP port when the platform can narrow the OS
+   * query. Callers use this on latency-sensitive route paths to avoid a global
+   * listener table scan.
+   */
+  listByPort?(port: number): Promise<readonly ListeningPort[]>;
 }
 
 export interface EstablishedTcpConnection {

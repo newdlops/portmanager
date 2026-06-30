@@ -102,6 +102,12 @@ test("package command shims rerun client tools without native runtime alias sema
   const hookedManagerStart = source.indexOf("function buildHookedPackageManagerEntrypointShell");
   const hookedManagerEnd = source.indexOf("function buildPreloadedPackageManagerEntrypointShell", hookedManagerStart);
   const hookedManagerBlock = source.slice(hookedManagerStart, hookedManagerEnd);
+  const viteHostNarrowingStart = source.indexOf("function buildViteHostNarrowingShell");
+  const viteHostNarrowingEnd = source.indexOf("/**\n * Protected shebang launchers", viteHostNarrowingStart);
+  const viteHostNarrowingBlock = source.slice(viteHostNarrowingStart, viteHostNarrowingEnd);
+  const nodeEntrypointBypassStart = source.indexOf("function buildPreloadNodeEntrypointBypassShell");
+  const nodeEntrypointBypassEnd = source.indexOf("function buildCleanPackageManagerEntrypointShell", nodeEntrypointBypassStart);
+  const nodeEntrypointBypassBlock = source.slice(nodeEntrypointBypassStart, nodeEntrypointBypassEnd);
 
   for (const packageBinary of ["concurrently", "wait-on", "retry", "vite", "dotenv", "celery", "uvicorn", "gunicorn", "daphne"]) {
     assert.equal(
@@ -191,6 +197,36 @@ test("package command shims rerun client tools without native runtime alias sema
     source.includes("function buildPreloadNodeEntrypointBypassShell"),
     true,
     "package-bin shims must keep the Node entrypoint bypass for protected shebangs",
+  );
+  assert.equal(
+    source.includes("function buildViteHostNarrowingShell"),
+    true,
+    "Vite package-bin shims must constrain unsafe --host forms to the attached logical network host",
+  );
+  assert.equal(
+    nodeEntrypointBypassBlock.includes("${buildViteHostNarrowingShell()}"),
+    true,
+    "package-bin shims must normalize Vite args before executing protected Node entrypoints",
+  );
+  assert.equal(
+    viteHostNarrowingBlock.includes('[ "\\${__pm_name:-}" = "vite" ]'),
+    true,
+    "host narrowing must apply only to Vite command shims",
+  );
+  assert.equal(
+    viteHostNarrowingBlock.includes("PORT_MANAGER_NETWORK_LOOPBACK_HOST"),
+    true,
+    "host narrowing must use the active logical network loopback host",
+  );
+  assert.equal(
+    viteHostNarrowingBlock.includes("--host=|--host=0.0.0.0|--host=::|--host=\\\\*)"),
+    true,
+    "wildcard --host forms must be rewritten to the logical network host",
+  );
+  assert.equal(
+    viteHostNarrowingBlock.includes('set -- "$@" "\\${__pm_vite_host}" "\\${__pm_arg}"'),
+    true,
+    "bare --host before another option must insert the logical host before preserving that option",
   );
   assert.equal(
     source.includes("function buildCleanPackageManagerEntrypointShell"),
@@ -745,7 +781,7 @@ test("background routing refresh polls terminals and containers", () => {
   assert.equal(source.includes("tryAcquireSharedBackgroundContainerRefreshSlot()"), true);
 });
 
-test("compose reconcile registers only live runtime endpoints", () => {
+test("compose reconcile preserves persisted routes when live runtime discovery is empty", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
   const reconcileStart = source.indexOf("private async reconcileComposeAttachmentPublishedPortsExclusive");
@@ -761,9 +797,17 @@ test("compose reconcile registers only live runtime endpoints", () => {
   const mergeEnd = source.indexOf("function composeAttachmentRuntimeStateChanged", mergeStart);
   const mergeBody = source.slice(mergeStart, mergeEnd);
   const replaceStart = source.indexOf("private async replaceComposeRouteProcesses");
-  const replaceEnd = source.indexOf("  /** Refreshes clone container id rewrites", replaceStart);
+  const replaceEnd = source.indexOf("private async ensureComposeRouteProcessesForAttachments", replaceStart);
   const replaceBody = source.slice(replaceStart, replaceEnd);
+  const ensureStart = source.indexOf("private async ensureComposeRouteProcesses");
+  const ensureEnd = source.indexOf("  /** Refreshes clone container id rewrites", ensureStart);
+  const ensureBody = source.slice(ensureStart, ensureEnd);
   const registerIndex = replaceBody.indexOf("await this.processService.registerExistingProcess(");
+  const emptyLiveIndex = replaceBody.indexOf("if (livePorts.length === 0) {");
+  const emptyLiveFallbackIndex = replaceBody.indexOf(
+    "return this.ensureComposeRouteProcesses(attachment, attachment.ports);",
+    emptyLiveIndex,
+  );
   const preserveIndex = replaceBody.indexOf("const registeredProcessIds = new Set<string>();");
   const staleRemoveIndex = replaceBody.indexOf("await this.removeComposeRouteProcesses(attachment, attachment.ports, registeredProcessIds);");
 
@@ -774,6 +818,7 @@ test("compose reconcile registers only live runtime endpoints", () => {
   assert.equal(reconcileBody.includes("reconcileComposeOverrideFileForAttachment("), true);
   assert.equal(reconcileBody.includes('if (overrideRestoredAttachment.status === "error")'), true);
   assert.equal(reconcileBody.includes("replaceComposeRouteProcesses(overrideRestoredAttachment, livePorts)"), true);
+  assert.equal(reconcileBody.includes("ensureComposeRouteProcesses(overrideRestoredAttachment, overrideRestoredAttachment.ports)"), true);
   assert.equal(reconcileBody.includes("mergeComposePortsWithLiveRoutes("), true);
   assert.equal(reconcileBody.includes("shouldRefreshComposeContainerMappingsFromRuntime(attachment, options)"), true);
   assert.equal(reconcileBody.includes("refreshComposeContainerMappings(attachment, discoverySession)"), true);
@@ -784,9 +829,18 @@ test("compose reconcile registers only live runtime endpoints", () => {
   assert.equal(mappingPolicyBody.includes("return options.force === true || options.background !== true;"), true);
   assert.equal(mergeBody.includes("for (const livePort of livePorts)"), true);
   assert.equal(mergeBody.includes("mergedPorts.push(livePort)"), true);
+  assert.equal(emptyLiveIndex >= 0, true);
+  assert.equal(emptyLiveFallbackIndex > emptyLiveIndex, true);
+  assert.equal(emptyLiveFallbackIndex < registerIndex, true);
   assert.equal(registerIndex >= 0, true);
   assert.equal(preserveIndex > registerIndex, true);
   assert.equal(staleRemoveIndex > preserveIndex, true);
+  assert.equal(source.includes("private async ensureComposeRouteProcessesForAttachments"), true);
+  assert.equal(source.includes("daemon restart the attachment object can be unchanged"), true);
+  assert.equal(ensureBody.includes("findComposeProcessForPort(snapshotProcesses, attachment, port)"), true);
+  assert.equal(ensureBody.includes("buildComposeRegisteredProcessInput(attachment, port, cwd)"), true);
+  assert.equal(ensureBody.includes("await this.removeComposeRouteProcesses(attachment, attachment.ports, registeredProcessIds);"), true);
+  assert.equal(replaceBody.includes("await this.removeComposeRouteProcesses(attachment, attachment.ports);\n      return [];"), false);
   assert.equal(replaceBody.includes("await this.removeComposeRouteProcesses(attachment, attachment.ports);\n    if (livePorts.length === 0)"), false);
   assert.equal(source.includes("private async restorePersistedComposeRoutesIfMissing"), false);
   assert.equal(source.includes("private async restorePersistedComposeRoutes("), false);
@@ -1272,7 +1326,7 @@ test("terminal reveal focuses injected VS Code and external terminal windows", (
   assert.equal(source.includes("select sessionItem"), true);
 });
 
-test("compose route reconciliation does not rehydrate persisted attachment routes", () => {
+test("compose route reconciliation rehydrates persisted attachment routes", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
   const reconcileStart = source.indexOf("private async reconcileComposeAttachmentPublishedPortsExclusive");
@@ -1303,16 +1357,20 @@ test("compose route reconciliation does not rehydrate persisted attachment route
   assert.equal(reconcileBody.includes(".catch(() => [])"), false);
   assert.equal(reconcileBody.includes("liveDiscoveryError"), true);
   assert.equal(reconcileBody.includes("this.replaceComposeRouteProcesses(overrideRestoredAttachment, livePorts)"), true);
+  assert.equal(reconcileBody.includes("this.ensureComposeRouteProcesses(overrideRestoredAttachment"), true);
   assert.equal(attachBody.includes(".listLiveComposePublishedPorts("), true);
   assert.equal(attachBody.includes("this.replaceComposeRouteProcesses(registeredAttachment, livePorts)"), true);
   assert.equal(renameBody.includes(".listLiveComposePublishedPorts("), true);
   assert.equal(renameBody.includes("this.replaceComposeRouteProcesses(nextAttachment, livePorts)"), true);
   assert.equal(renameBody.includes("this.replaceComposeRouteProcesses(nextAttachment, mutationResult.ports)"), false);
   assert.equal(source.includes("private async replaceComposeRouteProcesses("), true);
+  assert.equal(source.includes("private async ensureComposeRouteProcessesForAttachments("), true);
+  assert.equal(source.includes("private async ensureComposeRouteProcesses("), true);
   assert.equal(source.includes("private async restorePersistedComposeRoutesIfMissing"), false);
   assert.equal(source.includes("private async restorePersistedComposeRoutes("), false);
   assert.equal(source.includes("attachment.ports.length > 0"), true);
-  assert.equal(source.includes("process.actualPort === port.actualHostPort"), false);
+  assert.equal(source.includes("process.actualPort === port.actualHostPort"), true);
+  assert.equal(source.includes("function findComposeProcessForPort("), true);
   assert.equal(source.includes("await this.processService.registerExistingProcess("), true);
   assert.equal(source.includes("function hasComposePublishedPortListener"), false);
   assert.equal(source.includes("const hasRuntimeListener = hasComposePublishedPortListener"), false);

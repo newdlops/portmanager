@@ -2787,6 +2787,9 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.writeHostAccessBindingsFile().catch(() => undefined);
     await this.writeComposeProjectRoutingFile().catch(() => undefined);
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
+    await this.ensureComposeRouteProcessesForAttachments(
+      this.registry.getSnapshot().composeAttachments.filter(isRestorableComposeAttachment),
+    ).catch(() => undefined);
 
     /*
      * The agent owns periodic OS listener polling. Background convergence should
@@ -3296,7 +3299,7 @@ export class PortManagerNetworkService implements DisposableLike {
             overrideRestoredAttachment.ports,
             await this.replaceComposeRouteProcesses(overrideRestoredAttachment, livePorts),
           )
-        : overrideRestoredAttachment.ports;
+        : await this.ensureComposeRouteProcesses(overrideRestoredAttachment, overrideRestoredAttachment.ports);
       const syncedMutation = syncComposeMutationHiddenPorts(overrideRestoredAttachment.mutation, ports);
       const nextAttachment = {
         ...overrideRestoredAttachment,
@@ -3375,6 +3378,8 @@ export class PortManagerNetworkService implements DisposableLike {
    * container is up. When live ports exist, publish replacement rows before
    * deleting old rows so route/claim files never expose an empty ownership
    * window to DB and broker clients that connect immediately after compose up.
+   * An empty live result is treated as a transient Docker/Podman visibility gap,
+   * not a detach signal; explicit detach/remove paths own route deletion.
    */
   private async replaceComposeRouteProcesses(
     attachment: ComposeAttachment,
@@ -3385,8 +3390,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     if (livePorts.length === 0) {
-      await this.removeComposeRouteProcesses(attachment, attachment.ports);
-      return [];
+      return this.ensureComposeRouteProcesses(attachment, attachment.ports);
     }
 
     await this.processService.start();
@@ -3422,6 +3426,93 @@ export class PortManagerNetworkService implements DisposableLike {
 
     await this.removeComposeRouteProcesses(attachment, attachment.ports, registeredProcessIds);
 
+    return registeredPorts;
+  }
+
+  /**
+   * Rehydrates daemon-owned compose rows from persisted attachment state.
+   *
+   * The daemon keeps routing in memory, while compose attachments are durable VS
+   * Code state. After a daemon restart the attachment object can be unchanged
+   * even though all compose process rows disappeared, so convergence must compare
+   * against the daemon snapshot and re-register missing rows explicitly.
+   */
+  private async ensureComposeRouteProcessesForAttachments(
+    attachments: readonly ComposeAttachment[],
+  ): Promise<void> {
+    for (const attachment of attachments) {
+      const ports = await this.ensureComposeRouteProcesses(attachment, attachment.ports);
+      if (!composePortsChanged(attachment.ports, ports)) {
+        continue;
+      }
+
+      const syncedMutation = syncComposeMutationHiddenPorts(attachment.mutation, ports);
+      this.registry.updateComposeAttachment({
+        ...attachment,
+        ports,
+        ...(syncedMutation !== undefined ? { mutation: syncedMutation } : {}),
+        status: "attached",
+        errorMessage: undefined,
+      });
+    }
+  }
+
+  /** Registers missing persisted compose rows without forcing a Docker runtime poll. */
+  private async ensureComposeRouteProcesses(
+    attachment: ComposeAttachment,
+    ports: readonly ComposePublishedPort[],
+  ): Promise<readonly ComposePublishedPort[]> {
+    const processService = this.processService;
+    if (processService === undefined) {
+      return ports;
+    }
+
+    if (ports.length === 0) {
+      await this.removeComposeRouteProcesses(attachment, attachment.ports);
+      return [];
+    }
+
+    await processService.start();
+    const cwd = composeAttachmentWorkingDirectory(attachment);
+    // Mutable daemon snapshot mirror extended as missing rows are re-registered.
+    let snapshotProcesses = [...processService.getSnapshot().processes];
+    const registeredPorts: ComposePublishedPort[] = [];
+    // Rows that should remain attached to this compose route after reconciliation.
+    const registeredProcessIds = new Set<string>();
+    // Rows created during this pass so a partial registration failure can roll back.
+    const createdProcessIds: string[] = [];
+
+    try {
+      for (const port of ports) {
+        const existingProcess = findComposeProcessForPort(snapshotProcesses, attachment, port);
+        if (existingProcess !== undefined) {
+          registeredProcessIds.add(existingProcess.id);
+          registeredPorts.push({
+            ...port,
+            processId: existingProcess.id,
+          });
+          continue;
+        }
+
+        const process = await processService.registerExistingProcess(
+          buildComposeRegisteredProcessInput(attachment, port, cwd),
+        );
+        createdProcessIds.push(process.id);
+        registeredProcessIds.add(process.id);
+        snapshotProcesses = [...snapshotProcesses, process];
+        registeredPorts.push({
+          ...port,
+          processId: process.id,
+        });
+      }
+    } catch (error) {
+      await Promise.all(
+        createdProcessIds.map((processId) => processService.removeProcess(processId).catch(() => undefined)),
+      );
+      throw error;
+    }
+
+    await this.removeComposeRouteProcesses(attachment, attachment.ports, registeredProcessIds);
     return registeredPorts;
   }
 
@@ -5693,6 +5784,19 @@ function isComposeProcessForPort(
     process.source === "compose" &&
     composeRouteProcessKey(process.networkId, process.requestedPort) ===
       composeRouteProcessKey(attachment.networkId, port.logicalPort)
+  );
+}
+
+function findComposeProcessForPort(
+  processes: readonly ManagedProcess[],
+  attachment: ComposeAttachment,
+  port: ComposePublishedPort,
+): ManagedProcess | undefined {
+  return processes.find(
+    (process) =>
+      process.status !== "stopped" &&
+      process.actualPort === port.actualHostPort &&
+      isComposeProcessForPort(process, attachment, port),
   );
 }
 

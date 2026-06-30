@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  NodeListeningPortProvider,
   parsePosixLsofListeningPorts,
   parseWindowsListeningPortsJson,
 } from "../../src/platform/ports/node-listening-port-provider";
@@ -110,4 +111,29 @@ test("parses Windows PowerShell JSON output into listening TCP port rows", () =>
       updatedAt: scanTimestamp,
     },
   ]);
+});
+
+test("POSIX provider can query one listening TCP port without a global lsof scan", async () => {
+  const calls: Array<{ readonly file: string; readonly args: readonly string[] }> = [];
+  const provider = new NodeListeningPortProvider({
+    currentPlatform: "darwin",
+    now: () => new Date(scanTimestamp),
+    commandRunner: async (file, args) => {
+      calls.push({ file, args });
+      return {
+        stdout: ["p101", "cnode", "nTCP 127.0.0.1:3000 (LISTEN)"].join("\n"),
+      };
+    },
+  });
+
+  const listeners = await provider.listByPort(3000);
+
+  assert.deepEqual(calls, [
+    {
+      file: "lsof",
+      args: ["-nP", "-iTCP:3000", "-sTCP:LISTEN", "-Fpcn"],
+    },
+  ]);
+  assert.equal(listeners.length, 1);
+  assert.equal(listeners[0]?.port, 3000);
 });

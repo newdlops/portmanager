@@ -51,6 +51,7 @@ typedef struct {
 } pm_bidirectional_endpoint_index;
 
 static int pm_scan_lsof(pm_listener_list *listeners, const char *updated_at);
+static int pm_scan_lsof_for_port(int port, pm_listener_list *listeners, const char *updated_at);
 static int pm_scan_lsof_cached(pm_agent_state *state, pm_listener_list *listeners, char *updated_at, size_t updated_at_size, int *fresh_scan);
 static int pm_listener_cache_store(pm_agent_state *state, const pm_listener_list *listeners, const char *updated_at, time_t now);
 static void pm_listener_cache_invalidate(pm_agent_state *state);
@@ -3172,28 +3173,6 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
   pm_pending_route *reusable;
   int actual_port;
   pm_pending_route pending;
-  pm_listener_list listeners = {0};
-  char updated_at[PM_TIME];
-  int listener_scan_fresh = 0;
-
-  /*
-   * Allocation bursts come from short-lived hook clients, so one fresh lsof per
-   * request can starve response delivery. The scan here only reconciles process
-   * metadata; actual port safety still goes through bind() probes below.
-   */
-  if (pm_state_needs_external_listener_fresh_scan(state)) {
-    pm_listener_cache_invalidate(state);
-  }
-  if (pm_scan_lsof_cached(state, &listeners, updated_at, sizeof(updated_at), &listener_scan_fresh) == 0) {
-    if (listener_scan_fresh && pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
-      /*
-       * allocateRoute callers need the chosen port promptly. The dispatcher marks
-       * route tables dirty after the response, so reconciliation publishes through
-       * the coalesced event-loop writer instead of blocking this request.
-       */
-    }
-  }
-  free(listeners.items);
 
   (void)pm_cleanup_pending(state);
   pm_normalize_network(input->network_id, network_id, sizeof(network_id));
@@ -3488,8 +3467,8 @@ int pm_state_release_allocation(pm_agent_state *state, const char *allocation_id
   return pm_buffer_append(payload, before != state->pending_count ? "true" : "false");
 }
 
-static int pm_scan_lsof(pm_listener_list *listeners, const char *updated_at) {
-  FILE *pipe = popen("lsof -nP -iTCP -sTCP:LISTEN -Fpcn 2>/dev/null", "r");
+static int pm_scan_lsof_command(const char *command, pm_listener_list *listeners, const char *updated_at) {
+  FILE *pipe = popen(command, "r");
   char line[2048];
   pid_t current_pid = 0;
   char current_name[PM_SMALL] = "";
@@ -3582,6 +3561,21 @@ static int pm_scan_lsof(pm_listener_list *listeners, const char *updated_at) {
   return 0;
 }
 
+static int pm_scan_lsof(pm_listener_list *listeners, const char *updated_at) {
+  return pm_scan_lsof_command("lsof -nP -iTCP -sTCP:LISTEN -Fpcn 2>/dev/null", listeners, updated_at);
+}
+
+static int pm_scan_lsof_for_port(int port, pm_listener_list *listeners, const char *updated_at) {
+  char command[128];
+
+  if (!pm_is_valid_port(port)) {
+    return -1;
+  }
+
+  snprintf(command, sizeof(command), "lsof -nP -iTCP:%d -sTCP:LISTEN -Fpcn 2>/dev/null", port);
+  return pm_scan_lsof_command(command, listeners, updated_at);
+}
+
 static int pm_listener_list_copy(pm_listener_list *target, const pm_listener *items, size_t count) {
   memset(target, 0, sizeof(*target));
   if (count == 0) {
@@ -3658,7 +3652,7 @@ static int pm_find_listener_for_port_host(int port, const char *host, pm_listene
   int found = 0;
 
   pm_iso_now(updated_at, sizeof(updated_at));
-  if (pm_scan_lsof(&listeners, updated_at) != 0) {
+  if (pm_scan_lsof_for_port(port, &listeners, updated_at) != 0) {
     free(listeners.items);
     return 0;
   }
@@ -3696,10 +3690,7 @@ int pm_state_release_process_route(pm_agent_state *state, const pm_release_proce
 
   pm_normalize_network(input->network_id, network_id, sizeof(network_id));
   pm_iso_now(updated_at, sizeof(updated_at));
-  listener_scan_ok = pm_scan_lsof(&listeners, updated_at) == 0;
-  if (listener_scan_ok) {
-    (void)pm_listener_cache_store(state, &listeners, updated_at, time(NULL));
-  }
+  listener_scan_ok = pm_scan_lsof_for_port(input->actual_port, &listeners, updated_at) == 0;
 
   if (input->allocation_id[0] != '\0') {
     size_t before = state->pending_count;
