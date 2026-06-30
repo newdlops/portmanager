@@ -26,7 +26,7 @@
 #define PM_ROUTE_TABLE_WRITE_LOCK_SLEEP_US 10000
 #define PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"
 #define PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15
-/* Pre-handshake routes use a cleanup lease; the idle TTL starts only after bidirectional traffic. */
+/* Pre-handshake routes use a cleanup lease; observed routes use the short TTL only as a stale-writer guard. */
 #define PM_PRE_HANDSHAKE_ROUTE_TABLE_LEASE_SECONDS PM_ROUTE_TTL_SECONDS
 #define PM_ESTABLISHED_ROUTE_OBSERVATION_SCAN_INTERVAL_SECONDS 2
 
@@ -838,8 +838,8 @@ static int pm_bidirectional_endpoint_index_contains(
 }
 
 /*
- * Keeps expired observations while their route still exists. An expired value means
- * the route is post-handshake but idle, so it must not fall back to pre-handshake lease mode.
+ * Keeps observations while their route still exists. Once both sides have met,
+ * the route remains daemon-owned until registry/allocation cleanup removes it.
  */
 static void pm_prune_bidirectional_refreshes_for_routes(pm_agent_state *state, const pm_route *routes, size_t count) {
   pm_bidirectional_endpoint_index *active_index = NULL;
@@ -865,11 +865,11 @@ static void pm_prune_bidirectional_refreshes_for_routes(pm_agent_state *state, c
 
 static int pm_mark_bidirectional_route_observed(pm_agent_state *state, int logical_port, const char *network_id) {
   const char *normalized_network_id = pm_refresh_network_id(network_id);
-  time_t refresh_until = time(NULL) + pm_route_table_ttl_seconds();
+  time_t observed_at = time(NULL);
   size_t refresh_index = pm_bidirectional_refresh_lower_bound(state, logical_port, normalized_network_id);
 
   if (pm_bidirectional_refresh_index_matches(state, refresh_index, logical_port, normalized_network_id)) {
-    state->bidirectional_refreshes[refresh_index].refresh_until = refresh_until;
+    state->bidirectional_refreshes[refresh_index].observed_at = observed_at;
     return 0;
   }
 
@@ -889,52 +889,33 @@ static int pm_mark_bidirectional_route_observed(pm_agent_state *state, int logic
     state->bidirectional_refreshes[refresh_index].network_id,
     sizeof(state->bidirectional_refreshes[refresh_index].network_id),
     normalized_network_id);
-  state->bidirectional_refreshes[refresh_index].refresh_until = refresh_until;
+  state->bidirectional_refreshes[refresh_index].observed_at = observed_at;
   state->bidirectional_refresh_count++;
   return 0;
 }
 
-static int pm_route_bidirectional_refresh_until(pm_agent_state *state, const pm_route *route, time_t *refresh_until) {
+static int pm_route_has_bidirectional_observation(pm_agent_state *state, const pm_route *route) {
   const char *network_id = pm_refresh_network_id(route->network_id);
   size_t refresh_index = pm_bidirectional_refresh_lower_bound(state, route->logical_port, network_id);
 
-  if (pm_bidirectional_refresh_index_matches(state, refresh_index, route->logical_port, network_id)) {
-    if (refresh_until != NULL) {
-      *refresh_until = state->bidirectional_refreshes[refresh_index].refresh_until;
-    }
-    return 1;
-  }
-
-  return 0;
+  return pm_bidirectional_refresh_index_matches(state, refresh_index, route->logical_port, network_id);
 }
 
 /*
- * Unobserved routes may refresh from live owner/allocation state; observed routes
- * need a fresh bidirectional refresh grant to extend reader TTL.
+ * Unchanged route content is rebuilt from live state before this check. The
+ * route-table TTL prevents stale files after writer death; it must not become a
+ * post-handshake idle timeout for quiet but still-open TCP sessions.
  */
 static int pm_routes_can_refresh_unchanged_table(pm_agent_state *state, const pm_route *routes, size_t count) {
-  time_t now = time(NULL);
-
-  if (count == 0) {
-    return 0;
-  }
-
-  for (size_t index = 0; index < count; index++) {
-    time_t refresh_until = 0;
-    if (!pm_route_bidirectional_refresh_until(state, &routes[index], &refresh_until)) {
-      continue;
-    }
-    if (refresh_until <= now) {
-      return 0;
-    }
-  }
-
-  return 1;
+  (void)state;
+  (void)routes;
+  return count > 0;
 }
 
 /*
  * Computes the route table's reader expiry. Before first handshake the expiry is
- * a cleanup lease; after handshake it is the observed traffic idle deadline.
+ * a cleanup lease; after handshake live writer metadata prevents quiet sessions
+ * from being mistaken for stale daemon output.
  */
 static long pm_route_table_expires_at_ms(
   pm_agent_state *state,
@@ -953,11 +934,10 @@ static long pm_route_table_expires_at_ms(
 
   expires_at_ms = LONG_MAX;
   for (size_t index = 0; index < count; index++) {
-    time_t refresh_until = 0;
     long candidate_expires_at_ms;
 
-    if (pm_route_bidirectional_refresh_until(state, &routes[index], &refresh_until)) {
-      candidate_expires_at_ms = (long)refresh_until * 1000L;
+    if (pm_route_has_bidirectional_observation(state, &routes[index])) {
+      candidate_expires_at_ms = updated_at_ms + pm_route_table_ttl_seconds() * 1000L;
     } else {
       if (waits_for_first_handshake != NULL) {
         *waits_for_first_handshake = 1;

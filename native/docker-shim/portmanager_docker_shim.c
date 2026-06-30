@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <limits.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1447,6 +1448,20 @@ static int pm_read_file_limited(const char *path, char **buffer_out) {
   return 0;
 }
 
+static int pm_route_table_writer_alive(const char *buffer) {
+  long pid = pm_json_long(buffer, "pid", 0);
+
+  if (pid <= 0) {
+    return 0;
+  }
+
+  if (kill((pid_t)pid, 0) == 0) {
+    return 1;
+  }
+
+  return errno == EPERM;
+}
+
 static int pm_route_table_buffer_expired(const char *buffer) {
   long expires_at_ms;
   long now_ms;
@@ -1461,20 +1476,23 @@ static int pm_route_table_buffer_expired(const char *buffer) {
   }
 
   now_ms = (long)time(NULL) * 1000L;
-  return now_ms > 0 && now_ms >= expires_at_ms;
-}
-
-/** Reads route-table JSON only while both mtime and embedded expiresAtMs are valid. */
-static int pm_read_route_table_file_limited(const char *path, char **buffer_out) {
-  if (pm_generated_route_file_expired(path)) {
-    return -1;
+  if (now_ms <= 0 || now_ms < expires_at_ms) {
+    return 0;
   }
 
+  return !pm_route_table_writer_alive(buffer);
+}
+
+/** Reads route-table JSON; legacy files still use mtime, current files trust a live writer pid. */
+static int pm_read_route_table_file_limited(const char *path, char **buffer_out) {
   if (pm_read_file_limited(path, buffer_out) != 0) {
     return -1;
   }
 
-  if (pm_route_table_buffer_expired(*buffer_out)) {
+  if (
+    pm_route_table_buffer_expired(*buffer_out) ||
+    (pm_json_long(*buffer_out, "expiresAtMs", 0) <= 0 && pm_generated_route_file_expired(path))
+  ) {
     free(*buffer_out);
     *buffer_out = NULL;
     return -1;

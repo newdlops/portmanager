@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -2358,6 +2359,21 @@ static int pm_route_file_stat_expired(const struct stat *stat_buffer) {
   return now_ms - mtime_ms > pm_route_table_ttl_seconds() * 1000L;
 }
 
+/** True when the daemon generation that wrote a route table is still alive. */
+static int pm_route_file_writer_alive(const char *buffer) {
+  long pid = pm_json_long(buffer, "pid", 0);
+
+  if (pid <= 0) {
+    return 0;
+  }
+
+  if (kill((pid_t)pid, 0) == 0) {
+    return 1;
+  }
+
+  return errno == EPERM;
+}
+
 /** New route-table documents expose an explicit wall-clock expiry for readers. */
 static int pm_route_file_buffer_expired(const char *buffer) {
   long expires_at_ms;
@@ -2373,7 +2389,11 @@ static int pm_route_file_buffer_expired(const char *buffer) {
   }
 
   now_ms = pm_now_milliseconds();
-  return now_ms > 0 && now_ms >= expires_at_ms;
+  if (now_ms <= 0 || now_ms < expires_at_ms) {
+    return 0;
+  }
+
+  return !pm_route_file_writer_alive(buffer);
 }
 
 static void pm_clear_route_file_cache_entry(pm_route_file_cache_entry *entry) {
@@ -2593,12 +2613,7 @@ static int pm_load_route_file_routes(const char *path, pm_cached_route **routes_
     return -1;
   }
 
-  if (pm_route_file_stat_expired(&stat_buffer)) {
-    close(fd);
-    return -1;
-  }
-
-  if (pm_get_cached_route_file(path, &stat_buffer, routes_out, route_count_out) == 0) {
+  if (!pm_route_file_stat_expired(&stat_buffer) && pm_get_cached_route_file(path, &stat_buffer, routes_out, route_count_out) == 0) {
     close(fd);
     return 0;
   }
@@ -2617,7 +2632,10 @@ static int pm_load_route_file_routes(const char *path, pm_cached_route **routes_
   }
 
   buffer[read_count] = '\0';
-  if (pm_route_file_buffer_expired(buffer)) {
+  if (
+    pm_route_file_buffer_expired(buffer) ||
+    (pm_json_long(buffer, "expiresAtMs", 0) <= 0 && pm_route_file_stat_expired(&stat_buffer))
+  ) {
     free(buffer);
     return -1;
   }

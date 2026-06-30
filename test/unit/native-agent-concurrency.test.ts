@@ -102,7 +102,8 @@ test("native agent route tables carry TTL and refresh unchanged files", () => {
   assert.notEqual(unchangedStart, -1);
   assert.equal(unchangedBody.includes("pm_route_table_file_fresh_for_reuse(file_path, waits_for_first_handshake)"), true);
   assert.equal(unchangedBody.includes("pm_routes_can_refresh_unchanged_table(state, routes, count)"), true);
-  assert.equal(source.includes("pm_route_bidirectional_refresh_until(state, &routes[index], &refresh_until)"), true);
+  assert.equal(source.includes("pm_route_has_bidirectional_observation(state, &routes[index])"), true);
+  assert.equal(source.includes("route-table TTL prevents stale files after writer death"), true);
   assert.equal(unchangedBody.includes("pm_write_route_table_file(state, file_path, routes, count, sequence)"), true);
 });
 
@@ -582,6 +583,7 @@ async function startNativeAgent(context: TestContext): Promise<NativeAgentFixtur
   ], {
     env: {
       ...process.env,
+      PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS: "",
       PORT_MANAGER_AGENT_DISABLE_HOOK_RECOVERY: "1",
     },
     stdio: ["ignore", "ignore", "pipe"],

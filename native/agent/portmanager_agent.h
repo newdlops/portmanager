@@ -82,7 +82,7 @@ typedef struct {
 typedef struct {
   int logical_port;
   char network_id[PM_SMALL];
-  time_t refresh_until;
+  time_t observed_at;
 } pm_bidirectional_route_refresh;
 
 typedef struct {

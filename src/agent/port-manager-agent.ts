@@ -66,7 +66,7 @@ const DEFAULT_EXTERNAL_LISTENER_GRACE_MS = 60_000;
 const DEFAULT_EXTERNAL_LISTENER_MISSING_SCAN_THRESHOLD = 3;
 const HOOK_ROUTE_RECOVERY_MISS_TTL_MS = 60_000;
 const ROUTE_ALLOCATION_TTL_MS = 300_000;
-// Pre-handshake routes use a cleanup lease, not the idle TTL that starts after traffic proves both sides.
+// Pre-handshake routes use a cleanup lease; observed routes use the short TTL only as a stale-writer guard.
 const PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS = ROUTE_ALLOCATION_TTL_MS;
 const ESTABLISHED_ROUTE_OBSERVATION_SCAN_INTERVAL_MS = 2_000;
 const ROUTE_TABLE_GENERATION_LOCK_STALE_MS = 30_000;
@@ -287,6 +287,9 @@ export class PortManagerAgent implements DisposableLike {
   /** Active TTL written into generated route-table JSON files. */
   private readonly routeTableTtlMs: number;
 
+  /** Periodic refresh cadence that gives native readers margin before TTL expiry. */
+  private readonly routeTableHeartbeatIntervalMs: number;
+
   /** Writer identity persisted in route table files to reject stale daemon writes. */
   private readonly routeTableWriterId: string;
 
@@ -314,8 +317,14 @@ export class PortManagerAgent implements DisposableLike {
   /** Timer that keeps OS Listening Ports fresh without manual refresh. */
   private listenerScanTimer: NodeJS.Timeout | undefined;
 
+  /** Timer that keeps route-table reader TTLs fresh while the daemon is alive. */
+  private routeTableHeartbeatTimer: NodeJS.Timeout | undefined;
+
   /** Prevents overlapping lsof/netstat scans when an interval tick is slow. */
   private listenerScanInFlight = false;
+
+  /** Prevents overlapping route-table heartbeat writes during long route operations. */
+  private routeTableHeartbeatInFlight = false;
 
   /** Shared listener scan promise so concurrent requests do not spawn many lsof processes. */
   private listenerScanPromise: Promise<readonly ListeningPort[]> | undefined;
@@ -345,11 +354,11 @@ export class PortManagerAgent implements DisposableLike {
   private readonly routeTableSignaturesByPath = new Map<string, string>();
 
   /**
-   * Endpoint ids that saw both sides of routing at least once. The value is the
-   * expiry derived from the most recent observation; expired values are retained
-   * while the route exists so TTL does not reset before another handshake.
+   * Endpoint ids that saw both sides of routing at least once.
+   * The observation changes the route from a pre-handshake cleanup lease to a
+   * daemon-owned live route; the route-table TTL remains only a stale-writer guard.
    */
-  private readonly bidirectionalRouteRefreshUntilMsByEndpoint = new Map<string, number>();
+  private readonly bidirectionalRouteObservedAtMsByEndpoint = new Map<string, number>();
   /** Next wall-clock time when a full OS established-connection scan is allowed. */
   private nextEstablishedRouteObservationScanAtMs = 0;
 
@@ -406,6 +415,7 @@ export class PortManagerAgent implements DisposableLike {
     this.defaultCwd = options.defaultCwd ?? process.cwd();
     this.routeTablePath = options.routeTablePath ?? getDefaultRouteTablePath();
     this.routeTableTtlMs = normalizeRouteTableTtlMs(options.routeTableTtlMs ?? routeTableTtlMsFromEnvironment());
+    this.routeTableHeartbeatIntervalMs = routeTableHeartbeatIntervalMs(this.routeTableTtlMs);
     this.routeTableWriterStartedAtMs = options.routeTableWriterStartedAtMs ?? Date.now();
     this.routeTableWriterId =
       options.routeTableWriterId ?? `node-agent:${process.pid}:${this.routeTableWriterStartedAtMs}:${randomUUID()}`;
@@ -467,6 +477,7 @@ export class PortManagerAgent implements DisposableLike {
     });
 
     this.startListenerPolling();
+    this.startRouteTableHeartbeat();
   }
 
   /** Allows agent-main to exit if the underlying socket server fails. */
@@ -969,6 +980,10 @@ export class PortManagerAgent implements DisposableLike {
       clearInterval(this.listenerScanTimer);
       this.listenerScanTimer = undefined;
     }
+    if (this.routeTableHeartbeatTimer !== undefined) {
+      clearInterval(this.routeTableHeartbeatTimer);
+      this.routeTableHeartbeatTimer = undefined;
+    }
 
     if (this.snapshotBroadcastTimer !== undefined) {
       clearTimeout(this.snapshotBroadcastTimer);
@@ -1232,6 +1247,39 @@ export class PortManagerAgent implements DisposableLike {
     this.listenerScanTimer.unref();
   }
 
+  /** Starts a light route-table writer heartbeat independent of client traffic. */
+  private startRouteTableHeartbeat(): void {
+    if (this.routeTableHeartbeatTimer !== undefined) {
+      return;
+    }
+
+    this.routeTableHeartbeatTimer = setInterval(() => {
+      void this.refreshRouteTableHeartbeat();
+    }, this.routeTableHeartbeatIntervalMs);
+    this.routeTableHeartbeatTimer.unref();
+  }
+
+  /** Refreshes unchanged route files so the short TTL stays a stale-writer guard, not a session idle timeout. */
+  private async refreshRouteTableHeartbeat(): Promise<void> {
+    if (this.routeTableHeartbeatInFlight) {
+      return;
+    }
+    this.routeTableHeartbeatInFlight = true;
+
+    try {
+      await this.runExclusiveRouteOperation(async () => {
+        const routes = this.buildCurrentLogicalRoutes();
+        if (routes.length > 0) {
+          this.writeRouteTable(routes);
+        }
+      });
+    } catch (error) {
+      this.serverErrors.emit(error instanceof Error ? error : new Error(String(error)));
+    } finally {
+      this.routeTableHeartbeatInFlight = false;
+    }
+  }
+
   /**
    * Periodically rescans OS listeners and broadcasts only real table changes.
    * This is what removes stale OS Listening Ports after an external process
@@ -1423,10 +1471,10 @@ export class PortManagerAgent implements DisposableLike {
       logicalPort,
       ...(networkId ? { networkId } : {}),
     });
-    const refreshUntilMs = this.now().getTime() + this.routeTableTtlMs;
-    const previousRefreshUntilMs = this.bidirectionalRouteRefreshUntilMsByEndpoint.get(endpointIdentity);
-    this.bidirectionalRouteRefreshUntilMsByEndpoint.set(endpointIdentity, refreshUntilMs);
-    return previousRefreshUntilMs === undefined || refreshUntilMs > previousRefreshUntilMs;
+    const observedAtMs = this.now().getTime();
+    const previousObservedAtMs = this.bidirectionalRouteObservedAtMsByEndpoint.get(endpointIdentity);
+    this.bidirectionalRouteObservedAtMsByEndpoint.set(endpointIdentity, observedAtMs);
+    return previousObservedAtMs === undefined || observedAtMs > previousObservedAtMs;
   }
 
   /** Refreshes endpoint liveness from the OS TCP table so long-lived sockets keep their routes alive. */
@@ -1453,20 +1501,12 @@ export class PortManagerAgent implements DisposableLike {
   /**
    * True when unchanged route content is safe to rewrite for reader TTL.
    *
-   * Before the first bidirectional observation, rewrites are a liveness lease:
-   * current registry/allocation state says the route can still handshake. After
-   * the first observation, only fresh established traffic can extend the idle TTL.
+   * Current route content is rebuilt from registry/allocation state before this
+   * check. If a route still exists there, rewriting the same content extends the
+   * reader safety TTL without treating quiet TCP connections as dead.
    */
-  private canRefreshUnchangedRouteTable(routes: readonly LogicalPortRoute[], nowMs: number): boolean {
-    if (routes.length === 0) {
-      return false;
-    }
-
-    return routes.every((route) => {
-      const endpointIdentity = buildLogicalEndpointIdentity(route);
-      const refreshUntilMs = this.bidirectionalRouteRefreshUntilMsByEndpoint.get(endpointIdentity);
-      return refreshUntilMs === undefined || refreshUntilMs > nowMs;
-    });
+  private canRefreshUnchangedRouteTable(routes: readonly LogicalPortRoute[]): boolean {
+    return routes.length > 0;
   }
 
   /** Builds the effective reader expiry for the current route-table generation. */
@@ -1482,12 +1522,11 @@ export class PortManagerAgent implements DisposableLike {
     let expiresAtMs = Number.POSITIVE_INFINITY;
     for (const route of routes) {
       const endpointIdentity = buildLogicalEndpointIdentity(route);
-      const refreshUntilMs = this.bidirectionalRouteRefreshUntilMsByEndpoint.get(endpointIdentity);
-      if (refreshUntilMs === undefined) {
+      if (!this.bidirectionalRouteObservedAtMsByEndpoint.has(endpointIdentity)) {
         waitsForFirstHandshake = true;
         expiresAtMs = Math.min(expiresAtMs, writtenAtMs + PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS);
       } else {
-        expiresAtMs = Math.min(expiresAtMs, refreshUntilMs);
+        expiresAtMs = Math.min(expiresAtMs, writtenAtMs + this.routeTableTtlMs);
       }
     }
 
@@ -1500,9 +1539,9 @@ export class PortManagerAgent implements DisposableLike {
   /** Drops handshake observations only after the logical endpoint has disappeared. */
   private pruneBidirectionalRouteObservationsForRoutes(routes: readonly LogicalPortRoute[]): void {
     const activeEndpointIdentities = new Set(routes.map((route) => buildLogicalEndpointIdentity(route)));
-    for (const endpointIdentity of this.bidirectionalRouteRefreshUntilMsByEndpoint.keys()) {
+    for (const endpointIdentity of this.bidirectionalRouteObservedAtMsByEndpoint.keys()) {
       if (!activeEndpointIdentities.has(endpointIdentity)) {
-        this.bidirectionalRouteRefreshUntilMsByEndpoint.delete(endpointIdentity);
+        this.bidirectionalRouteObservedAtMsByEndpoint.delete(endpointIdentity);
       }
     }
   }
@@ -1965,7 +2004,7 @@ export class PortManagerAgent implements DisposableLike {
       if (!routeTableFileNeedsRefresh(routeTablePath, writtenAtMs, this.routeTableTtlMs, ttlMetadata)) {
         return true;
       }
-      if (!this.canRefreshUnchangedRouteTable(routes, writtenAtMs)) {
+      if (!this.canRefreshUnchangedRouteTable(routes)) {
         return true;
       }
     }
@@ -2626,6 +2665,13 @@ function normalizeListenerScanCacheTtlMs(ttlMs: number | undefined): number {
   }
 
   return Math.max(0, Math.trunc(ttlMs));
+}
+
+/** Chooses a heartbeat cadence that reaches refresh margin before reader expiry. */
+function routeTableHeartbeatIntervalMs(ttlMs: number): number {
+  const normalizedTtlMs = normalizeRouteTableTtlMs(ttlMs);
+  const refreshMarginMs = routeTableRefreshMarginMs(normalizedTtlMs);
+  return Math.max(1_000, Math.floor(Math.max(1_000, normalizedTtlMs - refreshMarginMs) / 2));
 }
 
 /** Keeps external listener cleanup delayed enough for autoreload handoffs. */

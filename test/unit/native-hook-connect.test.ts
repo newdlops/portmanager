@@ -52,13 +52,15 @@ test("native hook route file cache is invalidated by path size and high-resoluti
   assert.equal(source.includes("pm_route_table_ttl_seconds() * 1000L"), true);
   assert.equal(source.includes("pm_route_file_stat_expired"), true);
   assert.equal(source.includes("pm_route_file_buffer_expired"), true);
+  assert.equal(source.includes("pm_route_file_writer_alive"), true);
+  assert.equal(source.includes("return !pm_route_file_writer_alive(buffer);"), true);
   assert.equal(source.includes("entry->size == stat_buffer->st_size"), true);
   assert.equal(source.includes("entry->mtime_sec == pm_stat_mtime_sec(stat_buffer)"), true);
   assert.equal(source.includes("entry->mtime_nsec == pm_stat_mtime_nsec(stat_buffer)"), true);
   assert.notEqual(loaderStart, -1);
   assert.equal(
-    loaderBody.indexOf("pm_route_file_stat_expired(&stat_buffer)") <
-      loaderBody.indexOf("pm_get_cached_route_file(path, &stat_buffer"),
+    loaderBody.indexOf("pm_get_cached_route_file(path, &stat_buffer") <
+      loaderBody.indexOf("pm_route_file_buffer_expired(buffer)"),
     true,
   );
   assert.equal(source.includes("pm_cached_route_matches_cwd(route, current_cwd)"), true);

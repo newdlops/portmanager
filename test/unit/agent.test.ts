@@ -32,6 +32,8 @@ const fixedUpdatedAt = "2026-06-21T10:00:00.000Z";
 const fixedNow = () => new Date(fixedUpdatedAt);
 const PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS = 300_000;
 
+delete process.env.PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS;
+
 test("registers native hook processes as hooked managed rows", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   let listeners: readonly ListeningPort[] = [
@@ -206,7 +208,7 @@ test("newer route table generation rejects stale daemon writes", async (context)
   assert.equal(fs.existsSync(getRouteTablePathForLogicalPort(8001, "network-a", routeTablePath)), false);
 });
 
-test("route-table TTL starts after the first bidirectional handshake", async (context) => {
+test("route-table TTL starts after the first bidirectional handshake and stays alive while route is registered", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   let nowMs = Date.parse(fixedUpdatedAt);
   let establishedConnections: readonly EstablishedTcpConnection[] = [];
@@ -269,7 +271,12 @@ test("route-table TTL starts after the first bidirectional handshake", async (co
   nowMs = firstHandshakeRouteTable.expiresAtMs! - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
   await agent.refreshSnapshot();
 
-  assert.equal(readRouteTable(routeTablePath).expiresAtMs, firstHandshakeRouteTable.expiresAtMs);
+  assert.equal(readRouteTable(routeTablePath).expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
+
+  nowMs = firstHandshakeRouteTable.expiresAtMs! + 30_000;
+  await agent.refreshSnapshot();
+
+  assert.equal(readRouteTable(routeTablePath).expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
 
   fs.writeFileSync(
     routeTablePath,
