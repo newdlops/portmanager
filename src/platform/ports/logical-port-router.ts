@@ -84,6 +84,9 @@ export class LogicalPortRouterManager implements DisposableLike {
   /** Active loopback listener groups keyed by logical port. */
   private readonly listeners = new Map<number, LogicalPortRouterListenerHandle>();
 
+  /** Shared native data-plane process that can own many logical listener ports. */
+  private nativeRouter: NativeLogicalPortRouterProcess | undefined;
+
   /** Delayed closes for ports that vanish during transient route-table refreshes. */
   private readonly retireTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
@@ -168,6 +171,10 @@ export class LogicalPortRouterManager implements DisposableLike {
 
     this.listeners.delete(logicalPort);
     await listenerSet.close();
+    if (this.listeners.size === 0) {
+      await this.nativeRouter?.close().catch(() => undefined);
+      this.nativeRouter = undefined;
+    }
   }
 
   /** Closes every listener owned by this router. */
@@ -177,6 +184,8 @@ export class LogicalPortRouterManager implements DisposableLike {
       this.cancelRetire(port);
     }
     void Promise.all(ports.map((port) => this.close(port)));
+    void this.nativeRouter?.close();
+    this.nativeRouter = undefined;
   }
 
   /** Defers destructive close so refresh gaps do not tear down active TCP streams. */
@@ -213,26 +222,38 @@ export class LogicalPortRouterManager implements DisposableLike {
   }
 
   /** Starts the native data-plane router when the packaged helper is available. */
-  private async openNative(logicalPort: number): Promise<NativeLogicalPortRouterProcess | undefined> {
+  private async openNative(logicalPort: number): Promise<LogicalPortRouterListenerHandle | undefined> {
     const nativeRouterPath = this.options.nativeRouterPath;
     if (nativeRouterPath === undefined || !isExecutableFile(nativeRouterPath)) {
       return undefined;
     }
 
-    const router = new NativeLogicalPortRouterProcess(
-      logicalPort,
+    const router = this.getNativeRouter(nativeRouterPath);
+
+    try {
+      return await router.open(logicalPort);
+    } catch {
+      if (!router.hasOpenWork()) {
+        await router.close().catch(() => undefined);
+        if (this.nativeRouter === router) {
+          this.nativeRouter = undefined;
+        }
+      }
+      return undefined;
+    }
+  }
+
+  private getNativeRouter(nativeRouterPath: string): NativeLogicalPortRouterProcess {
+    if (this.nativeRouter?.isActive()) {
+      return this.nativeRouter;
+    }
+
+    this.nativeRouter = new NativeLogicalPortRouterProcess(
       nativeRouterPath,
       this.targetResolver,
       this.options.nativeStartupTimeoutMs ?? DEFAULT_NATIVE_STARTUP_TIMEOUT_MS,
     );
-
-    try {
-      await router.start();
-      return router;
-    } catch {
-      await router.close().catch(() => undefined);
-      return undefined;
-    }
+    return this.nativeRouter;
   }
 
   /** Resolves and pipes one accepted connection to its actual target. */
@@ -283,8 +304,8 @@ export class LogicalPortRouterManager implements DisposableLike {
  * process/network resolution logic while keeping high-volume TCP payloads out of
  * Node streams.
  */
-class NativeLogicalPortRouterProcess implements LogicalPortRouterListenerHandle {
-  /** Child process running the native router helper for one logical port. */
+class NativeLogicalPortRouterProcess {
+  /** Child process running the native router helper for many logical ports. */
   private child: ChildProcessWithoutNullStreams | undefined;
 
   /** Partial stdout line buffer for the helper control protocol. */
@@ -296,7 +317,7 @@ class NativeLogicalPortRouterProcess implements LogicalPortRouterListenerHandle 
   /** Whether the helper has exited or been closed. */
   private closed = false;
 
-  /** Startup promise hooks resolved by the helper READY line. */
+  /** Startup promise hooks resolved by the helper control READY line. */
   private startup:
     | {
         readonly resolve: () => void;
@@ -305,21 +326,38 @@ class NativeLogicalPortRouterProcess implements LogicalPortRouterListenerHandle 
       }
     | undefined;
 
+  private startupPromise: Promise<void> | undefined;
+
+  /** Logical ports successfully owned by the shared native helper. */
+  private readonly activePorts = new Set<number>();
+
+  /** Per-port LISTEN requests awaiting READY/LISTEN_ERROR from the helper. */
+  private readonly pendingListens = new Map<
+    number,
+    {
+      readonly resolve: () => void;
+      readonly reject: (error: Error) => void;
+      readonly timer: NodeJS.Timeout;
+    }
+  >();
+
   constructor(
-    private readonly logicalPort: number,
     private readonly executablePath: string,
     private readonly targetResolver: LogicalPortRouterTargetResolver,
     private readonly startupTimeoutMs: number,
   ) {}
 
-  /** Starts the helper and waits until it has bound at least one loopback address. */
+  /** Starts the shared helper and waits until it can accept LISTEN commands. */
   start(): Promise<void> {
-    if (this.child !== undefined && !this.closed) {
+    if (this.isActive() && this.startupPromise === undefined) {
       return Promise.resolve();
+    }
+    if (this.startupPromise !== undefined) {
+      return this.startupPromise;
     }
 
     this.closed = false;
-    this.child = spawn(this.executablePath, [String(this.logicalPort)], {
+    this.child = spawn(this.executablePath, ["--control"], {
       // The router's outbound target connection must not re-enter Port Manager's native hook.
       env: buildNodeRuntimeEnvironment(),
       stdio: ["pipe", "pipe", "pipe"],
@@ -332,28 +370,74 @@ class NativeLogicalPortRouterProcess implements LogicalPortRouterListenerHandle 
     this.child.once("error", (error) => this.rejectStartup(error));
     this.child.once("exit", (code, signal) => {
       this.closed = true;
-      this.rejectStartup(
-        new Error(
-          `Native logical router exited before ready for ${this.logicalPort}: ${formatNativeExit(code, signal)}${this.formatStderrSuffix()}`,
-        ),
+      this.activePorts.clear();
+      this.rejectPendingListens(
+        new Error(`Native logical router exited: ${formatNativeExit(code, signal)}${this.formatStderrSuffix()}`),
       );
+      this.rejectStartup(new Error(`Native logical router exited before ready: ${formatNativeExit(code, signal)}${this.formatStderrSuffix()}`));
     });
 
-    return new Promise((resolve, reject) => {
+    this.startupPromise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.rejectStartup(new Error(`Native logical router timed out for ${this.logicalPort}${this.formatStderrSuffix()}`));
+        this.rejectStartup(new Error(`Native logical router timed out${this.formatStderrSuffix()}`));
       }, this.startupTimeoutMs);
       this.startup = { resolve, reject, timer };
     });
+    return this.startupPromise;
+  }
+
+  async open(logicalPort: number): Promise<LogicalPortRouterListenerHandle> {
+    await this.start();
+    if (this.activePorts.has(logicalPort)) {
+      return new NativeLogicalPortRouterPortHandle(this, logicalPort);
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingListens.delete(logicalPort);
+        reject(new Error(`Native logical router timed out opening ${logicalPort}${this.formatStderrSuffix()}`));
+      }, this.startupTimeoutMs);
+      this.pendingListens.set(logicalPort, { resolve, reject, timer });
+      this.writeControlLine(`LISTEN\t${logicalPort}\n`);
+    });
+
+    return new NativeLogicalPortRouterPortHandle(this, logicalPort);
   }
 
   isActive(): boolean {
     return this.child !== undefined && !this.closed && this.child.exitCode === null && this.child.signalCode === null;
   }
 
+  isPortActive(logicalPort: number): boolean {
+    return this.isActive() && this.activePorts.has(logicalPort);
+  }
+
+  /** True while the shared helper still owns or is opening at least one logical port. */
+  hasOpenWork(): boolean {
+    return this.activePorts.size > 0 || this.pendingListens.size > 0;
+  }
+
+  async closePort(logicalPort: number): Promise<void> {
+    this.activePorts.delete(logicalPort);
+    const pending = this.pendingListens.get(logicalPort);
+    if (pending !== undefined) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(`Native logical router closed ${logicalPort}.`));
+      this.pendingListens.delete(logicalPort);
+    }
+    if (this.isActive()) {
+      this.writeControlLine(`CLOSE\t${logicalPort}\n`);
+    }
+    if (this.activePorts.size === 0 && this.pendingListens.size === 0) {
+      await this.close();
+    }
+  }
+
   async close(): Promise<void> {
     this.closed = true;
-    this.rejectStartup(new Error(`Native logical router closed for ${this.logicalPort}.`));
+    this.activePorts.clear();
+    this.rejectPendingListens(new Error("Native logical router closed."));
+    this.rejectStartup(new Error("Native logical router closed."));
 
     const child = this.child;
     this.child = undefined;
@@ -395,8 +479,26 @@ class NativeLogicalPortRouterProcess implements LogicalPortRouterListenerHandle 
   }
 
   private async handleProtocolLine(line: string): Promise<void> {
-    if (line === `READY\t${this.logicalPort}`) {
+    if (line === "READY\tcontrol") {
       this.resolveStartup();
+      return;
+    }
+
+    const readyPort = parseNativeRouterPortStatusLine(line, "READY");
+    if (readyPort !== undefined) {
+      this.resolveListen(readyPort);
+      return;
+    }
+
+    const failedPort = parseNativeRouterPortStatusLine(line, "LISTEN_ERROR");
+    if (failedPort !== undefined) {
+      this.rejectListen(failedPort, new Error(`Native logical router could not listen on ${failedPort}${this.formatStderrSuffix()}`));
+      return;
+    }
+
+    const closedPort = parseNativeRouterPortStatusLine(line, "CLOSED");
+    if (closedPort !== undefined) {
+      this.activePorts.delete(closedPort);
       return;
     }
 
@@ -414,6 +516,10 @@ class NativeLogicalPortRouterProcess implements LogicalPortRouterListenerHandle 
   }
 
   private writeResponse(line: string): void {
+    this.writeControlLine(line);
+  }
+
+  private writeControlLine(line: string): void {
     if (this.child === undefined || this.child.stdin.destroyed) {
       return;
     }
@@ -433,6 +539,7 @@ class NativeLogicalPortRouterProcess implements LogicalPortRouterListenerHandle 
     clearTimeout(this.startup.timer);
     this.startup.resolve();
     this.startup = undefined;
+    this.startupPromise = undefined;
   }
 
   private rejectStartup(error: Error): void {
@@ -443,11 +550,58 @@ class NativeLogicalPortRouterProcess implements LogicalPortRouterListenerHandle 
     clearTimeout(this.startup.timer);
     this.startup.reject(error);
     this.startup = undefined;
+    this.startupPromise = undefined;
+  }
+
+  private resolveListen(logicalPort: number): void {
+    const pending = this.pendingListens.get(logicalPort);
+    this.activePorts.add(logicalPort);
+    if (pending === undefined) {
+      return;
+    }
+
+    clearTimeout(pending.timer);
+    this.pendingListens.delete(logicalPort);
+    pending.resolve();
+  }
+
+  private rejectListen(logicalPort: number, error: Error): void {
+    const pending = this.pendingListens.get(logicalPort);
+    if (pending === undefined) {
+      return;
+    }
+
+    clearTimeout(pending.timer);
+    this.pendingListens.delete(logicalPort);
+    pending.reject(error);
+  }
+
+  private rejectPendingListens(error: Error): void {
+    for (const pending of this.pendingListens.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pendingListens.clear();
   }
 
   private formatStderrSuffix(): string {
     const stderr = this.stderrBuffer.trim();
     return stderr.length === 0 ? "" : `: ${stderr}`;
+  }
+}
+
+class NativeLogicalPortRouterPortHandle implements LogicalPortRouterListenerHandle {
+  constructor(
+    private readonly router: NativeLogicalPortRouterProcess,
+    private readonly logicalPort: number,
+  ) {}
+
+  isActive(): boolean {
+    return this.router.isPortActive(this.logicalPort);
+  }
+
+  close(): Promise<void> {
+    return this.router.closePort(this.logicalPort);
   }
 }
 
@@ -473,6 +627,15 @@ export function parseNativeRouterQueryLine(line: string): NativeLogicalPortRoute
     remoteAddress: parts[5],
     ...(remotePort === undefined ? {} : { remotePort }),
   };
+}
+
+function parseNativeRouterPortStatusLine(line: string, status: string): number | undefined {
+  const parts = line.split("\t");
+  if (parts.length !== 2 || parts[0] !== status) {
+    return undefined;
+  }
+
+  return parseTcpPort(parts[1]);
 }
 
 /** Wraps the original Node stream router behind the same listener handle. */

@@ -99,8 +99,14 @@ test("native logical router helper starts without inherited hook environment", a
       "#!/usr/bin/env node",
       'const fs = require("node:fs");',
       'fs.writeFileSync(process.env.PM_ROUTER_ENV_PATH, JSON.stringify(process.env));',
-      'process.stdout.write(`READY\\t${process.argv[2]}\\n`);',
-      "process.stdin.resume();",
+      'process.stdout.write("READY\\tcontrol\\n");',
+      'process.stdin.setEncoding("utf8");',
+      'process.stdin.on("data", (chunk) => {',
+      '  for (const line of chunk.split("\\n")) {',
+      '    const parts = line.trim().split("\\t");',
+      '    if (parts[0] === "LISTEN" && parts[1]) process.stdout.write(`READY\\t${parts[1]}\\n`);',
+      '  }',
+      '});',
     ].join("\n"),
     "utf8",
   );
@@ -155,6 +161,12 @@ test("native logical router pending route requests time out instead of blocking 
   assert.equal(routerSource.includes("clock_gettime(CLOCK_REALTIME, &deadline)"), true);
   assert.equal(routerSource.includes("pthread_cond_timedwait(&route.condition, &pm_pending_mutex, &deadline)"), true);
   assert.equal(routerSource.includes("if (!route.resolved || route.failed"), true);
+  assert.equal(routerSource.includes("listener_list_t"), true);
+  assert.equal(routerSource.includes("\"LISTEN\\t\""), true);
+  assert.equal(routerSource.includes("\"READY\\tcontrol\\n\""), true);
+  assert.equal(routerSource.includes("\"LISTEN_ERROR\\t%d\\n\""), true);
+  assert.equal(routerSource.includes("PM_ROUTER_USE_KQUEUE"), true);
+  assert.equal(routerSource.includes("kevent(pm_kqueue_fd"), true);
   assert.match(buildScript, /-pthread "\$TCP_ROUTER_SOURCE_FILE"/);
 });
 
@@ -211,6 +223,54 @@ test("keeps logical router TCP streams across transient route gaps", async () =>
     socket?.destroy();
     await manager.close(logicalPort).catch(() => undefined);
     await closeServer(targetServer).catch(() => undefined);
+  }
+});
+
+test("uses one shared native router process for many logical ports", async (context) => {
+  const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pm-router-budget-"));
+  const nativeRouterPath = path.join(tempDirectory, "native-router.js");
+  const markerPath = path.join(tempDirectory, "native-router-started");
+  const routerPorts = await findFreeLoopbackPorts(2);
+
+  fs.writeFileSync(
+    nativeRouterPath,
+    [
+      "#!/usr/bin/env node",
+      'require("node:fs").appendFileSync(process.env.PM_NATIVE_ROUTER_MARKER, `${process.argv.slice(2).join(",")}\\n`);',
+      'process.stdout.write("READY\\tcontrol\\n");',
+      'process.stdin.setEncoding("utf8");',
+      'process.stdin.on("data", (chunk) => {',
+      '  for (const line of chunk.split("\\n")) {',
+      '    const parts = line.trim().split("\\t");',
+      '    if (parts[0] === "LISTEN" && parts[1]) process.stdout.write(`READY\\t${parts[1]}\\n`);',
+      '    if (parts[0] === "CLOSE" && parts[1]) process.stdout.write(`CLOSED\\t${parts[1]}\\n`);',
+      '  }',
+      '});',
+    ].join("\n"),
+    "utf8",
+  );
+  fs.chmodSync(nativeRouterPath, 0o755);
+
+  const manager = new LogicalPortRouterManager(
+    {
+      resolve: () => ({ host: "127.0.0.1", port: 1 }),
+    },
+    {
+      nativeRouterPath,
+    },
+  );
+  const previousEnvironment = setProcessEnvironment({ PM_NATIVE_ROUTER_MARKER: markerPath });
+  context.after(() => {
+    restoreProcessEnvironment(previousEnvironment);
+    fs.rmSync(tempDirectory, { recursive: true, force: true });
+  });
+
+  try {
+    await manager.sync(routerPorts);
+
+    assert.equal(fs.readFileSync(markerPath, "utf8"), "--control\n");
+  } finally {
+    await Promise.all(routerPorts.map((port) => manager.close(port).catch(() => undefined)));
   }
 });
 
@@ -424,6 +484,21 @@ async function findFreeLoopbackPort(): Promise<number> {
   const port = serverPort(server);
   await closeServer(server);
   return port;
+}
+
+async function findFreeLoopbackPorts(count: number): Promise<readonly number[]> {
+  const servers: net.Server[] = [];
+
+  try {
+    for (let index = 0; index < count; index++) {
+      const server = net.createServer();
+      await listenServer(server, 0, "127.0.0.1");
+      servers.push(server);
+    }
+    return servers.map(serverPort);
+  } finally {
+    await Promise.all(servers.map((server) => closeServer(server).catch(() => undefined)));
+  }
 }
 
 function listenServer(server: net.Server, port: number, host: string, ipv6Only?: boolean): Promise<void> {

@@ -9,6 +9,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#include <sys/event.h>
+#include <sys/time.h>
+#define PM_ROUTER_USE_KQUEUE 1
+#endif
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
@@ -39,6 +44,23 @@ typedef struct accepted_connection {
   int remote_port;
 } accepted_connection_t;
 
+typedef struct logical_listener {
+  int fd;
+  int logical_port;
+} logical_listener_t;
+
+typedef struct listener_list {
+  logical_listener_t *items;
+  size_t count;
+  size_t capacity;
+} listener_list_t;
+
+typedef struct line_buffer {
+  char *data;
+  size_t length;
+  size_t capacity;
+} line_buffer_t;
+
 typedef struct copy_args {
   int source_fd;
   int target_fd;
@@ -48,6 +70,14 @@ static pthread_mutex_t pm_pending_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t pm_stdout_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pending_route_t *pm_pending_routes = NULL;
 static uint64_t pm_next_route_id = 1;
+#if PM_ROUTER_USE_KQUEUE
+static int pm_kqueue_fd = -1;
+#endif
+
+static int pm_parse_port(const char *value);
+static int pm_listener_list_open_port(listener_list_t *listeners, int logical_port);
+static void pm_listener_list_close_port(listener_list_t *listeners, int logical_port);
+static void pm_listener_list_free(listener_list_t *listeners);
 
 static int pm_write_all(int fd, const char *buffer, size_t length) {
   size_t written = 0;
@@ -178,18 +208,33 @@ static void pm_parse_response_line(char *line) {
   }
 }
 
-static void *pm_stdin_reader_thread(void *unused) {
-  char *line = NULL;
-  size_t capacity = 0;
-  (void)unused;
+static void pm_handle_control_line(listener_list_t *listeners, char *line) {
+  if (strncmp(line, "LISTEN\t", 7) == 0) {
+    int logical_port = pm_parse_port(line + 7);
+    char response[PM_ROUTER_LINE_SIZE];
 
-  while (getline(&line, &capacity, stdin) >= 0) {
-    pm_parse_response_line(line);
+    if (logical_port > 0 && pm_listener_list_open_port(listeners, logical_port) == 0) {
+      snprintf(response, sizeof(response), "READY\t%d\n", logical_port);
+    } else {
+      snprintf(response, sizeof(response), "LISTEN_ERROR\t%d\n", logical_port);
+    }
+    (void)pm_write_protocol_line(response);
+    return;
   }
 
-  free(line);
-  _exit(0);
-  return NULL;
+  if (strncmp(line, "CLOSE\t", 6) == 0) {
+    int logical_port = pm_parse_port(line + 6);
+    char response[PM_ROUTER_LINE_SIZE];
+
+    if (logical_port > 0) {
+      pm_listener_list_close_port(listeners, logical_port);
+      snprintf(response, sizeof(response), "CLOSED\t%d\n", logical_port);
+      (void)pm_write_protocol_line(response);
+    }
+    return;
+  }
+
+  pm_parse_response_line(line);
 }
 
 static int pm_send_route_request(const accepted_connection_t *connection, uint64_t route_id) {
@@ -457,6 +502,143 @@ static int pm_create_ipv6_listener(int port) {
   return fd;
 }
 
+static int pm_register_read_event(int fd, int logical_port) {
+#if PM_ROUTER_USE_KQUEUE
+  struct kevent change;
+
+  if (pm_kqueue_fd < 0) {
+    return 0;
+  }
+
+  /*
+   * kqueue removes events when an fd closes. We still delete explicitly on
+   * CLOSE so the control protocol has deterministic listener ownership.
+   */
+  EV_SET(&change, (uintptr_t)fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, (void *)(intptr_t)logical_port);
+  return kevent(pm_kqueue_fd, &change, 1, NULL, 0, NULL);
+#else
+  (void)fd;
+  (void)logical_port;
+  return 0;
+#endif
+}
+
+static void pm_unregister_read_event(int fd) {
+#if PM_ROUTER_USE_KQUEUE
+  struct kevent change;
+
+  if (pm_kqueue_fd < 0) {
+    return;
+  }
+
+  EV_SET(&change, (uintptr_t)fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+  (void)kevent(pm_kqueue_fd, &change, 1, NULL, 0, NULL);
+#else
+  (void)fd;
+#endif
+}
+
+static int pm_reserve_listeners(listener_list_t *listeners, size_t count) {
+  logical_listener_t *next;
+  size_t capacity;
+
+  if (count <= listeners->capacity) {
+    return 0;
+  }
+
+  capacity = listeners->capacity == 0 ? 16 : listeners->capacity;
+  while (capacity < count) {
+    capacity *= 2;
+  }
+
+  next = (logical_listener_t *)realloc(listeners->items, capacity * sizeof(logical_listener_t));
+  if (next == NULL) {
+    return -1;
+  }
+
+  listeners->items = next;
+  listeners->capacity = capacity;
+  return 0;
+}
+
+static int pm_listener_list_has_port(const listener_list_t *listeners, int logical_port) {
+  for (size_t index = 0; index < listeners->count; index++) {
+    if (listeners->items[index].logical_port == logical_port) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int pm_listener_list_add_fd(listener_list_t *listeners, int logical_port, int fd) {
+  if (pm_reserve_listeners(listeners, listeners->count + 1) != 0) {
+    return -1;
+  }
+  if (pm_register_read_event(fd, logical_port) != 0) {
+    return -1;
+  }
+
+  listeners->items[listeners->count].fd = fd;
+  listeners->items[listeners->count].logical_port = logical_port;
+  listeners->count++;
+  return 0;
+}
+
+static int pm_listener_list_open_port(listener_list_t *listeners, int logical_port) {
+  int ipv4_fd;
+  int ipv6_fd;
+  size_t before_count;
+
+  if (pm_listener_list_has_port(listeners, logical_port)) {
+    return 0;
+  }
+
+  before_count = listeners->count;
+  ipv4_fd = pm_create_ipv4_listener(logical_port);
+  if (ipv4_fd >= 0 && pm_listener_list_add_fd(listeners, logical_port, ipv4_fd) != 0) {
+    close(ipv4_fd);
+  }
+
+  ipv6_fd = pm_create_ipv6_listener(logical_port);
+  if (ipv6_fd >= 0 && pm_listener_list_add_fd(listeners, logical_port, ipv6_fd) != 0) {
+    close(ipv6_fd);
+  }
+
+  if (listeners->count == before_count) {
+    return -1;
+  }
+
+  return 0;
+}
+
+static void pm_listener_list_close_port(listener_list_t *listeners, int logical_port) {
+  size_t index = 0;
+
+  while (index < listeners->count) {
+    if (listeners->items[index].logical_port != logical_port) {
+      index++;
+      continue;
+    }
+
+    pm_unregister_read_event(listeners->items[index].fd);
+    close(listeners->items[index].fd);
+    memmove(&listeners->items[index], &listeners->items[index + 1], (listeners->count - index - 1) * sizeof(logical_listener_t));
+    listeners->count--;
+  }
+}
+
+static void pm_listener_list_free(listener_list_t *listeners) {
+  for (size_t index = 0; index < listeners->count; index++) {
+    pm_unregister_read_event(listeners->items[index].fd);
+    close(listeners->items[index].fd);
+  }
+  free(listeners->items);
+  listeners->items = NULL;
+  listeners->count = 0;
+  listeners->capacity = 0;
+}
+
 static void pm_sockaddr_text(
   const struct sockaddr *address,
   socklen_t address_length,
@@ -534,90 +716,252 @@ static int pm_parse_port(const char *value) {
   char *end = NULL;
   long port = strtol(value, &end, 10);
 
-  if (end == value || *end != '\0' || port < 1 || port > 65535) {
+  if (end == value || (*end != '\0' && *end != '\r' && *end != '\n') || port < 1 || port > 65535) {
     return 0;
   }
 
   return (int)port;
 }
 
-int main(int argc, char **argv) {
-  int logical_port;
-  int listeners[2];
-  int listener_count = 0;
-  pthread_t stdin_thread;
-  char ready_line[64];
+static int pm_line_buffer_reserve(line_buffer_t *buffer, size_t required) {
+  char *next;
+  size_t capacity;
 
-  if (argc != 2) {
-    fprintf(stderr, "usage: %s <logical-port>\n", argv[0]);
-    return 2;
+  if (required <= buffer->capacity) {
+    return 0;
   }
 
-  logical_port = pm_parse_port(argv[1]);
-  if (logical_port == 0) {
-    fprintf(stderr, "invalid logical port: %s\n", argv[1]);
-    return 2;
+  capacity = buffer->capacity == 0 ? 4096 : buffer->capacity;
+  while (capacity < required) {
+    capacity *= 2;
   }
 
-  signal(SIGPIPE, SIG_IGN);
-  listeners[listener_count] = pm_create_ipv4_listener(logical_port);
-  if (listeners[listener_count] >= 0) {
-    listener_count++;
+  next = (char *)realloc(buffer->data, capacity);
+  if (next == NULL) {
+    return -1;
   }
 
-  listeners[listener_count] = pm_create_ipv6_listener(logical_port);
-  if (listeners[listener_count] >= 0) {
-    listener_count++;
+  buffer->data = next;
+  buffer->capacity = capacity;
+  return 0;
+}
+
+static int pm_line_buffer_append(line_buffer_t *buffer, const char *data, size_t length) {
+  if (pm_line_buffer_reserve(buffer, buffer->length + length + 1) != 0) {
+    return -1;
   }
 
-  if (listener_count == 0) {
-    fprintf(stderr, "could not bind localhost logical port %d\n", logical_port);
-    return 3;
-  }
+  memcpy(buffer->data + buffer->length, data, length);
+  buffer->length += length;
+  buffer->data[buffer->length] = '\0';
+  return 0;
+}
 
-  if (pthread_create(&stdin_thread, NULL, pm_stdin_reader_thread, NULL) != 0) {
-    fprintf(stderr, "could not start control reader\n");
-    return 4;
-  }
-  pthread_detach(stdin_thread);
+static int pm_read_control_input(listener_list_t *listeners, line_buffer_t *buffer) {
+  char chunk[4096];
+  ssize_t count;
 
-  snprintf(ready_line, sizeof(ready_line), "READY\t%d\n", logical_port);
-  if (pm_write_protocol_line(ready_line) != 0) {
-    return 5;
+  count = read(STDIN_FILENO, chunk, sizeof(chunk));
+  if (count < 0) {
+    return errno == EINTR ? 0 : -1;
+  }
+  if (count == 0) {
+    return -1;
+  }
+  if (pm_line_buffer_append(buffer, chunk, (size_t)count) != 0) {
+    return -1;
   }
 
   for (;;) {
-    struct pollfd poll_fds[2];
-    int index;
-    int ready;
+    char *newline = memchr(buffer->data, '\n', buffer->length);
+    size_t line_length;
 
-    for (index = 0; index < listener_count; index++) {
-      poll_fds[index].fd = listeners[index];
-      poll_fds[index].events = POLLIN;
-      poll_fds[index].revents = 0;
+    if (newline == NULL) {
+      break;
     }
 
-    ready = poll(poll_fds, (nfds_t)listener_count, -1);
+    line_length = (size_t)(newline - buffer->data);
+    buffer->data[line_length] = '\0';
+    if (line_length > 0) {
+      pm_handle_control_line(listeners, buffer->data);
+    }
+
+    memmove(buffer->data, newline + 1, buffer->length - line_length - 1);
+    buffer->length -= line_length + 1;
+    buffer->data[buffer->length] = '\0';
+  }
+
+  return 0;
+}
+
+static void pm_line_buffer_free(line_buffer_t *buffer) {
+  free(buffer->data);
+  buffer->data = NULL;
+  buffer->length = 0;
+  buffer->capacity = 0;
+}
+
+#if PM_ROUTER_USE_KQUEUE
+static int pm_run_event_loop(listener_list_t *listeners, line_buffer_t *input_buffer) {
+  struct kevent events[256];
+
+  for (;;) {
+    int ready = kevent(pm_kqueue_fd, NULL, 0, events, (int)(sizeof(events) / sizeof(events[0])), NULL);
     if (ready < 0) {
       if (errno == EINTR) {
         continue;
       }
-      break;
+      fprintf(stderr, "kevent failed for router listeners: %s\n", strerror(errno));
+      return -1;
     }
 
-    for (index = 0; index < listener_count; index++) {
-      if ((poll_fds[index].revents & POLLIN) != 0) {
-        accepted_connection_t *connection = pm_accept_connection(poll_fds[index].fd, logical_port);
+    for (int index = 0; index < ready; index++) {
+      int fd = (int)events[index].ident;
+      int logical_port = (int)(intptr_t)events[index].udata;
+
+      if (fd == STDIN_FILENO) {
+        if (pm_read_control_input(listeners, input_buffer) != 0) {
+          return 0;
+        }
+        continue;
+      }
+
+      if ((events[index].flags & EV_ERROR) != 0 || events[index].filter != EVFILT_READ || logical_port <= 0) {
+        continue;
+      }
+
+      accepted_connection_t *connection = pm_accept_connection(fd, logical_port);
+      if (connection != NULL) {
+        pm_start_connection_thread(connection);
+      }
+    }
+  }
+}
+#else
+static int pm_run_event_loop(listener_list_t *listeners, line_buffer_t *input_buffer) {
+  struct pollfd *poll_fds = NULL;
+  size_t poll_capacity = 0;
+
+  for (;;) {
+    size_t required_poll_count = listeners->count + 1;
+    int ready;
+
+    if (required_poll_count > poll_capacity) {
+      size_t next_capacity = poll_capacity == 0 ? 16 : poll_capacity;
+      struct pollfd *next;
+
+      while (next_capacity < required_poll_count) {
+        next_capacity *= 2;
+      }
+      next = (struct pollfd *)realloc(poll_fds, next_capacity * sizeof(struct pollfd));
+      if (next == NULL) {
+        free(poll_fds);
+        return -1;
+      }
+      poll_fds = next;
+      poll_capacity = next_capacity;
+    }
+
+    poll_fds[0].fd = STDIN_FILENO;
+    poll_fds[0].events = POLLIN;
+    poll_fds[0].revents = 0;
+    for (size_t index = 0; index < listeners->count; index++) {
+      poll_fds[index + 1].fd = listeners->items[index].fd;
+      poll_fds[index + 1].events = POLLIN;
+      poll_fds[index + 1].revents = 0;
+    }
+
+    ready = poll(poll_fds, (nfds_t)required_poll_count, -1);
+    if (ready < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      fprintf(stderr, "poll failed for %zu router fds: %s\n", required_poll_count, strerror(errno));
+      free(poll_fds);
+      return -1;
+    }
+
+    for (size_t index = 0; index < listeners->count; index++) {
+      if ((poll_fds[index + 1].revents & POLLIN) != 0) {
+        accepted_connection_t *connection = pm_accept_connection(listeners->items[index].fd, listeners->items[index].logical_port);
         if (connection != NULL) {
           pm_start_connection_thread(connection);
         }
       }
     }
+
+    if ((poll_fds[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0 && pm_read_control_input(listeners, input_buffer) != 0) {
+      free(poll_fds);
+      return 0;
+    }
+  }
+}
+#endif
+
+int main(int argc, char **argv) {
+  listener_list_t listeners = {0};
+  line_buffer_t input_buffer = {0};
+  int control_mode = 0;
+  char ready_line[64];
+
+  if (argc < 2) {
+    fprintf(stderr, "usage: %s <logical-port> [logical-port ...] | --control\n", argv[0]);
+    return 2;
   }
 
-  for (int index = 0; index < listener_count; index++) {
-    close(listeners[index]);
+  signal(SIGPIPE, SIG_IGN);
+#if PM_ROUTER_USE_KQUEUE
+  pm_kqueue_fd = kqueue();
+  if (pm_kqueue_fd < 0) {
+    fprintf(stderr, "could not create router kqueue: %s\n", strerror(errno));
+    return 6;
+  }
+  if (pm_register_read_event(STDIN_FILENO, 0) != 0) {
+    fprintf(stderr, "could not register router control input: %s\n", strerror(errno));
+    close(pm_kqueue_fd);
+    pm_kqueue_fd = -1;
+    return 6;
+  }
+#endif
+  control_mode = argc == 2 && strcmp(argv[1], "--control") == 0;
+  if (control_mode) {
+    if (pm_write_protocol_line("READY\tcontrol\n") != 0) {
+      return 5;
+    }
+  } else {
+    for (int arg_index = 1; arg_index < argc; arg_index++) {
+      int logical_port = pm_parse_port(argv[arg_index]);
+      if (logical_port == 0) {
+        fprintf(stderr, "invalid logical port: %s\n", argv[arg_index]);
+        pm_listener_list_free(&listeners);
+        return 2;
+      }
+
+      if (pm_listener_list_open_port(&listeners, logical_port) != 0) {
+        fprintf(stderr, "could not bind localhost logical port %d\n", logical_port);
+        continue;
+      }
+
+      snprintf(ready_line, sizeof(ready_line), "READY\t%d\n", logical_port);
+      if (pm_write_protocol_line(ready_line) != 0) {
+        pm_listener_list_free(&listeners);
+        return 5;
+      }
+    }
+
+    if (listeners.count == 0) {
+      return 3;
+    }
   }
 
+  (void)pm_run_event_loop(&listeners, &input_buffer);
+  pm_line_buffer_free(&input_buffer);
+  pm_listener_list_free(&listeners);
+#if PM_ROUTER_USE_KQUEUE
+  if (pm_kqueue_fd >= 0) {
+    close(pm_kqueue_fd);
+    pm_kqueue_fd = -1;
+  }
+#endif
   return 0;
 }
