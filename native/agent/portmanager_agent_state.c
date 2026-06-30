@@ -21,10 +21,6 @@
 #include <unistd.h>
 
 #define PM_PROCESS_INSPECT_TEXT 65536
-#define PM_ROUTE_TABLE_WRITE_LOCK_STALE_SECONDS 30
-#define PM_ROUTE_TABLE_WRITE_LOCK_ATTEMPTS 100
-#define PM_ROUTE_TABLE_WRITE_LOCK_BACKGROUND_ATTEMPTS 1
-#define PM_ROUTE_TABLE_WRITE_LOCK_SLEEP_US 10000
 #define PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"
 #define PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15
 /* Pre-handshake routes use a cleanup lease; observed routes use the short TTL only as a stale-writer guard. */
@@ -2753,59 +2749,53 @@ static int pm_write_route_table_file_if_changed(
   return result;
 }
 
-static void pm_route_table_write_lock_path(const char *route_table_path, char *out, size_t out_size) {
-  snprintf(out, out_size, "%s.lock", route_table_path);
-}
+static int pm_route_table_generation_is_newer_for_publish(
+  pm_agent_state *state,
+  const pm_route *routes,
+  size_t route_count,
+  char **current_networks,
+  size_t current_network_count,
+  unsigned long sequence) {
+  int has_unscoped_route = 0;
 
-static void pm_remove_stale_route_table_write_lock(const char *lock_path) {
-  struct stat stats;
-  time_t now = time(NULL);
-
-  if (stat(lock_path, &stats) != 0) {
-    return;
-  }
-
-  if (now - stats.st_mtime >= PM_ROUTE_TABLE_WRITE_LOCK_STALE_SECONDS) {
-    unlink(lock_path);
-  }
-}
-
-static int pm_acquire_route_table_write_lock(const char *route_table_path, char *lock_path, size_t lock_path_size, int attempts) {
-  char owner[128];
-
-  pm_route_table_write_lock_path(route_table_path, lock_path, lock_path_size);
-  if (pm_mkdir_p_for_file(lock_path) != 0) {
-    return -1;
-  }
-
-  for (int attempt = 0; attempt < attempts; attempt++) {
-    int fd = open(lock_path, O_CREAT | O_EXCL | O_WRONLY, 0600);
-    if (fd >= 0) {
-      snprintf(owner, sizeof(owner), "%ld\n%ld\n", (long)getpid(), (long)time(NULL));
-      (void)write(fd, owner, strlen(owner));
-      return fd;
-    }
-
-    if (errno != EEXIST) {
-      return -1;
-    }
-
-    pm_remove_stale_route_table_write_lock(lock_path);
-    if (attempt + 1 < attempts) {
-      usleep(PM_ROUTE_TABLE_WRITE_LOCK_SLEEP_US);
+  for (size_t index = 0; index < route_count; index++) {
+    if (routes[index].network_id[0] == '\0') {
+      has_unscoped_route = 1;
+      break;
     }
   }
 
-  return -1;
-}
+  /*
+   * Network route tables are the generation owner for scoped routes. Legacy
+   * unscoped routes only consult an existing base table; the hot path no longer
+   * publishes a global aggregate file.
+   */
+  if (has_unscoped_route && access(state->route_table_path, F_OK) == 0 &&
+      pm_route_table_generation_is_newer(state, state->route_table_path, sequence)) {
+    return 1;
+  }
 
-static void pm_release_route_table_write_lock(int fd, const char *lock_path) {
-  if (fd >= 0) {
-    close(fd);
+  for (size_t index = 0; index < current_network_count; index++) {
+    char network_path[PM_TEXT];
+    pm_scoped_route_table_path(state->route_table_path, current_networks[index], network_path, sizeof(network_path));
+    if (pm_route_table_generation_is_newer(state, network_path, sequence)) {
+      return 1;
+    }
   }
-  if (lock_path != NULL && lock_path[0] != '\0') {
-    unlink(lock_path);
+
+  for (size_t index = 0; index < state->written_network_count; index++) {
+    char network_path[PM_TEXT];
+    if (pm_string_array_binary_contains(current_networks, current_network_count, state->written_network_ids[index])) {
+      continue;
+    }
+
+    pm_scoped_route_table_path(state->route_table_path, state->written_network_ids[index], network_path, sizeof(network_path));
+    if (pm_route_table_generation_is_newer(state, network_path, sequence)) {
+      return 1;
+    }
   }
+
+  return 0;
 }
 
 typedef struct {
@@ -2846,33 +2836,21 @@ static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock) {
   char **current_claims = NULL;
   size_t current_claim_count = 0;
   size_t current_claim_capacity = 0;
-  char lock_path[PM_TEXT];
-  int lock_fd;
   int result = 0;
   int endpoint_entries_complete = 1;
   int claim_entries_complete = 1;
   unsigned long sequence;
+  (void)wait_for_lock;
 
   if (pm_build_routes(state, NULL, &routes) != 0) {
     return -1;
   }
   pm_prune_bidirectional_refreshes_for_routes(state, routes.items, routes.count);
 
-  lock_fd = pm_acquire_route_table_write_lock(
-    state->route_table_path,
-    lock_path,
-    sizeof(lock_path),
-    wait_for_lock ? PM_ROUTE_TABLE_WRITE_LOCK_ATTEMPTS : PM_ROUTE_TABLE_WRITE_LOCK_BACKGROUND_ATTEMPTS);
-  if (lock_fd < 0) {
-    free(routes.items);
-    return -1;
-  }
-
   if (routes.count > 0) {
     entry_items = (pm_route_entry_item *)malloc(routes.count * sizeof(pm_route_entry_item));
     claim_items = (pm_route_claim_item *)malloc(routes.count * 2 * sizeof(pm_route_claim_item));
     if (entry_items == NULL || claim_items == NULL) {
-      pm_release_route_table_write_lock(lock_fd, lock_path);
       free(entry_items);
       free(claim_items);
       free(routes.items);
@@ -2881,13 +2859,6 @@ static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock) {
   }
 
   sequence = ++state->route_table_sequence;
-  if (pm_route_table_generation_is_newer(state, state->route_table_path, sequence)) {
-    pm_release_route_table_write_lock(lock_fd, lock_path);
-    free(claim_items);
-    free(entry_items);
-    free(routes.items);
-    return -1;
-  }
 
   for (size_t index = 0; index < routes.count; index++) {
     pm_route_entry_path(
@@ -2928,6 +2899,14 @@ static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock) {
     qsort(claim_items, claim_item_count, sizeof(pm_route_claim_item), pm_compare_route_claim_items);
   }
   pm_string_array_sort(current_networks, current_network_count);
+
+  if (pm_route_table_generation_is_newer_for_publish(state, routes.items, routes.count, current_networks, current_network_count, sequence)) {
+    pm_string_array_clear(&current_networks, &current_network_count, &current_network_capacity);
+    free(claim_items);
+    free(entry_items);
+    free(routes.items);
+    return -1;
+  }
 
   for (size_t index = 0; index < routes.count;) {
     size_t end = index + 1;
@@ -2992,10 +2971,6 @@ static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock) {
   }
   pm_string_array_sort(current_entries, current_entry_count);
   pm_string_array_sort(current_claims, current_claim_count);
-
-  if (pm_write_route_table_file_if_changed(state, state->route_table_path, routes.items, routes.count, sequence) != 0) {
-    result = -1;
-  }
 
   for (size_t network_index = 0; network_index < current_network_count; network_index++) {
     char network_path[PM_TEXT];
@@ -3076,7 +3051,6 @@ static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock) {
   pm_string_array_clear(&current_networks, &current_network_count, &current_network_capacity);
   pm_string_array_clear(&current_entries, &current_entry_count, &current_entry_capacity);
   pm_string_array_clear(&current_claims, &current_claim_count, &current_claim_capacity);
-  pm_release_route_table_write_lock(lock_fd, lock_path);
   free(claim_items);
   free(entry_items);
   free(routes.items);
@@ -3090,9 +3064,9 @@ int pm_state_flush_route_tables(pm_agent_state *state) {
   int result;
 
   /*
-   * Background flushes run on the single socket loop. If another daemon is
-   * publishing the same files, yield immediately and let the loop retry later
-   * instead of making registerExistingProcess clients wait behind the file lock.
+   * Background flushes run on the single socket loop. Route files are fallback
+   * shards, so a failed atomic write simply leaves daemon memory authoritative
+   * until the next idle or heartbeat flush.
    */
   result = pm_write_route_tables(state, 0);
   if (result == 0) {

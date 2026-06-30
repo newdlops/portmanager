@@ -5,7 +5,7 @@ import * as vscode from "vscode";
 import { getAgentSocketPath } from "../agent/agent-socket";
 import { getDefaultHostAccessBindingsPath, getDefaultRouteTablePath, ROUTE_TABLE_TTL_SECONDS_ENV } from "../agent/route-table";
 import { readPortManagerSettings, openPortManagerSettings } from "../config/vscode-settings";
-import { ACTUAL_LOOPBACK_HOST_ENV } from "../core/networks/loopback-address";
+import { ACTUAL_LOOPBACK_HOST_ENV, NETWORK_LOOPBACK_HOST_ENV } from "../core/networks/loopback-address";
 import { buildExistingCloneMutationFromCandidate } from "../platform/network/container-service-discovery";
 import { isValidComposeProjectName } from "../platform/network/compose-publish-mutator";
 import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
@@ -3133,8 +3133,43 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     options.runtimeShimDirectory !== undefined ? shellDoubleQuote(options.runtimeShimDirectory) : undefined;
   const escapedShellEnvRestorePath =
     options.shellEnvRestorePath !== undefined ? shellDoubleQuote(options.shellEnvRestorePath) : undefined;
-  const nodeRuntimePrefix = `${ELECTRON_RUN_AS_NODE}=1`;
-  const daemonRuntimePrefix = `PORT_MANAGER_HOOK_DISABLED=1 PORT_MANAGER_HOOK=0 DYLD_INSERT_LIBRARIES= LD_PRELOAD= ${nodeRuntimePrefix}`;
+  const daemonUnsetVariables = [
+    "DYLD_INSERT_LIBRARIES",
+    "LD_PRELOAD",
+    "BASH_ENV",
+    "ENV",
+    "PORT_MANAGER_DYLD_INSERT_LIBRARIES",
+    "PORT_MANAGER_LD_PRELOAD",
+    "PORT_MANAGER_NETWORK_ID",
+    "PORT_MANAGER_NETWORK_NAME",
+    "PORT_MANAGER_ROUTE_TABLE_NETWORK_ID",
+    "PORT_MANAGER_BORROWED_NETWORK_ID",
+    "PORT_MANAGER_ROUTES_FILE",
+    "PORT_MANAGER_COMPOSE_ROUTING_FILE",
+    "PORT_MANAGER_COMPOSE_LOGICAL_PORTS",
+    "PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS",
+    "PORT_MANAGER_TERMINAL_ATTACHMENT_DIR",
+    "PORT_MANAGER_TERMINAL_SESSION_ID",
+    "PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID",
+    "PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID",
+    "PORT_MANAGER_PRELOAD_REPAIR",
+    "PORT_MANAGER_RUNTIME_SHIM_READY",
+    "PORT_MANAGER_RUNTIME_SHIM_DIR",
+    "PORT_MANAGER_HOOK_DAEMON_STARTED",
+    "PORT_MANAGER_EXPECTED_VERSION",
+    ACTUAL_LOOPBACK_HOST_ENV,
+    NETWORK_LOOPBACK_HOST_ENV,
+    "NEWDLOPS_PM_NETWORK_ID",
+    "NEWDLOPS_PM_BORROWED_NETWORK_ID",
+  ].join(" ");
+  const daemonRuntimeExports = `export PORT_MANAGER_HOOK_DISABLED=1 PORT_MANAGER_HOOK=0 ${ELECTRON_RUN_AS_NODE}=1`;
+  const daemonRuntimeCommand = (command: string): string =>
+    `( unset ${daemonUnsetVariables}; ${daemonRuntimeExports}; ${command} )`;
+  const daemonLaunchCommand = (command: string): string =>
+    daemonRuntimeCommand(
+      `if command -v setsid >/dev/null 2>&1; then setsid ${command} </dev/null >/tmp/newdlops-portmanager-agent.log 2>&1 & else nohup ${command} </dev/null >/tmp/newdlops-portmanager-agent.log 2>&1 & fi`,
+    );
+  const helperRuntimePrefix = `PORT_MANAGER_HOOK_DISABLED=1 PORT_MANAGER_HOOK=0 DYLD_INSERT_LIBRARIES= LD_PRELOAD= ${ELECTRON_RUN_AS_NODE}=1`;
   const routeCountScript = [
     'const fs=require("node:fs");',
     'const file=process.argv[1]||"";',
@@ -3253,12 +3288,18 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     'const lock=process.argv[1];',
     'try{const age=Date.now()-fs.statSync(lock).mtimeMs;process.exit(age>15000?0:1);}catch{process.exit(1);}',
   ].join("");
-  const probeCommand = `${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
+  const probeCommand = daemonRuntimeCommand(`"${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
     nodeProbeScript,
-  )}" "$PORT_MANAGER_AGENT_SOCKET" "$PORT_MANAGER_AGENT_MAIN"`;
-  const staleLockCommand = `${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
+  )}" "$PORT_MANAGER_AGENT_SOCKET" "$PORT_MANAGER_AGENT_MAIN"`);
+  const staleLockCommand = daemonRuntimeCommand(`"${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
     staleLockScript,
-  )}" "$__pm_agent_lock"`;
+  )}" "$__pm_agent_lock"`);
+  const nativeAgentLaunchCommand = daemonLaunchCommand(
+    `"$PORT_MANAGER_AGENT_EXECUTABLE" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" --agent-main "$PORT_MANAGER_AGENT_MAIN"`,
+  );
+  const nodeAgentLaunchCommand = daemonLaunchCommand(
+    `"${escapedNodeExecutablePath}" "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE"`,
+  );
   const removeNativeHookPreloadScript = [
     shellRemovePathListEntry("DYLD_INSERT_LIBRARIES", options.hookLibraryPath),
     shellRemovePathListEntry("LD_PRELOAD", options.hookLibraryPath),
@@ -3343,7 +3384,7 @@ __pm_agent_version() {
     unset __pm_version_mode
     return 1
   fi
-  ${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
+  ${helperRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
     agentVersionScript,
   )}" "$PORT_MANAGER_AGENT_SOCKET" "\${PORT_MANAGER_EXPECTED_VERSION:-unknown}" "$__pm_version_mode"
   __pm_status=$?
@@ -3417,7 +3458,7 @@ pm() {
     printf 'Network loopback host: %s\n' "\${PORT_MANAGER_NETWORK_LOOPBACK_HOST:--}"
     printf 'Actual loopback host: %s\n' "\${PORT_MANAGER_ACTUAL_LOOPBACK_HOST:--}"
     if [ -n "$__pm_routes_file" ] && [ -f "$__pm_routes_file" ]; then
-      __pm_route_count="$(${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(routeCountScript)}" "$__pm_routes_file" 2>/dev/null || printf '?')"
+      __pm_route_count="$(${helperRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(routeCountScript)}" "$__pm_routes_file" 2>/dev/null || printf '?')"
       printf 'Route table: %s (%s routes)\n' "$__pm_routes_file" "$__pm_route_count"
     elif [ -n "$__pm_routes_file" ]; then
       printf 'Route table: missing (%s)\n' "$__pm_routes_file"
@@ -3439,7 +3480,7 @@ pm() {
     else
       printf '%s\n' 'Network selection file: unset'
     fi
-    PORT_MANAGER_DOCTOR_PROCESS_SCAN=1 ${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
+    PORT_MANAGER_DOCTOR_PROCESS_SCAN=1 ${helperRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
       doctorRoutingScript,
     )}" "$__pm_current_id" "$PWD" "$__pm_routes_file" "\${PORT_MANAGER_ROUTING_MODE:-}" "\${PORT_MANAGER_NETWORK_LOOPBACK_HOST:-}" 2>/dev/null || true
     unset __pm_current_id __pm_current_name __pm_routes_file __pm_networks_file __pm_host_access_file __pm_route_count __pm_network_count
@@ -3463,7 +3504,7 @@ pm() {
       unset __pm_current_id __pm_current_name __pm_routes_file __pm_host_access_file
       return 1
     fi
-    ${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(routePrintScript)}" "$__pm_routes_file" "$__pm_host_access_file" "$__pm_current_id" "$__pm_current_name"
+    ${helperRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(routePrintScript)}" "$__pm_routes_file" "$__pm_host_access_file" "$__pm_current_id" "$__pm_current_name"
     __pm_status=$?
     unset __pm_current_id __pm_current_name __pm_routes_file __pm_host_access_file
     return $__pm_status
@@ -3536,7 +3577,7 @@ pm() {
   if [ "$#" -gt 0 ]; then
     __pm_choice="$*"
   else
-    ${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(networkPrintScript)}" "$__pm_networks_file" "\${PORT_MANAGER_NETWORK_ID:-}" >&2
+    ${helperRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(networkPrintScript)}" "$__pm_networks_file" "\${PORT_MANAGER_NETWORK_ID:-}" >&2
     printf '%s' 'Select Port Manager network: ' >&2
     IFS= read -r __pm_choice || {
       unset __pm_networks_file __pm_choice
@@ -3602,9 +3643,9 @@ __pm_agent_ensure() {
     if [ "$__pm_agent_ready" != "1" ]; then
       rm -f "$PORT_MANAGER_AGENT_SOCKET" 2>/dev/null || true
   if [ -x "$PORT_MANAGER_AGENT_EXECUTABLE" ]; then
-    ${daemonRuntimePrefix} nohup "$PORT_MANAGER_AGENT_EXECUTABLE" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" --agent-main "$PORT_MANAGER_AGENT_MAIN" >/tmp/newdlops-portmanager-agent.log 2>&1 &
+    ${nativeAgentLaunchCommand}
   else
-    ${daemonRuntimePrefix} nohup "${escapedNodeExecutablePath}" "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" >/tmp/newdlops-portmanager-agent.log 2>&1 &
+    ${nodeAgentLaunchCommand}
   fi
   __pm_agent_wait_count=0
   while [ $__pm_agent_wait_count -lt 20 ]; do

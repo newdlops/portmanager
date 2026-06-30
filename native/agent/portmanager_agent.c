@@ -82,6 +82,19 @@ static int pm_parse_arguments(int argc, char **argv, pm_arguments *arguments) {
   return 0;
 }
 
+static int pm_socket_has_live_server(const struct sockaddr_un *address) {
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  int connected;
+
+  if (fd < 0) {
+    return 0;
+  }
+
+  connected = connect(fd, (const struct sockaddr *)address, sizeof(*address)) == 0;
+  close(fd);
+  return connected;
+}
+
 static int pm_create_server(const char *socket_path) {
   int fd;
   struct sockaddr_un address;
@@ -101,11 +114,29 @@ static int pm_create_server(const char *socket_path) {
   }
   snprintf(address.sun_path, sizeof(address.sun_path), "%s", socket_path);
 
-  unlink(socket_path);
   if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
-    perror("bind");
-    close(fd);
-    return -1;
+    int bind_errno = errno;
+    if (bind_errno != EADDRINUSE || pm_socket_has_live_server(&address)) {
+      if (bind_errno == EADDRINUSE) {
+        fprintf(stderr, "Port Manager agent is already listening on %s\n", socket_path);
+      } else {
+        errno = bind_errno;
+        perror("bind");
+      }
+      close(fd);
+      return -1;
+    }
+
+    /*
+     * A filesystem entry can outlive the daemon after a crash. Only unlink after
+     * a connection probe proves that no live daemon owns the socket path.
+     */
+    unlink(socket_path);
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+      perror("bind");
+      close(fd);
+      return -1;
+    }
   }
 
   chmod(socket_path, 0600);

@@ -839,6 +839,13 @@ test("terminal daemon ensure serializes agent startup and preserves slow live so
     assert.equal(source.includes('rm -f "$PORT_MANAGER_AGENT_SOCKET" 2>/dev/null || true'), true);
     assert.equal(source.includes('rmdir "$__pm_agent_lock" 2>/dev/null || true'), true);
     assert.equal(source.includes("while [ $__pm_agent_wait_count -lt 20 ]; do"), true);
+    assert.equal(source.includes("daemonUnsetVariables"), true);
+    assert.equal(source.includes('"BASH_ENV"'), true);
+    assert.equal(source.includes('"PORT_MANAGER_ROUTE_TABLE_NETWORK_ID"'), true);
+    assert.equal(source.includes('"PORT_MANAGER_ROUTES_FILE"'), true);
+    assert.equal(source.includes('"PORT_MANAGER_TERMINAL_ATTACHMENT_DIR"'), true);
+    assert.equal(source.includes("command -v setsid >/dev/null 2>&1"), true);
+    assert.equal(source.includes("</dev/null >/tmp/newdlops-portmanager-agent.log 2>&1 &"), true);
   }
   assert.equal(commandsSource.includes('if [ "\\${PORT_MANAGER_HOOK:-0}" = "1" ]; then\n  __pm_agent_ensure'), true);
   assert.equal(commandsSource.includes('__pm_repair\n    return $?'), true);
@@ -942,9 +949,9 @@ test("global storage cleanup rehydrates generated routing from live attachment s
   assert.equal(terminalRehydrateBody.includes("await this.writeTerminalNetworkSelectionFile();"), true);
   assert.equal(terminalRehydrateBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });"), true);
   assert.equal(terminalRehydrateBody.includes("await this.reapplyRoutingToAttachedTerminalWindows();"), true);
-  assert.equal(materializeBody.includes("getDefaultRouteTablePath()"), true);
+  assert.equal(materializeBody.includes("getDefaultRouteTablePath()"), false);
   assert.equal(materializeBody.includes("getRouteTablePathForNetwork(networkId)"), true);
-  assert.equal(materializeBody.includes("new Set(["), true);
+  assert.equal(materializeBody.includes("this.registry.getSnapshot().networks.map((network) => network.id)"), true);
   assert.equal(
     materializeBody.includes("Promise.all(routeTablePaths.map((routeTablePath) => routeTableFileIsFresh(routeTablePath, routeTableTtlMs)))"),
     true,
@@ -1334,15 +1341,16 @@ test("compose project routing files are published as a serialized atomic generat
   assert.equal(writeBody.includes("this.composeProjectRoutingForceOverrideRefreshQueued = true;"), true);
   assert.equal(writeBody.includes("this.composeProjectRoutingForceOverrideRefreshNetworkIds.add(networkId);"), true);
   assert.equal(writeBody.includes("this.composeProjectRoutingWriteQueued = true;"), true);
-  assert.equal(writeBody.includes("await withSharedFileGenerationLock(this.getComposeProjectRoutingLockPath(), async () => {"), true);
+  assert.equal(writeBody.includes("await withSharedFileGenerationLock(this.getComposeProjectRoutingLockPath(networkId), async () => {"), true);
   assert.equal(writeBody.includes("const overrideAttachments = filterComposeAttachmentsByNetworkIds"), true);
   assert.equal(writeBody.includes("await this.reconcileComposeOverrideFiles(overrideAttachments, {"), true);
-  assert.equal(writeBody.includes('await writeTextFileAtomicallyOrTouch(globalFilePath, "");'), true);
-  assert.equal(writeBody.includes('await writeTextFileAtomicallyOrTouch(scopedFilePath, "");'), true);
-  assert.equal(writeBody.includes("const rowsByScopedFilePath = new Map<string, ComposeProjectRoutingRow[]>();"), true);
+  assert.equal(writeBody.includes('await writeTextFileAtomicallyOrTouch(globalFilePath, "");'), false);
+  assert.equal(writeBody.includes('await writeTextFileAtomicallyOrTouch(networkFilePath, "");'), true);
+  assert.equal(writeBody.includes("const rowsByNetworkId = new Map<string, Map<string, ComposeProjectRoutingRow[]>>();"), true);
   assert.equal(writeBody.includes("rowsByScopedFilePath.set(scopedFilePath, [row]);"), true);
   assert.equal(writeBody.includes("scopedRows.push(row);"), true);
   assert.equal(writeBody.includes("await writeTextFileAtomicallyOrTouch(scopedFilePath, serializeComposeProjectRoutingRows(scopedRows));"), true);
+  assert.equal(writeBody.includes("await this.removeStaleComposeProjectRoutingFiles(networkId, currentScopedPaths);"), true);
   assert.equal(source.includes("async function writeTextFileAtomicallyOrTouch"), true);
   assert.equal(writeBody.includes("serializeComposeProjectRoutingRows([row])"), false);
   assert.equal(writeBody.includes("await fs.writeFile(scopedFilePath"), false);
@@ -1557,8 +1565,10 @@ test("route tables are stored in extension global storage and legacy temp files 
   assert.equal(networkCleanupBody.includes("getLegacyDefaultRouteTablePath()"), true);
   assert.equal(commandsSource.includes('--route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE"'), true);
   assert.equal(agentMainSource.includes("parsedArguments.routeTablePath ?? process.env.PORT_MANAGER_GLOBAL_ROUTES_FILE"), true);
-  assert.equal(agentSource.includes("const releaseGenerationLock = acquireRouteTableGenerationLock("), true);
-  assert.equal(agentSource.includes("ROUTE_TABLE_GENERATION_BACKGROUND_LOCK_ATTEMPTS"), true);
+  assert.equal(agentSource.includes("acquireRouteTableGenerationLock("), false);
+  assert.equal(agentSource.includes("ROUTE_TABLE_GENERATION_BACKGROUND_LOCK_ATTEMPTS"), false);
+  assert.equal(agentSource.includes("writeRouteTableFile(this.routeTablePath"), false);
+  assert.equal(agentSource.includes("getNetworkRouteTablePath(networkId, this.routeTablePath)"), true);
   assert.equal(agentSource.includes("private writeRouteTableGeneration("), true);
   assert.equal(agentSource.includes("generation: RouteTableGeneration"), true);
   assert.equal(agentSource.includes("isRouteTableGenerationNewer"), true);
@@ -1670,7 +1680,7 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   );
   assert.equal(loopbackStart < allocationStart, true);
   assert.equal(loopbackBind.includes("pm_set_sockaddr_host((struct sockaddr *)&rewritten, loopback_host);"), true);
-  assert.equal(loopbackBind.includes("pm_remember_route(logical_port, logical_port, loopback_host, \"\");"), true);
+  assert.equal(loopbackBind.includes("pm_remember_route(logical_port, logical_port, loopback_host, \"\", 0);"), true);
   assert.equal(loopbackBind.includes("pm_register_process(logical_port, logical_port, loopback_host, \"\");"), true);
   assert.equal(source.includes('PM_ACTUAL_LOOPBACK_HOST_ENV "PORT_MANAGER_ACTUAL_LOOPBACK_HOST"'), true);
   assert.equal(source.includes("actual_loopback_host = pm_actual_loopback_host();"), true);
@@ -1703,9 +1713,10 @@ test("native agent adopts previous route files before first startup write", () =
   assert.equal(initBody.includes("pm_adopt_previous_generation_route_files(state);"), true);
   assert.equal(initBody.includes("if (pm_write_route_tables(state, 1) == 0)"), true);
   assert.equal(initBody.includes("state->route_table_refreshed_at = time(NULL);"), true);
-  assert.equal(source.includes("pm_acquire_route_table_write_lock("), true);
-  assert.equal(source.includes("PM_ROUTE_TABLE_WRITE_LOCK_BACKGROUND_ATTEMPTS"), true);
-  assert.equal(source.includes("PM_ROUTE_TABLE_WRITE_LOCK_STALE_SECONDS"), true);
+  assert.equal(source.includes("pm_acquire_route_table_write_lock("), false);
+  assert.equal(source.includes("PM_ROUTE_TABLE_WRITE_LOCK_BACKGROUND_ATTEMPTS"), false);
+  assert.equal(source.includes("PM_ROUTE_TABLE_WRITE_LOCK_STALE_SECONDS"), false);
+  assert.equal(source.includes("pm_route_table_generation_is_newer_for_publish"), true);
 });
 
 test("native preload repair is opt-in at runtime shim boundaries", () => {

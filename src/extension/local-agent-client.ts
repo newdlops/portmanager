@@ -1270,7 +1270,7 @@ function isPortManagerAgentCommandForSocket(command: string, socketPath: string)
 function removeStaleStartupLock(lockPath: string): void {
   try {
     const stat = fs.statSync(lockPath);
-    if (Date.now() - stat.mtimeMs < AGENT_STARTUP_LOCK_STALE_MS) {
+    if (shouldPreserveStartupLock(lockPath, stat)) {
       return;
     }
 
@@ -1278,6 +1278,64 @@ function removeStaleStartupLock(lockPath: string): void {
   } catch {
     // Missing or inaccessible lock files are handled by the next acquire loop.
   }
+}
+
+function shouldPreserveStartupLock(lockPath: string, stat: fs.Stats): boolean {
+  if (Date.now() - stat.mtimeMs >= AGENT_STARTUP_LOCK_STALE_MS) {
+    return false;
+  }
+
+  /*
+   * The regular startup lock is owned by VS Code clients only. If an attached
+   * terminal shell PID leaks into this file, keeping it fresh blocks the control
+   * plane behind a process that will never complete daemon startup.
+   */
+  const ownerPid = readStartupLockOwnerPid(lockPath);
+  if (ownerPid === undefined) {
+    return true;
+  }
+
+  if (!isProcessAlive(ownerPid)) {
+    return false;
+  }
+
+  const ownerCommand = readProcessCommand(ownerPid);
+  return ownerCommand === undefined || !isInteractiveShellStartupLockOwner(ownerCommand);
+}
+
+function readStartupLockOwnerPid(lockPath: string): number | undefined {
+  try {
+    const firstLine = fs.readFileSync(lockPath, "utf8").split(/\r?\n/, 1)[0]?.trim();
+    const pid = Number.parseInt(firstLine ?? "", 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readProcessCommand(pid: number): string | undefined {
+  if (process.platform === "win32") {
+    return undefined;
+  }
+
+  try {
+    return execFileSync("ps", ["-p", String(pid), "-o", "command="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+function isInteractiveShellStartupLockOwner(command: string): boolean {
+  const firstToken = command.trim().split(/\s+/, 1)[0];
+  if (firstToken === undefined || firstToken.length === 0) {
+    return false;
+  }
+
+  const executableName = path.basename(firstToken).replace(/^-/, "");
+  return /^(?:bash|zsh|fish|sh|dash|ksh|tcsh|csh)$/.test(executableName);
 }
 
 function canRunNativeAgent(nativeAgentPath: string): boolean {

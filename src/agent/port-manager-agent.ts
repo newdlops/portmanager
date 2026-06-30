@@ -70,10 +70,6 @@ const ROUTE_ALLOCATION_TTL_MS = 300_000;
 // Pre-handshake routes use a cleanup lease; observed routes use the short TTL only as a stale-writer guard.
 const PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS = ROUTE_ALLOCATION_TTL_MS;
 const ESTABLISHED_ROUTE_OBSERVATION_SCAN_INTERVAL_MS = 2_000;
-const ROUTE_TABLE_GENERATION_LOCK_STALE_MS = 30_000;
-const ROUTE_TABLE_GENERATION_LOCK_ATTEMPTS = 100;
-const ROUTE_TABLE_GENERATION_BACKGROUND_LOCK_ATTEMPTS = 1;
-const ROUTE_TABLE_GENERATION_LOCK_SLEEP_MS = 10;
 const ROUTE_TABLE_BACKGROUND_FLUSH_RETRY_MS = 100;
 const AGENT_SOCKET_LISTEN_BACKLOG = 16384;
 const SNAPSHOT_BROADCAST_DEBOUNCE_MS = 50;
@@ -1311,11 +1307,7 @@ export class PortManagerAgent implements DisposableLike {
    * the source of truth while the agent is alive.
    */
   private publishRouteTableBestEffort(routes: readonly LogicalPortRoute[] = this.buildCurrentLogicalRoutes()): void {
-    if (!this.canPublishNextRouteTableGeneration()) {
-      throw new Error("Port Manager route table publish failed; refusing stale daemon generation.");
-    }
-
-    if (this.writeRouteTable(routes, { waitForLock: false })) {
+    if (this.writeRouteTable(routes)) {
       this.routeTableDirty = false;
       return;
     }
@@ -1353,12 +1345,7 @@ export class PortManagerAgent implements DisposableLike {
           return;
         }
 
-        if (!this.canPublishNextRouteTableGeneration()) {
-          this.routeTableDirty = false;
-          throw new Error("Port Manager route table publish failed; refusing stale daemon generation.");
-        }
-
-        if (this.writeRouteTable(this.buildCurrentLogicalRoutes(), { waitForLock: false })) {
+        if (this.writeRouteTable(this.buildCurrentLogicalRoutes())) {
           this.routeTableDirty = false;
         }
       });
@@ -1855,31 +1842,14 @@ export class PortManagerAgent implements DisposableLike {
     return removedRoute;
   }
 
-  /** Writes the latest dynamic route table for active and pending logical routes. */
-  private writeRouteTable(
-    routes: readonly LogicalPortRoute[],
-    options: { readonly waitForLock?: boolean } = {},
-  ): boolean {
-    const releaseGenerationLock = acquireRouteTableGenerationLock(
-      this.routeTablePath,
-      options.waitForLock === false
-        ? ROUTE_TABLE_GENERATION_BACKGROUND_LOCK_ATTEMPTS
-        : ROUTE_TABLE_GENERATION_LOCK_ATTEMPTS,
-    );
-    if (releaseGenerationLock === undefined) {
-      return false;
+  /** Writes sharded route snapshots for active and pending logical routes. */
+  private writeRouteTable(routes: readonly LogicalPortRoute[]): boolean {
+    const generation = this.createNextRouteTableGeneration();
+    if (!this.canPublishRouteTableGeneration(routes, generation)) {
+      throw new Error("Port Manager route table publish failed; refusing stale daemon generation.");
     }
 
-    try {
-      const generation = this.createNextRouteTableGeneration();
-      if (!this.canPublishRouteTableGeneration(generation)) {
-        return false;
-      }
-
-      return this.writeRouteTableGeneration(routes, generation);
-    } finally {
-      releaseGenerationLock();
-    }
+    return this.writeRouteTableGeneration(routes, generation);
   }
 
   /** Builds metadata shared by every file in one route-table publish. */
@@ -1894,26 +1864,50 @@ export class PortManagerAgent implements DisposableLike {
     };
   }
 
-  /** Checks publish ownership without consuming the writer sequence. */
-  private canPublishNextRouteTableGeneration(): boolean {
-    return this.canPublishRouteTableGeneration({
-      writerId: this.routeTableWriterId,
-      writerStartedAtMs: this.routeTableWriterStartedAtMs,
-      sequence: this.routeTableGenerationSequence + 1,
-      pid: this.agentPid,
-    });
-  }
+  /** Rejects this writer when a newer daemon generation already owns any touched shard. */
+  private canPublishRouteTableGeneration(
+    routes: readonly LogicalPortRoute[],
+    generation: RouteTableGeneration,
+  ): boolean {
+    const ownerPaths = new Set<string>();
+    let hasUnscopedRoute = false;
 
-  /** Rejects this writer when a newer daemon generation already owns the table. */
-  private canPublishRouteTableGeneration(generation: RouteTableGeneration): boolean {
-    const currentGeneration = readRouteTableGeneration(this.routeTablePath);
-    return currentGeneration === undefined || !isRouteTableGenerationBlockingNewer(currentGeneration, generation);
+    for (const networkId of this.writtenRouteTableNetworkIds) {
+      ownerPaths.add(getNetworkRouteTablePath(networkId, this.routeTablePath));
+    }
+
+    for (const route of routes) {
+      const networkId = normalizeNetworkId(route.networkId);
+      if (networkId === undefined) {
+        hasUnscopedRoute = true;
+      } else {
+        ownerPaths.add(getNetworkRouteTablePath(networkId, this.routeTablePath));
+      }
+    }
+
+    /*
+     * Network routes use their network table as the generation owner. Unscoped
+     * routes have no network shard, so they only consult an existing legacy/global
+     * table and otherwise rely on daemon memory plus per-endpoint atomic writes.
+     */
+    if (hasUnscopedRoute && fs.existsSync(this.routeTablePath)) {
+      ownerPaths.add(this.routeTablePath);
+    }
+
+    for (const ownerPath of ownerPaths) {
+      const currentGeneration = readRouteTableGeneration(ownerPath);
+      if (currentGeneration !== undefined && isRouteTableGenerationBlockingNewer(currentGeneration, generation)) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   /**
-   * Publishes global, network-scoped, and per-port route files as one generation.
-   * A cross-process lock keeps stale daemon generations from interleaving their
-   * cleanup pass with another daemon's route-file writes.
+   * Publishes network-scoped and per-port route files as one generation.
+   * Daemon/socket memory is the authoritative shared state while the agent is
+   * alive; files are sharded fallback logs for native readers and race recovery.
    */
   private writeRouteTableGeneration(
     routes: readonly LogicalPortRoute[],
@@ -1922,7 +1916,6 @@ export class PortManagerAgent implements DisposableLike {
     this.pruneBidirectionalRouteObservationsForRoutes(routes);
     let generationSucceeded = this.writeRouteEntryFiles(routes, generation);
     generationSucceeded = this.writeComposeClaimFiles(routes, generation) && generationSucceeded;
-    generationSucceeded = this.writeRouteTableFile(this.routeTablePath, routes, generation) && generationSucceeded;
 
     const currentNetworkIds = new Set<string>();
     const routesByNetworkId = new Map<string, LogicalPortRoute[]>();
@@ -2993,71 +2986,6 @@ function writeAtomicRouteTableFile(routeTablePath: string, content: string): voi
     }
 
     throw error;
-  }
-}
-
-function acquireRouteTableGenerationLock(routeTablePath: string, attempts: number): (() => void) | undefined {
-  const lockPath = `${routeTablePath}.lock`;
-
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    let lockFd: number | undefined;
-
-    try {
-      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-      lockFd = fs.openSync(lockPath, "wx");
-      fs.writeFileSync(lockFd, `${process.pid}\n${new Date().toISOString()}\n`, "utf8");
-      return () => {
-        closeRouteTableGenerationLock(lockFd);
-        try {
-          fs.rmSync(lockPath, { force: true });
-        } catch {
-          // A later generation can clear stale locks if this process exits mid-write.
-        }
-      };
-    } catch (error) {
-      if (lockFd !== undefined) {
-        closeRouteTableGenerationLock(lockFd);
-      }
-
-      if (!isNodeFileError(error, "EEXIST")) {
-        return undefined;
-      }
-
-      removeStaleRouteTableGenerationLock(lockPath);
-      if (attempt + 1 < attempts) {
-        sleepSync(ROUTE_TABLE_GENERATION_LOCK_SLEEP_MS);
-      }
-    }
-  }
-
-  return undefined;
-}
-
-function sleepSync(ms: number): void {
-  const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
-  Atomics.wait(waitBuffer, 0, 0, ms);
-}
-
-function removeStaleRouteTableGenerationLock(lockPath: string): void {
-  try {
-    const stats = fs.statSync(lockPath);
-    if (Date.now() - stats.mtimeMs >= ROUTE_TABLE_GENERATION_LOCK_STALE_MS) {
-      fs.rmSync(lockPath, { force: true });
-    }
-  } catch {
-    // Missing lock files are expected between daemon generations.
-  }
-}
-
-function closeRouteTableGenerationLock(fd: number | undefined): void {
-  if (fd === undefined) {
-    return;
-  }
-
-  try {
-    fs.closeSync(fd);
-  } catch {
-    // The descriptor may already be closed during process teardown.
   }
 }
 

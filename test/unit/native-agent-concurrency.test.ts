@@ -42,6 +42,10 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(header.includes("pm_listener *listener_cache_items;"), true);
   assert.equal(agentSource.includes("PM_LISTENER_POLL_INTERVAL_SECONDS 300"), true);
   assert.equal(agentSource.includes("PM_LISTEN_BACKLOG 16384"), true);
+  assert.equal(agentSource.includes("static int pm_socket_has_live_server"), true);
+  assert.equal(agentSource.includes("Port Manager agent is already listening"), true);
+  assert.equal(agentSource.includes("Only unlink after"), true);
+  assert.equal(agentSource.includes("bind_errno != EADDRINUSE || pm_socket_has_live_server"), true);
   assert.equal(agentSource.includes("PM_CLIENT_BUFFER_INITIAL 2048"), true);
   assert.equal(agentSource.includes("PM_CLIENT_BUFFER_MAX 32768"), true);
   assert.equal(agentSource.includes("#include <poll.h>"), true);
@@ -55,7 +59,8 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(hookSource.includes("\\\"compactResponse\\\":1"), true);
   assert.equal(source.includes("static int pm_scan_lsof_cached"), true);
   assert.equal(source.includes("static int pm_write_route_table_file_if_changed"), true);
-  assert.equal(source.includes("PM_ROUTE_TABLE_WRITE_LOCK_BACKGROUND_ATTEMPTS 1"), true);
+  assert.equal(source.includes("PM_ROUTE_TABLE_WRITE_LOCK_BACKGROUND_ATTEMPTS"), false);
+  assert.equal(source.includes("pm_route_table_generation_is_newer_for_publish"), true);
   assert.equal(source.includes("static void pm_mark_route_tables_dirty"), true);
   assert.equal(source.includes('pm_copy(state->version, sizeof(state->version), PORTMANAGER_PACKAGE_VERSION)'), true);
   assert.equal(source.includes('pm_buffer_append(payload, ",\\"version\\":")'), true);
@@ -94,7 +99,7 @@ test("native agent route tables carry TTL and refresh unchanged files", () => {
   const writeEnd = source.indexOf("static int pm_build_route_table_signature", writeStart);
   const writeBody = source.slice(writeStart, writeEnd);
   const unchangedStart = source.indexOf("static int pm_write_route_table_file_if_changed");
-  const unchangedEnd = source.indexOf("static void pm_route_table_write_lock_path", unchangedStart);
+  const unchangedEnd = source.indexOf("static int pm_route_table_generation_is_newer_for_publish", unchangedStart);
   const unchangedBody = source.slice(unchangedStart, unchangedEnd);
 
   assert.equal(source.includes('PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"'), true);
@@ -169,6 +174,50 @@ if (!fs.existsSync(nativeAgentPath)) {
     assert.equal(typeof daemon.pid, "number");
   });
 
+  test("native agent refuses to replace a live socket owner", async (context) => {
+    const fixture = await startNativeAgent(context);
+    if (fixture === undefined) {
+      return;
+    }
+
+    const firstDaemon = await requestOnce<{ readonly pid: number }>(fixture.socketPath, {
+      id: `daemon-status-before-duplicate-${process.pid}`,
+      method: "daemonStatus",
+    });
+    const stderrChunks: Buffer[] = [];
+    const duplicate = spawn(nativeAgentPath, [
+      "--socket",
+      fixture.socketPath,
+      "--route-table",
+      fixture.routeTablePath,
+      "--agent-main",
+      path.join(projectRoot, "out", "src", "agent", "agent-main.js"),
+    ], {
+      env: {
+        ...process.env,
+        PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS: "",
+        PORT_MANAGER_AGENT_DISABLE_HOOK_RECOVERY: "1",
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    duplicate.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+    context.after(async () => {
+      await stopAgent(duplicate);
+    });
+
+    const duplicateExitCode = await waitForProcessExit(duplicate, 2_000);
+    assert.notEqual(duplicateExitCode, null);
+    assert.notEqual(duplicateExitCode, 0);
+
+    const currentDaemon = await requestOnce<{ readonly pid: number }>(fixture.socketPath, {
+      id: `daemon-status-after-duplicate-${process.pid}`,
+      method: "daemonStatus",
+    });
+
+    assert.equal(currentDaemon.pid, firstDaemon.pid);
+    assert.equal(Buffer.concat(stderrChunks).toString("utf8").includes("already listening"), true);
+  });
+
   test("native agent serves concurrent hook-like clients while extension client receives events", async (context) => {
     const fixture = await startNativeAgent(context);
     if (fixture === undefined) {
@@ -215,7 +264,6 @@ if (!fs.existsSync(nativeAgentPath)) {
     assert.equal(new Set(allocations.map((allocation) => allocation.allocationId)).size, allocationCount);
     assert.equal(new Set(allocations.map((allocation) => allocation.actualPort)).size, allocationCount);
     assert.equal(allocations.every((allocation) => allocation.actualPort >= 45000 && allocation.actualPort <= 65000), true);
-    await waitForRouteTableCount(fixture.routeTablePath, allocationCount, 120_000);
     await waitForRouteTableCount(getNetworkRouteTablePath(networkId, fixture.routeTablePath), allocationCount, 120_000);
   });
 
@@ -254,7 +302,7 @@ if (!fs.existsSync(nativeAgentPath)) {
 
     await waitForFile(routeEntryPath);
     await waitForFile(networkRouteTablePath);
-    assert.equal(readRouteTable(fixture.routeTablePath).routes.length, 1);
+    assert.equal(readRouteTable(networkRouteTablePath).routes.length, 1);
     assert.deepEqual(readRouteTable(routeEntryPath).routes, readRouteTable(networkRouteTablePath).routes);
 
     const released = await requestOnce<boolean>(fixture.socketPath, {
@@ -982,6 +1030,20 @@ async function stopAgent(agent: ChildProcess): Promise<void> {
   if (agent.exitCode === null && !agent.killed) {
     agent.kill("SIGKILL");
   }
+}
+
+async function waitForProcessExit(process: ChildProcess, timeoutMs: number): Promise<number | null> {
+  if (process.exitCode !== null) {
+    return process.exitCode;
+  }
+
+  return await new Promise<number | null>((resolve) => {
+    const timer = setTimeout(() => resolve(null), timeoutMs);
+    process.once("exit", (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
 }
 
 async function removeRouteTableSiblings(routeTablePath: string): Promise<void> {

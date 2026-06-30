@@ -4,9 +4,10 @@ import * as path from "node:path";
 /**
  * Shared route-table path helpers.
  *
- * The daemon writes this JSON file, managed children read it through
- * environment variables, and native socket hooks use it to translate logical
- * connect targets to actual listening ports.
+ * The daemon keeps routing state in memory and flushes sharded JSON files as a
+ * fallback channel. Managed children receive these paths through environment
+ * variables, and native socket hooks use them only when daemon memory/RPC cannot
+ * answer a route immediately.
  */
 
 let routeTableStorageDirectory: string | undefined;
@@ -58,7 +59,7 @@ export function configureRouteTableStorageDirectory(storageDirectory: string): v
   routeTableStorageDirectory = normalizedDirectory.length > 0 ? normalizedDirectory : undefined;
 }
 
-/** Builds the per-user route table file path shared by one local agent. */
+/** Builds the per-user base path used to derive network and endpoint route shards. */
 export function getDefaultRouteTablePath(): string {
   return path.join(getRouteTableStorageDirectory(), getDefaultRouteTableFileName());
 }
@@ -80,9 +81,8 @@ function getDefaultRouteTableFileName(): string {
 /**
  * Builds the route-table path for one logical network.
  *
- * The global table remains for terminals that have not joined a network yet,
- * but attached terminals can read a smaller network-scoped file so unrelated
- * concurrent requests do not all depend on the same JSON payload.
+ * Attached terminals read a smaller network-scoped file so unrelated concurrent
+ * requests do not all depend on one JSON payload.
  */
 export function getNetworkRouteTablePath(networkId: string, baseRouteTablePath = getDefaultRouteTablePath()): string {
   const parsedPath = path.parse(baseRouteTablePath);

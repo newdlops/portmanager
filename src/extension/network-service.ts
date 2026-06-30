@@ -2845,8 +2845,8 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * Forces the daemon to rewrite route-table JSON after cleanup, while keeping
-   * normal background convergence cheap when the generated files still exist.
+   * Forces the daemon to rewrite sharded route-table JSON after cleanup, while
+   * keeping normal background convergence cheap when generated network files exist.
    */
   private async ensureDaemonRouteTablesMaterialized(
     options: { readonly force?: boolean; readonly networkIds?: readonly string[] } = {},
@@ -2855,12 +2855,12 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
-    const routeTablePaths = [
-      ...new Set([
-        getDefaultRouteTablePath(),
-        ...(options.networkIds ?? []).map((networkId) => getRouteTablePathForNetwork(networkId)),
-      ]),
-    ];
+    const targetNetworkIds = options.networkIds ?? this.registry.getSnapshot().networks.map((network) => network.id);
+    const routeTablePaths = [...new Set(targetNetworkIds.map((networkId) => getRouteTablePathForNetwork(networkId)))];
+    if (routeTablePaths.length === 0) {
+      return;
+    }
+
     const routeTableTtlMs = readPortManagerSettings().routeTableTtlSeconds * 1000;
     if (
       options.force !== true &&
@@ -3994,22 +3994,20 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Re-runs if a registry/process event arrived while compose routing files were being published. */
   private async writeComposeProjectRoutingFileSerially(): Promise<void> {
-    await withSharedFileGenerationLock(this.getComposeProjectRoutingLockPath(), async () => {
-      do {
-        const forceComposeOverrideRefresh = this.composeProjectRoutingForceOverrideRefreshQueued;
-        const forceRefreshNetworkIds = this.composeProjectRoutingForceOverrideRefreshAllQueued
-          ? undefined
-          : [...this.composeProjectRoutingForceOverrideRefreshNetworkIds];
-        this.composeProjectRoutingWriteQueued = false;
-        this.composeProjectRoutingForceOverrideRefreshQueued = false;
-        this.composeProjectRoutingForceOverrideRefreshAllQueued = false;
-        this.composeProjectRoutingForceOverrideRefreshNetworkIds.clear();
-        await this.writeComposeProjectRoutingFileExclusive({
-          forceComposeOverrideRefresh,
-          ...(forceComposeOverrideRefresh ? { networkIds: forceRefreshNetworkIds } : {}),
-        });
-      } while (this.composeProjectRoutingWriteQueued || this.composeProjectRoutingForceOverrideRefreshQueued);
-    });
+    do {
+      const forceComposeOverrideRefresh = this.composeProjectRoutingForceOverrideRefreshQueued;
+      const forceRefreshNetworkIds = this.composeProjectRoutingForceOverrideRefreshAllQueued
+        ? undefined
+        : [...this.composeProjectRoutingForceOverrideRefreshNetworkIds];
+      this.composeProjectRoutingWriteQueued = false;
+      this.composeProjectRoutingForceOverrideRefreshQueued = false;
+      this.composeProjectRoutingForceOverrideRefreshAllQueued = false;
+      this.composeProjectRoutingForceOverrideRefreshNetworkIds.clear();
+      await this.writeComposeProjectRoutingFileExclusive({
+        forceComposeOverrideRefresh,
+        ...(forceComposeOverrideRefresh ? { networkIds: forceRefreshNetworkIds } : {}),
+      });
+    } while (this.composeProjectRoutingWriteQueued || this.composeProjectRoutingForceOverrideRefreshQueued);
   }
 
   /** Writes a complete compose routing TSV generation with atomic replaces. */
@@ -4023,22 +4021,18 @@ export class PortManagerNetworkService implements DisposableLike {
     });
 
     const rows = buildComposeProjectRoutingRows(this.registry.getSnapshot().composeAttachments);
-    const globalFilePath = this.getComposeProjectRoutingFilePath();
-    const currentScopedPaths = new Set<string>();
-    const rowsByScopedFilePath = new Map<string, ComposeProjectRoutingRow[]>();
-
-    await fs.mkdir(path.dirname(globalFilePath), { recursive: true });
-    await writeTextFileAtomicallyOrTouch(globalFilePath, "");
-
-    for (const network of snapshot.networks) {
-      const scopedFilePath = this.getComposeProjectRoutingFilePath(network.id);
-      currentScopedPaths.add(scopedFilePath);
-      await writeTextFileAtomicallyOrTouch(scopedFilePath, "");
-    }
+    const rowsByNetworkId = new Map<string, Map<string, ComposeProjectRoutingRow[]>>();
+    const networkIdsToWrite = new Set(snapshot.networks.map((network) => network.id));
 
     for (const row of rows) {
+      networkIdsToWrite.add(row.networkId);
       const scopedFilePath = this.getComposeProjectRoutingFilePath(row.networkId, composeProjectRoutingRowScope(row));
-      currentScopedPaths.add(scopedFilePath);
+      let rowsByScopedFilePath = rowsByNetworkId.get(row.networkId);
+      if (rowsByScopedFilePath === undefined) {
+        rowsByScopedFilePath = new Map<string, ComposeProjectRoutingRow[]>();
+        rowsByNetworkId.set(row.networkId, rowsByScopedFilePath);
+      }
+
       const scopedRows = rowsByScopedFilePath.get(scopedFilePath);
       if (scopedRows === undefined) {
         rowsByScopedFilePath.set(scopedFilePath, [row]);
@@ -4047,11 +4041,28 @@ export class PortManagerNetworkService implements DisposableLike {
       }
     }
 
-    for (const [scopedFilePath, scopedRows] of rowsByScopedFilePath) {
-      await writeTextFileAtomicallyOrTouch(scopedFilePath, serializeComposeProjectRoutingRows(scopedRows));
+    if (networkIdsToWrite.size === 0) {
+      await this.removeStaleComposeProjectRoutingFiles(undefined, new Set());
+      return;
     }
 
-    await this.removeStaleComposeProjectRoutingFiles(currentScopedPaths);
+    for (const networkId of [...networkIdsToWrite].sort()) {
+      await withSharedFileGenerationLock(this.getComposeProjectRoutingLockPath(networkId), async () => {
+        const networkFilePath = this.getComposeProjectRoutingFilePath(networkId);
+        const currentScopedPaths = new Set<string>([networkFilePath]);
+        const rowsByScopedFilePath = rowsByNetworkId.get(networkId) ?? new Map<string, ComposeProjectRoutingRow[]>();
+
+        await fs.mkdir(path.dirname(networkFilePath), { recursive: true });
+        await writeTextFileAtomicallyOrTouch(networkFilePath, "");
+
+        for (const [scopedFilePath, scopedRows] of rowsByScopedFilePath) {
+          currentScopedPaths.add(scopedFilePath);
+          await writeTextFileAtomicallyOrTouch(scopedFilePath, serializeComposeProjectRoutingRows(scopedRows));
+        }
+
+        await this.removeStaleComposeProjectRoutingFiles(networkId, currentScopedPaths);
+      });
+    }
   }
 
   /** Recreates or refreshes generated compose overrides before shell wrappers can route compose commands. */
@@ -4227,14 +4238,23 @@ export class PortManagerNetworkService implements DisposableLike {
     return [...ports].sort((left, right) => left - right);
   }
 
-  /** Cross-window lock path for publishing one complete compose routing generation. */
-  private getComposeProjectRoutingLockPath(): string {
-    return path.join(this.context.globalStorageUri.fsPath, `${COMPOSE_PROJECT_ROUTING_FILE_NAME}.lock`);
+  /** Cross-window lock path for publishing one network-scoped compose routing generation. */
+  private getComposeProjectRoutingLockPath(networkId: string): string {
+    return `${this.getComposeProjectRoutingFilePath(networkId)}.lock`;
   }
 
   /** Removes scoped compose maps for deleted networks so stale terminals fail closed. */
-  private async removeStaleComposeProjectRoutingFiles(currentScopedPaths: ReadonlySet<string>): Promise<void> {
+  private async removeStaleComposeProjectRoutingFiles(
+    networkId: string | undefined,
+    currentScopedPaths: ReadonlySet<string>,
+  ): Promise<void> {
     let entries: readonly Dirent[];
+    const networkScope = networkId === undefined ? undefined : sanitizeRouteFileScope(networkId);
+    const networkFileName = networkScope === undefined ? undefined : `${COMPOSE_PROJECT_ROUTING_FILE_PREFIX}${networkScope}.tsv`;
+    const networkComposePrefix =
+      networkScope === undefined
+        ? undefined
+        : `${COMPOSE_PROJECT_ROUTING_FILE_PREFIX}${networkScope}${COMPOSE_PROJECT_ROUTING_COMPOSE_SEPARATOR}`;
 
     try {
       entries = await fs.readdir(this.context.globalStorageUri.fsPath, { withFileTypes: true });
@@ -4248,7 +4268,10 @@ export class PortManagerNetworkService implements DisposableLike {
           (entry) =>
             entry.isFile() &&
             entry.name.startsWith(COMPOSE_PROJECT_ROUTING_FILE_PREFIX) &&
-            entry.name.endsWith(".tsv"),
+            entry.name.endsWith(".tsv") &&
+            (networkScope === undefined ||
+              entry.name === networkFileName ||
+              entry.name.startsWith(networkComposePrefix ?? "")),
         )
         .map((entry) => path.join(this.context.globalStorageUri.fsPath, entry.name))
         .filter((filePath) => !currentScopedPaths.has(filePath))
@@ -7702,8 +7725,42 @@ function buildLoopbackAddressRoutingShell(host: string, mode: "auto" | "loopback
  * socket accepts connections before returning control to the prompt.
  */
 function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
-  const nodeRuntimePrefix = `${ELECTRON_RUN_AS_NODE}=1`;
-  const daemonRuntimePrefix = `PORT_MANAGER_HOOK_DISABLED=1 PORT_MANAGER_HOOK=0 DYLD_INSERT_LIBRARIES= LD_PRELOAD= ${nodeRuntimePrefix}`;
+  const daemonUnsetVariables = [
+    "DYLD_INSERT_LIBRARIES",
+    "LD_PRELOAD",
+    "BASH_ENV",
+    "ENV",
+    "PORT_MANAGER_DYLD_INSERT_LIBRARIES",
+    "PORT_MANAGER_LD_PRELOAD",
+    "PORT_MANAGER_NETWORK_ID",
+    "PORT_MANAGER_NETWORK_NAME",
+    "PORT_MANAGER_ROUTE_TABLE_NETWORK_ID",
+    "PORT_MANAGER_BORROWED_NETWORK_ID",
+    "PORT_MANAGER_ROUTES_FILE",
+    "PORT_MANAGER_COMPOSE_ROUTING_FILE",
+    "PORT_MANAGER_COMPOSE_LOGICAL_PORTS",
+    "PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS",
+    "PORT_MANAGER_TERMINAL_ATTACHMENT_DIR",
+    "PORT_MANAGER_TERMINAL_SESSION_ID",
+    "PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID",
+    "PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID",
+    "PORT_MANAGER_PRELOAD_REPAIR",
+    "PORT_MANAGER_RUNTIME_SHIM_READY",
+    "PORT_MANAGER_RUNTIME_SHIM_DIR",
+    "PORT_MANAGER_HOOK_DAEMON_STARTED",
+    "PORT_MANAGER_EXPECTED_VERSION",
+    ACTUAL_LOOPBACK_HOST_ENV,
+    NETWORK_LOOPBACK_HOST_ENV,
+    "NEWDLOPS_PM_NETWORK_ID",
+    "NEWDLOPS_PM_BORROWED_NETWORK_ID",
+  ].join(" ");
+  const daemonRuntimeExports = `export PORT_MANAGER_HOOK_DISABLED=1 PORT_MANAGER_HOOK=0 ${ELECTRON_RUN_AS_NODE}=1`;
+  const daemonRuntimeCommand = (command: string): string =>
+    `( unset ${daemonUnsetVariables}; ${daemonRuntimeExports}; ${command} )`;
+  const daemonLaunchCommand = (command: string): string =>
+    daemonRuntimeCommand(
+      `if command -v setsid >/dev/null 2>&1; then setsid ${command} </dev/null >/tmp/newdlops-portmanager-agent.log 2>&1 & else nohup ${command} </dev/null >/tmp/newdlops-portmanager-agent.log 2>&1 & fi`,
+    );
   const nodeProbeScript = [
     'const net=require("node:net");',
     'const fs=require("node:fs");',
@@ -7730,12 +7787,20 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     'const lock=process.argv[1];',
     'try{const age=Date.now()-fs.statSync(lock).mtimeMs;process.exit(age>15000?0:1);}catch{process.exit(1);}',
   ].join("");
-  const probeCommand = `${daemonRuntimePrefix} ${shellQuote(nodeExecutablePath)} -e ${shellQuote(
+  const probeCommand = daemonRuntimeCommand(`${shellQuote(nodeExecutablePath)} -e ${shellQuote(
     nodeProbeScript,
-  )} "$PORT_MANAGER_AGENT_SOCKET" "$PORT_MANAGER_AGENT_MAIN"`;
-  const staleLockCommand = `${daemonRuntimePrefix} ${shellQuote(nodeExecutablePath)} -e ${shellQuote(
+  )} "$PORT_MANAGER_AGENT_SOCKET" "$PORT_MANAGER_AGENT_MAIN"`);
+  const staleLockCommand = daemonRuntimeCommand(`${shellQuote(nodeExecutablePath)} -e ${shellQuote(
     staleLockScript,
-  )} "$__pm_agent_lock"`;
+  )} "$__pm_agent_lock"`);
+  const nativeAgentLaunchCommand = daemonLaunchCommand(
+    `"$PORT_MANAGER_AGENT_EXECUTABLE" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" --agent-main "$PORT_MANAGER_AGENT_MAIN"`,
+  );
+  const nodeAgentLaunchCommand = daemonLaunchCommand(
+    `${shellQuote(
+      nodeExecutablePath,
+    )} "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE"`,
+  );
 
   return [
     `__pm_agent_ready=0`,
@@ -7763,11 +7828,9 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     `if [ "$__pm_agent_ready" != "1" ]; then`,
     `rm -f "$PORT_MANAGER_AGENT_SOCKET" 2>/dev/null || true`,
     `if [ -x "$PORT_MANAGER_AGENT_EXECUTABLE" ]; then`,
-    `${daemonRuntimePrefix} nohup "$PORT_MANAGER_AGENT_EXECUTABLE" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" --agent-main "$PORT_MANAGER_AGENT_MAIN" >/tmp/newdlops-portmanager-agent.log 2>&1 &`,
+    `${nativeAgentLaunchCommand}`,
     `else`,
-    `${daemonRuntimePrefix} nohup ${shellQuote(
-      nodeExecutablePath,
-    )} "$PORT_MANAGER_AGENT_MAIN" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" >/tmp/newdlops-portmanager-agent.log 2>&1 &`,
+    `${nodeAgentLaunchCommand}`,
     `fi`,
     `__pm_agent_wait_count=0`,
     `while [ $__pm_agent_wait_count -lt 20 ]; do`,

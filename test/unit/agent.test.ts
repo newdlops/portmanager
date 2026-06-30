@@ -34,6 +34,16 @@ const PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS = 300_000;
 
 delete process.env.PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS;
 
+test("local agent startup lock treats interactive shell owners as leaked terminal state", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/local-agent-client.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+
+  assert.equal(source.includes("function shouldPreserveStartupLock"), true);
+  assert.equal(source.includes("readStartupLockOwnerPid(lockPath)"), true);
+  assert.equal(source.includes("isInteractiveShellStartupLockOwner(ownerCommand)"), true);
+  assert.equal(source.includes("The regular startup lock is owned by VS Code clients only"), true);
+});
+
 test("registers native hook processes as hooked managed rows", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   let listeners: readonly ListeningPort[] = [
@@ -118,7 +128,7 @@ test("new agent generation clears previous network route files on startup", asyn
   ];
 
   fs.mkdirSync(path.dirname(routeTablePath), { recursive: true });
-  for (const filePath of [routeTablePath, networkRouteTablePath, routeEntryPath]) {
+  for (const filePath of [networkRouteTablePath, routeEntryPath]) {
     fs.writeFileSync(filePath, `${JSON.stringify({ updatedAt: fixedUpdatedAt, routes: staleRoutes }, null, 2)}\n`);
   }
 
@@ -134,13 +144,14 @@ test("new agent generation clears previous network route files on startup", asyn
   });
   context.after(() => agent.dispose());
 
-  assert.deepEqual(readRouteTable(routeTablePath).routes, []);
+  assert.equal(fs.existsSync(routeTablePath), false);
   assert.deepEqual(readRouteTable(networkRouteTablePath).routes, []);
   assert.equal(fs.existsSync(routeEntryPath), false);
 });
 
 test("newer route table generation rejects stale daemon writes", async (context) => {
   const routeTablePath = createRouteTablePath(context);
+  const networkRouteTablePath = getNetworkRouteTablePath("network-a", routeTablePath);
   const staleAgent = new PortManagerAgent({
     processLauncher: createFakeLauncher(),
     portAvailabilityProvider: createAvailablePortProvider(),
@@ -167,8 +178,8 @@ test("newer route table generation rejects stale daemon writes", async (context)
     source: "hooked",
   });
 
-  assert.equal(readRouteTableGeneration(routeTablePath)?.writerId, "stale-writer");
-  assert.equal(readRouteTable(routeTablePath).routes.length, 1);
+  assert.equal(readRouteTableGeneration(networkRouteTablePath)?.writerId, "stale-writer");
+  assert.equal(readRouteTable(networkRouteTablePath).routes.length, 1);
 
   const freshAgent = new PortManagerAgent({
     processLauncher: createFakeLauncher(),
@@ -184,8 +195,8 @@ test("newer route table generation rejects stale daemon writes", async (context)
   });
   context.after(() => freshAgent.dispose());
 
-  assert.equal(readRouteTableGeneration(routeTablePath)?.writerId, "fresh-writer");
-  assert.deepEqual(readRouteTable(routeTablePath).routes, []);
+  assert.equal(readRouteTableGeneration(networkRouteTablePath)?.writerId, "fresh-writer");
+  assert.deepEqual(readRouteTable(networkRouteTablePath).routes, []);
 
   await assert.rejects(
     () =>
@@ -203,13 +214,14 @@ test("newer route table generation rejects stale daemon writes", async (context)
     /route table publish failed/,
   );
 
-  assert.equal(readRouteTableGeneration(routeTablePath)?.writerId, "fresh-writer");
-  assert.deepEqual(readRouteTable(routeTablePath).routes, []);
+  assert.equal(readRouteTableGeneration(networkRouteTablePath)?.writerId, "fresh-writer");
+  assert.deepEqual(readRouteTable(networkRouteTablePath).routes, []);
   assert.equal(fs.existsSync(getRouteTablePathForLogicalPort(8001, "network-a", routeTablePath)), false);
 });
 
 test("stale daemon can reclaim route table files from a dead newer generation", async (context) => {
   const routeTablePath = createRouteTablePath(context);
+  const networkRouteTablePath = getNetworkRouteTablePath("network-a", routeTablePath);
   const agent = new PortManagerAgent({
     processLauncher: createFakeLauncher(),
     portAvailabilityProvider: createAvailablePortProvider(),
@@ -237,7 +249,7 @@ test("stale daemon can reclaim route table files from a dead newer generation", 
   });
 
   fs.writeFileSync(
-    routeTablePath,
+    networkRouteTablePath,
     `${JSON.stringify(
       {
         updatedAt: fixedUpdatedAt,
@@ -266,12 +278,13 @@ test("stale daemon can reclaim route table files from a dead newer generation", 
     source: "hooked",
   });
 
-  assert.equal(readRouteTableGeneration(routeTablePath)?.writerId, "surviving-writer");
-  assert.equal(readRouteTable(routeTablePath).routes.length, 2);
+  assert.equal(readRouteTableGeneration(networkRouteTablePath)?.writerId, "surviving-writer");
+  assert.equal(readRouteTable(networkRouteTablePath).routes.length, 2);
 });
 
 test("route-table TTL starts after the first bidirectional handshake and stays alive while route is registered", async (context) => {
   const routeTablePath = createRouteTablePath(context);
+  const networkRouteTablePath = getNetworkRouteTablePath("network-a", routeTablePath);
   let nowMs = Date.parse(fixedUpdatedAt);
   let establishedConnections: readonly EstablishedTcpConnection[] = [];
   const agent = new PortManagerAgent({
@@ -301,14 +314,14 @@ test("route-table TTL starts after the first bidirectional handshake and stays a
     source: "hooked",
   });
 
-  const initialRouteTable = readRouteTable(routeTablePath);
+  const initialRouteTable = readRouteTable(networkRouteTablePath);
   assert.equal(initialRouteTable.ttlStartsAfterFirstHandshake, true);
   assert.equal(initialRouteTable.expiresAtMs, nowMs + PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS);
 
   nowMs = initialRouteTable.expiresAtMs! - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
   await agent.refreshSnapshot();
 
-  const refreshedWithoutEstablishedConnection = readRouteTable(routeTablePath);
+  const refreshedWithoutEstablishedConnection = readRouteTable(networkRouteTablePath);
   assert.equal(refreshedWithoutEstablishedConnection.ttlMs, ROUTE_TABLE_TTL_MS);
   assert.equal(refreshedWithoutEstablishedConnection.ttlStartsAfterFirstHandshake, true);
   assert.equal(refreshedWithoutEstablishedConnection.expiresAtMs, nowMs + PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS);
@@ -324,7 +337,7 @@ test("route-table TTL starts after the first bidirectional handshake and stays a
   nowMs += 2_001;
   await agent.refreshSnapshot();
 
-  const firstHandshakeRouteTable = readRouteTable(routeTablePath);
+  const firstHandshakeRouteTable = readRouteTable(networkRouteTablePath);
   assert.equal(firstHandshakeRouteTable.ttlMs, ROUTE_TABLE_TTL_MS);
   assert.equal(firstHandshakeRouteTable.ttlStartsAfterFirstHandshake, undefined);
   assert.equal(firstHandshakeRouteTable.expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
@@ -333,15 +346,15 @@ test("route-table TTL starts after the first bidirectional handshake and stays a
   nowMs = firstHandshakeRouteTable.expiresAtMs! - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
   await agent.refreshSnapshot();
 
-  assert.equal(readRouteTable(routeTablePath).expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
+  assert.equal(readRouteTable(networkRouteTablePath).expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
 
   nowMs = firstHandshakeRouteTable.expiresAtMs! + 30_000;
   await agent.refreshSnapshot();
 
-  assert.equal(readRouteTable(routeTablePath).expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
+  assert.equal(readRouteTable(networkRouteTablePath).expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
 
   fs.writeFileSync(
-    routeTablePath,
+    networkRouteTablePath,
     `${JSON.stringify(
       {
         updatedAt: fixedUpdatedAt,
@@ -356,11 +369,12 @@ test("route-table TTL starts after the first bidirectional handshake and stays a
 
   await agent.refreshSnapshot();
 
-  assert.equal(readRouteTable(routeTablePath).ttlMs, ROUTE_TABLE_TTL_MS);
+  assert.equal(readRouteTable(networkRouteTablePath).ttlMs, ROUTE_TABLE_TTL_MS);
 });
 
 test("established connection scans are indexed and throttled during bootstrap bursts", async (context) => {
   const routeTablePath = createRouteTablePath(context);
+  const networkRouteTablePath = getNetworkRouteTablePath("network-a", routeTablePath);
   let nowMs = Date.parse(fixedUpdatedAt);
   let establishedConnectionCalls = 0;
   const establishedConnections: EstablishedTcpConnection[] = [];
@@ -410,7 +424,7 @@ test("established connection scans are indexed and throttled during bootstrap bu
 
   await agent.refreshSnapshot();
 
-  const firstHandshakeRouteTable = readRouteTable(routeTablePath);
+  const firstHandshakeRouteTable = readRouteTable(networkRouteTablePath);
   assert.equal(firstHandshakeRouteTable.ttlStartsAfterFirstHandshake, undefined);
   assert.equal(firstHandshakeRouteTable.expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
   assert.equal(establishedConnectionCalls, 1);
@@ -423,6 +437,7 @@ test("established connection scans are indexed and throttled during bootstrap bu
 
 test("refreshSnapshot extends pending pre-handshake route tables while allocation is live", async (context) => {
   const routeTablePath = createRouteTablePath(context);
+  const networkRouteTablePath = getNetworkRouteTablePath("network-a", routeTablePath);
   let nowMs = Date.parse(fixedUpdatedAt);
   const agent = new PortManagerAgent({
     processLauncher: createFakeLauncher(),
@@ -454,18 +469,19 @@ test("refreshSnapshot extends pending pre-handshake route tables while allocatio
     virtualPortRangeEnd: 58010,
   });
 
-  const initialRouteTable = readRouteTable(routeTablePath);
+  const initialRouteTable = readRouteTable(networkRouteTablePath);
   assert.equal(initialRouteTable.ttlStartsAfterFirstHandshake, true);
   nowMs = initialRouteTable.expiresAtMs! - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
   await agent.refreshSnapshot();
 
-  const refreshedRouteTable = readRouteTable(routeTablePath);
+  const refreshedRouteTable = readRouteTable(networkRouteTablePath);
   assert.equal(refreshedRouteTable.ttlStartsAfterFirstHandshake, true);
   assert.equal(refreshedRouteTable.expiresAtMs, nowMs + PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS);
 });
 
 test("refreshSnapshot keeps large running route tables alive when some routes are idle", async (context) => {
   const routeTablePath = createRouteTablePath(context);
+  const networkRouteTablePath = getNetworkRouteTablePath("network-a", routeTablePath);
   let nowMs = Date.parse(fixedUpdatedAt);
   const agent = new PortManagerAgent({
     processLauncher: createFakeLauncher(),
@@ -496,13 +512,13 @@ test("refreshSnapshot keeps large running route tables alive when some routes ar
     });
   }
 
-  const initialRouteTable = readRouteTable(routeTablePath);
+  const initialRouteTable = readRouteTable(networkRouteTablePath);
   assert.equal(initialRouteTable.routes.length, 72);
 
   nowMs = initialRouteTable.expiresAtMs! - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
   await agent.refreshSnapshot();
 
-  const refreshedRouteTable = readRouteTable(routeTablePath);
+  const refreshedRouteTable = readRouteTable(networkRouteTablePath);
   assert.equal(refreshedRouteTable.routes.length, 72);
   assert.equal(refreshedRouteTable.ttlStartsAfterFirstHandshake, true);
   assert.equal(refreshedRouteTable.expiresAtMs, nowMs + PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS);
@@ -957,6 +973,7 @@ test("keeps expired pending route files while the actual listener is alive", asy
 
 test("keeps hooked process rows during request snapshots and transient background misses", async (context) => {
   const routeTablePath = createRouteTablePath(context);
+  const routeEntryPath = getRouteTablePathForLogicalPort(8000, undefined, routeTablePath);
   let nowMs = Date.parse(fixedUpdatedAt);
   let listeners: readonly ListeningPort[] = [
     createListener({
@@ -994,7 +1011,7 @@ test("keeps hooked process rows during request snapshots and transient backgroun
   assert.equal(requestSnapshot.processes[0]?.source, "hooked");
   assert.equal(requestSnapshot.processes[0]?.status, "running");
   assert.equal(requestSnapshot.routes.length, 1);
-  assert.equal(readRouteTable(routeTablePath).routes.length, 1);
+  assert.equal(readRouteTable(routeEntryPath).routes.length, 1);
 
   await runListenerPoll(agent);
   const firstMissSnapshot = await agent.listSnapshot();
@@ -1654,14 +1671,12 @@ test("reuses active compose routes before allocating host fallback routes", asyn
   const routeEntryTable = readRouteTable(getRouteTablePathForLogicalPort(15432, "network-a", routeTablePath));
   const logicalClaimTable = readRouteTable(getRouteTablePathForComposeClaimPort(15432, routeTablePath));
   const actualClaimTable = readRouteTable(getRouteTablePathForComposeClaimPort(57001, routeTablePath));
-  const globalRouteTable = readRouteTable(routeTablePath);
 
   assert.equal(allocation.allocationId, "");
   assert.equal(allocation.actualPort, 57001);
   assert.equal(allocation.host, "127.0.0.1");
   assert.deepEqual(checkedPorts, []);
-  assert.equal(globalRouteTable.routes.length, 1);
-  assert.equal((globalRouteTable.routes[0] as { source?: string }).source, "compose");
+  assert.equal(fs.existsSync(routeTablePath), false);
   assert.equal(routeTable.routes.length, 1);
   assert.equal((routeTable.routes[0] as { source?: string }).source, "compose");
   assert.equal((routeTable.routes[0] as { host?: string }).host, "127.0.0.1");
