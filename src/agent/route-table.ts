@@ -15,7 +15,7 @@ let routeTableStorageDirectory: string | undefined;
 export const ROUTE_TABLE_TTL_SECONDS_ENV = "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS";
 
 /** Route files expire if the extension/daemon no longer refreshes generated state. */
-export const ROUTE_TABLE_TTL_MS = 30_000;
+export const ROUTE_TABLE_TTL_MS = 15_000;
 
 /** Lowest supported TTL; shorter values create more agent round-trips than useful isolation. */
 export const MIN_ROUTE_TABLE_TTL_MS = 5_000;
@@ -46,7 +46,7 @@ export function routeTableTtlMsFromEnvironment(environment: NodeJS.ProcessEnv = 
   return normalizeRouteTableTtlMs(Number.isFinite(seconds) ? seconds * 1000 : undefined);
 }
 
-/** Computes the rewrite margin from the active TTL so a 30s cache does not use a 60s margin. */
+/** Computes the rewrite margin from the active TTL so short-lived route caches refresh before expiry. */
 export function routeTableRefreshMarginMs(ttlMs: number): number {
   const normalizedTtlMs = normalizeRouteTableTtlMs(ttlMs);
   return Math.min(ROUTE_TABLE_REFRESH_MARGIN_MS, Math.max(1_000, Math.floor(normalizedTtlMs / 2)));

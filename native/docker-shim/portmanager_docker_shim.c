@@ -37,7 +37,7 @@
 #define PM_TERMINAL_SESSION_ID_ENV "PORT_MANAGER_TERMINAL_SESSION_ID"
 #define PM_COMPOSE_REFRESH_WAIT_MS 3000
 #define PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"
-#define PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 30
+#define PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15
 
 typedef struct {
   char kind[16];
@@ -3402,10 +3402,6 @@ int main(int argc, char **argv) {
   command_index = pm_first_command_index(argc, argv);
   pm_debug("command_index=%d standalone_compose=%d", command_index, standalone_compose);
   if (standalone_compose || (command_index >= 0 && strcmp(argv[command_index], "compose") == 0)) {
-    signal_after_compose_success = pm_compose_command_may_change_endpoints(argc, argv, command_index, standalone_compose);
-    wait_for_compose_routes_after_success =
-      signal_after_compose_success &&
-      pm_compose_should_detach_up(argc, argv, command_index, standalone_compose);
     if (pm_find_compose_route(
       runtime,
       argc,
@@ -3418,6 +3414,10 @@ int main(int argc, char **argv) {
       sizeof(override_file)
     ) == 0) {
       int rewrites_project = original_project[0] != '\0' && strcmp(attached_project, original_project) != 0;
+      signal_after_compose_success = pm_compose_command_may_change_endpoints(argc, argv, command_index, standalone_compose);
+      wait_for_compose_routes_after_success =
+        signal_after_compose_success &&
+        pm_compose_should_detach_up(argc, argv, command_index, standalone_compose);
 
       if (override_file[0] == '\0') {
         (void)pm_compose_override_for_project(attached_project, override_file, sizeof(override_file));

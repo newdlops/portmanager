@@ -693,31 +693,35 @@ test("background routing refresh polls terminals and containers", () => {
 
   assert.equal(source.includes("private startRoutingSignalRefreshLoop(): void"), true);
   assert.equal(source.includes("this.refreshTerminals().catch(() => [])"), true);
-  assert.equal(source.includes("private terminalAttachmentComposeRefreshPending = false;"), true);
-  assert.equal(source.includes("this.terminalAttachmentComposeRefreshPending = true;"), true);
-  assert.equal(burstBody.includes("const shouldRefreshComposeRoutes = this.terminalAttachmentComposeRefreshPending;"), true);
-  assert.equal(burstBody.includes("this.terminalAttachmentComposeRefreshPending = false;"), true);
-  assert.equal(burstBody.includes("if (shouldRefreshComposeRoutes) {"), true);
+  assert.equal(source.includes("private readonly terminalAttachmentComposeRefreshNetworkIds = new Set<string>();"), true);
+  assert.equal(source.includes("this.terminalAttachmentComposeRefreshNetworkIds.add(networkId);"), true);
+  assert.equal(burstBody.includes("const refreshNetworkIds = [...this.terminalAttachmentComposeRefreshNetworkIds];"), true);
+  assert.equal(burstBody.includes("this.terminalAttachmentComposeRefreshNetworkIds.clear();"), true);
+  assert.equal(burstBody.includes("if (refreshNetworkIds.length > 0) {"), true);
   assert.equal(
-    burstBody.includes("await this.reconcileComposeAttachmentPublishedPorts({ force: true, coalesceForce: true }).catch(() => undefined);"),
+    burstBody.includes("networkIds: refreshNetworkIds,"),
     true,
   );
   assert.equal(
-    burstBody.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);"),
+    burstBody.includes("await this.reconcileComposeAttachmentPublishedPorts({"),
     true,
   );
   assert.equal(
-    burstBody.indexOf("this.terminalAttachmentComposeRefreshPending = false;") <
-      burstBody.indexOf("await this.reconcileComposeAttachmentPublishedPorts({ force: true, coalesceForce: true }).catch(() => undefined);"),
+    burstBody.includes("await this.writeComposeProjectRoutingFile({"),
     true,
   );
   assert.equal(
-    burstBody.indexOf("await this.reconcileComposeAttachmentPublishedPorts({ force: true, coalesceForce: true }).catch(() => undefined);") <
-      burstBody.indexOf("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);"),
+    burstBody.indexOf("this.terminalAttachmentComposeRefreshNetworkIds.clear();") <
+      burstBody.indexOf("await this.reconcileComposeAttachmentPublishedPorts({"),
     true,
   );
   assert.equal(
-    burstBody.indexOf("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);") <
+    burstBody.indexOf("await this.reconcileComposeAttachmentPublishedPorts({") <
+      burstBody.indexOf("await this.writeComposeProjectRoutingFile({"),
+    true,
+  );
+  assert.equal(
+    burstBody.indexOf("await this.writeComposeProjectRoutingFile({") <
       burstBody.indexOf("await this.refreshTerminals().catch(() => []);"),
     true,
   );
@@ -725,7 +729,7 @@ test("background routing refresh polls terminals and containers", () => {
   assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts({ background: true }).catch(() => undefined);"), false);
   assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts({ background: true, force: true }).catch(() => undefined);"), true);
   assert.equal(source.includes("FORCED_COMPOSE_RECONCILE_COALESCE_MS = 750"), true);
-  assert.equal(source.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);"), true);
+  assert.equal(source.includes("forceComposeOverrideRefresh: true,"), true);
   assert.equal(source.includes("await this.convergeDaemonAndRoutingState();"), true);
   assert.equal(refreshBody.includes("this.syncLogicalPortRouters().catch(() => undefined),"), true);
   assert.equal(refreshBody.includes("this.syncBrowserNetworkProxies().catch(() => undefined),"), true);
@@ -1198,7 +1202,7 @@ test("terminal hook markers refresh attached UI state without manual refresh", (
   assert.equal(source.includes("TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500"), true);
   assert.equal(source.includes("private watchTerminalAttachmentMarkers(directoryPath: string): DisposableLike"), true);
   assert.equal(source.includes("syncFs.watch(directoryPath"), true);
-  assert.equal(source.includes("private scheduleTerminalAttachmentRefreshBurst(): void"), true);
+  assert.equal(source.includes("private scheduleTerminalAttachmentRefreshBurst(networkIds: readonly string[] = []): void"), true);
   assert.equal(source.includes("private async refreshTerminalAttachmentsWhenMarkersChanged(): Promise<void>"), true);
   assert.notEqual(restoreStart, -1);
   assert.equal(
@@ -1247,6 +1251,14 @@ test("compose route reconciliation does not rehydrate persisted attachment route
   assert.equal(source.includes("function isRestorableComposeAttachment"), true);
   assert.equal(source.includes('attachment.status === "attached" || attachment.status === "error"'), true);
   assert.equal(reconcileBody.includes(".composeAttachments.filter(isRestorableComposeAttachment)"), true);
+  assert.equal(reconcileBody.includes("const targetAttachments = filterComposeAttachmentsByNetworkIds(attachments, options.networkIds);"), true);
+  assert.equal(reconcileBody.includes("for (const attachment of targetAttachments)"), true);
+  assert.equal(
+    reconcileBody.indexOf("await this.removeOrphanComposeRouteProcesses(attachments);") <
+      reconcileBody.indexOf("const targetAttachments = filterComposeAttachmentsByNetworkIds(attachments, options.networkIds);"),
+    true,
+    "orphan cleanup must keep using the full desired attachment set",
+  );
   assert.equal(reconcileBody.includes(".listLiveComposePublishedPorts("), true);
   assert.equal(reconcileBody.includes("let livePorts: readonly ComposePublishedPort[] | undefined;"), true);
   assert.equal(reconcileBody.includes("containerRuntimeSettingsForAttachment(settings, attachment)"), true);
@@ -1290,9 +1302,11 @@ test("compose project routing files are published as a serialized atomic generat
   assert.equal(rowBody.includes("routingFiles.overrideFile === undefined"), true);
   assert.equal(source.includes("function parseComposeConfiguredProjectNameForRouting"), true);
   assert.equal(writeBody.includes("this.composeProjectRoutingForceOverrideRefreshQueued = true;"), true);
+  assert.equal(writeBody.includes("this.composeProjectRoutingForceOverrideRefreshNetworkIds.add(networkId);"), true);
   assert.equal(writeBody.includes("this.composeProjectRoutingWriteQueued = true;"), true);
   assert.equal(writeBody.includes("await withSharedFileGenerationLock(this.getComposeProjectRoutingLockPath(), async () => {"), true);
-  assert.equal(writeBody.includes("await this.reconcileComposeOverrideFiles(undefined, {"), true);
+  assert.equal(writeBody.includes("const overrideAttachments = filterComposeAttachmentsByNetworkIds"), true);
+  assert.equal(writeBody.includes("await this.reconcileComposeOverrideFiles(overrideAttachments, {"), true);
   assert.equal(writeBody.includes('await writeTextFileAtomicallyOrTouch(globalFilePath, "");'), true);
   assert.equal(writeBody.includes('await writeTextFileAtomicallyOrTouch(scopedFilePath, "");'), true);
   assert.equal(writeBody.includes("const rowsByScopedFilePath = new Map<string, ComposeProjectRoutingRow[]>();"), true);
@@ -1771,7 +1785,7 @@ test("compose reconciliation removes orphan daemon route rows before runtime ref
   assert.equal(reconcileBody.includes("await this.removeOrphanComposeRouteProcesses(attachments);"), true);
   assert.equal(
     reconcileBody.indexOf("await this.removeOrphanComposeRouteProcesses(attachments);") <
-      reconcileBody.indexOf("if (attachments.length === 0)"),
+      reconcileBody.indexOf("if (targetAttachments.length === 0)"),
     true,
     "stale compose daemon rows must be removed even when no persisted compose attachment remains",
   );

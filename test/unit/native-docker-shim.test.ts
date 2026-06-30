@@ -29,6 +29,8 @@ test("docker shim refreshes terminal markers after compose lifecycle commands", 
   const signalStart = source.indexOf("static void pm_signal_terminal_attachment_changed(void)");
   const signalEnd = source.indexOf("/** Runs lifecycle commands as a child", signalStart);
   const signalBody = source.slice(signalStart, signalEnd);
+  const mainStart = source.indexOf("int main(int argc, char **argv)");
+  const mainBody = source.slice(mainStart);
 
   assert.equal(source.includes("PM_TERMINAL_ATTACHMENT_DIR_ENV"), true);
   assert.equal(source.includes("PM_TERMINAL_SESSION_ID_ENV"), true);
@@ -40,6 +42,12 @@ test("docker shim refreshes terminal markers after compose lifecycle commands", 
   assert.equal(signalBody.includes("pm_copy(key_source, sizeof(key_source), session_id);"), true);
   assert.equal(signalBody.includes('"%s\\t%s\\t%ld\\t%ld\\t%s\\t%s\\n"'), true);
   assert.equal(signalBody.includes('session_id == NULL ? "" : session_id'), true);
+  assert.equal(
+    mainBody.indexOf("if (pm_find_compose_route(") <
+      mainBody.indexOf("signal_after_compose_success = pm_compose_command_may_change_endpoints"),
+    true,
+    "host compose lifecycle commands without a Port Manager route must not emit network markers",
+  );
 });
 
 test("docker shim prefers scoped route table network over stale compose routing file", () => {
@@ -84,7 +92,7 @@ test("docker shim rejects expired route-table and compose routing files", () => 
   const containerFinderBody = source.slice(containerFinderStart, containerFinderEnd);
 
   assert.equal(source.includes('PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"'), true);
-  assert.equal(source.includes("PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 30"), true);
+  assert.equal(source.includes("PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15"), true);
   assert.equal(source.includes("pm_route_table_ttl_seconds()"), true);
   assert.equal(source.includes("pm_generated_route_file_expired(route_file)"), true);
   assert.equal(source.includes("pm_generated_route_file_expired(routing_file)"), true);

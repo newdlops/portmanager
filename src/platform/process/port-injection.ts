@@ -1,4 +1,4 @@
-import { ROUTE_TABLE_TTL_SECONDS_ENV } from "../../agent/route-table";
+import { ROUTE_TABLE_TTL_MS, ROUTE_TABLE_TTL_SECONDS_ENV } from "../../agent/route-table";
 import type { LogicalPortRoute, PortInjectionMode } from "../../shared/types";
 
 /**
@@ -63,6 +63,8 @@ export function buildPortManagerEnvironment(request: PortManagerEnvironmentReque
     PORT_MANAGER_LOGICAL_PORT: String(request.requestedPort),
     PORT_MANAGER_ROUTES: JSON.stringify(request.logicalRoutes ?? []),
     PORT_MANAGER_ROUTES_FILE: request.logicalRoutesFile ?? "",
-    [ROUTE_TABLE_TTL_SECONDS_ENV]: String(request.routeTableTtlSeconds ?? request.baseEnv[ROUTE_TABLE_TTL_SECONDS_ENV] ?? 30),
+    [ROUTE_TABLE_TTL_SECONDS_ENV]: String(
+      request.routeTableTtlSeconds ?? request.baseEnv[ROUTE_TABLE_TTL_SECONDS_ENV] ?? ROUTE_TABLE_TTL_MS / 1000,
+    ),
   };
 }

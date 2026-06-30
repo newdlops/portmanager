@@ -80,7 +80,7 @@ test("native agent route tables carry TTL and refresh unchanged files", () => {
   const unchangedBody = source.slice(unchangedStart, unchangedEnd);
 
   assert.equal(source.includes('PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"'), true);
-  assert.equal(source.includes("PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 30"), true);
+  assert.equal(source.includes("PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15"), true);
   assert.equal(source.includes("static void pm_refresh_established_route_observations"), true);
   assert.equal(source.includes('popen("lsof -nP -iTCP -sTCP:ESTABLISHED -Fn 2>/dev/null"'), true);
   assert.equal(source.includes("static int pm_route_table_file_fresh_for_reuse"), true);

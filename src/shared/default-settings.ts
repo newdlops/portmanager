@@ -48,7 +48,7 @@ export const DEFAULT_PORT_MANAGER_SETTINGS: PortManagerSettings = {
     50051,
   ],
   preservedListenPorts: [],
-  routeTableTtlSeconds: 30,
+  routeTableTtlSeconds: 15,
   autoOpenBrowser: false,
   showConflictNotification: true,
   watchPreferredPorts: true,

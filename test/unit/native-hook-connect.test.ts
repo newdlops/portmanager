@@ -48,7 +48,7 @@ test("native hook route file cache is invalidated by path size and high-resoluti
   assert.equal(source.includes("pm_route_file_cache_entry"), true);
   assert.equal(source.includes("PM_ROUTE_FILE_CACHE_CAPACITY"), true);
   assert.equal(source.includes('PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"'), true);
-  assert.equal(source.includes("PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 30"), true);
+  assert.equal(source.includes("PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15"), true);
   assert.equal(source.includes("pm_route_table_ttl_seconds() * 1000L"), true);
   assert.equal(source.includes("pm_route_file_stat_expired"), true);
   assert.equal(source.includes("pm_route_file_buffer_expired"), true);

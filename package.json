@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8064",
+  "version": "0.0.8066",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -870,7 +870,7 @@
         },
         "portManager.routeTableTtlSeconds": {
           "type": "number",
-          "default": 30,
+          "default": 15,
           "minimum": 5,
           "maximum": 3600,
           "description": "Seconds before generated routing cache files expire when they are not refreshed by successful routed traffic."

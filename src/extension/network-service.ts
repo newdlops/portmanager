@@ -39,6 +39,7 @@ import {
   runContainerCommand,
 } from "../platform/network/container-runtime";
 import { BrowserDnsServer, browserDnsPort, normalizeBrowserDnsHostname } from "../platform/network/browser-dns-server";
+import { openUrlWithSecureLocalOrigin } from "../platform/browser-opener";
 import {
   CONTAINER_ALIAS_SERVICE_PREFIX,
   mergeComposeContainerMappingLineage,
@@ -199,6 +200,8 @@ interface BackgroundRefreshOptions {
   readonly background?: boolean;
   /** True when a terminal-side signal observed user activity that can change routes. */
   readonly force?: boolean;
+  /** Limits forced runtime reconciliation to the logical networks that emitted a lifecycle signal. */
+  readonly networkIds?: readonly string[];
   /** Internal flag used when one outer Docker refresh already owns the shared lock. */
   readonly sharedRefreshAcquired?: boolean;
   /** Internal flag for marker bursts; keeps the first forced scan immediate but drops rapid repeats. */
@@ -208,6 +211,8 @@ interface BackgroundRefreshOptions {
 interface ComposeProjectRoutingWriteOptions {
   /** Rebuild generated Compose overrides before publishing compose routing TSVs. */
   readonly forceComposeOverrideRefresh?: boolean;
+  /** Networks whose generated Compose overrides need a forced refresh. */
+  readonly networkIds?: readonly string[];
 }
 
 interface ComposeOverrideReconcileOptions {
@@ -311,6 +316,22 @@ interface TerminalAttachmentMarkerCandidate {
   readonly markerPath: string;
 }
 
+interface TerminalAttachmentMarkerStateRow {
+  /** Marker file path used as the stable identity across stat polls. */
+  readonly filePath: string;
+  /** Stat-level signature that changes when the shell rewrites a marker. */
+  readonly signature: string;
+  /** Network label carried by the marker row, when the row is readable and valid. */
+  readonly networkId?: string;
+}
+
+interface TerminalAttachmentMarkerState {
+  /** Sorted aggregate signature used by the cheap marker poller. */
+  readonly signature: string;
+  /** Per-file rows retained so the next poll can identify affected networks. */
+  readonly rows: readonly TerminalAttachmentMarkerStateRow[];
+}
+
 interface BrowserProxyCommandTextCacheEntry {
   /** Cached process argv text used only for browser-entrypoint classification. */
   readonly commandText: string | undefined;
@@ -377,6 +398,12 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Carries force override regeneration across serialized compose routing publishes. */
   private composeProjectRoutingForceOverrideRefreshQueued = false;
+
+  /** True when a queued override refresh must cover every compose attachment. */
+  private composeProjectRoutingForceOverrideRefreshAllQueued = false;
+
+  /** Networks whose generated Compose overrides need refresh after the current publish completes. */
+  private readonly composeProjectRoutingForceOverrideRefreshNetworkIds = new Set<string>();
 
   /** Guards live compose endpoint refreshes while Docker is recreating hidden containers. */
   private composeAttachmentReconcileInFlight: Promise<void> | undefined;
@@ -480,11 +507,14 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Keeps a short refresh burst alive while a newly hooked terminal appears in the process table. */
   private terminalAttachmentRefreshBurstUntilMs = 0;
 
-  /** One pending compose refresh caused by terminal/lifecycle marker changes. */
-  private terminalAttachmentComposeRefreshPending = false;
+  /** Networks that need compose route refresh because their terminal marker changed. */
+  private readonly terminalAttachmentComposeRefreshNetworkIds = new Set<string>();
 
   /** Last stat-level signature of terminal hook marker files. */
   private terminalAttachmentMarkerSignature = "";
+
+  /** Last per-file marker state used to scope lifecycle refreshes to affected networks. */
+  private terminalAttachmentMarkerRows: readonly TerminalAttachmentMarkerStateRow[] = [];
 
   /** Last shared-state revision applied in this extension host. */
   private sharedNetworkStateRevision: string | undefined;
@@ -908,6 +938,16 @@ export class PortManagerNetworkService implements DisposableLike {
       buildBrowserProxyEndpoint(process, networks, this.browserDnsServer.isRunning()),
     );
     return endpoint === undefined ? undefined : formatBrowserNetworkProxyUrl(endpoint);
+  }
+
+  /** Opens Port Manager local browser URLs with Chrome's secure-context override, then falls back to VS Code. */
+  async openBrowserUrl(url: string): Promise<void> {
+    const opened = await openUrlWithSecureLocalOrigin(url, {
+      userDataRoot: path.join(this.context.globalStorageUri.fsPath, "secure-browser-profiles"),
+    }).catch(() => false);
+    if (!opened) {
+      await vscode.env.openExternal(vscode.Uri.parse(url));
+    }
   }
 
   /** Builds a sudo shell script that points macOS single-label resolvers at Port Manager DNS. */
@@ -2936,9 +2976,11 @@ export class PortManagerNetworkService implements DisposableLike {
   private watchTerminalAttachmentMarkers(directoryPath: string): DisposableLike {
     try {
       const watcher = syncFs.watch(directoryPath, { persistent: false }, (_eventType, fileName) => {
-        const markerName = fileName === undefined || fileName === null ? undefined : String(fileName);
-        if (markerName === undefined || markerName.endsWith(".tsv")) {
+        const markerName = fileName === undefined || fileName === null ? undefined : path.basename(String(fileName));
+        if (markerName === undefined) {
           this.scheduleTerminalAttachmentRefreshBurst();
+        } else if (markerName.endsWith(".tsv")) {
+          void this.scheduleTerminalAttachmentRefreshBurstForMarkerName(markerName);
         }
       });
       watcher.on("error", () => undefined);
@@ -3110,10 +3152,19 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /** Schedules a short refresh burst so process-table discovery can catch up to the shell marker. */
-  private scheduleTerminalAttachmentRefreshBurst(): void {
+  private scheduleTerminalAttachmentRefreshBurst(networkIds: readonly string[] = []): void {
     this.terminalAttachmentRefreshBurstUntilMs = Date.now() + TERMINAL_ATTACHMENT_REFRESH_BURST_WINDOW_MS;
-    this.terminalAttachmentComposeRefreshPending = true;
+    for (const networkId of networkIds) {
+      this.terminalAttachmentComposeRefreshNetworkIds.add(networkId);
+    }
     this.scheduleTerminalAttachmentRefresh(TERMINAL_ATTACHMENT_REFRESH_DEBOUNCE_MS);
+  }
+
+  /** Reads the changed marker row when the filesystem watcher provides a file name. */
+  private async scheduleTerminalAttachmentRefreshBurstForMarkerName(markerName: string): Promise<void> {
+    const markerPath = path.join(this.getTerminalAttachmentMarkerDirectoryPath(), markerName);
+    const marker = await this.readManualTerminalAttachmentMarker(markerPath);
+    this.scheduleTerminalAttachmentRefreshBurst(marker === undefined ? [] : [marker.networkId]);
   }
 
   private scheduleTerminalAttachmentRefresh(delayMs: number): void {
@@ -3129,12 +3180,19 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   private async runTerminalAttachmentRefreshBurstStep(): Promise<void> {
-    const shouldRefreshComposeRoutes = this.terminalAttachmentComposeRefreshPending;
-    this.terminalAttachmentComposeRefreshPending = false;
+    const refreshNetworkIds = [...this.terminalAttachmentComposeRefreshNetworkIds];
+    this.terminalAttachmentComposeRefreshNetworkIds.clear();
 
-    if (shouldRefreshComposeRoutes) {
-      await this.reconcileComposeAttachmentPublishedPorts({ force: true, coalesceForce: true }).catch(() => undefined);
-      await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
+    if (refreshNetworkIds.length > 0) {
+      await this.reconcileComposeAttachmentPublishedPorts({
+        force: true,
+        coalesceForce: true,
+        networkIds: refreshNetworkIds,
+      }).catch(() => undefined);
+      await this.writeComposeProjectRoutingFile({
+        forceComposeOverrideRefresh: true,
+        networkIds: refreshNetworkIds,
+      }).catch(() => undefined);
     }
 
     await this.refreshTerminals().catch(() => []);
@@ -3148,16 +3206,22 @@ export class PortManagerNetworkService implements DisposableLike {
    * parsing and process-table scans happen only when this cheap signature moves.
    */
   private async refreshTerminalAttachmentsWhenMarkersChanged(): Promise<void> {
-    const signature = await this.readTerminalAttachmentMarkerSignature();
-    if (signature === this.terminalAttachmentMarkerSignature) {
+    const state = await this.readTerminalAttachmentMarkerState();
+    if (state.signature === this.terminalAttachmentMarkerSignature) {
       return;
     }
 
-    this.terminalAttachmentMarkerSignature = signature;
-    this.scheduleTerminalAttachmentRefreshBurst();
+    const changedNetworkIds = changedTerminalAttachmentMarkerNetworkIds(this.terminalAttachmentMarkerRows, state.rows);
+    this.terminalAttachmentMarkerSignature = state.signature;
+    this.terminalAttachmentMarkerRows = state.rows;
+    this.scheduleTerminalAttachmentRefreshBurst(changedNetworkIds);
   }
 
   private async readTerminalAttachmentMarkerSignature(): Promise<string> {
+    return (await this.readTerminalAttachmentMarkerState()).signature;
+  }
+
+  private async readTerminalAttachmentMarkerState(): Promise<TerminalAttachmentMarkerState> {
     const markerDirectory = this.getTerminalAttachmentMarkerDirectoryPath();
     const entries = await fs.readdir(markerDirectory, { withFileTypes: true }).catch(() => []);
     const rows = await Promise.all(
@@ -3167,14 +3231,26 @@ export class PortManagerNetworkService implements DisposableLike {
           const filePath = path.join(markerDirectory, entry.name);
           const stats = await fs.stat(filePath).catch(() => undefined);
           if (stats === undefined) {
-            return `${entry.name}:missing`;
+            return {
+              filePath,
+              signature: `${entry.name}:missing`,
+            };
           }
 
-          return `${entry.name}:${stats.size}:${Math.trunc(stats.mtimeMs)}`;
+          const marker = await this.readManualTerminalAttachmentMarker(filePath);
+          return {
+            filePath,
+            signature: `${entry.name}:${stats.size}:${Math.trunc(stats.mtimeMs)}`,
+            ...(marker !== undefined ? { networkId: marker.networkId } : {}),
+          };
         }),
     );
 
-    return rows.sort().join("\n");
+    const sortedRows = rows.sort((left, right) => left.filePath.localeCompare(right.filePath));
+    return {
+      signature: sortedRows.map((row) => row.signature).join("\n"),
+      rows: sortedRows,
+    };
   }
 
   /** Rewrites compose route rows when Docker changed a running container's host port. */
@@ -3241,8 +3317,9 @@ export class PortManagerNetworkService implements DisposableLike {
       .getSnapshot()
       .composeAttachments.filter(isRestorableComposeAttachment);
     await this.removeOrphanComposeRouteProcesses(attachments);
+    const targetAttachments = filterComposeAttachmentsByNetworkIds(attachments, options.networkIds);
 
-    if (attachments.length === 0) {
+    if (targetAttachments.length === 0) {
       return;
     }
 
@@ -3261,7 +3338,7 @@ export class PortManagerNetworkService implements DisposableLike {
       return session;
     };
 
-    for (const attachment of attachments) {
+    for (const attachment of targetAttachments) {
       const shouldRefreshPorts = shouldRefreshComposePublishedPortsFromRuntime(attachment, options);
       const shouldRefreshMappings = shouldRefreshComposeContainerMappingsFromRuntime(attachment, options);
       const runtimeSettings = containerRuntimeSettingsForAttachment(settings, attachment);
@@ -3975,6 +4052,14 @@ export class PortManagerNetworkService implements DisposableLike {
   ): Promise<void> {
     if (options.forceComposeOverrideRefresh === true) {
       this.composeProjectRoutingForceOverrideRefreshQueued = true;
+      if (options.networkIds === undefined) {
+        this.composeProjectRoutingForceOverrideRefreshAllQueued = true;
+        this.composeProjectRoutingForceOverrideRefreshNetworkIds.clear();
+      } else if (!this.composeProjectRoutingForceOverrideRefreshAllQueued) {
+        for (const networkId of options.networkIds) {
+          this.composeProjectRoutingForceOverrideRefreshNetworkIds.add(networkId);
+        }
+      }
     }
     if (this.composeProjectRoutingWriteInFlight !== undefined) {
       this.composeProjectRoutingWriteQueued = true;
@@ -3993,9 +4078,17 @@ export class PortManagerNetworkService implements DisposableLike {
     await withSharedFileGenerationLock(this.getComposeProjectRoutingLockPath(), async () => {
       do {
         const forceComposeOverrideRefresh = this.composeProjectRoutingForceOverrideRefreshQueued;
+        const forceRefreshNetworkIds = this.composeProjectRoutingForceOverrideRefreshAllQueued
+          ? undefined
+          : [...this.composeProjectRoutingForceOverrideRefreshNetworkIds];
         this.composeProjectRoutingWriteQueued = false;
         this.composeProjectRoutingForceOverrideRefreshQueued = false;
-        await this.writeComposeProjectRoutingFileExclusive({ forceComposeOverrideRefresh });
+        this.composeProjectRoutingForceOverrideRefreshAllQueued = false;
+        this.composeProjectRoutingForceOverrideRefreshNetworkIds.clear();
+        await this.writeComposeProjectRoutingFileExclusive({
+          forceComposeOverrideRefresh,
+          ...(forceComposeOverrideRefresh ? { networkIds: forceRefreshNetworkIds } : {}),
+        });
       } while (this.composeProjectRoutingWriteQueued || this.composeProjectRoutingForceOverrideRefreshQueued);
     });
   }
@@ -4004,12 +4097,13 @@ export class PortManagerNetworkService implements DisposableLike {
   private async writeComposeProjectRoutingFileExclusive(
     options: ComposeProjectRoutingWriteOptions = {},
   ): Promise<void> {
-    await this.reconcileComposeOverrideFiles(undefined, {
+    const snapshot = this.registry.getSnapshot();
+    const overrideAttachments = filterComposeAttachmentsByNetworkIds(snapshot.composeAttachments, options.networkIds);
+    await this.reconcileComposeOverrideFiles(overrideAttachments, {
       force: options.forceComposeOverrideRefresh,
     });
 
     const rows = buildComposeProjectRoutingRows(this.registry.getSnapshot().composeAttachments);
-    const snapshot = this.registry.getSnapshot();
     const globalFilePath = this.getComposeProjectRoutingFilePath();
     const currentScopedPaths = new Set<string>();
     const rowsByScopedFilePath = new Map<string, ComposeProjectRoutingRow[]>();
@@ -4610,6 +4704,12 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     return markers;
+  }
+
+  /** Reads one marker file when a filesystem event identifies the changed file. */
+  private async readManualTerminalAttachmentMarker(filePath: string): Promise<TerminalAttachmentMarker | undefined> {
+    const contents = await fs.readFile(filePath, "utf8").catch(() => undefined);
+    return contents === undefined ? undefined : parseTerminalAttachmentMarker(contents, filePath);
   }
 
   /** Removes marker files that belong to one visible terminal window. */
@@ -5617,6 +5717,18 @@ function shouldRefreshComposeContainerMappingsFromRuntime(
   }
 
   return options.force === true || options.background !== true;
+}
+
+function filterComposeAttachmentsByNetworkIds(
+  attachments: readonly ComposeAttachment[],
+  networkIds: readonly string[] | undefined,
+): readonly ComposeAttachment[] {
+  if (networkIds === undefined) {
+    return attachments;
+  }
+
+  const networkIdSet = new Set(networkIds);
+  return attachments.filter((attachment) => networkIdSet.has(attachment.networkId));
 }
 
 function composeRouteCopyFiles(attachment: ComposeAttachment): readonly string[] {
@@ -7158,6 +7270,25 @@ function selectLatestTerminalAttachmentMarkerCandidates(
   }
 
   return selected;
+}
+
+/** Returns network ids whose marker file was created or rewritten since the previous stat poll. */
+function changedTerminalAttachmentMarkerNetworkIds(
+  previousRows: readonly TerminalAttachmentMarkerStateRow[],
+  nextRows: readonly TerminalAttachmentMarkerStateRow[],
+): readonly string[] {
+  const previousSignaturesByPath = new Map(previousRows.map((row) => [row.filePath, row.signature]));
+  const networkIds = new Set<string>();
+
+  for (const row of nextRows) {
+    if (row.networkId === undefined || previousSignaturesByPath.get(row.filePath) === row.signature) {
+      continue;
+    }
+
+    networkIds.add(row.networkId);
+  }
+
+  return [...networkIds];
 }
 
 /** Compares attach timestamps while treating malformed legacy values as oldest. */

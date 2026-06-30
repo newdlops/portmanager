@@ -952,7 +952,7 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
-    await openUrl(formatExposureUrl(exposure));
+    await this.dependencies.networkService.openBrowserUrl(formatExposureUrl(exposure));
   }
 
   /** Releases command subscriptions during extension deactivation. */
@@ -1395,7 +1395,7 @@ export class PortManagerCommandController implements DisposableLike {
 
     if (settings.autoOpenBrowser && restarted?.url) {
       const url = (await this.dependencies.networkService.getBrowserIsolatedUrl(restarted)) ?? restarted.url;
-      await openUrl(url);
+      await this.dependencies.networkService.openBrowserUrl(url);
     }
   }
 
@@ -1434,7 +1434,7 @@ export class PortManagerCommandController implements DisposableLike {
     }
 
     const url = (await this.dependencies.networkService.getBrowserIsolatedUrl(process)) ?? process.url;
-    await openUrl(url);
+    await this.dependencies.networkService.openBrowserUrl(url);
   }
 
   /** Installs macOS resolver rows needed for single-label browser aliases. */
@@ -1612,7 +1612,7 @@ export class PortManagerCommandController implements DisposableLike {
 
     if (settings.autoOpenBrowser && process.url) {
       const url = (await this.dependencies.networkService.getBrowserIsolatedUrl(process)) ?? process.url;
-      await openUrl(url);
+      await this.dependencies.networkService.openBrowserUrl(url);
     }
 
     return process;
@@ -2597,11 +2597,6 @@ function isReachableProcess(process: ManagedProcess | undefined): process is Man
 /** Returns the first workspace folder path because MVP commands are workspace-scoped. */
 function getDefaultWorkspaceFolder(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-}
-
-/** Opens an HTTP URL through VS Code's external URI bridge. */
-async function openUrl(url: string): Promise<void> {
-  await vscode.env.openExternal(vscode.Uri.parse(url));
 }
 
 /** Builds the URL users open from a host exposure row. */
