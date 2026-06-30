@@ -532,12 +532,11 @@ function getAsdfShimDirectory(): string | undefined {
  * name in that flow, while a hard link keeps the invoked basename.
  */
 function ensureExecutableAlias(linkPath: string, targetPath: string): void {
+  const tempPath = temporarySiblingPath(linkPath);
+
   try {
     const targetStat = fs.statSync(targetPath);
     const existingPath = fs.lstatSync(linkPath);
-    if (existingPath.isDirectory() && !existingPath.isSymbolicLink()) {
-      return;
-    }
 
     if (!existingPath.isSymbolicLink()) {
       const existingStat = fs.statSync(linkPath);
@@ -549,16 +548,25 @@ function ensureExecutableAlias(linkPath: string, targetPath: string): void {
     // Missing aliases and inaccessible stale entries are replaced below.
   }
 
-  fs.rmSync(linkPath, { force: true });
   try {
-    fs.linkSync(targetPath, linkPath);
-  } catch {
-    fs.symlinkSync(targetPath, linkPath);
+    fs.rmSync(tempPath, { recursive: true, force: true });
+    try {
+      fs.linkSync(targetPath, tempPath);
+    } catch {
+      fs.symlinkSync(targetPath, tempPath);
+    }
+
+    replacePathAtomically(linkPath, tempPath);
+  } catch (error) {
+    fs.rmSync(tempPath, { recursive: true, force: true });
+    throw error;
   }
 }
 
 /** Replaces stale extension-owned symlinks while leaving matching links alone. */
 function ensureSymlink(linkPath: string, targetPath: string): void {
+  const tempPath = temporarySiblingPath(linkPath);
+
   try {
     if (fs.readlinkSync(linkPath) === targetPath) {
       return;
@@ -568,16 +576,13 @@ function ensureSymlink(linkPath: string, targetPath: string): void {
   }
 
   try {
-    const existingPath = fs.lstatSync(linkPath);
-    if (existingPath.isDirectory() && !existingPath.isSymbolicLink()) {
-      return;
-    }
-  } catch {
-    // The desired link does not exist yet.
+    fs.rmSync(tempPath, { recursive: true, force: true });
+    fs.symlinkSync(targetPath, tempPath);
+    replacePathAtomically(linkPath, tempPath);
+  } catch (error) {
+    fs.rmSync(tempPath, { recursive: true, force: true });
+    throw error;
   }
-
-  fs.rmSync(linkPath, { force: true });
-  fs.symlinkSync(targetPath, linkPath);
 }
 
 function writeRuntimeCommandShims(targetDirectory: string, runtimeCommandShimPath: string | undefined): void {
@@ -620,8 +625,45 @@ function writeRuntimeCommandShim(filePath: string, contents: string): void {
     // Missing, unreadable, or non-file paths are replaced below.
   }
 
-  fs.rmSync(filePath, { recursive: true, force: true });
-  fs.writeFileSync(filePath, contents, { encoding: "utf8", mode: 0o700 });
+  const tempPath = temporarySiblingPath(filePath);
+  try {
+    fs.rmSync(tempPath, { recursive: true, force: true });
+    fs.writeFileSync(tempPath, contents, { encoding: "utf8", mode: 0o700 });
+    fs.chmodSync(tempPath, 0o700);
+    replacePathAtomically(filePath, tempPath);
+  } catch (error) {
+    fs.rmSync(tempPath, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+/**
+ * Creates a temporary sibling so POSIX rename can swap generated shims without
+ * exposing a missing executable between unlink and recreate.
+ */
+function temporarySiblingPath(filePath: string): string {
+  const directory = path.dirname(filePath);
+  const baseName = path.basename(filePath);
+  return path.join(directory, `.${baseName}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`);
+}
+
+/** Renames over files atomically; stale directories need one cleanup fallback. */
+function replacePathAtomically(filePath: string, tempPath: string): void {
+  try {
+    fs.renameSync(tempPath, filePath);
+  } catch (error) {
+    try {
+      if (fs.lstatSync(filePath).isDirectory()) {
+        fs.rmSync(filePath, { recursive: true, force: true });
+        fs.renameSync(tempPath, filePath);
+        return;
+      }
+    } catch {
+      // Preserve the original rename failure below.
+    }
+
+    throw error;
+  }
 }
 
 /**

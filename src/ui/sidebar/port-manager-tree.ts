@@ -1132,6 +1132,7 @@ function buildDaemonChildren(
       snapshot.controlPlane?.role === "owner" ? "workspace-trusted" : "workspace-untrusted",
       buildControlPlaneTooltip(snapshot.controlPlane),
     ),
+    ...buildOwnerUiActionRows(snapshot.controlPlane),
     new DaemonStatusTreeItem("This Window PID", String(snapshot.controlPlane?.currentPid ?? process.pid), "window"),
     new DaemonStatusTreeItem("Status", daemon.status, daemon.status === "running" ? "pass" : "warning"),
     new DaemonStatusTreeItem(
@@ -1153,6 +1154,33 @@ function buildDaemonChildren(
   }
 
   return children;
+}
+
+function buildOwnerUiActionRows(controlPlane: ControlPlaneStatus | undefined): PortManagerTreeItem[] {
+  if (isControlPlaneOwner(controlPlane)) {
+    return [];
+  }
+
+  return [
+    new ActionTreeItem(
+      "Open Owner UI",
+      "portManager.openOwnerUi",
+      "window",
+      formatOpenOwnerUiDescription(controlPlane),
+    ),
+  ];
+}
+
+function formatOpenOwnerUiDescription(controlPlane: ControlPlaneStatus | undefined): string {
+  if (controlPlane?.role === "worker") {
+    return `owner pid ${controlPlane.ownerPid ?? "unknown"}`;
+  }
+
+  if (controlPlane?.role === "unowned") {
+    return "no owner elected";
+  }
+
+  return "owner unknown";
 }
 
 function buildControlPlaneTooltip(controlPlane: ControlPlaneStatus | undefined): vscode.MarkdownString {

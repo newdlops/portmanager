@@ -157,6 +157,7 @@ const CONTROL_PLANE_OWNER_LEASE_MS = 120_000;
 const CONTROL_PLANE_OWNER_LOCK_STALE_MS = 30_000;
 const CONTROL_PLANE_OWNER_PATH = buildControlPlaneOwnerControlPath("owner");
 const CONTROL_PLANE_OWNER_LOCK_PATH = buildControlPlaneOwnerControlPath("lock");
+const CONTROL_PLANE_OWNER_UI_REQUEST_PATH = buildControlPlaneOwnerControlPath("owner-ui-request");
 const OWNER_LEASE_HANDOFF_RETRY_DELAY_MS = 1_000;
 const DAEMON_RESTART_BACKOFF_MS = 30_000;
 const TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500;
@@ -424,6 +425,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Disposables that must exist only in the current control-plane owner window. */
   private readonly controlPlaneOwnerDisposables: DisposableLike[] = [];
 
+  /** Last owner-UI request file timestamp consumed by this owner window. */
+  private lastOwnerUiRequestMtimeMs = 0;
+
   /** Guards owner startup so concurrent activation/configuration signals do not duplicate loops. */
   private controlPlaneOwnerStartupInFlight: Promise<boolean> | undefined;
 
@@ -650,10 +654,20 @@ export class PortManagerNetworkService implements DisposableLike {
     );
     const nativeTerminalAttachmentMarkerWatcher =
       this.watchTerminalAttachmentMarkers(terminalAttachmentMarkerDirectory);
+    const ownerUiRequestDirectory = path.dirname(CONTROL_PLANE_OWNER_UI_REQUEST_PATH);
+    await fs.mkdir(ownerUiRequestDirectory, { recursive: true }).catch(() => undefined);
+    this.lastOwnerUiRequestMtimeMs = await fs
+      .stat(CONTROL_PLANE_OWNER_UI_REQUEST_PATH)
+      .then((stats) => stats.mtimeMs)
+      .catch(() => 0);
+    const ownerUiRequestWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(ownerUiRequestDirectory, path.basename(CONTROL_PLANE_OWNER_UI_REQUEST_PATH)),
+    );
 
     this.controlPlaneOwnerDisposables.push(
       terminalAttachmentMarkerWatcher,
       nativeTerminalAttachmentMarkerWatcher,
+      ownerUiRequestWatcher,
       terminalAttachmentMarkerWatcher.onDidCreate(() => {
         this.scheduleTerminalAttachmentRefreshBurst();
       }),
@@ -662,6 +676,12 @@ export class PortManagerNetworkService implements DisposableLike {
       }),
       terminalAttachmentMarkerWatcher.onDidDelete(() => {
         this.scheduleTerminalAttachmentRefreshBurst();
+      }),
+      ownerUiRequestWatcher.onDidCreate(() => {
+        void this.openOwnerUiFromFocusRequest();
+      }),
+      ownerUiRequestWatcher.onDidChange(() => {
+        void this.openOwnerUiFromFocusRequest();
       }),
     );
   }
@@ -793,6 +813,54 @@ export class PortManagerNetworkService implements DisposableLike {
       ownerUpdatedAt: owner?.updatedAt,
       leaseExpiresAt,
     };
+  }
+
+  /**
+   * Signals the elected owner extension host to reveal its Port Manager UI.
+   * The worker cannot directly focus another VS Code window, so the owner-only
+   * watcher consumes this shared request file and opens the view locally.
+   */
+  async requestControlPlaneOwnerUiFocus(): Promise<boolean> {
+    const controlPlane = this.getControlPlaneStatus();
+    if (controlPlane.role !== "worker" || !controlPlane.ownerActive) {
+      return false;
+    }
+
+    try {
+      ensureControlPlaneOwnerControlDirectory();
+      await fs.writeFile(
+        CONTROL_PLANE_OWNER_UI_REQUEST_PATH,
+        `${JSON.stringify({
+          requesterPid: process.pid,
+          ownerPid: controlPlane.ownerPid,
+          requestedAt: new Date().toISOString(),
+        })}\n`,
+        "utf8",
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async openOwnerUiFromFocusRequest(): Promise<void> {
+    if (!this.ownsControlPlaneLease || !tryAcquireControlPlaneOwnerLease()) {
+      this.demoteControlPlaneOwner();
+      return;
+    }
+
+    const stats = await fs.stat(CONTROL_PLANE_OWNER_UI_REQUEST_PATH).catch(() => undefined);
+    if (stats === undefined || stats.mtimeMs <= this.lastOwnerUiRequestMtimeMs) {
+      return;
+    }
+    this.lastOwnerUiRequestMtimeMs = stats.mtimeMs;
+
+    try {
+      await vscode.commands.executeCommand("workbench.view.extension.portManager");
+      await vscode.commands.executeCommand("portManager.processes.focus");
+    } catch {
+      // The request is best-effort; the worker still reports the owner PID.
+    }
   }
 
   /** Returns daemon status when process service is available for the sidebar. */
@@ -7581,7 +7649,7 @@ function buildBrowserNetworkProxyOwnerControlPath(kind: "owner" | "lock"): strin
   return path.join(parsedPath.dir, `${parsedPath.name.replace("routes", "browser-network-proxy-owner")}.${kind}`);
 }
 
-function buildControlPlaneOwnerControlPath(kind: "owner" | "lock"): string {
+function buildControlPlaneOwnerControlPath(kind: "owner" | "lock" | "owner-ui-request"): string {
   const routeTablePath = getDefaultRouteTablePath();
   const parsedPath = path.parse(routeTablePath);
   return path.join(parsedPath.dir, `${parsedPath.name.replace("routes", "control-plane-owner")}.${kind}`);

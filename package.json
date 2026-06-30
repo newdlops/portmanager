@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8057",
+  "version": "0.0.8058",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -89,6 +89,7 @@
     "onCommand:portManager.removeProcess",
     "onCommand:portManager.installShellHook",
     "onCommand:portManager.installExternalCli",
+    "onCommand:portManager.openOwnerUi",
     "onCommand:portManager.openSettings"
   ],
   "main": "./out/src/extension/activate.js",
@@ -363,6 +364,12 @@
         "icon": "$(target)"
       },
       {
+        "command": "portManager.openOwnerUi",
+        "title": "Port Manager: Open Owner UI",
+        "category": "Port Manager",
+        "icon": "$(window)"
+      },
+      {
         "command": "portManager.stopProcess",
         "title": "Port Manager: Stop Process",
         "category": "Port Manager",
@@ -430,6 +437,11 @@
           "group": "navigation@2"
         },
         {
+          "command": "portManager.openOwnerUi",
+          "when": "view == portManager.processes && !portManager.isControlPlaneOwner",
+          "group": "navigation@2"
+        },
+        {
           "command": "portManager.openSettings",
           "when": "view == portManager.processes",
           "group": "navigation@3"
@@ -490,6 +502,10 @@
         },
         {
           "command": "portManager.installExternalCli",
+          "when": "false"
+        },
+        {
+          "command": "portManager.openOwnerUi",
           "when": "false"
         }
       ],

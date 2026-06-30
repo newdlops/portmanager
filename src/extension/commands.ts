@@ -193,6 +193,7 @@ export class PortManagerCommandController implements DisposableLike {
     );
     this.registerCommand(context, "portManager.installShellHook", () => this.installShellHook(context));
     this.registerCommand(context, "portManager.installExternalCli", () => this.installExternalCli(context));
+    this.registerCommand(context, "portManager.openOwnerUi", () => this.openOwnerUi());
     this.registerCommand(context, "portManager.openSettings", () => openPortManagerSettings());
   }
 
@@ -1300,6 +1301,12 @@ export class PortManagerCommandController implements DisposableLike {
             ]
           : [
               {
+                label: "$(window) Open Owner UI",
+                description: formatStatusMenuOwnerDescription(snapshot),
+                detail: "Owner-only routing actions run from the elected Port Manager window.",
+                action: "ownerUi" as const,
+              },
+              {
                 label: "$(lock) Owner actions disabled",
                 description: formatStatusMenuOwnerDescription(snapshot),
                 action: "ownerOnly" as const,
@@ -1331,9 +1338,30 @@ export class PortManagerCommandController implements DisposableLike {
       case "refresh":
         await this.refresh();
         return;
+      case "ownerUi":
+        await this.openOwnerUi();
+        return;
       case "ownerOnly":
         return;
     }
+  }
+
+  /**
+   * Opens the Port Manager view and explains where owner-only actions are
+   * available. Worker windows signal the elected owner because VS Code command
+   * execution is scoped to one extension host.
+   */
+  private async openOwnerUi(): Promise<void> {
+    const snapshot = this.dependencies.networkService.getSnapshot();
+
+    if (snapshot.controlPlane?.role === "owner") {
+      await vscode.commands.executeCommand("workbench.view.extension.portManager");
+      await vscode.commands.executeCommand("portManager.processes.focus");
+      return;
+    }
+
+    const requested = await this.dependencies.networkService.requestControlPlaneOwnerUiFocus();
+    await vscode.window.showInformationMessage(formatOwnerUiNavigationMessage(snapshot, requested));
   }
 
   /**
@@ -3042,6 +3070,22 @@ function formatStatusMenuOwnerDescription(snapshot: NetworkSnapshot): string {
   }
 
   return "Routing changes are available only in the owner window";
+}
+
+function formatOwnerUiNavigationMessage(snapshot: NetworkSnapshot, requested: boolean): string {
+  if (requested && snapshot.controlPlane?.role === "worker") {
+    return `Requested Port Manager owner window pid ${snapshot.controlPlane.ownerPid ?? "unknown"} to open its UI.`;
+  }
+
+  if (snapshot.controlPlane?.role === "worker") {
+    return `This window is read-only for automatic routing. Use the Port Manager owner window with pid ${snapshot.controlPlane.ownerPid ?? "unknown"}.`;
+  }
+
+  if (snapshot.controlPlane?.role === "unowned") {
+    return "No Port Manager owner window is elected yet. Refresh after one window claims the owner lease.";
+  }
+
+  return "Owner-only routing actions are available in the elected Port Manager owner window.";
 }
 
 function formatAttachedNetworkNames(

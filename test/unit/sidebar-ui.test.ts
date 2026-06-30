@@ -81,6 +81,7 @@ test("non-owner windows show owner status and disable owner actions", () => {
   const networkServiceSource = fs.readFileSync(networkServicePath, "utf8");
   const typesSource = fs.readFileSync(typesPath, "utf8");
   const manifest = JSON.parse(fs.readFileSync(packagePath, "utf8")) as {
+    activationEvents?: string[];
     contributes?: {
       menus?: {
         "view/title"?: Array<{ command: string; when?: string }>;
@@ -107,6 +108,9 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(typesSource.includes("readonly controlPlane?: ControlPlaneStatus;"), true);
   assert.equal(networkServiceSource.includes("getControlPlaneStatus(): ControlPlaneStatus"), true);
   assert.equal(networkServiceSource.includes("controlPlane: this.getControlPlaneStatus()"), true);
+  assert.equal(networkServiceSource.includes("CONTROL_PLANE_OWNER_UI_REQUEST_PATH"), true);
+  assert.equal(networkServiceSource.includes("requestControlPlaneOwnerUiFocus(): Promise<boolean>"), true);
+  assert.equal(networkServiceSource.includes("openOwnerUiFromFocusRequest"), true);
   assert.equal(activateSource.includes('"portManager.isControlPlaneOwner"'), true);
   assert.equal(activateSource.includes('snapshot.controlPlane?.role === "owner"'), true);
   assert.equal(source.includes("buildOwnerActionAvailability(snapshot.controlPlane)"), true);
@@ -114,8 +118,15 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(source.includes("availability.enabled ? undefined : new vscode.ThemeColor(\"disabledForeground\")"), true);
   assert.equal(source.includes("if (availability.enabled) {"), true);
   assert.equal(source.includes("formatOwnerOnlyActionReason(controlPlane)"), true);
+  assert.equal(source.includes("buildOwnerUiActionRows(snapshot.controlPlane)"), true);
+  assert.equal(source.includes('"Open Owner UI"'), true);
   assert.equal(commandsSource.includes('label: "$(lock) Owner actions disabled"'), true);
+  assert.equal(commandsSource.includes('label: "$(window) Open Owner UI"'), true);
+  assert.equal(commandsSource.includes('action: "ownerUi" as const'), true);
+  assert.equal(commandsSource.includes('"portManager.openOwnerUi"'), true);
+  assert.equal(commandsSource.includes("requestControlPlaneOwnerUiFocus()"), true);
   assert.equal(commandsSource.includes('action: "ownerOnly" as const'), true);
+  assert.equal(manifest.activationEvents?.includes("onCommand:portManager.openOwnerUi"), true);
 
   for (const command of ownerOnlyCommands) {
     const contextItems = menuItems.filter((item) => item.command === command);
@@ -131,6 +142,13 @@ test("non-owner windows show owner status and disable owner actions", () => {
     viewTitleItems
       .filter((item) => item.command === "portManager.createLogicalNetwork" || item.command === "portManager.refresh")
       .every((item) => item.when?.includes("portManager.isControlPlaneOwner")),
+    true,
+  );
+  assert.equal(
+    viewTitleItems.some(
+      (item) =>
+        item.command === "portManager.openOwnerUi" && item.when?.includes("!portManager.isControlPlaneOwner"),
+    ),
     true,
   );
 });
@@ -252,15 +270,24 @@ test("terminal rows expose reveal commands for injected external windows", () =>
 test("view title toolbar exposes only primary actions", () => {
   const packagePath = path.resolve(__dirname, "../../../package.json");
   const manifest = JSON.parse(fs.readFileSync(packagePath, "utf8")) as {
-    contributes?: { menus?: { "view/title"?: Array<{ command: string }> } };
+    contributes?: { menus?: { "view/title"?: Array<{ command: string; when?: string }> } };
   };
-  const viewTitleCommands = manifest.contributes?.menus?.["view/title"]?.map((item) => item.command) ?? [];
+  const viewTitleItems = manifest.contributes?.menus?.["view/title"] ?? [];
+  const viewTitleCommands = viewTitleItems.map((item) => item.command);
 
   assert.deepEqual(viewTitleCommands, [
     "portManager.createLogicalNetwork",
     "portManager.refresh",
+    "portManager.openOwnerUi",
     "portManager.openSettings",
   ]);
+  assert.equal(
+    viewTitleItems.some(
+      (item) =>
+        item.command === "portManager.openOwnerUi" && item.when?.includes("!portManager.isControlPlaneOwner"),
+    ),
+    true,
+  );
 });
 
 test("terminal context menu supports active attach and reveal", () => {
