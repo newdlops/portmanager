@@ -9,6 +9,7 @@ import { ACTUAL_LOOPBACK_HOST_ENV } from "../core/networks/loopback-address";
 import { buildExistingCloneMutationFromCandidate } from "../platform/network/container-service-discovery";
 import { isValidComposeProjectName } from "../platform/network/compose-publish-mutator";
 import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
+import { readPortManagerPackageVersion } from "../shared/package-version";
 import type { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import {
   getComposeAttachmentFromCommandArgument,
@@ -1031,7 +1032,9 @@ export class PortManagerCommandController implements DisposableLike {
     await this.dependencies.processService.refresh();
     const daemon = this.dependencies.processService.getSnapshot().daemon;
     const routeTablePath = daemon.routeTablePath ? `\nRoute table: ${daemon.routeTablePath}` : "";
-    const version = `\nVersion: ${daemon.versionStatus ?? "unknown"}${daemon.restartRequired ? " (restart required)" : ""}`;
+    const daemonVersion = daemon.version ?? "unknown";
+    const expectedVersion = daemon.expectedVersion ? `, expected ${daemon.expectedVersion}` : "";
+    const version = `\nVersion: ${daemonVersion} (${daemon.versionStatus ?? "unknown"}${expectedVersion}${daemon.restartRequired ? ", restart required" : ""})`;
     const agentMainPath = daemon.agentMainPath ? `\nAgent main: ${daemon.agentMainPath}` : "";
     const expectedAgentMainPath = daemon.expectedAgentMainPath ? `\nExpected agent: ${daemon.expectedAgentMainPath}` : "";
     const errorMessage = daemon.errorMessage ? `\nWarning: ${daemon.errorMessage}` : "";
@@ -1356,6 +1359,7 @@ export class PortManagerCommandController implements DisposableLike {
     if (snapshot.controlPlane?.role === "owner") {
       await vscode.commands.executeCommand("workbench.view.extension.portManager");
       await vscode.commands.executeCommand("portManager.processes.focus");
+      await vscode.window.showInformationMessage(formatOwnerUiNavigationMessage(snapshot, true));
       return;
     }
 
@@ -1544,6 +1548,7 @@ export class PortManagerCommandController implements DisposableLike {
       context.globalStorageUri.fsPath,
       TERMINAL_NETWORK_SELECTION_FILE_NAME,
     );
+    const packageVersion = readPortManagerPackageVersion() ?? "unknown";
     const shellProfilePaths = getShellProfilePaths();
     const sourceLine = `. "${hookScriptPath}"`;
 
@@ -1576,6 +1581,7 @@ export class PortManagerCommandController implements DisposableLike {
         routeTablePath: getDefaultRouteTablePath(),
         hostAccessFilePath: getDefaultHostAccessBindingsPath(),
         terminalNetworkSelectionFilePath,
+        packageVersion,
         settings,
         runtimeShimDirectory,
         shellEnvRestorePath,
@@ -2998,6 +3004,8 @@ interface ShellHookScriptOptions {
   readonly hostAccessFilePath: string;
   /** TSV file mapping logical networks to generated attach scripts for `pm`. */
   readonly terminalNetworkSelectionFilePath: string;
+  /** Extension package version expected by this generated hook. */
+  readonly packageVersion: string;
   /** Routing settings mirrored into native hook environment variables. */
   readonly settings: PortManagerSettings;
   /** Optional PATH directory that restores DYLD after protected runtime launch boundaries. */
@@ -3056,7 +3064,7 @@ function formatStatusMenuSummary(snapshot: NetworkSnapshot): StatusMenuSummary {
 
 function formatStatusMenuOwnerDescription(snapshot: NetworkSnapshot): string {
   if (snapshot.controlPlane?.role === "worker") {
-    return `Use owner window pid ${snapshot.controlPlane.ownerPid ?? "unknown"} for routing changes`;
+    return `Use ${formatOwnerWindowTitle(snapshot)} for routing changes`;
   }
 
   if (snapshot.controlPlane?.role === "unowned") {
@@ -3067,12 +3075,19 @@ function formatStatusMenuOwnerDescription(snapshot: NetworkSnapshot): string {
 }
 
 function formatOwnerUiNavigationMessage(snapshot: NetworkSnapshot, focused: boolean): string {
+  const ownerTitle = formatOwnerWindowTitle(snapshot);
+  const ownerPid = snapshot.controlPlane?.ownerPid ?? "unknown";
+
+  if (focused && snapshot.controlPlane?.role === "owner") {
+    return `Port Manager owner window: ${ownerTitle} (pid ${ownerPid}).`;
+  }
+
   if (focused && snapshot.controlPlane?.role === "worker") {
-    return `Focused Port Manager owner window pid ${snapshot.controlPlane.ownerPid ?? "unknown"}.`;
+    return `Focused Port Manager owner window: ${ownerTitle} (pid ${ownerPid}).`;
   }
 
   if (snapshot.controlPlane?.role === "worker") {
-    return `Could not focus Port Manager owner window pid ${snapshot.controlPlane.ownerPid ?? "unknown"}.`;
+    return `Could not focus Port Manager owner window: ${ownerTitle} (pid ${ownerPid}).`;
   }
 
   if (snapshot.controlPlane?.role === "unowned") {
@@ -3080,6 +3095,10 @@ function formatOwnerUiNavigationMessage(snapshot: NetworkSnapshot, focused: bool
   }
 
   return "Owner-only routing actions are available in the elected Port Manager owner window.";
+}
+
+function formatOwnerWindowTitle(snapshot: NetworkSnapshot): string {
+  return snapshot.controlPlane?.ownerTitle?.trim() || "owner window";
 }
 
 function formatAttachedNetworkNames(
@@ -3109,6 +3128,7 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
   const escapedRouteTablePath = shellDoubleQuote(options.routeTablePath);
   const escapedHostAccessFilePath = shellDoubleQuote(options.hostAccessFilePath);
   const escapedTerminalNetworkSelectionFilePath = shellDoubleQuote(options.terminalNetworkSelectionFilePath);
+  const escapedPackageVersion = shellDoubleQuote(options.packageVersion);
   const escapedRuntimeShimDirectory =
     options.runtimeShimDirectory !== undefined ? shellDoubleQuote(options.runtimeShimDirectory) : undefined;
   const escapedShellEnvRestorePath =
@@ -3188,6 +3208,25 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     'try{rows=fs.readFileSync(file,"utf8").split(/\\r?\\n/).filter((line)=>line.length>0).map((line)=>line.split("\\t"));}catch{}',
     'rows.forEach((row,index)=>{if(row.length<3)return;const marker=row[0]===current?"*":" ";console.error(marker+" "+(index+1)+") "+text(row[1])+" ["+text(row[0])+"]");const summary=row[3]&&row[3].trim()?row[3]:"no services";summary.split(/\\s+\\|\\|\\s+/).filter((entry)=>entry.trim().length>0).forEach((entry)=>console.error("     "+entry.trim()));});',
   ].join("");
+  const agentVersionScript = [
+    'const net=require("node:net");',
+    'const socketPath=process.argv[1]||"";',
+    'const expected=process.argv[2]||"unknown";',
+    'const mode=process.argv[3]||"status";',
+    'function known(value){return value&&value!=="unknown";}',
+    'function versionStatus(version){if(!known(version)||!known(expected))return ["unknown",known(expected)?"; expected "+expected:""];if(version!==expected)return ["stale","; expected "+expected+"; restart required"];return ["current",""];};',
+    'let timer;',
+    'let done=false;',
+    'let buffer="";',
+    'const socket=net.createConnection(socketPath);',
+    'function finish(code){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.destroy();}catch{}process.exit(code);}',
+    'function print(daemon){const version=(daemon&&daemon.version)||"unknown";const pid=(daemon&&daemon.pid)||"unknown";const result=versionStatus(version);if(mode==="version"){console.log("Port Manager expected version: "+expected);console.log("Port Manager daemon version: "+version+" ("+result[0]+result[1]+")");console.log("Port Manager daemon pid: "+pid);}else{console.log("Agent version: "+version+" ("+result[0]+result[1]+"), pid "+pid);}}',
+    'timer=setTimeout(()=>finish(1),700);',
+    'socket.setEncoding("utf8");',
+    'socket.once("connect",()=>{socket.write(JSON.stringify({id:"pm-version",method:"daemonStatus"})+"\\n");});',
+    'socket.once("error",()=>finish(1));',
+    'socket.on("data",(chunk)=>{buffer+=chunk;const lineEnd=buffer.indexOf("\\n");if(lineEnd<0)return;try{const message=JSON.parse(buffer.slice(0,lineEnd));if(!message||message.ok!==true)finish(1);print(message.payload);finish(0);}catch{finish(1);}});',
+  ].join("");
   const nodeProbeScript = [
     'const net=require("node:net");',
     'const fs=require("node:fs");',
@@ -3252,6 +3291,7 @@ export PORT_MANAGER_HOST_ACCESS_FILE="${escapedHostAccessFilePath}"
 export PORT_MANAGER_NETWORKS_FILE="${escapedTerminalNetworkSelectionFilePath}"
 export PORT_MANAGER_AGENT_MAIN="${escapedAgentMainPath}"
 export PORT_MANAGER_AGENT_EXECUTABLE="${escapedNativeAgentPath}"
+export PORT_MANAGER_EXPECTED_VERSION="${escapedPackageVersion}"
 export PORT_MANAGER_CONTAINER_MAP_HELPER="${escapedNativeContainerMapPath}"
 export ${DOCKER_SHIM_PATH_ENV}="${escapedDockerShimPath}"
 export PORT_MANAGER_SCAN_RANGE="${options.settings.scanRange}"
@@ -3296,16 +3336,45 @@ __pm_networks_file_path() {
   return 1
 }
 
+__pm_agent_version() {
+  __pm_version_mode="\${1:-status}"
+  if [ -z "\${PORT_MANAGER_AGENT_SOCKET:-}" ]; then
+    printf '%s\n' 'Agent version: unavailable (PORT_MANAGER_AGENT_SOCKET unset)'
+    unset __pm_version_mode
+    return 1
+  fi
+  ${daemonRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
+    agentVersionScript,
+  )}" "$PORT_MANAGER_AGENT_SOCKET" "\${PORT_MANAGER_EXPECTED_VERSION:-unknown}" "$__pm_version_mode"
+  __pm_status=$?
+  if [ "$__pm_status" -ne 0 ]; then
+    if [ "$__pm_version_mode" = "version" ]; then
+      printf 'Port Manager expected version: %s\n' "\${PORT_MANAGER_EXPECTED_VERSION:-unknown}"
+      printf '%s\n' 'Port Manager daemon version: unavailable'
+    else
+      printf '%s\n' 'Agent version: unavailable'
+    fi
+  fi
+  unset __pm_version_mode
+  return $__pm_status
+}
+
 pm() {
   if [ "\${1:-}" = "help" ] || [ "\${1:-}" = "--help" ] || [ "\${1:-}" = "-h" ]; then
-    printf '%s\n' 'Usage: pm [current|status|doctor|routes|repair|detach|network-number|network-name|network-id]' >&2
+    printf '%s\n' 'Usage: pm [current|status|version|doctor|routes|repair|detach|network-number|network-name|network-id]' >&2
     printf '%s\n' 'Run without arguments to choose a Port Manager logical network for this shell.' >&2
     printf '%s\n' 'Run "pm current" to print the network currently attached to this shell.' >&2
+    printf '%s\n' 'Run "pm version" to print the daemon package version visible to this shell.' >&2
     printf '%s\n' 'Run "pm doctor" to inspect shell routing files and daemon readiness.' >&2
     printf '%s\n' 'Run "pm routes" to print routes visible to this shell.' >&2
     printf '%s\n' 'Run "pm repair" to remove stale daemon startup state and reapply this shell network.' >&2
     printf '%s\n' 'Run "pm detach" to remove Port Manager routing from this shell.' >&2
     return 0
+  fi
+
+  if [ "\${1:-}" = "version" ] || [ "\${1:-}" = "--version" ] || [ "\${1:-}" = "-v" ]; then
+    __pm_agent_version version
+    return $?
   fi
 
   if [ "\${1:-}" = "doctor" ]; then
@@ -3412,7 +3481,7 @@ pm() {
     fi
     printf '\\033]0;%s\\007' 'Port Manager: detached' 2>/dev/null || true
     if [ -n "\${PORT_MANAGER_GLOBAL_ROUTES_FILE:-}" ]; then export PORT_MANAGER_ROUTES_FILE="$PORT_MANAGER_GLOBAL_ROUTES_FILE"; else unset PORT_MANAGER_ROUTES_FILE; fi
-    unset PORT_MANAGER_HOOK PORT_MANAGER_HOOK_DISABLED PORT_MANAGER_NETWORK_ID PORT_MANAGER_NETWORK_NAME PORT_MANAGER_ROUTE_TABLE_NETWORK_ID PORT_MANAGER_BORROWED_NETWORK_ID NEWDLOPS_PM_NETWORK_ID NEWDLOPS_PM_BORROWED_NETWORK_ID PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_RUNTIME_SHIM_READY PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_COMPOSE_LOGICAL_PORTS PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS PORT_MANAGER_TERMINAL_ATTACHMENT_DIR PORT_MANAGER_SCAN_RANGE PORT_MANAGER_ROUTING_MODE PORT_MANAGER_VIRTUAL_PORT_START PORT_MANAGER_VIRTUAL_PORT_END PORT_MANAGER_FIXED_PROTOCOL_PORTS PORT_MANAGER_PRESERVE_LISTEN_PORTS ${ROUTE_TABLE_TTL_SECONDS_ENV} ${ACTUAL_LOOPBACK_HOST_ENV} PORT_MANAGER_NETWORK_LOOPBACK_HOST PORT_MANAGER_DYLD_INSERT_LIBRARIES PORT_MANAGER_LD_PRELOAD
+    unset PORT_MANAGER_HOOK PORT_MANAGER_HOOK_DISABLED PORT_MANAGER_NETWORK_ID PORT_MANAGER_NETWORK_NAME PORT_MANAGER_ROUTE_TABLE_NETWORK_ID PORT_MANAGER_BORROWED_NETWORK_ID NEWDLOPS_PM_NETWORK_ID NEWDLOPS_PM_BORROWED_NETWORK_ID PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_RUNTIME_SHIM_READY PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_COMPOSE_LOGICAL_PORTS PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS PORT_MANAGER_TERMINAL_ATTACHMENT_DIR PORT_MANAGER_SCAN_RANGE PORT_MANAGER_ROUTING_MODE PORT_MANAGER_VIRTUAL_PORT_START PORT_MANAGER_VIRTUAL_PORT_END PORT_MANAGER_FIXED_PROTOCOL_PORTS PORT_MANAGER_PRESERVE_LISTEN_PORTS ${ROUTE_TABLE_TTL_SECONDS_ENV} ${ACTUAL_LOOPBACK_HOST_ENV} PORT_MANAGER_NETWORK_LOOPBACK_HOST PORT_MANAGER_EXPECTED_VERSION PORT_MANAGER_DYLD_INSERT_LIBRARIES PORT_MANAGER_LD_PRELOAD
     export PORT_MANAGER_HOOK=0
     export PORT_MANAGER_HOOK_DISABLED=1
     export PORT_MANAGER_HOOK_DAEMON_STARTED=0
@@ -3439,6 +3508,9 @@ pm() {
     fi
     if [ -z "$__pm_current_id" ]; then
       printf '%s\n' 'Port Manager shell network: none'
+      if [ "\${1:-}" = "status" ]; then
+        __pm_agent_version status || true
+      fi
       unset __pm_current_id __pm_current_name __pm_networks_file
       return 1
     fi
@@ -3446,6 +3518,9 @@ pm() {
       printf 'Port Manager shell network: %s [%s]\n' "$__pm_current_name" "$__pm_current_id"
     else
       printf 'Port Manager shell network: %s\n' "$__pm_current_id"
+    fi
+    if [ "\${1:-}" = "status" ]; then
+      __pm_agent_version status || true
     fi
     unset __pm_current_id __pm_current_name __pm_networks_file
     return 0

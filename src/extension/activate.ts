@@ -178,14 +178,19 @@ function formatControlPlaneTooltipLine(snapshot: NetworkSnapshot): string {
   }
 
   if (controlPlane.role === "owner") {
-    return `Control plane: owner in this window, pid ${controlPlane.currentPid}.`;
+    return `Control plane: owner in this window, ${formatControlPlaneOwnerTitle(controlPlane)}, pid ${controlPlane.currentPid}.`;
   }
 
   if (controlPlane.role === "worker") {
-    return `Control plane: worker in this window, owner pid ${controlPlane.ownerPid ?? "unknown"}.`;
+    return `Control plane: worker in this window, ${formatControlPlaneOwnerTitle(controlPlane)}, pid ${controlPlane.ownerPid ?? "unknown"}.`;
   }
 
   return "Control plane: no active owner.";
+}
+
+function formatControlPlaneOwnerTitle(controlPlane: NetworkSnapshot["controlPlane"]): string {
+  const title = controlPlane?.ownerTitle?.trim();
+  return title === undefined || title.length === 0 ? "owner window" : `owner window "${title}"`;
 }
 
 function countAttachedTerminalsByNetwork(

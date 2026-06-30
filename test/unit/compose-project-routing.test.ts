@@ -3447,7 +3447,7 @@ test(
 );
 
 test(
-  "native docker PATH shim refuses host compose when attached routing TSV is empty",
+  "native docker PATH shim falls back to current route table when attached routing TSV is empty",
   { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
   () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-compose-route-fallback-"));
@@ -3457,11 +3457,14 @@ test(
     const realBinDir = path.join(tempDir, "real-bin");
     const routingFile = path.join(tempDir, "routes.tsv");
     const routeTableFile = path.join(tempDir, "newdlops-portmanager-routes-501-network-a.json");
+    const overrideFile = path.join(tempDir, "compose-overrides", "c1-docker-691afbc8.ports.override.yaml");
 
     fs.mkdirSync(composeDir, { recursive: true });
+    fs.mkdirSync(path.dirname(overrideFile), { recursive: true });
     fs.mkdirSync(shimDir, { recursive: true });
     fs.mkdirSync(realBinDir, { recursive: true });
     fs.writeFileSync(routingFile, "", "utf8");
+    fs.writeFileSync(overrideFile, "services: {}\n", "utf8");
     fs.writeFileSync(
       routeTableFile,
       JSON.stringify({
@@ -3494,30 +3497,38 @@ test(
     );
 
     try {
-      let error: { readonly status?: number; readonly stderr?: Buffer | string } | undefined;
-      try {
-        execFileSync("docker", ["compose", "-p", "docker", "-f", "./docker/development.yaml", "stop", "db"], {
-          cwd: projectDir,
-          encoding: "utf8",
-          env: {
-            ...process.env,
-            PATH: `${shimDir}${path.delimiter}${realBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
-            PORT_MANAGER_RUNTIME_SHIM_DIR: shimDir,
-            PORT_MANAGER_COMPOSE_ROUTING_FILE: routingFile,
-            PORT_MANAGER_ROUTES_FILE: routeTableFile,
-            PORT_MANAGER_NETWORK_ID: "network-a",
-            PORT_MANAGER_BORROWED_NETWORK_ID: "",
-            NEWDLOPS_PM_NETWORK_ID: "",
-            NEWDLOPS_PM_BORROWED_NETWORK_ID: "",
-          },
-        });
-      } catch (caught) {
-        error = caught as { readonly status?: number; readonly stderr?: Buffer | string };
-      }
+      const output = execFileSync("docker", ["compose", "-p", "docker", "-f", "./docker/development.yaml", "stop", "db"], {
+        cwd: projectDir,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${shimDir}${path.delimiter}${realBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          PORT_MANAGER_RUNTIME_SHIM_DIR: shimDir,
+          PORT_MANAGER_COMPOSE_ROUTING_FILE: routingFile,
+          PORT_MANAGER_ROUTES_FILE: routeTableFile,
+          PORT_MANAGER_NETWORK_ID: "network-a",
+          PORT_MANAGER_BORROWED_NETWORK_ID: "",
+          NEWDLOPS_PM_NETWORK_ID: "",
+          NEWDLOPS_PM_BORROWED_NETWORK_ID: "",
+        },
+      });
 
-      assert.ok(error);
-      assert.equal(error.status, 127);
-      assert.match(String(error.stderr ?? ""), /refusing to run host Compose command/);
+      assert.equal(
+        output,
+        [
+          "env=c1-docker-691afbc8",
+          "<compose>",
+          "<-p>",
+          "<c1-docker-691afbc8>",
+          "<-f>",
+          "<./docker/development.yaml>",
+          "<-f>",
+          `<${overrideFile}>`,
+          "<stop>",
+          "<db>",
+          "",
+        ].join("\n"),
+      );
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }

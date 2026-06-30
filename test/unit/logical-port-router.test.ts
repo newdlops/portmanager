@@ -177,7 +177,7 @@ test("native logical router helper starts without inherited hook environment", a
     assert.equal(capturedEnvironment.LD_PRELOAD, undefined);
     assert.equal(capturedEnvironment.PM_ROUTER_ENV_PATH, capturedEnvPath);
   } finally {
-    await manager.close(logicalPort).catch(() => undefined);
+    manager.dispose();
     restoreProcessEnvironment(previousEnvironment);
     fs.rmSync(tempDirectory, { recursive: true, force: true });
   }
@@ -198,6 +198,11 @@ test("native logical router pending route requests time out instead of blocking 
   assert.equal(routerSource.includes("\"LISTEN_ERROR\\t%d\\n\""), true);
   assert.equal(routerSource.includes("PM_ROUTER_USE_KQUEUE"), true);
   assert.equal(routerSource.includes("kevent(pm_kqueue_fd"), true);
+  assert.equal(routerSource.includes("PM_ROUTER_BACKLOG 1024"), true);
+  assert.equal(routerSource.includes("static void *pm_copy_thread"), false);
+  assert.equal(routerSource.includes("static void pm_accept_ready_connections"), true);
+  assert.equal(routerSource.includes("flags | O_NONBLOCK"), true);
+  assert.equal(routerSource.includes("struct pollfd poll_fds[4]"), true);
   assert.match(buildScript, /-pthread "\$TCP_ROUTER_SOURCE_FILE"/);
 });
 
@@ -267,7 +272,7 @@ test("uses one shared native router process for many logical ports", async (cont
     nativeRouterPath,
     [
       "#!/usr/bin/env node",
-      'require("node:fs").appendFileSync(process.env.PM_NATIVE_ROUTER_MARKER, `${process.argv.slice(2).join(",")}\\n`);',
+      `require("node:fs").appendFileSync(${JSON.stringify(markerPath)}, \`\${process.argv.slice(2).join(",")}\\n\`);`,
       'process.stdout.write("READY\\tcontrol\\n");',
       'process.stdin.setEncoding("utf8");',
       'process.stdin.on("data", (chunk) => {',
@@ -290,9 +295,7 @@ test("uses one shared native router process for many logical ports", async (cont
       nativeRouterPath,
     },
   );
-  const previousEnvironment = setProcessEnvironment({ PM_NATIVE_ROUTER_MARKER: markerPath });
   context.after(() => {
-    restoreProcessEnvironment(previousEnvironment);
     fs.rmSync(tempDirectory, { recursive: true, force: true });
   });
 
@@ -301,7 +304,74 @@ test("uses one shared native router process for many logical ports", async (cont
 
     assert.equal(fs.readFileSync(markerPath, "utf8"), "--control\n");
   } finally {
-    await Promise.all(routerPorts.map((port) => manager.close(port).catch(() => undefined)));
+    manager.dispose();
+  }
+});
+
+test("keeps the native router process alive after all logical listeners close", async () => {
+  const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pm-router-idle-"));
+  const nativeRouterPath = path.join(tempDirectory, "native-router.js");
+  const markerPath = path.join(tempDirectory, "native-router-events");
+  const logicalPort = 61235;
+
+  fs.writeFileSync(
+    nativeRouterPath,
+    [
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      `const marker = ${JSON.stringify(markerPath)};`,
+      'fs.appendFileSync(marker, "start\\n");',
+      'process.on("SIGTERM", () => {',
+      '  fs.appendFileSync(marker, "term\\n");',
+      "  process.exit(0);",
+      "});",
+      'process.stdout.write("READY\\tcontrol\\n");',
+      'process.stdin.setEncoding("utf8");',
+      'process.stdin.on("data", (chunk) => {',
+      '  for (const line of chunk.split("\\n")) {',
+      '    const parts = line.trim().split("\\t");',
+      '    if (parts[0] === "LISTEN" && parts[1]) process.stdout.write(`READY\\t${parts[1]}\\n`);',
+      '    if (parts[0] === "CLOSE" && parts[1]) {',
+      '      fs.appendFileSync(marker, `close:${parts[1]}\\n`);',
+      '      process.stdout.write(`CLOSED\\t${parts[1]}\\n`);',
+      "    }",
+      "  }",
+      "});",
+      "setInterval(() => {}, 1000);",
+    ].join("\n"),
+    "utf8",
+  );
+  fs.chmodSync(nativeRouterPath, 0o755);
+
+  const manager = new LogicalPortRouterManager(
+    {
+      resolve: () => ({ host: "127.0.0.1", port: 1 }),
+    },
+    {
+      nativeRouterPath,
+      nativeStartupTimeoutMs: 1500,
+    },
+  );
+  try {
+    await manager.open(logicalPort);
+    await manager.close(logicalPort);
+
+    const closedEvents = await waitForFileContent(
+      markerPath,
+      (content) => content.includes(`close:${logicalPort}\n`),
+      3000,
+    );
+    assert.equal(countExactLines(closedEvents, "start"), 1);
+    assert.equal(closedEvents.includes("term\n"), false);
+
+    await manager.open(logicalPort);
+
+    const reopenedEvents = fs.readFileSync(markerPath, "utf8");
+    assert.equal(countExactLines(reopenedEvents, "start"), 1);
+  } finally {
+    manager.dispose();
+    await waitForFileContent(markerPath, (content) => content.includes("term\n"), 2000).catch(() => undefined);
+    fs.rmSync(tempDirectory, { recursive: true, force: true });
   }
 });
 
@@ -668,6 +738,39 @@ function closeServer(server: net.Server): Promise<void> {
       resolve();
     });
   });
+}
+
+function waitForFileContent(filePath: string, predicate: (content: string) => boolean, timeoutMs: number): Promise<string> {
+  const expiresAtMs = Date.now() + timeoutMs;
+
+  return new Promise((resolve, reject) => {
+    const poll = () => {
+      let content = "";
+      try {
+        content = fs.readFileSync(filePath, "utf8");
+      } catch {
+        // The child process creates the marker file after startup.
+      }
+
+      if (predicate(content)) {
+        resolve(content);
+        return;
+      }
+
+      if (Date.now() >= expiresAtMs) {
+        reject(new Error(`Timed out waiting for ${filePath}.`));
+        return;
+      }
+
+      setTimeout(poll, 10);
+    };
+
+    poll();
+  });
+}
+
+function countExactLines(content: string, expected: string): number {
+  return content.split(/\r?\n/).filter((line) => line === expected).length;
 }
 
 function createDeferred<T>(): {

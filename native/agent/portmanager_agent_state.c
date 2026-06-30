@@ -23,6 +23,7 @@
 #define PM_PROCESS_INSPECT_TEXT 65536
 #define PM_ROUTE_TABLE_WRITE_LOCK_STALE_SECONDS 30
 #define PM_ROUTE_TABLE_WRITE_LOCK_ATTEMPTS 100
+#define PM_ROUTE_TABLE_WRITE_LOCK_BACKGROUND_ATTEMPTS 1
 #define PM_ROUTE_TABLE_WRITE_LOCK_SLEEP_US 10000
 #define PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"
 #define PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15
@@ -62,7 +63,8 @@ static int pm_find_listener_for_port_host(int port, const char *host, pm_listene
 static const char *pm_listener_route_host(const pm_listener *listener, const char *fallback_host, char *buffer, size_t size);
 static void pm_remove_pending_endpoint(pm_agent_state *state, int logical_port, const char *network_id);
 static int pm_listener_is_tracked(pm_agent_state *state, const pm_listener *listener);
-static int pm_write_route_tables(pm_agent_state *state);
+static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock);
+static unsigned long pm_atomic_write_sequence = 1;
 
 static void pm_copy(char *target, size_t size, const char *value) {
   if (size == 0) {
@@ -84,6 +86,12 @@ static long pm_epoch_milliseconds(void) {
 
 static int pm_text_empty(const char *value) {
   return value == NULL || value[0] == '\0';
+}
+
+static void pm_mark_route_tables_dirty(pm_agent_state *state) {
+  if (state != NULL) {
+    state->route_tables_dirty = 1;
+  }
 }
 
 static int pm_route_table_ttl_seconds(void) {
@@ -672,6 +680,7 @@ void pm_state_init(pm_agent_state *state, const char *route_table_path, const ch
   }
   pm_adopt_previous_generation_route_files(state);
   pm_copy(state->agent_main_path, sizeof(state->agent_main_path), agent_main_path);
+  pm_copy(state->version, sizeof(state->version), PORTMANAGER_PACKAGE_VERSION);
   pm_iso_now(state->started_at, sizeof(state->started_at));
   state->route_table_writer_started_ms = pm_epoch_milliseconds();
   snprintf(
@@ -683,7 +692,9 @@ void pm_state_init(pm_agent_state *state, const char *route_table_path, const ch
   state->next_process_id = 1;
   state->next_allocation_id = 1;
   state->agent_pid = getpid();
-  pm_write_route_tables(state);
+  if (pm_write_route_tables(state, 1) == 0) {
+    state->route_table_refreshed_at = time(NULL);
+  }
 }
 
 void pm_state_dispose(pm_agent_state *state) {
@@ -903,8 +914,8 @@ static int pm_route_has_bidirectional_observation(pm_agent_state *state, const p
 
 /*
  * Unchanged route content is rebuilt from live state before this check. The
- * route-table TTL prevents stale files after writer death; it must not become a
- * post-handshake idle timeout for quiet but still-open TCP sessions.
+ * route-table TTL is extended by daemon heartbeat writes, not by reader-side
+ * process liveness checks.
  */
 static int pm_routes_can_refresh_unchanged_table(pm_agent_state *state, const pm_route *routes, size_t count) {
   (void)state;
@@ -914,8 +925,8 @@ static int pm_routes_can_refresh_unchanged_table(pm_agent_state *state, const pm
 
 /*
  * Computes the route table's reader expiry. Before first handshake the expiry is
- * a cleanup lease; after handshake live writer metadata prevents quiet sessions
- * from being mistaken for stale daemon output.
+ * a cleanup lease; after handshake the daemon heartbeat keeps quiet sessions
+ * fresh by rewriting unchanged route files before this short TTL expires.
  */
 static long pm_route_table_expires_at_ms(
   pm_agent_state *state,
@@ -2415,8 +2426,26 @@ static int pm_mkdir_p_for_file(const char *file_path) {
   return 0;
 }
 
+static char *pm_build_atomic_temp_path(const char *file_path) {
+  size_t size = strlen(file_path) + 80;
+  char *temp_path = (char *)malloc(size);
+
+  if (temp_path == NULL) {
+    return NULL;
+  }
+
+  snprintf(
+    temp_path,
+    size,
+    "%s.tmp.%ld.%lu",
+    file_path,
+    (long)getpid(),
+    pm_atomic_write_sequence++);
+  return temp_path;
+}
+
 static int pm_write_atomic(const char *file_path, const char *text) {
-  char temp_path[PM_TEXT];
+  char *temp_path;
   int fd;
   size_t length = strlen(text);
   size_t offset = 0;
@@ -2425,9 +2454,14 @@ static int pm_write_atomic(const char *file_path, const char *text) {
     return -1;
   }
 
-  snprintf(temp_path, sizeof(temp_path), "%s.tmp.%ld", file_path, (long)getpid());
+  temp_path = pm_build_atomic_temp_path(file_path);
+  if (temp_path == NULL) {
+    return -1;
+  }
+
   fd = open(temp_path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
   if (fd < 0) {
+    free(temp_path);
     return -1;
   }
 
@@ -2439,11 +2473,13 @@ static int pm_write_atomic(const char *file_path, const char *text) {
       }
       close(fd);
       unlink(temp_path);
+      free(temp_path);
       return -1;
     }
     if (written == 0) {
       close(fd);
       unlink(temp_path);
+      free(temp_path);
       return -1;
     }
     offset += (size_t)written;
@@ -2452,9 +2488,11 @@ static int pm_write_atomic(const char *file_path, const char *text) {
   close(fd);
   if (rename(temp_path, file_path) != 0) {
     unlink(temp_path);
+    free(temp_path);
     return -1;
   }
 
+  free(temp_path);
   return 0;
 }
 
@@ -2463,11 +2501,13 @@ static int pm_read_route_table_generation(
   char *writer_id,
   size_t writer_id_size,
   long *writer_started_ms,
-  unsigned long *sequence) {
+  unsigned long *sequence,
+  pid_t *owner_pid) {
   char buffer[4096];
   int fd;
   ssize_t count;
   long raw_sequence;
+  long raw_pid;
 
   if (writer_id_size > 0) {
     writer_id[0] = '\0';
@@ -2477,6 +2517,9 @@ static int pm_read_route_table_generation(
   }
   if (sequence != NULL) {
     *sequence = 0;
+  }
+  if (owner_pid != NULL) {
+    *owner_pid = 0;
   }
 
   fd = open(file_path, O_RDONLY);
@@ -2502,8 +2545,24 @@ static int pm_read_route_table_generation(
   if (sequence != NULL && raw_sequence > 0) {
     *sequence = (unsigned long)raw_sequence;
   }
+  raw_pid = pm_json_get_long(buffer, "pid", 0);
+  if (owner_pid != NULL && raw_pid > 0) {
+    *owner_pid = (pid_t)raw_pid;
+  }
 
-  return writer_started_ms != NULL && *writer_started_ms > 0 ? 0 : -1;
+  return writer_started_ms != NULL && *writer_started_ms > 0 && owner_pid != NULL && *owner_pid > 0 ? 0 : -1;
+}
+
+static int pm_route_table_generation_owner_alive(pid_t owner_pid) {
+  if (owner_pid <= 0) {
+    return 0;
+  }
+
+  if (kill(owner_pid, 0) == 0) {
+    return 1;
+  }
+
+  return errno == EPERM;
 }
 
 static int pm_route_table_generation_is_newer(
@@ -2513,24 +2572,29 @@ static int pm_route_table_generation_is_newer(
   char current_writer_id[PM_ID];
   long current_started_ms = 0;
   unsigned long current_sequence = 0;
+  pid_t current_owner_pid = 0;
   int writer_compare;
+  int newer;
 
   if (pm_read_route_table_generation(
         file_path,
         current_writer_id,
         sizeof(current_writer_id),
         &current_started_ms,
-        &current_sequence) != 0) {
+        &current_sequence,
+        &current_owner_pid) != 0) {
     return 0;
   }
 
   if (current_started_ms != state->route_table_writer_started_ms) {
-    return current_started_ms > state->route_table_writer_started_ms;
+    newer = current_started_ms > state->route_table_writer_started_ms;
+    return newer && pm_route_table_generation_owner_alive(current_owner_pid);
   }
 
   writer_compare = strcmp(current_writer_id, state->route_table_writer_id);
   if (writer_compare != 0) {
-    return writer_compare > 0;
+    newer = writer_compare > 0;
+    return newer && pm_route_table_generation_owner_alive(current_owner_pid);
   }
 
   return current_sequence > candidate_sequence;
@@ -2706,7 +2770,7 @@ static void pm_remove_stale_route_table_write_lock(const char *lock_path) {
   }
 }
 
-static int pm_acquire_route_table_write_lock(const char *route_table_path, char *lock_path, size_t lock_path_size) {
+static int pm_acquire_route_table_write_lock(const char *route_table_path, char *lock_path, size_t lock_path_size, int attempts) {
   char owner[128];
 
   pm_route_table_write_lock_path(route_table_path, lock_path, lock_path_size);
@@ -2714,7 +2778,7 @@ static int pm_acquire_route_table_write_lock(const char *route_table_path, char 
     return -1;
   }
 
-  for (int attempt = 0; attempt < PM_ROUTE_TABLE_WRITE_LOCK_ATTEMPTS; attempt++) {
+  for (int attempt = 0; attempt < attempts; attempt++) {
     int fd = open(lock_path, O_CREAT | O_EXCL | O_WRONLY, 0600);
     if (fd >= 0) {
       snprintf(owner, sizeof(owner), "%ld\n%ld\n", (long)getpid(), (long)time(NULL));
@@ -2727,7 +2791,9 @@ static int pm_acquire_route_table_write_lock(const char *route_table_path, char 
     }
 
     pm_remove_stale_route_table_write_lock(lock_path);
-    usleep(PM_ROUTE_TABLE_WRITE_LOCK_SLEEP_US);
+    if (attempt + 1 < attempts) {
+      usleep(PM_ROUTE_TABLE_WRITE_LOCK_SLEEP_US);
+    }
   }
 
   return -1;
@@ -2766,7 +2832,7 @@ static int pm_compare_route_claim_items(const void *left, const void *right) {
   return strcmp(left_item->claim_path, right_item->claim_path);
 }
 
-static int pm_write_route_tables(pm_agent_state *state) {
+static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock) {
   pm_route_list routes;
   pm_route_entry_item *entry_items = NULL;
   pm_route_claim_item *claim_items = NULL;
@@ -2792,7 +2858,11 @@ static int pm_write_route_tables(pm_agent_state *state) {
   }
   pm_prune_bidirectional_refreshes_for_routes(state, routes.items, routes.count);
 
-  lock_fd = pm_acquire_route_table_write_lock(state->route_table_path, lock_path, sizeof(lock_path));
+  lock_fd = pm_acquire_route_table_write_lock(
+    state->route_table_path,
+    lock_path,
+    sizeof(lock_path),
+    wait_for_lock ? PM_ROUTE_TABLE_WRITE_LOCK_ATTEMPTS : PM_ROUTE_TABLE_WRITE_LOCK_BACKGROUND_ATTEMPTS);
   if (lock_fd < 0) {
     free(routes.items);
     return -1;
@@ -3010,52 +3080,63 @@ static int pm_write_route_tables(pm_agent_state *state) {
   free(claim_items);
   free(entry_items);
   free(routes.items);
+  if (result == 0) {
+    state->route_table_refreshed_at = time(NULL);
+  }
   return result;
 }
 
 int pm_state_flush_route_tables(pm_agent_state *state) {
-  return pm_write_route_tables(state);
+  int result;
+
+  /*
+   * Background flushes run on the single socket loop. If another daemon is
+   * publishing the same files, yield immediately and let the loop retry later
+   * instead of making registerExistingProcess clients wait behind the file lock.
+   */
+  result = pm_write_route_tables(state, 0);
+  if (result == 0) {
+    state->route_tables_dirty = 0;
+  }
+  return result;
 }
 
-static int pm_write_route_entry_table(pm_agent_state *state, const pm_route *route) {
-  char entry_path[PM_TEXT];
-  char lock_path[PM_TEXT];
-  int lock_fd;
-  int result;
-  unsigned long sequence;
+int pm_state_route_table_heartbeat_due(const pm_agent_state *state, time_t now) {
+  time_t refreshed_at;
+  int interval_seconds;
 
-  pm_route_entry_path(state->route_table_path, route->logical_port, route->network_id, entry_path, sizeof(entry_path));
-  lock_fd = pm_acquire_route_table_write_lock(state->route_table_path, lock_path, sizeof(lock_path));
-  if (lock_fd < 0) {
-    return -1;
+  if (state == NULL) {
+    return 0;
   }
 
-  sequence = ++state->route_table_sequence;
-  if (pm_route_table_generation_is_newer(state, state->route_table_path, sequence)) {
-    pm_release_route_table_write_lock(lock_fd, lock_path);
-    return -1;
+  refreshed_at = state->route_table_refreshed_at;
+  if (refreshed_at <= 0) {
+    return 1;
   }
 
-  result = pm_write_route_table_file_if_changed(state, entry_path, route, 1, sequence);
-  if (result == 0) {
-    result = pm_string_array_add(&state->written_entry_paths, &state->written_entry_count, &state->written_entry_capacity, entry_path);
+  interval_seconds = pm_route_table_ttl_seconds() - pm_route_table_refresh_margin_seconds();
+  if (interval_seconds < 1) {
+    interval_seconds = 1;
   }
 
-  pm_release_route_table_write_lock(lock_fd, lock_path);
-  return result;
+  return now - refreshed_at >= interval_seconds;
 }
 
 static int pm_flush_route_tables_for_allocation(pm_agent_state *state, const pm_route *route, int compact_response) {
   /*
-   * Native hooks read per-endpoint files first. For large bind/connect bursts,
-   * publish that endpoint before replying and let the event loop coalesce the
-   * global/network aggregate table after the burst has gone idle.
+   * Native hook callers already receive actualPort in the response frame. During
+   * bind/connect bursts, writing one endpoint file before every response keeps
+   * the single control loop in filesystem I/O and delays unrelated clients.
+   * Mark the daemon state dirty in the event loop and publish route tables in a
+   * coalesced idle or periodic busy flush instead.
    */
-  if (compact_response && route != NULL) {
-    return pm_write_route_entry_table(state, route);
+  if (compact_response) {
+    (void)state;
+    (void)route;
+    return 0;
   }
 
-  return pm_write_route_tables(state);
+  return pm_write_route_tables(state, 1);
 }
 
 static int pm_build_allocation_payload(
@@ -3131,14 +3212,16 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
   }
   if (pm_scan_lsof_cached(state, &listeners, updated_at, sizeof(updated_at), &listener_scan_fresh) == 0) {
     if (listener_scan_fresh && pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
-      pm_write_route_tables(state);
+      /*
+       * allocateRoute callers need the chosen port promptly. The dispatcher marks
+       * route tables dirty after the response, so reconciliation publishes through
+       * the coalesced event-loop writer instead of blocking this request.
+       */
     }
   }
   free(listeners.items);
 
-  if (pm_cleanup_pending(state)) {
-    pm_write_route_tables(state);
-  }
+  (void)pm_cleanup_pending(state);
   pm_normalize_network(input->network_id, network_id, sizeof(network_id));
   pm_copy(actual_host, sizeof(actual_host), input->actual_host[0] ? input->actual_host : input->host);
 
@@ -3188,7 +3271,7 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
       payload);
   }
 
-  if (strcmp(input->route_direction, "send") == 0) {
+  if (strcmp(input->route_direction, "send") == 0 && network_id[0] == '\0') {
     pm_listener same_port_listener;
     char same_port_host[PM_SMALL];
 
@@ -3197,6 +3280,8 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
      * attach, or after a protected launcher dropped the hook. In that state
      * the OS has the requested listener but no route row exists yet, so a new
      * 5xxxx reservation would shadow the real server and make wait-on hang.
+     * Scoped networks must not use this fallback because same-port host
+     * listeners are outside the network's routing authority.
      */
     if (pm_find_listener_for_port_host(input->requested_port, input->host, &same_port_listener)) {
       return pm_build_allocation_payload(
@@ -3412,7 +3497,12 @@ int pm_state_register_process(pm_agent_state *state, const pm_register_input *in
 
   pm_remove_pending_endpoint(state, process->requested_port, network_id);
   pm_listener_cache_invalidate(state);
-  pm_write_route_tables(state);
+  /*
+   * Registrations can arrive in the same bind/connect burst as allocation
+   * requests. The event loop already marks route tables dirty after this method
+   * returns; defer every registration source to the coalesced flush so one
+   * cluster cannot keep the single control loop in filesystem writes.
+   */
   return pm_append_process_json(payload, process);
 }
 
@@ -3420,9 +3510,6 @@ int pm_state_release_allocation(pm_agent_state *state, const char *allocation_id
   size_t before = state->pending_count;
 
   pm_remove_pending_allocation(state, allocation_id);
-  if (before != state->pending_count) {
-    pm_write_route_tables(state);
-  }
 
   return pm_buffer_append(payload, before != state->pending_count ? "true" : "false");
 }
@@ -3675,7 +3762,6 @@ int pm_state_release_process_route(pm_agent_state *state, const pm_release_proce
 
   if (released || retained) {
     pm_listener_cache_invalidate(state);
-    pm_write_route_tables(state);
   }
 
   free(listeners.items);
@@ -3850,7 +3936,7 @@ static int pm_start_process_with_actual(pm_agent_state *state, const pm_start_in
   process->virtual_end = input->virtual_end;
 
   pm_listener_cache_invalidate(state);
-  pm_write_route_tables(state);
+  pm_mark_route_tables_dirty(state);
   *out_process = process;
   return 0;
 }
@@ -3916,7 +4002,7 @@ int pm_state_stop_process(pm_agent_state *state, const char *id, const char *sig
   process->url[0] = '\0';
   pm_clear_missing_listener_state(process);
   pm_listener_cache_invalidate(state);
-  pm_write_route_tables(state);
+  pm_mark_route_tables_dirty(state);
   return pm_append_process_json(payload, process);
 }
 
@@ -3983,7 +4069,7 @@ int pm_state_remove_process(pm_agent_state *state, const char *id, pm_buffer *pa
       memmove(&state->processes[index], &state->processes[index + 1], (state->process_count - index - 1) * sizeof(pm_process));
       state->process_count--;
       pm_listener_cache_invalidate(state);
-      pm_write_route_tables(state);
+      pm_mark_route_tables_dirty(state);
       return pm_append_process_json(payload, &removed);
     }
   }
@@ -4082,7 +4168,7 @@ int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload) {
 
   pm_iso_now(updated_at, sizeof(updated_at));
   if (pm_cleanup_pending(state)) {
-    pm_write_route_tables(state);
+    pm_mark_route_tables_dirty(state);
   }
   if (pm_state_needs_external_listener_fresh_scan(state)) {
     pm_listener_cache_invalidate(state);
@@ -4090,7 +4176,7 @@ int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload) {
   if (pm_scan_lsof_cached(state, &listeners, updated_at, sizeof(updated_at), &listener_scan_fresh) == 0 &&
       listener_scan_fresh &&
       pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
-    pm_write_route_tables(state);
+    pm_mark_route_tables_dirty(state);
   }
   for (size_t index = 0; index < listeners.count; index++) {
     if (pm_listener_is_tracked(state, &listeners.items[index])) {
@@ -4111,6 +4197,8 @@ int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload) {
       pm_json_append_string(payload, state->route_table_path) != 0 ||
       pm_buffer_append(payload, ",\"agentMainPath\":") != 0 ||
       pm_json_append_string(payload, state->agent_main_path) != 0 ||
+      pm_buffer_append(payload, ",\"version\":") != 0 ||
+      pm_json_append_string(payload, state->version) != 0 ||
       pm_buffer_appendf(payload, ",\"listenerCount\":%zu,\"routeCount\":%zu,\"monitoringAllListeners\":true},\"processes\":[", listeners.count, routes.count) != 0) {
     free(listeners.items);
     free(routes.items);
@@ -4179,7 +4267,7 @@ int pm_state_daemon_status(pm_agent_state *state, pm_buffer *payload) {
 
   pm_iso_now(updated_at, sizeof(updated_at));
   if (pm_cleanup_pending(state)) {
-    pm_write_route_tables(state);
+    pm_mark_route_tables_dirty(state);
   }
   if (pm_build_routes(state, NULL, &routes) != 0) {
     return -1;
@@ -4193,6 +4281,8 @@ int pm_state_daemon_status(pm_agent_state *state, pm_buffer *payload) {
       pm_json_append_string(payload, state->route_table_path) != 0 ||
       pm_buffer_append(payload, ",\"agentMainPath\":") != 0 ||
       pm_json_append_string(payload, state->agent_main_path) != 0 ||
+      pm_buffer_append(payload, ",\"version\":") != 0 ||
+      pm_json_append_string(payload, state->version) != 0 ||
       pm_buffer_appendf(payload, ",\"listenerCount\":%zu,\"routeCount\":%zu,\"monitoringAllListeners\":true}", state->listener_cache_count, routes.count) != 0) {
     free(routes.items);
     return -1;
@@ -4204,10 +4294,10 @@ int pm_state_daemon_status(pm_agent_state *state, pm_buffer *payload) {
 
 int pm_state_refresh_snapshot(pm_agent_state *state, pm_buffer *payload) {
   if (pm_cleanup_pending(state)) {
-    pm_write_route_tables(state);
+    pm_mark_route_tables_dirty(state);
   }
   pm_refresh_established_route_observations(state);
-  pm_write_route_tables(state);
+  pm_mark_route_tables_dirty(state);
   return pm_state_snapshot(state, payload);
 }
 
@@ -4235,7 +4325,7 @@ int pm_state_reap_children(pm_agent_state *state) {
   }
 
   if (changed) {
-    pm_write_route_tables(state);
+    pm_mark_route_tables_dirty(state);
   }
 
   return changed;
@@ -4253,7 +4343,7 @@ int pm_state_listener_signature(pm_agent_state *state, pm_buffer *signature) {
     return -1;
   }
   if (listener_scan_fresh && pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
-    pm_write_route_tables(state);
+    pm_mark_route_tables_dirty(state);
   }
 
   for (size_t index = 0; index < listeners.count; index++) {

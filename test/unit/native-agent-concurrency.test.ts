@@ -36,6 +36,8 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   const allocationBody = source.slice(allocationStart, allocationEnd);
 
   assert.equal(header.includes("PM_LISTENER_SCAN_CACHE_SECONDS 300"), true);
+  assert.equal(header.includes("PORTMANAGER_PACKAGE_VERSION"), true);
+  assert.equal(header.includes("char version[PM_SMALL];"), true);
   assert.equal(header.includes("endpoint security agents"), true);
   assert.equal(header.includes("pm_listener *listener_cache_items;"), true);
   assert.equal(agentSource.includes("PM_LISTENER_POLL_INTERVAL_SECONDS 300"), true);
@@ -44,10 +46,23 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(agentSource.includes("PM_CLIENT_BUFFER_MAX 32768"), true);
   assert.equal(agentSource.includes("#include <poll.h>"), true);
   assert.equal(agentSource.includes("ready = poll("), true);
-  assert.equal(hookSource.includes("PM_MAX_ROUTES 32768"), true);
+  assert.equal(agentSource.includes("state->route_tables_dirty = 1;"), true);
+  assert.equal(hookSource.includes("PM_MAX_ROUTES"), false);
+  assert.equal(hookSource.includes("PM_ROUTE_MAPPING_INITIAL_CAPACITY"), true);
+  assert.equal(hookSource.includes("PM_ROUTE_MAPPING_MAX_CAPACITY 65535"), true);
+  assert.equal(hookSource.includes("PM_ROUTE_FILE_CACHE_MAX_CAPACITY 65535"), true);
+  assert.equal(hookSource.includes("pm_ensure_memory_route_capacity"), true);
   assert.equal(hookSource.includes("\\\"compactResponse\\\":1"), true);
   assert.equal(source.includes("static int pm_scan_lsof_cached"), true);
   assert.equal(source.includes("static int pm_write_route_table_file_if_changed"), true);
+  assert.equal(source.includes("PM_ROUTE_TABLE_WRITE_LOCK_BACKGROUND_ATTEMPTS 1"), true);
+  assert.equal(source.includes("static void pm_mark_route_tables_dirty"), true);
+  assert.equal(source.includes('pm_copy(state->version, sizeof(state->version), PORTMANAGER_PACKAGE_VERSION)'), true);
+  assert.equal(source.includes('pm_buffer_append(payload, ",\\"version\\":")'), true);
+  assert.equal(source.includes("writing one endpoint file before every response"), true);
+  assert.equal(source.includes("defer every registration source to the coalesced flush"), true);
+  assert.equal(source.includes("%s.tmp.%ld.%lu"), true);
+  assert.equal(source.includes("pm_write_route_entry_table"), false);
   assert.equal(source.includes("pm_route_table_signature_for_path"), true);
   assert.equal(source.includes("pm_state_needs_external_listener_fresh_scan(state)"), true);
   assert.equal(source.includes("pm_listener_cache_invalidate(state);"), true);
@@ -56,6 +71,7 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(allocationBody.includes("pm_scan_lsof_cached(state, &listeners"), true);
   assert.equal(allocationBody.includes("listener_scan_fresh &&"), true);
   assert.equal(allocationBody.includes("pm_scan_lsof(&listeners"), false);
+  assert.equal(allocationBody.includes("strcmp(input->route_direction, \"send\") == 0 && network_id[0] == '\\0'"), true);
 });
 
 test("native agent matches loopback listeners by host as well as port", () => {
@@ -71,6 +87,8 @@ test("native agent matches loopback listeners by host as well as port", () => {
 });
 
 test("native agent route tables carry TTL and refresh unchanged files", () => {
+  const header = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.h"), "utf8");
+  const agentSource = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.c"), "utf8");
   const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
   const writeStart = source.indexOf("static int pm_write_route_table_file(");
   const writeEnd = source.indexOf("static int pm_build_route_table_signature", writeStart);
@@ -95,6 +113,12 @@ test("native agent route tables carry TTL and refresh unchanged files", () => {
   assert.equal(source.includes("pm_string_array_binary_contains(current_entries"), true);
   assert.equal(source.includes("pm_string_array_binary_contains(current_claims"), true);
   assert.equal(source.includes("static int pm_route_table_file_fresh_for_reuse"), true);
+  assert.equal(header.includes("time_t route_table_refreshed_at;"), true);
+  assert.equal(header.includes("pm_state_route_table_heartbeat_due"), true);
+  assert.equal(source.includes("state->route_table_refreshed_at = time(NULL);"), true);
+  assert.equal(source.includes("int pm_state_route_table_heartbeat_due"), true);
+  assert.equal(agentSource.includes("pm_state_route_table_heartbeat_due(state, time(NULL))"), true);
+  assert.equal(agentSource.includes("route_table_flush_retry_after"), true);
   assert.notEqual(writeStart, -1);
   assert.equal(writeBody.includes('\\"expiresAtMs\\":%ld,\\"ttlMs\\":%ld'), true);
   assert.equal(writeBody.includes('\\"ttlStartsAfterFirstHandshake\\":true'), true);
@@ -103,7 +127,7 @@ test("native agent route tables carry TTL and refresh unchanged files", () => {
   assert.equal(unchangedBody.includes("pm_route_table_file_fresh_for_reuse(file_path, waits_for_first_handshake)"), true);
   assert.equal(unchangedBody.includes("pm_routes_can_refresh_unchanged_table(state, routes, count)"), true);
   assert.equal(source.includes("pm_route_has_bidirectional_observation(state, &routes[index])"), true);
-  assert.equal(source.includes("route-table TTL prevents stale files after writer death"), true);
+  assert.equal(source.includes("route-table TTL is extended by daemon heartbeat writes"), true);
   assert.equal(unchangedBody.includes("pm_write_route_table_file(state, file_path, routes, count, sequence)"), true);
 });
 
@@ -127,6 +151,24 @@ test("native agent recovers restarted hook routes from process environment", () 
 if (!fs.existsSync(nativeAgentPath)) {
   test("native agent serves concurrent hook-like clients while extension client receives events", { skip: "native agent binary is not built" }, () => undefined);
 } else {
+  test("native agent reports the package version in daemon status", async (context) => {
+    const fixture = await startNativeAgent(context);
+    if (fixture === undefined) {
+      return;
+    }
+    const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf8")) as {
+      readonly version: string;
+    };
+
+    const daemon = await requestOnce<{ readonly version?: string; readonly pid: number }>(fixture.socketPath, {
+      id: `daemon-status-${process.pid}`,
+      method: "daemonStatus",
+    });
+
+    assert.equal(daemon.version, packageJson.version);
+    assert.equal(typeof daemon.pid, "number");
+  });
+
   test("native agent serves concurrent hook-like clients while extension client receives events", async (context) => {
     const fixture = await startNativeAgent(context);
     if (fixture === undefined) {
@@ -330,8 +372,10 @@ if (!fs.existsSync(nativeAgentPath)) {
       },
     });
 
-    await waitForFile(unscopedRouteEntryPath);
-    const route = readRouteTable(unscopedRouteEntryPath).routes[0] as {
+    const route = (await waitForRouteTable(
+      unscopedRouteEntryPath,
+      (table) => (table.routes[0] as { readonly source?: string } | undefined)?.source === "hooked",
+    )).routes[0] as {
       readonly networkId?: string;
       readonly source?: string;
     };
@@ -424,7 +468,17 @@ if (!fs.existsSync(nativeAgentPath)) {
       },
     });
 
-    const promotedRoute = readRouteTable(routeEntryPath).routes[0] as {
+    const promotedRoute = (await waitForRouteTable(
+      routeEntryPath,
+      (table) => {
+        const route = table.routes[0] as {
+          readonly host?: string;
+          readonly routeDirection?: string;
+          readonly source?: string;
+        } | undefined;
+        return route?.host === "127.0.0.1" && route.routeDirection === "listen" && route.source === "hooked";
+      },
+    )).routes[0] as {
       readonly actualPort?: number;
       readonly host?: string;
       readonly routeDirection?: string;
@@ -459,8 +513,7 @@ if (!fs.existsSync(nativeAgentPath)) {
       throw new Error("Failed to read test server address.");
     }
 
-    const networkId = "network-native-same-port-listener";
-    const routeEntryPath = getRouteTablePathForLogicalPort(address.port, networkId, fixture.routeTablePath);
+    const routeEntryPath = getRouteTablePathForLogicalPort(address.port, undefined, fixture.routeTablePath);
     await delay(100);
 
     const allocation = await requestOnce<{
@@ -477,7 +530,6 @@ if (!fs.existsSync(nativeAgentPath)) {
         cwd: projectRoot,
         requestedPort: address.port,
         host: "127.0.0.1",
-        networkId,
         routeDirection: "send",
         scanRange: 20,
         scanDirection: "up",
@@ -838,6 +890,33 @@ async function waitForRouteTableCount(filePath: string, expectedCount: number, t
 
   throw new Error(
     `Timed out waiting for route table count ${expectedCount} at ${filePath}; last count=${lastCount}; last error=${String(lastError)}`,
+  );
+}
+
+async function waitForRouteTable(
+  filePath: string,
+  predicate: (table: RouteTable) => boolean,
+  timeoutMs = 5_000,
+): Promise<RouteTable> {
+  const startedAt = Date.now();
+  let lastTable: RouteTable | undefined;
+  let lastError: unknown;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      lastTable = readRouteTable(filePath);
+      if (predicate(lastTable)) {
+        return lastTable;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+
+    await delay(100);
+  }
+
+  throw new Error(
+    `Timed out waiting for route table content at ${filePath}; last routes=${JSON.stringify(lastTable?.routes ?? [])}; last error=${String(lastError)}`,
   );
 }
 

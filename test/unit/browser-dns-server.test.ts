@@ -94,12 +94,34 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   const browserAliasReadyIndex = browserProxySyncSource.indexOf(
     "ensureBrowserDnsLoopbackAliasesReady(buildBrowserDnsRecords(networks))",
   );
+  const reloadSharedStateStart = networkServiceSource.indexOf("private async reloadSharedNetworkState");
+  const reloadSharedStateEnd = networkServiceSource.indexOf(
+    "private loadVscodeWindowTerminalBinding",
+    reloadSharedStateStart,
+  );
+  const reloadSharedStateSource = networkServiceSource.slice(reloadSharedStateStart, reloadSharedStateEnd);
+  const reloadTerminalSelectionIndex = reloadSharedStateSource.indexOf("await this.writeTerminalNetworkSelectionFile();");
+  const reloadBrowserDnsIndex = reloadSharedStateSource.indexOf(
+    "await this.rehydrateBrowserDnsAndProxies().catch(() => undefined);",
+  );
+  const convergeStart = networkServiceSource.indexOf("private async convergeDaemonAndRoutingStateExclusive");
+  const convergeEnd = networkServiceSource.indexOf("private async ensureCurrentProcessDaemon", convergeStart);
+  const convergeSource = networkServiceSource.slice(convergeStart, convergeEnd);
   assert.notEqual(browserProxySyncStart, -1);
   assert.notEqual(browserProxySyncEnd, -1);
+  assert.notEqual(reloadSharedStateStart, -1);
+  assert.notEqual(reloadSharedStateEnd, -1);
+  assert.notEqual(convergeStart, -1);
+  assert.notEqual(convergeEnd, -1);
   assert.equal(browserProxySyncSource.includes("this.syncBrowserDnsRecordsForNetworks(networks);"), true);
   assert.equal(browserProxySyncSource.includes("const dnsRunning = this.browserDnsServer.isRunning();"), true);
   assert.equal(browserProxyLeaseIndex >= 0, true);
   assert.equal(browserAliasReadyIndex > browserProxyLeaseIndex, true);
+  assert.equal(reloadBrowserDnsIndex > reloadTerminalSelectionIndex, true);
+  assert.equal(
+    convergeSource.includes("await this.rehydrateBrowserDnsAndProxies().catch(() => undefined);"),
+    true,
+  );
   assert.match(browserProxySyncSource, /collectBrowserProxyEndpoints\([\s\S]*networks,/);
   assert.equal(networkServiceSource.includes("isPublicWebEntrypointProcess"), true);
   assert.equal(networkServiceSource.includes("/\\bvite\\b/"), true);

@@ -1035,11 +1035,18 @@ function buildActionChildren(ownerAction: ActionAvailability = { enabled: true }
 class DaemonStatusTreeItem extends vscode.TreeItem {
   readonly contextValue = "daemonStatus";
 
-  constructor(label: string, description: string, icon: string = "info", tooltip?: vscode.MarkdownString) {
+  constructor(
+    label: string,
+    description: string,
+    icon: string = "info",
+    tooltip?: vscode.MarkdownString,
+    command?: vscode.Command,
+  ) {
     super(label, vscode.TreeItemCollapsibleState.None);
     this.description = description;
     this.iconPath = new vscode.ThemeIcon(icon);
     this.tooltip = tooltip;
+    this.command = command;
   }
 }
 
@@ -1131,13 +1138,17 @@ function buildDaemonChildren(
       formatControlPlaneRoleDescription(snapshot.controlPlane),
       snapshot.controlPlane?.role === "owner" ? "workspace-trusted" : "workspace-untrusted",
       buildControlPlaneTooltip(snapshot.controlPlane),
+      {
+        command: "portManager.openOwnerUi",
+        title: "Show Owner Window",
+      },
     ),
     ...buildOwnerUiActionRows(snapshot.controlPlane),
     new DaemonStatusTreeItem("This Window PID", String(snapshot.controlPlane?.currentPid ?? process.pid), "window"),
     new DaemonStatusTreeItem("Status", daemon.status, daemon.status === "running" ? "pass" : "warning"),
     new DaemonStatusTreeItem(
       "Version",
-      daemon.versionStatus ?? "unknown",
+      formatDaemonVersionDescription(daemon),
       daemon.restartRequired ? "warning" : "verified",
     ),
     new DaemonStatusTreeItem("PID", daemon.pid > 0 ? String(daemon.pid) : "n/a", "server-process"),
@@ -1173,7 +1184,7 @@ function buildOwnerUiActionRows(controlPlane: ControlPlaneStatus | undefined): P
 
 function formatOpenOwnerUiDescription(controlPlane: ControlPlaneStatus | undefined): string {
   if (controlPlane?.role === "worker") {
-    return `owner pid ${controlPlane.ownerPid ?? "unknown"}`;
+    return `${formatOwnerWindowTitle(controlPlane)}, pid ${controlPlane.ownerPid ?? "unknown"}`;
   }
 
   if (controlPlane?.role === "unowned") {
@@ -1183,11 +1194,16 @@ function formatOpenOwnerUiDescription(controlPlane: ControlPlaneStatus | undefin
   return "owner unknown";
 }
 
+function formatOwnerWindowTitle(controlPlane: ControlPlaneStatus | undefined): string {
+  return controlPlane?.ownerTitle?.trim() || "owner window";
+}
+
 function buildControlPlaneTooltip(controlPlane: ControlPlaneStatus | undefined): vscode.MarkdownString {
   const lines = [
     `Role: ${controlPlane?.role ?? "unknown"}`,
     `This window PID: ${controlPlane?.currentPid ?? process.pid}`,
     `Owner PID: ${controlPlane?.ownerPid ?? "n/a"}`,
+    `Owner window: ${controlPlane?.ownerTitle ?? "n/a"}`,
     `Owner active: ${controlPlane?.ownerActive === true ? "yes" : "no"}`,
     `Updated: ${controlPlane?.ownerUpdatedAt ?? "n/a"}`,
     `Lease expires: ${controlPlane?.leaseExpiresAt ?? "n/a"}`,
@@ -1426,6 +1442,14 @@ function createRoutingTimelineRow(input: {
 function formatDaemonSummary(daemon: AgentDaemonStatus): string {
   const version = daemon.restartRequired ? "stale" : (daemon.versionStatus ?? "unknown");
   return daemon.pid > 0 ? `${daemon.status} pid ${daemon.pid}, ${version}` : daemon.status;
+}
+
+/** Shows the daemon build and the client expectation in the diagnostics group. */
+function formatDaemonVersionDescription(daemon: AgentDaemonStatus): string {
+  const version = daemon.version ?? "unknown";
+  const status = daemon.versionStatus ?? "unknown";
+  const expected = daemon.expectedVersion !== undefined ? `, expected ${daemon.expectedVersion}` : "";
+  return `${version} ${status}${expected}`;
 }
 
 function isControlPlaneOwner(controlPlane: ControlPlaneStatus | undefined): boolean {

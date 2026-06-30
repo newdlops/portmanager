@@ -27,6 +27,10 @@
  */
 #define PM_LISTENER_SCAN_CACHE_SECONDS 300
 
+#ifndef PORTMANAGER_PACKAGE_VERSION
+#define PORTMANAGER_PACKAGE_VERSION "unknown"
+#endif
+
 typedef struct {
   char *data;
   size_t length;
@@ -128,10 +132,21 @@ typedef struct {
   char listener_cache_updated_at[PM_TIME];
   char route_table_path[PM_TEXT];
   char agent_main_path[PM_TEXT];
+  char version[PM_SMALL];
   char started_at[PM_TIME];
   char route_table_writer_id[PM_ID];
   long route_table_writer_started_ms;
   unsigned long route_table_sequence;
+  /*
+   * Last successful route-table publish time. Even unchanged in-memory routes
+   * must refresh generated files before their reader TTL expires.
+   */
+  time_t route_table_refreshed_at;
+  /*
+   * The daemon's in-memory registry is the source of truth while it is alive.
+   * This flag tracks whether the derived route-table files still need publishing.
+   */
+  int route_tables_dirty;
   time_t established_route_observation_scan_after;
   unsigned long next_process_id;
   unsigned long next_allocation_id;
@@ -226,6 +241,7 @@ int pm_state_refresh_snapshot(pm_agent_state *state, pm_buffer *payload);
 int pm_state_reap_children(pm_agent_state *state);
 int pm_state_listener_signature(pm_agent_state *state, pm_buffer *signature);
 int pm_state_flush_route_tables(pm_agent_state *state);
+int pm_state_route_table_heartbeat_due(const pm_agent_state *state, time_t now);
 
 int pm_parse_allocate_input(const char *payload, pm_allocate_input *input);
 int pm_parse_register_input(const char *payload, pm_register_input *input);

@@ -28,6 +28,12 @@ test("native hook memory route cache is scoped by logical network", () => {
   assert.equal(source.includes("pthread_mutex_lock(&pm_route_mutex);"), true);
   assert.equal(source.includes("__sync_fetch_and_add(&pm_request_sequence, 1)"), true);
   assert.equal(source.includes("pm_network_scope_payload_for_id(route->network_id"), true);
+  assert.equal(source.includes("PM_MAX_ROUTES"), false);
+  assert.equal(source.includes("pm_route_capacity"), true);
+  assert.equal(source.includes("PM_ROUTE_MAPPING_MAX_CAPACITY 65535"), true);
+  assert.equal(source.includes("PM_ROUTE_ALLOCATION_TTL_MS 300000"), true);
+  assert.equal(source.includes("long expires_at_ms;"), true);
+  assert.equal(source.includes("pm_ensure_memory_route_capacity(pm_route_count + 1)"), true);
   assert.equal(
     source.includes("pm_routes[index].logical_port == logical_port && strcmp(pm_routes[index].network_id, route_network_id) == 0"),
     true,
@@ -36,6 +42,7 @@ test("native hook memory route cache is scoped by logical network", () => {
     source.includes("pm_routes[index].actual_port == actual_port && strcmp(pm_routes[index].network_id, route_network_id) == 0"),
     true,
   );
+  assert.equal(source.includes("pm_memory_route_expired(&pm_routes[index], now_ms)"), true);
 });
 
 test("native hook route file cache is invalidated by path size and high-resolution mtime", () => {
@@ -46,14 +53,18 @@ test("native hook route file cache is invalidated by path size and high-resoluti
   const loaderBody = source.slice(loaderStart, loaderEnd);
 
   assert.equal(source.includes("pm_route_file_cache_entry"), true);
-  assert.equal(source.includes("PM_ROUTE_FILE_CACHE_CAPACITY"), true);
+  assert.equal(source.includes("PM_ROUTE_FILE_CACHE_CAPACITY"), false);
+  assert.equal(source.includes("PM_ROUTE_FILE_CACHE_INITIAL_CAPACITY"), true);
+  assert.equal(source.includes("PM_ROUTE_FILE_CACHE_MAX_CAPACITY 65535"), true);
+  assert.equal(source.includes("pm_route_file_cache_count"), true);
+  assert.equal(source.includes("pm_ensure_route_file_cache_capacity"), true);
   assert.equal(source.includes('PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"'), true);
   assert.equal(source.includes("PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15"), true);
   assert.equal(source.includes("pm_route_table_ttl_seconds() * 1000L"), true);
   assert.equal(source.includes("pm_route_file_stat_expired"), true);
   assert.equal(source.includes("pm_route_file_buffer_expired"), true);
-  assert.equal(source.includes("pm_route_file_writer_alive"), true);
-  assert.equal(source.includes("return !pm_route_file_writer_alive(buffer);"), true);
+  assert.equal(source.includes("pm_route_file_writer_alive"), false);
+  assert.equal(source.includes("return !pm_route_file_writer_alive(buffer);"), false);
   assert.equal(source.includes("entry->size == stat_buffer->st_size"), true);
   assert.equal(source.includes("entry->mtime_sec == pm_stat_mtime_sec(stat_buffer)"), true);
   assert.equal(source.includes("entry->mtime_nsec == pm_stat_mtime_nsec(stat_buffer)"), true);
@@ -65,7 +76,9 @@ test("native hook route file cache is invalidated by path size and high-resoluti
   );
   assert.equal(source.includes("pm_cached_route_matches_cwd(route, current_cwd)"), true);
   assert.equal(source.includes("pm_cached_route_network_match_level(route)"), true);
-  assert.equal(source.includes("pm_remember_route(logical_port, actual_port, target_host"), false);
+  assert.equal(source.includes("pm_remember_route(logical_port, actual_port, target_host"), true);
+  assert.equal(source.includes("pm_remember_route(logical_port, actual_port, target_host, allocation_id, PM_ROUTE_ALLOCATION_TTL_MS)"), true);
+  assert.equal(source.includes("if (!route->has_network_id) {\n    return 0;\n  }"), true);
 });
 
 if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
@@ -451,6 +464,60 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.equal(result.stderr, "");
   });
 
+  test("native hook does not use unscoped route-file entries inside a logical network", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-connect-"));
+    const server = net.createServer((socket) => {
+      socket.end("leaked\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-unscoped-route-leak";
+    const logicalPort = await chooseUnusedTcpPort(address.port);
+    const routeTablePath = path.join(tempDir, `newdlops-portmanager-routes-${process.getuid?.() ?? "user"}-${networkId}.json`);
+    fs.writeFileSync(
+      routeTablePath,
+      JSON.stringify({
+        updatedAt: "2026-06-30T00:00:00.000Z",
+        routes: [
+          {
+            logicalPort,
+            actualPort: address.port,
+            routeDirection: "listen",
+            host: "127.0.0.1",
+            cwd: projectRoot,
+            processId: "managed-process-unscoped",
+            processName: "node server.js",
+            status: "running",
+            source: "managed",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const result = await runHookedNodeClient(logicalPort, routeTablePath, networkId, {
+      env: {
+        PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
+        PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
+        PORT_MANAGER_AGENT_ROUNDTRIP_TIMEOUT_MS: "50",
+      },
+    });
+
+    assert.equal(result.exitCode, 23);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "ECONNREFUSED\n");
+  });
+
   test("native hook reuses sender-first route reservations without daemon roundtrip", async (context) => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-connect-"));
     const server = net.createServer((socket) => {
@@ -565,6 +632,119 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.equal(result.stderr, "");
   });
 
+  test("native hook coalesces concurrent sender-first allocation requests", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-send-join-"));
+    const routeTablePath = path.join(
+      tempDir,
+      `newdlops-portmanager-routes-${process.getuid?.() ?? "user"}-network-send-join.json`,
+    );
+    const agentSocketPath = path.join("/tmp", `portmanager-hook-send-join-${process.pid}-${Date.now()}.sock`);
+    const agentRequests: AgentRequest[] = [];
+    let actualPort = 0;
+    let logicalPort = 0;
+    const server = net.createServer((socket) => {
+      socket.end("ok\n");
+    });
+    const agentServer = net.createServer((socket) => {
+      let requestText = "";
+      socket.setEncoding("utf8");
+      socket.on("data", (chunk: string) => {
+        requestText += chunk;
+        const newline = requestText.indexOf("\n");
+        if (newline < 0) {
+          return;
+        }
+
+        const request = JSON.parse(requestText.slice(0, newline)) as AgentRequest;
+        agentRequests.push(request);
+        setTimeout(() => {
+          fs.writeFileSync(
+            routeTablePath,
+            JSON.stringify({
+              updatedAt: "2026-06-30T00:00:01.000Z",
+              routes: [
+                {
+                  logicalPort,
+                  actualPort,
+                  routeDirection: "send",
+                  host: "127.0.0.1",
+                  cwd: projectRoot,
+                  networkId: "network-send-join",
+                  processName: "wait-on",
+                  status: "starting",
+                  source: "allocated",
+                },
+              ],
+            }),
+            "utf8",
+          );
+          socket.end(
+            `${JSON.stringify({
+              type: "response",
+              id: request.id,
+              ok: true,
+              payload: {
+                allocationId: "allocation-1",
+                requestedPort: logicalPort,
+                actualPort,
+                host: "127.0.0.1",
+                routed: true,
+                logicalRoutes: [],
+                logicalRoutesFile: routeTablePath,
+                expiresAt: "2026-06-30T00:00:30Z",
+              },
+            })}\n`,
+          );
+        }, 150);
+      });
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await closeServer(agentServer);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+      await fs.promises.rm(agentSocketPath, { force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    actualPort = address.port;
+    logicalPort = await chooseUnusedTcpPort(actualPort);
+    fs.writeFileSync(routeTablePath, JSON.stringify({ updatedAt: "2026-06-30T00:00:00.000Z", routes: [] }), "utf8");
+    await listenOnUnixSocket(agentServer, agentSocketPath);
+
+    const clientEnv = {
+      PORT_MANAGER_AGENT_SOCKET: agentSocketPath,
+      PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
+      PORT_MANAGER_SEND_ALLOCATION_JOIN_WAIT_MS: "2000",
+      PORT_MANAGER_AGENT_TIMEOUT_MS: "3000",
+    };
+    const results = await Promise.all([
+      runHookedNodeClient(logicalPort, routeTablePath, "network-send-join", { env: clientEnv }),
+      runHookedNodeClient(logicalPort, routeTablePath, "network-send-join", { env: clientEnv }),
+    ]);
+
+    assert.deepEqual(
+      results.map((result) => result.exitCode),
+      [0, 0],
+    );
+    assert.deepEqual(
+      results.map((result) => result.stdout),
+      ["ok\n", "ok\n"],
+    );
+    assert.deepEqual(
+      results.map((result) => result.stderr),
+      ["", ""],
+    );
+    const allocationRequests = agentRequests.filter((request) => request.method === "allocateRoute");
+    assert.equal(allocationRequests.length, 1);
+    assert.equal(allocationRequests[0]?.payload.routeDirection, "send");
+  });
+
   test("native hook honors allocated route host over the environment actual host", async (context) => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-connect-"));
     const routeTablePath = path.join(tempDir, "routes.json");
@@ -636,10 +816,10 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.equal(result.exitCode, 0);
     assert.equal(result.stdout, "ok\n");
     assert.equal(result.stderr, "");
-    assert.equal(agentRequests.length, 1);
-    assert.equal(agentRequests[0]?.method, "allocateRoute");
-    assert.equal(agentRequests[0]?.payload.host, "127.0.0.1");
-    assert.equal(agentRequests[0]?.payload.actualHost, "127.81.154.127");
+    const allocationRequests = agentRequests.filter((request) => request.method === "allocateRoute");
+    assert.equal(allocationRequests.length, 1);
+    assert.equal(allocationRequests[0]?.payload.host, "127.0.0.1");
+    assert.equal(allocationRequests[0]?.payload.actualHost, "127.81.154.127");
   });
 }
 
@@ -649,6 +829,7 @@ interface AgentRequest {
   readonly payload: {
     readonly host?: string;
     readonly actualHost?: string;
+    readonly routeDirection?: string;
   };
 }
 

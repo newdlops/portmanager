@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { ManagedProcessRegistry } from "../core/process-registry";
 import { PortRoutingService } from "../core/port-routing";
 import { SimpleEventEmitter } from "../shared/events";
+import { readPortManagerPackageVersion } from "../shared/package-version";
 import {
   getDefaultRouteTablePath,
   getNetworkRouteTablePath,
@@ -71,7 +72,9 @@ const PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS = ROUTE_ALLOCATION_TTL_MS;
 const ESTABLISHED_ROUTE_OBSERVATION_SCAN_INTERVAL_MS = 2_000;
 const ROUTE_TABLE_GENERATION_LOCK_STALE_MS = 30_000;
 const ROUTE_TABLE_GENERATION_LOCK_ATTEMPTS = 100;
+const ROUTE_TABLE_GENERATION_BACKGROUND_LOCK_ATTEMPTS = 1;
 const ROUTE_TABLE_GENERATION_LOCK_SLEEP_MS = 10;
+const ROUTE_TABLE_BACKGROUND_FLUSH_RETRY_MS = 100;
 const AGENT_SOCKET_LISTEN_BACKLOG = 16384;
 const SNAPSHOT_BROADCAST_DEBOUNCE_MS = 50;
 
@@ -106,6 +109,8 @@ export interface PortManagerAgentOptions {
   readonly routeTableTtlMs?: number;
   /** Compiled daemon entrypoint path used by clients to detect stale agents. */
   readonly agentMainPath?: string;
+  /** Package version reported by daemonStatus and snapshots. */
+  readonly agentVersion?: string;
   /** Interval for daemon-side OS listener polling. */
   readonly listenerScanIntervalMs?: number;
   /** Short window that lets concurrent client refreshes reuse one OS listener scan. */
@@ -137,6 +142,8 @@ export interface BuildAgentSnapshotOptions {
   readonly routeTablePath?: string;
   /** Compiled daemon entrypoint path used by clients to detect stale agents. */
   readonly agentMainPath?: string;
+  /** Package version reported by the daemon build. */
+  readonly agentVersion?: string;
   /** Detected listener row ids hidden by removeProcess. */
   readonly suppressedDetectedProcessIds?: ReadonlySet<string>;
   /** Host used when a listener address is not user-friendly for HTTP URLs. */
@@ -302,6 +309,9 @@ export class PortManagerAgent implements DisposableLike {
   /** Compiled daemon entrypoint path for stale-daemon detection. */
   private readonly agentMainPath: string | undefined;
 
+  /** Package version for compatibility checks against the active extension. */
+  private readonly agentVersion: string | undefined;
+
   /** Interval for rescanning the OS listening table while clients are attached. */
   private readonly listenerScanIntervalMs: number;
 
@@ -325,6 +335,15 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Prevents overlapping route-table heartbeat writes during long route operations. */
   private routeTableHeartbeatInFlight = false;
+
+  /** True when in-memory routing state has not yet been published to route files. */
+  private routeTableDirty = false;
+
+  /** Timer that retries file publication after a contended generation lock. */
+  private routeTableFlushTimer: NodeJS.Timeout | undefined;
+
+  /** Prevents overlapping background route-table flush tasks. */
+  private routeTableFlushInFlight = false;
 
   /** Shared listener scan promise so concurrent requests do not spawn many lsof processes. */
   private listenerScanPromise: Promise<readonly ListeningPort[]> | undefined;
@@ -422,6 +441,7 @@ export class PortManagerAgent implements DisposableLike {
     this.adoptPreviousGenerationRouteFiles();
     this.writeRouteTable(this.buildCurrentLogicalRoutes());
     this.agentMainPath = options.agentMainPath;
+    this.agentVersion = options.agentVersion ?? readPortManagerPackageVersion();
     this.listenerScanIntervalMs = normalizeListenerScanInterval(options.listenerScanIntervalMs);
     this.listenerScanCacheTtlMs = normalizeListenerScanCacheTtlMs(options.listenerScanCacheTtlMs);
     this.externalListenerGraceMs = normalizeExternalListenerGraceMs(options.externalListenerGraceMs);
@@ -504,6 +524,7 @@ export class PortManagerAgent implements DisposableLike {
       startedAt: this.startedAt,
       routeTablePath: this.routeTablePath,
       agentMainPath: this.agentMainPath,
+      version: this.agentVersion,
       listenerCount: this.listenerScanCache?.listeners.length ?? 0,
       routeCount: routes.length,
     });
@@ -539,7 +560,7 @@ export class PortManagerAgent implements DisposableLike {
       if (activeRoute !== undefined) {
         this.markBidirectionalRouteObserved(input.requestedPort, networkRouteScope);
         const logicalRoutes = this.buildCurrentLogicalRoutes();
-        this.requireRouteTablePublish(logicalRoutes);
+        this.publishRouteTableBestEffort(logicalRoutes);
         this.queueSnapshotBroadcast();
 
         return {
@@ -561,7 +582,7 @@ export class PortManagerAgent implements DisposableLike {
         }
         const refreshedAllocation = this.refreshPendingRouteAllocation(reusableAllocation);
         const logicalRoutes = this.buildCurrentLogicalRoutes();
-        this.requireRouteTablePublish(logicalRoutes);
+        this.publishRouteTableBestEffort(logicalRoutes);
         this.queueSnapshotBroadcast();
 
         return {
@@ -577,12 +598,12 @@ export class PortManagerAgent implements DisposableLike {
       }
 
       const samePortListener =
-        routeDirection === "send"
+        routeDirection === "send" && networkRouteScope === undefined
           ? await this.findSamePortExternalListener(input.requestedPort, input.host, requestedActualHost)
           : undefined;
       if (samePortListener !== undefined) {
         const logicalRoutes = this.buildCurrentLogicalRoutes();
-        this.requireRouteTablePublish(logicalRoutes);
+        this.publishRouteTableBestEffort(logicalRoutes);
         this.queueSnapshotBroadcast();
 
         return {
@@ -618,7 +639,7 @@ export class PortManagerAgent implements DisposableLike {
       });
 
       const logicalRoutes = this.buildCurrentLogicalRoutes();
-      this.requireRouteTablePublish(logicalRoutes);
+      this.publishRouteTableBestEffort(logicalRoutes);
       this.queueSnapshotBroadcast();
 
       return {
@@ -644,7 +665,7 @@ export class PortManagerAgent implements DisposableLike {
     const released = this.pendingRouteAllocations.delete(allocationId);
 
     if (released) {
-      this.writeRouteTable(this.buildCurrentLogicalRoutes());
+      this.publishRouteTableBestEffort();
       this.queueSnapshotBroadcast();
     }
 
@@ -710,7 +731,7 @@ export class PortManagerAgent implements DisposableLike {
     }
 
     if (released || retained) {
-      this.writeRouteTable(this.buildCurrentLogicalRoutes());
+      this.publishRouteTableBestEffort();
       this.queueSnapshotBroadcast();
     }
 
@@ -783,7 +804,7 @@ export class PortManagerAgent implements DisposableLike {
     );
 
     this.launchProfilesByProcessId.set(process.id, { ...input });
-    this.writeRouteTable(this.buildCurrentLogicalRoutes());
+    this.publishRouteTableBestEffort();
     return process;
   }
 
@@ -807,7 +828,7 @@ export class PortManagerAgent implements DisposableLike {
     const process = this.upsertRegisteredProcess(registeredInput, normalizeRegisteredProcessSource(input.source));
     this.removePendingRouteAllocationsForIdentity(process.requestedPort, normalizeNetworkId(process.networkId));
     this.missingListenerStateByProcessId.delete(process.id);
-    this.requireRouteTablePublish(this.buildCurrentLogicalRoutes());
+    this.publishRouteTableBestEffort();
     this.queueSnapshotBroadcast();
 
     return process;
@@ -838,7 +859,7 @@ export class PortManagerAgent implements DisposableLike {
 
     const stoppedProcess = this.registry.stop(id, this.now().toISOString());
     this.missingListenerStateByProcessId.delete(id);
-    this.writeRouteTable(this.buildCurrentLogicalRoutes());
+    this.publishRouteTableBestEffort();
 
     return stoppedProcess;
   }
@@ -922,7 +943,7 @@ export class PortManagerAgent implements DisposableLike {
         errorMessage: undefined,
         source: "managed",
       });
-      this.writeRouteTable(this.buildCurrentLogicalRoutes());
+      this.publishRouteTableBestEffort();
 
       return restartedProcess;
     });
@@ -944,7 +965,7 @@ export class PortManagerAgent implements DisposableLike {
     this.missingListenerStateByProcessId.delete(id);
 
     if (removedProcess !== undefined) {
-      this.writeRouteTable(this.buildCurrentLogicalRoutes());
+      this.publishRouteTableBestEffort();
       return removedProcess;
     }
 
@@ -959,7 +980,7 @@ export class PortManagerAgent implements DisposableLike {
   /** Refreshes the snapshot and broadcasts it only when routing/listener state changed. */
   async refreshSnapshot(): Promise<AgentSnapshot> {
     const snapshot = await this.buildSnapshot({ allowRecentListenerCache: true });
-    this.writeRouteTable(snapshot.routes);
+    this.publishRouteTableBestEffort(snapshot.routes);
     this.broadcastSnapshotIfChanged(snapshot);
     return snapshot;
   }
@@ -983,6 +1004,10 @@ export class PortManagerAgent implements DisposableLike {
     if (this.routeTableHeartbeatTimer !== undefined) {
       clearInterval(this.routeTableHeartbeatTimer);
       this.routeTableHeartbeatTimer = undefined;
+    }
+    if (this.routeTableFlushTimer !== undefined) {
+      clearTimeout(this.routeTableFlushTimer);
+      this.routeTableFlushTimer = undefined;
     }
 
     if (this.snapshotBroadcastTimer !== undefined) {
@@ -1270,13 +1295,81 @@ export class PortManagerAgent implements DisposableLike {
       await this.runExclusiveRouteOperation(async () => {
         const routes = this.buildCurrentLogicalRoutes();
         if (routes.length > 0) {
-          this.writeRouteTable(routes);
+          this.publishRouteTableBestEffort(routes);
         }
       });
     } catch (error) {
       this.serverErrors.emit(error instanceof Error ? error : new Error(String(error)));
     } finally {
       this.routeTableHeartbeatInFlight = false;
+    }
+  }
+
+  /**
+   * Publishes the in-memory route state without letting route-file lock contention
+   * hold a request open. Files are a hook-reader snapshot; daemon memory remains
+   * the source of truth while the agent is alive.
+   */
+  private publishRouteTableBestEffort(routes: readonly LogicalPortRoute[] = this.buildCurrentLogicalRoutes()): void {
+    if (!this.canPublishNextRouteTableGeneration()) {
+      throw new Error("Port Manager route table publish failed; refusing stale daemon generation.");
+    }
+
+    if (this.writeRouteTable(routes, { waitForLock: false })) {
+      this.routeTableDirty = false;
+      return;
+    }
+
+    this.markRouteTableDirty();
+  }
+
+  /** Marks route files stale and schedules a background publish retry. */
+  private markRouteTableDirty(delayMs = 0): void {
+    this.routeTableDirty = true;
+    this.queueRouteTableFlush(delayMs);
+  }
+
+  private queueRouteTableFlush(delayMs = 0): void {
+    if (this.routeTableFlushTimer !== undefined || this.routeTableFlushInFlight) {
+      return;
+    }
+
+    this.routeTableFlushTimer = setTimeout(() => {
+      this.routeTableFlushTimer = undefined;
+      void this.flushQueuedRouteTable();
+    }, delayMs);
+    this.routeTableFlushTimer.unref();
+  }
+
+  private async flushQueuedRouteTable(): Promise<void> {
+    if (!this.routeTableDirty || this.routeTableFlushInFlight) {
+      return;
+    }
+
+    this.routeTableFlushInFlight = true;
+    try {
+      await this.runExclusiveRouteOperation(async () => {
+        if (!this.routeTableDirty) {
+          return;
+        }
+
+        if (!this.canPublishNextRouteTableGeneration()) {
+          this.routeTableDirty = false;
+          throw new Error("Port Manager route table publish failed; refusing stale daemon generation.");
+        }
+
+        if (this.writeRouteTable(this.buildCurrentLogicalRoutes(), { waitForLock: false })) {
+          this.routeTableDirty = false;
+        }
+      });
+    } catch (error) {
+      this.serverErrors.emit(error instanceof Error ? error : new Error(String(error)));
+    } finally {
+      this.routeTableFlushInFlight = false;
+    }
+
+    if (this.routeTableDirty) {
+      this.queueRouteTableFlush(ROUTE_TABLE_BACKGROUND_FLUSH_RETRY_MS);
     }
   }
 
@@ -1320,7 +1413,7 @@ export class PortManagerAgent implements DisposableLike {
       routeStateChanged = this.reconcileRegisteredProcessesWithListeners(listeners) || routeStateChanged;
     }
     if (routeStateChanged) {
-      this.writeRouteTable(this.buildCurrentLogicalRoutes());
+      this.publishRouteTableBestEffort();
     }
     const snapshot = buildAgentSnapshot({
       agentPid: this.agentPid,
@@ -1331,13 +1424,14 @@ export class PortManagerAgent implements DisposableLike {
       daemonStartedAt: this.startedAt,
       routeTablePath: this.routeTablePath,
       agentMainPath: this.agentMainPath,
+      agentVersion: this.agentVersion,
       suppressedDetectedProcessIds: this.suppressedDetectedProcessIds,
       defaultHost: this.defaultHost,
       defaultCwd: this.defaultCwd,
     });
 
     if (await this.refreshEstablishedRouteObservations(snapshot.routes)) {
-      this.writeRouteTable(snapshot.routes);
+      this.publishRouteTableBestEffort(snapshot.routes);
     }
     return snapshot;
   }
@@ -1762,8 +1856,16 @@ export class PortManagerAgent implements DisposableLike {
   }
 
   /** Writes the latest dynamic route table for active and pending logical routes. */
-  private writeRouteTable(routes: readonly LogicalPortRoute[]): boolean {
-    const releaseGenerationLock = acquireRouteTableGenerationLock(this.routeTablePath);
+  private writeRouteTable(
+    routes: readonly LogicalPortRoute[],
+    options: { readonly waitForLock?: boolean } = {},
+  ): boolean {
+    const releaseGenerationLock = acquireRouteTableGenerationLock(
+      this.routeTablePath,
+      options.waitForLock === false
+        ? ROUTE_TABLE_GENERATION_BACKGROUND_LOCK_ATTEMPTS
+        : ROUTE_TABLE_GENERATION_LOCK_ATTEMPTS,
+    );
     if (releaseGenerationLock === undefined) {
       return false;
     }
@@ -1780,15 +1882,6 @@ export class PortManagerAgent implements DisposableLike {
     }
   }
 
-  /** Fails request paths where returning a route without a fresh table would misroute clients. */
-  private requireRouteTablePublish(routes: readonly LogicalPortRoute[]): void {
-    if (this.writeRouteTable(routes)) {
-      return;
-    }
-
-    throw new Error("Port Manager route table publish failed; refusing to return stale routing state.");
-  }
-
   /** Builds metadata shared by every file in one route-table publish. */
   private createNextRouteTableGeneration(): RouteTableGeneration {
     this.routeTableGenerationSequence += 1;
@@ -1801,10 +1894,20 @@ export class PortManagerAgent implements DisposableLike {
     };
   }
 
+  /** Checks publish ownership without consuming the writer sequence. */
+  private canPublishNextRouteTableGeneration(): boolean {
+    return this.canPublishRouteTableGeneration({
+      writerId: this.routeTableWriterId,
+      writerStartedAtMs: this.routeTableWriterStartedAtMs,
+      sequence: this.routeTableGenerationSequence + 1,
+      pid: this.agentPid,
+    });
+  }
+
   /** Rejects this writer when a newer daemon generation already owns the table. */
   private canPublishRouteTableGeneration(generation: RouteTableGeneration): boolean {
     const currentGeneration = readRouteTableGeneration(this.routeTablePath);
-    return currentGeneration === undefined || !isRouteTableGenerationNewer(currentGeneration, generation);
+    return currentGeneration === undefined || !isRouteTableGenerationBlockingNewer(currentGeneration, generation);
   }
 
   /**
@@ -2092,7 +2195,7 @@ export class PortManagerAgent implements DisposableLike {
 
     this.registry.stop(process.id, this.now().toISOString());
     this.missingListenerStateByProcessId.delete(process.id);
-    this.writeRouteTable(this.buildCurrentLogicalRoutes());
+    this.publishRouteTableBestEffort();
   }
 
   /**
@@ -2193,6 +2296,7 @@ export function buildAgentSnapshot(options: BuildAgentSnapshotOptions): AgentSna
     startedAt: options.daemonStartedAt,
     routeTablePath: options.routeTablePath,
     agentMainPath: options.agentMainPath,
+    version: options.agentVersion,
     listenerCount: normalizedListeners.length,
     routeCount: routes.length,
   });
@@ -2214,6 +2318,7 @@ function buildDaemonStatus(options: {
   readonly startedAt?: string;
   readonly routeTablePath?: string;
   readonly agentMainPath?: string;
+  readonly version?: string;
   readonly listenerCount: number;
   readonly routeCount: number;
 }): AgentDaemonStatus {
@@ -2224,6 +2329,7 @@ function buildDaemonStatus(options: {
     updatedAt: options.updatedAt,
     routeTablePath: options.routeTablePath,
     agentMainPath: options.agentMainPath,
+    version: options.version,
     listenerCount: options.listenerCount,
     routeCount: options.routeCount,
     monitoringAllListeners: true,
@@ -2809,7 +2915,12 @@ function readRouteTableGeneration(routeTablePath: string): RouteTableGeneration 
 /** True when a file already belongs to a daemon generation newer than this write. */
 function isRouteTablePathNewerThanGeneration(routeTablePath: string, generation: RouteTableGeneration): boolean {
   const currentGeneration = readRouteTableGeneration(routeTablePath);
-  return currentGeneration !== undefined && isRouteTableGenerationNewer(currentGeneration, generation);
+  return currentGeneration !== undefined && isRouteTableGenerationBlockingNewer(currentGeneration, generation);
+}
+
+/** True only when a newer generation still has a live owner process. */
+function isRouteTableGenerationBlockingNewer(current: RouteTableGeneration, candidate: RouteTableGeneration): boolean {
+  return isRouteTableGenerationNewer(current, candidate) && routeTableGenerationOwnerIsAlive(current.pid);
 }
 
 /** Compares route-table document metadata before replacing or deleting a file. */
@@ -2828,6 +2939,28 @@ function isRouteTableGenerationNewer(current: RouteTableGeneration, candidate: R
   }
 
   return current.sequence > candidate.sequence;
+}
+
+/**
+ * A newer generation only blocks publishing while its daemon can still own the
+ * socket. If that process died after writing the route files, the surviving
+ * daemon must be able to reclaim the files instead of freezing route updates.
+ */
+function routeTableGenerationOwnerIsAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+
+  if (pid === process.pid) {
+    return true;
+  }
+
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return isNodeFileError(error, "EPERM");
+  }
 }
 
 /**
@@ -2863,10 +2996,10 @@ function writeAtomicRouteTableFile(routeTablePath: string, content: string): voi
   }
 }
 
-function acquireRouteTableGenerationLock(routeTablePath: string): (() => void) | undefined {
+function acquireRouteTableGenerationLock(routeTablePath: string, attempts: number): (() => void) | undefined {
   const lockPath = `${routeTablePath}.lock`;
 
-  for (let attempt = 0; attempt < ROUTE_TABLE_GENERATION_LOCK_ATTEMPTS; attempt += 1) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     let lockFd: number | undefined;
 
     try {
@@ -2891,7 +3024,7 @@ function acquireRouteTableGenerationLock(routeTablePath: string): (() => void) |
       }
 
       removeStaleRouteTableGenerationLock(lockPath);
-      if (attempt + 1 < ROUTE_TABLE_GENERATION_LOCK_ATTEMPTS) {
+      if (attempt + 1 < attempts) {
         sleepSync(ROUTE_TABLE_GENERATION_LOCK_SLEEP_MS);
       }
     }

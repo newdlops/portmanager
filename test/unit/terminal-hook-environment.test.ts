@@ -516,8 +516,12 @@ test("external pm shell function selects a network and sources its attach script
   assert.equal(commandSource.includes("Port Manager: \\${PORT_MANAGER_NETWORK_NAME}"), true);
   assert.equal(commandSource.includes("pm() {"), true);
   assert.equal(commandSource.includes('"pm current"'), true);
+  assert.equal(commandSource.includes('"pm version"'), true);
   assert.equal(commandSource.includes('= "current"'), true);
   assert.equal(commandSource.includes('= "status"'), true);
+  assert.equal(commandSource.includes('__pm_agent_version()'), true);
+  assert.equal(commandSource.includes("PORT_MANAGER_EXPECTED_VERSION"), true);
+  assert.equal(commandSource.includes('method:"daemonStatus"'), true);
   assert.equal(commandSource.includes("Port Manager shell network: none"), true);
   assert.equal(commandSource.includes('__pm_current_id="\\${PORT_MANAGER_NETWORK_ID:-}"'), true);
   assert.equal(commandSource.includes("Select Port Manager network:"), true);
@@ -542,6 +546,9 @@ test("external pm shell function exposes doctor routes and detach diagnostics", 
 
   assert.equal(commandSource.includes("routeCountScript"), true);
   assert.equal(commandSource.includes("routePrintScript"), true);
+  assert.equal(commandSource.includes("agentVersionScript"), true);
+  assert.equal(commandSource.includes('if [ "\\${1:-}" = "version" ]'), true);
+  assert.equal(commandSource.includes('if [ "\\${1:-}" = "status" ]; then'), true);
   assert.equal(commandSource.includes('"doctor"'), true);
   assert.equal(commandSource.includes('"routes"'), true);
   assert.equal(commandSource.includes('"repair"'), true);
@@ -660,10 +667,10 @@ test("agent compatibility rejects daemons with stale route table storage", () =>
   assert.notEqual(compatibilityStart, -1);
   assert.equal(compatibilityBody.includes("getDefaultRouteTablePath()"), true);
   assert.equal(compatibilityBody.includes("routeTablePathMismatch"), true);
-  assert.equal(
-    compatibilityBody.includes("missingAgentMetadata || pathMismatch || routeTablePathMismatch || olderThanCurrentBuild"),
-    true,
-  );
+  assert.equal(compatibilityBody.includes("missingVersionMetadata"), true);
+  assert.equal(compatibilityBody.includes("versionMismatch"), true);
+  assert.equal(compatibilityBody.includes("routeTablePathMismatch"), true);
+  assert.equal(compatibilityBody.includes("olderThanCurrentBuild"), true);
 });
 
 test("network removal restores compose attachments before deleting the network", () => {
@@ -857,6 +864,10 @@ test("background routing refresh converges daemon version and generated route fi
   assert.equal(convergeBody.includes("restorePersistedComposeRoutesIfMissing"), false);
   assert.equal(convergeBody.includes("not force an additional full listener scan every minute"), true);
   assert.equal(convergeBody.includes("await this.ensureDaemonRouteTablesMaterialized().catch(() => undefined);"), true);
+  assert.equal(
+    convergeBody.includes("await this.rehydrateBrowserDnsAndProxies().catch(() => undefined);"),
+    true,
+  );
   assert.equal(convergeBody.includes("await this.processService.refresh().catch(() => undefined);"), false);
   assert.equal(convergeBody.includes("await this.syncLogicalPortRouters().catch(() => undefined);"), true);
   assert.equal(ensureBody.includes('daemon.status !== "running"'), true);
@@ -1222,6 +1233,24 @@ test("terminal hook markers refresh attached UI state without manual refresh", (
   assert.equal(source.includes("this.startTerminalAttachmentMarkerPolling();"), true);
 });
 
+test("terminal refresh scans only from the control-plane owner window", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const refreshStart = source.indexOf("async refreshTerminals(options: BackgroundRefreshOptions = {})");
+  const refreshEnd = source.indexOf("private async refreshTerminalsSerially", refreshStart);
+  const refreshBody = source.slice(refreshStart, refreshEnd);
+
+  assert.notEqual(refreshStart, -1);
+  assert.equal(refreshBody.includes("if (!this.ownsControlPlaneLease) {"), true);
+  assert.equal(refreshBody.includes("await this.startControlPlaneOwnerIfAvailable();"), true);
+  assert.equal(refreshBody.includes("return this.registry.getSnapshot().terminalWindows;"), true);
+  assert.equal(
+    refreshBody.indexOf("return this.registry.getSnapshot().terminalWindows;") <
+      refreshBody.indexOf("this.terminalRefreshInFlight = this.refreshTerminalsSerially()"),
+    true,
+  );
+});
+
 test("terminal reveal focuses injected VS Code and external terminal windows", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
@@ -1528,7 +1557,8 @@ test("route tables are stored in extension global storage and legacy temp files 
   assert.equal(networkCleanupBody.includes("getLegacyDefaultRouteTablePath()"), true);
   assert.equal(commandsSource.includes('--route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE"'), true);
   assert.equal(agentMainSource.includes("parsedArguments.routeTablePath ?? process.env.PORT_MANAGER_GLOBAL_ROUTES_FILE"), true);
-  assert.equal(agentSource.includes("const releaseGenerationLock = acquireRouteTableGenerationLock(this.routeTablePath);"), true);
+  assert.equal(agentSource.includes("const releaseGenerationLock = acquireRouteTableGenerationLock("), true);
+  assert.equal(agentSource.includes("ROUTE_TABLE_GENERATION_BACKGROUND_LOCK_ATTEMPTS"), true);
   assert.equal(agentSource.includes("private writeRouteTableGeneration("), true);
   assert.equal(agentSource.includes("generation: RouteTableGeneration"), true);
   assert.equal(agentSource.includes("isRouteTableGenerationNewer"), true);
@@ -1671,8 +1701,10 @@ test("native agent adopts previous route files before first startup write", () =
   assert.equal(adoptBody.includes("state->written_network_ids"), true);
   assert.equal(adoptBody.includes("unlink(file_path);"), false);
   assert.equal(initBody.includes("pm_adopt_previous_generation_route_files(state);"), true);
-  assert.equal(initBody.includes("pm_write_route_tables(state);"), true);
-  assert.equal(source.includes("pm_acquire_route_table_write_lock(state->route_table_path"), true);
+  assert.equal(initBody.includes("if (pm_write_route_tables(state, 1) == 0)"), true);
+  assert.equal(initBody.includes("state->route_table_refreshed_at = time(NULL);"), true);
+  assert.equal(source.includes("pm_acquire_route_table_write_lock("), true);
+  assert.equal(source.includes("PM_ROUTE_TABLE_WRITE_LOCK_BACKGROUND_ATTEMPTS"), true);
   assert.equal(source.includes("PM_ROUTE_TABLE_WRITE_LOCK_STALE_SECONDS"), true);
 });
 

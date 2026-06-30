@@ -417,6 +417,7 @@ static void pm_handle_line(pm_client *client, pm_agent_state *state, const char 
      * have received their response frames.
      */
     *snapshot_dirty = 1;
+    state->route_tables_dirty = 1;
     *route_tables_dirty = 1;
   }
   if (shutdown_requested) {
@@ -544,6 +545,7 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
   pm_buffer last_listener_signature;
   time_t next_poll = time(NULL) + 3;
   time_t last_io_at = 0;
+  time_t route_table_flush_retry_after = 0;
   int snapshot_dirty = 0;
   int route_tables_dirty = 0;
 
@@ -584,10 +586,12 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
       if (errno == EINTR) {
         continue;
       }
+      fprintf(stderr, "Port Manager native agent poll failed: %s\n", strerror(errno));
       break;
     }
 
     if (ready > 0 && (poll_fds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+      fprintf(stderr, "Port Manager native agent socket failed: revents=%hd\n", poll_fds[0].revents);
       break;
     }
 
@@ -677,11 +681,17 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
       }
     }
 
-    if (route_tables_dirty) {
+    if (route_tables_dirty || state->route_tables_dirty || pm_state_route_table_heartbeat_due(state, time(NULL))) {
       time_t now = time(NULL);
-      if (!handled_io && (last_io_at == 0 || now - last_io_at >= PM_LISTENER_POLL_IDLE_GRACE_SECONDS)) {
+      int heartbeat_due = pm_state_route_table_heartbeat_due(state, now);
+
+      if (now >= route_table_flush_retry_after &&
+          (heartbeat_due || (!handled_io && (last_io_at == 0 || now - last_io_at >= PM_LISTENER_POLL_IDLE_GRACE_SECONDS)))) {
         if (pm_state_flush_route_tables(state) == 0) {
           route_tables_dirty = 0;
+          route_table_flush_retry_after = 0;
+        } else {
+          route_table_flush_retry_after = now + 1;
         }
       }
     }

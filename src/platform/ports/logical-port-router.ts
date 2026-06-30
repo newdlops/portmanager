@@ -50,7 +50,7 @@ export interface LogicalPortRouterOptions {
 interface LogicalPortRouterListenerHandle {
   /** True while the underlying listener is still expected to accept sockets. */
   isActive(): boolean;
-  /** Closes the listener and any sockets it owns. */
+  /** Closes the listener accept path for this logical port. */
   close(): Promise<void>;
 }
 
@@ -171,10 +171,6 @@ export class LogicalPortRouterManager implements DisposableLike {
 
     this.listeners.delete(logicalPort);
     await listenerSet.close();
-    if (this.listeners.size === 0) {
-      await this.nativeRouter?.close().catch(() => undefined);
-      this.nativeRouter = undefined;
-    }
   }
 
   /** Closes every listener owned by this router. */
@@ -233,7 +229,7 @@ export class LogicalPortRouterManager implements DisposableLike {
     try {
       return await router.open(logicalPort);
     } catch {
-      if (!router.hasOpenWork()) {
+      if (!router.isControlReady()) {
         await router.close().catch(() => undefined);
         if (this.nativeRouter === router) {
           this.nativeRouter = undefined;
@@ -317,6 +313,9 @@ class NativeLogicalPortRouterProcess {
   /** Whether the helper has exited or been closed. */
   private closed = false;
 
+  /** True only after the helper announces that its control protocol is ready. */
+  private controlReady = false;
+
   /** Startup promise hooks resolved by the helper control READY line. */
   private startup:
     | {
@@ -357,6 +356,7 @@ class NativeLogicalPortRouterProcess {
     }
 
     this.closed = false;
+    this.controlReady = false;
     this.child = spawn(this.executablePath, ["--control"], {
       // The router's outbound target connection must not re-enter Port Manager's native hook.
       env: buildNodeRuntimeEnvironment(),
@@ -370,6 +370,7 @@ class NativeLogicalPortRouterProcess {
     this.child.once("error", (error) => this.rejectStartup(error));
     this.child.once("exit", (code, signal) => {
       this.closed = true;
+      this.controlReady = false;
       this.activePorts.clear();
       this.rejectPendingListens(
         new Error(`Native logical router exited: ${formatNativeExit(code, signal)}${this.formatStderrSuffix()}`),
@@ -408,15 +409,15 @@ class NativeLogicalPortRouterProcess {
     return this.child !== undefined && !this.closed && this.child.exitCode === null && this.child.signalCode === null;
   }
 
+  isControlReady(): boolean {
+    return this.isActive() && this.controlReady;
+  }
+
   isPortActive(logicalPort: number): boolean {
     return this.isActive() && this.activePorts.has(logicalPort);
   }
 
-  /** True while the shared helper still owns or is opening at least one logical port. */
-  hasOpenWork(): boolean {
-    return this.activePorts.size > 0 || this.pendingListens.size > 0;
-  }
-
+  /** Stops accepting new connections for one port while accepted native streams stay alive. */
   async closePort(logicalPort: number): Promise<void> {
     this.activePorts.delete(logicalPort);
     const pending = this.pendingListens.get(logicalPort);
@@ -428,13 +429,11 @@ class NativeLogicalPortRouterProcess {
     if (this.isActive()) {
       this.writeControlLine(`CLOSE\t${logicalPort}\n`);
     }
-    if (this.activePorts.size === 0 && this.pendingListens.size === 0) {
-      await this.close();
-    }
   }
 
   async close(): Promise<void> {
     this.closed = true;
+    this.controlReady = false;
     this.activePorts.clear();
     this.rejectPendingListens(new Error("Native logical router closed."));
     this.rejectStartup(new Error("Native logical router closed."));
@@ -532,6 +531,7 @@ class NativeLogicalPortRouterProcess {
   }
 
   private resolveStartup(): void {
+    this.controlReady = true;
     if (this.startup === undefined) {
       return;
     }

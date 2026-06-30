@@ -1157,8 +1157,7 @@ static int pm_compose_override_for_project(const char *attached_project, char *b
     attached_project == NULL ||
     attached_project[0] == '\0' ||
     routing_file == NULL ||
-    routing_file[0] == '\0' ||
-    pm_generated_route_file_expired(routing_file)
+    routing_file[0] == '\0'
   ) {
     return -1;
   }
@@ -1448,20 +1447,6 @@ static int pm_read_file_limited(const char *path, char **buffer_out) {
   return 0;
 }
 
-static int pm_route_table_writer_alive(const char *buffer) {
-  long pid = pm_json_long(buffer, "pid", 0);
-
-  if (pid <= 0) {
-    return 0;
-  }
-
-  if (kill((pid_t)pid, 0) == 0) {
-    return 1;
-  }
-
-  return errno == EPERM;
-}
-
 static int pm_route_table_buffer_expired(const char *buffer) {
   long expires_at_ms;
   long now_ms;
@@ -1480,7 +1465,7 @@ static int pm_route_table_buffer_expired(const char *buffer) {
     return 0;
   }
 
-  return !pm_route_table_writer_alive(buffer);
+  return 1;
 }
 
 /** Reads route-table JSON; legacy files still use mtime, current files trust a live writer pid. */
@@ -1727,6 +1712,81 @@ static int pm_find_compose_route_in_file(const char *file_path, void *context) {
   return 0;
 }
 
+/** Recovers compose project routing from the fresh network route table when TSV publication lags. */
+static int pm_find_compose_route_from_route_table(pm_compose_route_search *search) {
+  const char *route_file = pm_effective_route_table_path();
+  char *buffer;
+  char *cursor;
+
+  if (search == NULL || search->network_id == NULL || search->network_id[0] == '\0') {
+    return -1;
+  }
+
+  if (pm_read_route_table_file_limited(route_file, &buffer) != 0) {
+    return -1;
+  }
+
+  cursor = buffer;
+  while ((cursor = strstr(cursor, "\"source\"")) != NULL) {
+    char *object_start = cursor;
+    char *object_end = strchr(cursor, '}');
+    char object_end_saved;
+    char source[64];
+    char route_cwd[PM_MAX_PATH];
+    char route_status[64];
+    char process_name[PM_MAX_FIELD];
+    char attached_project[PM_MAX_FIELD];
+    char service_name[PM_MAX_FIELD];
+    size_t workdir_length;
+
+    while (object_start > buffer && *object_start != '{') {
+      object_start--;
+    }
+
+    if (object_end == NULL) {
+      break;
+    }
+
+    object_end_saved = *object_end;
+    *object_end = '\0';
+    if (
+      pm_json_string(object_start, "source", source, sizeof(source)) == 0 &&
+      strcmp(source, "compose") == 0 &&
+      pm_route_network_matches(object_start, search->network_id) &&
+      pm_json_string(object_start, "cwd", route_cwd, sizeof(route_cwd)) == 0 &&
+      pm_json_string(object_start, "processName", process_name, sizeof(process_name)) == 0 &&
+      (pm_json_string(object_start, "status", route_status, sizeof(route_status)) != 0 || strcmp(route_status, "stopped") != 0) &&
+      pm_extract_project_service_from_process_name(
+        process_name,
+        attached_project,
+        sizeof(attached_project),
+        service_name,
+        sizeof(service_name)) == 0
+    ) {
+      workdir_length = strlen(route_cwd);
+      if (pm_cwd_matches_workdir(route_cwd) && workdir_length >= search->best_length) {
+        search->best_length = workdir_length;
+        pm_copy(search->attached_project, search->attached_size, attached_project);
+        pm_copy(search->original_project, search->original_size, search->requested_project);
+        (void)pm_compose_override_for_project(attached_project, search->override_file, search->override_size);
+        search->context_found = 1;
+        search->found = search->attached_project[0] != '\0';
+      } else if (search->requested_project[0] != '\0' && strcmp(search->requested_project, attached_project) == 0) {
+        search->project_match_count++;
+        pm_copy(search->project_attached, sizeof(search->project_attached), attached_project);
+        pm_copy(search->project_original, sizeof(search->project_original), search->requested_project);
+        (void)pm_compose_override_for_project(attached_project, search->project_override, sizeof(search->project_override));
+      }
+    }
+
+    *object_end = object_end_saved;
+    cursor = object_end + 1;
+  }
+
+  free(buffer);
+  return search->found ? 0 : -1;
+}
+
 /** Finds the most-specific attached compose project for cwd, compose file, runtime, and network. */
 static int pm_find_compose_route(
   const char *runtime,
@@ -1744,13 +1804,7 @@ static int pm_find_compose_route(
   pm_compose_route_search search;
   int scoped_file_count = 0;
 
-  if (
-    file_path == NULL ||
-    file_path[0] == '\0' ||
-    network_id == NULL ||
-    network_id[0] == '\0' ||
-    pm_generated_route_file_expired(file_path)
-  ) {
+  if (network_id == NULL || network_id[0] == '\0') {
     return -1;
   }
 
@@ -1767,9 +1821,11 @@ static int pm_find_compose_route(
   search.override_file = override_file;
   search.override_size = override_size;
 
-  pm_visit_scoped_compose_routing_files(file_path, pm_find_compose_route_in_file, &search, &scoped_file_count);
-  if (scoped_file_count == 0) {
-    pm_find_compose_route_in_file(file_path, &search);
+  if (file_path != NULL && file_path[0] != '\0' && !pm_generated_route_file_expired(file_path)) {
+    pm_visit_scoped_compose_routing_files(file_path, pm_find_compose_route_in_file, &search, &scoped_file_count);
+    if (scoped_file_count == 0) {
+      pm_find_compose_route_in_file(file_path, &search);
+    }
   }
 
   if (!search.context_found && search.project_match_count == 1 && search.project_attached[0] != '\0') {
@@ -1779,7 +1835,22 @@ static int pm_find_compose_route(
     return 0;
   }
 
-  return search.found ? 0 : -1;
+  if (search.found) {
+    return 0;
+  }
+
+  if (pm_find_compose_route_from_route_table(&search) == 0) {
+    return 0;
+  }
+
+  if (!search.context_found && search.project_match_count == 1 && search.project_attached[0] != '\0') {
+    pm_copy(attached_project, attached_size, search.project_attached);
+    pm_copy(original_project, original_size, search.project_original);
+    pm_copy(override_file, override_size, search.project_override);
+    return 0;
+  }
+
+  return -1;
 }
 
 /** Allocates one rewritten compose project option argument. */

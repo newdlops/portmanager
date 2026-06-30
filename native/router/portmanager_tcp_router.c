@@ -1,7 +1,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -19,11 +21,16 @@
 #include <time.h>
 #include <unistd.h>
 
-#define PM_ROUTER_BACKLOG 128
+#define PM_ROUTER_BACKLOG 1024
 #define PM_ROUTER_BUFFER_SIZE 65536
 #define PM_ROUTER_HOST_SIZE 256
 #define PM_ROUTER_LINE_SIZE 1024
 #define PM_ROUTER_ROUTE_RESPONSE_TIMEOUT_MS 5000
+#if defined(MSG_NOSIGNAL)
+#define PM_ROUTER_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define PM_ROUTER_SEND_FLAGS 0
+#endif
 
 typedef struct pending_route {
   uint64_t id;
@@ -61,10 +68,15 @@ typedef struct line_buffer {
   size_t capacity;
 } line_buffer_t;
 
-typedef struct copy_args {
+typedef struct proxy_direction {
   int source_fd;
   int target_fd;
-} copy_args_t;
+  char *buffer;
+  size_t start;
+  size_t length;
+  int source_open;
+  int target_shutdown;
+} proxy_direction_t;
 
 static pthread_mutex_t pm_pending_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t pm_stdout_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -342,87 +354,243 @@ static int pm_connect_target(const char *host, int port) {
   return fd;
 }
 
-static int pm_send_all_socket(int fd, const char *buffer, size_t length) {
-  size_t sent = 0;
+static int pm_socket_would_block(void) {
+  return errno == EAGAIN || errno == EWOULDBLOCK;
+}
 
-  while (sent < length) {
-    ssize_t result = send(fd, buffer + sent, length - sent, 0);
-    if (result < 0) {
-      if (errno == EINTR) {
-        continue;
+static int pm_set_nonblocking(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+
+  if (flags < 0) {
+    return -1;
+  }
+
+  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static void pm_set_tcp_nodelay(int fd) {
+  int enabled = 1;
+
+#if defined(TCP_NODELAY)
+  (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+#else
+  (void)fd;
+  (void)enabled;
+#endif
+}
+
+static void pm_proxy_direction_compact(proxy_direction_t *direction) {
+  if (direction->start == 0) {
+    return;
+  }
+
+  if (direction->length > 0) {
+    memmove(direction->buffer, direction->buffer + direction->start, direction->length);
+  }
+  direction->start = 0;
+}
+
+static int pm_proxy_direction_read(proxy_direction_t *direction) {
+  ssize_t count;
+  size_t available;
+
+  if (!direction->source_open || direction->length >= PM_ROUTER_BUFFER_SIZE) {
+    return 0;
+  }
+
+  if (direction->start + direction->length >= PM_ROUTER_BUFFER_SIZE) {
+    pm_proxy_direction_compact(direction);
+  }
+  available = PM_ROUTER_BUFFER_SIZE - direction->start - direction->length;
+  if (available == 0) {
+    return 0;
+  }
+
+  count = recv(direction->source_fd, direction->buffer + direction->start + direction->length, available, 0);
+  if (count > 0) {
+    direction->length += (size_t)count;
+    return 0;
+  }
+  if (count == 0) {
+    direction->source_open = 0;
+    return 0;
+  }
+  if (errno == EINTR || pm_socket_would_block()) {
+    return 0;
+  }
+
+  direction->source_open = 0;
+  return -1;
+}
+
+static int pm_proxy_direction_write(proxy_direction_t *direction) {
+  while (direction->length > 0) {
+    ssize_t count = send(
+      direction->target_fd,
+      direction->buffer + direction->start,
+      direction->length,
+      PM_ROUTER_SEND_FLAGS);
+
+    if (count > 0) {
+      direction->start += (size_t)count;
+      direction->length -= (size_t)count;
+      if (direction->length == 0) {
+        direction->start = 0;
       }
+      continue;
+    }
+    if (count == 0) {
       return -1;
     }
-    if (result == 0) {
-      return -1;
+    if (errno == EINTR) {
+      continue;
     }
-    sent += (size_t)result;
+    if (pm_socket_would_block()) {
+      return 0;
+    }
+    return -1;
   }
 
   return 0;
 }
 
-static void *pm_copy_thread(void *raw_args) {
-  copy_args_t *args = (copy_args_t *)raw_args;
-  char *buffer = (char *)malloc(PM_ROUTER_BUFFER_SIZE);
+static void pm_proxy_direction_shutdown_if_drained(proxy_direction_t *direction) {
+  if (!direction->source_open && direction->length == 0 && !direction->target_shutdown) {
+    shutdown(direction->target_fd, SHUT_WR);
+    direction->target_shutdown = 1;
+  }
+}
 
-  if (buffer != NULL) {
-    for (;;) {
-      ssize_t count = recv(args->source_fd, buffer, PM_ROUTER_BUFFER_SIZE, 0);
-      if (count < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        break;
+/**
+ * Proxies one TCP connection with a single nonblocking pump.
+ *
+ * The previous implementation used two extra copy threads per connection. That
+ * multiplied scheduler and stack pressure during bursty browser/container
+ * traffic. A bounded poll loop keeps both directions moving from the connection
+ * worker itself while still honoring TCP half-close semantics.
+ */
+static void pm_proxy_connection(int client_fd, int target_fd) {
+  proxy_direction_t forward;
+  proxy_direction_t backward;
+  char *forward_buffer = (char *)malloc(PM_ROUTER_BUFFER_SIZE);
+  char *backward_buffer = (char *)malloc(PM_ROUTER_BUFFER_SIZE);
+
+  if (forward_buffer == NULL || backward_buffer == NULL) {
+    free(forward_buffer);
+    free(backward_buffer);
+    return;
+  }
+  if (pm_set_nonblocking(client_fd) != 0 || pm_set_nonblocking(target_fd) != 0) {
+    free(forward_buffer);
+    free(backward_buffer);
+    return;
+  }
+
+  pm_set_tcp_nodelay(client_fd);
+  pm_set_tcp_nodelay(target_fd);
+  memset(&forward, 0, sizeof(forward));
+  memset(&backward, 0, sizeof(backward));
+  forward.source_fd = client_fd;
+  forward.target_fd = target_fd;
+  forward.buffer = forward_buffer;
+  forward.source_open = 1;
+  backward.source_fd = target_fd;
+  backward.target_fd = client_fd;
+  backward.buffer = backward_buffer;
+  backward.source_open = 1;
+
+  for (;;) {
+    struct pollfd poll_fds[4];
+    int poll_roles[4];
+    nfds_t poll_count = 0;
+    int ready;
+    int failed = 0;
+
+    if (forward.source_open && forward.length < PM_ROUTER_BUFFER_SIZE) {
+      poll_fds[poll_count].fd = forward.source_fd;
+      poll_fds[poll_count].events = POLLIN;
+      poll_fds[poll_count].revents = 0;
+      poll_roles[poll_count++] = 0;
+    }
+    if (forward.length > 0) {
+      poll_fds[poll_count].fd = forward.target_fd;
+      poll_fds[poll_count].events = POLLOUT;
+      poll_fds[poll_count].revents = 0;
+      poll_roles[poll_count++] = 1;
+    }
+    if (backward.source_open && backward.length < PM_ROUTER_BUFFER_SIZE) {
+      poll_fds[poll_count].fd = backward.source_fd;
+      poll_fds[poll_count].events = POLLIN;
+      poll_fds[poll_count].revents = 0;
+      poll_roles[poll_count++] = 2;
+    }
+    if (backward.length > 0) {
+      poll_fds[poll_count].fd = backward.target_fd;
+      poll_fds[poll_count].events = POLLOUT;
+      poll_fds[poll_count].revents = 0;
+      poll_roles[poll_count++] = 3;
+    }
+
+    if (poll_count == 0) {
+      break;
+    }
+
+    ready = poll(poll_fds, poll_count, -1);
+    if (ready < 0) {
+      if (errno == EINTR) {
+        continue;
       }
-      if (count == 0) {
-        break;
+      break;
+    }
+
+    for (nfds_t index = 0; index < poll_count; index++) {
+      short revents = poll_fds[index].revents;
+
+      if (revents == 0) {
+        continue;
       }
-      if (pm_send_all_socket(args->target_fd, buffer, (size_t)count) != 0) {
-        break;
+
+      switch (poll_roles[index]) {
+        case 0:
+          if ((revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0 &&
+              pm_proxy_direction_read(&forward) != 0) {
+            failed = 1;
+          }
+          break;
+        case 1:
+          if ((revents & (POLLHUP | POLLERR | POLLNVAL)) != 0 ||
+              ((revents & POLLOUT) != 0 && pm_proxy_direction_write(&forward) != 0)) {
+            failed = 1;
+          }
+          break;
+        case 2:
+          if ((revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0 &&
+              pm_proxy_direction_read(&backward) != 0) {
+            failed = 1;
+          }
+          break;
+        case 3:
+          if ((revents & (POLLHUP | POLLERR | POLLNVAL)) != 0 ||
+              ((revents & POLLOUT) != 0 && pm_proxy_direction_write(&backward) != 0)) {
+            failed = 1;
+          }
+          break;
+        default:
+          break;
       }
+    }
+
+    pm_proxy_direction_shutdown_if_drained(&forward);
+    pm_proxy_direction_shutdown_if_drained(&backward);
+    if (failed) {
+      break;
     }
   }
 
-  free(buffer);
-  shutdown(args->target_fd, SHUT_WR);
-  shutdown(args->source_fd, SHUT_RD);
-  free(args);
-  return NULL;
-}
-
-static void pm_proxy_connection(int client_fd, int target_fd) {
-  pthread_t client_to_target;
-  pthread_t target_to_client;
-  copy_args_t *forward = (copy_args_t *)calloc(1, sizeof(copy_args_t));
-  copy_args_t *backward = (copy_args_t *)calloc(1, sizeof(copy_args_t));
-
-  if (forward == NULL || backward == NULL) {
-    free(forward);
-    free(backward);
-    return;
-  }
-
-  forward->source_fd = client_fd;
-  forward->target_fd = target_fd;
-  backward->source_fd = target_fd;
-  backward->target_fd = client_fd;
-
-  if (pthread_create(&client_to_target, NULL, pm_copy_thread, forward) != 0) {
-    free(forward);
-    free(backward);
-    return;
-  }
-  if (pthread_create(&target_to_client, NULL, pm_copy_thread, backward) != 0) {
-    shutdown(client_fd, SHUT_RDWR);
-    shutdown(target_fd, SHUT_RDWR);
-    pthread_join(client_to_target, NULL);
-    free(backward);
-    return;
-  }
-
-  pthread_join(client_to_target, NULL);
-  pthread_join(target_to_client, NULL);
+  shutdown(client_fd, SHUT_RDWR);
+  shutdown(target_fd, SHUT_RDWR);
+  free(forward_buffer);
+  free(backward_buffer);
 }
 
 static void *pm_connection_thread(void *raw_connection) {
@@ -465,6 +633,10 @@ static int pm_create_ipv4_listener(int port) {
   }
 
   pm_set_reuseaddr(fd);
+  if (pm_set_nonblocking(fd) != 0) {
+    close(fd);
+    return -1;
+  }
   memset(&address, 0, sizeof(address));
   address.sin_family = AF_INET;
   address.sin_port = htons((uint16_t)port);
@@ -488,6 +660,10 @@ static int pm_create_ipv6_listener(int port) {
   }
 
   pm_set_reuseaddr(fd);
+  if (pm_set_nonblocking(fd) != 0) {
+    close(fd);
+    return -1;
+  }
   setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
   memset(&address, 0, sizeof(address));
   address.sin6_family = AF_INET6;
@@ -712,6 +888,18 @@ static void pm_start_connection_thread(accepted_connection_t *connection) {
   pthread_detach(thread);
 }
 
+static void pm_accept_ready_connections(int listener_fd, int logical_port) {
+  for (;;) {
+    accepted_connection_t *connection = pm_accept_connection(listener_fd, logical_port);
+
+    if (connection == NULL) {
+      break;
+    }
+
+    pm_start_connection_thread(connection);
+  }
+}
+
 static int pm_parse_port(const char *value) {
   char *end = NULL;
   long port = strtol(value, &end, 10);
@@ -830,10 +1018,7 @@ static int pm_run_event_loop(listener_list_t *listeners, line_buffer_t *input_bu
         continue;
       }
 
-      accepted_connection_t *connection = pm_accept_connection(fd, logical_port);
-      if (connection != NULL) {
-        pm_start_connection_thread(connection);
-      }
+      pm_accept_ready_connections(fd, logical_port);
     }
   }
 }
@@ -883,10 +1068,7 @@ static int pm_run_event_loop(listener_list_t *listeners, line_buffer_t *input_bu
 
     for (size_t index = 0; index < listeners->count; index++) {
       if ((poll_fds[index + 1].revents & POLLIN) != 0) {
-        accepted_connection_t *connection = pm_accept_connection(listeners->items[index].fd, listeners->items[index].logical_port);
-        if (connection != NULL) {
-          pm_start_connection_thread(connection);
-        }
+        pm_accept_ready_connections(listeners->items[index].fd, listeners->items[index].logical_port);
       }
     }
 

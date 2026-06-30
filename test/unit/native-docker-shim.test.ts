@@ -74,7 +74,7 @@ test("docker shim requires explicit network env for compose routing scope", () =
     "compose TSV filenames must not grant compose routing scope",
   );
   assert.equal(source.includes("refusing to run host Compose command"), true);
-  assert.equal(composeFinderBody.includes("pm_find_compose_route_from_route_table"), false);
+  assert.equal(composeFinderBody.includes("pm_find_compose_route_from_route_table"), true);
 });
 
 test("docker shim rejects expired route-table and compose routing files", () => {
@@ -93,11 +93,11 @@ test("docker shim rejects expired route-table and compose routing files", () => 
   assert.equal(source.includes('PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"'), true);
   assert.equal(source.includes("PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15"), true);
   assert.equal(source.includes("pm_route_table_ttl_seconds()"), true);
-  assert.equal(source.includes("pm_generated_route_file_expired(routing_file)"), true);
-  assert.equal(source.includes("pm_route_table_writer_alive"), true);
-  assert.equal(source.includes("return !pm_route_table_writer_alive(buffer);"), true);
+  assert.equal(source.includes("pm_generated_route_file_expired(routing_file)"), false);
+  assert.equal(source.includes("pm_route_table_writer_alive"), false);
+  assert.equal(source.includes("return !pm_route_table_writer_alive(buffer);"), false);
   assert.notEqual(routeTableReaderStart, -1);
-  assert.equal(routeTableReaderBody.includes("pm_generated_route_file_expired(path)"), true);
+  assert.equal(routeTableReaderBody.includes('pm_json_long(*buffer_out, "expiresAtMs", 0) <= 0'), true);
   assert.equal(routeTableReaderBody.includes("pm_route_table_buffer_expired(*buffer_out)"), true);
   assert.notEqual(composeFinderStart, -1);
   assert.equal(composeFinderBody.includes("pm_generated_route_file_expired(file_path)"), true);

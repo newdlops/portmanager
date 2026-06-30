@@ -15,6 +15,11 @@ CONTAINER_MAP_SOURCE_FILE="$ROOT_DIR/native/container-mutation/portmanager_conta
 DOCKER_SHIM_SOURCE_FILE="$ROOT_DIR/native/docker-shim/portmanager_docker_shim.c"
 AGENT_SOURCE_FILES="$ROOT_DIR/native/agent/portmanager_agent.c $ROOT_DIR/native/agent/portmanager_agent_state.c $ROOT_DIR/native/agent/portmanager_agent_json.c"
 OUTPUT_DIR="$ROOT_DIR/media/native"
+PACKAGE_VERSION="unknown"
+if command -v node >/dev/null 2>&1; then
+  PACKAGE_VERSION="$(node -e 'process.stdout.write(require(process.argv[1]).version || "unknown")' "$ROOT_DIR/package.json" 2>/dev/null || printf 'unknown')"
+fi
+AGENT_VERSION_DEFINE="-DPORTMANAGER_PACKAGE_VERSION=\"$PACKAGE_VERSION\""
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -33,7 +38,7 @@ case "$(uname -s)" in
     cc -Wall -Wextra -O2 "$PROCESS_LOOKUP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_lookup"
     cc -Wall -Wextra -O2 "$CONTAINER_MAP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_container_map"
     cc -Wall -Wextra -O2 "$DOCKER_SHIM_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_docker_shim"
-    cc -Wall -Wextra -O2 $AGENT_SOURCE_FILES -o "$OUTPUT_DIR/portmanager_agent"
+    cc -Wall -Wextra -O2 "$AGENT_VERSION_DEFINE" $AGENT_SOURCE_FILES -o "$OUTPUT_DIR/portmanager_agent"
     if command -v codesign >/dev/null 2>&1; then
       # DYLD-injected helpers must survive macOS library validation paths.
       # Linker-signed output can be rejected by some runtimes, so sign the
@@ -57,7 +62,7 @@ case "$(uname -s)" in
     cc -Wall -Wextra -O2 "$PROCESS_LOOKUP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_lookup"
     cc -Wall -Wextra -O2 "$CONTAINER_MAP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_container_map"
     cc -Wall -Wextra -O2 "$DOCKER_SHIM_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_docker_shim"
-    cc -Wall -Wextra -O2 $AGENT_SOURCE_FILES -o "$OUTPUT_DIR/portmanager_agent"
+    cc -Wall -Wextra -O2 "$AGENT_VERSION_DEFINE" $AGENT_SOURCE_FILES -o "$OUTPUT_DIR/portmanager_agent"
     ;;
   *)
     echo "Unsupported native hook platform; skipping"

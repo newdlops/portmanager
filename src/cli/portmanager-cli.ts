@@ -15,7 +15,9 @@ import { buildReroutableCommand } from "../core/terminal-conflict-parser";
 import { buildInjectedCommand, buildPortManagerEnvironment } from "../platform/process/port-injection";
 import { buildNodeRuntimeEnvironment } from "../platform/process/node-runtime";
 import { DEFAULT_PORT_MANAGER_SETTINGS } from "../shared/default-settings";
+import { isKnownPortManagerPackageVersion, readPortManagerPackageVersion } from "../shared/package-version";
 import type {
+  AgentDaemonStatus,
   AgentAllocateRouteRequest,
   ManagedProcess,
   PortInjectionMode,
@@ -32,7 +34,7 @@ import type {
  * commands an explicit daemon-managed launch path.
  */
 
-type CliCommand = "run" | "status" | "help";
+type CliCommand = "run" | "status" | "version" | "help";
 type InjectionOption = PortInjectionMode | "auto";
 
 interface ParsedCli {
@@ -89,6 +91,17 @@ interface PendingRequest {
   readonly timer: NodeJS.Timeout;
 }
 
+interface VersionCheck {
+  /** Package version read from this CLI installation. */
+  readonly expectedVersion: string;
+  /** Package version reported by the currently connected daemon. */
+  readonly daemonVersion: string;
+  /** Short compatibility label shown by status and version commands. */
+  readonly status: "current" | "stale" | "unknown";
+  /** Human-readable suffix for mismatch diagnostics. */
+  readonly detail: string;
+}
+
 if (require.main === module) {
   void main(process.argv.slice(2));
 }
@@ -107,12 +120,21 @@ async function main(args: readonly string[]): Promise<void> {
     await client.connectOrStart();
 
     if (parsed.command === "status") {
-      const snapshot = await client.request<{ agentPid: number; daemon?: { listenerCount: number; routeCount: number } }>(
-        "refreshSnapshot",
-      );
+      const daemon = await client.request<AgentDaemonStatus>("daemonStatus");
+      const version = buildVersionCheck(daemon);
       console.log(
-        `Port Manager daemon pid ${snapshot.agentPid}; listeners ${snapshot.daemon?.listenerCount ?? 0}; routes ${snapshot.daemon?.routeCount ?? 0}`,
+        `Port Manager daemon pid ${daemon.pid}; listeners ${daemon.listenerCount}; routes ${daemon.routeCount}; version ${version.daemonVersion} (${version.status}${version.detail})`,
       );
+      client.dispose();
+      return;
+    }
+
+    if (parsed.command === "version") {
+      const daemon = await client.request<AgentDaemonStatus>("daemonStatus");
+      const version = buildVersionCheck(daemon);
+      console.log(`Port Manager CLI version ${version.expectedVersion}`);
+      console.log(`Port Manager daemon version ${version.daemonVersion} (${version.status}${version.detail})`);
+      console.log(`Port Manager daemon pid ${daemon.pid}`);
       client.dispose();
       return;
     }
@@ -395,6 +417,10 @@ function parseCli(args: readonly string[]): ParsedCli {
 
   if (command === "status") {
     return { command: "status" };
+  }
+
+  if (command === "version" || command === "--version" || command === "-v") {
+    return { command: "version" };
   }
 
   if (command === "run") {
@@ -739,6 +765,37 @@ function deriveProcessName(command: string, cwd: string): string {
   return folderName.length > 0 ? folderName : commandName || "Managed Process";
 }
 
+/** Compares this CLI package version with the daemon build it is controlling. */
+function buildVersionCheck(daemon: Pick<AgentDaemonStatus, "version">): VersionCheck {
+  const expectedVersion = readPortManagerPackageVersion() ?? "unknown";
+  const daemonVersion = daemon.version ?? "unknown";
+
+  if (!isKnownPortManagerPackageVersion(expectedVersion) || !isKnownPortManagerPackageVersion(daemonVersion)) {
+    return {
+      expectedVersion,
+      daemonVersion,
+      status: "unknown",
+      detail: expectedVersion === daemonVersion ? "" : `; expected ${expectedVersion}`,
+    };
+  }
+
+  if (daemonVersion !== expectedVersion) {
+    return {
+      expectedVersion,
+      daemonVersion,
+      status: "stale",
+      detail: `; expected ${expectedVersion}; restart required`,
+    };
+  }
+
+  return {
+    expectedVersion,
+    daemonVersion,
+    status: "current",
+    detail: "",
+  };
+}
+
 /** Runtime guard for daemon response frames. */
 function isAgentResponse(value: unknown): value is AgentResponse {
   if (typeof value !== "object" || value === null) {
@@ -763,6 +820,7 @@ function toErrorMessage(error: unknown): string {
 function printUsage(): void {
   console.log(`Usage:
   portmanager status
+  portmanager version
   portmanager run --port <port> [options] -- <command ...>
 
 Options:

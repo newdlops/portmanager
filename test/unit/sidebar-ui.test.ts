@@ -49,6 +49,7 @@ test("diagnostics exposes stale routing repair and recent activity", () => {
   assert.equal(source.includes("buildRoutingTimelineRows(snapshot, agentSnapshot)"), true);
   assert.equal(source.includes('"Control Owner"'), true);
   assert.equal(source.includes("buildControlPlaneTooltip(snapshot.controlPlane)"), true);
+  assert.equal(source.includes('command: "portManager.openOwnerUi"'), true);
   assert.equal(manifest.activationEvents?.includes("onCommand:portManager.fixStaleRouting"), true);
   assert.equal(
     manifest.contributes?.commands?.some((item) => item.command === "portManager.fixStaleRouting"),
@@ -106,9 +107,13 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(typesSource.includes('export type ControlPlaneRole = "owner" | "worker" | "unowned";'), true);
   assert.equal(typesSource.includes("export interface ControlPlaneStatus"), true);
   assert.equal(typesSource.includes("readonly ownerFocusPid?: number;"), true);
+  assert.equal(typesSource.includes("readonly ownerTitle?: string;"), true);
   assert.equal(typesSource.includes("readonly controlPlane?: ControlPlaneStatus;"), true);
   assert.equal(networkServiceSource.includes("getControlPlaneStatus(): ControlPlaneStatus"), true);
   assert.equal(networkServiceSource.includes("controlPlane: this.getControlPlaneStatus()"), true);
+  assert.equal(networkServiceSource.includes("ownerTitle: owner?.title"), true);
+  assert.equal(networkServiceSource.includes("title: buildCurrentVsCodeWindowTitle()"), true);
+  assert.equal(networkServiceSource.includes("function buildCurrentVsCodeWindowTitle()"), true);
   assert.equal(networkServiceSource.includes("focusControlPlaneOwnerWindow(): Promise<boolean>"), true);
   assert.equal(networkServiceSource.includes("requestControlPlaneOwnerUiFocus"), false);
   assert.equal(networkServiceSource.includes("CONTROL_PLANE_OWNER_UI_REQUEST_PATH"), false);
@@ -122,12 +127,15 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(source.includes("if (availability.enabled) {"), true);
   assert.equal(source.includes("formatOwnerOnlyActionReason(controlPlane)"), true);
   assert.equal(source.includes("buildOwnerUiActionRows(snapshot.controlPlane)"), true);
+  assert.equal(source.includes("formatOwnerWindowTitle(controlPlane)"), true);
   assert.equal(source.includes('"Open Owner UI"'), true);
   assert.equal(commandsSource.includes('label: "$(lock) Owner actions disabled"'), true);
   assert.equal(commandsSource.includes('label: "$(window) Open Owner UI"'), true);
   assert.equal(commandsSource.includes('action: "ownerUi" as const'), true);
   assert.equal(commandsSource.includes('"portManager.openOwnerUi"'), true);
   assert.equal(commandsSource.includes("focusControlPlaneOwnerWindow()"), true);
+  assert.equal(commandsSource.includes("Port Manager owner window:"), true);
+  assert.equal(commandsSource.includes("formatOwnerWindowTitle(snapshot)"), true);
   assert.equal(commandsSource.includes("requestControlPlaneOwnerUiFocus()"), false);
   assert.equal(commandsSource.includes('action: "ownerOnly" as const'), true);
   assert.equal(manifest.activationEvents?.includes("onCommand:portManager.openOwnerUi"), true);

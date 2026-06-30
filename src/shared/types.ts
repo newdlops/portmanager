@@ -449,6 +449,8 @@ export interface ControlPlaneStatus {
   readonly ownerPid?: number;
   /** Best-known UI process PID to focus when another window asks for the owner. */
   readonly ownerFocusPid?: number;
+  /** User-facing title for the elected owner window. */
+  readonly ownerTitle?: string;
   /** True when the owner lease is fresh and its PID is still alive. */
   readonly ownerActive: boolean;
   /** Last owner lease renewal time. */
@@ -749,6 +751,10 @@ export interface AgentDaemonStatus {
   readonly routeTablePath?: string;
   /** Compiled agent entrypoint path for detecting stale daemons after extension updates. */
   readonly agentMainPath?: string;
+  /** Package version reported by the running daemon build. */
+  readonly version?: string;
+  /** Current extension package version expected by the client. */
+  readonly expectedVersion?: string;
   /** Current extension's expected agent entrypoint, when known by the client. */
   readonly expectedAgentMainPath?: string;
   /** Whether the connected daemon matches the active extension build. */

@@ -176,7 +176,7 @@ test("newer route table generation rejects stale daemon writes", async (context)
     listeningPortProvider: {
       list: async () => [],
     },
-    agentPid: 888,
+    agentPid: process.pid,
     now: fixedNow,
     routeTablePath,
     routeTableWriterStartedAtMs: 2_000,
@@ -206,6 +206,68 @@ test("newer route table generation rejects stale daemon writes", async (context)
   assert.equal(readRouteTableGeneration(routeTablePath)?.writerId, "fresh-writer");
   assert.deepEqual(readRouteTable(routeTablePath).routes, []);
   assert.equal(fs.existsSync(getRouteTablePathForLogicalPort(8001, "network-a", routeTablePath)), false);
+});
+
+test("stale daemon can reclaim route table files from a dead newer generation", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    agentPid: process.pid,
+    now: fixedNow,
+    routeTablePath,
+    routeTableWriterStartedAtMs: 1_000,
+    routeTableWriterId: "surviving-writer",
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 1234,
+    name: "node",
+    command: "node server.js",
+    cwd: "/workspace/app",
+    requestedPort: 8000,
+    actualPort: 58000,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+
+  fs.writeFileSync(
+    routeTablePath,
+    `${JSON.stringify(
+      {
+        updatedAt: fixedUpdatedAt,
+        generation: {
+          writerId: "dead-newer-writer",
+          writerStartedAtMs: 2_000,
+          sequence: 1,
+          pid: findUnusedPid(),
+        },
+        routes: [],
+      },
+      null,
+      2,
+    )}\n`,
+  );
+
+  await agent.registerExistingProcess({
+    pid: 5678,
+    name: "node",
+    command: "node other-server.js",
+    cwd: "/workspace/app",
+    requestedPort: 8001,
+    actualPort: 58001,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+
+  assert.equal(readRouteTableGeneration(routeTablePath)?.writerId, "surviving-writer");
+  assert.equal(readRouteTable(routeTablePath).routes.length, 2);
 });
 
 test("route-table TTL starts after the first bidirectional handshake and stays alive while route is registered", async (context) => {
@@ -1233,7 +1295,7 @@ test("reuses pending route allocations for sender-first and receiver-first order
   assert.equal(laterSenderAllocation.actualPort, firstReceiverAllocation.actualPort);
 });
 
-test("allocates new routes on actualHost without breaking same-port send detection", async (context) => {
+test("allocates scoped sender routes on actualHost without leaking to same-port host listeners", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const checkedHosts: string[] = [];
   const agent = new PortManagerAgent({
@@ -1297,9 +1359,10 @@ test("allocates new routes on actualHost without breaking same-port send detecti
     virtualPortRangeEnd: 58010,
   });
 
-  assert.equal(senderAllocation.actualPort, 8123);
-  assert.equal(senderAllocation.host, "127.0.0.1");
-  assert.deepEqual(checkedHosts, [actualHost]);
+  assert.notEqual(senderAllocation.allocationId, "");
+  assert.notEqual(senderAllocation.actualPort, 8123);
+  assert.equal(senderAllocation.host, actualHost);
+  assert.deepEqual(checkedHosts, [actualHost, actualHost]);
 });
 
 test("uses same-port OS listeners for sender requests before creating a shadow route", async (context) => {
@@ -1335,7 +1398,6 @@ test("uses same-port OS listeners for sender requests before creating a shadow r
     cwd: "/workspace/app",
     requestedPort: 8004,
     host: "127.0.0.1",
-    networkId: "network-a",
     routeDirection: "send",
     scanRange: 20,
     scanDirection: "up",
@@ -2302,6 +2364,20 @@ function readRouteTableGeneration(routeTablePath: string): { readonly writerId?:
 
 function readRouteTableWriterSequence(agent: PortManagerAgent): number {
   return (agent as unknown as { readonly routeTableGenerationSequence: number }).routeTableGenerationSequence;
+}
+
+function findUnusedPid(): number {
+  for (let pid = 9_999_999; pid > 9_999_000; pid -= 1) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (typeof error === "object" && error !== null && (error as { code?: unknown }).code === "ESRCH") {
+        return pid;
+      }
+    }
+  }
+
+  throw new Error("Could not find an unused PID for route-table generation test.");
 }
 
 function createRouteTablePath(context: TestContext): string {

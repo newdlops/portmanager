@@ -8,6 +8,7 @@ import { getDefaultRouteTablePath, ROUTE_TABLE_TTL_SECONDS_ENV } from "../agent/
 import { readPortManagerSettings } from "../config/vscode-settings";
 import { buildNodeRuntimeEnvironment } from "../platform/process/node-runtime";
 import { SimpleEventEmitter } from "../shared/events";
+import { isKnownPortManagerPackageVersion, readPortManagerPackageVersion } from "../shared/package-version";
 import type {
   AgentDaemonStatus,
   AgentSnapshot,
@@ -886,6 +887,8 @@ function buildClientSnapshotSignature(snapshot: AgentSnapshot): string {
     daemon.startedAt ?? "",
     daemon.routeTablePath ?? "",
     daemon.agentMainPath ?? "",
+    daemon.version ?? "",
+    daemon.expectedVersion ?? "",
     daemon.expectedAgentMainPath ?? "",
     daemon.versionStatus ?? "",
     daemon.restartRequired === true,
@@ -1068,12 +1071,14 @@ function annotateDaemonCompatibility(snapshot: AgentSnapshot, expectedAgentMainP
   const actualPath = normalizeAgentMainPath(daemon.agentMainPath);
   const expectedRouteTablePath = normalizeDaemonPath(getDefaultRouteTablePath());
   const actualRouteTablePath = normalizeDaemonPath(daemon.routeTablePath);
+  const expectedVersion = readPortManagerPackageVersion();
 
   if (daemon.status !== "running" || daemon.pid <= 0) {
     return {
       ...snapshot,
       daemon: {
         ...daemon,
+        expectedVersion,
         expectedAgentMainPath: expectedPath,
         versionStatus: "unknown",
         restartRequired: false,
@@ -1082,15 +1087,30 @@ function annotateDaemonCompatibility(snapshot: AgentSnapshot, expectedAgentMainP
   }
 
   const missingAgentMetadata = actualPath === undefined;
+  const missingVersionMetadata = !isKnownPortManagerPackageVersion(daemon.version);
+  const versionMismatch =
+    isKnownPortManagerPackageVersion(daemon.version) &&
+    isKnownPortManagerPackageVersion(expectedVersion) &&
+    daemon.version !== expectedVersion;
   const pathMismatch = actualPath !== undefined && actualPath !== expectedPath;
   const routeTablePathMismatch = actualRouteTablePath !== undefined && actualRouteTablePath !== expectedRouteTablePath;
   const olderThanCurrentBuild = isDaemonOlderThanAgentMain(daemon, expectedAgentMainPath);
-  const restartRequired = missingAgentMetadata || pathMismatch || routeTablePathMismatch || olderThanCurrentBuild;
+  const restartRequired =
+    missingAgentMetadata ||
+    missingVersionMetadata ||
+    versionMismatch ||
+    pathMismatch ||
+    routeTablePathMismatch ||
+    olderThanCurrentBuild;
   const staleWarning = missingAgentMetadata
     ? "Connected daemon does not expose version metadata; restart it with the active extension build."
-    : routeTablePathMismatch
-      ? "Connected daemon publishes route tables outside the active extension storage; restart required."
-      : "Connected daemon is older than the active extension build; restart required.";
+    : missingVersionMetadata
+      ? "Connected daemon does not expose package version metadata; restart it with the active extension build."
+      : versionMismatch
+        ? `Connected daemon version ${daemon.version} does not match active extension version ${expectedVersion}; restart required.`
+        : routeTablePathMismatch
+          ? "Connected daemon publishes route tables outside the active extension storage; restart required."
+          : "Connected daemon is older than the active extension build; restart required.";
   const warning = restartRequired
     ? appendDaemonWarning(daemon.errorMessage, staleWarning)
     : daemon.errorMessage;
@@ -1099,6 +1119,7 @@ function annotateDaemonCompatibility(snapshot: AgentSnapshot, expectedAgentMainP
     ...snapshot,
     daemon: {
       ...daemon,
+      expectedVersion,
       expectedAgentMainPath: expectedPath,
       versionStatus: restartRequired ? "stale" : "current",
       restartRequired,

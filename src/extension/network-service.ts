@@ -223,6 +223,8 @@ interface LogicalRouterOwnerDocument {
   readonly pid: number;
   /** Best-known UI process PID for direct cross-window focusing. */
   readonly focusPid?: number;
+  /** User-facing title recorded by the owner window for worker diagnostics. */
+  readonly title?: string;
   /** Lease renewal time; stale leases can be stolen by another active window. */
   readonly updatedAt: string;
 }
@@ -828,6 +830,7 @@ export class PortManagerNetworkService implements DisposableLike {
       currentPid: process.pid,
       ownerPid: owner?.pid,
       ownerFocusPid: owner?.focusPid,
+      ownerTitle: owner?.title,
       ownerActive,
       ownerUpdatedAt: owner?.updatedAt,
       leaseExpiresAt,
@@ -1083,7 +1086,16 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /** Refreshes VS Code and external OS terminal windows. */
-  async refreshTerminals(): Promise<readonly TerminalWindow[]> {
+  async refreshTerminals(options: BackgroundRefreshOptions = {}): Promise<readonly TerminalWindow[]> {
+    if (!this.ownsControlPlaneLease) {
+      if (options.force === true) {
+        await this.startControlPlaneOwnerIfAvailable();
+      }
+      if (!this.ownsControlPlaneLease) {
+        return this.registry.getSnapshot().terminalWindows;
+      }
+    }
+
     if (this.terminalRefreshInFlight !== undefined) {
       this.terminalRefreshQueued = true;
       return this.terminalRefreshInFlight;
@@ -2359,6 +2371,7 @@ export class PortManagerNetworkService implements DisposableLike {
       await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
       await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });
       await this.writeTerminalNetworkSelectionFile();
+      await this.rehydrateBrowserDnsAndProxies().catch(() => undefined);
       await this.syncLogicalPortRouters();
     } else if (this.ownsControlPlaneLease) {
       this.demoteControlPlaneOwner();
@@ -2782,6 +2795,7 @@ export class PortManagerNetworkService implements DisposableLike {
      * cleaned and the daemon must write its current snapshot back to disk.
      */
     await this.ensureDaemonRouteTablesMaterialized().catch(() => undefined);
+    await this.rehydrateBrowserDnsAndProxies().catch(() => undefined);
     await this.syncLogicalPortRouters().catch(() => undefined);
   }
 
@@ -4381,7 +4395,7 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * Restores browser-facing DNS/proxy state after generated storage cleanup.
+   * Restores browser-facing DNS/proxy state after generated state is rebuilt.
    *
    * Resolver files live outside globalStorage, but DNS records and browser proxy
    * listeners are in-memory data plane state. Re-sync them here so browser aliases
@@ -7934,6 +7948,7 @@ function writeControlPlaneOwnerLease(nowMs: number): boolean {
       `${JSON.stringify({
         pid: process.pid,
         focusPid: resolveControlPlaneFocusPid(),
+        title: buildCurrentVsCodeWindowTitle(),
         updatedAt: new Date(nowMs).toISOString(),
       })}\n`,
       "utf8",
@@ -8129,7 +8144,22 @@ function readOwnerDocument(filePath: string): LogicalRouterOwnerDocument | undef
     return undefined;
   }
 
-  return { pid: owner.pid, updatedAt: owner.updatedAt };
+  return {
+    pid: owner.pid,
+    ...(typeof owner.focusPid === "number" && Number.isInteger(owner.focusPid) && owner.focusPid > 0
+      ? { focusPid: owner.focusPid }
+      : {}),
+    ...(typeof owner.title === "string" && owner.title.trim().length > 0 ? { title: owner.title.trim() } : {}),
+    updatedAt: owner.updatedAt,
+  };
+}
+
+function buildCurrentVsCodeWindowTitle(): string {
+  const workspaceName = vscode.workspace.name?.trim();
+  const folderName = vscode.workspace.workspaceFolders?.[0]?.name.trim();
+  const title = workspaceName && workspaceName.length > 0 ? workspaceName : folderName;
+
+  return title === undefined || title.length === 0 ? vscode.env.appName : `${title} - ${vscode.env.appName}`;
 }
 
 function readBrowserNetworkProxyOwner(): LogicalRouterOwnerDocument | undefined {

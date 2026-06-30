@@ -38,9 +38,11 @@
 #define PM_MAX_PATH 1024
 #define PM_MAX_SHEBANG 4096
 #define PM_MAX_SCRIPT_LINE 4096
-#define PM_MAX_ROUTES 32768
+#define PM_ROUTE_MAPPING_INITIAL_CAPACITY 128
+#define PM_ROUTE_MAPPING_MAX_CAPACITY 65535
 #define PM_MAX_ROUTE_OBJECT 8192
-#define PM_ROUTE_FILE_CACHE_CAPACITY 64
+#define PM_ROUTE_FILE_CACHE_INITIAL_CAPACITY 128
+#define PM_ROUTE_FILE_CACHE_MAX_CAPACITY 65535
 #define PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"
 #define PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15
 #define PM_DEFAULT_SCAN_RANGE 20
@@ -51,6 +53,10 @@
 #define PM_BIND_ALLOCATION_ATTEMPTS 4
 #define PM_COMPOSE_ROUTE_WAIT_MS 10000
 #define PM_CONNECT_ROUTE_WAIT_MS 1000
+#define PM_ROUTE_ALLOCATION_TTL_MS 300000
+#define PM_SEND_ALLOCATION_JOIN_WAIT_MS 1000
+#define PM_SEND_ALLOCATION_LOCK_STALE_MS 10000
+#define PM_SEND_ALLOCATION_LOCK_POLL_MS 25
 #define PM_ACTUAL_LOOPBACK_HOST_ENV "PORT_MANAGER_ACTUAL_LOOPBACK_HOST"
 #define PM_NETWORK_LOOPBACK_HOST_ENV "PORT_MANAGER_NETWORK_LOOPBACK_HOST"
 
@@ -78,6 +84,7 @@ typedef int (*pm_posix_spawnp_fn)(
 typedef struct {
   int logical_port;
   int actual_port;
+  long expires_at_ms;
   char allocation_id[PM_MAX_TEXT];
   char host[128];
   char network_id[PM_MAX_TEXT];
@@ -125,18 +132,24 @@ static pm_posix_spawn_fn pm_real_posix_spawn = NULL;
 static pm_posix_spawnp_fn pm_real_posix_spawnp = NULL;
 #endif
 static __thread int pm_hook_depth = 0;
-static pm_route_mapping pm_routes[PM_MAX_ROUTES];
-static int pm_route_count = 0;
-static pm_route_file_cache_entry pm_route_file_cache[PM_ROUTE_FILE_CACHE_CAPACITY];
+static pm_route_mapping *pm_routes = NULL;
+static size_t pm_route_count = 0;
+static size_t pm_route_capacity = 0;
+static pm_route_file_cache_entry *pm_route_file_cache = NULL;
+static size_t pm_route_file_cache_count = 0;
+static size_t pm_route_file_cache_capacity = 0;
 static unsigned long pm_request_sequence = 1;
 static unsigned long pm_route_file_cache_tick = 1;
 static pthread_mutex_t pm_route_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t pm_route_file_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void pm_release_process_routes(void);
+static void pm_clear_memory_routes(void);
+static void pm_clear_route_file_cache(void);
 static const char *pm_actual_loopback_host(void);
 static const char *pm_current_network_id(void);
 static const char *pm_network_loopback_host(void);
+static int pm_connect_route_table_lookup(int logical_port, char *target_host, size_t target_host_size, int *is_compose_route);
 extern char **environ;
 
 static int pm_hook_enabled(void) {
@@ -1304,6 +1317,8 @@ __attribute__((constructor)) static void pm_hook_loaded(void) {
 
 __attribute__((destructor)) static void pm_hook_unloaded(void) {
   pm_release_process_routes();
+  pm_clear_memory_routes();
+  pm_clear_route_file_cache();
 }
 
 static void *pm_resolve_symbol(const char *name) {
@@ -2359,21 +2374,6 @@ static int pm_route_file_stat_expired(const struct stat *stat_buffer) {
   return now_ms - mtime_ms > pm_route_table_ttl_seconds() * 1000L;
 }
 
-/** True when the daemon generation that wrote a route table is still alive. */
-static int pm_route_file_writer_alive(const char *buffer) {
-  long pid = pm_json_long(buffer, "pid", 0);
-
-  if (pid <= 0) {
-    return 0;
-  }
-
-  if (kill((pid_t)pid, 0) == 0) {
-    return 1;
-  }
-
-  return errno == EPERM;
-}
-
 /** New route-table documents expose an explicit wall-clock expiry for readers. */
 static int pm_route_file_buffer_expired(const char *buffer) {
   long expires_at_ms;
@@ -2393,7 +2393,7 @@ static int pm_route_file_buffer_expired(const char *buffer) {
     return 0;
   }
 
-  return !pm_route_file_writer_alive(buffer);
+  return 1;
 }
 
 static void pm_clear_route_file_cache_entry(pm_route_file_cache_entry *entry) {
@@ -2403,6 +2403,18 @@ static void pm_clear_route_file_cache_entry(pm_route_file_cache_entry *entry) {
 
   free(entry->routes);
   memset(entry, 0, sizeof(*entry));
+}
+
+static void pm_clear_route_file_cache(void) {
+  pthread_mutex_lock(&pm_route_file_cache_mutex);
+  for (size_t index = 0; index < pm_route_file_cache_count; index++) {
+    pm_clear_route_file_cache_entry(&pm_route_file_cache[index]);
+  }
+  free(pm_route_file_cache);
+  pm_route_file_cache = NULL;
+  pm_route_file_cache_count = 0;
+  pm_route_file_cache_capacity = 0;
+  pthread_mutex_unlock(&pm_route_file_cache_mutex);
 }
 
 static int pm_route_file_cache_entry_matches(
@@ -2453,7 +2465,7 @@ static int pm_get_cached_route_file(
   int found = 0;
 
   pthread_mutex_lock(&pm_route_file_cache_mutex);
-  for (int index = 0; index < PM_ROUTE_FILE_CACHE_CAPACITY; index++) {
+  for (size_t index = 0; index < pm_route_file_cache_count; index++) {
     pm_route_file_cache_entry *entry = &pm_route_file_cache[index];
     if (!pm_route_file_cache_entry_matches(entry, path, stat_buffer)) {
       continue;
@@ -2468,20 +2480,44 @@ static int pm_get_cached_route_file(
   return found ? 0 : -1;
 }
 
-static pm_route_file_cache_entry *pm_select_route_file_cache_slot(void) {
-  pm_route_file_cache_entry *oldest = &pm_route_file_cache[0];
+static int pm_ensure_route_file_cache_capacity(size_t required) {
+  size_t next_capacity;
+  pm_route_file_cache_entry *next_cache;
 
-  for (int index = 0; index < PM_ROUTE_FILE_CACHE_CAPACITY; index++) {
-    pm_route_file_cache_entry *entry = &pm_route_file_cache[index];
-    if (entry->path[0] == '\0') {
-      return entry;
+  if (required <= pm_route_file_cache_capacity) {
+    return 0;
+  }
+  if (required > PM_ROUTE_FILE_CACHE_MAX_CAPACITY) {
+    return -1;
+  }
+
+  next_capacity = pm_route_file_cache_capacity == 0 ? PM_ROUTE_FILE_CACHE_INITIAL_CAPACITY : pm_route_file_cache_capacity;
+  while (next_capacity < required) {
+    if (next_capacity >= PM_ROUTE_FILE_CACHE_MAX_CAPACITY) {
+      next_capacity = PM_ROUTE_FILE_CACHE_MAX_CAPACITY;
+      break;
     }
-    if (entry->last_used < oldest->last_used) {
-      oldest = entry;
+    if (next_capacity > PM_ROUTE_FILE_CACHE_MAX_CAPACITY / 2) {
+      next_capacity = PM_ROUTE_FILE_CACHE_MAX_CAPACITY;
+    } else {
+      next_capacity *= 2;
     }
   }
 
-  return oldest;
+  next_cache = (pm_route_file_cache_entry *)realloc(
+    pm_route_file_cache,
+    next_capacity * sizeof(pm_route_file_cache_entry));
+  if (next_cache == NULL) {
+    return -1;
+  }
+
+  memset(
+    next_cache + pm_route_file_cache_capacity,
+    0,
+    (next_capacity - pm_route_file_cache_capacity) * sizeof(pm_route_file_cache_entry));
+  pm_route_file_cache = next_cache;
+  pm_route_file_cache_capacity = next_capacity;
+  return 0;
 }
 
 static void pm_store_route_file_cache(
@@ -2489,7 +2525,7 @@ static void pm_store_route_file_cache(
   const struct stat *stat_buffer,
   const pm_cached_route *routes,
   size_t route_count) {
-  pm_route_file_cache_entry *entry;
+  pm_route_file_cache_entry *entry = NULL;
   pm_cached_route *copy = NULL;
 
   if (route_count > 0) {
@@ -2501,7 +2537,22 @@ static void pm_store_route_file_cache(
   }
 
   pthread_mutex_lock(&pm_route_file_cache_mutex);
-  entry = pm_select_route_file_cache_slot();
+  for (size_t index = 0; index < pm_route_file_cache_count; index++) {
+    if (strcmp(pm_route_file_cache[index].path, path) == 0) {
+      entry = &pm_route_file_cache[index];
+      break;
+    }
+  }
+
+  if (entry == NULL) {
+    if (pm_ensure_route_file_cache_capacity(pm_route_file_cache_count + 1) != 0) {
+      pthread_mutex_unlock(&pm_route_file_cache_mutex);
+      free(copy);
+      return;
+    }
+    entry = &pm_route_file_cache[pm_route_file_cache_count++];
+  }
+
   pm_clear_route_file_cache_entry(entry);
   snprintf(entry->path, sizeof(entry->path), "%s", path);
   entry->mtime_sec = pm_stat_mtime_sec(stat_buffer);
@@ -2660,7 +2711,7 @@ static int pm_cached_route_network_match_level(const pm_cached_route *route) {
   }
 
   if (!route->has_network_id) {
-    return 1;
+    return 0;
   }
 
   return strcmp(route->network_id, network_id) == 0 ? 2 : 0;
@@ -2769,6 +2820,214 @@ static int pm_response_ok(const char *response) {
   return strstr(response, "\"ok\":true") != NULL || strstr(response, "\"ok\": true") != NULL;
 }
 
+static int pm_process_is_alive(pid_t pid) {
+  if (pid <= 0) {
+    return 0;
+  }
+
+  if (kill(pid, 0) == 0) {
+    return 1;
+  }
+
+  return errno == EPERM;
+}
+
+static pid_t pm_lock_owner_pid(const char *path) {
+  char buffer[64];
+  int fd;
+  ssize_t count;
+  char *end = NULL;
+  long pid;
+
+  fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    return 0;
+  }
+
+  count = read(fd, buffer, sizeof(buffer) - 1);
+  close(fd);
+  if (count <= 0) {
+    return 0;
+  }
+
+  buffer[count] = '\0';
+  pid = strtol(buffer, &end, 10);
+  if (end == buffer || pid <= 0) {
+    return 0;
+  }
+
+  return (pid_t)pid;
+}
+
+static int pm_send_allocation_lock_path(int logical_port, char *buffer, size_t size) {
+  char route_table_path[PM_MAX_PATH];
+  char route_entry_path[PM_MAX_PATH];
+  int written;
+
+  if (buffer == NULL || size == 0 || logical_port <= 0) {
+    return -1;
+  }
+
+  pm_effective_route_table_path(route_table_path, sizeof(route_table_path));
+  if (route_table_path[0] == '\0') {
+    return -1;
+  }
+
+  pm_route_entry_path(route_table_path, logical_port, route_entry_path, sizeof(route_entry_path));
+  written = snprintf(buffer, size, "%s.send.lock", route_entry_path);
+  return written > 0 && (size_t)written < size ? 0 : -1;
+}
+
+static int pm_try_remove_stale_lock(const char *path) {
+  struct stat stat_buffer;
+  long now_ms;
+  long mtime_ms;
+  pid_t owner_pid;
+
+  if (path == NULL || stat(path, &stat_buffer) != 0) {
+    return 0;
+  }
+
+  now_ms = pm_now_milliseconds();
+  mtime_ms = (long)pm_stat_mtime_sec(&stat_buffer) * 1000L + pm_stat_mtime_nsec(&stat_buffer) / 1000000L;
+  owner_pid = pm_lock_owner_pid(path);
+  if (
+    now_ms > 0 &&
+    mtime_ms > 0 &&
+    now_ms - mtime_ms > PM_SEND_ALLOCATION_LOCK_STALE_MS &&
+    !pm_process_is_alive(owner_pid)
+  ) {
+    return unlink(path) == 0;
+  }
+
+  return 0;
+}
+
+static int pm_try_acquire_send_allocation_lock(const char *path) {
+  char payload[64];
+  int fd;
+  int written;
+
+  if (path == NULL || path[0] == '\0') {
+    return 0;
+  }
+
+  fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+  if (fd < 0 && errno == EEXIST && pm_try_remove_stale_lock(path)) {
+    fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+  }
+  if (fd < 0) {
+    return 0;
+  }
+
+  written = snprintf(payload, sizeof(payload), "%ld\n%ld\n", (long)getpid(), pm_now_milliseconds());
+  if (written > 0) {
+    (void)write(fd, payload, (size_t)written);
+  }
+  close(fd);
+  return 1;
+}
+
+static void pm_release_send_allocation_lock(const char *path) {
+  if (path != NULL && path[0] != '\0') {
+    unlink(path);
+  }
+}
+
+static int pm_reuse_existing_send_route(
+  int logical_port,
+  int *actual_port,
+  char *allocation_id,
+  size_t allocation_size,
+  char *allocated_host,
+  size_t allocated_host_size) {
+  char target_host[128];
+  int route_is_compose = 0;
+  int route_port;
+
+  target_host[0] = '\0';
+  route_port = pm_connect_route_table_lookup(logical_port, target_host, sizeof(target_host), &route_is_compose);
+  (void)route_is_compose;
+  if (route_port <= 0) {
+    return 0;
+  }
+
+  if (actual_port != NULL) {
+    *actual_port = route_port;
+  }
+  if (allocation_id != NULL && allocation_size > 0) {
+    allocation_id[0] = '\0';
+  }
+  if (allocated_host != NULL && allocated_host_size > 0) {
+    snprintf(allocated_host, allocated_host_size, "%s", target_host[0] == '\0' ? "127.0.0.1" : target_host);
+  }
+  pm_debug("joined route allocation logical=%d actual=%d host=%s", logical_port, route_port, target_host);
+  return 1;
+}
+
+static int pm_join_or_acquire_send_allocation_lock(
+  int logical_port,
+  char *lock_path,
+  size_t lock_path_size,
+  int *actual_port,
+  char *allocation_id,
+  size_t allocation_size,
+  char *allocated_host,
+  size_t allocated_host_size) {
+  int wait_ms;
+  int waited_ms = 0;
+
+  if (pm_send_allocation_lock_path(logical_port, lock_path, lock_path_size) != 0) {
+    return 0;
+  }
+
+  /*
+   * This lock is not an ownership decision for servers. It only lets sender-first
+   * connect() hooks converge behind the first route allocation instead of
+   * stampeding the single daemon when many polling clients start together.
+   */
+  wait_ms = pm_parse_int_env("PORT_MANAGER_SEND_ALLOCATION_JOIN_WAIT_MS", PM_SEND_ALLOCATION_JOIN_WAIT_MS);
+  if (wait_ms > 10000) {
+    wait_ms = 10000;
+  }
+
+  while (waited_ms <= wait_ms) {
+    if (pm_reuse_existing_send_route(
+          logical_port,
+          actual_port,
+          allocation_id,
+          allocation_size,
+          allocated_host,
+          allocated_host_size)) {
+      return -1;
+    }
+
+    if (pm_try_acquire_send_allocation_lock(lock_path)) {
+      if (pm_reuse_existing_send_route(
+            logical_port,
+            actual_port,
+            allocation_id,
+            allocation_size,
+            allocated_host,
+            allocated_host_size)) {
+        pm_release_send_allocation_lock(lock_path);
+        return -1;
+      }
+      return 1;
+    }
+
+    if (waited_ms >= wait_ms) {
+      break;
+    }
+
+    usleep(PM_SEND_ALLOCATION_LOCK_POLL_MS * 1000);
+    waited_ms += PM_SEND_ALLOCATION_LOCK_POLL_MS;
+  }
+
+  pm_debug("send allocation lock busy logical=%d wait_ms=%d; falling back to daemon request", logical_port, waited_ms);
+  return 0;
+}
+
 static int pm_allocate_route(
   int logical_port,
   const char *host,
@@ -2790,7 +3049,10 @@ static int pm_allocate_route(
   char network_payload[PM_MAX_TEXT * 3];
   char request[PM_MAX_REQUEST];
   char response[PM_MAX_RESPONSE];
+  char send_allocation_lock_path[PM_MAX_PATH];
   unsigned long sequence = __sync_fetch_and_add(&pm_request_sequence, 1);
+  int owns_send_allocation_lock = 0;
+  int is_sender_first_route = route_direction != NULL && strcmp(route_direction, "send") == 0;
 
   pm_cwd(cwd, sizeof(cwd));
   pm_command_name(command, sizeof(command));
@@ -2833,7 +3095,28 @@ static int pm_allocate_route(
     actual_host != NULL && actual_host[0] != '\0' ? actual_host : host,
     route_direction_json,
     pm_routing_mode());
+
+  send_allocation_lock_path[0] = '\0';
+  if (is_sender_first_route) {
+    int join_result = pm_join_or_acquire_send_allocation_lock(
+      logical_port,
+      send_allocation_lock_path,
+      sizeof(send_allocation_lock_path),
+      actual_port,
+      allocation_id,
+      allocation_size,
+      allocated_host,
+      allocated_host_size);
+    if (join_result < 0) {
+      return 0;
+    }
+    owns_send_allocation_lock = join_result > 0;
+  }
+
   if (pm_agent_roundtrip(request, response, sizeof(response)) != 0 || !pm_response_ok(response)) {
+    if (owns_send_allocation_lock) {
+      pm_release_send_allocation_lock(send_allocation_lock_path);
+    }
     pm_debug("allocateRoute failed logical=%d response=%.240s", logical_port, response);
     return -1;
   }
@@ -2854,6 +3137,9 @@ static int pm_allocate_route(
     allocated_host != NULL && allocated_host[0] != '\0' ? allocated_host : "",
     allocation_id);
 
+  if (owns_send_allocation_lock) {
+    pm_release_send_allocation_lock(send_allocation_lock_path);
+  }
   return 0;
 }
 
@@ -2951,9 +3237,53 @@ static int pm_release_process_route(const pm_route_mapping *route) {
   return pm_send_simple_payload("releaseProcessRoute", payload);
 }
 
+static int pm_ensure_memory_route_capacity(size_t required) {
+  size_t next_capacity;
+  pm_route_mapping *next_routes;
+
+  if (required <= pm_route_capacity) {
+    return 0;
+  }
+  if (required > PM_ROUTE_MAPPING_MAX_CAPACITY) {
+    return -1;
+  }
+
+  next_capacity = pm_route_capacity == 0 ? PM_ROUTE_MAPPING_INITIAL_CAPACITY : pm_route_capacity;
+  while (next_capacity < required) {
+    if (next_capacity >= PM_ROUTE_MAPPING_MAX_CAPACITY) {
+      next_capacity = PM_ROUTE_MAPPING_MAX_CAPACITY;
+      break;
+    }
+    if (next_capacity > PM_ROUTE_MAPPING_MAX_CAPACITY / 2) {
+      next_capacity = PM_ROUTE_MAPPING_MAX_CAPACITY;
+    } else {
+      next_capacity *= 2;
+    }
+  }
+
+  next_routes = (pm_route_mapping *)realloc(pm_routes, next_capacity * sizeof(pm_route_mapping));
+  if (next_routes == NULL) {
+    return -1;
+  }
+
+  memset(next_routes + pm_route_capacity, 0, (next_capacity - pm_route_capacity) * sizeof(pm_route_mapping));
+  pm_routes = next_routes;
+  pm_route_capacity = next_capacity;
+  return 0;
+}
+
+static void pm_clear_memory_routes(void) {
+  pthread_mutex_lock(&pm_route_mutex);
+  free(pm_routes);
+  pm_routes = NULL;
+  pm_route_count = 0;
+  pm_route_capacity = 0;
+  pthread_mutex_unlock(&pm_route_mutex);
+}
+
 static void pm_release_process_routes(void) {
   pm_route_mapping *routes;
-  int route_count;
+  size_t route_count;
 
   /*
    * Listener scans are intentionally conservative, but the process that owns a
@@ -2962,9 +3292,9 @@ static void pm_release_process_routes(void) {
    */
   pthread_mutex_lock(&pm_route_mutex);
   route_count = pm_route_count;
-  routes = route_count <= 0 ? NULL : (pm_route_mapping *)malloc((size_t)route_count * sizeof(pm_route_mapping));
+  routes = route_count == 0 ? NULL : (pm_route_mapping *)malloc(route_count * sizeof(pm_route_mapping));
   if (routes != NULL) {
-    memcpy(routes, pm_routes, (size_t)route_count * sizeof(pm_route_mapping));
+    memcpy(routes, pm_routes, route_count * sizeof(pm_route_mapping));
   }
   pthread_mutex_unlock(&pm_route_mutex);
 
@@ -2972,7 +3302,7 @@ static void pm_release_process_routes(void) {
     return;
   }
 
-  for (int index = 0; index < route_count; index++) {
+  for (size_t index = 0; index < route_count; index++) {
     if (pm_release_process_route(&routes[index]) != 0) {
       break;
     }
@@ -2980,16 +3310,23 @@ static void pm_release_process_routes(void) {
   free(routes);
 }
 
-static void pm_remember_route(int logical_port, int actual_port, const char *host, const char *allocation_id) {
+static int pm_memory_route_expired(const pm_route_mapping *route, long now_ms) {
+  return route != NULL && route->expires_at_ms > 0 && now_ms > 0 && now_ms >= route->expires_at_ms;
+}
+
+static void pm_remember_route(int logical_port, int actual_port, const char *host, const char *allocation_id, long lease_ms) {
   pm_route_mapping *slot;
   const char *network_id = pm_current_network_id();
   const char *route_network_id = network_id == NULL ? "" : network_id;
+  long now_ms = pm_now_milliseconds();
+  long expires_at_ms = lease_ms > 0 && now_ms > 0 ? now_ms + lease_ms : 0;
 
   pthread_mutex_lock(&pm_route_mutex);
-  for (int index = 0; index < pm_route_count; index++) {
+  for (size_t index = 0; index < pm_route_count; index++) {
     if (pm_routes[index].logical_port == logical_port && strcmp(pm_routes[index].network_id, route_network_id) == 0) {
       slot = &pm_routes[index];
       slot->actual_port = actual_port;
+      slot->expires_at_ms = expires_at_ms;
       snprintf(slot->host, sizeof(slot->host), "%s", host);
       snprintf(slot->allocation_id, sizeof(slot->allocation_id), "%s", allocation_id);
       pthread_mutex_unlock(&pm_route_mutex);
@@ -2997,7 +3334,7 @@ static void pm_remember_route(int logical_port, int actual_port, const char *hos
     }
   }
 
-  if (pm_route_count >= PM_MAX_ROUTES) {
+  if (pm_ensure_memory_route_capacity(pm_route_count + 1) != 0) {
     pthread_mutex_unlock(&pm_route_mutex);
     return;
   }
@@ -3005,6 +3342,7 @@ static void pm_remember_route(int logical_port, int actual_port, const char *hos
   slot = &pm_routes[pm_route_count++];
   slot->logical_port = logical_port;
   slot->actual_port = actual_port;
+  slot->expires_at_ms = expires_at_ms;
   snprintf(slot->host, sizeof(slot->host), "%s", host);
   snprintf(slot->allocation_id, sizeof(slot->allocation_id), "%s", allocation_id);
   snprintf(slot->network_id, sizeof(slot->network_id), "%s", route_network_id);
@@ -3016,15 +3354,23 @@ static int pm_memory_actual_for_logical(int logical_port, char *target_host, siz
   const char *route_network_id = network_id == NULL ? "" : network_id;
   int actual_port = 0;
   char host[128];
+  long now_ms = pm_now_milliseconds();
 
   host[0] = '\0';
   pthread_mutex_lock(&pm_route_mutex);
-  for (int index = 0; index < pm_route_count; index++) {
+  for (size_t index = 0; index < pm_route_count;) {
+    if (pm_memory_route_expired(&pm_routes[index], now_ms)) {
+      memmove(&pm_routes[index], &pm_routes[index + 1], (pm_route_count - index - 1) * sizeof(pm_route_mapping));
+      pm_route_count--;
+      continue;
+    }
+
     if (pm_routes[index].logical_port == logical_port && strcmp(pm_routes[index].network_id, route_network_id) == 0) {
       actual_port = pm_routes[index].actual_port;
       snprintf(host, sizeof(host), "%s", pm_routes[index].host);
       break;
     }
+    index++;
   }
   pthread_mutex_unlock(&pm_route_mutex);
 
@@ -3039,13 +3385,21 @@ static int pm_memory_logical_for_actual(int actual_port) {
   const char *network_id = pm_current_network_id();
   const char *route_network_id = network_id == NULL ? "" : network_id;
   int logical_port = 0;
+  long now_ms = pm_now_milliseconds();
 
   pthread_mutex_lock(&pm_route_mutex);
-  for (int index = 0; index < pm_route_count; index++) {
+  for (size_t index = 0; index < pm_route_count;) {
+    if (pm_memory_route_expired(&pm_routes[index], now_ms)) {
+      memmove(&pm_routes[index], &pm_routes[index + 1], (pm_route_count - index - 1) * sizeof(pm_route_mapping));
+      pm_route_count--;
+      continue;
+    }
+
     if (pm_routes[index].actual_port == actual_port && strcmp(pm_routes[index].network_id, route_network_id) == 0) {
       logical_port = pm_routes[index].logical_port;
       break;
     }
+    index++;
   }
   pthread_mutex_unlock(&pm_route_mutex);
 
@@ -3363,7 +3717,7 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
     if (result == 0) {
       char logical_text[16];
 
-      pm_remember_route(logical_port, logical_port, host, "");
+      pm_remember_route(logical_port, logical_port, host, "", 0);
       snprintf(logical_text, sizeof(logical_text), "%d", logical_port);
       setenv("PORT_MANAGER_LOGICAL_PORT", logical_text, 1);
       setenv("PORT_MANAGER_ACTUAL_PORT", logical_text, 1);
@@ -3385,7 +3739,7 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
     if (result == 0) {
       char logical_text[16];
 
-      pm_remember_route(logical_port, logical_port, loopback_host, "");
+      pm_remember_route(logical_port, logical_port, loopback_host, "", 0);
       snprintf(logical_text, sizeof(logical_text), "%d", logical_port);
       setenv("PORT_MANAGER_LOGICAL_PORT", logical_text, 1);
       setenv("PORT_MANAGER_ACTUAL_PORT", logical_text, 1);
@@ -3476,7 +3830,7 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
     char logical_text[16];
     char actual_text[16];
 
-    pm_remember_route(logical_port, actual_port, bind_host, allocation_id);
+    pm_remember_route(logical_port, actual_port, bind_host, allocation_id, 0);
     snprintf(logical_text, sizeof(logical_text), "%d", logical_port);
     snprintf(actual_text, sizeof(actual_text), "%d", actual_port);
     setenv("PORT_MANAGER_LOGICAL_PORT", logical_text, 1);
@@ -3630,10 +3984,11 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
       }
       /*
        * connect() may arrive before the server bind(). Keep the daemon's
-       * pending route as the shared endpoint reservation, but do not cache it
-       * forever in-process; if the daemon TTL expires, later retries can
-       * allocate the next live reservation.
+       * pending route as the shared endpoint reservation and cache it only for
+       * that lease window so retry loops do not depend on route-file flush
+       * timing but stale reservations still age out.
        */
+      pm_remember_route(logical_port, actual_port, target_host, allocation_id, PM_ROUTE_ALLOCATION_TTL_MS);
       pm_debug("connect allocated route logical=%d actual=%d host=%s allocation=%s", logical_port, actual_port, target_host, allocation_id);
     }
   }
