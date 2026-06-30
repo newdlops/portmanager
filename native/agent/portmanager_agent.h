@@ -132,6 +132,7 @@ typedef struct {
   char route_table_writer_id[PM_ID];
   long route_table_writer_started_ms;
   unsigned long route_table_sequence;
+  time_t established_route_observation_scan_after;
   unsigned long next_process_id;
   unsigned long next_allocation_id;
   pid_t agent_pid;

@@ -28,6 +28,7 @@
 #define PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15
 /* Pre-handshake routes use a cleanup lease; the idle TTL starts only after bidirectional traffic. */
 #define PM_PRE_HANDSHAKE_ROUTE_TABLE_LEASE_SECONDS PM_ROUTE_TTL_SECONDS
+#define PM_ESTABLISHED_ROUTE_OBSERVATION_SCAN_INTERVAL_SECONDS 2
 
 typedef struct {
   pm_route *items;
@@ -40,6 +41,17 @@ typedef struct {
   size_t count;
   size_t capacity;
 } pm_listener_list;
+
+typedef struct {
+  int actual_port;
+  const pm_route *route;
+  int observed;
+} pm_route_endpoint_index;
+
+typedef struct {
+  int logical_port;
+  char network_id[PM_SMALL];
+} pm_bidirectional_endpoint_index;
 
 static int pm_scan_lsof(pm_listener_list *listeners, const char *updated_at);
 static int pm_scan_lsof_cached(pm_agent_state *state, pm_listener_list *listeners, char *updated_at, size_t updated_at_size, int *fresh_scan);
@@ -330,6 +342,36 @@ static void pm_string_array_clear(char ***items, size_t *count, size_t *capacity
   *capacity = 0;
 }
 
+static int pm_string_pointer_compare(const void *left, const void *right) {
+  const char *const *left_value = (const char *const *)left;
+  const char *const *right_value = (const char *const *)right;
+
+  return strcmp(*left_value, *right_value);
+}
+
+static void pm_string_array_sort(char **items, size_t count) {
+  if (count > 1) {
+    qsort(items, count, sizeof(char *), pm_string_pointer_compare);
+  }
+}
+
+static int pm_string_array_binary_contains(char **items, size_t count, const char *value) {
+  size_t low = 0;
+  size_t high = count;
+
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    int compare = strcmp(items[mid], value);
+    if (compare < 0) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+
+  return low < count && strcmp(items[low], value) == 0;
+}
+
 static int pm_reserve_route_table_signatures(pm_agent_state *state, size_t count) {
   char **next_paths;
   char **next_signatures;
@@ -364,20 +406,31 @@ static int pm_reserve_route_table_signatures(pm_agent_state *state, size_t count
   return 0;
 }
 
-static int pm_route_table_signature_index(const pm_agent_state *state, const char *file_path) {
-  for (size_t index = 0; index < state->route_table_signature_count; index++) {
-    if (strcmp(state->route_table_signature_paths[index], file_path) == 0) {
-      return (int)index;
+static size_t pm_route_table_signature_lower_bound(const pm_agent_state *state, const char *file_path) {
+  size_t low = 0;
+  size_t high = state->route_table_signature_count;
+
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    int compare = strcmp(state->route_table_signature_paths[mid], file_path);
+    if (compare < 0) {
+      low = mid + 1;
+    } else {
+      high = mid;
     }
   }
 
-  return -1;
+  return low;
+}
+
+static int pm_route_table_signature_index_matches(const pm_agent_state *state, size_t index, const char *file_path) {
+  return index < state->route_table_signature_count && strcmp(state->route_table_signature_paths[index], file_path) == 0;
 }
 
 static const char *pm_route_table_signature_for_path(const pm_agent_state *state, const char *file_path) {
-  int index = pm_route_table_signature_index(state, file_path);
+  size_t index = pm_route_table_signature_lower_bound(state, file_path);
 
-  if (index < 0) {
+  if (!pm_route_table_signature_index_matches(state, index, file_path)) {
     return NULL;
   }
 
@@ -385,7 +438,8 @@ static const char *pm_route_table_signature_for_path(const pm_agent_state *state
 }
 
 static int pm_remember_route_table_signature(pm_agent_state *state, const char *file_path, const char *signature) {
-  int index = pm_route_table_signature_index(state, file_path);
+  size_t index = pm_route_table_signature_lower_bound(state, file_path);
+  char *path_copy;
   char *signature_copy;
 
   signature_copy = strdup(signature == NULL ? "" : signature);
@@ -393,36 +447,47 @@ static int pm_remember_route_table_signature(pm_agent_state *state, const char *
     return -1;
   }
 
-  if (index >= 0) {
+  if (pm_route_table_signature_index_matches(state, index, file_path)) {
     free(state->route_table_signatures[index]);
     state->route_table_signatures[index] = signature_copy;
     return 0;
   }
 
-  if (pm_reserve_route_table_signatures(state, state->route_table_signature_count + 1) != 0) {
+  path_copy = strdup(file_path);
+  if (path_copy == NULL) {
     free(signature_copy);
     return -1;
   }
 
-  state->route_table_signature_paths[state->route_table_signature_count] = strdup(file_path);
-  if (state->route_table_signature_paths[state->route_table_signature_count] == NULL) {
+  if (pm_reserve_route_table_signatures(state, state->route_table_signature_count + 1) != 0) {
+    free(path_copy);
     free(signature_copy);
     return -1;
   }
-  state->route_table_signatures[state->route_table_signature_count] = signature_copy;
+
+  if (index < state->route_table_signature_count) {
+    memmove(
+      &state->route_table_signature_paths[index + 1],
+      &state->route_table_signature_paths[index],
+      (state->route_table_signature_count - index) * sizeof(char *));
+    memmove(
+      &state->route_table_signatures[index + 1],
+      &state->route_table_signatures[index],
+      (state->route_table_signature_count - index) * sizeof(char *));
+  }
+  state->route_table_signature_paths[index] = path_copy;
+  state->route_table_signatures[index] = signature_copy;
   state->route_table_signature_count++;
   return 0;
 }
 
 static void pm_forget_route_table_signature(pm_agent_state *state, const char *file_path) {
-  int found = pm_route_table_signature_index(state, file_path);
-  size_t index;
+  size_t index = pm_route_table_signature_lower_bound(state, file_path);
 
-  if (found < 0) {
+  if (!pm_route_table_signature_index_matches(state, index, file_path)) {
     return;
   }
 
-  index = (size_t)found;
   free(state->route_table_signature_paths[index]);
   free(state->route_table_signatures[index]);
   memmove(
@@ -642,11 +707,134 @@ static void pm_endpoint_identity(int logical_port, const char *network_id, char 
   snprintf(buffer, size, "%s:%d", network_id == NULL ? "" : network_id, logical_port);
 }
 
-/* Matches the logical endpoint identity used to remember whether a route has ever handshaken. */
-static int pm_route_matches_bidirectional_refresh(const pm_route *route, const pm_bidirectional_route_refresh *refresh) {
-  const char *network_id = route->network_id[0] == '\0' ? "" : route->network_id;
+static const char *pm_refresh_network_id(const char *network_id) {
+  return network_id == NULL || network_id[0] == '\0' ? "" : network_id;
+}
 
-  return refresh->logical_port == route->logical_port && strcmp(refresh->network_id, network_id) == 0;
+static int pm_compare_bidirectional_endpoint_identity(
+  int left_logical_port,
+  const char *left_network_id,
+  int right_logical_port,
+  const char *right_network_id) {
+  int network_compare = strcmp(pm_refresh_network_id(left_network_id), pm_refresh_network_id(right_network_id));
+
+  if (network_compare != 0) {
+    return network_compare;
+  }
+  if (left_logical_port < right_logical_port) {
+    return -1;
+  }
+  if (left_logical_port > right_logical_port) {
+    return 1;
+  }
+
+  return 0;
+}
+
+static int pm_bidirectional_endpoint_index_compare(const void *left, const void *right) {
+  const pm_bidirectional_endpoint_index *left_index = (const pm_bidirectional_endpoint_index *)left;
+  const pm_bidirectional_endpoint_index *right_index = (const pm_bidirectional_endpoint_index *)right;
+
+  return pm_compare_bidirectional_endpoint_identity(
+    left_index->logical_port,
+    left_index->network_id,
+    right_index->logical_port,
+    right_index->network_id);
+}
+
+static size_t pm_bidirectional_refresh_lower_bound(
+  const pm_agent_state *state,
+  int logical_port,
+  const char *network_id) {
+  size_t low = 0;
+  size_t high = state->bidirectional_refresh_count;
+
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    int compare = pm_compare_bidirectional_endpoint_identity(
+      state->bidirectional_refreshes[mid].logical_port,
+      state->bidirectional_refreshes[mid].network_id,
+      logical_port,
+      network_id);
+    if (compare < 0) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+
+  return low;
+}
+
+static int pm_bidirectional_refresh_index_matches(
+  const pm_agent_state *state,
+  size_t index,
+  int logical_port,
+  const char *network_id) {
+  return index < state->bidirectional_refresh_count &&
+    pm_compare_bidirectional_endpoint_identity(
+      state->bidirectional_refreshes[index].logical_port,
+      state->bidirectional_refreshes[index].network_id,
+      logical_port,
+      network_id) == 0;
+}
+
+static int pm_build_bidirectional_endpoint_index(
+  const pm_route *routes,
+  size_t count,
+  pm_bidirectional_endpoint_index **out_index,
+  size_t *out_count) {
+  pm_bidirectional_endpoint_index *index;
+
+  *out_index = NULL;
+  *out_count = 0;
+  if (count == 0) {
+    return 0;
+  }
+
+  index = (pm_bidirectional_endpoint_index *)calloc(count, sizeof(pm_bidirectional_endpoint_index));
+  if (index == NULL) {
+    return -1;
+  }
+
+  for (size_t route_index = 0; route_index < count; route_index++) {
+    index[route_index].logical_port = routes[route_index].logical_port;
+    pm_copy(index[route_index].network_id, sizeof(index[route_index].network_id), routes[route_index].network_id);
+  }
+
+  qsort(index, count, sizeof(pm_bidirectional_endpoint_index), pm_bidirectional_endpoint_index_compare);
+  *out_index = index;
+  *out_count = count;
+  return 0;
+}
+
+static int pm_bidirectional_endpoint_index_contains(
+  const pm_bidirectional_endpoint_index *index,
+  size_t count,
+  const pm_bidirectional_route_refresh *refresh) {
+  size_t low = 0;
+  size_t high = count;
+
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    int compare = pm_compare_bidirectional_endpoint_identity(
+      index[mid].logical_port,
+      index[mid].network_id,
+      refresh->logical_port,
+      refresh->network_id);
+    if (compare < 0) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+
+  return low < count &&
+    pm_compare_bidirectional_endpoint_identity(
+      index[low].logical_port,
+      index[low].network_id,
+      refresh->logical_port,
+      refresh->network_id) == 0;
 }
 
 /*
@@ -654,17 +842,16 @@ static int pm_route_matches_bidirectional_refresh(const pm_route *route, const p
  * the route is post-handshake but idle, so it must not fall back to pre-handshake lease mode.
  */
 static void pm_prune_bidirectional_refreshes_for_routes(pm_agent_state *state, const pm_route *routes, size_t count) {
+  pm_bidirectional_endpoint_index *active_index = NULL;
+  size_t active_count = 0;
   size_t write_index = 0;
 
+  if (pm_build_bidirectional_endpoint_index(routes, count, &active_index, &active_count) != 0) {
+    return;
+  }
+
   for (size_t read_index = 0; read_index < state->bidirectional_refresh_count; read_index++) {
-    int keep = 0;
-    for (size_t route_index = 0; route_index < count; route_index++) {
-      if (pm_route_matches_bidirectional_refresh(&routes[route_index], &state->bidirectional_refreshes[read_index])) {
-        keep = 1;
-        break;
-      }
-    }
-    if (keep) {
+    if (pm_bidirectional_endpoint_index_contains(active_index, active_count, &state->bidirectional_refreshes[read_index])) {
       if (write_index != read_index) {
         state->bidirectional_refreshes[write_index] = state->bidirectional_refreshes[read_index];
       }
@@ -673,43 +860,49 @@ static void pm_prune_bidirectional_refreshes_for_routes(pm_agent_state *state, c
   }
 
   state->bidirectional_refresh_count = write_index;
+  free(active_index);
 }
 
 static int pm_mark_bidirectional_route_observed(pm_agent_state *state, int logical_port, const char *network_id) {
-  const char *normalized_network_id = network_id == NULL ? "" : network_id;
+  const char *normalized_network_id = pm_refresh_network_id(network_id);
   time_t refresh_until = time(NULL) + pm_route_table_ttl_seconds();
+  size_t refresh_index = pm_bidirectional_refresh_lower_bound(state, logical_port, normalized_network_id);
 
-  for (size_t index = 0; index < state->bidirectional_refresh_count; index++) {
-    pm_bidirectional_route_refresh *refresh = &state->bidirectional_refreshes[index];
-    if (refresh->logical_port == logical_port && strcmp(refresh->network_id, normalized_network_id) == 0) {
-      refresh->refresh_until = refresh_until;
-      return 0;
-    }
+  if (pm_bidirectional_refresh_index_matches(state, refresh_index, logical_port, normalized_network_id)) {
+    state->bidirectional_refreshes[refresh_index].refresh_until = refresh_until;
+    return 0;
   }
 
   if (pm_reserve_bidirectional_refreshes(state, state->bidirectional_refresh_count + 1) != 0) {
     return -1;
   }
 
-  state->bidirectional_refreshes[state->bidirectional_refresh_count].logical_port = logical_port;
+  if (refresh_index < state->bidirectional_refresh_count) {
+    memmove(
+      &state->bidirectional_refreshes[refresh_index + 1],
+      &state->bidirectional_refreshes[refresh_index],
+      (state->bidirectional_refresh_count - refresh_index) * sizeof(pm_bidirectional_route_refresh));
+  }
+
+  state->bidirectional_refreshes[refresh_index].logical_port = logical_port;
   pm_copy(
-    state->bidirectional_refreshes[state->bidirectional_refresh_count].network_id,
-    sizeof(state->bidirectional_refreshes[state->bidirectional_refresh_count].network_id),
+    state->bidirectional_refreshes[refresh_index].network_id,
+    sizeof(state->bidirectional_refreshes[refresh_index].network_id),
     normalized_network_id);
-  state->bidirectional_refreshes[state->bidirectional_refresh_count].refresh_until = refresh_until;
+  state->bidirectional_refreshes[refresh_index].refresh_until = refresh_until;
   state->bidirectional_refresh_count++;
   return 0;
 }
 
 static int pm_route_bidirectional_refresh_until(pm_agent_state *state, const pm_route *route, time_t *refresh_until) {
-  for (size_t index = 0; index < state->bidirectional_refresh_count; index++) {
-    pm_bidirectional_route_refresh *refresh = &state->bidirectional_refreshes[index];
-    if (pm_route_matches_bidirectional_refresh(route, refresh)) {
-      if (refresh_until != NULL) {
-        *refresh_until = refresh->refresh_until;
-      }
-      return 1;
+  const char *network_id = pm_refresh_network_id(route->network_id);
+  size_t refresh_index = pm_bidirectional_refresh_lower_bound(state, route->logical_port, network_id);
+
+  if (pm_bidirectional_refresh_index_matches(state, refresh_index, route->logical_port, network_id)) {
+    if (refresh_until != NULL) {
+      *refresh_until = state->bidirectional_refreshes[refresh_index].refresh_until;
     }
+    return 1;
   }
 
   return 0;
@@ -1231,17 +1424,20 @@ static int pm_parse_lsof_tcp_endpoint(const char *value, char *host, size_t host
   return 0;
 }
 
-static int pm_established_line_matches_route(const char *line, const pm_route *route) {
+static int pm_parse_established_lsof_line(
+  const char *line,
+  char *local_host,
+  size_t local_host_size,
+  int *local_port,
+  char *remote_host,
+  size_t remote_host_size,
+  int *remote_port) {
   char endpoint[PM_TEXT];
   char *state_marker;
   char *arrow;
-  char local_host[PM_SMALL];
-  char remote_host[PM_SMALL];
-  int local_port;
-  int remote_port;
 
-  if (line == NULL || route == NULL || strcmp(route->source, "compose") == 0) {
-    return 0;
+  if (line == NULL) {
+    return -1;
   }
 
   pm_copy(endpoint, sizeof(endpoint), line);
@@ -1256,33 +1452,133 @@ static int pm_established_line_matches_route(const char *line, const pm_route *r
   *arrow = '\0';
   arrow += 2;
 
-  if (pm_parse_lsof_tcp_endpoint(endpoint, local_host, sizeof(local_host), &local_port) != 0 ||
-      pm_parse_lsof_tcp_endpoint(arrow, remote_host, sizeof(remote_host), &remote_port) != 0) {
+  if (pm_parse_lsof_tcp_endpoint(endpoint, local_host, local_host_size, local_port) != 0 ||
+      pm_parse_lsof_tcp_endpoint(arrow, remote_host, remote_host_size, remote_port) != 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+static int pm_route_endpoint_index_compare(const void *left, const void *right) {
+  const pm_route_endpoint_index *left_index = (const pm_route_endpoint_index *)left;
+  const pm_route_endpoint_index *right_index = (const pm_route_endpoint_index *)right;
+
+  if (left_index->actual_port < right_index->actual_port) {
+    return -1;
+  }
+  if (left_index->actual_port > right_index->actual_port) {
+    return 1;
+  }
+
+  return 0;
+}
+
+static int pm_build_route_endpoint_index(
+  const pm_route_list *routes,
+  pm_route_endpoint_index **out_index,
+  size_t *out_count) {
+  pm_route_endpoint_index *index;
+  size_t count = 0;
+
+  *out_index = NULL;
+  *out_count = 0;
+  if (routes->count == 0) {
     return 0;
   }
 
-  return (local_port == route->actual_port && pm_endpoint_hosts_match(local_host, route->host)) ||
-    (remote_port == route->actual_port && pm_endpoint_hosts_match(remote_host, route->host));
+  index = (pm_route_endpoint_index *)calloc(routes->count, sizeof(pm_route_endpoint_index));
+  if (index == NULL) {
+    return -1;
+  }
+
+  for (size_t route_index = 0; route_index < routes->count; route_index++) {
+    const pm_route *route = &routes->items[route_index];
+    if (strcmp(route->source, "compose") == 0) {
+      continue;
+    }
+    index[count].actual_port = route->actual_port;
+    index[count].route = route;
+    count++;
+  }
+
+  qsort(index, count, sizeof(pm_route_endpoint_index), pm_route_endpoint_index_compare);
+  *out_index = index;
+  *out_count = count;
+  return 0;
+}
+
+static size_t pm_route_endpoint_index_lower_bound(const pm_route_endpoint_index *index, size_t count, int port) {
+  size_t low = 0;
+  size_t high = count;
+
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    if (index[mid].actual_port < port) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+
+  return low;
+}
+
+static void pm_mark_established_endpoint_routes(
+  pm_agent_state *state,
+  pm_route_endpoint_index *index,
+  size_t count,
+  int port,
+  const char *host) {
+  size_t route_index = pm_route_endpoint_index_lower_bound(index, count, port);
+
+  while (route_index < count && index[route_index].actual_port == port) {
+    pm_route_endpoint_index *entry = &index[route_index];
+    if (!entry->observed && pm_endpoint_hosts_match(host, entry->route->host)) {
+      pm_mark_bidirectional_route_observed(state, entry->route->logical_port, entry->route->network_id);
+      entry->observed = 1;
+    }
+    route_index++;
+  }
 }
 
 static void pm_refresh_established_route_observations(pm_agent_state *state) {
   pm_route_list routes = {0};
+  pm_route_endpoint_index *route_index = NULL;
+  size_t route_index_count = 0;
   FILE *pipe;
   char line[2048];
+  time_t now = time(NULL);
+
+  if (now < state->established_route_observation_scan_after) {
+    return;
+  }
+  state->established_route_observation_scan_after = now + PM_ESTABLISHED_ROUTE_OBSERVATION_SCAN_INTERVAL_SECONDS;
 
   if (pm_build_routes(state, NULL, &routes) != 0 || routes.count == 0) {
+    free(routes.items);
+    return;
+  }
+  if (pm_build_route_endpoint_index(&routes, &route_index, &route_index_count) != 0 || route_index_count == 0) {
+    free(route_index);
     free(routes.items);
     return;
   }
 
   pipe = popen("lsof -nP -iTCP -sTCP:ESTABLISHED -Fn 2>/dev/null", "r");
   if (pipe == NULL) {
+    free(route_index);
     free(routes.items);
     return;
   }
 
   while (fgets(line, sizeof(line), pipe) != NULL) {
     size_t length = strlen(line);
+    char local_host[PM_SMALL];
+    char remote_host[PM_SMALL];
+    int local_port;
+    int remote_port;
+
     while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r')) {
       line[--length] = '\0';
     }
@@ -1290,14 +1586,22 @@ static void pm_refresh_established_route_observations(pm_agent_state *state) {
       continue;
     }
 
-    for (size_t index = 0; index < routes.count; index++) {
-      if (pm_established_line_matches_route(line + 1, &routes.items[index])) {
-        pm_mark_bidirectional_route_observed(state, routes.items[index].logical_port, routes.items[index].network_id);
-      }
+    if (pm_parse_established_lsof_line(
+          line + 1,
+          local_host,
+          sizeof(local_host),
+          &local_port,
+          remote_host,
+          sizeof(remote_host),
+          &remote_port) != 0) {
+      continue;
     }
+    pm_mark_established_endpoint_routes(state, route_index, route_index_count, local_port, local_host);
+    pm_mark_established_endpoint_routes(state, route_index, route_index_count, remote_port, remote_host);
   }
 
   pclose(pipe);
+  free(route_index);
   free(routes.items);
 }
 
@@ -2573,6 +2877,7 @@ static int pm_write_route_tables(pm_agent_state *state) {
   if (claim_item_count > 0) {
     qsort(claim_items, claim_item_count, sizeof(pm_route_claim_item), pm_compare_route_claim_items);
   }
+  pm_string_array_sort(current_networks, current_network_count);
 
   for (size_t index = 0; index < routes.count;) {
     size_t end = index + 1;
@@ -2635,6 +2940,8 @@ static int pm_write_route_tables(pm_agent_state *state) {
     free(claim_routes.items);
     index = end;
   }
+  pm_string_array_sort(current_entries, current_entry_count);
+  pm_string_array_sort(current_claims, current_claim_count);
 
   if (pm_write_route_table_file_if_changed(state, state->route_table_path, routes.items, routes.count, sequence) != 0) {
     result = -1;
@@ -2658,7 +2965,7 @@ static int pm_write_route_tables(pm_agent_state *state) {
   }
 
   for (size_t index = 0; index < state->written_network_count; index++) {
-    if (!pm_string_array_contains(current_networks, current_network_count, state->written_network_ids[index])) {
+    if (!pm_string_array_binary_contains(current_networks, current_network_count, state->written_network_ids[index])) {
       char network_path[PM_TEXT];
       pm_scoped_route_table_path(state->route_table_path, state->written_network_ids[index], network_path, sizeof(network_path));
       if (pm_write_route_table_file_if_changed(state, network_path, NULL, 0, sequence) != 0) {
@@ -2669,7 +2976,7 @@ static int pm_write_route_tables(pm_agent_state *state) {
 
   if (endpoint_entries_complete) {
     for (size_t index = 0; index < state->written_entry_count; index++) {
-      if (!pm_string_array_contains(current_entries, current_entry_count, state->written_entry_paths[index])) {
+      if (!pm_string_array_binary_contains(current_entries, current_entry_count, state->written_entry_paths[index])) {
         if (pm_unlink_route_table_file_if_not_newer(state, state->written_entry_paths[index], sequence) != 0 && errno != ENOENT) {
           result = -1;
         } else {
@@ -2681,7 +2988,7 @@ static int pm_write_route_tables(pm_agent_state *state) {
 
   if (claim_entries_complete) {
     for (size_t index = 0; index < state->written_claim_count; index++) {
-      if (!pm_string_array_contains(current_claims, current_claim_count, state->written_claim_paths[index])) {
+      if (!pm_string_array_binary_contains(current_claims, current_claim_count, state->written_claim_paths[index])) {
         if (pm_unlink_route_table_file_if_not_newer(state, state->written_claim_paths[index], sequence) != 0 && errno != ENOENT) {
           result = -1;
         } else {

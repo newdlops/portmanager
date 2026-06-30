@@ -88,6 +88,7 @@ async function stressRouteTableRefresh(count) {
   const routeTablePath = path.join(tempDirectory, "routes.json");
   const networkIds = Array.from({ length: networkCount }, (_, index) => `network-${String(index + 1).padStart(3, "0")}`);
   let nowMs = Date.parse("2026-06-21T10:00:00.000Z");
+  let establishedConnections = [];
 
   try {
     const registry = new ManagedProcessRegistry({
@@ -125,7 +126,7 @@ async function stressRouteTableRefresh(count) {
         list: async () => [],
       },
       establishedConnectionProvider: {
-        list: async () => [],
+        list: async () => establishedConnections,
       },
       agentPid: 777,
       now: () => new Date(nowMs),
@@ -168,6 +169,23 @@ async function stressRouteTableRefresh(count) {
         if (networkRouteTable.expiresAtMs !== nowMs + networkRouteTable.preHandshakeLeaseMs) {
           throw new Error(`network route table pre-handshake lease was not refreshed for ${networkId}`);
         }
+      }
+
+      establishedConnections = Array.from({ length: count }, (_, index) => ({
+        localAddress: "127.0.0.1",
+        localPort: 58_000 + index,
+        remoteAddress: "127.0.0.1",
+        remotePort: 40_000 + index,
+      }));
+      nowMs += 2_001;
+      await agent.refreshSnapshot();
+
+      const observedRouteTable = readRouteTable(routeTablePath);
+      if (observedRouteTable.ttlStartsAfterFirstHandshake === true) {
+        throw new Error("route table stayed in pre-handshake mode after observed connections");
+      }
+      if (observedRouteTable.expiresAtMs !== nowMs + ROUTE_TABLE_TTL_MS) {
+        throw new Error(`route table observed TTL was not refreshed for ${count} routes`);
       }
     } finally {
       agent.dispose();

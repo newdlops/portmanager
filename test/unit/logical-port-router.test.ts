@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { findRoutesMatchingClientCwd } from "../../src/core/networks/logical-route-selection";
 import {
+  NodeEstablishedTcpConnectionProvider,
   NodeTcpConnectionProcessResolver,
   parseClientProcessFromLsof,
   parseEstablishedTcpConnectionsFromLsof,
@@ -71,6 +72,36 @@ test("parses established TCP tuples for route-cache liveness", () => {
       localPort: 58000,
       remoteAddress: "127.0.0.1",
       remotePort: 49152,
+    },
+  ]);
+});
+
+test("caches parsed established TCP tuples inside one provider snapshot", async () => {
+  let establishedConnectionCalls = 0;
+  const provider = new NodeEstablishedTcpConnectionProvider({
+    commandRunner: async () => {
+      establishedConnectionCalls += 1;
+      return {
+        stdout: [
+          "p101",
+          "cserver",
+          "nTCP 127.0.0.1:49152->127.0.0.1:58000 (ESTABLISHED)",
+        ].join("\n"),
+      };
+    },
+  });
+
+  const first = await provider.list();
+  const second = await provider.list();
+
+  assert.equal(establishedConnectionCalls, 1);
+  assert.equal(first, second);
+  assert.deepEqual(second, [
+    {
+      localAddress: "127.0.0.1",
+      localPort: 49152,
+      remoteAddress: "127.0.0.1",
+      remotePort: 58000,
     },
   ]);
 });

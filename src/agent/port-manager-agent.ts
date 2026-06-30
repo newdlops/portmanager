@@ -68,6 +68,7 @@ const HOOK_ROUTE_RECOVERY_MISS_TTL_MS = 60_000;
 const ROUTE_ALLOCATION_TTL_MS = 300_000;
 // Pre-handshake routes use a cleanup lease, not the idle TTL that starts after traffic proves both sides.
 const PRE_HANDSHAKE_ROUTE_TABLE_LEASE_MS = ROUTE_ALLOCATION_TTL_MS;
+const ESTABLISHED_ROUTE_OBSERVATION_SCAN_INTERVAL_MS = 2_000;
 const ROUTE_TABLE_GENERATION_LOCK_STALE_MS = 30_000;
 const ROUTE_TABLE_GENERATION_LOCK_ATTEMPTS = 100;
 const ROUTE_TABLE_GENERATION_LOCK_SLEEP_MS = 10;
@@ -349,6 +350,8 @@ export class PortManagerAgent implements DisposableLike {
    * while the route exists so TTL does not reset before another handshake.
    */
   private readonly bidirectionalRouteRefreshUntilMsByEndpoint = new Map<string, number>();
+  /** Next wall-clock time when a full OS established-connection scan is allowed. */
+  private nextEstablishedRouteObservationScanAtMs = 0;
 
   /** Network ids that already had a scoped table, so empty updates can clear stale rows. */
   private readonly writtenRouteTableNetworkIds = new Set<string>();
@@ -1431,23 +1434,20 @@ export class PortManagerAgent implements DisposableLike {
     if (this.establishedConnectionProvider === undefined || routes.length === 0) {
       return false;
     }
+    const nowMs = this.now().getTime();
+    if (nowMs < this.nextEstablishedRouteObservationScanAtMs) {
+      return false;
+    }
+    this.nextEstablishedRouteObservationScanAtMs = nowMs + ESTABLISHED_ROUTE_OBSERVATION_SCAN_INTERVAL_MS;
 
     const establishedConnections = await this.establishedConnectionProvider.list().catch(() => []);
     if (establishedConnections.length === 0) {
       return false;
     }
 
-    let changed = false;
-    for (const route of routes) {
-      if (route.source === "compose") {
-        continue;
-      }
-      if (routeHasEstablishedConnection(route, establishedConnections)) {
-        changed = this.markBidirectionalRouteObserved(route.logicalPort, normalizeNetworkId(route.networkId)) || changed;
-      }
-    }
-
-    return changed;
+    return markRoutesWithEstablishedConnections(routes, establishedConnections, (route) =>
+      this.markBidirectionalRouteObserved(route.logicalPort, normalizeNetworkId(route.networkId)),
+    );
   }
 
   /**
@@ -2399,16 +2399,60 @@ function endpointHostMatches(listenerHost: string, routeHost: string): boolean {
   return normalizedListenerHost === normalizedRouteHost;
 }
 
-/** True when the route's actual endpoint appears on either side of an ESTABLISHED TCP tuple. */
-function routeHasEstablishedConnection(
-  route: LogicalPortRoute,
+/**
+ * Marks routes whose actual endpoint appears on either side of an ESTABLISHED TCP tuple.
+ * The port index keeps snapshot refresh cost near O(routes + connections), rather than
+ * multiplying every boot-time connection by every route.
+ */
+function markRoutesWithEstablishedConnections(
+  routes: readonly LogicalPortRoute[],
   connections: readonly EstablishedTcpConnection[],
+  markObserved: (route: LogicalPortRoute) => boolean,
 ): boolean {
-  return connections.some(
-    (connection) =>
-      (connection.localPort === route.actualPort && endpointHostMatches(connection.localAddress, route.host)) ||
-      (connection.remotePort === route.actualPort && endpointHostMatches(connection.remoteAddress, route.host)),
-  );
+  const routesByActualPort = new Map<number, LogicalPortRoute[]>();
+  for (const route of routes) {
+    if (route.source === "compose") {
+      continue;
+    }
+    const portRoutes = routesByActualPort.get(route.actualPort);
+    if (portRoutes === undefined) {
+      routesByActualPort.set(route.actualPort, [route]);
+    } else {
+      portRoutes.push(route);
+    }
+  }
+  if (routesByActualPort.size === 0) {
+    return false;
+  }
+
+  const observedEndpointIdentities = new Set<string>();
+  let changed = false;
+  const markEndpoint = (port: number, host: string) => {
+    const portRoutes = routesByActualPort.get(port);
+    if (portRoutes === undefined) {
+      return;
+    }
+
+    for (const route of portRoutes) {
+      if (!endpointHostMatches(host, route.host)) {
+        continue;
+      }
+      const endpointIdentity = buildLogicalEndpointIdentity(route);
+      if (observedEndpointIdentities.has(endpointIdentity)) {
+        continue;
+      }
+
+      observedEndpointIdentities.add(endpointIdentity);
+      changed = markObserved(route) || changed;
+    }
+  };
+
+  for (const connection of connections) {
+    markEndpoint(connection.localPort, connection.localAddress);
+    markEndpoint(connection.remotePort, connection.remoteAddress);
+  }
+
+  return changed;
 }
 
 /**

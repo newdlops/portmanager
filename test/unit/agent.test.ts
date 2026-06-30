@@ -257,6 +257,7 @@ test("route-table TTL starts after the first bidirectional handshake", async (co
       remotePort: 49152,
     },
   ];
+  nowMs += 2_001;
   await agent.refreshSnapshot();
 
   const firstHandshakeRouteTable = readRouteTable(routeTablePath);
@@ -287,6 +288,68 @@ test("route-table TTL starts after the first bidirectional handshake", async (co
   await agent.refreshSnapshot();
 
   assert.equal(readRouteTable(routeTablePath).ttlMs, ROUTE_TABLE_TTL_MS);
+});
+
+test("established connection scans are indexed and throttled during bootstrap bursts", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  let nowMs = Date.parse(fixedUpdatedAt);
+  let establishedConnectionCalls = 0;
+  const establishedConnections: EstablishedTcpConnection[] = [];
+  for (let index = 0; index < 5_000; index++) {
+    establishedConnections.push({
+      localAddress: "127.0.0.1",
+      localPort: 40_000 + index,
+      remoteAddress: "127.0.0.1",
+      remotePort: 45_000 + index,
+    });
+  }
+  establishedConnections.push({
+    localAddress: "127.0.0.1",
+    localPort: 58000,
+    remoteAddress: "127.0.0.1",
+    remotePort: 49152,
+  });
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    establishedConnectionProvider: {
+      list: async () => {
+        establishedConnectionCalls += 1;
+        return establishedConnections;
+      },
+    },
+    agentPid: 777,
+    now: () => new Date(nowMs),
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 1234,
+    name: "node",
+    command: "node server.js",
+    cwd: "/workspace/app",
+    requestedPort: 8000,
+    actualPort: 58000,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "hooked",
+  });
+
+  await agent.refreshSnapshot();
+
+  const firstHandshakeRouteTable = readRouteTable(routeTablePath);
+  assert.equal(firstHandshakeRouteTable.ttlStartsAfterFirstHandshake, undefined);
+  assert.equal(firstHandshakeRouteTable.expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
+  assert.equal(establishedConnectionCalls, 1);
+
+  nowMs += 1_000;
+  await agent.refreshSnapshot();
+
+  assert.equal(establishedConnectionCalls, 1);
 });
 
 test("refreshSnapshot extends pending pre-handshake route tables while allocation is live", async (context) => {

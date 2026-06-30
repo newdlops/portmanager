@@ -50,6 +50,7 @@ interface ParsedConnection {
 interface EstablishedConnectionSnapshot {
   readonly output: string;
   readonly expiresAtMs: number;
+  readonly connections?: readonly EstablishedTcpConnection[];
 }
 
 interface ProcessCwdSnapshot {
@@ -218,7 +219,20 @@ export class NodeEstablishedTcpConnectionProvider implements EstablishedTcpConne
 
   async list(): Promise<readonly EstablishedTcpConnection[]> {
     try {
-      return parseEstablishedTcpConnectionsFromLsof(await this.readEstablishedConnections());
+      const output = await this.readEstablishedConnections();
+      const snapshot = this.establishedConnectionsSnapshot;
+      if (snapshot?.output === output && snapshot.connections !== undefined) {
+        return snapshot.connections;
+      }
+
+      const connections = parseEstablishedTcpConnectionsFromLsof(output);
+      if (snapshot?.output === output) {
+        this.establishedConnectionsSnapshot = {
+          ...snapshot,
+          connections,
+        };
+      }
+      return connections;
     } catch {
       return [];
     }

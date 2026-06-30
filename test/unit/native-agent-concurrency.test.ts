@@ -83,6 +83,17 @@ test("native agent route tables carry TTL and refresh unchanged files", () => {
   assert.equal(source.includes("PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15"), true);
   assert.equal(source.includes("static void pm_refresh_established_route_observations"), true);
   assert.equal(source.includes('popen("lsof -nP -iTCP -sTCP:ESTABLISHED -Fn 2>/dev/null"'), true);
+  assert.equal(source.includes("PM_ESTABLISHED_ROUTE_OBSERVATION_SCAN_INTERVAL_SECONDS 2"), true);
+  assert.equal(source.includes("static int pm_build_route_endpoint_index"), true);
+  assert.equal(source.includes("pm_route_endpoint_index_lower_bound"), true);
+  assert.equal(source.includes("pm_mark_established_endpoint_routes"), true);
+  assert.equal(source.includes("static size_t pm_bidirectional_refresh_lower_bound"), true);
+  assert.equal(source.includes("static int pm_build_bidirectional_endpoint_index"), true);
+  assert.equal(source.includes("pm_bidirectional_endpoint_index_contains"), true);
+  assert.equal(source.includes("static size_t pm_route_table_signature_lower_bound"), true);
+  assert.equal(source.includes("pm_route_table_signature_index_matches"), true);
+  assert.equal(source.includes("pm_string_array_binary_contains(current_entries"), true);
+  assert.equal(source.includes("pm_string_array_binary_contains(current_claims"), true);
   assert.equal(source.includes("static int pm_route_table_file_fresh_for_reuse"), true);
   assert.notEqual(writeStart, -1);
   assert.equal(writeBody.includes('\\"expiresAtMs\\":%ld,\\"ttlMs\\":%ld'), true);
