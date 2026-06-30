@@ -729,7 +729,7 @@ test("background routing refresh polls terminals and containers", () => {
   assert.equal(source.includes("await this.convergeDaemonAndRoutingState();"), true);
   assert.equal(refreshBody.includes("this.syncLogicalPortRouters().catch(() => undefined),"), true);
   assert.equal(refreshBody.includes("this.syncBrowserNetworkProxies().catch(() => undefined),"), true);
-  assert.equal(source.includes("ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 60_000"), true);
+  assert.equal(source.includes("ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 10_000"), true);
   assert.equal(source.includes("BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS = 60_000"), true);
   assert.equal(source.includes("tryAcquireSharedBackgroundContainerRefreshSlot()"), true);
 });
@@ -930,7 +930,10 @@ test("global storage cleanup rehydrates generated routing from live attachment s
   assert.equal(materializeBody.includes("getDefaultRouteTablePath()"), true);
   assert.equal(materializeBody.includes("getRouteTablePathForNetwork(networkId)"), true);
   assert.equal(materializeBody.includes("new Set(["), true);
-  assert.equal(materializeBody.includes("Promise.all(routeTablePaths.map((routeTablePath) => routeTableFileIsFresh(routeTablePath)))"), true);
+  assert.equal(
+    materializeBody.includes("Promise.all(routeTablePaths.map((routeTablePath) => routeTableFileIsFresh(routeTablePath, routeTableTtlMs)))"),
+    true,
+  );
   assert.equal(source.includes("async function routeTableFileIsFresh"), true);
   assert.equal(materializeBody.includes("await this.processService.start();"), true);
   assert.equal(materializeBody.includes("await this.processService.refresh();"), true);

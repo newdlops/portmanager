@@ -9,6 +9,7 @@ import { findRoutesMatchingClientCwd } from "../../src/core/networks/logical-rou
 import {
   NodeTcpConnectionProcessResolver,
   parseClientProcessFromLsof,
+  parseEstablishedTcpConnectionsFromLsof,
   parseProcessCwdFromLsof,
 } from "../../src/platform/ports/tcp-connection-process-resolver";
 import type { LogicalPortRouterConnection } from "../../src/platform/ports/logical-port-router";
@@ -46,6 +47,32 @@ test("resolves client PID from an established TCP tuple without process-name rul
   });
 
   assert.equal(process?.pid, 101);
+});
+
+test("parses established TCP tuples for route-cache liveness", () => {
+  const output = [
+    "p101",
+    "canything",
+    "nTCP 127.0.0.1:49152->127.0.0.1:58000 (ESTABLISHED)",
+    "p202",
+    "cserver",
+    "nTCP 127.0.0.1:58000->127.0.0.1:49152 (ESTABLISHED)",
+  ].join("\n");
+
+  assert.deepEqual(parseEstablishedTcpConnectionsFromLsof(output), [
+    {
+      localAddress: "127.0.0.1",
+      localPort: 49152,
+      remoteAddress: "127.0.0.1",
+      remotePort: 58000,
+    },
+    {
+      localAddress: "127.0.0.1",
+      localPort: 58000,
+      remoteAddress: "127.0.0.1",
+      remotePort: 49152,
+    },
+  ]);
 });
 
 test("parses native logical router control requests", () => {

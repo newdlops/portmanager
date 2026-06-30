@@ -36,7 +36,8 @@
 #define PM_TERMINAL_ATTACHMENT_DIR_ENV "PORT_MANAGER_TERMINAL_ATTACHMENT_DIR"
 #define PM_TERMINAL_SESSION_ID_ENV "PORT_MANAGER_TERMINAL_SESSION_ID"
 #define PM_COMPOSE_REFRESH_WAIT_MS 3000
-#define PM_ROUTE_TABLE_TTL_SECONDS 300
+#define PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"
+#define PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 30
 
 typedef struct {
   char kind[16];
@@ -69,6 +70,30 @@ static void pm_debug(const char *format, ...) {
   vfprintf(stderr, format, args);
   va_end(args);
   fprintf(stderr, "\n");
+}
+
+/** Reads the shared route-cache TTL before the generic env parser is declared. */
+static int pm_route_table_ttl_seconds(void) {
+  const char *value = getenv(PM_ROUTE_TABLE_TTL_SECONDS_ENV);
+  char *end = NULL;
+  long parsed;
+
+  if (value == NULL || value[0] == '\0') {
+    return PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS;
+  }
+
+  parsed = strtol(value, &end, 10);
+  if (end == value || *end != '\0') {
+    return PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS;
+  }
+  if (parsed < 5) {
+    return 5;
+  }
+  if (parsed > 3600) {
+    return 3600;
+  }
+
+  return (int)parsed;
 }
 
 /** Returns the executable name used to decide whether this invocation is docker or podman. */
@@ -115,7 +140,7 @@ static int pm_generated_route_file_expired(const char *path) {
     return 0;
   }
 
-  return now - stats.st_mtime > PM_ROUTE_TABLE_TTL_SECONDS;
+  return now - stats.st_mtime > pm_route_table_ttl_seconds();
 }
 
 /** Removes line endings left on the final TSV field after splitting a row. */

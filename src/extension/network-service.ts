@@ -12,7 +12,8 @@ import {
   getDefaultRouteTablePath,
   getLegacyDefaultRouteTablePath,
   getRouteTablePathForNetwork,
-  ROUTE_TABLE_REFRESH_MARGIN_MS,
+  routeTableRefreshMarginMs,
+  ROUTE_TABLE_TTL_SECONDS_ENV,
   ROUTE_TABLE_TTL_MS,
 } from "../agent/route-table";
 import { readContainerRuntimeSettings, readPortManagerSettings } from "../config/vscode-settings";
@@ -134,7 +135,7 @@ const TERMINAL_NETWORK_SELECTION_FILE_NAME = "terminal-networks.tsv";
 const RUNTIME_SHIM_DIRECTORY_NAME = "runtime-shims";
 const MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX = "manual-terminal:";
 const PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX = "process-terminal:";
-const ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 60_000;
+const ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 10_000;
 const BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS = 60_000;
 const BACKGROUND_CONTAINER_REFRESH_LOCK_STALE_MS = 120_000;
 const BACKGROUND_CONTAINER_REFRESH_STAMP_PATH = buildBackgroundContainerRefreshControlPath("stamp");
@@ -2867,9 +2868,10 @@ export class PortManagerNetworkService implements DisposableLike {
         ...(options.networkIds ?? []).map((networkId) => getRouteTablePathForNetwork(networkId)),
       ]),
     ];
+    const routeTableTtlMs = readPortManagerSettings().routeTableTtlSeconds * 1000;
     if (
       options.force !== true &&
-      (await Promise.all(routeTablePaths.map((routeTablePath) => routeTableFileIsFresh(routeTablePath)))).every(Boolean)
+      (await Promise.all(routeTablePaths.map((routeTablePath) => routeTableFileIsFresh(routeTablePath, routeTableTtlMs)))).every(Boolean)
     ) {
       return;
     }
@@ -4817,6 +4819,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_VIRTUAL_PORT_END", String(settings.virtualPortRangeEnd)),
       shellExport("PORT_MANAGER_FIXED_PROTOCOL_PORTS", settings.fixedProtocolPorts.join(",")),
       shellExport("PORT_MANAGER_PRESERVE_LISTEN_PORTS", settings.preservedListenPorts.join(",")),
+      shellExport(ROUTE_TABLE_TTL_SECONDS_ENV, String(settings.routeTableTtlSeconds)),
       shellPrependLibrary(preloadVariable, hookLibraryPath),
     ];
     commands.push(buildLoopbackAddressRoutingShell(loopbackAddressForNetwork(networkId), resolveLoopbackAddressRoutingMode(settings)));
@@ -8223,16 +8226,17 @@ async function fileIsReadable(filePath: string): Promise<boolean> {
 }
 
 /** True when daemon route-table storage is readable and not close to reader-side TTL expiry. */
-async function routeTableFileIsFresh(filePath: string): Promise<boolean> {
+async function routeTableFileIsFresh(filePath: string, routeTableTtlMs = ROUTE_TABLE_TTL_MS): Promise<boolean> {
   try {
     const [text, stat] = await Promise.all([fs.readFile(filePath, "utf8"), fs.stat(filePath)]);
     const nowMs = Date.now();
+    const refreshMarginMs = routeTableRefreshMarginMs(routeTableTtlMs);
     const parsed = JSON.parse(text) as { readonly expiresAtMs?: unknown };
     if (typeof parsed.expiresAtMs === "number" && Number.isFinite(parsed.expiresAtMs)) {
-      return parsed.expiresAtMs - nowMs > ROUTE_TABLE_REFRESH_MARGIN_MS;
+      return parsed.expiresAtMs - nowMs > refreshMarginMs;
     }
 
-    return stat.mtimeMs + ROUTE_TABLE_TTL_MS - nowMs > ROUTE_TABLE_REFRESH_MARGIN_MS;
+    return stat.mtimeMs + routeTableTtlMs - nowMs > refreshMarginMs;
   } catch {
     return false;
   }

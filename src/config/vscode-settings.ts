@@ -68,6 +68,9 @@ export function readPortManagerSettings(): PortManagerSettings {
       DEFAULT_SETTINGS.preservedListenPorts,
       { allowEmpty: true },
     ),
+    routeTableTtlSeconds: normalizeRouteTableTtlSeconds(
+      config.get<number>("routeTableTtlSeconds", DEFAULT_SETTINGS.routeTableTtlSeconds),
+    ),
     autoOpenBrowser: config.get<boolean>("autoOpenBrowser", DEFAULT_SETTINGS.autoOpenBrowser),
     showConflictNotification: config.get<boolean>(
       "showConflictNotification",
@@ -153,6 +156,15 @@ function normalizeWatchIntervalMs(watchIntervalMs: number): number {
   }
 
   return Math.max(1000, Math.min(60_000, Math.trunc(watchIntervalMs)));
+}
+
+/** Keeps route-cache TTLs inside the native reader contract. */
+function normalizeRouteTableTtlSeconds(routeTableTtlSeconds: number): number {
+  if (!Number.isFinite(routeTableTtlSeconds)) {
+    return DEFAULT_SETTINGS.routeTableTtlSeconds;
+  }
+
+  return Math.max(5, Math.min(3600, Math.trunc(routeTableTtlSeconds)));
 }
 
 /** Converts unknown scan direction strings to the documented default policy. */

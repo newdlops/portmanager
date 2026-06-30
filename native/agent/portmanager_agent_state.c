@@ -23,8 +23,8 @@
 #define PM_ROUTE_TABLE_WRITE_LOCK_STALE_SECONDS 30
 #define PM_ROUTE_TABLE_WRITE_LOCK_ATTEMPTS 100
 #define PM_ROUTE_TABLE_WRITE_LOCK_SLEEP_US 10000
-#define PM_ROUTE_TABLE_TTL_SECONDS 300
-#define PM_ROUTE_TABLE_REFRESH_MARGIN_SECONDS 60
+#define PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"
+#define PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 30
 
 typedef struct {
   pm_route *items;
@@ -69,6 +69,43 @@ static long pm_epoch_milliseconds(void) {
 
 static int pm_text_empty(const char *value) {
   return value == NULL || value[0] == '\0';
+}
+
+static int pm_route_table_ttl_seconds(void) {
+  const char *value = getenv(PM_ROUTE_TABLE_TTL_SECONDS_ENV);
+  char *end = NULL;
+  long parsed;
+
+  if (value == NULL || value[0] == '\0') {
+    return PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS;
+  }
+
+  parsed = strtol(value, &end, 10);
+  if (end == value || *end != '\0') {
+    return PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS;
+  }
+  if (parsed < 5) {
+    return 5;
+  }
+  if (parsed > 3600) {
+    return 3600;
+  }
+
+  return (int)parsed;
+}
+
+static int pm_route_table_refresh_margin_seconds(void) {
+  int ttl_seconds = pm_route_table_ttl_seconds();
+  int margin_seconds = ttl_seconds / 2;
+
+  if (margin_seconds < 1) {
+    margin_seconds = 1;
+  }
+  if (margin_seconds > 10) {
+    margin_seconds = 10;
+  }
+
+  return margin_seconds;
 }
 
 static void pm_normalize_network(const char *value, char *out, size_t out_size) {
@@ -145,6 +182,29 @@ static int pm_reserve_pending(pm_agent_state *state, size_t count) {
 
   state->pending_routes = next;
   state->pending_capacity = capacity;
+  return 0;
+}
+
+static int pm_reserve_bidirectional_refreshes(pm_agent_state *state, size_t count) {
+  pm_bidirectional_route_refresh *next;
+  size_t capacity;
+
+  if (count <= state->bidirectional_refresh_capacity) {
+    return 0;
+  }
+
+  capacity = state->bidirectional_refresh_capacity == 0 ? 16 : state->bidirectional_refresh_capacity;
+  while (capacity < count) {
+    capacity *= 2;
+  }
+
+  next = (pm_bidirectional_route_refresh *)realloc(state->bidirectional_refreshes, capacity * sizeof(pm_bidirectional_route_refresh));
+  if (next == NULL) {
+    return -1;
+  }
+
+  state->bidirectional_refreshes = next;
+  state->bidirectional_refresh_capacity = capacity;
   return 0;
 }
 
@@ -561,6 +621,7 @@ void pm_state_init(pm_agent_state *state, const char *route_table_path, const ch
 void pm_state_dispose(pm_agent_state *state) {
   free(state->processes);
   free(state->pending_routes);
+  free(state->bidirectional_refreshes);
   pm_string_array_clear(&state->suppressed_detected_ids, &state->suppressed_count, &state->suppressed_capacity);
   pm_string_array_clear(&state->written_network_ids, &state->written_network_count, &state->written_network_capacity);
   pm_string_array_clear(&state->written_entry_paths, &state->written_entry_count, &state->written_entry_capacity);
@@ -576,6 +637,81 @@ static void pm_route_identity(const pm_route *route, char *buffer, size_t size) 
 
 static void pm_endpoint_identity(int logical_port, const char *network_id, char *buffer, size_t size) {
   snprintf(buffer, size, "%s:%d", network_id == NULL ? "" : network_id, logical_port);
+}
+
+static void pm_prune_bidirectional_refreshes(pm_agent_state *state, time_t now) {
+  size_t write_index = 0;
+
+  for (size_t read_index = 0; read_index < state->bidirectional_refresh_count; read_index++) {
+    if (state->bidirectional_refreshes[read_index].refresh_until > now) {
+      if (write_index != read_index) {
+        state->bidirectional_refreshes[write_index] = state->bidirectional_refreshes[read_index];
+      }
+      write_index++;
+    }
+  }
+
+  state->bidirectional_refresh_count = write_index;
+}
+
+static int pm_mark_bidirectional_route_observed(pm_agent_state *state, int logical_port, const char *network_id) {
+  const char *normalized_network_id = network_id == NULL ? "" : network_id;
+  time_t refresh_until = time(NULL) + pm_route_table_ttl_seconds();
+
+  pm_prune_bidirectional_refreshes(state, time(NULL));
+  for (size_t index = 0; index < state->bidirectional_refresh_count; index++) {
+    pm_bidirectional_route_refresh *refresh = &state->bidirectional_refreshes[index];
+    if (refresh->logical_port == logical_port && strcmp(refresh->network_id, normalized_network_id) == 0) {
+      refresh->refresh_until = refresh_until;
+      return 0;
+    }
+  }
+
+  if (pm_reserve_bidirectional_refreshes(state, state->bidirectional_refresh_count + 1) != 0) {
+    return -1;
+  }
+
+  state->bidirectional_refreshes[state->bidirectional_refresh_count].logical_port = logical_port;
+  pm_copy(
+    state->bidirectional_refreshes[state->bidirectional_refresh_count].network_id,
+    sizeof(state->bidirectional_refreshes[state->bidirectional_refresh_count].network_id),
+    normalized_network_id);
+  state->bidirectional_refreshes[state->bidirectional_refresh_count].refresh_until = refresh_until;
+  state->bidirectional_refresh_count++;
+  return 0;
+}
+
+static int pm_route_recently_bidirectional(pm_agent_state *state, const pm_route *route, time_t now) {
+  const char *network_id = route->network_id[0] == '\0' ? "" : route->network_id;
+
+  pm_prune_bidirectional_refreshes(state, now);
+  for (size_t index = 0; index < state->bidirectional_refresh_count; index++) {
+    pm_bidirectional_route_refresh *refresh = &state->bidirectional_refreshes[index];
+    if (refresh->logical_port == route->logical_port && strcmp(refresh->network_id, network_id) == 0) {
+      return refresh->refresh_until > now;
+    }
+  }
+
+  return 0;
+}
+
+static int pm_routes_can_refresh_unchanged_table(pm_agent_state *state, const pm_route *routes, size_t count) {
+  time_t now = time(NULL);
+
+  if (count == 0) {
+    return 0;
+  }
+
+  for (size_t index = 0; index < count; index++) {
+    if (strcmp(routes[index].source, "compose") == 0) {
+      continue;
+    }
+    if (!pm_route_recently_bidirectional(state, &routes[index], now)) {
+      return 0;
+    }
+  }
+
+  return 1;
 }
 
 static int pm_route_list_add_dedupe(pm_route_list *routes, const pm_route *route) {
@@ -976,6 +1112,127 @@ static int pm_endpoint_hosts_match(const char *listener_host, const char *route_
   }
 
   return strcmp(normalized_listener, normalized_route) == 0;
+}
+
+static int pm_parse_lsof_tcp_endpoint(const char *value, char *host, size_t host_size, int *port) {
+  const char *start = value == NULL ? "" : value;
+  const char *end;
+  const char *colon;
+  size_t host_length;
+  char port_text[16];
+  size_t port_length;
+
+  while (*start != '\0' && isspace((unsigned char)*start)) {
+    start++;
+  }
+  if (strncmp(start, "TCP ", 4) == 0) {
+    start += 4;
+  }
+  end = start + strlen(start);
+  while (end > start && isspace((unsigned char)*(end - 1))) {
+    end--;
+  }
+
+  colon = end;
+  while (colon > start && *colon != ':') {
+    colon--;
+  }
+  if (colon <= start || colon + 1 >= end) {
+    return -1;
+  }
+
+  port_length = (size_t)(end - colon - 1);
+  if (port_length == 0 || port_length >= sizeof(port_text)) {
+    return -1;
+  }
+  memcpy(port_text, colon + 1, port_length);
+  port_text[port_length] = '\0';
+  *port = atoi(port_text);
+  if (!pm_is_valid_port(*port)) {
+    return -1;
+  }
+
+  host_length = (size_t)(colon - start);
+  if (host_length > 1 && start[0] == '[' && start[host_length - 1] == ']') {
+    start++;
+    host_length -= 2;
+  }
+  if (host_length >= host_size) {
+    host_length = host_size - 1;
+  }
+  memcpy(host, start, host_length);
+  host[host_length] = '\0';
+  return 0;
+}
+
+static int pm_established_line_matches_route(const char *line, const pm_route *route) {
+  char endpoint[PM_TEXT];
+  char *state_marker;
+  char *arrow;
+  char local_host[PM_SMALL];
+  char remote_host[PM_SMALL];
+  int local_port;
+  int remote_port;
+
+  if (line == NULL || route == NULL || strcmp(route->source, "compose") == 0) {
+    return 0;
+  }
+
+  pm_copy(endpoint, sizeof(endpoint), line);
+  state_marker = strstr(endpoint, " (");
+  if (state_marker != NULL) {
+    *state_marker = '\0';
+  }
+  arrow = strstr(endpoint, "->");
+  if (arrow == NULL) {
+    return 0;
+  }
+  *arrow = '\0';
+  arrow += 2;
+
+  if (pm_parse_lsof_tcp_endpoint(endpoint, local_host, sizeof(local_host), &local_port) != 0 ||
+      pm_parse_lsof_tcp_endpoint(arrow, remote_host, sizeof(remote_host), &remote_port) != 0) {
+    return 0;
+  }
+
+  return (local_port == route->actual_port && pm_endpoint_hosts_match(local_host, route->host)) ||
+    (remote_port == route->actual_port && pm_endpoint_hosts_match(remote_host, route->host));
+}
+
+static void pm_refresh_established_route_observations(pm_agent_state *state) {
+  pm_route_list routes = {0};
+  FILE *pipe;
+  char line[2048];
+
+  if (pm_build_routes(state, NULL, &routes) != 0 || routes.count == 0) {
+    free(routes.items);
+    return;
+  }
+
+  pipe = popen("lsof -nP -iTCP -sTCP:ESTABLISHED -Fn 2>/dev/null", "r");
+  if (pipe == NULL) {
+    free(routes.items);
+    return;
+  }
+
+  while (fgets(line, sizeof(line), pipe) != NULL) {
+    size_t length = strlen(line);
+    while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r')) {
+      line[--length] = '\0';
+    }
+    if (length == 0 || line[0] != 'n') {
+      continue;
+    }
+
+    for (size_t index = 0; index < routes.count; index++) {
+      if (pm_established_line_matches_route(line + 1, &routes.items[index])) {
+        pm_mark_bidirectional_route_observed(state, routes.items[index].logical_port, routes.items[index].network_id);
+      }
+    }
+  }
+
+  pclose(pipe);
+  free(routes.items);
 }
 
 static const pm_listener *pm_find_listener_by_process_pid_endpoint(const pm_listener_list *listeners, const pm_process *process) {
@@ -1959,7 +2216,7 @@ static int pm_route_table_file_fresh_for_reuse(const char *file_path) {
   }
 
   now_ms = pm_epoch_milliseconds();
-  return expires_at_ms - now_ms > PM_ROUTE_TABLE_REFRESH_MARGIN_SECONDS * 1000L;
+  return expires_at_ms - now_ms > pm_route_table_refresh_margin_seconds() * 1000L;
 }
 
 static int pm_unlink_route_table_file_if_not_newer(
@@ -1983,6 +2240,7 @@ static int pm_write_route_table_file(
   char updated_at[PM_TIME];
   long updated_at_ms;
   long expires_at_ms;
+  long ttl_ms;
   int result;
 
   if (pm_route_table_generation_is_newer(state, file_path, sequence)) {
@@ -1992,14 +2250,15 @@ static int pm_write_route_table_file(
   pm_buffer_init(&buffer);
   pm_iso_now(updated_at, sizeof(updated_at));
   updated_at_ms = pm_epoch_milliseconds();
-  expires_at_ms = updated_at_ms + PM_ROUTE_TABLE_TTL_SECONDS * 1000L;
+  ttl_ms = pm_route_table_ttl_seconds() * 1000L;
+  expires_at_ms = updated_at_ms + ttl_ms;
   result = pm_buffer_append(&buffer, "{\"updatedAt\":") ||
            pm_json_append_string(&buffer, updated_at) ||
            pm_buffer_appendf(
              &buffer,
              ",\"expiresAtMs\":%ld,\"ttlMs\":%ld",
              expires_at_ms,
-             PM_ROUTE_TABLE_TTL_SECONDS * 1000L) ||
+             ttl_ms) ||
            pm_buffer_append(&buffer, ",\"generation\":{\"writerId\":") ||
            pm_json_append_string(&buffer, state->route_table_writer_id) ||
            pm_buffer_appendf(
@@ -2045,6 +2304,8 @@ static int pm_write_route_table_file_if_changed(
     if (pm_route_table_generation_is_newer(state, file_path, sequence)) {
       result = -1;
     } else if (pm_route_table_file_fresh_for_reuse(file_path)) {
+      result = 0;
+    } else if (!pm_routes_can_refresh_unchanged_table(state, routes, count)) {
       result = 0;
     } else {
       result = pm_write_route_table_file(state, file_path, routes, count, sequence);
@@ -2520,6 +2781,7 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
   pm_copy(effective_input.network_id, sizeof(effective_input.network_id), network_id);
 
   if (strcmp(input->route_direction, "send") == 0 && pm_find_active_route(state, input->requested_port, network_id, &active_route) != NULL) {
+    pm_mark_bidirectional_route_observed(state, input->requested_port, network_id);
     if (pm_flush_route_tables_for_allocation(state, &active_route, input->compact_response) != 0) {
       return -1;
     }
@@ -2537,6 +2799,9 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
 
   reusable = pm_find_pending_endpoint(state, input->requested_port, network_id);
   if (reusable != NULL) {
+    if (strcmp(reusable->route.route_direction, input->route_direction) != 0) {
+      pm_mark_bidirectional_route_observed(state, input->requested_port, network_id);
+    }
     reusable->expires_at = time(NULL) + PM_ROUTE_TTL_SECONDS;
     if (pm_flush_route_tables_for_allocation(state, &reusable->route, input->compact_response) != 0) {
       return -1;
@@ -2737,6 +3002,9 @@ int pm_state_register_process(pm_agent_state *state, const pm_register_input *in
   allocation = pm_find_pending_allocation(state, input->allocation_id);
   if (network_id[0] == '\0' && allocation != NULL) {
     pm_copy(network_id, sizeof(network_id), allocation->route.network_id);
+  }
+  if (allocation != NULL && strcmp(allocation->route.route_direction, "send") == 0) {
+    pm_mark_bidirectional_route_observed(state, input->requested_port, network_id);
   }
   pm_copy(source, sizeof(source), pm_normalized_source(input->source));
   if (input->allocation_id[0] != '\0') {
@@ -3568,6 +3836,7 @@ int pm_state_refresh_snapshot(pm_agent_state *state, pm_buffer *payload) {
   if (pm_cleanup_pending(state)) {
     pm_write_route_tables(state);
   }
+  pm_refresh_established_route_observations(state);
   pm_write_route_tables(state);
   return pm_state_snapshot(state, payload);
 }

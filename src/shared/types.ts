@@ -489,6 +489,8 @@ export interface PortManagerSettings {
   readonly fixedProtocolPorts: readonly number[];
   /** Host-visible listener ports that should stay bound to their logical port. */
   readonly preservedListenPorts: readonly number[];
+  /** Seconds before generated routing cache files are considered stale by native readers. */
+  readonly routeTableTtlSeconds: number;
   /** Whether a newly launched routed URL should be opened automatically. */
   readonly autoOpenBrowser: boolean;
   /** Whether conflict routing should show an informational notification. */
@@ -583,6 +585,25 @@ export interface ListeningPortProvider {
    * Implementations live in the platform layer because they execute OS tools.
    */
   list(): Promise<readonly ListeningPort[]>;
+}
+
+export interface EstablishedTcpConnection {
+  /** Local endpoint address reported by the OS connection table. */
+  readonly localAddress: string;
+  /** Local TCP port reported by the OS connection table. */
+  readonly localPort: number;
+  /** Remote endpoint address reported by the OS connection table. */
+  readonly remoteAddress: string;
+  /** Remote TCP port reported by the OS connection table. */
+  readonly remotePort: number;
+}
+
+export interface EstablishedTcpConnectionProvider {
+  /**
+   * Lists currently established TCP connections. The agent uses this only as a
+   * liveness signal for route-cache refresh, not for process ownership.
+   */
+  list(): Promise<readonly EstablishedTcpConnection[]>;
 }
 
 export interface PortAvailability {

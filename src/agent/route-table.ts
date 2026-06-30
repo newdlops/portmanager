@@ -11,11 +11,46 @@ import * as path from "node:path";
 
 let routeTableStorageDirectory: string | undefined;
 
-/** Route files expire if the extension/daemon no longer refreshes generated state. */
-export const ROUTE_TABLE_TTL_MS = 300_000;
+/** Environment key shared with native readers and daemon processes. */
+export const ROUTE_TABLE_TTL_SECONDS_ENV = "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS";
 
-/** Background convergence refreshes route files before native readers reject them. */
-export const ROUTE_TABLE_REFRESH_MARGIN_MS = 60_000;
+/** Route files expire if the extension/daemon no longer refreshes generated state. */
+export const ROUTE_TABLE_TTL_MS = 30_000;
+
+/** Lowest supported TTL; shorter values create more agent round-trips than useful isolation. */
+export const MIN_ROUTE_TABLE_TTL_MS = 5_000;
+
+/** Highest supported TTL; stale route files should never outlive an ordinary dev-session restart window. */
+export const MAX_ROUTE_TABLE_TTL_MS = 3_600_000;
+
+/** Background convergence refreshes route files shortly before native readers reject them. */
+export const ROUTE_TABLE_REFRESH_MARGIN_MS = 10_000;
+
+/** Clamps user or environment-provided route cache TTLs to the reader-supported range. */
+export function normalizeRouteTableTtlMs(value: number | undefined, fallback = ROUTE_TABLE_TTL_MS): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return normalizeRouteTableTtlMs(fallback, ROUTE_TABLE_TTL_MS);
+  }
+
+  return Math.min(MAX_ROUTE_TABLE_TTL_MS, Math.max(MIN_ROUTE_TABLE_TTL_MS, Math.round(value)));
+}
+
+/** Reads the route cache TTL from the process environment used by Node daemon fallbacks. */
+export function routeTableTtlMsFromEnvironment(environment: NodeJS.ProcessEnv = process.env): number {
+  const rawValue = environment[ROUTE_TABLE_TTL_SECONDS_ENV];
+  if (rawValue === undefined || rawValue.trim().length === 0) {
+    return ROUTE_TABLE_TTL_MS;
+  }
+
+  const seconds = Number(rawValue);
+  return normalizeRouteTableTtlMs(Number.isFinite(seconds) ? seconds * 1000 : undefined);
+}
+
+/** Computes the rewrite margin from the active TTL so a 30s cache does not use a 60s margin. */
+export function routeTableRefreshMarginMs(ttlMs: number): number {
+  const normalizedTtlMs = normalizeRouteTableTtlMs(ttlMs);
+  return Math.min(ROUTE_TABLE_REFRESH_MARGIN_MS, Math.max(1_000, Math.floor(normalizedTtlMs / 2)));
+}
 
 /** Points extension-owned route tables at durable globalStorage instead of OS temp. */
 export function configureRouteTableStorageDirectory(storageDirectory: string): void {

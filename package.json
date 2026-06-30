@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8059",
+  "version": "0.0.8061",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -866,6 +866,13 @@
             "type": "number"
           },
           "description": "Host-visible listener ports that terminal hooks should keep on the requested port. Leave browser dev servers out so Port Manager can provide stable network aliases."
+        },
+        "portManager.routeTableTtlSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 5,
+          "maximum": 3600,
+          "description": "Seconds before generated routing cache files expire when they are not refreshed by successful routed traffic."
         },
         "portManager.containerRuntime": {
           "type": "string",

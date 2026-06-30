@@ -1,9 +1,11 @@
 import { NodePortScanner } from "../platform/ports/node-port-scanner";
 import { NodeListeningPortProvider } from "../platform/ports/node-listening-port-provider";
+import { NodeEstablishedTcpConnectionProvider } from "../platform/ports/tcp-connection-process-resolver";
 import { NodeProcessEnvironmentProvider } from "../platform/process/node-process-environment";
 import { NodeProcessLauncher } from "../platform/process/node-process-launcher";
 import { disableNativeHookForCurrentProcess } from "../platform/process/node-runtime";
 import { PortManagerAgent } from "./port-manager-agent";
+import { routeTableTtlMsFromEnvironment } from "./route-table";
 
 /**
  * CLI entrypoint for the single local Port Manager agent.
@@ -36,8 +38,10 @@ async function main(args: readonly string[]): Promise<void> {
       processLauncher: new NodeProcessLauncher(),
       portAvailabilityProvider: new NodePortScanner(),
       listeningPortProvider: new NodeListeningPortProvider(),
+      establishedConnectionProvider: new NodeEstablishedTcpConnectionProvider(),
       hookRouteRecoveryProvider: new NodeProcessEnvironmentProvider(),
       routeTablePath,
+      routeTableTtlMs: routeTableTtlMsFromEnvironment(),
       agentMainPath: __filename,
     });
 

@@ -11,7 +11,9 @@ import {
   getRouteTablePathForComposeClaimPort,
   getRouteTablePathForLogicalPort,
   getRouteTablePathForNetwork,
-  ROUTE_TABLE_REFRESH_MARGIN_MS,
+  normalizeRouteTableTtlMs,
+  routeTableRefreshMarginMs,
+  routeTableTtlMsFromEnvironment,
   ROUTE_TABLE_TTL_MS,
 } from "./route-table";
 import type {
@@ -20,6 +22,8 @@ import type {
   AgentStartManagedProcessRequest,
   DisposableLike,
   AgentDaemonStatus,
+  EstablishedTcpConnection,
+  EstablishedTcpConnectionProvider,
   HookRouteRecoveryProvider,
   LogicalPortRouteDirection,
   LogicalPortRoute,
@@ -77,6 +81,8 @@ export interface PortManagerAgentOptions {
   readonly portAvailabilityProvider?: PortAvailabilityProvider;
   /** Full listening-port table provider for snapshot generation. */
   readonly listeningPortProvider: ListeningPortProvider;
+  /** Established TCP table provider used to extend route-cache TTL only for live connections. */
+  readonly establishedConnectionProvider?: EstablishedTcpConnectionProvider;
   /** Best-effort recovery for hook-owned listeners after daemon restart. */
   readonly hookRouteRecoveryProvider?: HookRouteRecoveryProvider;
   /** Optional prebuilt router, useful for tests that fake routing behavior. */
@@ -93,6 +99,8 @@ export interface PortManagerAgentOptions {
   readonly defaultCwd?: string;
   /** JSON route table path shared with launched child processes. */
   readonly routeTablePath?: string;
+  /** Route table freshness TTL in milliseconds, usually sourced from VS Code settings. */
+  readonly routeTableTtlMs?: number;
   /** Compiled daemon entrypoint path used by clients to detect stale agents. */
   readonly agentMainPath?: string;
   /** Interval for daemon-side OS listener polling. */
@@ -215,6 +223,9 @@ export class PortManagerAgent implements DisposableLike {
   /** Provider used to merge all OS-level listeners into each snapshot. */
   private readonly listeningPortProvider: ListeningPortProvider;
 
+  /** Provider used only for route cache freshness; failures are fail-soft. */
+  private readonly establishedConnectionProvider: EstablishedTcpConnectionProvider | undefined;
+
   /** Reconstructs hook rows from live listener process metadata after restart. */
   private readonly hookRouteRecoveryProvider: HookRouteRecoveryProvider | undefined;
 
@@ -262,6 +273,9 @@ export class PortManagerAgent implements DisposableLike {
 
   /** JSON file path that stores the latest logical routing table. */
   private readonly routeTablePath: string;
+
+  /** Active TTL written into generated route-table JSON files. */
+  private readonly routeTableTtlMs: number;
 
   /** Writer identity persisted in route table files to reject stale daemon writes. */
   private readonly routeTableWriterId: string;
@@ -320,6 +334,12 @@ export class PortManagerAgent implements DisposableLike {
   /** Last route table content signature by file path, used to avoid timer-driven file churn. */
   private readonly routeTableSignaturesByPath = new Map<string, string>();
 
+  /**
+   * Endpoint ids that recently saw both sides of routing: a live listener route
+   * and a successful sender path that asked the daemon to refresh it.
+   */
+  private readonly bidirectionalRouteRefreshUntilMsByEndpoint = new Map<string, number>();
+
   /** Network ids that already had a scoped table, so empty updates can clear stale rows. */
   private readonly writtenRouteTableNetworkIds = new Set<string>();
 
@@ -341,6 +361,7 @@ export class PortManagerAgent implements DisposableLike {
       });
     this.processLauncher = options.processLauncher;
     this.listeningPortProvider = options.listeningPortProvider;
+    this.establishedConnectionProvider = options.establishedConnectionProvider;
     this.hookRouteRecoveryProvider = options.hookRouteRecoveryProvider;
     const portAvailabilityProvider = options.portAvailabilityProvider;
     this.routingService =
@@ -371,6 +392,7 @@ export class PortManagerAgent implements DisposableLike {
     this.defaultHost = options.defaultHost ?? "localhost";
     this.defaultCwd = options.defaultCwd ?? process.cwd();
     this.routeTablePath = options.routeTablePath ?? getDefaultRouteTablePath();
+    this.routeTableTtlMs = normalizeRouteTableTtlMs(options.routeTableTtlMs ?? routeTableTtlMsFromEnvironment());
     this.routeTableWriterStartedAtMs = options.routeTableWriterStartedAtMs ?? Date.now();
     this.routeTableWriterId =
       options.routeTableWriterId ?? `node-agent:${process.pid}:${this.routeTableWriterStartedAtMs}:${randomUUID()}`;
@@ -491,6 +513,7 @@ export class PortManagerAgent implements DisposableLike {
           ? this.findReusableActiveRoute(input.requestedPort, networkRouteScope, requestedActualHost)
           : undefined;
       if (activeRoute !== undefined) {
+        this.markBidirectionalRouteObserved(input.requestedPort, networkRouteScope);
         const logicalRoutes = this.buildCurrentLogicalRoutes();
         this.requireRouteTablePublish(logicalRoutes);
         this.queueSnapshotBroadcast();
@@ -509,6 +532,9 @@ export class PortManagerAgent implements DisposableLike {
 
       const reusableAllocation = this.findReusablePendingRouteAllocation(input.requestedPort, networkRouteScope);
       if (reusableAllocation !== undefined) {
+        if (normalizeRouteDirection(reusableAllocation.route.routeDirection) !== routeDirection) {
+          this.markBidirectionalRouteObserved(input.requestedPort, networkRouteScope);
+        }
         const refreshedAllocation = this.refreshPendingRouteAllocation(reusableAllocation);
         const logicalRoutes = this.buildCurrentLogicalRoutes();
         this.requireRouteTablePublish(logicalRoutes);
@@ -1249,6 +1275,7 @@ export class PortManagerAgent implements DisposableLike {
       defaultCwd: this.defaultCwd,
     });
 
+    await this.refreshEstablishedRouteObservations(snapshot.routes);
     return snapshot;
   }
 
@@ -1370,6 +1397,65 @@ export class PortManagerAgent implements DisposableLike {
         normalizeRouteDirection(route.routeDirection) === "listen" &&
         (expectedHost === undefined || normalizeOptionalHost(route.host) === expectedHost),
     );
+  }
+
+  /**
+   * Marks an endpoint as safe to extend because the daemon observed a sender
+   * after a listener route existed, or the second side joined a pending route.
+   */
+  private markBidirectionalRouteObserved(logicalPort: number, networkId: string | undefined): void {
+    const endpointIdentity = buildLogicalEndpointIdentity({
+      logicalPort,
+      ...(networkId ? { networkId } : {}),
+    });
+    this.bidirectionalRouteRefreshUntilMsByEndpoint.set(endpointIdentity, this.now().getTime() + this.routeTableTtlMs);
+  }
+
+  /** Refreshes endpoint liveness from the OS TCP table so long-lived sockets keep their routes alive. */
+  private async refreshEstablishedRouteObservations(routes: readonly LogicalPortRoute[]): Promise<void> {
+    if (this.establishedConnectionProvider === undefined || routes.length === 0) {
+      return;
+    }
+
+    const establishedConnections = await this.establishedConnectionProvider.list().catch(() => []);
+    if (establishedConnections.length === 0) {
+      return;
+    }
+
+    for (const route of routes) {
+      if (route.source === "compose") {
+        continue;
+      }
+      if (routeHasEstablishedConnection(route, establishedConnections)) {
+        this.markBidirectionalRouteObserved(route.logicalPort, normalizeNetworkId(route.networkId));
+      }
+    }
+  }
+
+  /** True when every non-compose route in a file has a recent two-sided observation. */
+  private canRefreshUnchangedRouteTable(routes: readonly LogicalPortRoute[], nowMs: number): boolean {
+    this.pruneExpiredBidirectionalRouteObservations(nowMs);
+    if (routes.length === 0) {
+      return false;
+    }
+
+    return routes.every((route) => {
+      if (route.source === "compose") {
+        return true;
+      }
+
+      const endpointIdentity = buildLogicalEndpointIdentity(route);
+      return (this.bidirectionalRouteRefreshUntilMsByEndpoint.get(endpointIdentity) ?? 0) > nowMs;
+    });
+  }
+
+  /** Drops expired refresh grants so a single historical connect cannot keep routes alive forever. */
+  private pruneExpiredBidirectionalRouteObservations(nowMs: number): void {
+    for (const [endpointIdentity, refreshUntilMs] of this.bidirectionalRouteRefreshUntilMsByEndpoint) {
+      if (refreshUntilMs <= nowMs) {
+        this.bidirectionalRouteRefreshUntilMsByEndpoint.delete(endpointIdentity);
+      }
+    }
   }
 
   /**
@@ -1825,7 +1911,10 @@ export class PortManagerAgent implements DisposableLike {
       if (isRouteTablePathNewerThanGeneration(routeTablePath, generation)) {
         return false;
       }
-      if (!routeTableFileNeedsRefresh(routeTablePath, writtenAtMs)) {
+      if (!routeTableFileNeedsRefresh(routeTablePath, writtenAtMs, this.routeTableTtlMs)) {
+        return true;
+      }
+      if (!this.canRefreshUnchangedRouteTable(routes, writtenAtMs)) {
         return true;
       }
     }
@@ -1835,7 +1924,7 @@ export class PortManagerAgent implements DisposableLike {
         return false;
       }
 
-      const expiresAtMs = writtenAtMs + ROUTE_TABLE_TTL_MS;
+      const expiresAtMs = writtenAtMs + this.routeTableTtlMs;
       fs.mkdirSync(path.dirname(routeTablePath), { recursive: true });
       writeAtomicRouteTableFile(
         routeTablePath,
@@ -1844,7 +1933,7 @@ export class PortManagerAgent implements DisposableLike {
             updatedAt: writtenAt.toISOString(),
             expiresAt: new Date(expiresAtMs).toISOString(),
             expiresAtMs,
-            ttlMs: ROUTE_TABLE_TTL_MS,
+            ttlMs: this.routeTableTtlMs,
             generation,
             routes,
           },
@@ -2254,6 +2343,18 @@ function endpointHostMatches(listenerHost: string, routeHost: string): boolean {
   return normalizedListenerHost === normalizedRouteHost;
 }
 
+/** True when the route's actual endpoint appears on either side of an ESTABLISHED TCP tuple. */
+function routeHasEstablishedConnection(
+  route: LogicalPortRoute,
+  connections: readonly EstablishedTcpConnection[],
+): boolean {
+  return connections.some(
+    (connection) =>
+      (connection.localPort === route.actualPort && endpointHostMatches(connection.localAddress, route.host)) ||
+      (connection.remotePort === route.actualPort && endpointHostMatches(connection.remoteAddress, route.host)),
+  );
+}
+
 /**
  * Same-port sender fallback is safe when the OS listener covers either the
  * original connect host or the scoped actual host. Other listeners on the same
@@ -2491,14 +2592,15 @@ function buildRouteTableSignature(routes: readonly LogicalPortRoute[]): string {
 }
 
 /** True when an existing route table should be rewritten to extend native-reader TTL. */
-function routeTableFileNeedsRefresh(routeTablePath: string, nowMs: number): boolean {
+function routeTableFileNeedsRefresh(routeTablePath: string, nowMs: number, routeTableTtlMs = ROUTE_TABLE_TTL_MS): boolean {
   try {
     const parsed = JSON.parse(fs.readFileSync(routeTablePath, "utf8")) as { readonly expiresAtMs?: unknown };
+    const refreshMarginMs = routeTableRefreshMarginMs(routeTableTtlMs);
     if (typeof parsed.expiresAtMs !== "number" || !Number.isFinite(parsed.expiresAtMs)) {
       return true;
     }
 
-    return parsed.expiresAtMs - nowMs <= ROUTE_TABLE_REFRESH_MARGIN_MS;
+    return parsed.expiresAtMs - nowMs <= refreshMarginMs;
   } catch {
     return true;
   }

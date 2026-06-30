@@ -11,9 +11,15 @@ import {
   getNetworkRouteTablePath,
   getRouteTablePathForComposeClaimPort,
   getRouteTablePathForLogicalPort,
+  routeTableRefreshMarginMs,
   ROUTE_TABLE_TTL_MS,
 } from "../../src/agent/route-table";
-import type { ListeningPort, PortAvailabilityProvider, ProcessLauncher } from "../../src/shared/types";
+import type {
+  EstablishedTcpConnection,
+  ListeningPort,
+  PortAvailabilityProvider,
+  ProcessLauncher,
+} from "../../src/shared/types";
 
 /**
  * Unit tests for daemon-side registration behavior.
@@ -194,14 +200,18 @@ test("newer route table generation rejects stale daemon writes", async (context)
   assert.equal(fs.existsSync(getRouteTablePathForLogicalPort(8001, "network-a", routeTablePath)), false);
 });
 
-test("refreshSnapshot refreshes unchanged route tables before TTL expiry", async (context) => {
+test("refreshSnapshot refreshes unchanged route tables only for established routes", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   let nowMs = Date.parse(fixedUpdatedAt);
+  let establishedConnections: readonly EstablishedTcpConnection[] = [];
   const agent = new PortManagerAgent({
     processLauncher: createFakeLauncher(),
     portAvailabilityProvider: createAvailablePortProvider(),
     listeningPortProvider: {
       list: async () => [],
+    },
+    establishedConnectionProvider: {
+      list: async () => establishedConnections,
     },
     agentPid: 777,
     now: () => new Date(nowMs),
@@ -224,7 +234,20 @@ test("refreshSnapshot refreshes unchanged route tables before TTL expiry", async
   const initialRouteTable = readRouteTable(routeTablePath);
   assert.equal(initialRouteTable.expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
 
-  nowMs += ROUTE_TABLE_TTL_MS - 59_999;
+  nowMs += ROUTE_TABLE_TTL_MS - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
+  await agent.refreshSnapshot();
+
+  assert.equal(readRouteTable(routeTablePath).expiresAtMs, initialRouteTable.expiresAtMs);
+
+  establishedConnections = [
+    {
+      localAddress: "127.0.0.1",
+      localPort: 58000,
+      remoteAddress: "127.0.0.1",
+      remotePort: 53000,
+    },
+  ];
+  nowMs += 1_000;
   await agent.refreshSnapshot();
 
   const refreshedRouteTable = readRouteTable(routeTablePath);

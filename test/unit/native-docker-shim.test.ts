@@ -83,7 +83,9 @@ test("docker shim rejects expired route-table and compose routing files", () => 
   const containerFinderEnd = source.indexOf("/** Rewrites container-name arguments", containerFinderStart);
   const containerFinderBody = source.slice(containerFinderStart, containerFinderEnd);
 
-  assert.equal(source.includes("PM_ROUTE_TABLE_TTL_SECONDS 300"), true);
+  assert.equal(source.includes('PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"'), true);
+  assert.equal(source.includes("PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 30"), true);
+  assert.equal(source.includes("pm_route_table_ttl_seconds()"), true);
   assert.equal(source.includes("pm_generated_route_file_expired(route_file)"), true);
   assert.equal(source.includes("pm_generated_route_file_expired(routing_file)"), true);
   assert.notEqual(routeTableReaderStart, -1);

@@ -79,13 +79,16 @@ test("native agent route tables carry TTL and refresh unchanged files", () => {
   const unchangedEnd = source.indexOf("static void pm_route_table_write_lock_path", unchangedStart);
   const unchangedBody = source.slice(unchangedStart, unchangedEnd);
 
-  assert.equal(source.includes("PM_ROUTE_TABLE_TTL_SECONDS 300"), true);
-  assert.equal(source.includes("PM_ROUTE_TABLE_REFRESH_MARGIN_SECONDS 60"), true);
+  assert.equal(source.includes('PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"'), true);
+  assert.equal(source.includes("PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 30"), true);
+  assert.equal(source.includes("static void pm_refresh_established_route_observations"), true);
+  assert.equal(source.includes('popen("lsof -nP -iTCP -sTCP:ESTABLISHED -Fn 2>/dev/null"'), true);
   assert.equal(source.includes("static int pm_route_table_file_fresh_for_reuse"), true);
   assert.notEqual(writeStart, -1);
   assert.equal(writeBody.includes('\\"expiresAtMs\\":%ld,\\"ttlMs\\":%ld'), true);
   assert.notEqual(unchangedStart, -1);
   assert.equal(unchangedBody.includes("pm_route_table_file_fresh_for_reuse(file_path)"), true);
+  assert.equal(unchangedBody.includes("pm_routes_can_refresh_unchanged_table(state, routes, count)"), true);
   assert.equal(unchangedBody.includes("pm_write_route_table_file(state, file_path, routes, count, sequence)"), true);
 });
 

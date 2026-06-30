@@ -40,7 +40,8 @@
 #define PM_MAX_ROUTES 32768
 #define PM_MAX_ROUTE_OBJECT 8192
 #define PM_ROUTE_FILE_CACHE_CAPACITY 64
-#define PM_ROUTE_TABLE_TTL_SECONDS 300
+#define PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"
+#define PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 30
 #define PM_DEFAULT_SCAN_RANGE 20
 #define PM_DEFAULT_VIRTUAL_START 53000
 #define PM_DEFAULT_VIRTUAL_END 59999
@@ -1360,6 +1361,19 @@ static int pm_parse_int_env(const char *name, int fallback) {
   return (int)parsed;
 }
 
+static int pm_route_table_ttl_seconds(void) {
+  int ttl_seconds = pm_parse_int_env(PM_ROUTE_TABLE_TTL_SECONDS_ENV, PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS);
+
+  if (ttl_seconds < 5) {
+    return 5;
+  }
+  if (ttl_seconds > 3600) {
+    return 3600;
+  }
+
+  return ttl_seconds;
+}
+
 static void pm_agent_roundtrip_timeout(struct timeval *timeout) {
   int timeout_ms = pm_parse_int_env("PORT_MANAGER_AGENT_TIMEOUT_MS", PM_AGENT_ROUNDTRIP_TIMEOUT_MS);
 
@@ -2341,7 +2355,7 @@ static int pm_route_file_stat_expired(const struct stat *stat_buffer) {
     return 0;
   }
 
-  return now_ms - mtime_ms > PM_ROUTE_TABLE_TTL_SECONDS * 1000L;
+  return now_ms - mtime_ms > pm_route_table_ttl_seconds() * 1000L;
 }
 
 /** New route-table documents expose an explicit wall-clock expiry for readers. */

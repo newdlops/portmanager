@@ -4,7 +4,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { getAgentSocketPath, getAgentStartupLockPath, removeStaleSocketFile } from "../agent/agent-socket";
-import { getDefaultRouteTablePath } from "../agent/route-table";
+import { getDefaultRouteTablePath, ROUTE_TABLE_TTL_SECONDS_ENV } from "../agent/route-table";
 import { readPortManagerSettings } from "../config/vscode-settings";
 import { buildNodeRuntimeEnvironment } from "../platform/process/node-runtime";
 import { SimpleEventEmitter } from "../shared/events";
@@ -574,7 +574,7 @@ export class LocalAgentClient implements PortManagerProcessService {
         ["--socket", socketPath, "--route-table", getDefaultRouteTablePath(), "--agent-main", agentMainPath],
         {
           detached: true,
-          env: buildNodeRuntimeEnvironment(),
+          env: this.buildAgentEnvironment(),
           stdio: "ignore",
           windowsHide: true,
         },
@@ -593,11 +593,20 @@ export class LocalAgentClient implements PortManagerProcessService {
   private startNodeAgentProcess(agentMainPath: string, socketPath: string): void {
     this.childProcess = spawn(process.execPath, [agentMainPath, "--socket", socketPath, "--route-table", getDefaultRouteTablePath()], {
       detached: true,
-      env: buildNodeRuntimeEnvironment(),
+      env: this.buildAgentEnvironment(),
       stdio: "ignore",
       windowsHide: true,
     });
     this.childProcess.unref();
+  }
+
+  /** Mirrors VS Code settings into daemon env without inheriting terminal hook routing. */
+  private buildAgentEnvironment(): NodeJS.ProcessEnv {
+    const settings = readPortManagerSettings();
+    return buildNodeRuntimeEnvironment({
+      ...process.env,
+      [ROUTE_TABLE_TTL_SECONDS_ENV]: String(settings.routeTableTtlSeconds),
+    });
   }
 
   /** Returns the compiled agent entrypoint owned by this extension instance. */

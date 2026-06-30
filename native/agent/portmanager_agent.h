@@ -80,6 +80,12 @@ typedef struct {
 } pm_pending_route;
 
 typedef struct {
+  int logical_port;
+  char network_id[PM_SMALL];
+  time_t refresh_until;
+} pm_bidirectional_route_refresh;
+
+typedef struct {
   char id[PM_TEXT];
   char local_address[PM_SMALL];
   int port;
@@ -97,6 +103,9 @@ typedef struct {
   pm_pending_route *pending_routes;
   size_t pending_count;
   size_t pending_capacity;
+  pm_bidirectional_route_refresh *bidirectional_refreshes;
+  size_t bidirectional_refresh_count;
+  size_t bidirectional_refresh_capacity;
   char **suppressed_detected_ids;
   size_t suppressed_count;
   size_t suppressed_capacity;

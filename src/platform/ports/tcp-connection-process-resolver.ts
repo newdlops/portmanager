@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { NativeProcessLookupProvider } from "../process/native-process-lookup";
 import type { LogicalPortRouterConnection } from "./logical-port-router";
+import type { EstablishedTcpConnection, EstablishedTcpConnectionProvider } from "../../shared/types";
 
 const execFileAsync = promisify(execFile);
 const ESTABLISHED_CONNECTION_SNAPSHOT_TTL_MS = 250;
@@ -205,6 +206,59 @@ export class NodeTcpConnectionProcessResolver {
   }
 }
 
+/** Lists established TCP tuples for route-cache liveness checks. */
+export class NodeEstablishedTcpConnectionProvider implements EstablishedTcpConnectionProvider {
+  private readonly runCommand: CommandRunner;
+  private establishedConnectionsSnapshot?: EstablishedConnectionSnapshot;
+  private establishedConnectionsRequest?: Promise<string>;
+
+  constructor(options: Pick<TcpConnectionProcessResolverOptions, "commandRunner"> = {}) {
+    this.runCommand = options.commandRunner ?? runExecFile;
+  }
+
+  async list(): Promise<readonly EstablishedTcpConnection[]> {
+    try {
+      return parseEstablishedTcpConnectionsFromLsof(await this.readEstablishedConnections());
+    } catch {
+      return [];
+    }
+  }
+
+  private async readEstablishedConnections(): Promise<string> {
+    const now = Date.now();
+
+    if (
+      this.establishedConnectionsSnapshot !== undefined &&
+      this.establishedConnectionsSnapshot.expiresAtMs > now
+    ) {
+      return this.establishedConnectionsSnapshot.output;
+    }
+
+    if (this.establishedConnectionsRequest !== undefined) {
+      return this.establishedConnectionsRequest;
+    }
+
+    let request: Promise<string>;
+    request = this.runCommand("lsof", ["-nP", "-iTCP", "-sTCP:ESTABLISHED", "-Fpcn"])
+      .then(({ stdout }) => {
+        const output = toText(stdout);
+        this.establishedConnectionsSnapshot = {
+          output,
+          expiresAtMs: Date.now() + ESTABLISHED_CONNECTION_SNAPSHOT_TTL_MS,
+        };
+        return output;
+      })
+      .finally(() => {
+        if (this.establishedConnectionsRequest === request) {
+          this.establishedConnectionsRequest = undefined;
+        }
+      });
+
+    this.establishedConnectionsRequest = request;
+    return request;
+  }
+}
+
 /** Parses lsof field output and finds the client-side owner of a socket tuple. */
 export function parseClientProcessFromLsof(
   output: string,
@@ -250,6 +304,32 @@ export function parseClientProcessFromLsof(
   }
 
   return undefined;
+}
+
+/** Parses every established TCP tuple from lsof field output. */
+export function parseEstablishedTcpConnectionsFromLsof(output: string): readonly EstablishedTcpConnection[] {
+  const connections: EstablishedTcpConnection[] = [];
+
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || line[0] !== "n") {
+      continue;
+    }
+
+    const parsed = parseLsofTcpConnection(line.slice(1));
+    if (parsed === undefined) {
+      continue;
+    }
+
+    connections.push({
+      localAddress: parsed.local.address,
+      localPort: parsed.local.port,
+      remoteAddress: parsed.remote.address,
+      remotePort: parsed.remote.port,
+    });
+  }
+
+  return connections;
 }
 
 /** Parses the first lsof file-name field from a cwd-only query. */

@@ -47,7 +47,9 @@ test("native hook route file cache is invalidated by path size and high-resoluti
 
   assert.equal(source.includes("pm_route_file_cache_entry"), true);
   assert.equal(source.includes("PM_ROUTE_FILE_CACHE_CAPACITY"), true);
-  assert.equal(source.includes("PM_ROUTE_TABLE_TTL_SECONDS 300"), true);
+  assert.equal(source.includes('PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"'), true);
+  assert.equal(source.includes("PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 30"), true);
+  assert.equal(source.includes("pm_route_table_ttl_seconds() * 1000L"), true);
   assert.equal(source.includes("pm_route_file_stat_expired"), true);
   assert.equal(source.includes("pm_route_file_buffer_expired"), true);
   assert.equal(source.includes("entry->size == stat_buffer->st_size"), true);
@@ -109,6 +111,60 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     );
 
     const result = await runHookedNodeClient(address.port, routeTablePath, networkId);
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "ok\n");
+    assert.equal(result.stderr, "");
+  });
+
+  test("native hook shares current-network routes across terminal working directories", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-network-share-"));
+    const server = net.createServer((socket) => {
+      socket.end("ok\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-shared";
+    const logicalPort = chooseDifferentTcpPort(address.port);
+    const ownerCwd = path.join(tempDir, "owner");
+    const clientCwd = path.join(tempDir, "client");
+    fs.mkdirSync(ownerCwd);
+    fs.mkdirSync(clientCwd);
+
+    const routeTablePath = path.join(tempDir, `newdlops-portmanager-routes-${process.getuid?.() ?? "user"}-${networkId}.json`);
+    fs.writeFileSync(
+      routeTablePath,
+      JSON.stringify({
+        updatedAt: "2026-06-30T00:00:00.000Z",
+        routes: [
+          {
+            logicalPort,
+            actualPort: address.port,
+            routeDirection: "listen",
+            host: "127.0.0.1",
+            cwd: ownerCwd,
+            networkId,
+            processId: "managed-process-hooked",
+            processName: "node",
+            status: "running",
+            source: "hooked",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const result = await runHookedNodeClient(logicalPort, routeTablePath, networkId, { cwd: clientCwd });
 
     assert.equal(result.exitCode, 0);
     assert.equal(result.stdout, "ok\n");
@@ -663,6 +719,7 @@ async function runHookedNodeClient(
   options: {
     readonly env?: NodeJS.ProcessEnv;
     readonly host?: string;
+    readonly cwd?: string;
   } = {},
 ): Promise<{ readonly exitCode: number | null; readonly stdout: string; readonly stderr: string }> {
   const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
@@ -678,7 +735,7 @@ async function runHookedNodeClient(
   ].join("\n");
 
   const child = spawn(process.execPath, ["-e", script], {
-    cwd: projectRoot,
+    cwd: options.cwd ?? projectRoot,
     env: {
       ...process.env,
       [preloadVariable]: hookLibraryPath,
