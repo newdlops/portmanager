@@ -150,6 +150,13 @@ interface PendingRouteAllocation {
   readonly expiresAtMs: number;
 }
 
+interface ListeningPortEndpoint {
+  /** OS bind address reported by lsof/netstat for this listener. */
+  readonly localAddress: string;
+  /** OS bind port reported by lsof/netstat for this listener. */
+  readonly port: number;
+}
+
 interface MissingExternalListenerState {
   /** First background scan time when the registered listener was absent. */
   readonly sinceMs: number;
@@ -218,8 +225,8 @@ export class PortManagerAgent implements DisposableLike {
   /** Short-lived route reservations created for external terminal wrappers. */
   private readonly pendingRouteAllocations = new Map<string, PendingRouteAllocation>();
 
-  /** Last OS listener ports captured before or during route allocation. */
-  private reservedListeningPorts = new Set<number>();
+  /** Last OS listener endpoints captured before or during route allocation. */
+  private reservedListeningEndpoints: readonly ListeningPortEndpoint[] = [];
 
   /** Serializes route decisions so concurrent binds cannot reserve one actual port. */
   private routeOperationQueue: Promise<void> = Promise.resolve();
@@ -338,7 +345,7 @@ export class PortManagerAgent implements DisposableLike {
       options.routingService ??
       new PortRoutingService({
         check: async (port, host) => {
-          if (this.isActualPortReserved(port)) {
+          if (this.isActualPortReserved(port, host)) {
             return {
               port,
               available: false,
@@ -1217,7 +1224,7 @@ export class PortManagerAgent implements DisposableLike {
     let routeStateChanged = false;
 
     this.updateReservedListeningPorts(listeners);
-    routeStateChanged = this.cleanupExpiredRouteAllocations(this.reservedListeningPorts) || routeStateChanged;
+    routeStateChanged = this.cleanupExpiredRouteAllocations(this.reservedListeningEndpoints) || routeStateChanged;
     routeStateChanged = (await this.recoverHookRoutesFromListeners(listeners)) || routeStateChanged;
     if (options.reconcileExternalListeners === true) {
       routeStateChanged = this.reconcileRegisteredProcessesWithListeners(listeners) || routeStateChanged;
@@ -1406,27 +1413,39 @@ export class PortManagerAgent implements DisposableLike {
     return refreshedAllocation;
   }
 
-  /** True when a short-lived route allocation already owns this actual port. */
-  private isActualPortReserved(port: number): boolean {
+  /** True when a short-lived route allocation already owns this actual endpoint. */
+  private isActualPortReserved(port: number, host = "127.0.0.1"): boolean {
     this.cleanupExpiredRouteAllocations();
-    if ([...this.pendingRouteAllocations.values()].some((allocation) => allocation.route.actualPort === port)) {
+    if (
+      [...this.pendingRouteAllocations.values()].some(
+        (allocation) => allocation.route.actualPort === port && endpointHostMatches(allocation.route.host, host),
+      )
+    ) {
       return true;
     }
 
     /*
      * A listener can disappear briefly while a dev server reloads or while the
      * OS command table is catching up. Keep active registry ports reserved so
-     * another concurrent bind cannot claim the same actual port during grace.
+     * another concurrent bind cannot claim the same actual endpoint during grace.
      */
     if (
       this.registry
         .list()
-        .some((process) => process.status === "running" && process.source !== "detected" && process.actualPort === port)
+        .some(
+          (process) =>
+            process.status === "running" &&
+            process.source !== "detected" &&
+            process.actualPort === port &&
+            endpointHostMatches(routeHostFromUrl(process.url), host),
+        )
     ) {
       return true;
     }
 
-    return this.reservedListeningPorts.has(port);
+    return this.reservedListeningEndpoints.some(
+      (listener) => listener.port === port && endpointHostMatches(listener.localAddress, host),
+    );
   }
 
   /**
@@ -1488,11 +1507,9 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Replaces the reservation cache with one coherent listener scan. */
   private updateReservedListeningPorts(listeners: readonly ListeningPort[]): void {
-    this.reservedListeningPorts = new Set(
-      listeners
-        .map((listener) => listener.port)
-        .filter((port) => Number.isInteger(port) && port > 0 && port <= 65_535),
-    );
+    this.reservedListeningEndpoints = listeners
+      .filter((listener) => Number.isInteger(listener.port) && listener.port > 0 && listener.port <= 65_535)
+      .map((listener) => ({ localAddress: listener.localAddress, port: listener.port }));
   }
 
   /**
@@ -1537,8 +1554,10 @@ export class PortManagerAgent implements DisposableLike {
     return true;
   }
 
-  /** Removes abandoned route allocations after their TTL unless a listener owns the actual port. */
-  private cleanupExpiredRouteAllocations(activeListenerPorts: ReadonlySet<number> = this.reservedListeningPorts): boolean {
+  /** Removes abandoned route allocations after their TTL unless a listener owns the actual endpoint. */
+  private cleanupExpiredRouteAllocations(
+    activeListenerEndpoints: readonly ListeningPortEndpoint[] = this.reservedListeningEndpoints,
+  ): boolean {
     const nowMs = this.now().getTime();
     let removedRoute = false;
 
@@ -1547,7 +1566,13 @@ export class PortManagerAgent implements DisposableLike {
         continue;
       }
 
-      if (activeListenerPorts.has(allocation.route.actualPort)) {
+      if (
+        activeListenerEndpoints.some(
+          (listener) =>
+            listener.port === allocation.route.actualPort &&
+            endpointHostMatches(listener.localAddress, allocation.route.host),
+        )
+      ) {
         this.refreshPendingRouteAllocation(allocation);
         continue;
       }
@@ -2189,12 +2214,12 @@ function endpointHostMatches(listenerHost: string, routeHost: string): boolean {
   const normalizedListenerHost = normalizeEndpointHostKey(listenerHost);
   const normalizedRouteHost = normalizeEndpointHostKey(routeHost);
 
-  if (isNonDefaultLoopbackHost(normalizedRouteHost)) {
-    return normalizedListenerHost === normalizedRouteHost;
-  }
-
   if (normalizedListenerHost === "*" || normalizedRouteHost === "*") {
     return true;
+  }
+
+  if (isNonDefaultLoopbackHost(normalizedRouteHost)) {
+    return normalizedListenerHost === normalizedRouteHost;
   }
 
   if (

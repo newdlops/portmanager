@@ -82,8 +82,8 @@ test("package command shims rerun client tools without native runtime alias sema
   const sourcePath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
   const launcherList = /const PRELOAD_RUNTIME_LAUNCHER_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
-  const packageCommandList = /const PRELOAD_PACKAGE_COMMAND_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
-  const packageManagerList = /const PRELOAD_PACKAGE_MANAGER_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
+  const packageCommandList = /const PRELOAD_PACKAGE_COMMAND_NAMES(?::[^=]+)? = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
+  const packageManagerList = /const PRELOAD_PACKAGE_MANAGER_NAMES(?::[^=]+)? = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
   const packageManagerShimStart = source.indexOf("function buildPreloadPackageManagerCommandShimScript");
   const packageManagerShimEnd = source.indexOf("function shellEnvRestoreFileName", packageManagerShimStart);
   const packageManagerShim = source.slice(packageManagerShimStart, packageManagerShimEnd);
@@ -335,12 +335,21 @@ test("global shell hook keeps no-network shells out of native preload routing", 
   assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK=0"), true);
   assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK_DISABLED=1"), true);
   assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK_DAEMON_STARTED=0"), true);
+  assert.equal(hookTemplate.includes("export PORT_MANAGER_RUNTIME_SHIM_READY=0"), true);
   assert.equal(hookTemplate.includes("unset PORT_MANAGER_DYLD_INSERT_LIBRARIES"), true);
   assert.equal(hookTemplate.includes("PORT_MANAGER_LD_PRELOAD"), true);
   const preloadRepairExport = hookTemplate.indexOf("export PORT_MANAGER_DYLD_INSERT_LIBRARIES");
   assert.notEqual(preloadRepairExport, -1);
   assert.notEqual(hookTemplate.lastIndexOf('if [ "\\${PORT_MANAGER_HOOK:-0}" = "1" ]; then', preloadRepairExport), -1);
   assert.equal(hookTemplate.includes("__pm_load_native_hook()"), true);
+  assert.equal(hookTemplate.includes("__pm_runtime_shim_check()"), true);
+  assert.equal(hookTemplate.includes("Port Manager routing unavailable: runtime shim check failed."), true);
+  assert.equal(
+    hookTemplate.includes(
+      'if [ -n "\\${PORT_MANAGER_RUNTIME_SHIM_DIR:-}" ] && [ "\\${PORT_MANAGER_RUNTIME_SHIM_READY:-0}" != "1" ]; then',
+    ),
+    true,
+  );
   assert.equal(hookTemplate.includes('if [ "\\${PORT_MANAGER_HOOK:-0}" != "1" ] || [ ! -f "${escapedHookLibraryPath}" ]; then'), true);
   assert.equal(hookTemplate.includes('shellPrependPathListEntry("DYLD_INSERT_LIBRARIES", options.hookLibraryPath)'), true);
   assert.equal(hookTemplate.includes('shellPrependPathListEntry("LD_PRELOAD", options.hookLibraryPath)'), true);
@@ -434,6 +443,10 @@ test("external pm shell function selects a network and sources its attach script
   const daemonReadyGuardIndex = attachBody.indexOf(
     'if [ "\\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" != "1" ]; then return 1 2>/dev/null || exit 1; fi',
   );
+  const shimReadyCheckIndex = attachBody.indexOf("buildRuntimeShimReadinessShell(runtimeShimDirectory)");
+  const shimReadyGuardIndex = attachBody.indexOf(
+    'if [ "\\${PORT_MANAGER_RUNTIME_SHIM_READY:-0}" != "1" ]; then return 1 2>/dev/null || exit 1; fi',
+  );
   const titleWriteIndex = attachBody.indexOf("buildTerminalTitleShell(buildPortManagerTerminalTitle(networkName))");
   const markerWriteIndex = attachBody.indexOf("buildTerminalAttachmentMarkerWriteShell()");
 
@@ -458,8 +471,14 @@ test("external pm shell function selects a network and sources its attach script
   assert.equal(networkServiceSource.includes('shellExport("PORT_MANAGER_NETWORK_NAME", networkName)'), true);
   assert.equal(networkServiceSource.includes("buildTerminalTitleShell(buildPortManagerTerminalTitle(networkName))"), true);
   assert.equal(daemonReadyGuardIndex >= 0, true);
+  assert.equal(shimReadyCheckIndex > daemonReadyGuardIndex, true);
+  assert.equal(shimReadyGuardIndex > shimReadyCheckIndex, true);
   assert.equal(titleWriteIndex > daemonReadyGuardIndex, true);
   assert.equal(markerWriteIndex > daemonReadyGuardIndex, true);
+  assert.equal(titleWriteIndex > shimReadyGuardIndex, true);
+  assert.equal(markerWriteIndex > shimReadyGuardIndex, true);
+  assert.equal(networkServiceSource.includes("TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES"), true);
+  assert.equal(networkServiceSource.includes("Port Manager routing unavailable: runtime shim check failed."), true);
   assert.equal(networkServiceSource.includes('buildTerminalTitleShell("Port Manager: detached")'), true);
   assert.equal(terminalHookEnvironmentSource.includes("readonly networkName?: string;"), true);
   assert.equal(terminalHookEnvironmentSource.includes('collection.replace("PORT_MANAGER_NETWORK_NAME", scope.networkName'), true);
@@ -514,6 +533,8 @@ test("external pm shell function exposes doctor routes and detach diagnostics", 
   assert.equal(commandSource.includes('"repair"'), true);
   assert.equal(commandSource.includes('"detach"'), true);
   assert.equal(commandSource.includes("Daemon readiness flag:"), true);
+  assert.equal(commandSource.includes("Runtime shim readiness flag:"), true);
+  assert.equal(commandSource.includes("Runtime shim dir:"), true);
   assert.equal(commandSource.includes("Routing mode:"), true);
   assert.equal(commandSource.includes("Network loopback host:"), true);
   assert.equal(commandSource.includes("Actual loopback host:"), true);
@@ -541,6 +562,8 @@ test("external pm shell function exposes doctor routes and detach diagnostics", 
   assert.equal(commandSource.includes("__pm_routing_ready()"), true);
   assert.equal(commandSource.includes("__pm_agent_ensure()"), true);
   assert.equal(commandSource.includes("__pm_load_native_hook()"), true);
+  assert.equal(commandSource.includes("__pm_runtime_shim_check()"), true);
+  assert.equal(commandSource.includes("PORT_MANAGER_RUNTIME_SHIM_READY"), true);
   assert.equal(commandSource.includes("Port Manager: detached"), true);
   assert.equal(commandSource.includes('rm -f "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR/$__pm_marker_key.tsv"'), true);
   assert.equal(commandSource.includes("Port Manager routing detached from this shell."), true);
@@ -1499,6 +1522,16 @@ test("terminal attach does not require durable compose routes before reporting a
       scriptBody.indexOf("Port Manager routing active for"),
     true,
   );
+  assert.equal(
+    scriptBody.indexOf("buildRuntimeShimReadinessShell(runtimeShimDirectory)") <
+      scriptBody.indexOf("buildTerminalAttachmentMarkerWriteShell()"),
+    true,
+  );
+  assert.equal(
+    scriptBody.indexOf('if [ "\\${PORT_MANAGER_RUNTIME_SHIM_READY:-0}" != "1" ]; then return 1 2>/dev/null || exit 1; fi') <
+      scriptBody.indexOf("buildTerminalAttachmentMarkerWriteShell()"),
+    true,
+  );
 });
 
 test("native hook preserves listener ports only for explicit overrides", () => {
@@ -1621,6 +1654,10 @@ test("logical routers are opened only after logical routes are live", () => {
   assert.equal(collectLogicalRouterPorts.includes("route.actualPort !== route.logicalPort"), true);
   assert.equal(collectLogicalRouterPorts.includes("!isDetachedNetworkRoute(route, networkScopedLiveRoutes)"), true);
   assert.equal(collectLogicalRouterPorts.includes("!externallyOwnedPorts.has(route.logicalPort)"), true);
+  assert.equal(collectLogicalRouterPorts.includes("listenerCoversLogicalRouterHost(listener.localAddress)"), true);
+  assert.equal(source.includes("function listenerCoversLogicalRouterHost"), true);
+  assert.equal(source.includes("function endpointHostMatches"), true);
+  assert.equal(source.includes("function isGeneratedLoopbackHost"), true);
   assert.equal(
     syncBody.includes("await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);"),
     true,

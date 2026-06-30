@@ -27,6 +27,7 @@ import {
   prepareRuntimeShimLauncherDirectory,
   prepareShellEnvRestoreScript,
   RUNTIME_SHIM_DIRECTORY_ENV,
+  TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES,
 } from "./terminal-hook-environment";
 import type {
   ComposeAttachment,
@@ -3199,6 +3200,7 @@ else
   export PORT_MANAGER_HOOK=0
   export PORT_MANAGER_HOOK_DISABLED=1
   export PORT_MANAGER_HOOK_DAEMON_STARTED=0
+  export PORT_MANAGER_RUNTIME_SHIM_READY=0
   unset PORT_MANAGER_DYLD_INSERT_LIBRARIES PORT_MANAGER_LD_PRELOAD
   unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID
   ${escapedShellEnvRestorePath !== undefined ? `if [ -n "\${PORT_MANAGER_PREV_BASH_ENV:-}" ] && [ "\${BASH_ENV:-}" = "${escapedShellEnvRestorePath}" ]; then export BASH_ENV="\${PORT_MANAGER_PREV_BASH_ENV}"; elif [ "\${BASH_ENV:-}" = "${escapedShellEnvRestorePath}" ]; then unset BASH_ENV; fi` : ""}
@@ -3297,6 +3299,12 @@ pm() {
     else
       printf 'Daemon readiness flag: not ready (PORT_MANAGER_HOOK_DAEMON_STARTED=%s)\n' "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-unset}"
     fi
+    if [ -n "\${PORT_MANAGER_RUNTIME_SHIM_DIR:-}" ]; then
+      printf 'Runtime shim readiness flag: %s\n' "\${PORT_MANAGER_RUNTIME_SHIM_READY:-0}"
+      printf 'Runtime shim dir: %s\n' "$PORT_MANAGER_RUNTIME_SHIM_DIR"
+    else
+      printf '%s\n' 'Runtime shim dir: unset'
+    fi
     printf 'Routing mode: %s\n' "\${PORT_MANAGER_ROUTING_MODE:-unset}"
     printf 'Network loopback host: %s\n' "\${PORT_MANAGER_NETWORK_LOOPBACK_HOST:--}"
     printf 'Actual loopback host: %s\n' "\${PORT_MANAGER_ACTUAL_LOOPBACK_HOST:--}"
@@ -3365,7 +3373,7 @@ pm() {
     fi
     printf '\\033]0;%s\\007' 'Port Manager: detached' 2>/dev/null || true
     if [ -n "\${PORT_MANAGER_GLOBAL_ROUTES_FILE:-}" ]; then export PORT_MANAGER_ROUTES_FILE="$PORT_MANAGER_GLOBAL_ROUTES_FILE"; else unset PORT_MANAGER_ROUTES_FILE; fi
-    unset PORT_MANAGER_HOOK PORT_MANAGER_HOOK_DISABLED PORT_MANAGER_NETWORK_ID PORT_MANAGER_NETWORK_NAME PORT_MANAGER_ROUTE_TABLE_NETWORK_ID PORT_MANAGER_BORROWED_NETWORK_ID NEWDLOPS_PM_NETWORK_ID NEWDLOPS_PM_BORROWED_NETWORK_ID PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_COMPOSE_LOGICAL_PORTS PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS PORT_MANAGER_TERMINAL_ATTACHMENT_DIR PORT_MANAGER_SCAN_RANGE PORT_MANAGER_ROUTING_MODE PORT_MANAGER_VIRTUAL_PORT_START PORT_MANAGER_VIRTUAL_PORT_END PORT_MANAGER_FIXED_PROTOCOL_PORTS PORT_MANAGER_PRESERVE_LISTEN_PORTS ${ACTUAL_LOOPBACK_HOST_ENV} PORT_MANAGER_NETWORK_LOOPBACK_HOST PORT_MANAGER_DYLD_INSERT_LIBRARIES PORT_MANAGER_LD_PRELOAD
+    unset PORT_MANAGER_HOOK PORT_MANAGER_HOOK_DISABLED PORT_MANAGER_NETWORK_ID PORT_MANAGER_NETWORK_NAME PORT_MANAGER_ROUTE_TABLE_NETWORK_ID PORT_MANAGER_BORROWED_NETWORK_ID NEWDLOPS_PM_NETWORK_ID NEWDLOPS_PM_BORROWED_NETWORK_ID PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_RUNTIME_SHIM_READY PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_COMPOSE_LOGICAL_PORTS PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS PORT_MANAGER_TERMINAL_ATTACHMENT_DIR PORT_MANAGER_SCAN_RANGE PORT_MANAGER_ROUTING_MODE PORT_MANAGER_VIRTUAL_PORT_START PORT_MANAGER_VIRTUAL_PORT_END PORT_MANAGER_FIXED_PROTOCOL_PORTS PORT_MANAGER_PRESERVE_LISTEN_PORTS ${ACTUAL_LOOPBACK_HOST_ENV} PORT_MANAGER_NETWORK_LOOPBACK_HOST PORT_MANAGER_DYLD_INSERT_LIBRARIES PORT_MANAGER_LD_PRELOAD
     export PORT_MANAGER_HOOK=0
     export PORT_MANAGER_HOOK_DISABLED=1
     export PORT_MANAGER_HOOK_DAEMON_STARTED=0
@@ -3442,6 +3450,7 @@ pm() {
   __pm_status=$?
   if [ "$__pm_status" -eq 0 ]; then
     __pm_load_native_hook
+    __pm_runtime_shim_check
     if __pm_routing_ready; then
       printf 'Port Manager shell network: %s [%s]\n' "$__pm_network_name" "$__pm_network_id" >&2
     else
@@ -3541,6 +3550,43 @@ __pm_current_network_id() {
   return 1
 }
 
+__pm_runtime_shim_check() {
+  export PORT_MANAGER_RUNTIME_SHIM_READY=0
+  if [ -z "\${PORT_MANAGER_RUNTIME_SHIM_DIR:-}" ]; then
+    export PORT_MANAGER_RUNTIME_SHIM_READY=1
+    return 0
+  fi
+
+  __pm_runtime_shim_missing=0
+  if [ ! -d "$PORT_MANAGER_RUNTIME_SHIM_DIR" ]; then
+    __pm_runtime_shim_missing=1
+  else
+    for __pm_shim_name in ${TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES.join(" ")}; do
+      if [ ! -x "$PORT_MANAGER_RUNTIME_SHIM_DIR/$__pm_shim_name" ]; then
+        __pm_runtime_shim_missing=1
+        break
+      fi
+    done
+    case ":$PATH:" in
+      *":$PORT_MANAGER_RUNTIME_SHIM_DIR:"*) ;;
+      *) __pm_runtime_shim_missing=1 ;;
+    esac
+  fi
+
+  if [ "$__pm_runtime_shim_missing" = "0" ]; then
+    export PORT_MANAGER_RUNTIME_SHIM_READY=1
+    unset __pm_runtime_shim_missing __pm_shim_name
+    return 0
+  fi
+
+  export PORT_MANAGER_HOOK=0
+  export PORT_MANAGER_HOOK_DISABLED=1
+  export PORT_MANAGER_RUNTIME_SHIM_READY=0
+  printf '%s\n' 'Port Manager routing unavailable: runtime shim check failed.' >&2
+  unset __pm_runtime_shim_missing __pm_shim_name
+  return 1
+}
+
 __pm_routing_ready() {
   __pm_ready_network_id="$(__pm_current_network_id 2>/dev/null || true)"
   if [ -z "$__pm_ready_network_id" ]; then
@@ -3548,6 +3594,10 @@ __pm_routing_ready() {
     return 1
   fi
   if [ "\${PORT_MANAGER_HOOK:-0}" != "1" ] || [ "\${PORT_MANAGER_HOOK_DISABLED:-0}" = "1" ] || [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" != "1" ]; then
+    unset __pm_ready_network_id
+    return 1
+  fi
+  if [ -n "\${PORT_MANAGER_RUNTIME_SHIM_DIR:-}" ] && [ "\${PORT_MANAGER_RUNTIME_SHIM_READY:-0}" != "1" ]; then
     unset __pm_ready_network_id
     return 1
   fi
@@ -3582,6 +3632,7 @@ __pm_repair() {
         __pm_status=$?
         if [ "$__pm_status" -eq 0 ]; then
           __pm_load_native_hook
+          __pm_runtime_shim_check
           if __pm_routing_ready; then
             printf 'Port Manager repair complete for %s [%s].\n' "\${__pm_network_name:-$__pm_current_id}" "$__pm_current_id"
           else
@@ -3599,6 +3650,7 @@ __pm_repair() {
   __pm_status=$?
   if [ "$__pm_status" -eq 0 ]; then
     __pm_load_native_hook
+    __pm_runtime_shim_check
     if __pm_routing_ready; then
       printf 'Port Manager repair complete for %s.\n' "$__pm_current_id"
     else
@@ -3613,6 +3665,7 @@ __pm_repair() {
 if [ "\${PORT_MANAGER_HOOK:-0}" = "1" ]; then
   __pm_agent_ensure
   __pm_load_native_hook
+  __pm_runtime_shim_check
 fi
 `;
 }

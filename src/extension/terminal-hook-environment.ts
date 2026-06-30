@@ -19,6 +19,7 @@ import type { DisposableLike, PortManagerSettings } from "../shared/types";
 import {
   buildComposeProjectRoutingFunctionScript,
   buildRuntimeCommandShimScript,
+  type RuntimeCommandShimName,
 } from "./compose-project-routing";
 
 /**
@@ -37,8 +38,8 @@ const TERMINAL_MUTATOR_OPTIONS: vscode.EnvironmentVariableMutatorOptions = {
 
 export const RUNTIME_SHIM_DIRECTORY_ENV = "PORT_MANAGER_RUNTIME_SHIM_DIR";
 export const DOCKER_SHIM_PATH_ENV = "PORT_MANAGER_DOCKER_SHIM";
-const PRELOAD_PACKAGE_MANAGER_NAMES = ["npm", "npx", "pnpm", "pnpx", "corepack", "uv", "uvx", "yarn", "yarnpkg"];
-const RUNTIME_COMMAND_SHIM_NAMES = ["docker", "podman", "docker-compose", "podman-compose"] as const;
+const PRELOAD_PACKAGE_MANAGER_NAMES: readonly string[] = ["npm", "npx", "pnpm", "pnpx", "corepack", "uv", "uvx", "yarn", "yarnpkg"];
+const RUNTIME_COMMAND_SHIM_NAMES: readonly RuntimeCommandShimName[] = ["docker", "podman", "docker-compose", "podman-compose"];
 const PRELOAD_RUNTIME_LAUNCHER_NAMES = [
   "node",
   "python",
@@ -58,7 +59,7 @@ const PRELOAD_RUNTIME_LAUNCHER_NAMES = [
 // Package managers are intentionally excluded so install/link lifecycle work
 // does not inherit socket routing unless the invoked tool crosses a runtime
 // shim boundary later.
-const PRELOAD_PACKAGE_COMMAND_NAMES = [
+const PRELOAD_PACKAGE_COMMAND_NAMES: readonly string[] = [
   "celery",
   "vite",
   "uvicorn",
@@ -68,6 +69,11 @@ const PRELOAD_PACKAGE_COMMAND_NAMES = [
   "dotenv",
   "wait-on",
   "retry",
+];
+export const TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES: readonly string[] = [
+  ...RUNTIME_COMMAND_SHIM_NAMES,
+  ...PRELOAD_PACKAGE_MANAGER_NAMES,
+  ...PRELOAD_PACKAGE_COMMAND_NAMES,
 ];
 const COMPOSE_REFRESH_WAIT_MS = "3000";
 

@@ -77,22 +77,37 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(networkServiceSource.includes("with administrator privileges"), true);
   assert.equal(networkServiceSource.includes("maybeAutoInstallBrowserDnsResolvers"), true);
   assert.equal(networkServiceSource.includes("isBrowserDnsLoopbackAliasConfigured"), true);
+  assert.equal(networkServiceSource.includes("ensureBrowserDnsLoopbackAliasesReady"), true);
   assert.equal(networkServiceSource.includes("loopbackAliasConfigured"), true);
   assert.equal(networkServiceSource.includes("readBrowserProxyProcessCommandTexts"), true);
   assert.equal(networkServiceSource.includes("readProcessCommand(process.pid)"), true);
   assert.equal(networkServiceSource.includes("processCommandTextByPid"), true);
+  assert.equal(networkServiceSource.includes("this.browserNetworkProxy.retryFailedEndpointsNow();"), true);
+  assert.equal(networkServiceSource.includes("await this.syncBrowserNetworkProxies().catch(() => undefined);"), true);
   const browserProxySyncStart = networkServiceSource.indexOf("private async syncBrowserNetworkProxiesExclusive");
   const browserProxySyncEnd = networkServiceSource.indexOf(
     "private async readBrowserProxyProcessCommandTexts",
     browserProxySyncStart,
   );
   const browserProxySyncSource = networkServiceSource.slice(browserProxySyncStart, browserProxySyncEnd);
+  const browserProxyLeaseIndex = browserProxySyncSource.indexOf("this.ownsBrowserNetworkProxyLease = true;");
+  const browserAliasReadyIndex = browserProxySyncSource.indexOf(
+    "ensureBrowserDnsLoopbackAliasesReady(buildBrowserDnsRecords(networks))",
+  );
   assert.notEqual(browserProxySyncStart, -1);
   assert.notEqual(browserProxySyncEnd, -1);
   assert.equal(browserProxySyncSource.includes("this.syncBrowserDnsRecordsForNetworks(networks);"), true);
+  assert.equal(browserProxySyncSource.includes("const dnsRunning = this.browserDnsServer.isRunning();"), true);
+  assert.equal(browserProxyLeaseIndex >= 0, true);
+  assert.equal(browserAliasReadyIndex > browserProxyLeaseIndex, true);
   assert.match(browserProxySyncSource, /collectBrowserProxyEndpoints\([\s\S]*networks,/);
   assert.equal(networkServiceSource.includes("isPublicWebEntrypointProcess"), true);
   assert.equal(networkServiceSource.includes("/\\bvite\\b/"), true);
+  assert.equal(networkServiceSource.includes("/\\bmanage\\.py\\s+runserver\\b/"), true);
+  assert.equal(networkServiceSource.includes("/\\bdjango-admin\\s+runserver\\b/"), true);
+  assert.equal(networkServiceSource.includes("/\\bdaphne\\b/"), true);
+  assert.equal(networkServiceSource.includes("/\\buvicorn\\b/"), true);
+  assert.equal(networkServiceSource.includes("/\\bgunicorn\\b/"), true);
   assert.equal(networkServiceSource.includes("backend ports remain"), true);
   assert.equal(
     networkServiceSource.includes("grep -q '^# Port Manager browser DNS resolver$'"),

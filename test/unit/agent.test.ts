@@ -1620,6 +1620,116 @@ test("reserves OS listener ports even when availability probing reports them fre
   assert.equal(allocation.actualPort, 3001);
 });
 
+test("allows actual ports to be reused on distinct loopback hosts", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const checkedHosts: Array<string | undefined> = [];
+  const listeners: readonly ListeningPort[] = [
+    createListener({
+      id: "tcp:127.80.10.20:58000:4321",
+      localAddress: "127.80.10.20",
+      port: 58000,
+      pid: 4321,
+      processName: "node",
+      command: "node server.js",
+    }),
+  ];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: {
+      check: async (port, host) => {
+        checkedHosts.push(host);
+        return {
+          port,
+          available: true,
+        };
+      },
+    },
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.refreshSnapshot();
+
+  const allocation = await agent.allocateRoute({
+    name: "node",
+    command: "node server.js",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    actualHost: "127.81.154.127",
+    networkId: "network-a",
+    routeDirection: "listen",
+    scanRange: 0,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58000,
+  });
+
+  assert.equal(allocation.actualPort, 58000);
+  assert.equal(allocation.host, "127.81.154.127");
+  assert.deepEqual(checkedHosts, ["127.81.154.127"]);
+});
+
+test("treats wildcard listener ports as reserved for generated loopback hosts", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const checkedPorts: number[] = [];
+  const listeners: readonly ListeningPort[] = [
+    createListener({
+      id: "tcp:0.0.0.0:58000:4321",
+      localAddress: "0.0.0.0",
+      port: 58000,
+      pid: 4321,
+      processName: "node",
+      command: "node server.js",
+    }),
+  ];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: {
+      check: async (port) => {
+        checkedPorts.push(port);
+        return {
+          port,
+          available: true,
+        };
+      },
+    },
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.refreshSnapshot();
+
+  const allocation = await agent.allocateRoute({
+    name: "node",
+    command: "node server.js",
+    cwd: "/workspace/app",
+    requestedPort: 58000,
+    host: "127.0.0.1",
+    actualHost: "127.81.154.127",
+    networkId: "network-a",
+    routeDirection: "listen",
+    scanRange: 1,
+    scanDirection: "up",
+    routingMode: "nearest",
+  });
+
+  assert.equal(allocation.actualPort, 58001);
+  assert.equal(allocation.host, "127.81.154.127");
+  assert.deepEqual(checkedPorts, [58001]);
+});
+
 test("coalesces concurrent listener snapshot scans", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const scanStarted = deferred<void>();

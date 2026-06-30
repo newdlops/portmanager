@@ -109,6 +109,7 @@ import {
   prepareShellEnvRestoreScript,
   RUNTIME_SHIM_DIRECTORY_ENV,
   shouldInjectTerminalHook,
+  TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES,
 } from "./terminal-hook-environment";
 import {
   buildComposeProjectRoutingShell,
@@ -883,6 +884,8 @@ export class PortManagerNetworkService implements DisposableLike {
 
     await runShellScriptWithAdministratorPrivileges(buildBrowserDnsResolverSetupScript(status.records, status.dnsPort));
     this.localChangeEvents.emit();
+    this.browserNetworkProxy.retryFailedEndpointsNow();
+    await this.syncBrowserNetworkProxies().catch(() => undefined);
 
     if (options.automatic === true) {
       void vscode.window.showInformationMessage("Port Manager browser DNS aliases installed.");
@@ -3596,6 +3599,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const snapshot = this.processService?.getSnapshot();
     const networks = this.registry.getSnapshot().networks;
     this.syncBrowserDnsRecordsForNetworks(networks);
+    const dnsRunning = this.browserDnsServer.isRunning();
 
     if (!tryAcquireBrowserNetworkProxyOwnerLease()) {
       if (this.ownsBrowserNetworkProxyLease) {
@@ -3606,11 +3610,15 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     this.ownsBrowserNetworkProxyLease = true;
+    if (dnsRunning) {
+      await ensureBrowserDnsLoopbackAliasesReady(buildBrowserDnsRecords(networks)).catch(() => undefined);
+    }
+
     const processCommandTextByPid = await this.readBrowserProxyProcessCommandTexts(snapshot?.processes ?? []);
     const endpoints = collectBrowserProxyEndpoints(
       snapshot?.processes ?? [],
       networks,
-      this.browserDnsServer.isRunning(),
+      dnsRunning,
       processCommandTextByPid,
     );
 
@@ -4652,6 +4660,7 @@ export class PortManagerNetworkService implements DisposableLike {
       "unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID",
       "unset PORT_MANAGER_HOOK_DISABLED",
       shellExport("PORT_MANAGER_HOOK", "1"),
+      shellExport("PORT_MANAGER_RUNTIME_SHIM_READY", "0"),
       shellExport("PORT_MANAGER_NETWORK_ID", networkId),
       shellExport("PORT_MANAGER_NETWORK_NAME", networkName),
       shellExport("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID", networkId),
@@ -4701,6 +4710,8 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     commands.push(
+      buildRuntimeShimReadinessShell(runtimeShimDirectory),
+      `if [ "\${PORT_MANAGER_RUNTIME_SHIM_READY:-0}" != "1" ]; then return 1 2>/dev/null || exit 1; fi`,
       buildTerminalAttachmentMarkerWriteShell(),
       buildTerminalTitleShell(buildPortManagerTerminalTitle(networkName)),
       `if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" = "1" ]; then printf '%s\\n' ${shellQuote(
@@ -4751,6 +4762,7 @@ export class PortManagerNetworkService implements DisposableLike {
       DOCKER_SHIM_PATH_ENV,
       "PORT_MANAGER_PRELOAD_REPAIR",
       "PORT_MANAGER_HOOK_DAEMON_STARTED",
+      "PORT_MANAGER_RUNTIME_SHIM_READY",
       "PORT_MANAGER_ROUTES_FILE",
       "PORT_MANAGER_GLOBAL_ROUTES_FILE",
       "PORT_MANAGER_COMPOSE_ROUTING_FILE",
@@ -6210,6 +6222,7 @@ function collectLogicalRouterPorts(
   const externallyOwnedPorts = new Set(
     listeners
       .filter((listener) => listener.protocol === "tcp" && !isPortManagerLogicalRouterListener(listener))
+      .filter((listener) => listenerCoversLogicalRouterHost(listener.localAddress))
       .map((listener) => listener.port),
   );
 
@@ -6240,6 +6253,66 @@ function isDetachedNetworkRoute(
       networkRoute.cwd !== undefined &&
       pathsShareDirectoryScope(route.cwd, networkRoute.cwd),
   );
+}
+
+/** True only when an OS listener occupies the localhost hosts used by logical routers. */
+function listenerCoversLogicalRouterHost(listenerHost: string): boolean {
+  return endpointHostMatches(listenerHost, "127.0.0.1") || endpointHostMatches(listenerHost, "::1");
+}
+
+/** Compares socket bind hosts while keeping generated network loopbacks distinct. */
+function endpointHostMatches(listenerHost: string, routeHost: string): boolean {
+  const normalizedListenerHost = normalizeEndpointHostKey(listenerHost);
+  const normalizedRouteHost = normalizeEndpointHostKey(routeHost);
+
+  if (normalizedListenerHost === "*" || normalizedRouteHost === "*") {
+    return true;
+  }
+
+  if (isGeneratedLoopbackHost(normalizedRouteHost)) {
+    return normalizedListenerHost === normalizedRouteHost;
+  }
+
+  if (
+    (normalizedRouteHost === "127.0.0.1" && normalizedListenerHost === "::1") ||
+    (normalizedRouteHost === "::1" && normalizedListenerHost === "127.0.0.1")
+  ) {
+    return true;
+  }
+
+  return normalizedListenerHost === normalizedRouteHost;
+}
+
+function normalizeEndpointHostKey(host: string): string {
+  let trimmedHost = host.trim().toLowerCase();
+
+  if (
+    trimmedHost.length === 0 ||
+    trimmedHost === "*" ||
+    trimmedHost === "0.0.0.0" ||
+    trimmedHost === "::" ||
+    trimmedHost === "[::]"
+  ) {
+    return "*";
+  }
+
+  if (trimmedHost === "localhost") {
+    return "127.0.0.1";
+  }
+
+  if (trimmedHost.startsWith("[") && trimmedHost.endsWith("]")) {
+    trimmedHost = trimmedHost.slice(1, -1);
+  }
+
+  if (trimmedHost.startsWith("::ffff:")) {
+    return trimmedHost.slice("::ffff:".length);
+  }
+
+  return trimmedHost;
+}
+
+function isGeneratedLoopbackHost(host: string): boolean {
+  return /^127\.(?!0\.0\.1$)\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 
 function collectBrowserProxyEndpoints(
@@ -6311,6 +6384,11 @@ function isPublicWebEntrypointProcess(process: ManagedProcess, processCommandTex
     /\bastro\s+dev\b/,
     /\bsvelte-kit\b/,
     /\bremix\s+vite:dev\b/,
+    /\bdjango-admin\s+runserver\b/,
+    /\bmanage\.py\s+runserver\b/,
+    /\bdaphne\b/,
+    /\buvicorn\b/,
+    /\bgunicorn\b/,
   ].some((pattern) => pattern.test(text));
 }
 
@@ -6498,6 +6576,26 @@ function loopbackAddressRoutingFailureMessage(
  */
 function isBrowserDnsLoopbackAliasConfigured(address: string): boolean {
   return isLoopbackAddressAliasConfigured(address);
+}
+
+/** Best-effort noninteractive preparation for browser-facing loopback aliases. */
+async function ensureBrowserDnsLoopbackAliasesReady(
+  records: readonly { readonly address: string }[],
+): Promise<void> {
+  const uniqueAddresses = [...new Set(records.map((record) => record.address))];
+
+  await Promise.all(
+    uniqueAddresses.map(async (address) => {
+      if (isBrowserDnsLoopbackAliasConfigured(address)) {
+        return;
+      }
+
+      await execFileAsync("/bin/sh", ["-c", buildNonInteractiveLoopbackAliasSetupCommand(address)], {
+        timeout: 5_000,
+        maxBuffer: 128 * 1024,
+      });
+    }),
+  );
 }
 
 function normalizeBrowserProxyTargetHost(host: string): string {
@@ -7418,6 +7516,46 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     `printf '%s\\n' 'Port Manager routing unavailable: local daemon did not become ready.' >&2`,
     `fi`,
     `unset __pm_agent_ready __pm_agent_lock __pm_agent_lock_acquired`,
+  ].join("\n");
+}
+
+/**
+ * Marks terminal routing ready only after PATH-visible runtime shims exist.
+ * The native preload can be active while shell command lookup still points at
+ * old shims, so attach waits for this cheap filesystem check before publishing
+ * the terminal marker or printing the active prompt.
+ */
+function buildRuntimeShimReadinessShell(runtimeShimDirectory: string | undefined): string {
+  if (runtimeShimDirectory === undefined) {
+    return "export PORT_MANAGER_RUNTIME_SHIM_READY=1";
+  }
+
+  return [
+    "export PORT_MANAGER_RUNTIME_SHIM_READY=0",
+    "__pm_runtime_shim_missing=0",
+    'if [ -z "${PORT_MANAGER_RUNTIME_SHIM_DIR:-}" ] || [ ! -d "$PORT_MANAGER_RUNTIME_SHIM_DIR" ]; then',
+    "  __pm_runtime_shim_missing=1",
+    "else",
+    `  for __pm_shim_name in ${TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES.join(" ")}; do`,
+    '    if [ ! -x "$PORT_MANAGER_RUNTIME_SHIM_DIR/$__pm_shim_name" ]; then',
+    "      __pm_runtime_shim_missing=1",
+    "      break",
+    "    fi",
+    "  done",
+    '  case ":$PATH:" in',
+    '    *":$PORT_MANAGER_RUNTIME_SHIM_DIR:"*) ;;',
+    "    *) __pm_runtime_shim_missing=1 ;;",
+    "  esac",
+    "fi",
+    'if [ "$__pm_runtime_shim_missing" = "0" ]; then',
+    "  export PORT_MANAGER_RUNTIME_SHIM_READY=1",
+    "else",
+    "  export PORT_MANAGER_HOOK=0",
+    "  export PORT_MANAGER_HOOK_DISABLED=1",
+    "  export PORT_MANAGER_RUNTIME_SHIM_READY=0",
+    "  printf '%s\\n' 'Port Manager routing unavailable: runtime shim check failed.' >&2",
+    "fi",
+    "unset __pm_runtime_shim_missing __pm_shim_name",
   ].join("\n");
 }
 
