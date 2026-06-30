@@ -703,7 +703,7 @@ static int pm_routes_can_refresh_unchanged_table(pm_agent_state *state, const pm
   }
 
   for (size_t index = 0; index < count; index++) {
-    if (strcmp(routes[index].source, "compose") == 0) {
+    if (strcmp(routes[index].status, "running") == 0 || strcmp(routes[index].source, "compose") == 0) {
       continue;
     }
     if (!pm_route_recently_bidirectional(state, &routes[index], now)) {

@@ -200,7 +200,7 @@ test("newer route table generation rejects stale daemon writes", async (context)
   assert.equal(fs.existsSync(getRouteTablePathForLogicalPort(8001, "network-a", routeTablePath)), false);
 });
 
-test("refreshSnapshot refreshes unchanged route tables only for established routes", async (context) => {
+test("refreshSnapshot refreshes running unchanged route tables without requiring every route to be established", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   let nowMs = Date.parse(fixedUpdatedAt);
   let establishedConnections: readonly EstablishedTcpConnection[] = [];
@@ -237,17 +237,11 @@ test("refreshSnapshot refreshes unchanged route tables only for established rout
   nowMs += ROUTE_TABLE_TTL_MS - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
   await agent.refreshSnapshot();
 
-  assert.equal(readRouteTable(routeTablePath).expiresAtMs, initialRouteTable.expiresAtMs);
+  const refreshedWithoutEstablishedConnection = readRouteTable(routeTablePath);
+  assert.equal(refreshedWithoutEstablishedConnection.ttlMs, ROUTE_TABLE_TTL_MS);
+  assert.equal(refreshedWithoutEstablishedConnection.expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
 
-  establishedConnections = [
-    {
-      localAddress: "127.0.0.1",
-      localPort: 58000,
-      remoteAddress: "127.0.0.1",
-      remotePort: 53000,
-    },
-  ];
-  nowMs += 1_000;
+  nowMs = refreshedWithoutEstablishedConnection.expiresAtMs - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
   await agent.refreshSnapshot();
 
   const refreshedRouteTable = readRouteTable(routeTablePath);
@@ -271,6 +265,89 @@ test("refreshSnapshot refreshes unchanged route tables only for established rout
   await agent.refreshSnapshot();
 
   assert.equal(readRouteTable(routeTablePath).ttlMs, ROUTE_TABLE_TTL_MS);
+});
+
+test("refreshSnapshot does not extend unchanged pending-only route tables without route traffic", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  let nowMs = Date.parse(fixedUpdatedAt);
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    establishedConnectionProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: () => new Date(nowMs),
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.allocateRoute({
+    name: "wait-on",
+    command: "wait-on http://localhost:8004/healthz",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    routeDirection: "send",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+
+  const initialRouteTable = readRouteTable(routeTablePath);
+  nowMs += ROUTE_TABLE_TTL_MS - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
+  await agent.refreshSnapshot();
+
+  assert.equal(readRouteTable(routeTablePath).expiresAtMs, initialRouteTable.expiresAtMs);
+});
+
+test("refreshSnapshot keeps large running route tables alive when some routes are idle", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  let nowMs = Date.parse(fixedUpdatedAt);
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => [],
+    },
+    establishedConnectionProvider: {
+      list: async () => [],
+    },
+    agentPid: 777,
+    now: () => new Date(nowMs),
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  for (let index = 0; index < 72; index++) {
+    await agent.registerExistingProcess({
+      pid: 2_000 + index,
+      name: "node",
+      command: `node server-${index}.js`,
+      cwd: `/workspace/cluster-${Math.floor(index / 12)}`,
+      requestedPort: 8_000 + index,
+      actualPort: 58_000 + index,
+      host: "127.0.0.1",
+      networkId: "network-a",
+      source: "hooked",
+    });
+  }
+
+  const initialRouteTable = readRouteTable(routeTablePath);
+  assert.equal(initialRouteTable.routes.length, 72);
+
+  nowMs += ROUTE_TABLE_TTL_MS - routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) + 1;
+  await agent.refreshSnapshot();
+
+  const refreshedRouteTable = readRouteTable(routeTablePath);
+  assert.equal(refreshedRouteTable.routes.length, 72);
+  assert.equal(refreshedRouteTable.expiresAtMs, nowMs + ROUTE_TABLE_TTL_MS);
 });
 
 test("keeps unscoped host listeners out of cwd-matched networks", async (context) => {

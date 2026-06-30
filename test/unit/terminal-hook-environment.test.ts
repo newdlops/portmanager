@@ -1678,17 +1678,21 @@ test("logical routers are opened only after logical routes are live", () => {
   const collectStart = source.indexOf("function collectLogicalRouterPorts");
   const collectEnd = source.indexOf("function isPortManagerLogicalRouterListener", collectStart);
   const collectLogicalRouterPorts = source.slice(collectStart, collectEnd);
+  const routeNeedsStart = source.indexOf("function routeNeedsLogicalRouter");
+  const routeNeedsEnd = source.indexOf("function isDetachedNetworkRoute", routeNeedsStart);
+  const routeNeedsLogicalRouter = source.slice(routeNeedsStart, routeNeedsEnd);
   const syncStart = source.indexOf("private async syncLogicalPortRoutersExclusive(): Promise<void>");
   const syncEnd = source.indexOf("private async findClientNetworkForRouter", syncStart);
   const syncBody = source.slice(syncStart, syncEnd);
 
   assert.equal(source.includes("collectLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? [])"), true);
-  assert.equal(source.includes("Scoped network routes are"), true);
+  assert.equal(source.includes("Network loopback routes"), true);
   assert.equal(collectLogicalRouterPorts.includes('route.source === "compose"'), false);
-  assert.equal(collectLogicalRouterPorts.includes("route.networkId === undefined"), true);
-  assert.equal(collectLogicalRouterPorts.includes("route.actualPort !== route.logicalPort"), true);
-  assert.equal(collectLogicalRouterPorts.includes("!isDetachedNetworkRoute(route, networkScopedLiveRoutes)"), true);
+  assert.equal(collectLogicalRouterPorts.includes("routeNeedsLogicalRouter(route)"), true);
+  assert.equal(collectLogicalRouterPorts.includes("route.networkId === undefined && isDetachedNetworkRoute"), true);
   assert.equal(collectLogicalRouterPorts.includes("!externallyOwnedPorts.has(route.logicalPort)"), true);
+  assert.equal(routeNeedsLogicalRouter.includes("route.actualPort !== route.logicalPort"), true);
+  assert.equal(routeNeedsLogicalRouter.includes("!listenerCoversLogicalRouterHost(route.host)"), true);
   assert.equal(collectLogicalRouterPorts.includes("listenerCoversLogicalRouterHost(listener.localAddress)"), true);
   assert.equal(source.includes("function listenerCoversLogicalRouterHost"), true);
   assert.equal(source.includes("function endpointHostMatches"), true);

@@ -1432,7 +1432,13 @@ export class PortManagerAgent implements DisposableLike {
     }
   }
 
-  /** True when every non-compose route in a file has a recent two-sided observation. */
+  /**
+   * True when unchanged route content is safe to rewrite for reader TTL.
+   *
+   * Running rows are already backed by live registry state. Short-lived pending
+   * allocations still need a recent two-sided observation so a never-started
+   * route cannot be kept alive by aggregate table rewrites.
+   */
   private canRefreshUnchangedRouteTable(routes: readonly LogicalPortRoute[], nowMs: number): boolean {
     this.pruneExpiredBidirectionalRouteObservations(nowMs);
     if (routes.length === 0) {
@@ -1440,7 +1446,7 @@ export class PortManagerAgent implements DisposableLike {
     }
 
     return routes.every((route) => {
-      if (route.source === "compose") {
+      if (route.status === "running" || route.source === "compose") {
         return true;
       }
 

@@ -89,6 +89,7 @@ test("native agent route tables carry TTL and refresh unchanged files", () => {
   assert.notEqual(unchangedStart, -1);
   assert.equal(unchangedBody.includes("pm_route_table_file_fresh_for_reuse(file_path)"), true);
   assert.equal(unchangedBody.includes("pm_routes_can_refresh_unchanged_table(state, routes, count)"), true);
+  assert.equal(source.includes('strcmp(routes[index].status, "running") == 0'), true);
   assert.equal(unchangedBody.includes("pm_write_route_table_file(state, file_path, routes, count, sequence)"), true);
 });
 

@@ -3686,9 +3686,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
   private async syncLogicalPortRoutersExclusive(): Promise<void> {
     /*
-     * Host loopback belongs to the host unless an explicit unscoped host route
-     * needs a localhost compatibility listener. Scoped network routes are
-     * intentionally excluded so they cannot occupy host localhost ports.
+     * Host loopback belongs to the host unless a live route needs a localhost
+     * compatibility listener. Network loopback routes such as 127.x.y.z:8004
+     * still need this bridge for unhooked tools that dial localhost:8004.
      */
     const snapshot = this.processService?.getSnapshot();
     const logicalPorts = collectLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? []);
@@ -6378,10 +6378,9 @@ function collectLogicalRouterPorts(
   for (const route of routes) {
     if (
       isLiveListenRoute(route) &&
-      route.networkId === undefined &&
-      route.actualPort !== route.logicalPort &&
       isTcpPort(route.logicalPort) &&
-      !isDetachedNetworkRoute(route, networkScopedLiveRoutes) &&
+      routeNeedsLogicalRouter(route) &&
+      !(route.networkId === undefined && isDetachedNetworkRoute(route, networkScopedLiveRoutes)) &&
       !externallyOwnedPorts.has(route.logicalPort)
     ) {
       ports.add(route.logicalPort);
@@ -6389,6 +6388,14 @@ function collectLogicalRouterPorts(
   }
 
   return [...ports].sort((left, right) => left - right);
+}
+
+/**
+ * Opens a localhost compatibility router when the route's real endpoint is not
+ * the host-visible localhost endpoint clients are dialing.
+ */
+function routeNeedsLogicalRouter(route: LogicalPortRoute): boolean {
+  return route.actualPort !== route.logicalPort || !listenerCoversLogicalRouterHost(route.host);
 }
 
 function isDetachedNetworkRoute(
