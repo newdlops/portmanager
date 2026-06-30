@@ -1055,6 +1055,7 @@ test("automatic control plane side effects use a single cross-window owner lease
   assert.equal(source.includes("CONTROL_PLANE_OWNER_LOCK_STALE_MS = 30_000"), true);
   assert.equal(source.includes('function buildControlPlaneOwnerControlPath(kind: "owner" | "lock" | "owner-ui-request"): string'), true);
   assert.equal(source.includes("CONTROL_PLANE_OWNER_UI_REQUEST_PATH"), true);
+  assert.equal(source.includes("OWNER_UI_REQUEST_POLL_INTERVAL_MS = 500"), true);
   assert.equal(source.includes("function tryAcquireControlPlaneOwnerLease(): boolean"), true);
   assert.equal(source.includes("function isActiveControlPlaneOwner"), true);
   assert.equal(source.includes("private ownsControlPlaneLease = false;"), true);
@@ -1069,6 +1070,8 @@ test("automatic control plane side effects use a single cross-window owner lease
   assert.equal(startBody.includes("this.startRoutingSignalRefreshLoop();"), false);
   assert.equal(startBody.includes("this.startTerminalAttachmentMarkerPolling();"), false);
   assert.equal(ownerWatcherBody.includes("vscode.workspace.createFileSystemWatcher"), true);
+  assert.equal(ownerWatcherBody.includes("this.watchOwnerUiFocusRequests(ownerUiRequestDirectory)"), true);
+  assert.equal(ownerWatcherBody.includes("this.startOwnerUiRequestPolling();"), true);
   assert.equal(ownerWatcherBody.includes("ownerUiRequestWatcher.onDidChange"), true);
   assert.equal(ownerWatcherBody.includes("void this.openOwnerUiFromFocusRequest();"), true);
   assert.equal(ownerWatcherBody.includes("this.controlPlaneOwnerDisposables.push("), true);

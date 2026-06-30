@@ -161,6 +161,7 @@ const CONTROL_PLANE_OWNER_UI_REQUEST_PATH = buildControlPlaneOwnerControlPath("o
 const OWNER_LEASE_HANDOFF_RETRY_DELAY_MS = 1_000;
 const DAEMON_RESTART_BACKOFF_MS = 30_000;
 const TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500;
+const OWNER_UI_REQUEST_POLL_INTERVAL_MS = 500;
 const TERMINAL_ATTACHMENT_REFRESH_DEBOUNCE_MS = 50;
 const TERMINAL_ATTACHMENT_REFRESH_BURST_WINDOW_MS = 2_000;
 const TERMINAL_ATTACHMENT_REFRESH_BURST_INTERVAL_MS = 250;
@@ -467,6 +468,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Lightweight marker poller used when VS Code file events miss global storage writes. */
   private terminalAttachmentMarkerPollTimer: ReturnType<typeof setInterval> | undefined;
 
+  /** Owner-only poller used when file watchers miss cross-window UI requests. */
+  private ownerUiRequestPollTimer: ReturnType<typeof setInterval> | undefined;
+
   /** Debounces marker file events before scanning terminals. */
   private terminalAttachmentRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -663,11 +667,14 @@ export class PortManagerNetworkService implements DisposableLike {
     const ownerUiRequestWatcher = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(ownerUiRequestDirectory, path.basename(CONTROL_PLANE_OWNER_UI_REQUEST_PATH)),
     );
+    const nativeOwnerUiRequestWatcher = this.watchOwnerUiFocusRequests(ownerUiRequestDirectory);
+    this.startOwnerUiRequestPolling();
 
     this.controlPlaneOwnerDisposables.push(
       terminalAttachmentMarkerWatcher,
       nativeTerminalAttachmentMarkerWatcher,
       ownerUiRequestWatcher,
+      nativeOwnerUiRequestWatcher,
       terminalAttachmentMarkerWatcher.onDidCreate(() => {
         this.scheduleTerminalAttachmentRefreshBurst();
       }),
@@ -754,6 +761,10 @@ export class PortManagerNetworkService implements DisposableLike {
     if (this.terminalAttachmentMarkerPollTimer !== undefined) {
       clearInterval(this.terminalAttachmentMarkerPollTimer);
       this.terminalAttachmentMarkerPollTimer = undefined;
+    }
+    if (this.ownerUiRequestPollTimer !== undefined) {
+      clearInterval(this.ownerUiRequestPollTimer);
+      this.ownerUiRequestPollTimer = undefined;
     }
     if (this.terminalAttachmentRefreshTimer !== undefined) {
       clearTimeout(this.terminalAttachmentRefreshTimer);
@@ -844,7 +855,8 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   private async openOwnerUiFromFocusRequest(): Promise<void> {
-    if (!this.ownsControlPlaneLease || !tryAcquireControlPlaneOwnerLease()) {
+    const owner = readControlPlaneOwner();
+    if (!this.ownsControlPlaneLease || owner?.pid !== process.pid || !isActiveControlPlaneOwner(owner, Date.now())) {
       this.demoteControlPlaneOwner();
       return;
     }
@@ -2255,6 +2267,10 @@ export class PortManagerNetworkService implements DisposableLike {
       clearInterval(this.terminalAttachmentMarkerPollTimer);
       this.terminalAttachmentMarkerPollTimer = undefined;
     }
+    if (this.ownerUiRequestPollTimer !== undefined) {
+      clearInterval(this.ownerUiRequestPollTimer);
+      this.ownerUiRequestPollTimer = undefined;
+    }
     if (this.terminalAttachmentRefreshTimer !== undefined) {
       clearTimeout(this.terminalAttachmentRefreshTimer);
       this.terminalAttachmentRefreshTimer = undefined;
@@ -2927,6 +2943,40 @@ export class PortManagerNetworkService implements DisposableLike {
         dispose: () => undefined,
       };
     }
+  }
+
+  /**
+   * Watches owner UI requests with Node's native watcher because VS Code file
+   * events are not reliable for shared control files outside the workspace.
+   */
+  private watchOwnerUiFocusRequests(directoryPath: string): DisposableLike {
+    try {
+      const requestFileName = path.basename(CONTROL_PLANE_OWNER_UI_REQUEST_PATH);
+      const watcher = syncFs.watch(directoryPath, { persistent: false }, (_eventType, fileName) => {
+        const changedName = fileName === undefined || fileName === null ? undefined : path.basename(String(fileName));
+        if (changedName === undefined || changedName === requestFileName) {
+          void this.openOwnerUiFromFocusRequest();
+        }
+      });
+      watcher.on("error", () => undefined);
+      return {
+        dispose: () => watcher.close(),
+      };
+    } catch {
+      return {
+        dispose: () => undefined,
+      };
+    }
+  }
+
+  private startOwnerUiRequestPolling(): void {
+    if (this.ownerUiRequestPollTimer !== undefined) {
+      return;
+    }
+
+    this.ownerUiRequestPollTimer = setInterval(() => {
+      void this.openOwnerUiFromFocusRequest();
+    }, OWNER_UI_REQUEST_POLL_INTERVAL_MS);
   }
 
   /**

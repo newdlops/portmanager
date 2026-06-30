@@ -109,6 +109,8 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(networkServiceSource.includes("getControlPlaneStatus(): ControlPlaneStatus"), true);
   assert.equal(networkServiceSource.includes("controlPlane: this.getControlPlaneStatus()"), true);
   assert.equal(networkServiceSource.includes("CONTROL_PLANE_OWNER_UI_REQUEST_PATH"), true);
+  assert.equal(networkServiceSource.includes("watchOwnerUiFocusRequests"), true);
+  assert.equal(networkServiceSource.includes("startOwnerUiRequestPolling"), true);
   assert.equal(networkServiceSource.includes("requestControlPlaneOwnerUiFocus(): Promise<boolean>"), true);
   assert.equal(networkServiceSource.includes("openOwnerUiFromFocusRequest"), true);
   assert.equal(activateSource.includes('"portManager.isControlPlaneOwner"'), true);
