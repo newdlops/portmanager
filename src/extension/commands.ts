@@ -1347,9 +1347,8 @@ export class PortManagerCommandController implements DisposableLike {
   }
 
   /**
-   * Opens the Port Manager view and explains where owner-only actions are
-   * available. Worker windows signal the elected owner because VS Code command
-   * execution is scoped to one extension host.
+   * Opens the Port Manager view locally or focuses the elected owner window.
+   * Worker windows do not request remote command execution from the owner.
    */
   private async openOwnerUi(): Promise<void> {
     const snapshot = this.dependencies.networkService.getSnapshot();
@@ -1360,8 +1359,8 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
-    const requested = await this.dependencies.networkService.requestControlPlaneOwnerUiFocus();
-    await vscode.window.showInformationMessage(formatOwnerUiNavigationMessage(snapshot, requested));
+    const focused = await this.dependencies.networkService.focusControlPlaneOwnerWindow();
+    await vscode.window.showInformationMessage(formatOwnerUiNavigationMessage(snapshot, focused));
   }
 
   /**
@@ -3067,13 +3066,13 @@ function formatStatusMenuOwnerDescription(snapshot: NetworkSnapshot): string {
   return "Routing changes are available only in the owner window";
 }
 
-function formatOwnerUiNavigationMessage(snapshot: NetworkSnapshot, requested: boolean): string {
-  if (requested && snapshot.controlPlane?.role === "worker") {
-    return `Requested Port Manager owner window pid ${snapshot.controlPlane.ownerPid ?? "unknown"} to open its UI.`;
+function formatOwnerUiNavigationMessage(snapshot: NetworkSnapshot, focused: boolean): string {
+  if (focused && snapshot.controlPlane?.role === "worker") {
+    return `Focused Port Manager owner window pid ${snapshot.controlPlane.ownerPid ?? "unknown"}.`;
   }
 
   if (snapshot.controlPlane?.role === "worker") {
-    return `This window is read-only for automatic routing. Use the Port Manager owner window with pid ${snapshot.controlPlane.ownerPid ?? "unknown"}.`;
+    return `Could not focus Port Manager owner window pid ${snapshot.controlPlane.ownerPid ?? "unknown"}.`;
   }
 
   if (snapshot.controlPlane?.role === "unowned") {

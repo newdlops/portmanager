@@ -299,49 +299,6 @@ __port_manager_network_id() {
     return 0
   fi
 
-  __pm_bash_env_path="\${BASH_ENV:-}"
-  __pm_bash_env_base="\${__pm_bash_env_path##*/}"
-  case "\${__pm_bash_env_base}" in
-    portmanager-bash-env-*.sh)
-      __pm_bash_network="\${__pm_bash_env_base#portmanager-bash-env-}"
-      __pm_bash_network="\${__pm_bash_network%.sh}"
-      if [ -n "\${__pm_bash_network}" ]; then
-        printf '%s\\n' "\${__pm_bash_network}"
-        return 0
-      fi
-      ;;
-  esac
-
-  __pm_routes_path="\${PORT_MANAGER_ROUTES_FILE:-}"
-  __pm_routes_base="\${__pm_routes_path##*/}"
-  __pm_routes_base="\${__pm_routes_base%.json}"
-  case "\${__pm_routes_base}" in
-    newdlops-portmanager-routes-*-*)
-      __pm_routes_network="\${__pm_routes_base#newdlops-portmanager-routes-}"
-      __pm_routes_network="\${__pm_routes_network#*-}"
-      if [ -n "\${__pm_routes_network}" ]; then
-        printf '%s\\n' "\${__pm_routes_network}"
-        return 0
-      fi
-      ;;
-  esac
-
-  __pm_compose_routes_path="\${PORT_MANAGER_COMPOSE_ROUTING_FILE:-}"
-  __pm_compose_routes_base="\${__pm_compose_routes_path##*/}"
-  __pm_compose_routes_base="\${__pm_compose_routes_base%.tsv}"
-  case "\${__pm_compose_routes_base}" in
-    compose-project-routing-*)
-      __pm_compose_routes_network="\${__pm_compose_routes_base#compose-project-routing-}"
-      case "\${__pm_compose_routes_network}" in
-        *.compose-*) __pm_compose_routes_network="\${__pm_compose_routes_network%%.compose-*}" ;;
-      esac
-      if [ -n "\${__pm_compose_routes_network}" ]; then
-        printf '%s\\n' "\${__pm_compose_routes_network}"
-        return 0
-      fi
-      ;;
-  esac
-
   return 1
 }
 
@@ -1312,6 +1269,13 @@ __port_manager_run_compose_command_with_routing() {
   shift 3
   __pm_route="$(__port_manager_compose_route_for_runtime "\${__pm_route_runtime}" "$@")"
   if [ -z "\${__pm_route}" ]; then
+    __pm_active_network="$(__port_manager_network_id 2>/dev/null || true)"
+    if [ -n "\${__pm_active_network}" ]; then
+      printf 'Port Manager compose routing unavailable for attached network %s; refusing to run host Compose command.\\n' "\${__pm_active_network}" >&2
+      unset __pm_active_network
+      return 127
+    fi
+    unset __pm_active_network
     command "\${__pm_command}" "$@"
     return $?
   fi

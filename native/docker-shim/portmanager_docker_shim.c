@@ -488,110 +488,6 @@ static int pm_first_command_index(int argc, char **argv) {
   return -1;
 }
 
-static const char *pm_network_id_from_route_table_path(void) {
-  const char *route_file = getenv("PORT_MANAGER_ROUTES_FILE");
-  const char *base_name;
-  const char *prefix = "newdlops-portmanager-routes-";
-  const char *suffix = ".json";
-  const char *scope_start;
-  size_t prefix_length = strlen(prefix);
-  size_t suffix_length = strlen(suffix);
-  size_t base_length;
-  size_t body_length;
-  size_t network_length;
-  static char network_id_from_route_table[PM_MAX_FIELD];
-
-  /*
-   * Child process launchers sometimes keep the scoped route file but drop the
-   * explicit network variables. The filename is stable enough to recover the
-   * logical-network id for Docker/Compose argv rewrites.
-   */
-  if (route_file == NULL || route_file[0] == '\0') {
-    return NULL;
-  }
-
-  if (pm_generated_route_file_expired(route_file)) {
-    return NULL;
-  }
-
-  base_name = strrchr(route_file, '/');
-  base_name = base_name == NULL ? route_file : base_name + 1;
-  base_length = strlen(base_name);
-
-  if (base_length <= prefix_length + suffix_length || strncmp(base_name, prefix, prefix_length) != 0) {
-    return NULL;
-  }
-
-  if (strcmp(base_name + base_length - suffix_length, suffix) != 0) {
-    return NULL;
-  }
-
-  body_length = base_length - prefix_length - suffix_length;
-  scope_start = memchr(base_name + prefix_length, '-', body_length);
-  if (scope_start == NULL) {
-    return NULL;
-  }
-
-  scope_start++;
-  network_length = (size_t)((base_name + prefix_length + body_length) - scope_start);
-  if (network_length == 0 || network_length >= sizeof(network_id_from_route_table)) {
-    return NULL;
-  }
-
-  memcpy(network_id_from_route_table, scope_start, network_length);
-  network_id_from_route_table[network_length] = '\0';
-  return network_id_from_route_table;
-}
-
-static const char *pm_network_id_from_compose_routing_file(void) {
-  const char *routing_file = getenv(PM_COMPOSE_ROUTING_FILE_ENV);
-  const char *base_name;
-  const char *compose_separator;
-  size_t prefix_length = strlen(PM_COMPOSE_ROUTING_FILE_PREFIX);
-  size_t suffix_length = strlen(PM_COMPOSE_ROUTING_FILE_SUFFIX);
-  size_t base_length;
-  size_t scoped_length;
-  size_t network_length;
-  static char network_id_from_compose_file[PM_MAX_FIELD];
-
-  /*
-   * Per-network Compose maps let child-process Docker calls recover scope even
-   * when launcher boundaries dropped the explicit network variables.
-   */
-  if (routing_file == NULL || routing_file[0] == '\0') {
-    return NULL;
-  }
-
-  if (pm_generated_route_file_expired(routing_file)) {
-    return NULL;
-  }
-
-  base_name = strrchr(routing_file, '/');
-  base_name = base_name == NULL ? routing_file : base_name + 1;
-  base_length = strlen(base_name);
-
-  if (base_length <= prefix_length + suffix_length || strncmp(base_name, PM_COMPOSE_ROUTING_FILE_PREFIX, prefix_length) != 0) {
-    return NULL;
-  }
-
-  if (strcmp(base_name + base_length - suffix_length, PM_COMPOSE_ROUTING_FILE_SUFFIX) != 0) {
-    return NULL;
-  }
-
-  scoped_length = base_length - prefix_length - suffix_length;
-  compose_separator = strstr(base_name + prefix_length, PM_COMPOSE_ROUTING_COMPOSE_SEPARATOR);
-  network_length = compose_separator == NULL
-    ? scoped_length
-    : (size_t)(compose_separator - (base_name + prefix_length));
-  if (network_length == 0 || network_length >= sizeof(network_id_from_compose_file)) {
-    return NULL;
-  }
-
-  memcpy(network_id_from_compose_file, base_name + prefix_length, network_length);
-  network_id_from_compose_file[network_length] = '\0';
-  return network_id_from_compose_file;
-}
-
 /** Extracts the logical network suffix from a scoped route-table filename. */
 static int pm_route_table_path_network_id(const char *route_file, char *network_id, size_t size) {
   const char *base_name;
@@ -637,7 +533,7 @@ static int pm_route_table_path_network_id(const char *route_file, char *network_
   return 0;
 }
 
-/** Chooses the active logical network from the terminal hook environment. */
+/** Chooses the active logical network from explicit terminal hook environment only. */
 static const char *pm_network_id(void) {
   const char *network_id = getenv("PORT_MANAGER_NETWORK_ID");
 
@@ -655,14 +551,6 @@ static const char *pm_network_id(void) {
 
   if (network_id == NULL || network_id[0] == '\0') {
     network_id = getenv("NEWDLOPS_PM_BORROWED_NETWORK_ID");
-  }
-
-  if (network_id == NULL || network_id[0] == '\0') {
-    network_id = pm_network_id_from_route_table_path();
-  }
-
-  if (network_id == NULL || network_id[0] == '\0') {
-    network_id = pm_network_id_from_compose_routing_file();
   }
 
   return network_id;
@@ -1476,29 +1364,6 @@ static long pm_json_long(const char *json, const char *key, long fallback) {
   return end == cursor ? fallback : parsed;
 }
 
-static int pm_extract_project_from_process_name(const char *process_name, char *buffer, size_t size) {
-  const char *separator;
-  size_t project_length;
-
-  if (process_name == NULL || process_name[0] == '\0' || size == 0) {
-    return -1;
-  }
-
-  separator = strchr(process_name, ':');
-  if (separator == NULL) {
-    return -1;
-  }
-
-  project_length = (size_t)(separator - process_name);
-  if (project_length == 0 || project_length >= size) {
-    return -1;
-  }
-
-  memcpy(buffer, process_name, project_length);
-  buffer[project_length] = '\0';
-  return 0;
-}
-
 static int pm_extract_project_service_from_process_name(
   const char *process_name,
   char *project,
@@ -1686,86 +1551,6 @@ static int pm_route_network_matches(const char *route_json, const char *network_
   return strcmp(route_network, network_id) == 0;
 }
 
-static int pm_find_compose_route_from_route_table(
-  const char *runtime,
-  char *attached_project,
-  size_t attached_size,
-  char *original_project,
-  size_t original_size,
-  char *override_file,
-  size_t override_size
-) {
-  const char *route_file = pm_effective_route_table_path();
-  const char *network_id = pm_network_id();
-  char *buffer;
-  char *cursor;
-  char selected_project[PM_MAX_FIELD] = "";
-  int found = 0;
-
-  (void)runtime;
-  if (pm_read_route_table_file_limited(route_file, &buffer) != 0) {
-    return -1;
-  }
-
-  cursor = buffer;
-  while ((cursor = strstr(cursor, "\"source\"")) != NULL) {
-    char *object_start = cursor;
-    char *object_end = strchr(cursor, '}');
-    char object_end_saved;
-    char source[64];
-    char route_cwd[PM_MAX_PATH];
-    char process_name[PM_MAX_FIELD];
-    char project_name[PM_MAX_FIELD];
-
-    while (object_start > buffer && *object_start != '{') {
-      object_start--;
-    }
-
-    if (object_end == NULL) {
-      break;
-    }
-
-    object_end_saved = *object_end;
-    *object_end = '\0';
-
-    if (
-      pm_json_string(object_start, "source", source, sizeof(source)) == 0 &&
-      strcmp(source, "compose") == 0 &&
-      pm_route_network_matches(object_start, network_id) &&
-      pm_json_string(object_start, "cwd", route_cwd, sizeof(route_cwd)) == 0 &&
-      pm_current_cwd_matches_route_cwd(route_cwd) &&
-      pm_json_string(object_start, "processName", process_name, sizeof(process_name)) == 0 &&
-      pm_extract_project_from_process_name(process_name, project_name, sizeof(project_name)) == 0
-    ) {
-      if (selected_project[0] != '\0' && strcmp(selected_project, project_name) != 0) {
-        *object_end = object_end_saved;
-        free(buffer);
-        return -1;
-      }
-
-      pm_copy(selected_project, sizeof(selected_project), project_name);
-      found = 1;
-    }
-
-    *object_end = object_end_saved;
-    cursor = object_end + 1;
-  }
-
-  free(buffer);
-  if (!found || selected_project[0] == '\0') {
-    return -1;
-  }
-
-  pm_copy(attached_project, attached_size, selected_project);
-  if (original_size > 0) {
-    original_project[0] = '\0';
-  }
-  if (override_size > 0) {
-    override_file[0] = '\0';
-  }
-  return 0;
-}
-
 static int pm_route_table_has_current_compose_route(void) {
   const char *route_file = pm_effective_route_table_path();
   const char *network_id = pm_network_id();
@@ -1948,15 +1733,7 @@ static int pm_find_compose_route(
     network_id[0] == '\0' ||
     pm_generated_route_file_expired(file_path)
   ) {
-    return pm_find_compose_route_from_route_table(
-      runtime,
-      attached_project,
-      attached_size,
-      original_project,
-      original_size,
-      override_file,
-      override_size
-    );
+    return -1;
   }
 
   memset(&search, 0, sizeof(search));
@@ -1984,15 +1761,7 @@ static int pm_find_compose_route(
     return 0;
   }
 
-  return search.found ? 0 : pm_find_compose_route_from_route_table(
-    runtime,
-    attached_project,
-    attached_size,
-    original_project,
-    original_size,
-    override_file,
-    override_size
-  );
+  return search.found ? 0 : -1;
 }
 
 /** Allocates one rewritten compose project option argument. */
@@ -2901,10 +2670,15 @@ static char *pm_container_target_for_token(
   }
 
   if (
+    network_id == NULL ||
+    network_id[0] == '\0'
+  ) {
+    return NULL;
+  }
+
+  if (
     file_path == NULL ||
     file_path[0] == '\0' ||
-    network_id == NULL ||
-    network_id[0] == '\0' ||
     pm_generated_route_file_expired(file_path)
   ) {
     return pm_container_target_from_route_table(runtime, real_runtime_path, token_copy, suffix);
@@ -3402,6 +3176,7 @@ int main(int argc, char **argv) {
   command_index = pm_first_command_index(argc, argv);
   pm_debug("command_index=%d standalone_compose=%d", command_index, standalone_compose);
   if (standalone_compose || (command_index >= 0 && strcmp(argv[command_index], "compose") == 0)) {
+    const char *compose_network_id = pm_network_id();
     if (pm_find_compose_route(
       runtime,
       argc,
@@ -3444,6 +3219,14 @@ int main(int argc, char **argv) {
         standalone_compose
       );
     } else {
+      if (compose_network_id != NULL && compose_network_id[0] != '\0') {
+        fprintf(
+          stderr,
+          "portmanager-docker-shim: no Compose route for attached network %s; refusing to run host Compose command\n",
+          compose_network_id
+        );
+        return 127;
+      }
       next_argv = pm_copy_runtime_args(real_runtime_path, argc, argv);
     }
   } else if (command_index >= 0 && strcmp(argv[command_index], "compose") != 0 &&

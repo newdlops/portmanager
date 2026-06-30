@@ -447,6 +447,8 @@ export interface ControlPlaneStatus {
   readonly currentPid: number;
   /** PID recorded in the active or recently stale owner lease, if any. */
   readonly ownerPid?: number;
+  /** Best-known UI process PID to focus when another window asks for the owner. */
+  readonly ownerFocusPid?: number;
   /** True when the owner lease is fresh and its PID is still alive. */
   readonly ownerActive: boolean;
   /** Last owner lease renewal time. */

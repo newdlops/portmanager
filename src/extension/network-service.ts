@@ -223,6 +223,8 @@ interface ComposeOverrideReconcileOptions {
 interface LogicalRouterOwnerDocument {
   /** Extension host process that currently owns localhost logical router children. */
   readonly pid: number;
+  /** Best-known UI process PID for direct cross-window focusing. */
+  readonly focusPid?: number;
   /** Lease renewal time; stale leases can be stolen by another active window. */
   readonly updatedAt: string;
 }
@@ -856,10 +858,31 @@ export class PortManagerNetworkService implements DisposableLike {
       role,
       currentPid: process.pid,
       ownerPid: owner?.pid,
+      ownerFocusPid: owner?.focusPid,
       ownerActive,
       ownerUpdatedAt: owner?.updatedAt,
       leaseExpiresAt,
     };
+  }
+
+  /**
+   * Brings the elected owner VS Code process to the foreground without sending
+   * a file request back to the owner extension host.
+   */
+  async focusControlPlaneOwnerWindow(): Promise<boolean> {
+    const controlPlane = this.getControlPlaneStatus();
+    if (!controlPlane.ownerActive || controlPlane.ownerPid === undefined) {
+      return false;
+    }
+
+    if (controlPlane.role === "owner") {
+      await vscode.commands.executeCommand("workbench.view.extension.portManager");
+      await vscode.commands.executeCommand("portManager.processes.focus");
+      return true;
+    }
+
+    const processRows = await this.processTableProvider.list().catch(() => []);
+    return focusOwnerWindowByPid(controlPlane.ownerPid, controlPlane.ownerFocusPid, processRows);
   }
 
   /**
@@ -7345,6 +7368,10 @@ function parseOptionalPositiveInteger(value: string | undefined): number | undef
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+function resolveControlPlaneFocusPid(): number | undefined {
+  return parseOptionalPositiveInteger(process.env.VSCODE_PID) ?? (process.ppid > 0 ? process.ppid : undefined);
+}
+
 /** Sends a command to every integrated terminal owned by this VS Code window. */
 function sendCommandToOpenVscodeTerminals(command: string): number {
   let sentCount = 0;
@@ -7507,6 +7534,76 @@ tell application "iTerm2"
           return "ok"
         end if
       end repeat
+    end repeat
+  end repeat
+end tell
+return "missing"
+`;
+
+  return runAppleScript(appleScript);
+}
+
+/** Focuses the owner process or one of its ancestors without asking the owner extension host to run a command. */
+async function focusOwnerWindowByPid(
+  ownerPid: number,
+  ownerFocusPid: number | undefined,
+  processRows: readonly ProcessTableRow[],
+): Promise<boolean> {
+  if (process.platform !== "darwin") {
+    return false;
+  }
+
+  const pids = collectProcessAndAncestorPids([ownerFocusPid, ownerPid], processRows);
+  if (pids.length === 0) {
+    return false;
+  }
+
+  return focusMacApplicationProcessByPid(pids);
+}
+
+/** Builds a nearest-first PID list so UI process hints are tried before generic ancestors. */
+function collectProcessAndAncestorPids(
+  candidatePids: readonly (number | undefined)[],
+  processRows: readonly ProcessTableRow[],
+): readonly number[] {
+  const rowsByPid = new Map(processRows.map((row) => [row.pid, row]));
+  const pids: number[] = [];
+  const seen = new Set<number>();
+
+  for (const candidatePid of candidatePids) {
+    if (candidatePid === undefined || !Number.isInteger(candidatePid) || candidatePid <= 0 || seen.has(candidatePid)) {
+      continue;
+    }
+
+    let cursorPid = candidatePid;
+    while (Number.isInteger(cursorPid) && cursorPid > 0 && !seen.has(cursorPid)) {
+      pids.push(cursorPid);
+      seen.add(cursorPid);
+
+      const row = rowsByPid.get(cursorPid);
+      if (row === undefined || row.parentPid <= 0) {
+        break;
+      }
+      cursorPid = row.parentPid;
+    }
+  }
+
+  return pids;
+}
+
+/** macOS exposes foreground control by application-process PID through System Events. */
+async function focusMacApplicationProcessByPid(pids: readonly number[]): Promise<boolean> {
+  const pidList = pids.join(", ");
+  const appleScript = `
+tell application "System Events"
+  repeat with pidValue in {${pidList}}
+    repeat with processItem in application processes
+      try
+        if (unix id of processItem) is pidValue then
+          set frontmost of processItem to true
+          return "ok"
+        end if
+      end try
     end repeat
   end repeat
 end tell
@@ -7950,11 +8047,15 @@ function readControlPlaneOwner(): LogicalRouterOwnerDocument | undefined {
 function writeControlPlaneOwnerLease(nowMs: number): boolean {
   try {
     ensureControlPlaneOwnerControlDirectory();
-    syncFs.writeFileSync(
-      CONTROL_PLANE_OWNER_PATH,
-      `${JSON.stringify({ pid: process.pid, updatedAt: new Date(nowMs).toISOString() })}\n`,
-      "utf8",
-    );
+      syncFs.writeFileSync(
+        CONTROL_PLANE_OWNER_PATH,
+        `${JSON.stringify({
+          pid: process.pid,
+          focusPid: resolveControlPlaneFocusPid(),
+          updatedAt: new Date(nowMs).toISOString(),
+        })}\n`,
+        "utf8",
+      );
     return true;
   } catch {
     return false;

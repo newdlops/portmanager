@@ -50,32 +50,31 @@ test("docker shim refreshes terminal markers after compose lifecycle commands", 
   );
 });
 
-test("docker shim prefers scoped route table network over stale compose routing file", () => {
+test("docker shim requires explicit network env for compose routing scope", () => {
   const sourcePath = path.resolve(__dirname, "../../../native/docker-shim/portmanager_docker_shim.c");
   const source = fs.readFileSync(sourcePath, "utf8");
   const networkStart = source.indexOf("static const char *pm_network_id(void)");
   const networkEnd = source.indexOf("static void pm_default_global_route_table_path", networkStart);
   const networkBody = source.slice(networkStart, networkEnd);
-  const matcherStart = source.indexOf("static int pm_route_network_matches");
-  const matcherEnd = source.indexOf("static int pm_find_compose_route_from_route_table", matcherStart);
-  const matcherBody = source.slice(matcherStart, matcherEnd);
+  const composeFinderStart = source.indexOf("static int pm_find_compose_route(");
+  const composeFinderEnd = source.indexOf("/** Allocates one rewritten compose project option argument.", composeFinderStart);
+  const composeFinderBody = source.slice(composeFinderStart, composeFinderEnd);
 
   assert.notEqual(networkStart, -1);
-  assert.notEqual(matcherStart, -1);
+  assert.notEqual(composeFinderStart, -1);
+  assert.equal(networkBody.includes('getenv("PORT_MANAGER_NETWORK_ID")'), true);
   assert.equal(
-    networkBody.indexOf('getenv("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID")') <
-      networkBody.indexOf("pm_network_id_from_route_table_path()"),
-    true,
-    "explicit route-table network env must outrank a stale inherited route file",
+    networkBody.includes("pm_network_id_from_route_table_path()"),
+    false,
+    "route-table filenames must not grant compose routing scope",
   );
   assert.equal(
-    networkBody.indexOf("pm_network_id_from_route_table_path()") <
-      networkBody.indexOf("pm_network_id_from_compose_routing_file()"),
-    true,
-    "current scoped route table must outrank an inherited stale compose TSV",
+    networkBody.includes("pm_network_id_from_compose_routing_file()"),
+    false,
+    "compose TSV filenames must not grant compose routing scope",
   );
-  assert.equal(matcherBody.includes("return 1;"), false);
-  assert.equal(matcherBody.includes("return 0;"), true);
+  assert.equal(source.includes("refusing to run host Compose command"), true);
+  assert.equal(composeFinderBody.includes("pm_find_compose_route_from_route_table"), false);
 });
 
 test("docker shim rejects expired route-table and compose routing files", () => {
@@ -94,7 +93,6 @@ test("docker shim rejects expired route-table and compose routing files", () => 
   assert.equal(source.includes('PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"'), true);
   assert.equal(source.includes("PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15"), true);
   assert.equal(source.includes("pm_route_table_ttl_seconds()"), true);
-  assert.equal(source.includes("pm_generated_route_file_expired(route_file)"), true);
   assert.equal(source.includes("pm_generated_route_file_expired(routing_file)"), true);
   assert.notEqual(routeTableReaderStart, -1);
   assert.equal(routeTableReaderBody.includes("pm_generated_route_file_expired(path)"), true);

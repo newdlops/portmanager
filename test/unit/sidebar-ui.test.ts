@@ -105,13 +105,14 @@ test("non-owner windows show owner status and disable owner actions", () => {
 
   assert.equal(typesSource.includes('export type ControlPlaneRole = "owner" | "worker" | "unowned";'), true);
   assert.equal(typesSource.includes("export interface ControlPlaneStatus"), true);
+  assert.equal(typesSource.includes("readonly ownerFocusPid?: number;"), true);
   assert.equal(typesSource.includes("readonly controlPlane?: ControlPlaneStatus;"), true);
   assert.equal(networkServiceSource.includes("getControlPlaneStatus(): ControlPlaneStatus"), true);
   assert.equal(networkServiceSource.includes("controlPlane: this.getControlPlaneStatus()"), true);
   assert.equal(networkServiceSource.includes("CONTROL_PLANE_OWNER_UI_REQUEST_PATH"), true);
   assert.equal(networkServiceSource.includes("watchOwnerUiFocusRequests"), true);
   assert.equal(networkServiceSource.includes("startOwnerUiRequestPolling"), true);
-  assert.equal(networkServiceSource.includes("requestControlPlaneOwnerUiFocus(): Promise<boolean>"), true);
+  assert.equal(networkServiceSource.includes("focusControlPlaneOwnerWindow(): Promise<boolean>"), true);
   assert.equal(networkServiceSource.includes("openOwnerUiFromFocusRequest"), true);
   assert.equal(activateSource.includes('"portManager.isControlPlaneOwner"'), true);
   assert.equal(activateSource.includes('snapshot.controlPlane?.role === "owner"'), true);
@@ -126,7 +127,8 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(commandsSource.includes('label: "$(window) Open Owner UI"'), true);
   assert.equal(commandsSource.includes('action: "ownerUi" as const'), true);
   assert.equal(commandsSource.includes('"portManager.openOwnerUi"'), true);
-  assert.equal(commandsSource.includes("requestControlPlaneOwnerUiFocus()"), true);
+  assert.equal(commandsSource.includes("focusControlPlaneOwnerWindow()"), true);
+  assert.equal(commandsSource.includes("requestControlPlaneOwnerUiFocus()"), false);
   assert.equal(commandsSource.includes('action: "ownerOnly" as const'), true);
   assert.equal(manifest.activationEvents?.includes("onCommand:portManager.openOwnerUi"), true);
 
