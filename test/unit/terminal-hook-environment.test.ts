@@ -93,6 +93,12 @@ test("package command shims rerun client tools without native runtime alias sema
     packageManagerProjectCommandStart,
     packageManagerProjectCommandEnd,
   );
+  const preloadedManagerStart = source.indexOf("function buildPreloadedPackageManagerEntrypointShell");
+  const preloadedManagerEnd = source.indexOf("function buildPreloadPackageCommandShimScript", preloadedManagerStart);
+  const preloadedManagerBlock = source.slice(preloadedManagerStart, preloadedManagerEnd);
+  const hookedManagerStart = source.indexOf("function buildHookedPackageManagerEntrypointShell");
+  const hookedManagerEnd = source.indexOf("function buildPreloadedPackageManagerEntrypointShell", hookedManagerStart);
+  const hookedManagerBlock = source.slice(hookedManagerStart, hookedManagerEnd);
 
   for (const packageBinary of ["concurrently", "wait-on", "retry", "vite", "dotenv", "celery", "uvicorn", "gunicorn", "daphne"]) {
     assert.equal(
@@ -181,17 +187,92 @@ test("package command shims rerun client tools without native runtime alias sema
   assert.equal(
     source.includes("function buildPreloadNodeEntrypointBypassShell"),
     true,
-    "Node entrypoint bypass should be shared by package-bin and package-manager shims",
+    "package-bin shims must keep the Node entrypoint bypass for protected shebangs",
   );
   assert.equal(
-    packageManagerProjectCommandBlock.includes("${buildPreloadNodeEntrypointBypassShell()}"),
+    source.includes("function buildCleanPackageManagerEntrypointShell"),
     true,
-    "package-manager project commands must bypass /usr/bin/env node before DYLD is stripped",
+    "package-manager shims must clean-run manager layers before child runtime shims restore preload",
+  );
+  assert.equal(
+    source.includes("function buildHookedPackageManagerEntrypointShell"),
+    true,
+    "script-based package managers must keep native exec interception for absolute node_modules/.bin launches",
+  );
+  assert.equal(
+    source.includes("function buildPreloadedPackageManagerEntrypointShell"),
+    true,
+    "package-manager shims must preserve preload for managers that exec runtimes by absolute path",
+  );
+  assert.equal(
+    source.includes("__pm_package_manager_requires_preload_parent()"),
+    true,
+    "package-manager shim must classify managers that need parent preload",
+  );
+  assert.equal(
+    source.includes("uv|uvx) return 0"),
+    true,
+    "uv and uvx must stay preloaded so uv-run Python children keep routing hooks",
+  );
+  assert.equal(
+    source.includes("npm|npx|pnpm|pnpx|corepack|yarn|yarnpkg) return 0"),
+    true,
+    "Node package managers must keep the parent hook during project scripts so Yarn shell launches can be rewritten",
+  );
+  assert.equal(
+    source.includes("__pm_package_manager_is_native_binary()"),
+    true,
+    "package-manager shim must keep native binaries out of script parsing",
+  );
+  assert.equal(
+    packageManagerProjectCommandBlock.includes("${buildCleanPackageManagerEntrypointShell()}"),
+    true,
+    "package-manager project commands must keep a clean fallback for Node manager layers",
+  );
+  assert.equal(
+    packageManagerProjectCommandBlock.includes("${buildPreloadedPackageManagerEntrypointShell()}"),
+    true,
+    "package-manager project commands must preserve preload before clean fallback when needed",
+  );
+  assert.equal(
+    packageManagerProjectCommandBlock.includes("${buildHookedPackageManagerEntrypointShell()}"),
+    true,
+    "package-manager project commands must run script-based managers with a hooked parent",
+  );
+  assert.equal(
+    packageManagerProjectCommandBlock.includes("__pm_package_manager_is_native_binary"),
+    true,
+    "package-manager project commands must avoid Node wrapper parsing for native package managers",
   );
   assert.equal(
     packageManagerProjectCommandBlock.includes("export PORT_MANAGER_PRELOAD_REPAIR=1"),
     true,
     "package-manager shim must repair runtime commands while keeping dependency lifecycle commands clean",
+  );
+  assert.equal(
+    source.includes('buildShellPrependVariablePathListEntry("DYLD_INSERT_LIBRARIES", "PORT_MANAGER_DYLD_INSERT_LIBRARIES")'),
+    true,
+    "preload-parent package managers must restore macOS DYLD before running project code",
+  );
+  assert.equal(
+    hookedManagerBlock.includes("buildPreloadNodeEntrypointBypassShell"),
+    true,
+    "hooked script package managers must bypass protected Node shebangs while preserving preload",
+  );
+  assert.equal(
+    preloadedManagerBlock.includes('exec "\\${__pm_target}" "$@"`;'),
+    true,
+    "preload-parent package managers should exec the native manager directly instead of parsing it as a Node wrapper",
+  );
+  assert.equal(
+    preloadedManagerBlock.includes("buildPreloadNodeEntrypointBypassShell"),
+    false,
+    "preload-parent package managers must not parse native binaries with the Node wrapper bypass",
+  );
+  assert.equal(
+    source.includes("Darwin) unset DYLD_INSERT_LIBRARIES ;;"),
+    true,
+    "package-manager clean exec should remove macOS DYLD only from the manager layer",
   );
 });
 
@@ -215,8 +296,13 @@ test("runtime shim directory removes reverted clean-run artifacts before rewriti
     "stale artifacts must be removed before stable package-manager shims are rewritten",
   );
   assert.equal(cleanupBody.includes('path.join(targetDirectory, ".portmanager-node")'), true);
+  assert.equal(cleanupBody.includes("fs.readdirSync(targetDirectory, { withFileTypes: true })"), true);
+  assert.equal(cleanupBody.includes("currentGeneratedShimNames"), true);
+  assert.equal(cleanupBody.includes("RUNTIME_COMMAND_SHIM_NAMES"), true);
   assert.equal(cleanupBody.includes("PRELOAD_PACKAGE_MANAGER_NAMES"), true);
   assert.equal(cleanupBody.includes("PRELOAD_PACKAGE_COMMAND_NAMES"), true);
+  assert.equal(cleanupBody.includes("isPortManagerGeneratedRuntimeShim(shimPath)"), true);
+  assert.equal(cleanupBody.includes("existingPath.isSymbolicLink()"), true);
   assert.equal(staleCheckBody.includes('"Generated by Port Manager."'), true);
   assert.equal(staleCheckBody.includes('"__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS"'), true);
   assert.equal(staleCheckBody.includes('".portmanager-node"'), true);
@@ -327,7 +413,7 @@ test("terminal attach markers are scoped by terminal session id", () => {
   assert.equal(composeRoutingSource.includes("printf '%s\\\\t%s\\\\t%s\\\\t%s\\\\t%s\\\\t%s\\\\n'"), true);
   assert.equal(
     registrySource.includes(
-      "if (left.terminalSessionId !== undefined || right.terminalSessionId !== undefined)",
+      "left.terminalSessionId !== undefined &&\n    right.terminalSessionId !== undefined &&",
     ),
     true,
   );
@@ -687,6 +773,11 @@ test("terminal daemon ensure serializes agent startup and preserves slow live so
     assert.equal(source.includes("age>15000?0:1"), true);
     assert.equal(source.includes('timer=setTimeout(()=>finish(1,false),350);'), true);
     assert.equal(source.includes('socket.once("error",()=>finish(1,false));'), true);
+    assert.equal(
+      source.includes('if [ -S "$PORT_MANAGER_AGENT_SOCKET" ]; then'),
+      true,
+      "daemon ensure should skip expensive Node probes when no socket exists yet",
+    );
     assert.equal(source.includes('rm -f "$PORT_MANAGER_AGENT_SOCKET" 2>/dev/null || true'), true);
     assert.equal(source.includes('rmdir "$__pm_agent_lock" 2>/dev/null || true'), true);
     assert.equal(source.includes("while [ $__pm_agent_wait_count -lt 20 ]; do"), true);

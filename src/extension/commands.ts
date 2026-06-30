@@ -3457,7 +3457,9 @@ __pm_agent_ensure() {
   __pm_agent_ready=0
   __pm_agent_lock="\${PORT_MANAGER_AGENT_SOCKET}.startup.lock"
   __pm_agent_lock_acquired=0
-  ${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1
+  if [ -S "$PORT_MANAGER_AGENT_SOCKET" ]; then
+    ${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1
+  fi
   if [ "$__pm_agent_ready" != "1" ]; then
     if mkdir "$__pm_agent_lock" 2>/dev/null; then
       __pm_agent_lock_acquired=1
@@ -3466,12 +3468,14 @@ __pm_agent_ensure() {
       mkdir "$__pm_agent_lock" 2>/dev/null && __pm_agent_lock_acquired=1
     fi
     if [ "$__pm_agent_lock_acquired" = "1" ]; then
-    __pm_agent_wait_count=0
-    while [ $__pm_agent_wait_count -lt 2 ]; do
-      ${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1 && break
-      __pm_agent_wait_count=$((__pm_agent_wait_count + 1))
-      sleep 0.1
-    done
+      if [ -S "$PORT_MANAGER_AGENT_SOCKET" ]; then
+        __pm_agent_wait_count=0
+        while [ $__pm_agent_wait_count -lt 2 ]; do
+          ${probeCommand} >/dev/null 2>&1 && __pm_agent_ready=1 && break
+          __pm_agent_wait_count=$((__pm_agent_wait_count + 1))
+          sleep 0.1
+        done
+      fi
     if [ "$__pm_agent_ready" != "1" ]; then
       rm -f "$PORT_MANAGER_AGENT_SOCKET" 2>/dev/null || true
   if [ -x "$PORT_MANAGER_AGENT_EXECUTABLE" ]; then

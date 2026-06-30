@@ -343,7 +343,7 @@ test("moves a terminal attachment when the same terminal joins another network",
   assert.equal(attachments[0]?.networkId, "network-2");
 });
 
-test("keeps terminal attachments distinct when attach sessions differ", () => {
+test("moves a terminal attachment when the same terminal gets a new attach session", () => {
   const registry = new LogicalNetworkRegistry([runtime]);
   registry.addNetwork(createNetwork());
   registry.addNetwork(createNetwork({ id: "network-2", name: "B app" }));
@@ -353,6 +353,32 @@ test("keeps terminal attachments distinct when attach sessions differ", () => {
     createTerminalAttachment({
       id: "attachment-2",
       networkId: "network-2",
+      terminalSessionId: "session-production",
+      attachedAt: "2026-06-22T00:05:00.000Z",
+    }),
+  );
+
+  const attachments = registry.getSnapshot().attachments;
+
+  assert.equal(attachments.length, 1);
+  assert.equal(attachments[0]?.id, "attachment-2");
+  assert.equal(attachments[0]?.networkId, "network-2");
+  assert.equal(attachments[0]?.terminalSessionId, "session-production");
+});
+
+test("keeps attach sessions distinct when terminal identities differ", () => {
+  const registry = new LogicalNetworkRegistry([runtime]);
+  registry.addNetwork(createNetwork());
+  registry.addNetwork(createNetwork({ id: "network-2", name: "B app" }));
+
+  registry.addAttachment(createTerminalAttachment({ terminalSessionId: "session-alpha" }));
+  registry.addAttachment(
+    createTerminalAttachment({
+      id: "attachment-2",
+      networkId: "network-2",
+      rootPid: 202,
+      processGroupId: 202,
+      terminalWindowId: "tty:ttys002",
       terminalSessionId: "session-production",
       attachedAt: "2026-06-22T00:05:00.000Z",
     }),

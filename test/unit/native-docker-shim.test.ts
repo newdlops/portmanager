@@ -26,11 +26,20 @@ test("docker shim skips hard-linked Port Manager aliases while resolving the rea
 test("docker shim refreshes terminal markers after compose lifecycle commands", () => {
   const sourcePath = path.resolve(__dirname, "../../../native/docker-shim/portmanager_docker_shim.c");
   const source = fs.readFileSync(sourcePath, "utf8");
+  const signalStart = source.indexOf("static void pm_signal_terminal_attachment_changed(void)");
+  const signalEnd = source.indexOf("/** Runs lifecycle commands as a child", signalStart);
+  const signalBody = source.slice(signalStart, signalEnd);
 
   assert.equal(source.includes("PM_TERMINAL_ATTACHMENT_DIR_ENV"), true);
+  assert.equal(source.includes("PM_TERMINAL_SESSION_ID_ENV"), true);
   assert.equal(source.includes("pm_compose_command_may_change_endpoints"), true);
   assert.equal(source.includes("pm_spawn_and_signal_on_success"), true);
   assert.equal(source.includes("pm_signal_terminal_attachment_changed();"), true);
+  assert.equal(signalBody.includes("getenv(PM_TERMINAL_SESSION_ID_ENV)"), true);
+  assert.equal(signalBody.includes("if (session_id != NULL && session_id[0] != '\\0')"), true);
+  assert.equal(signalBody.includes("pm_copy(key_source, sizeof(key_source), session_id);"), true);
+  assert.equal(signalBody.includes('"%s\\t%s\\t%ld\\t%ld\\t%s\\t%s\\n"'), true);
+  assert.equal(signalBody.includes('session_id == NULL ? "" : session_id'), true);
 });
 
 test("docker shim prefers scoped route table network over stale compose routing file", () => {

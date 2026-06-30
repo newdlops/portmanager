@@ -34,6 +34,7 @@
 #define PM_DOCKER_SHIM_BYPASS_ENV "PORT_MANAGER_DOCKER_SHIM_BYPASS"
 #define PM_DOCKER_SHIM_DEBUG_ENV "PORT_MANAGER_DOCKER_SHIM_DEBUG"
 #define PM_TERMINAL_ATTACHMENT_DIR_ENV "PORT_MANAGER_TERMINAL_ATTACHMENT_DIR"
+#define PM_TERMINAL_SESSION_ID_ENV "PORT_MANAGER_TERMINAL_SESSION_ID"
 #define PM_COMPOSE_REFRESH_WAIT_MS 3000
 
 typedef struct {
@@ -3109,6 +3110,7 @@ static void pm_current_utc_timestamp(char *buffer, size_t size) {
 static void pm_signal_terminal_attachment_changed(void) {
   const char *marker_directory = getenv(PM_TERMINAL_ATTACHMENT_DIR_ENV);
   const char *network_id = pm_network_id();
+  const char *session_id = getenv(PM_TERMINAL_SESSION_ID_ENV);
   const char *tty_path;
   char tty_name[PM_MAX_FIELD] = "";
   char key_source[PM_MAX_FIELD];
@@ -3140,7 +3142,9 @@ static void pm_signal_terminal_attachment_changed(void) {
     pm_copy(tty_name, sizeof(tty_name), tty_path);
   }
 
-  if (tty_name[0] == '\0') {
+  if (session_id != NULL && session_id[0] != '\0') {
+    pm_copy(key_source, sizeof(key_source), session_id);
+  } else if (tty_name[0] == '\0') {
     snprintf(key_source, sizeof(key_source), "pid-%ld", (long)getpid());
   } else {
     pm_copy(key_source, sizeof(key_source), tty_name);
@@ -3159,12 +3163,13 @@ static void pm_signal_terminal_attachment_changed(void) {
 
   fprintf(
     file,
-    "%s\t%s\t%ld\t%ld\t%s\n",
+    "%s\t%s\t%ld\t%ld\t%s\t%s\n",
     network_id,
     tty_name,
     (long)getpid(),
     (long)getpgrp(),
-    timestamp
+    timestamp,
+    session_id == NULL ? "" : session_id
   );
   fclose(file);
 }

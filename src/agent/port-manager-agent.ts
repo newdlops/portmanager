@@ -518,7 +518,9 @@ export class PortManagerAgent implements DisposableLike {
       }
 
       const samePortListener =
-        routeDirection === "send" ? await this.findSamePortExternalListener(input.requestedPort) : undefined;
+        routeDirection === "send"
+          ? await this.findSamePortExternalListener(input.requestedPort, input.host, requestedActualHost)
+          : undefined;
       if (samePortListener !== undefined) {
         const logicalRoutes = this.buildCurrentLogicalRoutes();
         this.requireRouteTablePublish(logicalRoutes);
@@ -1499,11 +1501,19 @@ export class PortManagerAgent implements DisposableLike {
    * is no route row yet, but the OS already has the requested localhost port.
    * Prefer that same-port listener over creating a shadow 5xxxx reservation.
    */
-  private async findSamePortExternalListener(logicalPort: number): Promise<ListeningPort | undefined> {
+  private async findSamePortExternalListener(
+    logicalPort: number,
+    requestedHost: string,
+    actualHost: string | undefined,
+  ): Promise<ListeningPort | undefined> {
     try {
       const listeners = await this.scanListeningPorts();
       this.updateReservedListeningPorts(listeners);
-      return listeners.find((listener) => listener.port === logicalPort);
+      return listeners.find(
+        (listener) =>
+          listener.port === logicalPort &&
+          samePortListenerMatchesRoutedHosts(listener.localAddress, requestedHost, actualHost),
+      );
     } catch {
       return undefined;
     }
@@ -2197,9 +2207,45 @@ function endpointHostMatches(listenerHost: string, routeHost: string): boolean {
   return normalizedListenerHost === normalizedRouteHost;
 }
 
+/**
+ * Same-port sender fallback is safe when the OS listener covers either the
+ * original connect host or the scoped actual host. Other listeners on the same
+ * numeric port must not suppress a sender-first reservation.
+ */
+function samePortListenerMatchesRoutedHosts(
+  listenerHost: string,
+  requestedHost: string,
+  actualHost: string | undefined,
+): boolean {
+  if (actualHost === undefined) {
+    return true;
+  }
+
+  return samePortListenerMatchesHost(listenerHost, requestedHost) || samePortListenerMatchesHost(listenerHost, actualHost);
+}
+
+/** Compares one scanned listener address against one connect target address. */
+function samePortListenerMatchesHost(listenerHost: string, targetHost: string): boolean {
+  const normalizedListenerHost = normalizeEndpointHostKey(listenerHost);
+  const normalizedTargetHost = normalizeEndpointHostKey(targetHost);
+
+  if (normalizedListenerHost === "*" || normalizedTargetHost === "*") {
+    return true;
+  }
+
+  if (
+    (normalizedTargetHost === "127.0.0.1" && normalizedListenerHost === "::1") ||
+    (normalizedTargetHost === "::1" && normalizedListenerHost === "127.0.0.1")
+  ) {
+    return true;
+  }
+
+  return normalizedListenerHost === normalizedTargetHost;
+}
+
 /** Normalizes listener host spellings while keeping network-specific 127/8 IPs distinct. */
 function normalizeEndpointHostKey(host: string): string {
-  const trimmedHost = host.trim().toLowerCase();
+  let trimmedHost = host.trim().toLowerCase();
 
   if (
     trimmedHost.length === 0 ||
@@ -2216,7 +2262,11 @@ function normalizeEndpointHostKey(host: string): string {
   }
 
   if (trimmedHost.startsWith("[") && trimmedHost.endsWith("]")) {
-    return trimmedHost.slice(1, -1);
+    trimmedHost = trimmedHost.slice(1, -1);
+  }
+
+  if (trimmedHost.startsWith("::ffff:")) {
+    return trimmedHost.slice("::ffff:".length);
   }
 
   return trimmedHost;

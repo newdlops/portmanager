@@ -1094,6 +1094,60 @@ test("uses same-port OS listeners for sender requests before creating a shadow r
   assert.deepEqual(allocation.logicalRoutes, []);
 });
 
+test("keeps scoped sender reservations when same-port OS listeners are bound to unrelated hosts", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const checkedHosts: Array<string | undefined> = [];
+  const listeners: readonly ListeningPort[] = [
+    createListener({
+      port: 8004,
+      localAddress: "127.0.0.2",
+      pid: 4321,
+      processName: "python3",
+      command: "python manage.py runserver 8004",
+    }),
+  ];
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: {
+      check: async (port, host) => {
+        checkedHosts.push(host);
+        return {
+          port,
+          available: true,
+        };
+      },
+    },
+    listeningPortProvider: {
+      list: async () => listeners,
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  const allocation = await agent.allocateRoute({
+    name: "wait-on",
+    command: "wait-on http-get://localhost:8004/healthz",
+    cwd: "/workspace/app",
+    requestedPort: 8004,
+    host: "127.0.0.1",
+    actualHost: "127.81.154.127",
+    networkId: "network-a",
+    routeDirection: "send",
+    scanRange: 20,
+    scanDirection: "up",
+    routingMode: "hashed",
+    virtualPortRangeStart: 58000,
+    virtualPortRangeEnd: 58010,
+  });
+
+  assert.notEqual(allocation.allocationId, "");
+  assert.equal(allocation.actualPort, 58000);
+  assert.equal(allocation.host, "127.81.154.127");
+  assert.deepEqual(checkedHosts, ["127.81.154.127"]);
+});
+
 test("promotes sender-first reservations into listener routes", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   const agent = new PortManagerAgent({
