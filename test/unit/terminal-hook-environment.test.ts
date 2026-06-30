@@ -1077,13 +1077,14 @@ test("automatic control plane side effects use a single cross-window owner lease
 
   assert.equal(source.includes("CONTROL_PLANE_OWNER_LEASE_MS = 120_000"), true);
   assert.equal(source.includes("CONTROL_PLANE_OWNER_LOCK_STALE_MS = 30_000"), true);
-  assert.equal(source.includes('function buildControlPlaneOwnerControlPath(kind: "owner" | "lock" | "owner-ui-request"): string'), true);
-  assert.equal(source.includes("CONTROL_PLANE_OWNER_UI_REQUEST_PATH"), true);
-  assert.equal(source.includes("OWNER_UI_REQUEST_POLL_INTERVAL_MS = 500"), true);
+  assert.equal(source.includes('function buildControlPlaneOwnerControlPath(kind: "owner" | "lock"): string'), true);
+  assert.equal(source.includes("CONTROL_PLANE_OWNER_UI_REQUEST_PATH"), false);
+  assert.equal(source.includes("OWNER_UI_REQUEST_POLL_INTERVAL_MS"), false);
   assert.equal(source.includes("function tryAcquireControlPlaneOwnerLease(): boolean"), true);
   assert.equal(source.includes("function isActiveControlPlaneOwner"), true);
   assert.equal(source.includes("private ownsControlPlaneLease = false;"), true);
   assert.equal(source.includes("private readonly controlPlaneOwnerDisposables"), true);
+  assert.equal(source.includes("focusControlPlaneOwnerWindow(): Promise<boolean>"), true);
   assert.equal(source.includes("private controlPlaneOwnerStartupInFlight: Promise<boolean> | undefined;"), true);
   assert.equal(source.includes("void this.runControlPlaneRegistrySideEffects();"), true);
   assert.equal(source.includes("if (this.ownsControlPlaneLease) {\n            void this.syncLogicalPortRouters();"), true);
@@ -1094,10 +1095,10 @@ test("automatic control plane side effects use a single cross-window owner lease
   assert.equal(startBody.includes("this.startRoutingSignalRefreshLoop();"), false);
   assert.equal(startBody.includes("this.startTerminalAttachmentMarkerPolling();"), false);
   assert.equal(ownerWatcherBody.includes("vscode.workspace.createFileSystemWatcher"), true);
-  assert.equal(ownerWatcherBody.includes("this.watchOwnerUiFocusRequests(ownerUiRequestDirectory)"), true);
-  assert.equal(ownerWatcherBody.includes("this.startOwnerUiRequestPolling();"), true);
-  assert.equal(ownerWatcherBody.includes("ownerUiRequestWatcher.onDidChange"), true);
-  assert.equal(ownerWatcherBody.includes("void this.openOwnerUiFromFocusRequest();"), true);
+  assert.equal(ownerWatcherBody.includes("this.watchOwnerUiFocusRequests(ownerUiRequestDirectory)"), false);
+  assert.equal(ownerWatcherBody.includes("this.startOwnerUiRequestPolling();"), false);
+  assert.equal(ownerWatcherBody.includes("ownerUiRequestWatcher.onDidChange"), false);
+  assert.equal(ownerWatcherBody.includes("void this.openOwnerUiFromFocusRequest();"), false);
   assert.equal(ownerWatcherBody.includes("this.controlPlaneOwnerDisposables.push("), true);
   assert.equal(ownerServicesBody.includes("await this.refreshRuntimeDescriptors({ includeContainerRuntime: true });"), true);
   assert.equal(ownerServicesBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });"), true);
