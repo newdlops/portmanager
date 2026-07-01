@@ -927,9 +927,11 @@ test("browser proxy target resolution uses a snapshot route index before refresh
   );
   assert.equal(resolveBody.includes("await this.findBrowserProxyFallbackListenerTarget(endpoint.networkId, endpoint.logicalPort)"), true);
   assert.equal(indexBody.includes("snapshot !== this.browserProxyRouteTargetSnapshot"), true);
-  assert.equal(indexBody.includes("buildBrowserProxyRouteTargetIndex(snapshot.routes)"), true);
+  assert.equal(indexBody.includes("buildBrowserProxyRouteTargetIndex(snapshot.routes, snapshot.processes)"), true);
   assert.equal(indexBody.includes("this.browserProxyGeneratedRouteTargetByEndpointId.get(endpointId)"), true);
   assert.equal(source.includes("function buildBrowserProxyRouteTargetIndex("), true);
+  assert.equal(source.includes("browserProxyTargetProtocolFromUrl"), true);
+  assert.equal(source.includes('new URL(url).protocol === "https:" ? "https" : undefined'), true);
 });
 
 test("terminal daemon ensure serializes agent startup and preserves slow live sockets", () => {

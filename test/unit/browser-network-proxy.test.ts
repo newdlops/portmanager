@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import * as http from "node:http";
+import * as https from "node:https";
 import * as net from "node:net";
 import test from "node:test";
 
@@ -134,6 +135,139 @@ test("does not open HTTPS browser proxy endpoints without TLS credentials", asyn
     assert.equal(activeEndpoint, undefined);
   } finally {
     await proxy.dispose();
+  }
+});
+
+test("terminates HTTPS browser proxy requests and returns upstream responses", async () => {
+  const upstreamRequests: http.IncomingHttpHeaders[] = [];
+  const upstream = http.createServer((request, response) => {
+    upstreamRequests.push(request.headers);
+    response.writeHead(200, {
+      "access-control-allow-origin": "http://localhost:3004",
+      location: "http://localhost:3004/secure",
+    });
+    response.end("secure-target");
+  });
+  await listen(upstream, 0, "127.0.0.1");
+
+  const proxyPort = await getAvailablePort();
+  const proxy = new BrowserNetworkProxyManager(
+    {
+      resolve: () => ({
+        host: "127.0.0.1",
+        port: getServerPort(upstream),
+      }),
+    },
+    {
+      tlsCredentials: {
+        getCredentials: () => ({
+          key: TEST_TLS_KEY,
+          cert: TEST_TLS_CERTIFICATE,
+        }),
+      },
+    },
+  );
+
+  try {
+    const activeEndpoint = await proxy.ensure(
+      createEndpoint({
+        publicHost: "alpha1",
+        publicProtocol: "https",
+        listenPorts: [proxyPort],
+      }),
+    );
+
+    assert.ok(activeEndpoint);
+
+    const publicOrigin = `https://alpha1:${activeEndpoint.listenPort}`;
+    const response = await requestHttps({
+      host: "127.0.0.1",
+      port: activeEndpoint.listenPort,
+      path: "/dashboard",
+      headers: {
+        host: `alpha1:${activeEndpoint.listenPort}`,
+        origin: publicOrigin,
+      },
+    });
+
+    assert.equal(upstreamRequests[0]?.host, "localhost:3004");
+    assert.equal(upstreamRequests[0]?.origin, "http://localhost:3004");
+    assert.equal(response.body, "secure-target");
+    assert.equal(response.headers.location, `${publicOrigin}/secure`);
+    assert.equal(response.headers["access-control-allow-origin"], publicOrigin);
+  } finally {
+    await proxy.dispose();
+    await closeServer(upstream);
+  }
+});
+
+test("forwards browser proxy requests to HTTPS upstream targets", async () => {
+  const upstreamRequests: http.IncomingHttpHeaders[] = [];
+  const upstream = https.createServer(
+    {
+      key: TEST_TLS_KEY,
+      cert: TEST_TLS_CERTIFICATE,
+    },
+    (request, response) => {
+      upstreamRequests.push(request.headers);
+      response.writeHead(200, {
+        "access-control-allow-origin": "https://localhost:3004",
+        location: "https://localhost:3004/secure",
+      });
+      response.end("secure-upstream");
+    },
+  );
+  await listen(upstream, 0, "127.0.0.1");
+
+  const proxyPort = await getAvailablePort();
+  const proxy = new BrowserNetworkProxyManager(
+    {
+      resolve: () => ({
+        host: "127.0.0.1",
+        port: getServerPort(upstream),
+        protocol: "https",
+      }),
+    },
+    {
+      tlsCredentials: {
+        getCredentials: () => ({
+          key: TEST_TLS_KEY,
+          cert: TEST_TLS_CERTIFICATE,
+        }),
+      },
+    },
+  );
+
+  try {
+    const activeEndpoint = await proxy.ensure(
+      createEndpoint({
+        publicHost: "alpha1",
+        publicProtocol: "https",
+        listenPorts: [proxyPort],
+      }),
+    );
+
+    assert.ok(activeEndpoint);
+
+    const publicOrigin = `https://alpha1:${activeEndpoint.listenPort}`;
+    const response = await requestHttps({
+      host: "127.0.0.1",
+      port: activeEndpoint.listenPort,
+      path: "/dashboard",
+      headers: {
+        host: `alpha1:${activeEndpoint.listenPort}`,
+        origin: publicOrigin,
+      },
+    });
+
+    assert.equal(upstreamRequests[0]?.host, "localhost:3004");
+    assert.equal(upstreamRequests[0]?.origin, "https://localhost:3004");
+    assert.equal(response.body, "secure-upstream");
+    assert.equal(response.headers.location, `${publicOrigin}/secure`);
+    assert.equal(response.headers["access-control-allow-origin"], publicOrigin);
+  } finally {
+    await proxy.dispose();
+    await closeServer(upstream);
   }
 });
 
@@ -364,6 +498,58 @@ test("rewrites WebSocket upgrade metadata before tunneling", async () => {
   }
 });
 
+test("tunnels WebSocket upgrades to HTTPS upstream targets", async () => {
+  let upgradeHost = "";
+  let upgradeOrigin = "";
+  const upstream = https.createServer({
+    key: TEST_TLS_KEY,
+    cert: TEST_TLS_CERTIFICATE,
+  });
+  upstream.on("upgrade", (request, socket) => {
+    upgradeHost = request.headers.host ?? "";
+    upgradeOrigin = request.headers.origin ?? "";
+    socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+    socket.end("secure-upgraded");
+  });
+  await listen(upstream, 0, "127.0.0.1");
+
+  const proxyPort = await getAvailablePort();
+  const proxy = new BrowserNetworkProxyManager({
+    resolve: () => ({
+      host: "127.0.0.1",
+      port: getServerPort(upstream),
+      protocol: "https",
+    }),
+  });
+
+  try {
+    const activeEndpoint = await proxy.ensure(createEndpoint({ listenPorts: [proxyPort] }));
+
+    assert.ok(activeEndpoint);
+
+    const publicOrigin = `http://127.0.0.1:${activeEndpoint.listenPort}`;
+    const response = await sendUpgradeRequest(activeEndpoint.listenPort, [
+      "GET /graphql HTTP/1.1",
+      `Host: 127.0.0.1:${activeEndpoint.listenPort}`,
+      "Connection: Upgrade",
+      "Upgrade: websocket",
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+      "Sec-WebSocket-Version: 13",
+      `Origin: ${publicOrigin}`,
+      "",
+      "",
+    ].join("\r\n"));
+
+    assert.equal(upgradeHost, "localhost:3004");
+    assert.equal(upgradeOrigin, "https://localhost:3004");
+    assert.match(response, /^HTTP\/1\.1 101 Switching Protocols/);
+    assert.match(response, /secure-upgraded$/);
+  } finally {
+    await proxy.dispose();
+    await closeServer(upstream);
+  }
+});
+
 test("keeps in-flight browser proxy sockets across transient missing endpoint sync", async () => {
   let upstreamResponse: http.ServerResponse | undefined;
   let markUpstreamReceived!: () => void;
@@ -441,6 +627,26 @@ function requestHttp(options: {
   });
 }
 
+function requestHttps(options: {
+  readonly host: string;
+  readonly port: number;
+  readonly path: string;
+  readonly headers?: http.OutgoingHttpHeaders;
+}): Promise<{ readonly body: string; readonly headers: http.IncomingHttpHeaders }> {
+  return new Promise((resolve, reject) => {
+    const request = https.request({ ...options, rejectUnauthorized: false }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => {
+        body += chunk;
+      });
+      response.once("end", () => resolve({ body, headers: response.headers }));
+    });
+    request.once("error", reject);
+    request.end();
+  });
+}
+
 function sendUpgradeRequest(port: number, message: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection({ host: "127.0.0.1", port });
@@ -467,6 +673,26 @@ function listen(server: http.Server, port: number, host: string): Promise<void> 
     });
   });
 }
+
+const TEST_TLS_KEY = [
+  "-----BEGIN EC PRIVATE KEY-----",
+  "MHcCAQEEIDZb4xEoHQfbkJepy/ZcuiGP2yZT2sJvIvrUXmGWZrswoAoGCCqGSM49",
+  "AwEHoUQDQgAElxFcMvH6ntfaQEbFPllq5UbHlszHDkY9HytoA6QMvdRY5SDw0kRY",
+  "2CA+HZlSVGvyKTSDI2KXlILCDRzp9r39sw==",
+  "-----END EC PRIVATE KEY-----",
+].join("\n");
+
+const TEST_TLS_CERTIFICATE = [
+  "-----BEGIN CERTIFICATE-----",
+  "MIIBPTCB46ADAgECAgkAwldsxvU6r/IwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJ",
+  "bG9jYWxob3N0MB4XDTI2MDcwMTExMDkwMVoXDTI2MDcwMjExMDkwMVowFDESMBAG",
+  "A1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAElxFcMvH6",
+  "ntfaQEbFPllq5UbHlszHDkY9HytoA6QMvdRY5SDw0kRY2CA+HZlSVGvyKTSDI2KX",
+  "lILCDRzp9r39s6MeMBwwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqG",
+  "SM49BAMCA0kAMEYCIQDcaODSRujrhUdKGuUamG0d2/E5ZPqRQhGKFc2aoEN0BgIh",
+  "AJ2jn5A6mS9hO3n71Qg38NpLWD9pG8kjc9ItMwZmb/8f",
+  "-----END CERTIFICATE-----",
+].join("\n");
 
 function getServerPort(server: http.Server): number {
   const address = server.address();

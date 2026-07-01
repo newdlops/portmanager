@@ -3798,6 +3798,7 @@ export class PortManagerNetworkService implements DisposableLike {
     return {
       host: route.host,
       port: route.actualPort,
+      ...browserProxyTargetProtocolForRoute(route, this.processService?.getSnapshot()?.processes ?? []),
     };
   }
 
@@ -3811,7 +3812,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     if (snapshot !== this.browserProxyRouteTargetSnapshot) {
       this.browserProxyRouteTargetSnapshot = snapshot;
-      this.browserProxyRouteTargetByEndpointId = buildBrowserProxyRouteTargetIndex(snapshot.routes);
+      this.browserProxyRouteTargetByEndpointId = buildBrowserProxyRouteTargetIndex(snapshot.routes, snapshot.processes);
     }
 
     return (
@@ -3838,6 +3839,7 @@ export class PortManagerNetworkService implements DisposableLike {
     return {
       host: normalizeBrowserProxyTargetHost(listener.localAddress),
       port: listener.port,
+      ...browserProxyTargetProtocolForListener(listener, this.processService?.getSnapshot()?.processes ?? []),
     };
   }
 
@@ -4021,7 +4023,10 @@ export class PortManagerNetworkService implements DisposableLike {
       processEndpoints,
       collectBrowserProxyRouteEndpoints(routes, networks, dnsRunning, routeHintTextByEndpointId, processEndpoints),
     );
-    this.browserProxyGeneratedRouteTargetByEndpointId = buildBrowserProxyRouteTargetIndex(routes);
+    this.browserProxyGeneratedRouteTargetByEndpointId = buildBrowserProxyRouteTargetIndex(
+      routes,
+      snapshot?.processes ?? [],
+    );
     const hostLocalGatewayPorts = new Set(readPortManagerSettings().fixedProtocolPorts);
     const hostGatewayExposures = collectHostGatewayExposures(
       routes,
@@ -6965,6 +6970,7 @@ function isLogicalPortRoute(value: unknown): value is LogicalPortRoute {
 /** Builds a stable first-match index matching findMatchingRoute's route precedence. */
 function buildBrowserProxyRouteTargetIndex(
   routes: readonly LogicalPortRoute[],
+  processes: readonly ManagedProcess[] = [],
 ): Map<string, BrowserNetworkProxyTarget> {
   const targets = new Map<string, BrowserNetworkProxyTarget>();
   for (const route of routes) {
@@ -6980,10 +6986,55 @@ function buildBrowserProxyRouteTargetIndex(
     targets.set(endpointId, {
       host: route.host,
       port: route.actualPort,
+      ...browserProxyTargetProtocolForRoute(route, processes),
     });
   }
 
   return targets;
+}
+
+/** Routes store socket targets only; browser proxy protocol is recovered from the managed process URL. */
+function browserProxyTargetProtocolForRoute(
+  route: LogicalPortRoute,
+  processes: readonly ManagedProcess[],
+): Pick<BrowserNetworkProxyTarget, "protocol"> | Record<string, never> {
+  const process =
+    (route.processId === undefined ? undefined : processes.find((item) => item.id === route.processId)) ??
+    processes.find(
+      (item) =>
+        item.status === "running" &&
+        item.networkId === route.networkId &&
+        item.requestedPort === route.logicalPort,
+    );
+
+  return browserProxyTargetProtocolFromProcess(process);
+}
+
+function browserProxyTargetProtocolForListener(
+  listener: ListeningPort,
+  processes: readonly ManagedProcess[],
+): Pick<BrowserNetworkProxyTarget, "protocol"> | Record<string, never> {
+  const process = listener.pid === undefined ? undefined : processes.find((item) => item.pid === listener.pid);
+  return browserProxyTargetProtocolFromProcess(process);
+}
+
+function browserProxyTargetProtocolFromProcess(
+  process: ManagedProcess | undefined,
+): Pick<BrowserNetworkProxyTarget, "protocol"> | Record<string, never> {
+  const protocol = browserProxyTargetProtocolFromUrl(process?.url);
+  return protocol === undefined ? {} : { protocol };
+}
+
+function browserProxyTargetProtocolFromUrl(url: string | undefined): BrowserNetworkProxyTarget["protocol"] | undefined {
+  if (url === undefined) {
+    return undefined;
+  }
+
+  try {
+    return new URL(url).protocol === "https:" ? "https" : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

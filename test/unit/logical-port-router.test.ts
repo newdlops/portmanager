@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as https from "node:https";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -258,6 +259,46 @@ test("keeps logical router TCP streams across transient route gaps", async () =>
   } finally {
     socket?.destroy();
     await manager.close(logicalPort).catch(() => undefined);
+    await closeServer(targetServer).catch(() => undefined);
+  }
+});
+
+test("native logical router tunnels TLS responses after handshake", async () => {
+  const nativeRouterPath = path.resolve(__dirname, "../../../media/native/portmanager_tcp_router");
+  if (!fs.existsSync(nativeRouterPath)) {
+    return;
+  }
+
+  const targetServer = https.createServer(
+    {
+      key: TEST_TLS_KEY,
+      cert: TEST_TLS_CERTIFICATE,
+    },
+    (_request, response) => {
+      response.end("native-tls-response");
+    },
+  );
+  await listenServer(targetServer, 0, "127.0.0.1");
+  const logicalPort = await findFreeLoopbackPort();
+  const manager = new LogicalPortRouterManager(
+    {
+      resolve: () => ({
+        host: "127.0.0.1",
+        port: serverPort(targetServer),
+      }),
+    },
+    {
+      nativeRouterPath,
+      nativeStartupTimeoutMs: 3000,
+    },
+  );
+
+  try {
+    await manager.open(logicalPort);
+
+    assert.equal(await requestHttpsBody(logicalPort), "native-tls-response");
+  } finally {
+    manager.dispose();
     await closeServer(targetServer).catch(() => undefined);
   }
 });
@@ -721,6 +762,29 @@ function writeAndReadSocket(socket: net.Socket, message: string, expected: strin
   });
 }
 
+function requestHttpsBody(port: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const request = https.request(
+      {
+        host: "127.0.0.1",
+        port,
+        path: "/",
+        rejectUnauthorized: false,
+      },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          body += chunk;
+        });
+        response.once("end", () => resolve(body));
+      },
+    );
+    request.once("error", reject);
+    request.end();
+  });
+}
+
 function serverPort(server: net.Server): number {
   const address = server.address();
   assert.ok(address !== null && typeof address === "object");
@@ -787,3 +851,23 @@ function createDeferred<T>(): {
 
   return { promise, resolve, reject };
 }
+
+const TEST_TLS_KEY = [
+  "-----BEGIN EC PRIVATE KEY-----",
+  "MHcCAQEEIDZb4xEoHQfbkJepy/ZcuiGP2yZT2sJvIvrUXmGWZrswoAoGCCqGSM49",
+  "AwEHoUQDQgAElxFcMvH6ntfaQEbFPllq5UbHlszHDkY9HytoA6QMvdRY5SDw0kRY",
+  "2CA+HZlSVGvyKTSDI2KXlILCDRzp9r39sw==",
+  "-----END EC PRIVATE KEY-----",
+].join("\n");
+
+const TEST_TLS_CERTIFICATE = [
+  "-----BEGIN CERTIFICATE-----",
+  "MIIBPTCB46ADAgECAgkAwldsxvU6r/IwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJ",
+  "bG9jYWxob3N0MB4XDTI2MDcwMTExMDkwMVoXDTI2MDcwMjExMDkwMVowFDESMBAG",
+  "A1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAElxFcMvH6",
+  "ntfaQEbFPllq5UbHlszHDkY9HytoA6QMvdRY5SDw0kRY2CA+HZlSVGvyKTSDI2KX",
+  "lILCDRzp9r39s6MeMBwwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqG",
+  "SM49BAMCA0kAMEYCIQDcaODSRujrhUdKGuUamG0d2/E5ZPqRQhGKFc2aoEN0BgIh",
+  "AJ2jn5A6mS9hO3n71Qg38NpLWD9pG8kjc9ItMwZmb/8f",
+  "-----END CERTIFICATE-----",
+].join("\n");

@@ -1,6 +1,7 @@
 import * as http from "node:http";
 import * as https from "node:https";
 import * as net from "node:net";
+import * as tls from "node:tls";
 
 export interface BrowserNetworkProxyEndpoint {
   /** Stable id for one network/logical-port browser entrypoint. */
@@ -29,6 +30,8 @@ export interface BrowserNetworkProxyTarget {
   readonly host: string;
   /** Current actual port where the real development server accepts sockets. */
   readonly port: number;
+  /** Upstream application protocol. HTTP remains the default for dev servers. */
+  readonly protocol?: "http" | "https";
 }
 
 export interface BrowserNetworkProxyTargetResolver {
@@ -71,7 +74,9 @@ interface BrowserNetworkProxyListener {
   /** HTTP(S)/WebSocket server that owns the browser-facing socket. */
   readonly server: BrowserNetworkProxyServer;
   /** Upstream HTTP connection pool scoped to this browser-facing endpoint. */
-  readonly agent: http.Agent;
+  readonly httpAgent: http.Agent;
+  /** Upstream HTTPS connection pool scoped to this browser-facing endpoint. */
+  readonly httpsAgent: https.Agent;
   /** Client and upstream sockets closed together during reconciliation. */
   readonly sockets: Set<net.Socket>;
 }
@@ -211,7 +216,8 @@ export class BrowserNetworkProxyManager {
       socket.destroy();
     }
     listener.sockets.clear();
-    listener.agent.destroy();
+    listener.httpAgent.destroy();
+    listener.httpsAgent.destroy();
 
     await closeServer(listener.server);
   }
@@ -260,19 +266,26 @@ export class BrowserNetworkProxyManager {
         listenPort,
       };
       const metadata = buildEndpointMetadata(activeEndpoint);
-      const agent = new http.Agent({
+      const httpAgent = new http.Agent({
         keepAlive: true,
         maxSockets: UPSTREAM_KEEP_ALIVE_MAX_SOCKETS,
         maxFreeSockets: UPSTREAM_KEEP_ALIVE_MAX_FREE_SOCKETS,
+      });
+      const httpsAgent = new https.Agent({
+        keepAlive: true,
+        maxSockets: UPSTREAM_KEEP_ALIVE_MAX_SOCKETS,
+        maxFreeSockets: UPSTREAM_KEEP_ALIVE_MAX_FREE_SOCKETS,
+        rejectUnauthorized: false,
       });
       const sockets = new Set<net.Socket>();
       let server: BrowserNetworkProxyServer;
       try {
         server = this.createServer(activeEndpoint, (request, response) => {
-          void this.forwardHttp(activeEndpoint, metadata, agent, request, response);
+          void this.forwardHttp(activeEndpoint, metadata, httpAgent, httpsAgent, request, response);
         });
       } catch (error) {
-        agent.destroy();
+        httpAgent.destroy();
+        httpsAgent.destroy();
         errors.push(error instanceof Error ? error : new Error(String(error)));
         continue;
       }
@@ -287,10 +300,11 @@ export class BrowserNetworkProxyManager {
 
       try {
         await listen(server, listenPort, endpoint.listenHost);
-        this.listeners.set(endpoint.id, { endpoint: activeEndpoint, metadata, server, agent, sockets });
+        this.listeners.set(endpoint.id, { endpoint: activeEndpoint, metadata, server, httpAgent, httpsAgent, sockets });
         return activeEndpoint;
       } catch (error) {
-        agent.destroy();
+        httpAgent.destroy();
+        httpsAgent.destroy();
         await closeServer(server).catch(() => undefined);
         errors.push(error instanceof Error ? error : new Error(String(error)));
       }
@@ -303,7 +317,8 @@ export class BrowserNetworkProxyManager {
   private async forwardHttp(
     endpoint: ActiveBrowserNetworkProxyEndpoint,
     metadata: BrowserNetworkProxyEndpointMetadata,
-    agent: http.Agent,
+    httpAgent: http.Agent,
+    httpsAgent: https.Agent,
     request: http.IncomingMessage,
     response: http.ServerResponse,
   ): Promise<void> {
@@ -316,24 +331,27 @@ export class BrowserNetworkProxyManager {
       return;
     }
 
-    const upstreamRequest = http.request(
-      {
-        host: normalizeTargetHost(target.host),
-        port: target.port,
-        agent,
-        method: request.method,
-        path: request.url ?? "/",
-        headers: rewriteRequestHeaders(request.headers, metadata),
-      },
-      (upstreamResponse) => {
-        response.writeHead(
-          upstreamResponse.statusCode ?? 502,
-          upstreamResponse.statusMessage,
-          rewriteResponseHeaders(upstreamResponse.headers, metadata),
-        );
-        upstreamResponse.pipe(response);
-      },
-    );
+    const upstreamProtocol = normalizeTargetProtocol(target.protocol);
+    const upstreamMetadata = buildUpstreamMetadata(endpoint, metadata, upstreamProtocol);
+    const requestOptions = {
+      host: normalizeTargetHost(target.host),
+      port: target.port,
+      method: request.method,
+      path: request.url ?? "/",
+      headers: rewriteRequestHeaders(request.headers, upstreamMetadata),
+    };
+    const responseHandler = (upstreamResponse: http.IncomingMessage) => {
+      response.writeHead(
+        upstreamResponse.statusCode ?? 502,
+        upstreamResponse.statusMessage,
+        rewriteResponseHeaders(upstreamResponse.headers, upstreamMetadata),
+      );
+      upstreamResponse.pipe(response);
+    };
+    const upstreamRequest =
+      upstreamProtocol === "https"
+        ? https.request({ ...requestOptions, agent: httpsAgent, rejectUnauthorized: false }, responseHandler)
+        : http.request({ ...requestOptions, agent: httpAgent }, responseHandler);
 
     upstreamRequest.once("error", () => writeGatewayError(response));
     request.pipe(upstreamRequest);
@@ -357,10 +375,22 @@ export class BrowserNetworkProxyManager {
       return;
     }
 
-    const upstream = net.createConnection({
-      host: normalizeTargetHost(target.host),
-      port: target.port,
-    });
+    const targetHost = normalizeTargetHost(target.host);
+    const upstreamProtocol = normalizeTargetProtocol(target.protocol);
+    const upstreamMetadata = buildUpstreamMetadata(endpoint, metadata, upstreamProtocol);
+    const upstreamReadyEvent = upstreamProtocol === "https" ? "secureConnect" : "connect";
+    const upstream =
+      upstreamProtocol === "https"
+        ? tls.connect({
+            host: targetHost,
+            port: target.port,
+            rejectUnauthorized: false,
+            ...(net.isIP(targetHost) === 0 ? { servername: targetHost } : {}),
+          })
+        : net.createConnection({
+            host: targetHost,
+            port: target.port,
+          });
     sockets.add(upstream);
     upstream.once("close", () => sockets.delete(upstream));
 
@@ -372,8 +402,8 @@ export class BrowserNetworkProxyManager {
     socket.once("error", destroyBoth);
     upstream.once("error", destroyBoth);
     socket.once("close", () => upstream.destroy());
-    upstream.once("connect", () => {
-      upstream.write(buildUpgradeRequest(request, metadata));
+    upstream.once(upstreamReadyEvent, () => {
+      upstream.write(buildUpgradeRequest(request, upstreamMetadata));
       if (head.length > 0) {
         upstream.write(head);
       }
@@ -592,12 +622,33 @@ function buildEndpointMetadata(endpoint: ActiveBrowserNetworkProxyEndpoint): Bro
     publicOrigin,
     upstreamOrigin,
     upstreamHostHeader,
-    upstreamOrigins: [
-      upstreamOrigin,
-      `http://127.0.0.1:${endpoint.logicalPort}`,
-      `http://[::1]:${endpoint.logicalPort}`,
-    ],
+    upstreamOrigins: buildUpstreamOrigins(endpoint.logicalPort),
   };
+}
+
+/** Browser-facing TLS and upstream application TLS are independent routing decisions. */
+function buildUpstreamMetadata(
+  endpoint: ActiveBrowserNetworkProxyEndpoint,
+  metadata: BrowserNetworkProxyEndpointMetadata,
+  protocol: "http" | "https",
+): BrowserNetworkProxyEndpointMetadata {
+  return {
+    ...metadata,
+    upstreamOrigin: `${protocol}://${metadata.upstreamHostHeader}`,
+    upstreamOrigins: buildUpstreamOrigins(endpoint.logicalPort),
+  };
+}
+
+function buildUpstreamOrigins(logicalPort: number): readonly string[] {
+  return ["http", "https"].flatMap((protocol) => [
+    `${protocol}://${LOCALHOST_UPSTREAM_HOST}:${logicalPort}`,
+    `${protocol}://127.0.0.1:${logicalPort}`,
+    `${protocol}://[::1]:${logicalPort}`,
+  ]);
+}
+
+function normalizeTargetProtocol(protocol: BrowserNetworkProxyTarget["protocol"]): "http" | "https" {
+  return protocol === "https" ? "https" : "http";
 }
 
 function normalizeTargetHost(host: string): string {
