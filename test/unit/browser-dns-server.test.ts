@@ -71,6 +71,9 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   };
 
   assert.equal(networkServiceSource.includes("# Port Manager browser DNS resolver"), true);
+  assert.equal(networkServiceSource.includes("# Port Manager browser DNS hosts begin"), true);
+  assert.equal(networkServiceSource.includes("isBrowserDnsHostsEntryConfigured"), true);
+  assert.equal(networkServiceSource.includes("hostsConfigured"), true);
   assert.equal(networkServiceSource.includes("buildBrowserDnsResolverCleanupScript"), true);
   assert.equal(networkServiceSource.includes("ifconfig lo0 alias"), true);
   assert.equal(networkServiceSource.includes("ifconfig lo0 -alias"), true);
@@ -91,8 +94,10 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   );
   const browserProxySyncSource = networkServiceSource.slice(browserProxySyncStart, browserProxySyncEnd);
   const browserProxyLeaseIndex = browserProxySyncSource.indexOf("this.ownsBrowserNetworkProxyLease = true;");
-  const browserAliasReadyIndex = browserProxySyncSource.indexOf(
-    "ensureBrowserDnsLoopbackAliasesReady(buildBrowserDnsRecords(networks))",
+  const browserAliasReadyIndex = browserProxySyncSource.indexOf("ensureBrowserDnsLoopbackAliasesReady(dnsRecords)");
+  const directBrowserProxyClearIndex = browserProxySyncSource.indexOf(
+    "await this.browserNetworkProxy.sync([]).catch(() => undefined);",
+    browserAliasReadyIndex,
   );
   const reloadSharedStateStart = networkServiceSource.indexOf("private async reloadSharedNetworkState");
   const reloadSharedStateEnd = networkServiceSource.indexOf(
@@ -113,10 +118,14 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.notEqual(reloadSharedStateEnd, -1);
   assert.notEqual(convergeStart, -1);
   assert.notEqual(convergeEnd, -1);
-  assert.equal(browserProxySyncSource.includes("this.syncBrowserDnsRecordsForNetworks(networks);"), true);
+  assert.equal(browserProxySyncSource.includes("this.syncBrowserDnsRecordsForNetworks(networks, dnsRecordOptions)"), true);
   assert.equal(browserProxySyncSource.includes("const dnsRunning = this.browserDnsServer.isRunning();"), true);
   assert.equal(browserProxyLeaseIndex >= 0, true);
   assert.equal(browserAliasReadyIndex > browserProxyLeaseIndex, true);
+  assert.equal(directBrowserProxyClearIndex > browserAliasReadyIndex, true);
+  assert.equal(networkServiceSource.includes("shouldRouteBrowserDnsToNetworkLoopback(readPortManagerSettings())"), true);
+  assert.equal(networkServiceSource.includes("loopbackAddressForNetwork(network.id)"), true);
+  assert.equal(networkServiceSource.includes("buildDirectNetworkLoopbackUrl"), true);
   assert.equal(reloadBrowserDnsIndex > reloadTerminalSelectionIndex, true);
   assert.equal(
     convergeSource.includes("await this.rehydrateBrowserDnsAndProxies().catch(() => undefined);"),
@@ -143,6 +152,7 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(treeSource.includes("Install Browser DNS"), true);
   assert.equal(treeSource.includes("Clean Browser DNS"), true);
   assert.equal(treeSource.includes("Loopback alias: ${aliasStatus}"), true);
+  assert.equal(treeSource.includes("Hosts entry: ${hostsStatus}"), true);
   assert.equal(treeSource.includes("buildBrowserDnsRecordRows"), true);
   assert.equal(treeSource.includes("Logical port: ${route.logicalPort}"), true);
   assert.equal(treeSource.includes("Proxy: ${proxy}"), true);

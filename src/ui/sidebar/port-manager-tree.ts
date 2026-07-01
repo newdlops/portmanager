@@ -1251,7 +1251,8 @@ function buildBrowserDnsDiagnosticRows(
 function buildBrowserDnsRecordRows(record: BrowserDnsResolverStatus["records"][number]): PortManagerTreeItem[] {
   const resolverStatus = record.resolverConfigured ? "resolver ok" : "missing resolver";
   const aliasStatus = record.loopbackAliasConfigured ? "loopback ok" : "missing loopback";
-  const configured = record.configured ? "configured" : `${resolverStatus}, ${aliasStatus}`;
+  const hostsStatus = record.hostsConfigured ? "hosts ok" : "missing hosts";
+  const configured = record.configured ? "configured" : `${resolverStatus}, ${aliasStatus}, ${hostsStatus}`;
   const aliasTooltip = new vscode.MarkdownString(
     [
       `Network: ${record.networkName}`,
@@ -1259,6 +1260,7 @@ function buildBrowserDnsRecordRows(record: BrowserDnsResolverStatus["records"][n
       `Loopback: ${record.address}`,
       `Resolver: ${resolverStatus}`,
       `Loopback alias: ${aliasStatus}`,
+      `Hosts entry: ${hostsStatus}`,
     ].join("\n\n"),
   );
   const rows: PortManagerTreeItem[] = [

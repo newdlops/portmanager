@@ -10,6 +10,7 @@ export const DEFAULT_PORT_MANAGER_SETTINGS: PortManagerSettings = {
   scanRange: 20,
   scanDirection: "up",
   routingMode: "hashed",
+  experimentalRouteOwnershipMode: "process",
   enableLoopbackAddressRouting: false,
   loopbackAddressRoutingMode: "high-port",
   virtualPortRangeStart: 53_000,

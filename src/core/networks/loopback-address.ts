@@ -6,10 +6,11 @@
  * address first exists as a lo0 alias; Linux commonly routes 127/8 without it.
  */
 
-import type { LoopbackAddressRoutingMode } from "../../shared/types";
+import type { ExperimentalRouteOwnershipMode, LoopbackAddressRoutingMode } from "../../shared/types";
 
 export const ACTUAL_LOOPBACK_HOST_ENV = "PORT_MANAGER_ACTUAL_LOOPBACK_HOST";
 export const NETWORK_LOOPBACK_HOST_ENV = "PORT_MANAGER_NETWORK_LOOPBACK_HOST";
+export const LOOPBACK_ADDRESS_ONLY_ROUTE_OWNERSHIP_MODE: ExperimentalRouteOwnershipMode = "loopback-address-only";
 const DEFAULT_LOOPBACK_ADDRESS_ROUTING_MODE: LoopbackAddressRoutingMode = "high-port";
 
 export function isLoopbackAddressRoutingEnabled(settings: {
@@ -17,6 +18,32 @@ export function isLoopbackAddressRoutingEnabled(settings: {
   readonly loopbackAddressRoutingMode?: LoopbackAddressRoutingMode;
 }): boolean {
   return resolveLoopbackAddressRoutingMode(settings) !== "high-port";
+}
+
+/** True when the experimental terminal hook should preserve ports and isolate only by loopback IP. */
+export function usesLoopbackAddressOnlyRouting(settings: {
+  readonly experimentalRouteOwnershipMode?: ExperimentalRouteOwnershipMode;
+}): boolean {
+  return settings.experimentalRouteOwnershipMode === LOOPBACK_ADDRESS_ONLY_ROUTE_OWNERSHIP_MODE;
+}
+
+/** Decides whether terminal hooks should expose the same-port network loopback host. */
+export function shouldExposeNetworkLoopbackHost(settings: {
+  readonly enableLoopbackAddressRouting?: boolean;
+  readonly experimentalRouteOwnershipMode?: ExperimentalRouteOwnershipMode;
+  readonly loopbackAddressRoutingMode?: LoopbackAddressRoutingMode;
+}): boolean {
+  return isLoopbackAddressRoutingEnabled(settings) || usesLoopbackAddressOnlyRouting(settings);
+}
+
+/** Resolves the attach-time alias policy after applying address-only experimental routing. */
+export function resolveTerminalLoopbackAddressRoutingMode(settings: {
+  readonly enableLoopbackAddressRouting?: boolean;
+  readonly experimentalRouteOwnershipMode?: ExperimentalRouteOwnershipMode;
+  readonly loopbackAddressRoutingMode?: LoopbackAddressRoutingMode;
+}): LoopbackAddressRoutingMode {
+  const mode = resolveLoopbackAddressRoutingMode(settings);
+  return usesLoopbackAddressOnlyRouting(settings) && mode === "high-port" ? "loopback" : mode;
 }
 
 export function resolveLoopbackAddressRoutingMode(settings: {

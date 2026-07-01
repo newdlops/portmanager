@@ -12,9 +12,9 @@ import {
 import { readPortManagerSettings } from "../config/vscode-settings";
 import {
   ACTUAL_LOOPBACK_HOST_ENV,
-  isLoopbackAddressRoutingEnabled,
   loopbackAddressForNetwork,
   NETWORK_LOOPBACK_HOST_ENV,
+  shouldExposeNetworkLoopbackHost,
 } from "../core/networks/loopback-address";
 import type { DisposableLike, PortManagerSettings } from "../shared/types";
 import {
@@ -22,6 +22,7 @@ import {
   buildRuntimeCommandShimScript,
   type RuntimeCommandShimName,
 } from "./compose-project-routing";
+import { normalizeBrowserDnsHostname } from "../platform/network/browser-dns-server";
 
 /**
  * Keeps new VS Code terminals on the pre-bind routing path.
@@ -39,6 +40,8 @@ const TERMINAL_MUTATOR_OPTIONS: vscode.EnvironmentVariableMutatorOptions = {
 
 export const RUNTIME_SHIM_DIRECTORY_ENV = "PORT_MANAGER_RUNTIME_SHIM_DIR";
 export const DOCKER_SHIM_PATH_ENV = "PORT_MANAGER_DOCKER_SHIM";
+export const EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV = "PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE";
+export const NETWORK_DNS_ALIAS_ENV = "PORT_MANAGER_NETWORK_DNS_ALIAS";
 const PRELOAD_PACKAGE_MANAGER_NAMES: readonly string[] = ["npm", "npx", "pnpm", "pnpx", "corepack", "uv", "uvx", "yarn", "yarnpkg"];
 const RUNTIME_COMMAND_SHIM_NAMES: readonly RuntimeCommandShimName[] = ["docker", "podman", "docker-compose", "podman-compose"];
 const PRELOAD_RUNTIME_LAUNCHER_NAMES = [
@@ -83,6 +86,8 @@ export interface TerminalHookEnvironmentScope {
   readonly networkId: string;
   /** Display name used by shell startup hooks to label attached terminals. */
   readonly networkName?: string;
+  /** Single-label DNS alias for this network, when the name is resolver-safe. */
+  readonly networkDnsAlias?: string;
   /** Dynamic Compose/container routing map consumed by Docker/Podman shims. */
   readonly composeRoutingFilePath?: string;
   /** Directory where Docker/Podman shims signal lifecycle changes back to the extension. */
@@ -141,8 +146,10 @@ export function applyTerminalHookEnvironment(
   const nativeContainerMapPath = context.asAbsolutePath(path.join("media", "native", "portmanager_container_map"));
   const asdfShimLauncherPath = context.asAbsolutePath(getAsdfShimLauncherRelativePath());
   const runtimeCommandShimPath = context.asAbsolutePath(getRuntimeCommandShimRelativePath());
+  const networkDnsAlias = scope.networkDnsAlias ?? normalizeBrowserDnsHostname(scope.networkName ?? "");
   const shellEnvRestorePath = prepareShellEnvRestoreScript(context.globalStorageUri.fsPath, hookLibraryPath, {
     networkId: scope.networkId,
+    networkDnsAlias,
     agentSocketPath: getAgentSocketPath(),
     agentMainPath,
     agentExecutablePath: nativeAgentPath,
@@ -162,6 +169,9 @@ export function applyTerminalHookEnvironment(
   collection.replace("PORT_MANAGER_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
   if (scope.networkName !== undefined) {
     collection.replace("PORT_MANAGER_NETWORK_NAME", scope.networkName, TERMINAL_MUTATOR_OPTIONS);
+  }
+  if (networkDnsAlias !== undefined) {
+    collection.replace(NETWORK_DNS_ALIAS_ENV, networkDnsAlias, TERMINAL_MUTATOR_OPTIONS);
   }
   collection.replace("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_BORROWED_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
@@ -214,7 +224,7 @@ function applyLoopbackRoutingHosts(
 
   collection.replace(ACTUAL_LOOPBACK_HOST_ENV, loopbackHost, TERMINAL_MUTATOR_OPTIONS);
 
-  if (isLoopbackAddressRoutingEnabled(settings)) {
+  if (shouldExposeNetworkLoopbackHost(settings)) {
     collection.replace(NETWORK_LOOPBACK_HOST_ENV, loopbackHost, TERMINAL_MUTATOR_OPTIONS);
   }
 }
@@ -226,6 +236,13 @@ function applyRoutingSettings(
 ): void {
   collection.replace("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_ROUTING_MODE", settings.routingMode, TERMINAL_MUTATOR_OPTIONS);
+  if (settings.experimentalRouteOwnershipMode !== "process") {
+    collection.replace(
+      EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV,
+      settings.experimentalRouteOwnershipMode,
+      TERMINAL_MUTATOR_OPTIONS,
+    );
+  }
   collection.replace(
     "PORT_MANAGER_VIRTUAL_PORT_START",
     String(settings.virtualPortRangeStart),
@@ -406,6 +423,8 @@ function isStaleGeneratedRuntimeShim(filePath: string): boolean {
 export interface ShellEnvRestoreScope {
   /** Logical network scope that must survive protected shebang and bash boundaries. */
   readonly networkId?: string;
+  /** Single-label network alias used to fold dev-server --host aliases back to localhost. */
+  readonly networkDnsAlias?: string;
   /** Singleton daemon socket path; losing this can point native hooks at a different temp directory. */
   readonly agentSocketPath?: string;
   /** Agent entrypoint used by child-side readiness probes. */
@@ -640,11 +659,12 @@ function replacePathAtomically(filePath: string, tempPath: string): void {
 /**
  * Vite prints every available network interface when it receives a bare or
  * wildcard --host. In attached terminals that includes every logical loopback
- * alias, so constrain only the unsafe host forms to the active network host.
+ * alias, so constrain unsafe and Port Manager DNS-alias host forms to localhost.
  */
 function buildViteHostNarrowingShell(): string {
-  return `if [ "\${__pm_name:-}" = "vite" ] && [ -n "\${PORT_MANAGER_NETWORK_LOOPBACK_HOST:-}" ]; then
-  __pm_vite_host="\${PORT_MANAGER_NETWORK_LOOPBACK_HOST}"
+  return `if [ "\${__pm_name:-}" = "vite" ]; then
+  __pm_vite_host="localhost"
+  __pm_vite_alias="\${PORT_MANAGER_NETWORK_DNS_ALIAS:-}"
   __pm_vite_args_initialized=0
   __pm_vite_host_pending=0
   for __pm_arg in "$@"; do
@@ -655,6 +675,15 @@ function buildViteHostNarrowingShell(): string {
 
     if [ "\${__pm_vite_host_pending}" = "1" ]; then
       __pm_vite_host_pending=0
+      if [ -n "\${__pm_vite_alias}" ]; then
+        __pm_arg_lc="$(printf '%s' "\${__pm_arg}" | tr '[:upper:]' '[:lower:]')"
+        if [ "\${__pm_arg_lc}" = "\${__pm_vite_alias}" ]; then
+          set -- "$@" "\${__pm_vite_host}"
+          unset __pm_arg_lc
+          continue
+        fi
+        unset __pm_arg_lc
+      fi
       case "\${__pm_arg}" in
         -*)
           set -- "$@" "\${__pm_vite_host}" "\${__pm_arg}"
@@ -677,6 +706,21 @@ function buildViteHostNarrowingShell(): string {
       --host=|--host=0.0.0.0|--host=::|--host=\\*)
         set -- "$@" "--host=\${__pm_vite_host}"
         ;;
+      --host=*)
+        __pm_vite_host_value="\${__pm_arg#--host=}"
+        if [ -n "\${__pm_vite_alias}" ]; then
+          __pm_vite_host_value_lc="$(printf '%s' "\${__pm_vite_host_value}" | tr '[:upper:]' '[:lower:]')"
+          if [ "\${__pm_vite_host_value_lc}" = "\${__pm_vite_alias}" ]; then
+            set -- "$@" "--host=\${__pm_vite_host}"
+          else
+            set -- "$@" "\${__pm_arg}"
+          fi
+          unset __pm_vite_host_value_lc
+        else
+          set -- "$@" "\${__pm_arg}"
+        fi
+        unset __pm_vite_host_value
+        ;;
       *)
         set -- "$@" "\${__pm_arg}"
         ;;
@@ -686,7 +730,7 @@ function buildViteHostNarrowingShell(): string {
   if [ "\${__pm_vite_host_pending}" = "1" ]; then
     set -- "$@" "\${__pm_vite_host}"
   fi
-  unset __pm_vite_host __pm_vite_args_initialized __pm_vite_host_pending __pm_arg
+  unset __pm_vite_host __pm_vite_alias __pm_vite_args_initialized __pm_vite_host_pending __pm_arg
 fi`;
 }
 
@@ -1070,7 +1114,7 @@ else
   fi
   export PORT_MANAGER_HOOK=0
   export PORT_MANAGER_HOOK_DISABLED=1
-  unset BASH_ENV PORT_MANAGER_PRELOAD_REPAIR PORT_MANAGER_DYLD_INSERT_LIBRARIES PORT_MANAGER_LD_PRELOAD DYLD_INSERT_LIBRARIES LD_PRELOAD PORT_MANAGER_RUNTIME_SHIM_DIR PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_COMPOSE_LOGICAL_PORTS PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS PORT_MANAGER_DOCKER_SHIM
+  unset BASH_ENV PORT_MANAGER_PRELOAD_REPAIR PORT_MANAGER_DYLD_INSERT_LIBRARIES PORT_MANAGER_LD_PRELOAD DYLD_INSERT_LIBRARIES LD_PRELOAD PORT_MANAGER_RUNTIME_SHIM_DIR PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_COMPOSE_LOGICAL_PORTS PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS PORT_MANAGER_DOCKER_SHIM ${NETWORK_DNS_ALIAS_ENV}
 fi
 
 exec "\${__pm_target}" "$@"
@@ -1127,6 +1171,10 @@ export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID=${shellQuote(scope.networkId)}
 	export PORT_MANAGER_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}
 	export NEWDLOPS_PM_NETWORK_ID=${shellQuote(scope.networkId)}
 	export NEWDLOPS_PM_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}`;
+  const networkDnsAliasExport =
+    scope.networkDnsAlias === undefined
+      ? `unset ${NETWORK_DNS_ALIAS_ENV}`
+      : `export ${NETWORK_DNS_ALIAS_ENV}=${shellQuote(scope.networkDnsAlias)}`;
   const composeRoutingExport =
     scope.composeRoutingFilePath === undefined
       ? ""
@@ -1148,7 +1196,7 @@ export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID=${shellQuote(scope.networkId)}
       ? ""
       : [
           `export ${ACTUAL_LOOPBACK_HOST_ENV}=${shellQuote(loopbackHost)}`,
-          scope.settings !== undefined && isLoopbackAddressRoutingEnabled(scope.settings)
+          scope.settings !== undefined && shouldExposeNetworkLoopbackHost(scope.settings)
             ? `export ${NETWORK_LOOPBACK_HOST_ENV}=${shellQuote(loopbackHost)}`
             : `unset ${NETWORK_LOOPBACK_HOST_ENV}`,
         ].join("\n");
@@ -1170,6 +1218,9 @@ export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID=${shellQuote(scope.networkId)}
       : [
           `export PORT_MANAGER_SCAN_RANGE=${shellQuote(String(scope.settings.scanRange))}`,
           `export PORT_MANAGER_ROUTING_MODE=${shellQuote(scope.settings.routingMode)}`,
+          scope.settings.experimentalRouteOwnershipMode !== "process"
+            ? `export ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}=${shellQuote(scope.settings.experimentalRouteOwnershipMode)}`
+            : `unset ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}`,
           `export PORT_MANAGER_VIRTUAL_PORT_START=${shellQuote(String(scope.settings.virtualPortRangeStart))}`,
           `export PORT_MANAGER_VIRTUAL_PORT_END=${shellQuote(String(scope.settings.virtualPortRangeEnd))}`,
           `export PORT_MANAGER_FIXED_PROTOCOL_PORTS=${shellQuote(scope.settings.fixedProtocolPorts.join(","))}`,
@@ -1185,6 +1236,7 @@ if [ -n "\${PORT_MANAGER_PREV_BASH_ENV:-}" ] && [ "\${PORT_MANAGER_PREV_BASH_ENV
 fi
 
 ${networkScope}
+${networkDnsAliasExport}
 ${routeTableExports}
 ${agentExports}
 ${routingExports}

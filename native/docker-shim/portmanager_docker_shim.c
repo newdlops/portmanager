@@ -1825,6 +1825,8 @@ static int pm_find_compose_route(
     pm_visit_scoped_compose_routing_files(file_path, pm_find_compose_route_in_file, &search, &scoped_file_count);
     if (scoped_file_count == 0) {
       pm_find_compose_route_in_file(file_path, &search);
+    } else if (!search.context_found && search.project_match_count == 0 && !search.found) {
+      pm_find_compose_route_in_file(file_path, &search);
     }
   }
 
@@ -2808,6 +2810,9 @@ static char *pm_container_target_for_token(
     search.argv = argv;
     search.require_context = 0;
     pm_visit_scoped_compose_routing_files(file_path, pm_container_target_scan_file, &search, NULL);
+    if (search.matches == 0 && search.target[0] == '\0') {
+      pm_container_target_scan_file(file_path, &search);
+    }
   } else {
     search.require_context = 0;
     search.context_files = 0;

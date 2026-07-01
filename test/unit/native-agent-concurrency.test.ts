@@ -57,6 +57,10 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(hookSource.includes("PM_ROUTE_FILE_CACHE_MAX_CAPACITY 65535"), true);
   assert.equal(hookSource.includes("pm_ensure_memory_route_capacity"), true);
   assert.equal(hookSource.includes("\\\"compactResponse\\\":1"), true);
+  assert.equal(hookSource.includes("PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE"), true);
+  assert.equal(hookSource.includes('PM_LOOPBACK_ADDRESS_ONLY_MODE "loopback-address-only"'), true);
+  assert.equal(hookSource.includes('\\\"experimentalRouteOwnershipMode\\\":\\\"%s\\\"'), true);
+  assert.equal(hookSource.includes("\\\"terminalSessionId\\\":\\\""), true);
   assert.equal(source.includes("static int pm_scan_lsof_cached"), true);
   assert.equal(source.includes("static int pm_write_route_table_file_if_changed"), true);
   assert.equal(source.includes("PM_ROUTE_TABLE_WRITE_LOCK_BACKGROUND_ATTEMPTS"), false);
@@ -66,6 +70,10 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(source.includes('pm_buffer_append(payload, ",\\"version\\":")'), true);
   assert.equal(source.includes("writing one endpoint file before every response"), true);
   assert.equal(source.includes("defer every registration source to the coalesced flush"), true);
+  assert.equal(source.includes("pm_process_route_owner_matches_release"), true);
+  assert.equal(source.includes("pm_scoped_route_ownership_mode(input->experimental_route_ownership_mode)"), true);
+  assert.equal(source.includes("pm_loopback_address_only_mode(experimental_route_ownership_mode)"), true);
+  assert.equal(source.includes('pm_buffer_append(buffer, ",\\\"terminalSessionId\\\":")'), true);
   assert.equal(source.includes("%s.tmp.%ld.%lu"), true);
   assert.equal(source.includes("pm_write_route_entry_table"), false);
   assert.equal(source.includes("pm_route_table_signature_for_path"), true);

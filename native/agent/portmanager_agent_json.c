@@ -389,11 +389,14 @@ int pm_parse_allocate_input(const char *payload, pm_allocate_input *input) {
   pm_json_get_string(payload, "host", input->host, sizeof(input->host));
   pm_json_get_string(payload, "actualHost", input->actual_host, sizeof(input->actual_host));
   pm_json_get_string(payload, "networkId", input->network_id, sizeof(input->network_id));
+  pm_json_get_string(payload, "experimentalRouteOwnershipMode", input->experimental_route_ownership_mode, sizeof(input->experimental_route_ownership_mode));
+  pm_json_get_string(payload, "terminalSessionId", input->terminal_session_id, sizeof(input->terminal_session_id));
   pm_json_get_string(payload, "routeDirection", input->route_direction, sizeof(input->route_direction));
   pm_json_get_string(payload, "scanDirection", input->scan_direction, sizeof(input->scan_direction));
   pm_json_get_string(payload, "routingMode", input->routing_mode, sizeof(input->routing_mode));
   input->compact_response = pm_json_get_int(payload, "compactResponse", 0) != 0;
   input->requested_port = pm_json_get_int(payload, "requestedPort", 0);
+  input->process_group_id = pm_json_get_int(payload, "processGroupId", 0);
   input->scan_range = pm_json_get_int(payload, "scanRange", PM_DEFAULT_SCAN_RANGE);
   input->virtual_start = pm_json_get_int(payload, "virtualPortRangeStart", PM_DEFAULT_VIRTUAL_START);
   input->virtual_end = pm_json_get_int(payload, "virtualPortRangeEnd", PM_DEFAULT_VIRTUAL_END);
@@ -414,10 +417,13 @@ int pm_parse_register_input(const char *payload, pm_register_input *input) {
   pm_json_get_string(payload, "cwd", input->cwd, sizeof(input->cwd));
   pm_json_get_string(payload, "host", input->host, sizeof(input->host));
   pm_json_get_string(payload, "networkId", input->network_id, sizeof(input->network_id));
+  pm_json_get_string(payload, "experimentalRouteOwnershipMode", input->experimental_route_ownership_mode, sizeof(input->experimental_route_ownership_mode));
+  pm_json_get_string(payload, "terminalSessionId", input->terminal_session_id, sizeof(input->terminal_session_id));
   pm_json_get_string(payload, "allocationId", input->allocation_id, sizeof(input->allocation_id));
   pm_json_get_string(payload, "source", input->source, sizeof(input->source));
   input->requested_port = pm_json_get_int(payload, "requestedPort", 0);
   input->actual_port = pm_json_get_int(payload, "actualPort", input->requested_port);
+  input->process_group_id = pm_json_get_int(payload, "processGroupId", 0);
   pm_default_text(input->name, sizeof(input->name), "Process");
   pm_default_text(input->command, sizeof(input->command), input->name);
   pm_default_text(input->cwd, sizeof(input->cwd), ".");
@@ -463,7 +469,10 @@ int pm_parse_release_process_input(const char *payload, pm_release_process_input
   input->pid = (pid_t)pm_json_get_long(payload, "pid", 0);
   pm_json_get_string(payload, "allocationId", input->allocation_id, sizeof(input->allocation_id));
   pm_json_get_string(payload, "networkId", input->network_id, sizeof(input->network_id));
+  pm_json_get_string(payload, "experimentalRouteOwnershipMode", input->experimental_route_ownership_mode, sizeof(input->experimental_route_ownership_mode));
+  pm_json_get_string(payload, "terminalSessionId", input->terminal_session_id, sizeof(input->terminal_session_id));
   input->requested_port = pm_json_get_int(payload, "requestedPort", 0);
   input->actual_port = pm_json_get_int(payload, "actualPort", 0);
+  input->process_group_id = pm_json_get_int(payload, "processGroupId", 0);
   return input->pid > 0 && input->requested_port > 0 && input->actual_port > 0 ? 0 : -1;
 }

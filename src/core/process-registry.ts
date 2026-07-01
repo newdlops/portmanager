@@ -121,6 +121,8 @@ export class ManagedProcessRegistry {
       command: input.command,
       cwd: input.cwd,
       ...(input.networkId ? { networkId: input.networkId } : {}),
+      ...(input.terminalSessionId ? { terminalSessionId: input.terminalSessionId } : {}),
+      ...(input.processGroupId !== undefined ? { processGroupId: input.processGroupId } : {}),
       requestedPort: input.requestedPort,
       actualPort: input.actualPort,
       status: options.status ?? "running",

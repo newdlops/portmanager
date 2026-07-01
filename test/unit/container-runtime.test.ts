@@ -1182,6 +1182,102 @@ test("mutates compose services into a hidden network-scoped project", async (con
   assert.equal(calls[4]?.cwd, tempDir);
 });
 
+test("compose hidden publish can preserve logical ports on network loopback hosts", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-mutator-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: workspace",
+      "services:",
+      "  postgres:",
+      "    image: postgres:16",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  let containerListCount = 0;
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "postgres\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        containerListCount += 1;
+        return {
+          stdout: JSON.stringify(
+            containerListCount === 1
+              ? {
+                  ID: "original123",
+                  Names: "workspace-postgres-1",
+                  Ports: "127.0.0.1:15432->5432/tcp",
+                  Labels: "com.docker.compose.project=workspace,com.docker.compose.service=postgres",
+                }
+              : {
+                  ID: "hidden123",
+                  Names: "a-app-workspace-bc74e5f2-postgres-1",
+                  Ports: "127.81.154.127:15432->5432/tcp",
+                  Labels:
+                    "com.docker.compose.project=a-app-workspace-bc74e5f2,com.docker.compose.service=postgres",
+                },
+          ),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({
+              Id: id,
+              Name: id === "hidden123" ? "/a-app-workspace-bc74e5f2-postgres-1" : "/workspace-postgres-1",
+              Config: {
+                Labels: {
+                  "com.docker.compose.service": "postgres",
+                },
+              },
+              Mounts: [],
+            })),
+          ),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    runtime: "docker",
+    networkName: "A app",
+    hiddenHostAddress: "127.81.154.127",
+    preservePublishedHostPorts: true,
+    originalProjectName: "workspace",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    ports: [
+      {
+        serviceName: "postgres",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 15432,
+        containerPort: 5432,
+        protocol: "tcp",
+        protocolName: "postgresql",
+      },
+    ],
+  });
+
+  const overrideText = fs.readFileSync(result.state.overrideFile, "utf8");
+  assert.match(overrideText, /'127\.81\.154\.127:15432:5432\/tcp'/);
+  assert.doesNotMatch(overrideText, /127\.81\.154\.127::5432\/tcp/);
+  assert.equal(result.ports[0]?.logicalPort, 15432);
+  assert.equal(result.ports[0]?.actualHostAddress, "127.81.154.127");
+  assert.equal(result.ports[0]?.actualHostPort, 15432);
+});
+
 test("clone attach carries running internal compose services without stopping their originals", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-internal-service-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
@@ -3642,6 +3738,73 @@ test("recreates missing compose clone override from persisted mutation state", a
   assert.match(overrideText, /127\.81\.154\.127::5432\/tcp/);
   assert.match(overrideText, /'langgraph_server':\n    container_name: !reset null/);
   assert.match(overrideText, /profiles: !override\n      - 'pm_unattached'/);
+});
+
+test("recreates compose override with current loopback publish model", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-loopback-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const overrideFile = path.join(tempDir, "network-workspace.ports.override.yaml");
+
+  fs.writeFileSync(
+    composeFile,
+    [
+      "services:",
+      "  db:",
+      "    image: postgres:16",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await mutator.restoreHiddenPortsOverride(
+    {
+      mode: "clone",
+      runtime: "docker",
+      originalProjectName: "workspace",
+      attachedProjectName: "network-workspace",
+      workingDirectory: tempDir,
+      composeFiles: [composeFile],
+      services: ["db"],
+      overrideFile,
+      originalPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 15432,
+          actualHostAddress: "127.0.0.1",
+          actualHostPort: 15432,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+      hiddenPorts: [
+        {
+          serviceName: "db",
+          logicalPort: 15432,
+          actualHostAddress: "127.81.154.127",
+          actualHostPort: 57002,
+          containerPort: 5432,
+          protocol: "tcp",
+        },
+      ],
+    },
+    { force: true, preservePublishedHostPorts: true },
+  );
+
+  const overrideText = fs.readFileSync(overrideFile, "utf8");
+  assert.match(overrideText, /'127\.81\.154\.127:15432:5432\/tcp'/);
+  assert.doesNotMatch(overrideText, /127\.81\.154\.127::5432\/tcp/);
 });
 
 test("recovers compose clone overrides into the current storage directory", async (context) => {

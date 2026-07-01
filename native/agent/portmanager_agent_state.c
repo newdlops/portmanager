@@ -715,6 +715,58 @@ static void pm_endpoint_identity(int logical_port, const char *network_id, char 
   snprintf(buffer, size, "%s:%d", network_id == NULL ? "" : network_id, logical_port);
 }
 
+static int pm_scoped_route_ownership_mode(const char *mode) {
+  return mode != NULL &&
+    (strcmp(mode, "terminal-scope-listener") == 0 ||
+     strcmp(mode, "loopback-address-only") == 0);
+}
+
+static int pm_loopback_address_only_mode(const char *mode) {
+  return mode != NULL && strcmp(mode, "loopback-address-only") == 0;
+}
+
+static int pm_normalized_process_group_id(int process_group_id) {
+  return process_group_id > 0 ? process_group_id : 0;
+}
+
+static int pm_process_matches_terminal_scope(
+  const pm_process *process,
+  const char *terminal_session_id,
+  int process_group_id) {
+  int normalized_process_group_id = pm_normalized_process_group_id(process_group_id);
+
+  if (terminal_session_id != NULL &&
+      terminal_session_id[0] != '\0' &&
+      strcmp(process->terminal_session_id, terminal_session_id) == 0) {
+    return 1;
+  }
+
+  return normalized_process_group_id > 0 &&
+    process->process_group_id == normalized_process_group_id;
+}
+
+static void pm_copy_terminal_scope_to_route(pm_route *route, const pm_allocate_input *input) {
+  if (!pm_scoped_route_ownership_mode(input->experimental_route_ownership_mode)) {
+    route->terminal_session_id[0] = '\0';
+    route->process_group_id = 0;
+    return;
+  }
+
+  pm_copy(route->terminal_session_id, sizeof(route->terminal_session_id), input->terminal_session_id);
+  route->process_group_id = pm_normalized_process_group_id(input->process_group_id);
+}
+
+static void pm_copy_terminal_scope_to_process(pm_process *process, const pm_register_input *input) {
+  if (!pm_scoped_route_ownership_mode(input->experimental_route_ownership_mode)) {
+    process->terminal_session_id[0] = '\0';
+    process->process_group_id = 0;
+    return;
+  }
+
+  pm_copy(process->terminal_session_id, sizeof(process->terminal_session_id), input->terminal_session_id);
+  process->process_group_id = pm_normalized_process_group_id(input->process_group_id);
+}
+
 static const char *pm_refresh_network_id(const char *network_id) {
   return network_id == NULL || network_id[0] == '\0' ? "" : network_id;
 }
@@ -1000,6 +1052,8 @@ static void pm_process_to_route(const pm_process *process, pm_route *route) {
   pm_copy(route->host, sizeof(route->host), process->host[0] ? process->host : "localhost");
   pm_copy(route->cwd, sizeof(route->cwd), process->cwd);
   pm_copy(route->network_id, sizeof(route->network_id), process->network_id);
+  pm_copy(route->terminal_session_id, sizeof(route->terminal_session_id), process->terminal_session_id);
+  route->process_group_id = process->process_group_id;
   pm_copy(route->process_id, sizeof(route->process_id), process->id);
   pm_copy(route->process_name, sizeof(route->process_name), process->name);
   pm_copy(route->status, sizeof(route->status), process->status);
@@ -1051,6 +1105,13 @@ static int pm_append_route_json(pm_buffer *buffer, const pm_route *route) {
       (pm_buffer_append(buffer, ",\"networkId\":") != 0 || pm_json_append_string(buffer, route->network_id) != 0)) {
     return -1;
   }
+  if (route->terminal_session_id[0] != '\0' &&
+      (pm_buffer_append(buffer, ",\"terminalSessionId\":") != 0 || pm_json_append_string(buffer, route->terminal_session_id) != 0)) {
+    return -1;
+  }
+  if (route->process_group_id > 0 && pm_buffer_appendf(buffer, ",\"processGroupId\":%d", route->process_group_id) != 0) {
+    return -1;
+  }
   if (route->process_id[0] != '\0' &&
       (pm_buffer_append(buffer, ",\"processId\":") != 0 || pm_json_append_string(buffer, route->process_id) != 0)) {
     return -1;
@@ -1098,6 +1159,13 @@ static int pm_append_process_json(pm_buffer *buffer, const pm_process *process) 
 
   if (process->network_id[0] != '\0' &&
       (pm_buffer_append(buffer, ",\"networkId\":") != 0 || pm_json_append_string(buffer, process->network_id) != 0)) {
+    return -1;
+  }
+  if (process->terminal_session_id[0] != '\0' &&
+      (pm_buffer_append(buffer, ",\"terminalSessionId\":") != 0 || pm_json_append_string(buffer, process->terminal_session_id) != 0)) {
+    return -1;
+  }
+  if (process->process_group_id > 0 && pm_buffer_appendf(buffer, ",\"processGroupId\":%d", process->process_group_id) != 0) {
     return -1;
   }
 
@@ -1993,10 +2061,19 @@ static int pm_recover_untracked_hooked_listener(pm_agent_state *state, const pm_
     "PWD",
     "INIT_CWD",
   };
+  static const char *const terminal_session_variables[] = {
+    "PORT_MANAGER_TERMINAL_SESSION_ID",
+  };
+  static const char *const terminal_group_variables[] = {
+    "PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID",
+  };
   char environment[PM_PROCESS_INSPECT_TEXT];
   char command[PM_TEXT];
   char network_id[PM_SMALL];
   char cwd[PM_TEXT];
+  char experimental_route_ownership_mode[PM_SMALL];
+  char terminal_session_id[PM_SMALL];
+  char terminal_group_id[PM_SMALL];
   char host[PM_SMALL];
   char name[PM_SMALL];
   pm_process *process;
@@ -2017,6 +2094,14 @@ static int pm_recover_untracked_hooked_listener(pm_agent_state *state, const pm_
   }
   network_id[0] = '\0';
   (void)pm_process_text_first_value(environment, network_variables, sizeof(network_variables) / sizeof(network_variables[0]), network_id, sizeof(network_id));
+  experimental_route_ownership_mode[0] = '\0';
+  terminal_session_id[0] = '\0';
+  terminal_group_id[0] = '\0';
+  (void)pm_process_text_first_value(environment, (const char *const[]){"PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE"}, 1, experimental_route_ownership_mode, sizeof(experimental_route_ownership_mode));
+  if (pm_scoped_route_ownership_mode(experimental_route_ownership_mode)) {
+    (void)pm_process_text_first_value(environment, terminal_session_variables, sizeof(terminal_session_variables) / sizeof(terminal_session_variables[0]), terminal_session_id, sizeof(terminal_session_id));
+    (void)pm_process_text_first_value(environment, terminal_group_variables, sizeof(terminal_group_variables) / sizeof(terminal_group_variables[0]), terminal_group_id, sizeof(terminal_group_id));
+  }
 
   if (!pm_read_process_command_text(listener->pid, command, sizeof(command))) {
     pm_copy(command, sizeof(command), listener->command[0] ? listener->command : listener->process_name);
@@ -2034,7 +2119,7 @@ static int pm_recover_untracked_hooked_listener(pm_agent_state *state, const pm_
   }
   if (network_id[0] == '\0' ||
       requested_port <= 0 ||
-      requested_port == listener->port ||
+      (requested_port == listener->port && !pm_loopback_address_only_mode(experimental_route_ownership_mode)) ||
       pm_recovered_hook_route_exists(state, listener->pid, requested_port, listener->port, network_id)) {
     return 0;
   }
@@ -2057,6 +2142,8 @@ static int pm_recover_untracked_hooked_listener(pm_agent_state *state, const pm_
   pm_copy(process->command, sizeof(process->command), command);
   pm_copy(process->cwd, sizeof(process->cwd), cwd);
   pm_copy(process->network_id, sizeof(process->network_id), network_id);
+  pm_copy(process->terminal_session_id, sizeof(process->terminal_session_id), terminal_session_id);
+  process->process_group_id = pm_normalized_process_group_id(atoi(terminal_group_id));
   process->requested_port = requested_port;
   process->actual_port = listener->port;
   pm_copy(process->host, sizeof(process->host), pm_listener_route_host(listener, "127.0.0.1", host, sizeof(host)));
@@ -3265,6 +3352,7 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
   pm_copy(pending.route.host, sizeof(pending.route.host), actual_host);
   pm_copy(pending.route.cwd, sizeof(pending.route.cwd), input->cwd);
   pm_copy(pending.route.network_id, sizeof(pending.route.network_id), network_id);
+  pm_copy_terminal_scope_to_route(&pending.route, input);
   pm_copy(pending.route.process_name, sizeof(pending.route.process_name), input->name[0] ? input->name : input->command);
   pm_copy(pending.route.status, sizeof(pending.route.status), "starting");
   pm_copy(pending.route.source, sizeof(pending.route.source), "allocated");
@@ -3436,6 +3524,7 @@ int pm_state_register_process(pm_agent_state *state, const pm_register_input *in
   pm_copy(process->command, sizeof(process->command), input->command);
   pm_copy(process->cwd, sizeof(process->cwd), input->cwd);
   pm_copy(process->network_id, sizeof(process->network_id), network_id);
+  pm_copy_terminal_scope_to_process(process, input);
   process->requested_port = input->requested_port;
   process->actual_port = input->actual_port;
   pm_copy(process->host, sizeof(process->host), input->host);
@@ -3680,6 +3769,18 @@ static int pm_find_listener_for_port_host(int port, const char *host, pm_listene
   return found;
 }
 
+static int pm_process_route_owner_matches_release(const pm_process *process, const pm_release_process_input *input) {
+  if (process->pid == input->pid) {
+    return 1;
+  }
+
+  if (!pm_scoped_route_ownership_mode(input->experimental_route_ownership_mode)) {
+    return 0;
+  }
+
+  return pm_process_matches_terminal_scope(process, input->terminal_session_id, input->process_group_id);
+}
+
 int pm_state_release_process_route(pm_agent_state *state, const pm_release_process_input *input, pm_buffer *payload) {
   char network_id[PM_SMALL];
   pm_listener_list listeners = {0};
@@ -3704,7 +3805,7 @@ int pm_state_release_process_route(pm_agent_state *state, const pm_release_proce
 
     if (strcmp(process->status, "running") != 0 ||
         strcmp(process->source, "detected") == 0 ||
-        process->pid != input->pid ||
+        !pm_process_route_owner_matches_release(process, input) ||
         process->requested_port != input->requested_port ||
         process->actual_port != input->actual_port ||
         (network_id[0] != '\0' && strcmp(process->network_id, network_id) != 0)) {
@@ -3714,6 +3815,15 @@ int pm_state_release_process_route(pm_agent_state *state, const pm_release_proce
     active_listener = listener_scan_ok ? pm_find_listener_by_process_endpoint(&listeners, process) : NULL;
     if (active_listener != NULL) {
       (void)pm_adopt_listener_owner(process, active_listener);
+      retained = 1;
+      continue;
+    }
+
+    if (pm_scoped_route_ownership_mode(input->experimental_route_ownership_mode)) {
+      if (process->missing_listener_since == 0) {
+        process->missing_listener_since = time(NULL);
+      }
+      process->missing_listener_count++;
       retained = 1;
       continue;
     }

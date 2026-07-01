@@ -44,6 +44,8 @@ typedef struct {
   char host[PM_SMALL];
   char cwd[PM_TEXT];
   char network_id[PM_SMALL];
+  char terminal_session_id[PM_SMALL];
+  int process_group_id;
   char process_id[PM_ID];
   char process_name[PM_SMALL];
   char status[PM_STATUS];
@@ -57,6 +59,8 @@ typedef struct {
   char command[PM_TEXT];
   char cwd[PM_TEXT];
   char network_id[PM_SMALL];
+  char terminal_session_id[PM_SMALL];
+  int process_group_id;
   int requested_port;
   int actual_port;
   char host[PM_SMALL];
@@ -166,6 +170,9 @@ typedef struct {
   char host[PM_SMALL];
   char actual_host[PM_SMALL];
   char network_id[PM_SMALL];
+  char experimental_route_ownership_mode[PM_SMALL];
+  char terminal_session_id[PM_SMALL];
+  int process_group_id;
   char route_direction[PM_DIRECTION];
   int compact_response;
   int requested_port;
@@ -182,6 +189,9 @@ typedef struct {
   char command[PM_TEXT];
   char cwd[PM_TEXT];
   char network_id[PM_SMALL];
+  char experimental_route_ownership_mode[PM_SMALL];
+  char terminal_session_id[PM_SMALL];
+  int process_group_id;
   char allocation_id[PM_ID];
   char source[PM_SOURCE];
   char host[PM_SMALL];
@@ -207,6 +217,9 @@ typedef struct {
   pid_t pid;
   char allocation_id[PM_ID];
   char network_id[PM_SMALL];
+  char experimental_route_ownership_mode[PM_SMALL];
+  char terminal_session_id[PM_SMALL];
+  int process_group_id;
   int requested_port;
   int actual_port;
 } pm_release_process_input;

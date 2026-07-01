@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { ListeningPort, RegisteredProcessInput } from "../../shared/types";
+import type { ExperimentalRouteOwnershipMode, ListeningPort, RegisteredProcessInput } from "../../shared/types";
 import { NativeProcessLookupProvider } from "./native-process-lookup";
 
 const execFileAsync = promisify(execFile);
@@ -16,6 +16,7 @@ const ROUTING_NETWORK_VARIABLES = [
 const HOOK_PRELOAD_HINT_VARIABLES = ["PORT_MANAGER_DYLD_INSERT_LIBRARIES", "PORT_MANAGER_LD_PRELOAD"] as const;
 const HOOK_PRELOAD_VARIABLES = ["DYLD_INSERT_LIBRARIES", "LD_PRELOAD"] as const;
 const PORT_MANAGER_HOOK_LIBRARY_PATTERN = /(?:^|[:/])libportmanager_hook\.(?:dylib|so)(?=$|:)/i;
+const EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV = "PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE";
 
 interface CommandResult {
   readonly stdout: string | Buffer;
@@ -153,6 +154,7 @@ export class NodeProcessEnvironmentProvider {
       parseProcessEnvironmentValue(environmentOutput, ["PWD", "INIT_CWD"]) ??
       "";
     const networkId = nativeDetails?.networkId ?? parseRoutingNetworkIdFromProcessEnvironment(environmentOutput);
+    const terminalScope = parseExperimentalTerminalScopeFromProcessEnvironment(environmentOutput);
 
     return {
       pid,
@@ -163,6 +165,7 @@ export class NodeProcessEnvironmentProvider {
       actualPort: listener.port,
       host: normalizeListeningHost(listener.localAddress),
       ...(networkId === undefined ? {} : { networkId }),
+      ...terminalScope,
       source: "hooked",
     };
   }
@@ -188,6 +191,27 @@ export class NodeProcessEnvironmentProvider {
     const { stdout } = await this.runCommand("ps", ["-o", "command=", "-p", String(pid)]);
     return toText(stdout);
   }
+}
+
+/** Reads optional terminal-scope ownership metadata left by the experimental hook path. */
+function parseExperimentalTerminalScopeFromProcessEnvironment(
+  output: string,
+): Pick<RegisteredProcessInput, "experimentalRouteOwnershipMode" | "terminalSessionId" | "processGroupId"> {
+  const mode = parseProcessEnvironmentValue(output, [EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV]);
+  if (mode !== "terminal-scope-listener" && mode !== "loopback-address-only") {
+    return {};
+  }
+
+  const terminalSessionId = normalizeNonEmptyText(parseProcessEnvironmentValue(output, ["PORT_MANAGER_TERMINAL_SESSION_ID"]));
+  const processGroupId = parsePositiveInteger(
+    parseProcessEnvironmentValue(output, ["PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID"]),
+  );
+
+  return {
+    experimentalRouteOwnershipMode: mode as ExperimentalRouteOwnershipMode,
+    ...(terminalSessionId === undefined ? {} : { terminalSessionId }),
+    ...(processGroupId === undefined ? {} : { processGroupId }),
+  };
 }
 
 /** Extracts the routing network id from `ps eww` output. */
@@ -330,6 +354,20 @@ function parseTcpPort(value: string | undefined): number | undefined {
 
   const port = Number(value);
   return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : undefined;
+}
+
+function normalizeNonEmptyText(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  return normalized && normalized.length > 0 ? normalized : undefined;
+}
+
+function parsePositiveInteger(value: string | undefined): number | undefined {
+  if (value === undefined || !/^\d+$/.test(value)) {
+    return undefined;
+  }
+
+  const numberValue = Number(value);
+  return Number.isSafeInteger(numberValue) && numberValue > 0 ? numberValue : undefined;
 }
 
 function isPositiveInteger(value: unknown): value is number {

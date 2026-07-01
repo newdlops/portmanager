@@ -3,6 +3,7 @@ import { DEFAULT_PORT_MANAGER_SETTINGS } from "../shared/default-settings";
 import type {
   ContainerRuntimePreference,
   ContainerRuntimeSettings,
+  ExperimentalRouteOwnershipMode,
   LoopbackAddressRoutingMode,
   PortManagerSettings,
   PortRoutingMode,
@@ -25,6 +26,11 @@ const DEFAULT_CONTAINER_RUNTIME_SETTINGS: ContainerRuntimeSettings = {
 
 const VALID_SCAN_DIRECTIONS = new Set<ScanDirection>(["up", "down", "both"]);
 const VALID_ROUTING_MODES = new Set<PortRoutingMode>(["nearest", "hashed"]);
+const VALID_EXPERIMENTAL_ROUTE_OWNERSHIP_MODES = new Set<ExperimentalRouteOwnershipMode>([
+  "process",
+  "terminal-scope-listener",
+  "loopback-address-only",
+]);
 const VALID_LOOPBACK_ADDRESS_ROUTING_MODES = new Set<LoopbackAddressRoutingMode>(["high-port", "auto", "loopback"]);
 const VALID_CONTAINER_RUNTIMES = new Set<ContainerRuntimePreference>(["auto", "docker", "podman"]);
 
@@ -48,6 +54,12 @@ export function readPortManagerSettings(): PortManagerSettings {
       config.get<ScanDirection>("scanDirection", DEFAULT_SETTINGS.scanDirection),
     ),
     routingMode: normalizeRoutingMode(config.get<PortRoutingMode>("routingMode", DEFAULT_SETTINGS.routingMode)),
+    experimentalRouteOwnershipMode: normalizeExperimentalRouteOwnershipMode(
+      config.get<ExperimentalRouteOwnershipMode>(
+        "experimentalRouteOwnershipMode",
+        DEFAULT_SETTINGS.experimentalRouteOwnershipMode,
+      ),
+    ),
     enableLoopbackAddressRouting: config.get<boolean>(
       "enableLoopbackAddressRouting",
       DEFAULT_SETTINGS.enableLoopbackAddressRouting ?? false,
@@ -175,6 +187,15 @@ function normalizeScanDirection(scanDirection: ScanDirection): ScanDirection {
 /** Converts unknown routing modes to the hashed logical-port policy. */
 function normalizeRoutingMode(routingMode: PortRoutingMode): PortRoutingMode {
   return VALID_ROUTING_MODES.has(routingMode) ? routingMode : DEFAULT_SETTINGS.routingMode;
+}
+
+/** Keeps experimental route ownership opt-in and falls back to legacy PID ownership. */
+function normalizeExperimentalRouteOwnershipMode(
+  mode: ExperimentalRouteOwnershipMode,
+): ExperimentalRouteOwnershipMode {
+  return VALID_EXPERIMENTAL_ROUTE_OWNERSHIP_MODES.has(mode)
+    ? mode
+    : DEFAULT_SETTINGS.experimentalRouteOwnershipMode;
 }
 
 /** Reads the explicit loopback policy while preserving the legacy boolean setting. */

@@ -602,7 +602,11 @@ __port_manager_compose_route_for_runtime() {
       ;;
   esac
 
-  if [ "\${__pm_scoped_files}" != "1" ]; then
+  if [ "\${__pm_scoped_files}" = "1" ]; then
+    if [ -z "\${__pm_best_attached_project}" ] && [ "\${__pm_project_match_count}" = "0" ]; then
+      __port_manager_compose_route_scan_file_for_runtime "\${__pm_file}" "\${__pm_runtime}" "\${__pm_network}" "$@" || true
+    fi
+  else
     __port_manager_compose_route_scan_file_for_runtime "\${__pm_file}" "\${__pm_runtime}" "\${__pm_network}" "$@" || return 1
   fi
 
@@ -930,6 +934,10 @@ __port_manager_container_target_for_runtime() {
       __port_manager_container_target_helper_scan_file_for_runtime "\${__pm_scoped_file}" "\${__pm_runtime}" "\${__pm_network}" "\${__pm_token}"
       __port_manager_container_target_scan_file_for_runtime "\${__pm_scoped_file}" "\${__pm_runtime}" "\${__pm_network}" "\${__pm_token}" "\${__pm_token_length}" "\${__pm_token_suffix}"
     done
+    if [ "\${__pm_matches}" = "0" ] && [ "\${__pm_helper_matches}" = "0" ]; then
+      __port_manager_container_target_helper_scan_file_for_runtime "\${__pm_file}" "\${__pm_runtime}" "\${__pm_network}" "\${__pm_token}"
+      __port_manager_container_target_scan_file_for_runtime "\${__pm_file}" "\${__pm_runtime}" "\${__pm_network}" "\${__pm_token}" "\${__pm_token_length}" "\${__pm_token_suffix}" || true
+    fi
   else
     __port_manager_container_target_helper_scan_file_for_runtime "\${__pm_file}" "\${__pm_runtime}" "\${__pm_network}" "\${__pm_token}"
     __port_manager_container_target_scan_file_for_runtime "\${__pm_file}" "\${__pm_runtime}" "\${__pm_network}" "\${__pm_token}" "\${__pm_token_length}" "\${__pm_token_suffix}" || return 1

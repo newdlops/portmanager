@@ -6,6 +6,7 @@ import type {
   ManagedProcess,
   ProcessKillSignal,
   PortRouteAllocation,
+  ExperimentalRouteOwnershipMode,
   PortRoutingMode,
   RegisteredProcessInput,
   ScanDirection,
@@ -129,6 +130,12 @@ export interface ReleaseProcessRoutePayload {
   readonly actualPort: number;
   /** Logical network scope inherited by the process, when present. */
   readonly networkId?: string;
+  /** Experimental ownership policy used by the hook that is releasing this route. */
+  readonly experimentalRouteOwnershipMode?: ExperimentalRouteOwnershipMode;
+  /** Terminal attachment generation that produced the route release. */
+  readonly terminalSessionId?: string;
+  /** POSIX process group of the attached terminal that produced the route release. */
+  readonly processGroupId?: number;
 }
 
 export type AgentRequestPayloadByMethod = {

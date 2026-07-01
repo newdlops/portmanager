@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8084",
+  "version": "0.0.8091",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -771,6 +771,21 @@
             "hashed"
           ],
           "description": "Routing policy. Hashed keeps logical ports unoccupied and assigns actual ports from the virtual range."
+        },
+        "portManager.experimentalRouteOwnershipMode": {
+          "type": "string",
+          "default": "process",
+          "enum": [
+            "process",
+            "terminal-scope-listener",
+            "loopback-address-only"
+          ],
+          "enumDescriptions": [
+            "Use the current PID-first route release behavior.",
+            "Experimental: use terminal session and process group metadata plus live listener checks to keep route ownership stable across PID churn.",
+            "Experimental: isolate attached terminals by rewriting local binds/connects to the network loopback IP while preserving the requested port."
+          ],
+          "description": "Experimental routing model for terminal-hooked external processes. Keep the default unless validating high-load terminal scope routing."
         },
         "portManager.enableLoopbackAddressRouting": {
           "type": "boolean",

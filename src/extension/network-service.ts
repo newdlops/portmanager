@@ -25,12 +25,11 @@ import {
 import {
   ACTUAL_LOOPBACK_HOST_ENV,
   browserLoopbackAddressForNetwork,
-  isLoopbackAddressRoutingEnabled,
   loopbackAddressForNetwork,
   NETWORK_LOOPBACK_HOST_ENV,
-  resolveLoopbackAddressRoutingMode,
+  resolveTerminalLoopbackAddressRoutingMode,
 } from "../core/networks/loopback-address";
-import { findRoutesMatchingClientCwd, pathsShareDirectoryScope } from "../core/networks/logical-route-selection";
+import { findRoutesMatchingClientCwd } from "../core/networks/logical-route-selection";
 import { resolveProcessTreeNetworkLabel } from "../core/process-network-labels";
 import { SimpleEventEmitter } from "../shared/events";
 import {
@@ -106,9 +105,11 @@ import type {
 import {
   applyTerminalHookEnvironment,
   DOCKER_SHIM_PATH_ENV,
+  EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV,
   getAsdfShimLauncherRelativePath,
   getHookLibraryRelativePath,
   getRuntimeCommandShimRelativePath,
+  NETWORK_DNS_ALIAS_ENV,
   prepareRuntimeShimLauncherDirectory,
   prepareShellEnvRestoreScript,
   RUNTIME_SHIM_DIRECTORY_ENV,
@@ -153,6 +154,8 @@ const BROWSER_NETWORK_PROXY_OWNER_LEASE_MS = 120_000;
 const BROWSER_NETWORK_PROXY_OWNER_LOCK_STALE_MS = 30_000;
 const BROWSER_NETWORK_PROXY_OWNER_PATH = buildBrowserNetworkProxyOwnerControlPath("owner");
 const BROWSER_NETWORK_PROXY_OWNER_LOCK_PATH = buildBrowserNetworkProxyOwnerControlPath("lock");
+const BROWSER_DNS_HOSTS_BLOCK_BEGIN = "# Port Manager browser DNS hosts begin";
+const BROWSER_DNS_HOSTS_BLOCK_END = "# Port Manager browser DNS hosts end";
 // The control-plane owner is the only VS Code extension host allowed to run
 // automatic Docker/terminal discovery, generated-file repair, and hook env
 // collection refresh. Other windows stay read-only unless the user triggers an
@@ -216,6 +219,20 @@ interface ComposeProjectRoutingWriteOptions {
 interface ComposeOverrideReconcileOptions {
   /** Rewrite readable override YAML instead of trusting the previous contents. */
   readonly force?: boolean;
+  /** Keep Docker host publishes on logical ports when the current loopback model requires it. */
+  readonly preservePublishedHostPorts?: boolean;
+}
+
+interface BrowserDnsRecordBuildOptions {
+  /** True when DNS should act as a host gate directly into each network loopback IP. */
+  readonly routeToNetworkLoopback?: boolean;
+}
+
+interface NetworkDnsRecord {
+  readonly networkId: string;
+  readonly networkName: string;
+  readonly hostname: string;
+  readonly address: string;
 }
 
 interface LogicalRouterOwnerDocument {
@@ -869,8 +886,8 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /**
    * Returns a browser-facing URL whose host is unique per logical network.
-   * The upstream request is still rewritten as localhost so dev auth settings
-   * that reject raw loopback aliases can continue to work.
+   * In same-port loopback modes DNS is the host gate, so the URL goes straight
+   * to the network loopback IP instead of creating an HTTP-only browser proxy.
    */
   async getBrowserIsolatedUrl(process: ManagedProcess): Promise<string | undefined> {
     const networks = this.registry.getSnapshot().networks;
@@ -878,6 +895,10 @@ export class PortManagerNetworkService implements DisposableLike {
 
     if (!isBrowserProxyProcess(process, networks)) {
       return undefined;
+    }
+
+    if (this.shouldRouteBrowserDnsToNetworkLoopback()) {
+      return buildDirectNetworkLoopbackUrl(process, networks, this.browserDnsServer.isRunning());
     }
 
     const endpoint = await this.browserNetworkProxy.ensure(
@@ -899,7 +920,7 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Builds a sudo shell script that points macOS single-label resolvers at Port Manager DNS. */
   createBrowserDnsResolverSetupScript(): string {
     return buildBrowserDnsResolverSetupScript(
-      buildBrowserDnsRecords(this.registry.getSnapshot().networks),
+      this.buildBrowserDnsRecordsForCurrentSettings(this.registry.getSnapshot().networks),
       this.browserDnsServer.getPort(),
     );
   }
@@ -910,13 +931,14 @@ export class PortManagerNetworkService implements DisposableLike {
     const agentSnapshot = this.getAgentSnapshot();
 
     return buildBrowserDnsResolverStatus(
-      buildBrowserDnsRecords(networkSnapshot.networks),
+      this.buildBrowserDnsRecordsForCurrentSettings(networkSnapshot.networks),
       this.browserDnsServer.getPort(),
       this.browserDnsServer.isRunning(),
       agentSnapshot.processes,
       agentSnapshot.routes,
       networkSnapshot.networks,
       this.browserNetworkProxy,
+      this.browserDnsRecordBuildOptionsForCurrentSettings(),
     );
   }
 
@@ -997,9 +1019,26 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /** Publishes aliases from the same snapshot used by browser proxy reconciliation. */
-  private syncBrowserDnsRecordsForNetworks(networks: readonly LogicalNetwork[]): void {
-    const records = buildBrowserDnsRecords(networks);
+  private syncBrowserDnsRecordsForNetworks(
+    networks: readonly LogicalNetwork[],
+    options = this.browserDnsRecordBuildOptionsForCurrentSettings(),
+  ): readonly NetworkDnsRecord[] {
+    const records = buildBrowserDnsRecords(networks, options);
     this.browserDnsServer.sync(records);
+    return records;
+  }
+
+  /** Resolves whether DNS should expose the HTTP proxy band or the network IP itself. */
+  private browserDnsRecordBuildOptionsForCurrentSettings(): BrowserDnsRecordBuildOptions {
+    return { routeToNetworkLoopback: this.shouldRouteBrowserDnsToNetworkLoopback() };
+  }
+
+  private buildBrowserDnsRecordsForCurrentSettings(networks: readonly LogicalNetwork[]): readonly NetworkDnsRecord[] {
+    return buildBrowserDnsRecords(networks, this.browserDnsRecordBuildOptionsForCurrentSettings());
+  }
+
+  private shouldRouteBrowserDnsToNetworkLoopback(): boolean {
+    return shouldRouteBrowserDnsToNetworkLoopback(readPortManagerSettings());
   }
 
   /** Lists saved binding presets without exposing mutable stored arrays. */
@@ -1318,7 +1357,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     await ensureLoopbackAddressRoutingHostReady(
       loopbackAddressForNetwork(networkId),
-      resolveLoopbackAddressRoutingMode(settings),
+      resolveTerminalLoopbackAddressRoutingMode(settings),
       { interactive: true },
     );
     await this.processService?.start();
@@ -1704,9 +1743,10 @@ export class PortManagerNetworkService implements DisposableLike {
       if (input.composeMutation !== undefined) {
         const portSettings = readPortManagerSettings();
         const hiddenHostAddress = loopbackAddressForNetwork(network.id);
+        const loopbackMode = resolveTerminalLoopbackAddressRoutingMode(portSettings);
         await ensureLoopbackAddressRoutingHostReady(
           hiddenHostAddress,
-          resolveLoopbackAddressRoutingMode(portSettings),
+          loopbackMode,
           { interactive: true },
         );
         const mutationResult = await this.composePublishMutator.hidePublishedPorts({
@@ -1717,6 +1757,7 @@ export class PortManagerNetworkService implements DisposableLike {
           networkName: network.name,
           networkId: network.id,
           hiddenHostAddress,
+          preservePublishedHostPorts: loopbackMode !== "high-port",
           originalProjectName: attachment.projectName,
           workingDirectory: input.composeMutation.workingDirectory ?? input.cwd,
           composeFiles: input.composeMutation.composeFiles ?? input.composeFiles ?? [],
@@ -2422,13 +2463,14 @@ export class PortManagerNetworkService implements DisposableLike {
       this.context,
       networkId === undefined
         ? undefined
-          : {
-              networkId,
-              networkName: this.registry.getNetwork(networkId)?.name,
-              composeRoutingFilePath: this.getComposeProjectRoutingFilePath(networkId),
-              terminalAttachmentMarkerDirectoryPath: this.getTerminalAttachmentMarkerDirectoryPath(),
-              composeLogicalPorts: this.getComposeLogicalPortsForNetwork(networkId),
-            },
+            : {
+                networkId,
+                networkName: this.registry.getNetwork(networkId)?.name,
+                networkDnsAlias: normalizeBrowserDnsHostname(this.registry.getNetwork(networkId)?.name ?? ""),
+                composeRoutingFilePath: this.getComposeProjectRoutingFilePath(networkId),
+                terminalAttachmentMarkerDirectoryPath: this.getTerminalAttachmentMarkerDirectoryPath(),
+                composeLogicalPorts: this.getComposeLogicalPortsForNetwork(networkId),
+              },
     );
   }
 
@@ -2448,7 +2490,7 @@ export class PortManagerNetworkService implements DisposableLike {
         try {
           await ensureLoopbackAddressRoutingHostReady(
             loopbackAddressForNetwork(binding.networkId),
-            resolveLoopbackAddressRoutingMode(settings),
+            resolveTerminalLoopbackAddressRoutingMode(settings),
             options,
           );
           if (binding.status === "error") {
@@ -2740,6 +2782,11 @@ export class PortManagerNetworkService implements DisposableLike {
     options: ComposeOverrideReconcileOptions = {},
   ): Promise<void> {
     await this.reconcileComposeOverrideFiles([attachment], options);
+  }
+
+  /** Applies the same loopback model to regenerated Compose overrides as new attaches use. */
+  private shouldPreserveComposeHiddenPublishedHostPorts(): boolean {
+    return resolveTerminalLoopbackAddressRoutingMode(readPortManagerSettings()) !== "high-port";
   }
 
   /** Rebuilds generated Compose files/routes before a terminal receives routing env. */
@@ -3773,9 +3820,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
   private async syncLogicalPortRoutersExclusive(): Promise<void> {
     /*
-     * Host loopback belongs to the host unless a live route needs a localhost
-     * compatibility listener. Network loopback routes such as 127.x.y.z:8004
-     * still need this bridge for unhooked tools that dial localhost:8004.
+     * Host loopback belongs to processes outside logical networks. Network-owned
+     * routes must stay reachable through hooks, DNS aliases, or explicit browser
+     * proxies without reserving 127.0.0.1:logicalPort in the host namespace.
      */
     const snapshot = this.processService?.getSnapshot();
     const logicalPorts = collectLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? []);
@@ -3817,7 +3864,8 @@ export class PortManagerNetworkService implements DisposableLike {
   private async syncBrowserNetworkProxiesExclusive(): Promise<void> {
     const snapshot = this.processService?.getSnapshot();
     const networks = this.registry.getSnapshot().networks;
-    this.syncBrowserDnsRecordsForNetworks(networks);
+    const dnsRecordOptions = this.browserDnsRecordBuildOptionsForCurrentSettings();
+    const dnsRecords = this.syncBrowserDnsRecordsForNetworks(networks, dnsRecordOptions);
     const dnsRunning = this.browserDnsServer.isRunning();
 
     if (!tryAcquireBrowserNetworkProxyOwnerLease()) {
@@ -3830,7 +3878,12 @@ export class PortManagerNetworkService implements DisposableLike {
 
     this.ownsBrowserNetworkProxyLease = true;
     if (dnsRunning) {
-      await ensureBrowserDnsLoopbackAliasesReady(buildBrowserDnsRecords(networks)).catch(() => undefined);
+      await ensureBrowserDnsLoopbackAliasesReady(dnsRecords).catch(() => undefined);
+    }
+
+    if (dnsRecordOptions.routeToNetworkLoopback === true) {
+      await this.browserNetworkProxy.sync([]).catch(() => undefined);
+      return;
     }
 
     const processCommandTextByPid = await this.readBrowserProxyProcessCommandTexts(snapshot?.processes ?? []);
@@ -4112,16 +4165,24 @@ export class PortManagerNetworkService implements DisposableLike {
     });
 
     const rows = buildComposeProjectRoutingRows(this.registry.getSnapshot().composeAttachments);
-    const rowsByNetworkId = new Map<string, Map<string, ComposeProjectRoutingRow[]>>();
+    const aggregateRowsByNetworkId = new Map<string, ComposeProjectRoutingRow[]>();
+    const rowsByScopedFileByNetworkId = new Map<string, Map<string, ComposeProjectRoutingRow[]>>();
     const networkIdsToWrite = new Set(snapshot.networks.map((network) => network.id));
 
     for (const row of rows) {
       networkIdsToWrite.add(row.networkId);
+      const aggregateRows = aggregateRowsByNetworkId.get(row.networkId);
+      if (aggregateRows === undefined) {
+        aggregateRowsByNetworkId.set(row.networkId, [row]);
+      } else {
+        aggregateRows.push(row);
+      }
+
       const scopedFilePath = this.getComposeProjectRoutingFilePath(row.networkId, composeProjectRoutingRowScope(row));
-      let rowsByScopedFilePath = rowsByNetworkId.get(row.networkId);
+      let rowsByScopedFilePath = rowsByScopedFileByNetworkId.get(row.networkId);
       if (rowsByScopedFilePath === undefined) {
         rowsByScopedFilePath = new Map<string, ComposeProjectRoutingRow[]>();
-        rowsByNetworkId.set(row.networkId, rowsByScopedFilePath);
+        rowsByScopedFileByNetworkId.set(row.networkId, rowsByScopedFilePath);
       }
 
       const scopedRows = rowsByScopedFilePath.get(scopedFilePath);
@@ -4141,10 +4202,13 @@ export class PortManagerNetworkService implements DisposableLike {
       await withSharedFileGenerationLock(this.getComposeProjectRoutingLockPath(networkId), async () => {
         const networkFilePath = this.getComposeProjectRoutingFilePath(networkId);
         const currentScopedPaths = new Set<string>([networkFilePath]);
-        const rowsByScopedFilePath = rowsByNetworkId.get(networkId) ?? new Map<string, ComposeProjectRoutingRow[]>();
+        const aggregateRows = aggregateRowsByNetworkId.get(networkId) ?? [];
+        const rowsByScopedFilePath = rowsByScopedFileByNetworkId.get(networkId) ?? new Map<string, ComposeProjectRoutingRow[]>();
 
         await fs.mkdir(path.dirname(networkFilePath), { recursive: true });
-        await writeTextFileAtomicallyOrTouch(networkFilePath, "");
+        // The per-network file is an aggregate compatibility fallback for
+        // shells or shims that cannot discover the per-compose scoped TSVs.
+        await writeTextFileAtomicallyOrTouch(networkFilePath, serializeComposeProjectRoutingRows(aggregateRows));
 
         for (const [scopedFilePath, scopedRows] of rowsByScopedFilePath) {
           currentScopedPaths.add(scopedFilePath);
@@ -4197,13 +4261,15 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const mutation = attachment.mutation;
     if (mutation === undefined) {
-      return this.reconcileMutationlessComposeOverrideFile(attachment);
+      return this.reconcileMutationlessComposeOverrideFile(attachment, options);
     }
 
     try {
       const overrideFile = await this.composePublishMutator.restoreHiddenPortsOverride(mutation, {
         ...options,
         recoverToStorageDirectory: true,
+        preservePublishedHostPorts:
+          options.preservePublishedHostPorts ?? this.shouldPreserveComposeHiddenPublishedHostPorts(),
       });
       const sourceComposeFiles = splitGeneratedComposeRoutingFiles(mutation.composeFiles).composeFiles;
       const nextMutation =
@@ -4235,7 +4301,10 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /** Mutationless clone rows cannot be regenerated, so missing overrides must not reach TSV routing. */
-  private async reconcileMutationlessComposeOverrideFile(attachment: ComposeAttachment): Promise<ComposeAttachment> {
+  private async reconcileMutationlessComposeOverrideFile(
+    attachment: ComposeAttachment,
+    options: ComposeOverrideReconcileOptions = {},
+  ): Promise<ComposeAttachment> {
     const routingFiles = splitGeneratedComposeRoutingFiles(attachment.composeFiles);
     if (routingFiles.overrideFile === undefined) {
       return attachment;
@@ -4259,6 +4328,8 @@ export class PortManagerNetworkService implements DisposableLike {
         const overrideFile = await this.composePublishMutator.restoreHiddenPortsOverride(recoveryMutation, {
           force: true,
           recoverToStorageDirectory: true,
+          preservePublishedHostPorts:
+            options.preservePublishedHostPorts ?? this.shouldPreserveComposeHiddenPublishedHostPorts(),
         });
         const nextMutation = {
           ...recoveryMutation,
@@ -4902,8 +4973,10 @@ export class PortManagerNetworkService implements DisposableLike {
       asdfShimLauncherPath,
       runtimeCommandShimPath,
     );
+    const networkDnsAlias = normalizeBrowserDnsHostname(networkName);
     const shellEnvRestorePath = prepareShellEnvRestoreScript(this.context.globalStorageUri.fsPath, hookLibraryPath, {
       networkId,
+      networkDnsAlias,
       agentSocketPath: getAgentSocketPath(),
       agentMainPath,
       agentExecutablePath: nativeAgentPath,
@@ -4922,12 +4995,15 @@ export class PortManagerNetworkService implements DisposableLike {
       buildTerminalAttachmentMarkerRemoveShell(),
       shellRemovePathListEntry(preloadVariable, hookLibraryPath),
       ...(runtimeShimDirectory === undefined ? [] : [shellRemovePathListEntry("PATH", runtimeShimDirectory)]),
-      "unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID",
+      `unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}`,
       "unset PORT_MANAGER_HOOK_DISABLED",
       shellExport("PORT_MANAGER_HOOK", "1"),
       shellExport("PORT_MANAGER_RUNTIME_SHIM_READY", "0"),
       shellExport("PORT_MANAGER_NETWORK_ID", networkId),
       shellExport("PORT_MANAGER_NETWORK_NAME", networkName),
+      networkDnsAlias === undefined
+        ? `unset ${NETWORK_DNS_ALIAS_ENV}`
+        : shellExport(NETWORK_DNS_ALIAS_ENV, networkDnsAlias),
       shellExport("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID", networkId),
       shellExport("PORT_MANAGER_BORROWED_NETWORK_ID", networkId),
       shellExport("NEWDLOPS_PM_NETWORK_ID", networkId),
@@ -4948,6 +5024,9 @@ export class PortManagerNetworkService implements DisposableLike {
       buildComposeProjectRoutingShell(this.getComposeProjectRoutingFilePath(networkId), nativeContainerMapPath),
       shellExport("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange)),
       shellExport("PORT_MANAGER_ROUTING_MODE", settings.routingMode),
+      settings.experimentalRouteOwnershipMode !== "process"
+        ? shellExport(EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV, settings.experimentalRouteOwnershipMode)
+        : `unset ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}`,
       shellExport("PORT_MANAGER_VIRTUAL_PORT_START", String(settings.virtualPortRangeStart)),
       shellExport("PORT_MANAGER_VIRTUAL_PORT_END", String(settings.virtualPortRangeEnd)),
       shellExport("PORT_MANAGER_FIXED_PROTOCOL_PORTS", settings.fixedProtocolPorts.join(",")),
@@ -4955,7 +5034,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport(ROUTE_TABLE_TTL_SECONDS_ENV, String(settings.routeTableTtlSeconds)),
       shellPrependLibrary(preloadVariable, hookLibraryPath),
     ];
-    commands.push(buildLoopbackAddressRoutingShell(loopbackAddressForNetwork(networkId), resolveLoopbackAddressRoutingMode(settings)));
+    commands.push(buildLoopbackAddressRoutingShell(loopbackAddressForNetwork(networkId), resolveTerminalLoopbackAddressRoutingMode(settings)));
     commands.push(buildAgentDaemonEnsureShell(process.execPath));
     commands.push(`if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" != "1" ]; then return 1 2>/dev/null || exit 1; fi`);
     commands.push(buildTerminalSessionIsolationShell());
@@ -5014,6 +5093,7 @@ export class PortManagerNetworkService implements DisposableLike {
       "PORT_MANAGER_HOOK_DISABLED",
       "PORT_MANAGER_NETWORK_ID",
       "PORT_MANAGER_NETWORK_NAME",
+      NETWORK_DNS_ALIAS_ENV,
       "PORT_MANAGER_ROUTE_TABLE_NETWORK_ID",
       "PORT_MANAGER_BORROWED_NETWORK_ID",
       "NEWDLOPS_PM_NETWORK_ID",
@@ -5021,6 +5101,7 @@ export class PortManagerNetworkService implements DisposableLike {
       "PORT_MANAGER_TERMINAL_SESSION_ID",
       "PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID",
       "PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID",
+      EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV,
       "PORT_MANAGER_AGENT_SOCKET",
       "PORT_MANAGER_AGENT_MAIN",
       "PORT_MANAGER_AGENT_EXECUTABLE",
@@ -6523,9 +6604,6 @@ function collectLogicalRouterPorts(
   listeners: readonly ListeningPort[] = [],
 ): readonly number[] {
   const ports = new Set<number>();
-  const networkScopedLiveRoutes = routes.filter(
-    (route) => isLiveListenRoute(route) && route.networkId !== undefined && route.cwd !== undefined,
-  );
   const externallyOwnedPorts = new Set(
     listeners
       .filter((listener) => listener.protocol === "tcp" && !isPortManagerLogicalRouterListener(listener))
@@ -6536,9 +6614,9 @@ function collectLogicalRouterPorts(
   for (const route of routes) {
     if (
       isLiveListenRoute(route) &&
+      route.networkId === undefined &&
       isTcpPort(route.logicalPort) &&
       routeNeedsLogicalRouter(route) &&
-      !(route.networkId === undefined && isDetachedNetworkRoute(route, networkScopedLiveRoutes)) &&
       !externallyOwnedPorts.has(route.logicalPort)
     ) {
       ports.add(route.logicalPort);
@@ -6554,19 +6632,6 @@ function collectLogicalRouterPorts(
  */
 function routeNeedsLogicalRouter(route: LogicalPortRoute): boolean {
   return route.actualPort !== route.logicalPort || !listenerCoversLogicalRouterHost(route.host);
-}
-
-function isDetachedNetworkRoute(
-  route: LogicalPortRoute,
-  networkScopedLiveRoutes: readonly LogicalPortRoute[],
-): boolean {
-  return networkScopedLiveRoutes.some(
-    (networkRoute) =>
-      networkRoute.logicalPort === route.logicalPort &&
-      route.cwd !== undefined &&
-      networkRoute.cwd !== undefined &&
-      pathsShareDirectoryScope(route.cwd, networkRoute.cwd),
-  );
 }
 
 /** True only when an OS listener occupies the localhost hosts used by logical routers. */
@@ -6728,12 +6793,8 @@ function buildBrowserProxyEndpoint(
 
 function buildBrowserDnsRecords(
   networks: readonly LogicalNetwork[],
-): readonly {
-  readonly networkId: string;
-  readonly networkName: string;
-  readonly hostname: string;
-  readonly address: string;
-}[] {
+  options: BrowserDnsRecordBuildOptions = {},
+): readonly NetworkDnsRecord[] {
   const hostnameCounts = new Map<string, number>();
   const hostnamesByNetworkId = new Map<string, string>();
 
@@ -6758,24 +6819,25 @@ function buildBrowserDnsRecords(
         networkId: network.id,
         networkName: network.name,
         hostname,
-        address: browserLoopbackAddressForNetwork(network.id),
+        address:
+          options.routeToNetworkLoopback === true
+            ? loopbackAddressForNetwork(network.id)
+            : browserLoopbackAddressForNetwork(network.id),
       };
     })
-    .filter(
-      (
-        record,
-      ): record is {
-        readonly networkId: string;
-        readonly networkName: string;
-        readonly hostname: string;
-        readonly address: string;
-      } => record !== undefined,
-    );
+    .filter((record): record is NetworkDnsRecord => record !== undefined);
 }
 
-function browserPublicHostForNetwork(networkId: string, networks: readonly LogicalNetwork[]): string | undefined {
-  const records = buildBrowserDnsRecords(networks);
-  const address = browserLoopbackAddressForNetwork(networkId);
+function browserPublicHostForNetwork(
+  networkId: string,
+  networks: readonly LogicalNetwork[],
+  options: BrowserDnsRecordBuildOptions = {},
+): string | undefined {
+  const records = buildBrowserDnsRecords(networks, options);
+  const address =
+    options.routeToNetworkLoopback === true
+      ? loopbackAddressForNetwork(networkId)
+      : browserLoopbackAddressForNetwork(networkId);
 
   const record = records.find((item) => item.address === address);
   if (record === undefined || !isBrowserDnsResolverConfigured(record.hostname)) {
@@ -6783,6 +6845,22 @@ function browserPublicHostForNetwork(networkId: string, networks: readonly Logic
   }
 
   return record.hostname;
+}
+
+function buildDirectNetworkLoopbackUrl(
+  process: ManagedProcess & { readonly networkId: string },
+  networks: readonly LogicalNetwork[],
+  useDnsAlias: boolean,
+): string {
+  const hostname = useDnsAlias
+    ? browserPublicHostForNetwork(process.networkId, networks, { routeToNetworkLoopback: true })
+    : undefined;
+  const host = hostname ?? loopbackAddressForNetwork(process.networkId);
+  return `http://${host}:${process.requestedPort}/`;
+}
+
+function shouldRouteBrowserDnsToNetworkLoopback(settings: PortManagerSettings): boolean {
+  return resolveTerminalLoopbackAddressRoutingMode(settings) !== "high-port";
 }
 
 function isBrowserDnsResolverConfigured(hostname: string): boolean {
@@ -6798,6 +6876,22 @@ function isBrowserDnsResolverConfigured(hostname: string): boolean {
       /^nameserver[ \t]+127\.0\.0\.1$/m.test(content) &&
       new RegExp(`^port[ \\t]+${browserDnsPort()}$`, "m").test(content)
     );
+  } catch {
+    return false;
+  }
+}
+
+function isBrowserDnsHostsEntryConfigured(hostname: string, address: string): boolean {
+  if (process.platform !== "darwin") {
+    return false;
+  }
+
+  try {
+    const content = syncFs.readFileSync("/etc/hosts", "utf8");
+    return content.split(/\r?\n/).some((line) => {
+      const [hostAddress, ...hostnames] = line.replace(/#.*/, "").trim().split(/\s+/);
+      return hostAddress === address && hostnames.includes(hostname);
+    });
   } catch {
     return false;
   }
@@ -6937,18 +7031,21 @@ function buildBrowserDnsResolverStatus(
   routes: readonly LogicalPortRoute[],
   networks: readonly LogicalNetwork[],
   browserNetworkProxy: BrowserNetworkProxyManager,
+  options: BrowserDnsRecordBuildOptions = {},
 ): BrowserDnsResolverStatus {
   const supported = process.platform === "darwin";
   const recordStatuses = records.map((record) => {
     const resolverConfigured = supported && isBrowserDnsResolverConfigured(record.hostname);
     const loopbackAliasConfigured = supported && isBrowserDnsLoopbackAliasConfigured(record.address);
+    const hostsConfigured = supported && isBrowserDnsHostsEntryConfigured(record.hostname, record.address);
 
     return {
       ...record,
-      configured: resolverConfigured && loopbackAliasConfigured,
+      configured: resolverConfigured && loopbackAliasConfigured && hostsConfigured,
       resolverConfigured,
       loopbackAliasConfigured,
-      routes: buildBrowserDnsAliasRouteStatus(record, processes, routes, networks, browserNetworkProxy),
+      hostsConfigured,
+      routes: buildBrowserDnsAliasRouteStatus(record, processes, routes, networks, browserNetworkProxy, options),
     };
   });
 
@@ -6972,6 +7069,7 @@ function buildBrowserDnsAliasRouteStatus(
   routes: readonly LogicalPortRoute[],
   networks: readonly LogicalNetwork[],
   browserNetworkProxy: BrowserNetworkProxyManager,
+  options: BrowserDnsRecordBuildOptions = {},
 ): BrowserDnsResolverStatus["records"][number]["routes"] {
   return processes
     .filter((process): process is ManagedProcess & { readonly networkId: string; readonly url: string } =>
@@ -6980,15 +7078,18 @@ function buildBrowserDnsAliasRouteStatus(
     .map((process) => {
       const endpoint = buildBrowserProxyEndpoint(process, networks, true);
       const activeEndpoint = browserNetworkProxy.get(record.networkId, process.requestedPort);
-      const proxyPort = activeEndpoint?.listenPort ?? endpoint.listenPorts[0] ?? process.requestedPort;
+      const directNetworkLoopback = options.routeToNetworkLoopback === true;
+      const proxyPort = directNetworkLoopback
+        ? process.requestedPort
+        : activeEndpoint?.listenPort ?? endpoint.listenPorts[0] ?? process.requestedPort;
       const route = findMatchingRoute(routes, record.networkId, process.requestedPort);
 
       return {
         url: `http://${record.hostname}:${proxyPort}/`,
         logicalPort: process.requestedPort,
-        proxyHost: endpoint.listenHost,
+        proxyHost: directNetworkLoopback ? record.address : endpoint.listenHost,
         proxyPort,
-        proxyActive: activeEndpoint !== undefined,
+        proxyActive: directNetworkLoopback ? route !== undefined : activeEndpoint !== undefined,
         ...(route === undefined ? {} : { upstreamHost: route.host, upstreamPort: route.actualPort }),
         processName: process.name,
       };
@@ -7022,6 +7123,7 @@ function buildBrowserDnsResolverSetupScript(
     );
   }
 
+  appendBrowserDnsHostsInstallLines(lines, uniqueRecords);
   lines.push("dscacheutil -flushcache >/dev/null 2>&1 || true");
   lines.push("killall -HUP mDNSResponder >/dev/null 2>&1 || true");
   return `${lines.join("\n")}\n`;
@@ -7043,9 +7145,34 @@ function buildBrowserDnsResolverCleanupScript(
     );
   }
 
+  appendBrowserDnsHostsCleanupLines(lines);
   lines.push("dscacheutil -flushcache >/dev/null 2>&1 || true");
   lines.push("killall -HUP mDNSResponder >/dev/null 2>&1 || true");
   return `${lines.join("\n")}\n`;
+}
+
+function appendBrowserDnsHostsInstallLines(
+  lines: string[],
+  records: readonly { readonly hostname: string; readonly address: string }[],
+): void {
+  appendBrowserDnsHostsCleanupLines(lines);
+  lines.push(
+    "cat >> /etc/hosts <<'PORTMANAGER_HOSTS'",
+    BROWSER_DNS_HOSTS_BLOCK_BEGIN,
+    ...records.map((record) => `${record.address}\t${record.hostname}`),
+    BROWSER_DNS_HOSTS_BLOCK_END,
+    "PORTMANAGER_HOSTS",
+  );
+}
+
+function appendBrowserDnsHostsCleanupLines(lines: string[]): void {
+  lines.push(
+    "__pm_hosts_tmp=$(mktemp)",
+    `sed '/^${escapeSedBasicPattern(BROWSER_DNS_HOSTS_BLOCK_BEGIN)}$/,/^${escapeSedBasicPattern(BROWSER_DNS_HOSTS_BLOCK_END)}$/d' /etc/hosts > "$__pm_hosts_tmp"`,
+    'cat "$__pm_hosts_tmp" > /etc/hosts',
+    'rm -f "$__pm_hosts_tmp"',
+    "unset __pm_hosts_tmp",
+  );
 }
 
 function isPortManagerLogicalRouterListener(listener: ListeningPort): boolean {
@@ -7060,6 +7187,10 @@ function isTcpPort(port: number): boolean {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function escapeSedBasicPattern(value: string): string {
+  return value.replace(/[\\/.*[\]^$]/g, "\\$&");
 }
 
 /** Converts the container adapter target into the socket proxy contract. */
@@ -7838,6 +7969,7 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     "PORT_MANAGER_LD_PRELOAD",
     "PORT_MANAGER_NETWORK_ID",
     "PORT_MANAGER_NETWORK_NAME",
+    NETWORK_DNS_ALIAS_ENV,
     "PORT_MANAGER_ROUTE_TABLE_NETWORK_ID",
     "PORT_MANAGER_BORROWED_NETWORK_ID",
     "PORT_MANAGER_ROUTES_FILE",

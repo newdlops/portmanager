@@ -8,6 +8,9 @@ import {
   loopbackAddressForNetwork,
   NETWORK_LOOPBACK_HOST_ENV,
   resolveLoopbackAddressRoutingMode,
+  resolveTerminalLoopbackAddressRoutingMode,
+  shouldExposeNetworkLoopbackHost,
+  usesLoopbackAddressOnlyRouting,
 } from "../../src/core/networks/loopback-address";
 
 test("loopback address routing maps network ids to stable non-default loopback hosts", () => {
@@ -40,4 +43,7 @@ test("loopback address routing mode keeps high-port as the default actual-port p
   assert.equal(isLoopbackAddressRoutingEnabled({ enableLoopbackAddressRouting: false }), false);
   assert.equal(resolveLoopbackAddressRoutingMode({ enableLoopbackAddressRouting: false }), "high-port");
   assert.equal(resolveLoopbackAddressRoutingMode({ loopbackAddressRoutingMode: "loopback" }), "loopback");
+  assert.equal(usesLoopbackAddressOnlyRouting({ experimentalRouteOwnershipMode: "loopback-address-only" }), true);
+  assert.equal(shouldExposeNetworkLoopbackHost({ experimentalRouteOwnershipMode: "loopback-address-only" }), true);
+  assert.equal(resolveTerminalLoopbackAddressRoutingMode({ experimentalRouteOwnershipMode: "loopback-address-only" }), "loopback");
 });

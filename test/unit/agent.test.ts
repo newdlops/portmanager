@@ -825,6 +825,79 @@ test("keeps hooked process routes when another PID still owns the listener", asy
   assert.equal(fs.existsSync(routeEntryPath), true);
 });
 
+for (const experimentalRouteOwnershipMode of ["terminal-scope-listener", "loopback-address-only"] as const) {
+  test(`experimental ${experimentalRouteOwnershipMode} release keeps routes in listener grace across PID churn`, async (context) => {
+    const routeTablePath = createRouteTablePath(context);
+    const actualPort = experimentalRouteOwnershipMode === "loopback-address-only" ? 8000 : 58000;
+    let listeners: readonly ListeningPort[] = [
+      createListener({
+        port: actualPort,
+        pid: 1234,
+      }),
+    ];
+    const agent = new PortManagerAgent({
+      processLauncher: createFakeLauncher(),
+      portAvailabilityProvider: createAvailablePortProvider(),
+      listeningPortProvider: {
+        list: async () => listeners,
+      },
+      agentPid: 777,
+      now: fixedNow,
+      routeTablePath,
+    });
+    context.after(() => agent.dispose());
+
+    const process = await agent.registerExistingProcess({
+      pid: 1234,
+      name: "uvicorn",
+      command: "uv run python manage.py runserver 8000",
+      cwd: "/workspace/app",
+      requestedPort: 8000,
+      actualPort,
+      host: "127.0.0.1",
+      networkId: "network-a",
+      experimentalRouteOwnershipMode,
+      terminalSessionId: "network-a-tty-session",
+      processGroupId: 4242,
+      source: "hooked",
+    });
+
+    listeners = [];
+    const released = await agent.releaseProcessRoute({
+      pid: 4321,
+      requestedPort: 8000,
+      actualPort,
+      networkId: "network-a",
+      experimentalRouteOwnershipMode,
+      terminalSessionId: "network-a-tty-session",
+      processGroupId: 4242,
+    });
+    const snapshot = await agent.listSnapshot();
+    const routeEntryPath = getRouteTablePathForLogicalPort(8000, "network-a", routeTablePath);
+
+    assert.equal(released, false);
+    assert.equal(snapshot.processes[0]?.status, "running");
+    assert.equal(snapshot.processes[0]?.pid, 1234);
+    assert.deepEqual(snapshot.routes, [
+      {
+        logicalPort: 8000,
+        actualPort,
+        routeDirection: "listen",
+        host: "127.0.0.1",
+        cwd: "/workspace/app",
+        networkId: "network-a",
+        terminalSessionId: "network-a-tty-session",
+        processGroupId: 4242,
+        processId: process.id,
+        processName: "uvicorn",
+        status: "running",
+        source: "hooked",
+      },
+    ]);
+    assert.deepEqual(readRouteTable(routeEntryPath).routes, snapshot.routes);
+  });
+}
+
 test("preserves pending allocation network scope when a hooked register omits it", async (context) => {
   const routeTablePath = createRouteTablePath(context);
   let listeners: readonly ListeningPort[] = [];

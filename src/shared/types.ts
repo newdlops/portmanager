@@ -468,6 +468,8 @@ export interface TerminalCandidateProvider {
   list(): Promise<readonly TerminalCandidate[]>;
 }
 
+export type ExperimentalRouteOwnershipMode = "process" | "terminal-scope-listener" | "loopback-address-only";
+
 export interface PortManagerSettings {
   /** Master switch used by command handlers before launching managed processes. */
   readonly enabled: boolean;
@@ -479,6 +481,13 @@ export interface PortManagerSettings {
   readonly scanDirection: ScanDirection;
   /** Routing policy used to choose the actual bind port. */
   readonly routingMode: PortRoutingMode;
+  /**
+   * Experimental ownership policy for hook-managed external routes.
+   * "process" preserves the legacy PID-first behavior; terminal-scope-listener
+   * lets listener state inside the same terminal scope survive PID churn, and
+   * loopback-address-only also disables high-port remapping inside that scope.
+   */
+  readonly experimentalRouteOwnershipMode: ExperimentalRouteOwnershipMode;
   /** Whether terminal hooks should prefer per-network loopback IPs over high-port remapping. Legacy boolean setting. */
   readonly enableLoopbackAddressRouting?: boolean;
   /** Per-network loopback address policy. High-port keeps the original remapping behavior. */
@@ -535,6 +544,10 @@ export interface ManagedProcess {
   readonly cwd: string;
   /** Logical network scope inherited from the terminal that launched the process. */
   readonly networkId?: string;
+  /** Stable terminal attachment generation that produced hook-managed route metadata. */
+  readonly terminalSessionId?: string;
+  /** POSIX process group captured from the attached terminal, used as a generic scope hint. */
+  readonly processGroupId?: number;
   /** Logical port requested by the user or launch profile. */
   readonly requestedPort: number;
   /** Actual TCP port assigned to the running process. */
@@ -683,6 +696,10 @@ export interface LogicalPortRoute {
   readonly cwd?: string;
   /** Logical network scope this route belongs to, when allocated from an attached terminal. */
   readonly networkId?: string;
+  /** Terminal attachment generation that owns this route when experimental scope ownership is enabled. */
+  readonly terminalSessionId?: string;
+  /** POSIX process group for the owning terminal scope, when available. */
+  readonly processGroupId?: number;
   /** Process row that owns this mapping when known. */
   readonly processId?: string;
   /** Human-readable process name for route table displays and env payloads. */
@@ -708,6 +725,12 @@ export interface AgentAllocateRouteRequest {
   readonly actualHost?: string;
   /** Logical network scope inherited from an attached terminal window. */
   readonly networkId?: string;
+  /** Experimental route ownership mode supplied by terminal hooks. */
+  readonly experimentalRouteOwnershipMode?: ExperimentalRouteOwnershipMode;
+  /** Terminal attachment generation that requested this allocation. */
+  readonly terminalSessionId?: string;
+  /** POSIX process group of the attached terminal that requested this allocation. */
+  readonly processGroupId?: number;
   /** Whether this allocation is preparing a listener bind or a sender connect. */
   readonly routeDirection?: LogicalPortRouteDirection;
   /** Number of nearby candidate ports checked after the requested port is busy. */
@@ -837,6 +860,12 @@ export interface RegisteredProcessInput {
   readonly host: string;
   /** Logical network scope inherited from an attached terminal window. */
   readonly networkId?: string;
+  /** Experimental route ownership mode supplied by terminal hooks. */
+  readonly experimentalRouteOwnershipMode?: ExperimentalRouteOwnershipMode;
+  /** Terminal attachment generation that produced this route registration. */
+  readonly terminalSessionId?: string;
+  /** POSIX process group of the attached terminal that produced this route registration. */
+  readonly processGroupId?: number;
   /** Optional pending route allocation that this running process consumes. */
   readonly allocationId?: string;
   /** Registration origin; hook and compose rows are managed by listener state. */
@@ -911,6 +940,8 @@ export interface BrowserDnsResolverRecordStatus {
   readonly resolverConfigured: boolean;
   /** True when macOS can bind/connect the DNS-returned loopback address on lo0. */
   readonly loopbackAliasConfigured: boolean;
+  /** True when /etc/hosts contains the exact single-label hostname entry. */
+  readonly hostsConfigured: boolean;
   /** Browser-visible port routes currently known for this alias. */
   readonly routes: readonly BrowserDnsAliasRouteStatus[];
 }

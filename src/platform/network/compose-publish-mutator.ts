@@ -54,6 +54,8 @@ export interface ComposePublishMutationInput {
   readonly networkId?: string;
   /** Host interface used for hidden Docker/Podman published ports. */
   readonly hiddenHostAddress?: string;
+  /** Keep Docker's host-published port equal to the logical port on the hidden loopback host. */
+  readonly preservePublishedHostPorts?: boolean;
   /** Compose project that currently publishes the host ports. */
   readonly originalProjectName: string;
   /** Directory where compose should resolve relative paths and defaults. */
@@ -73,6 +75,15 @@ export interface ComposePublishMutationResult {
   readonly ports: readonly ComposePublishedPort[];
   /** Durable state required to restore the original compose project. */
   readonly state: ComposePortMutationState;
+}
+
+export interface ComposeHiddenPortsRestoreOptions {
+  /** Rewrite readable override YAML instead of trusting the previous contents. */
+  readonly force?: boolean;
+  /** Recover generated overrides into this extension host's current storage directory. */
+  readonly recoverToStorageDirectory?: boolean;
+  /** Override persisted state inference when current settings require a different publish model. */
+  readonly preservePublishedHostPorts?: boolean;
 }
 
 export interface ComposePublishMutatorOptions {
@@ -369,6 +380,7 @@ export class ComposePublishMutator {
         isolatedNetwork: createsHiddenProject ? "pm_isolated" : undefined,
         disabledServices: disabledOverrideServices,
         hostAddress: input.hiddenHostAddress,
+        preservePublishedHostPorts: input.preservePublishedHostPorts === true,
       },
     );
     const hiddenContext: ComposeCommandContext = {
@@ -534,10 +546,10 @@ export class ComposePublishMutator {
    * selected services, cloned volumes, and container-name lineage. Static compose
    * service discovery is repeated so no-port services with global container_name
    * values are still disabled in the restored override.
-   */
+  */
   async restoreHiddenPortsOverride(
     state: ComposePortMutationState,
-    options: { readonly force?: boolean; readonly recoverToStorageDirectory?: boolean } = {},
+    options: ComposeHiddenPortsRestoreOptions = {},
   ): Promise<string> {
     const overrideFile =
       options.recoverToStorageDirectory === true
@@ -594,6 +606,8 @@ export class ComposePublishMutator {
         disabledServices,
         overrideFile,
         hostAddress: composeHiddenPublishHostFromState(state),
+        preservePublishedHostPorts:
+          options.preservePublishedHostPorts ?? composeHiddenPublishPreservesPortsFromState(state),
       },
     );
 
@@ -759,6 +773,7 @@ export class ComposePublishMutator {
         isolatedNetwork: "pm_isolated",
         disabledServices: disabledOverrideServices,
         hostAddress: composeHiddenPublishHostFromState(state),
+        preservePublishedHostPorts: composeHiddenPublishPreservesPortsFromState(state),
       },
     );
     const nextHiddenContext: ComposeCommandContext = {
@@ -939,6 +954,7 @@ export class ComposePublishMutator {
       readonly disabledServices?: readonly string[];
       readonly overrideFile?: string;
       readonly hostAddress?: string;
+      readonly preservePublishedHostPorts?: boolean;
     },
   ): Promise<string> {
     const overrideFile = options.overrideFile ?? this.getHiddenPortsOverridePath(attachedProjectName);
@@ -983,7 +999,9 @@ export class ComposePublishMutator {
         }
         lines.push("    ports: !override");
         for (const port of servicePorts) {
-          lines.push(`      - ${quoteYamlString(`${hostAddress}::${port.containerPort}/${port.protocol}`)}`);
+          lines.push(
+            `      - ${quoteYamlString(formatHiddenPublishedPort(port, hostAddress, options.preservePublishedHostPorts === true))}`,
+          );
         }
       }
 
@@ -1470,6 +1488,11 @@ function buildPortKey(port: ComposePublishedPort): string {
 
 function buildLogicalPortLabelKey(containerPort: number, protocol: string): string {
   return `newdlops.portmanager.logical-port.${containerPort}.${protocol}`;
+}
+
+function formatHiddenPublishedPort(port: ComposePublishedPort, hostAddress: string, preserveHostPort: boolean): string {
+  const hostPort = preserveHostPort ? String(port.logicalPort) : "";
+  return `${hostAddress}:${hostPort}:${port.containerPort}/${port.protocol}`;
 }
 
 function resolveHiddenPorts(
@@ -2451,6 +2474,11 @@ function isLocalHostAddress(host: string): boolean {
 
 function composeHiddenPublishHostFromState(state: ComposePortMutationState): string {
   return normalizeHiddenPublishHost(state.hiddenPorts.find((port) => port.actualHostAddress.trim().length > 0)?.actualHostAddress);
+}
+
+function composeHiddenPublishPreservesPortsFromState(state: ComposePortMutationState): boolean {
+  return state.hiddenPorts.length > 0 &&
+    state.hiddenPorts.every((port) => port.actualHostPort === port.logicalPort);
 }
 
 function normalizeHiddenPublishHost(host: string | undefined): string {

@@ -671,8 +671,8 @@ export class PortManagerAgent implements DisposableLike {
   /**
    * Releases a route owned by an external hook process that is exiting.
    * The native hook cannot know the registry id, so it identifies ownership by
-   * PID plus logical/actual route identity. A newer process with the same route
-   * but a different PID is intentionally left alone.
+   * PID plus logical/actual route identity. The experimental ownership mode also
+   * accepts terminal-session scope so autoreload handoffs can survive PID churn.
    */
   async releaseProcessRoute(input: ReleaseProcessRoutePayload): Promise<boolean> {
     return this.runExclusiveRouteOperation(async () => this.releaseProcessRouteExclusive(input));
@@ -686,7 +686,8 @@ export class PortManagerAgent implements DisposableLike {
     try {
       listeners = await this.scanListeningPortsForPort(input.actualPort);
     } catch {
-      // If listener scans fail, fall back to the explicit lifecycle signal.
+      // Legacy mode falls back to the explicit lifecycle signal; experimental
+      // scope ownership below keeps the route in normal listener-reconcile grace.
     }
     let released = false;
     let retained = false;
@@ -699,7 +700,7 @@ export class PortManagerAgent implements DisposableLike {
       if (
         process.status !== "running" ||
         process.source === "detected" ||
-        process.pid !== input.pid ||
+        !processRouteOwnerMatchesRelease(process, input) ||
         process.requestedPort !== input.requestedPort ||
         process.actualPort !== input.actualPort ||
         (inputNetworkId !== undefined && normalizeNetworkId(process.networkId) !== inputNetworkId)
@@ -720,6 +721,18 @@ export class PortManagerAgent implements DisposableLike {
         continue;
       }
 
+      if (usesScopedRouteOwnership(input)) {
+        /*
+         * In the scoped experimental ownership models an explicit exit signal is
+         * not enough to clear a route. Under high load the exiting wrapper can
+         * beat lsof/process-table visibility for the replacement listener, so
+         * let the normal listener reconciliation grace decide.
+         */
+        this.rememberMissingExternalListener(process);
+        retained = true;
+        continue;
+      }
+
       this.registry.stop(process.id, this.now().toISOString());
       this.missingListenerStateByProcessId.delete(process.id);
       released = true;
@@ -731,6 +744,16 @@ export class PortManagerAgent implements DisposableLike {
     }
 
     return released;
+  }
+
+  /** Records a missing listener observation without immediately clearing the route table. */
+  private rememberMissingExternalListener(process: ManagedProcess): void {
+    const nowMs = this.now().getTime();
+    const previousState = this.missingListenerStateByProcessId.get(process.id);
+    this.missingListenerStateByProcessId.set(process.id, {
+      sinceMs: previousState?.sinceMs ?? nowMs,
+      scanCount: (previousState?.scanCount ?? 0) + 1,
+    });
   }
 
   /**
@@ -2247,6 +2270,8 @@ export class PortManagerAgent implements DisposableLike {
       command: input.command,
       cwd: input.cwd,
       networkId: normalizeNetworkId(input.networkId),
+      terminalSessionId: normalizeTerminalSessionId(input.terminalSessionId),
+      processGroupId: normalizeProcessGroupId(input.processGroupId),
       actualPort: input.actualPort,
       status: "running",
       startedAt: this.now().toISOString(),
@@ -2389,6 +2414,8 @@ function buildLogicalRoutes(
       host: routeHostFromUrl(process.url),
       cwd: process.cwd,
       ...(process.networkId ? { networkId: process.networkId } : {}),
+      ...(process.terminalSessionId ? { terminalSessionId: process.terminalSessionId } : {}),
+      ...(process.processGroupId !== undefined ? { processGroupId: process.processGroupId } : {}),
       processId: process.id,
       processName: process.name,
       status: process.status,
@@ -2458,6 +2485,7 @@ function buildAllocatedLogicalRoute(
     host: input.host,
     cwd: input.cwd,
     ...logicalNetworkRouteScope(input.networkId),
+    ...experimentalTerminalScope(input),
     processName: input.name ?? input.command,
     status: "starting",
     source: "allocated",
@@ -2469,10 +2497,34 @@ function normalizeRouteDirection(direction: LogicalPortRouteDirection | undefine
   return direction === "send" ? "send" : "listen";
 }
 
+/** True for opt-in POC modes where legacy PID-first ownership is too fragile. */
+function usesScopedRouteOwnership(
+  input: Pick<AgentAllocateRouteRequest | RegisteredProcessInput | ReleaseProcessRoutePayload, "experimentalRouteOwnershipMode">,
+): boolean {
+  return input.experimentalRouteOwnershipMode === "terminal-scope-listener" ||
+    input.experimentalRouteOwnershipMode === "loopback-address-only";
+}
+
 /** Normalizes absent or blank terminal network scope to the unscoped route path. */
 function normalizeNetworkId(networkId: string | undefined): string | undefined {
   const normalized = networkId?.trim();
   return normalized && normalized.length > 0 ? normalized : undefined;
+}
+
+/** Normalizes blank terminal attachment generations to absent scope metadata. */
+function normalizeTerminalSessionId(terminalSessionId: string | undefined): string | undefined {
+  const normalized = terminalSessionId?.trim();
+  return normalized && normalized.length > 0 ? normalized : undefined;
+}
+
+/** Keeps process-group scope metadata numeric and positive before it can own a route. */
+function normalizeProcessGroupId(processGroupId: number | undefined): number | undefined {
+  if (processGroupId === undefined || !Number.isFinite(processGroupId)) {
+    return undefined;
+  }
+
+  const normalized = Math.trunc(processGroupId);
+  return normalized > 0 ? normalized : undefined;
 }
 
 /** Adds network scope to a route only when the hook actually provided one. */
@@ -2483,6 +2535,47 @@ function logicalNetworkRouteScope(
   return normalized === undefined ? {} : { networkId: normalized };
 }
 
+/**
+ * Adds terminal scope only for experimental scoped modes so route tables remain
+ * byte-compatible with legacy readers unless the user explicitly opts in.
+ */
+function experimentalTerminalScope(
+  input: Pick<
+    AgentAllocateRouteRequest | RegisteredProcessInput | ReleaseProcessRoutePayload,
+    "experimentalRouteOwnershipMode" | "terminalSessionId" | "processGroupId"
+  >,
+): Pick<LogicalPortRoute, "terminalSessionId" | "processGroupId"> | Record<string, never> {
+  if (!usesScopedRouteOwnership(input)) {
+    return {};
+  }
+
+  const terminalSessionId = normalizeTerminalSessionId(input.terminalSessionId);
+  const processGroupId = normalizeProcessGroupId(input.processGroupId);
+
+  return {
+    ...(terminalSessionId ? { terminalSessionId } : {}),
+    ...(processGroupId !== undefined ? { processGroupId } : {}),
+  };
+}
+
+/** Matches release ownership by PID in legacy mode, or by same terminal scope in the experimental mode. */
+function processRouteOwnerMatchesRelease(process: ManagedProcess, input: ReleaseProcessRoutePayload): boolean {
+  if (process.pid === input.pid) {
+    return true;
+  }
+
+  if (!usesScopedRouteOwnership(input)) {
+    return false;
+  }
+
+  const terminalSessionId = normalizeTerminalSessionId(input.terminalSessionId);
+  if (terminalSessionId !== undefined && process.terminalSessionId === terminalSessionId) {
+    return true;
+  }
+
+  const processGroupId = normalizeProcessGroupId(input.processGroupId);
+  return processGroupId !== undefined && process.processGroupId === processGroupId;
+}
 
 /**
  * Builds match keys for registry rows that should suppress duplicate detected

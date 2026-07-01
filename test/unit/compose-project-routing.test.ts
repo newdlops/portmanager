@@ -811,6 +811,69 @@ test("docker compose wrapper prefers per-compose route files inside one network"
   }
 });
 
+test("docker compose wrapper falls back to the aggregate route file when scoped files miss context", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-anchor-fallback-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const staleProjectDir = path.join(tempDir, "workspace", "stale");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "compose-project-routing-network-a.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(staleProjectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        originalProjectName: "app",
+        attachedProjectName: "network-a-app-1234",
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(tempDir, "compose-project-routing-network-a.compose-stale.tsv"),
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: staleProjectDir,
+        originalProjectName: "stale",
+        attachedProjectName: "network-a-stale-9999",
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nprintf '%s\\n' \"${COMPOSE_PROJECT_NAME:-}\"\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker compose ps",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(output.trim(), "network-a-app-1234");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("docker wrapper resolves duplicate service names from the cwd scoped compose file", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-container-scoped-service-"));
   const firstProjectDir = path.join(tempDir, "workspace", "first");
@@ -2990,6 +3053,79 @@ test(
           "",
         ].join("\n"),
       );
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "native docker PATH shim falls back to the aggregate route file when scoped files miss context",
+  { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
+  () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-compose-anchor-fallback-"));
+    const projectDir = path.join(tempDir, "workspace", "app");
+    const staleProjectDir = path.join(tempDir, "workspace", "stale");
+    const shimDir = path.join(tempDir, "shim");
+    const realBinDir = path.join(tempDir, "real-bin");
+    const routingFile = path.join(tempDir, "compose-project-routing-network-a.tsv");
+    const overrideFile = path.join(tempDir, "network-a-app-1234.ports.override.yaml");
+
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.mkdirSync(staleProjectDir, { recursive: true });
+    fs.mkdirSync(shimDir, { recursive: true });
+    fs.mkdirSync(realBinDir, { recursive: true });
+    fs.writeFileSync(overrideFile, "services: {}\n", "utf8");
+    fs.writeFileSync(
+      routingFile,
+      serializeComposeProjectRoutingRows([
+        {
+          networkId: "network-a",
+          runtime: "docker",
+          workingDirectory: projectDir,
+          originalProjectName: "app",
+          attachedProjectName: "network-a-app-1234",
+          overrideFile,
+        },
+      ]),
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(tempDir, "compose-project-routing-network-a.compose-stale.tsv"),
+      serializeComposeProjectRoutingRows([
+        {
+          networkId: "network-a",
+          runtime: "docker",
+          workingDirectory: staleProjectDir,
+          originalProjectName: "stale",
+          attachedProjectName: "network-a-stale-9999",
+        },
+      ]),
+      "utf8",
+    );
+    fs.symlinkSync(getNativeDockerShimPath(), path.join(shimDir, "docker"));
+    fs.writeFileSync(path.join(realBinDir, "docker"), "#!/bin/sh\nprintf '%s\\n' \"${COMPOSE_PROJECT_NAME:-}\"\n", {
+      encoding: "utf8",
+      mode: 0o700,
+    });
+
+    try {
+      const output = execFileSync("docker", ["compose", "ps"], {
+        cwd: projectDir,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${shimDir}${path.delimiter}${realBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          PORT_MANAGER_RUNTIME_SHIM_DIR: shimDir,
+          PORT_MANAGER_COMPOSE_ROUTING_FILE: routingFile,
+          PORT_MANAGER_NETWORK_ID: "network-a",
+          PORT_MANAGER_BORROWED_NETWORK_ID: "",
+          NEWDLOPS_PM_NETWORK_ID: "",
+          NEWDLOPS_PM_BORROWED_NETWORK_ID: "",
+        },
+      });
+
+      assert.equal(output.trim(), "network-a-app-1234");
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }

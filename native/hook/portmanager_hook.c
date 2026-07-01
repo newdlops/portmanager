@@ -59,6 +59,9 @@
 #define PM_SEND_ALLOCATION_LOCK_POLL_MS 25
 #define PM_ACTUAL_LOOPBACK_HOST_ENV "PORT_MANAGER_ACTUAL_LOOPBACK_HOST"
 #define PM_NETWORK_LOOPBACK_HOST_ENV "PORT_MANAGER_NETWORK_LOOPBACK_HOST"
+#define PM_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV "PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE"
+#define PM_TERMINAL_SCOPE_LISTENER_MODE "terminal-scope-listener"
+#define PM_LOOPBACK_ADDRESS_ONLY_MODE "loopback-address-only"
 
 typedef int (*pm_bind_fn)(int, const struct sockaddr *, socklen_t);
 typedef int (*pm_connect_fn)(int, const struct sockaddr *, socklen_t);
@@ -2322,6 +2325,95 @@ static void pm_network_scope_payload(char *buffer, size_t size) {
   pm_network_scope_payload_for_id(pm_current_network_id(), buffer, size);
 }
 
+static const char *pm_experimental_route_ownership_mode(void) {
+  const char *mode = getenv(PM_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV);
+
+  if (mode == NULL) {
+    return NULL;
+  }
+
+  if (strcmp(mode, PM_TERMINAL_SCOPE_LISTENER_MODE) == 0 ||
+      strcmp(mode, PM_LOOPBACK_ADDRESS_ONLY_MODE) == 0) {
+    return mode;
+  }
+
+  return NULL;
+}
+
+static int pm_scoped_route_ownership_enabled(void) {
+  return pm_experimental_route_ownership_mode() != NULL;
+}
+
+static int pm_loopback_address_only_mode(void) {
+  const char *mode = pm_experimental_route_ownership_mode();
+  return mode != NULL && strcmp(mode, PM_LOOPBACK_ADDRESS_ONLY_MODE) == 0;
+}
+
+static int pm_positive_int_text(const char *value) {
+  char *end = NULL;
+  long parsed;
+
+  if (value == NULL || value[0] == '\0') {
+    return 0;
+  }
+
+  parsed = strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed <= 0 || parsed > 2147483647L) {
+    return 0;
+  }
+
+  return (int)parsed;
+}
+
+static void pm_append_text(char *buffer, size_t size, const char *value) {
+  size_t length;
+
+  if (buffer == NULL || size == 0 || value == NULL) {
+    return;
+  }
+
+  length = strlen(buffer);
+  if (length >= size - 1) {
+    return;
+  }
+
+  snprintf(buffer + length, size - length, "%s", value);
+}
+
+static void pm_terminal_scope_payload(char *buffer, size_t size) {
+  const char *session_id = getenv("PORT_MANAGER_TERMINAL_SESSION_ID");
+  const char *process_group_text = getenv("PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID");
+  const char *mode = pm_experimental_route_ownership_mode();
+  char mode_json[PM_MAX_TEXT * 2];
+  char session_json[PM_MAX_TEXT * 2];
+  int process_group_id;
+
+  if (size == 0) {
+    return;
+  }
+
+  if (!pm_scoped_route_ownership_enabled() || mode == NULL) {
+    buffer[0] = '\0';
+    return;
+  }
+
+  pm_json_escape(mode, mode_json, sizeof(mode_json));
+  snprintf(buffer, size, ",\"experimentalRouteOwnershipMode\":\"%s\"", mode_json);
+  if (session_id != NULL && session_id[0] != '\0') {
+    pm_json_escape(session_id, session_json, sizeof(session_json));
+    pm_append_text(buffer, size, ",\"terminalSessionId\":\"");
+    pm_append_text(buffer, size, session_json);
+    pm_append_text(buffer, size, "\"");
+  }
+
+  process_group_id = pm_positive_int_text(process_group_text);
+  if (process_group_id > 0) {
+    char process_group_json[64];
+    snprintf(process_group_json, sizeof(process_group_json), ",\"processGroupId\":%d", process_group_id);
+    pm_append_text(buffer, size, process_group_json);
+  }
+}
+
 static int pm_route_matches_network(const char *route_json) {
   const char *network_id = pm_current_network_id();
   char route_network[PM_MAX_TEXT];
@@ -3047,6 +3139,7 @@ static int pm_allocate_route(
   char actual_host_payload[320];
   char route_direction_json[32];
   char network_payload[PM_MAX_TEXT * 3];
+  char terminal_scope_payload[PM_MAX_TEXT * 3];
   char request[PM_MAX_REQUEST];
   char response[PM_MAX_RESPONSE];
   char send_allocation_lock_path[PM_MAX_PATH];
@@ -3067,12 +3160,13 @@ static int pm_allocate_route(
   }
   pm_json_escape(route_direction == NULL ? "listen" : route_direction, route_direction_json, sizeof(route_direction_json));
   pm_network_scope_payload(network_payload, sizeof(network_payload));
+  pm_terminal_scope_payload(terminal_scope_payload, sizeof(terminal_scope_payload));
   response[0] = '\0';
 
   snprintf(
     request,
     sizeof(request),
-    "{\"id\":\"hook-%ld-%lu\",\"method\":\"allocateRoute\",\"payload\":{\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"host\":\"%s\"%s,\"routeDirection\":\"%s\"%s,\"compactResponse\":1,\"scanRange\":%d,\"scanDirection\":\"up\",\"routingMode\":\"%s\",\"virtualPortRangeStart\":%d,\"virtualPortRangeEnd\":%d}}\n",
+    "{\"id\":\"hook-%ld-%lu\",\"method\":\"allocateRoute\",\"payload\":{\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"host\":\"%s\"%s,\"routeDirection\":\"%s\"%s%s,\"compactResponse\":1,\"scanRange\":%d,\"scanDirection\":\"up\",\"routingMode\":\"%s\",\"virtualPortRangeStart\":%d,\"virtualPortRangeEnd\":%d}}\n",
     (long)getpid(),
     sequence,
     command_json,
@@ -3083,6 +3177,7 @@ static int pm_allocate_route(
     actual_host_payload,
     route_direction_json,
     network_payload,
+    terminal_scope_payload,
     pm_parse_int_env("PORT_MANAGER_SCAN_RANGE", PM_DEFAULT_SCAN_RANGE),
     pm_routing_mode(),
     pm_parse_int_env("PORT_MANAGER_VIRTUAL_PORT_START", PM_DEFAULT_VIRTUAL_START),
@@ -3174,6 +3269,7 @@ static void pm_register_process(int logical_port, int actual_port, const char *h
   char host_json[256];
   char allocation_json[PM_MAX_TEXT * 2];
   char network_payload[PM_MAX_TEXT * 3];
+  char terminal_scope_payload[PM_MAX_TEXT * 3];
   char payload[PM_MAX_REQUEST];
 
   pm_cwd(cwd, sizeof(cwd));
@@ -3183,11 +3279,12 @@ static void pm_register_process(int logical_port, int actual_port, const char *h
   pm_json_escape(host, host_json, sizeof(host_json));
   pm_json_escape(allocation_id, allocation_json, sizeof(allocation_json));
   pm_network_scope_payload(network_payload, sizeof(network_payload));
+  pm_terminal_scope_payload(terminal_scope_payload, sizeof(terminal_scope_payload));
 
   snprintf(
     payload,
     sizeof(payload),
-    "{\"pid\":%ld,\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"actualPort\":%d,\"host\":\"%s\"%s,\"allocationId\":\"%s\",\"source\":\"hooked\"}",
+    "{\"pid\":%ld,\"name\":\"%s\",\"command\":\"%s\",\"cwd\":\"%s\",\"requestedPort\":%d,\"actualPort\":%d,\"host\":\"%s\"%s%s,\"allocationId\":\"%s\",\"source\":\"hooked\"}",
     (long)getpid(),
     command_json,
     command_json,
@@ -3196,6 +3293,7 @@ static void pm_register_process(int logical_port, int actual_port, const char *h
     actual_port,
     host_json,
     network_payload,
+    terminal_scope_payload,
     allocation_json);
   pm_debug("registering hooked process logical=%d actual=%d host=%s allocation=%s", logical_port, actual_port, host, allocation_id);
   (void)pm_send_simple_payload("registerExistingProcess", payload);
@@ -3217,6 +3315,7 @@ static void pm_release_allocation(const char *allocation_id) {
 static int pm_release_process_route(const pm_route_mapping *route) {
   char allocation_json[PM_MAX_TEXT * 2];
   char network_payload[PM_MAX_TEXT * 3];
+  char terminal_scope_payload[PM_MAX_TEXT * 3];
   char payload[PM_MAX_REQUEST];
 
   if (route == NULL || route->logical_port <= 0 || route->actual_port <= 0) {
@@ -3225,15 +3324,17 @@ static int pm_release_process_route(const pm_route_mapping *route) {
 
   pm_json_escape(route->allocation_id, allocation_json, sizeof(allocation_json));
   pm_network_scope_payload_for_id(route->network_id, network_payload, sizeof(network_payload));
+  pm_terminal_scope_payload(terminal_scope_payload, sizeof(terminal_scope_payload));
   snprintf(
     payload,
     sizeof(payload),
-    "{\"pid\":%ld,\"allocationId\":\"%s\",\"requestedPort\":%d,\"actualPort\":%d%s}",
+    "{\"pid\":%ld,\"allocationId\":\"%s\",\"requestedPort\":%d,\"actualPort\":%d%s%s}",
     (long)getpid(),
     allocation_json,
     route->logical_port,
     route->actual_port,
-    network_payload);
+    network_payload,
+    terminal_scope_payload);
   return pm_send_simple_payload("releaseProcessRoute", payload);
 }
 
@@ -3706,6 +3807,38 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
     return pm_real_bind(sockfd, addr, addrlen);
   }
 
+  if (pm_loopback_address_only_mode()) {
+    loopback_host = pm_network_loopback_host();
+    if (loopback_host == NULL || !pm_sockaddr_is_local(addr)) {
+      pm_debug("bind address-only unavailable logical=%d", logical_port);
+      errno = EADDRNOTAVAIL;
+      return -1;
+    }
+
+    memcpy(&rewritten, addr, addrlen);
+    pm_set_sockaddr_host((struct sockaddr *)&rewritten, loopback_host);
+    pm_set_sockaddr_port((struct sockaddr *)&rewritten, logical_port);
+
+    result = pm_real_bind(sockfd, (struct sockaddr *)&rewritten, addrlen);
+    if (result == 0) {
+      char logical_text[16];
+
+      /*
+       * Address-only routing keeps the requested port as the actual endpoint.
+       * The route row is still registered so DNS/safe-area clients can discover
+       * that this network owns host:port without triggering high-port allocation.
+       */
+      pm_remember_route(logical_port, logical_port, loopback_host, "", 0);
+      snprintf(logical_text, sizeof(logical_text), "%d", logical_port);
+      setenv("PORT_MANAGER_LOGICAL_PORT", logical_text, 1);
+      setenv("PORT_MANAGER_ACTUAL_PORT", logical_text, 1);
+      pm_register_process(logical_port, logical_port, loopback_host, "");
+      pm_debug("bind address-only logical=%d host=%s", logical_port, loopback_host);
+    }
+
+    return result;
+  }
+
   if (pm_is_fixed_protocol_port(logical_port) && !pm_compose_claim_blocks_port(logical_port)) {
     pm_debug("preserving fixed protocol bind port=%d", logical_port);
     return pm_real_bind(sockfd, addr, addrlen);
@@ -3869,6 +4002,25 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
   }
 
   logical_port = pm_sockaddr_port(addr);
+  if (logical_port <= 0) {
+    return pm_real_connect(sockfd, addr, addrlen);
+  }
+
+  if (pm_loopback_address_only_mode()) {
+    loopback_host = pm_network_loopback_host();
+    if (loopback_host == NULL) {
+      pm_debug("connect address-only unavailable logical=%d", logical_port);
+      errno = ECONNREFUSED;
+      return -1;
+    }
+
+    memcpy(&rewritten, addr, addrlen);
+    pm_set_sockaddr_port((struct sockaddr *)&rewritten, logical_port);
+    pm_set_sockaddr_host((struct sockaddr *)&rewritten, loopback_host);
+    pm_debug("connect address-only logical=%d host=%s", logical_port, loopback_host);
+    return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
+  }
+
   target_host[0] = '\0';
   route_is_compose = 0;
   actual_port = pm_memory_actual_for_logical(logical_port, target_host, sizeof(target_host));

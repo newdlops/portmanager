@@ -81,6 +81,25 @@ test("terminal hook preload entries are normalized across multiple VS Code windo
   assert.equal(nativeAsdfShimSource.includes("setenv(PM_PRELOAD_ENV, merged, 1);"), true);
 });
 
+test("experimental route ownership env is opt-in and cleaned from legacy paths", () => {
+  const terminalHookEnvironmentPath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
+  const networkServicePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const commandsPath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const nodeRuntimePath = path.resolve(__dirname, "../../../src/platform/process/node-runtime.ts");
+  const terminalHookEnvironmentSource = fs.readFileSync(terminalHookEnvironmentPath, "utf8");
+  const networkServiceSource = fs.readFileSync(networkServicePath, "utf8");
+  const commandsSource = fs.readFileSync(commandsPath, "utf8");
+  const nodeRuntimeSource = fs.readFileSync(nodeRuntimePath, "utf8");
+
+  assert.equal(terminalHookEnvironmentSource.includes("PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE"), true);
+  assert.equal(terminalHookEnvironmentSource.includes('settings.experimentalRouteOwnershipMode !== "process"'), true);
+  assert.equal(terminalHookEnvironmentSource.includes("shouldExposeNetworkLoopbackHost(settings)"), true);
+  assert.equal(terminalHookEnvironmentSource.includes("unset ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}"), true);
+  assert.equal(networkServiceSource.includes("EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV"), true);
+  assert.equal(commandsSource.includes("EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV"), true);
+  assert.equal(nodeRuntimeSource.includes('"PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE"'), true);
+});
+
 test("package command shims rerun client tools without native runtime alias semantics", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
@@ -201,7 +220,7 @@ test("package command shims rerun client tools without native runtime alias sema
   assert.equal(
     source.includes("function buildViteHostNarrowingShell"),
     true,
-    "Vite package-bin shims must constrain unsafe --host forms to the attached logical network host",
+    "Vite package-bin shims must constrain unsafe --host forms to localhost",
   );
   assert.equal(
     nodeEntrypointBypassBlock.includes("${buildViteHostNarrowingShell()}"),
@@ -214,19 +233,24 @@ test("package command shims rerun client tools without native runtime alias sema
     "host narrowing must apply only to Vite command shims",
   );
   assert.equal(
-    viteHostNarrowingBlock.includes("PORT_MANAGER_NETWORK_LOOPBACK_HOST"),
+    viteHostNarrowingBlock.includes('__pm_vite_host="localhost"'),
     true,
-    "host narrowing must use the active logical network loopback host",
+    "host narrowing must keep Vite listening as localhost",
+  );
+  assert.equal(
+    viteHostNarrowingBlock.includes("PORT_MANAGER_NETWORK_DNS_ALIAS"),
+    true,
+    "host narrowing must fold the active DNS alias back to localhost",
   );
   assert.equal(
     viteHostNarrowingBlock.includes("--host=|--host=0.0.0.0|--host=::|--host=\\\\*)"),
     true,
-    "wildcard --host forms must be rewritten to the logical network host",
+    "wildcard --host forms must be rewritten to localhost",
   );
   assert.equal(
     viteHostNarrowingBlock.includes('set -- "$@" "\\${__pm_vite_host}" "\\${__pm_arg}"'),
     true,
-    "bare --host before another option must insert the logical host before preserving that option",
+    "bare --host before another option must insert localhost before preserving that option",
   );
   assert.equal(
     source.includes("function buildCleanPackageManagerEntrypointShell"),
@@ -519,6 +543,8 @@ test("external pm shell function selects a network and sources its attach script
   assert.equal(networkServiceSource.includes("isContainerStyleComposeAttachment(attachment)"), true);
   assert.equal(networkServiceSource.includes("formatTerminalNetworkServiceEntry(\"container\""), true);
   assert.equal(networkServiceSource.includes('shellExport("PORT_MANAGER_NETWORK_NAME", networkName)'), true);
+  assert.equal(networkServiceSource.includes("NETWORK_DNS_ALIAS_ENV"), true);
+  assert.equal(networkServiceSource.includes("normalizeBrowserDnsHostname(networkName)"), true);
   assert.equal(networkServiceSource.includes("buildTerminalTitleShell(buildPortManagerTerminalTitle(networkName))"), true);
   assert.equal(daemonReadyGuardIndex >= 0, true);
   assert.equal(shimReadyCheckIndex > daemonReadyGuardIndex, true);
@@ -531,7 +557,9 @@ test("external pm shell function selects a network and sources its attach script
   assert.equal(networkServiceSource.includes("Port Manager routing unavailable: runtime shim check failed."), true);
   assert.equal(networkServiceSource.includes('buildTerminalTitleShell("Port Manager: detached")'), true);
   assert.equal(terminalHookEnvironmentSource.includes("readonly networkName?: string;"), true);
+  assert.equal(terminalHookEnvironmentSource.includes("readonly networkDnsAlias?: string;"), true);
   assert.equal(terminalHookEnvironmentSource.includes('collection.replace("PORT_MANAGER_NETWORK_NAME", scope.networkName'), true);
+  assert.equal(terminalHookEnvironmentSource.includes("collection.replace(NETWORK_DNS_ALIAS_ENV, networkDnsAlias"), true);
   assert.equal(commandSource.includes("readonly terminalNetworkSelectionFilePath: string;"), true);
   assert.equal(commandSource.includes('export PORT_MANAGER_NETWORKS_FILE="'), true);
   assert.equal(commandSource.includes("__pm_networks_file_path()"), true);
@@ -549,6 +577,7 @@ test("external pm shell function selects a network and sources its attach script
   assert.equal(commandSource.includes('__pm_networks_file="$(__pm_networks_file_path 2>/dev/null || true)"'), true);
   assert.equal(commandSource.includes("Port Manager has no exported networks in %s."), true);
   assert.equal(commandSource.includes("PORT_MANAGER_NETWORK_NAME"), true);
+  assert.equal(commandSource.includes("PORT_MANAGER_NETWORK_DNS_ALIAS"), true);
   assert.equal(commandSource.includes("Port Manager: \\${PORT_MANAGER_NETWORK_NAME}"), true);
   assert.equal(commandSource.includes("pm() {"), true);
   assert.equal(commandSource.includes('"pm current"'), true);
@@ -965,11 +994,15 @@ test("global storage cleanup rehydrates generated routing from live attachment s
   const reapplyStart = source.indexOf("private async reapplyRoutingToAttachedTerminalWindows");
   const reapplyEnd = source.indexOf("private watchTerminalAttachmentMarkers", reapplyStart);
   const reapplyBody = source.slice(reapplyStart, reapplyEnd);
+  const reconcileStart = source.indexOf("private async reconcileComposeOverrideFileForAttachment");
+  const reconcileEnd = source.indexOf("private async reconcileMutationlessComposeOverrideFile", reconcileStart);
+  const reconcileBody = source.slice(reconcileStart, reconcileEnd);
 
   assert.notEqual(rehydrateStart, -1);
   assert.notEqual(terminalRehydrateStart, -1);
   assert.notEqual(materializeStart, -1);
   assert.notEqual(reapplyStart, -1);
+  assert.notEqual(reconcileStart, -1);
   assert.equal(rehydrateBody.includes("this.ensureSharedNetworkStateFileMaterialized();"), true);
   assert.equal(rehydrateBody.includes("await this.rehydrateTerminalHookFiles().catch(() => undefined);"), true);
   assert.equal(
@@ -1000,6 +1033,13 @@ test("global storage cleanup rehydrates generated routing from live attachment s
   assert.equal(source.includes("this.maybeAutoInstallBrowserDnsResolvers();"), true);
   assert.equal(source.includes("await this.syncBrowserNetworkProxies().catch(() => undefined);"), true);
   assert.equal(rehydrateBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);"), true);
+  assert.equal(source.includes("private shouldPreserveComposeHiddenPublishedHostPorts(): boolean"), true);
+  assert.equal(
+    source.includes('return resolveTerminalLoopbackAddressRoutingMode(readPortManagerSettings()) !== "high-port";'),
+    true,
+  );
+  assert.equal(reconcileBody.includes("preservePublishedHostPorts:"), true);
+  assert.equal(reconcileBody.includes("this.shouldPreserveComposeHiddenPublishedHostPorts()"), true);
   assert.equal(terminalRehydrateBody.includes("await this.writeTerminalNetworkSelectionFile();"), true);
   assert.equal(terminalRehydrateBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });"), true);
   assert.equal(terminalRehydrateBody.includes("await this.reapplyRoutingToAttachedTerminalWindows();"), true);
@@ -1403,8 +1443,13 @@ test("compose project routing files are published as a serialized atomic generat
   assert.equal(writeBody.includes("const overrideAttachments = filterComposeAttachmentsByNetworkIds"), true);
   assert.equal(writeBody.includes("await this.reconcileComposeOverrideFiles(overrideAttachments, {"), true);
   assert.equal(writeBody.includes('await writeTextFileAtomicallyOrTouch(globalFilePath, "");'), false);
-  assert.equal(writeBody.includes('await writeTextFileAtomicallyOrTouch(networkFilePath, "");'), true);
-  assert.equal(writeBody.includes("const rowsByNetworkId = new Map<string, Map<string, ComposeProjectRoutingRow[]>>();"), true);
+  assert.equal(writeBody.includes('await writeTextFileAtomicallyOrTouch(networkFilePath, "");'), false);
+  assert.equal(writeBody.includes("const aggregateRowsByNetworkId = new Map<string, ComposeProjectRoutingRow[]>();"), true);
+  assert.equal(writeBody.includes("const rowsByScopedFileByNetworkId = new Map<string, Map<string, ComposeProjectRoutingRow[]>>();"), true);
+  assert.equal(
+    writeBody.includes("await writeTextFileAtomicallyOrTouch(networkFilePath, serializeComposeProjectRoutingRows(aggregateRows));"),
+    true,
+  );
   assert.equal(writeBody.includes("rowsByScopedFilePath.set(scopedFilePath, [row]);"), true);
   assert.equal(writeBody.includes("scopedRows.push(row);"), true);
   assert.equal(writeBody.includes("await writeTextFileAtomicallyOrTouch(scopedFilePath, serializeComposeProjectRoutingRows(scopedRows));"), true);
@@ -1714,6 +1759,7 @@ test("native hook preserves listener ports only for explicit overrides", () => {
 test("native hook binds high-port routes on dedicated actual loopback hosts", () => {
   const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
   const source = fs.readFileSync(sourcePath, "utf8");
+  const bindStart = source.indexOf("static int pm_bind_hook");
   const loopbackStart = source.indexOf("loopback_host = pm_network_loopback_host();");
   const allocationStart = source.indexOf("pm_allocate_route(logical_port, bind_host, NULL, \"listen\"");
   const loopbackBind = source.slice(loopbackStart, allocationStart);
@@ -1724,11 +1770,18 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   const connectStart = source.indexOf("static int pm_connect_hook");
   const connectEnd = source.indexOf("static int pm_getsockname_hook", connectStart);
   const connectBody = source.slice(connectStart, connectEnd);
+  const addressOnlyBindStart = source.indexOf("if (pm_loopback_address_only_mode())", bindStart);
+  const addressOnlyConnectStart = connectBody.indexOf("if (pm_loopback_address_only_mode())");
+  const addressOnlyConnectEnd = connectBody.indexOf("target_host[0] = '\\0';", addressOnlyConnectStart);
+  const addressOnlyConnectBlock = connectBody.slice(addressOnlyConnectStart, addressOnlyConnectEnd);
 
   assert.notEqual(loopbackStart, -1);
+  assert.notEqual(bindStart, -1);
   assert.notEqual(allocationStart, -1);
   assert.notEqual(matchLevelStart, -1);
   assert.notEqual(connectStart, -1);
+  assert.notEqual(addressOnlyBindStart, -1);
+  assert.notEqual(addressOnlyConnectStart, -1);
   assert.equal(
     matchLevelBody.includes(
       "return route->has_network_id ? 0 : 2;",
@@ -1753,6 +1806,11 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   assert.equal(source.includes("actual_port != logical_port && actual_loopback_host != NULL"), false);
   assert.equal(connectBody.includes("falling back to routed allocation"), true);
   assert.equal(connectBody.includes("loopback_connect_errno != ECONNREFUSED"), true);
+  assert.equal(source.includes('PM_LOOPBACK_ADDRESS_ONLY_MODE "loopback-address-only"'), true);
+  assert.equal(source.includes("bind address-only logical=%d host=%s"), true);
+  assert.equal(addressOnlyBindStart < allocationStart, true);
+  assert.equal(addressOnlyConnectBlock.includes("pm_allocate_route("), false);
+  assert.equal(addressOnlyConnectBlock.includes("pm_set_sockaddr_host((struct sockaddr *)&rewritten, loopback_host);"), true);
 });
 
 test("native agent adopts previous route files before first startup write", () => {
@@ -1788,24 +1846,25 @@ test("native preload repair is opt-in at runtime shim boundaries", () => {
   assert.equal(asdfShimSource.includes('setenv("PORT_MANAGER_PRELOAD_REPAIR", "1", 1);'), true);
 });
 
-test("logical routers are opened only after logical routes are live", () => {
+test("logical routers leave network-owned localhost ports to host processes", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
   const collectStart = source.indexOf("function collectLogicalRouterPorts");
   const collectEnd = source.indexOf("function isPortManagerLogicalRouterListener", collectStart);
   const collectLogicalRouterPorts = source.slice(collectStart, collectEnd);
   const routeNeedsStart = source.indexOf("function routeNeedsLogicalRouter");
-  const routeNeedsEnd = source.indexOf("function isDetachedNetworkRoute", routeNeedsStart);
+  const routeNeedsEnd = source.indexOf("function listenerCoversLogicalRouterHost", routeNeedsStart);
   const routeNeedsLogicalRouter = source.slice(routeNeedsStart, routeNeedsEnd);
   const syncStart = source.indexOf("private async syncLogicalPortRoutersExclusive(): Promise<void>");
   const syncEnd = source.indexOf("private async findClientNetworkForRouter", syncStart);
   const syncBody = source.slice(syncStart, syncEnd);
 
   assert.equal(source.includes("collectLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? [])"), true);
-  assert.equal(source.includes("Network loopback routes"), true);
+  assert.equal(source.includes("Host loopback belongs to processes outside logical networks"), true);
   assert.equal(collectLogicalRouterPorts.includes('route.source === "compose"'), false);
   assert.equal(collectLogicalRouterPorts.includes("routeNeedsLogicalRouter(route)"), true);
-  assert.equal(collectLogicalRouterPorts.includes("route.networkId === undefined && isDetachedNetworkRoute"), true);
+  assert.equal(collectLogicalRouterPorts.includes("route.networkId === undefined"), true);
+  assert.equal(source.includes("function isDetachedNetworkRoute"), false);
   assert.equal(collectLogicalRouterPorts.includes("!externallyOwnedPorts.has(route.logicalPort)"), true);
   assert.equal(routeNeedsLogicalRouter.includes("route.actualPort !== route.logicalPort"), true);
   assert.equal(routeNeedsLogicalRouter.includes("!listenerCoversLogicalRouterHost(route.host)"), true);
@@ -1927,6 +1986,6 @@ test("compose mutation publishes hidden ports on the network loopback host", () 
   assert.notEqual(attachStart, -1);
   assert.equal(attachBody.includes("const hiddenHostAddress = loopbackAddressForNetwork(network.id);"), true);
   assert.equal(attachBody.includes("await ensureLoopbackAddressRoutingHostReady("), true);
-  assert.equal(attachBody.includes("resolveLoopbackAddressRoutingMode(portSettings)"), true);
+  assert.equal(attachBody.includes("resolveTerminalLoopbackAddressRoutingMode(portSettings)"), true);
   assert.equal(attachBody.includes("hiddenHostAddress,"), true);
 });
