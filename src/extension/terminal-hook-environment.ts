@@ -15,6 +15,7 @@ import {
   loopbackAddressForNetwork,
   NETWORK_LOOPBACK_HOST_ENV,
   shouldExposeNetworkLoopbackHost,
+  usesLoopbackAddressOnlyRouting,
 } from "../core/networks/loopback-address";
 import type { DisposableLike, PortManagerSettings } from "../shared/types";
 import {
@@ -41,6 +42,7 @@ const TERMINAL_MUTATOR_OPTIONS: vscode.EnvironmentVariableMutatorOptions = {
 export const RUNTIME_SHIM_DIRECTORY_ENV = "PORT_MANAGER_RUNTIME_SHIM_DIR";
 export const DOCKER_SHIM_PATH_ENV = "PORT_MANAGER_DOCKER_SHIM";
 export const EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV = "PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE";
+export const AGENT_REQUIRED_ENV = "PORT_MANAGER_AGENT_REQUIRED";
 export const NETWORK_DNS_ALIAS_ENV = "PORT_MANAGER_NETWORK_DNS_ALIAS";
 const PRELOAD_PACKAGE_MANAGER_NAMES: readonly string[] = ["npm", "npx", "pnpm", "pnpx", "corepack", "uv", "uvx", "yarn", "yarnpkg"];
 const RUNTIME_COMMAND_SHIM_NAMES: readonly RuntimeCommandShimName[] = ["docker", "podman", "docker-compose", "podman-compose"];
@@ -238,6 +240,7 @@ function applyRoutingSettings(
 ): void {
   collection.replace("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_ROUTING_MODE", settings.routingMode, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace(AGENT_REQUIRED_ENV, usesLoopbackAddressOnlyRouting(settings) ? "0" : "1", TERMINAL_MUTATOR_OPTIONS);
   if (settings.experimentalRouteOwnershipMode !== "process") {
     collection.replace(
       EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV,
@@ -1279,6 +1282,7 @@ export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID=${shellQuote(scope.networkId)}
           scope.settings.experimentalRouteOwnershipMode !== "process"
             ? `export ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}=${shellQuote(scope.settings.experimentalRouteOwnershipMode)}`
             : `unset ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}`,
+          `export ${AGENT_REQUIRED_ENV}=${shellQuote(usesLoopbackAddressOnlyRouting(scope.settings) ? "0" : "1")}`,
           `export PORT_MANAGER_VIRTUAL_PORT_START=${shellQuote(String(scope.settings.virtualPortRangeStart))}`,
           `export PORT_MANAGER_VIRTUAL_PORT_END=${shellQuote(String(scope.settings.virtualPortRangeEnd))}`,
           `export PORT_MANAGER_FIXED_PROTOCOL_PORTS=${shellQuote(scope.settings.fixedProtocolPorts.join(","))}`,

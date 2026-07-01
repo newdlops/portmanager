@@ -447,10 +447,13 @@ test("global shell hook keeps no-network shells out of native preload routing", 
   assert.equal(source.includes('shellRemovePathListEntry("DYLD_INSERT_LIBRARIES", options.hookLibraryPath)'), true);
   assert.equal(source.includes('shellRemovePathListEntry("LD_PRELOAD", options.hookLibraryPath)'), true);
   assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK=1\nexport PORT_MANAGER_AGENT_SOCKET"), false);
+  assert.equal(hookTemplate.includes("__pm_agent_required()"), true);
+  assert.equal(hookTemplate.includes('export ${AGENT_REQUIRED_ENV}="${agentRequired ? "1" : "0"}"'), true);
+  assert.equal(hookTemplate.includes('if __pm_agent_required; then\n    __pm_agent_ensure'), true);
   assert.equal(
     hookTemplate.includes('if [ "\\${PORT_MANAGER_HOOK:-0}" = "1" ]; then\n  __pm_agent_ensure'),
-    true,
-    "global shell hook must not probe or start the daemon for unattached shells",
+    false,
+    "global shell hook must not start the daemon without checking whether this routing mode needs it",
   );
 });
 
@@ -618,6 +621,7 @@ test("external pm shell function selects a network and sources its attach script
     true,
   );
   assert.equal(commandSource.includes("__pm_routing_ready()"), true);
+  assert.equal(commandSource.includes("if __pm_agent_required && [ \"\\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}\" != \"1\" ]; then"), true);
   assert.equal(commandSource.includes("Port Manager attach did not activate routing"), true);
 });
 
@@ -938,6 +942,8 @@ test("terminal daemon ensure serializes agent startup and preserves slow live so
     assert.equal(source.includes('__pm_agent_lock="\\${PORT_MANAGER_AGENT_SOCKET}.startup.lock"'), true);
     assert.equal(source.includes('if mkdir "$__pm_agent_lock" 2>/dev/null; then'), true);
     assert.equal(source.includes('method:"daemonStatus"'), true);
+    assert.equal(source.includes("probe-shutdown"), false);
+    assert.equal(source.includes("function shutdownStale"), false);
     assert.equal(source.includes('const staleLockScript = ['), true);
     assert.equal(source.includes("age>15000?0:1"), true);
     assert.equal(source.includes('timer=setTimeout(()=>finish(1,false),350);'), true);
@@ -958,7 +964,8 @@ test("terminal daemon ensure serializes agent startup and preserves slow live so
     assert.equal(source.includes("command -v setsid >/dev/null 2>&1"), true);
     assert.equal(source.includes("</dev/null >/tmp/newdlops-portmanager-agent.log 2>&1 &"), true);
   }
-  assert.equal(commandsSource.includes('if [ "\\${PORT_MANAGER_HOOK:-0}" = "1" ]; then\n  __pm_agent_ensure'), true);
+  assert.equal(commandsSource.includes("__pm_agent_required()"), true);
+  assert.equal(commandsSource.includes('if __pm_agent_required; then\n    __pm_agent_ensure'), true);
   assert.equal(commandsSource.includes('__pm_repair\n    return $?'), true);
 });
 
@@ -989,6 +996,7 @@ test("background routing refresh converges daemon version and generated route fi
   assert.equal(convergeBody.includes("await this.processService.refresh().catch(() => undefined);"), false);
   assert.equal(convergeBody.includes("await this.syncLogicalPortRouters().catch(() => undefined);"), true);
   assert.equal(ensureBody.includes('daemon.status !== "running"'), true);
+  assert.equal(ensureBody.includes("usesLoopbackAddressOnlyRouting(readPortManagerSettings())"), true);
   assert.equal(ensureBody.includes("await this.processService.start();"), true);
   assert.equal(ensureBody.includes("daemon.restartRequired"), true);
   assert.equal(ensureBody.includes("await this.processService.restartDaemon();"), true);
@@ -1079,6 +1087,7 @@ test("global storage cleanup rehydrates generated routing from live attachment s
     true,
   );
   assert.equal(source.includes("async function routeTableFileIsFresh"), true);
+  assert.equal(materializeBody.includes("usesLoopbackAddressOnlyRouting(readPortManagerSettings())"), true);
   assert.equal(materializeBody.includes("await this.processService.start();"), true);
   assert.equal(materializeBody.includes("await this.processService.refresh();"), true);
   assert.equal(source.includes("missing marker"), true);

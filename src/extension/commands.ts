@@ -5,7 +5,11 @@ import * as vscode from "vscode";
 import { getAgentSocketPath } from "../agent/agent-socket";
 import { getDefaultHostAccessBindingsPath, getDefaultRouteTablePath, ROUTE_TABLE_TTL_SECONDS_ENV } from "../agent/route-table";
 import { readPortManagerSettings, openPortManagerSettings } from "../config/vscode-settings";
-import { ACTUAL_LOOPBACK_HOST_ENV, NETWORK_LOOPBACK_HOST_ENV } from "../core/networks/loopback-address";
+import {
+  ACTUAL_LOOPBACK_HOST_ENV,
+  NETWORK_LOOPBACK_HOST_ENV,
+  usesLoopbackAddressOnlyRouting,
+} from "../core/networks/loopback-address";
 import { buildExistingCloneMutationFromCandidate } from "../platform/network/container-service-discovery";
 import { isValidComposeProjectName } from "../platform/network/compose-publish-mutator";
 import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
@@ -26,6 +30,7 @@ import type { PortManagerProcessService } from "./process-service";
 import {
   DOCKER_SHIM_PATH_ENV,
   EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV,
+  AGENT_REQUIRED_ENV,
   prepareRuntimeShimLauncherDirectory,
   prepareShellEnvRestoreScript,
   RUNTIME_SHIM_DIRECTORY_ENV,
@@ -3134,6 +3139,7 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     options.runtimeShimDirectory !== undefined ? shellDoubleQuote(options.runtimeShimDirectory) : undefined;
   const escapedShellEnvRestorePath =
     options.shellEnvRestorePath !== undefined ? shellDoubleQuote(options.shellEnvRestorePath) : undefined;
+  const agentRequired = !usesLoopbackAddressOnlyRouting(options.settings);
   const daemonUnsetVariables = [
     "DYLD_INSERT_LIBRARIES",
     "LD_PRELOAD",
@@ -3277,13 +3283,12 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     'let done=false;',
     'const socket=net.createConnection(socketPath);',
     'function finish(code,remove){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.destroy();}catch{}if(remove)removeSocket();process.exit(code);}',
-    'function shutdownStale(){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.end(JSON.stringify({id:"probe-shutdown",method:"shutdownDaemon"})+"\\n");}catch{}setTimeout(()=>process.exit(2),75);}',
     'let buffer="";',
     'timer=setTimeout(()=>finish(1,false),350);',
     'socket.setEncoding("utf8");',
     'socket.once("connect",()=>{socket.write(JSON.stringify({id:"probe",method:"daemonStatus"})+"\\n");});',
     'socket.once("error",()=>finish(1,false));',
-    'socket.on("data",(chunk)=>{buffer+=chunk;const lineEnd=buffer.indexOf("\\n");if(lineEnd<0)return;try{const message=JSON.parse(buffer.slice(0,lineEnd));const daemon=message&&message.payload;const actual=normalize(daemon&&daemon.agentMainPath);const expectedPath=normalize(expected);if(!actual||actual!==expectedPath||isOlder(daemon&&daemon.startedAt,expected)){shutdownStale();return;}finish(0,false);}catch{finish(1,true);}});',
+    'socket.on("data",(chunk)=>{buffer+=chunk;const lineEnd=buffer.indexOf("\\n");if(lineEnd<0)return;try{const message=JSON.parse(buffer.slice(0,lineEnd));const daemon=message&&message.payload;const actual=normalize(daemon&&daemon.agentMainPath);const expectedPath=normalize(expected);if(!actual||actual!==expectedPath||isOlder(daemon&&daemon.startedAt,expected)){finish(1,false);return;}finish(0,false);}catch{finish(1,true);}});',
   ].join("");
   const staleLockScript = [
     'const fs=require("node:fs");',
@@ -3322,7 +3327,7 @@ else
   export PORT_MANAGER_HOOK_DAEMON_STARTED=0
   export PORT_MANAGER_RUNTIME_SHIM_READY=0
   unset PORT_MANAGER_DYLD_INSERT_LIBRARIES PORT_MANAGER_LD_PRELOAD
-  unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}
+  unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV} ${AGENT_REQUIRED_ENV}
   ${escapedShellEnvRestorePath !== undefined ? `if [ -n "\${PORT_MANAGER_PREV_BASH_ENV:-}" ] && [ "\${BASH_ENV:-}" = "${escapedShellEnvRestorePath}" ]; then export BASH_ENV="\${PORT_MANAGER_PREV_BASH_ENV}"; elif [ "\${BASH_ENV:-}" = "${escapedShellEnvRestorePath}" ]; then unset BASH_ENV; fi` : ""}
   unset PORT_MANAGER_PREV_BASH_ENV
   ${removeNativeHookPreloadScript}
@@ -3339,6 +3344,7 @@ export PORT_MANAGER_CONTAINER_MAP_HELPER="${escapedNativeContainerMapPath}"
 export ${DOCKER_SHIM_PATH_ENV}="${escapedDockerShimPath}"
 export PORT_MANAGER_SCAN_RANGE="${options.settings.scanRange}"
 export PORT_MANAGER_ROUTING_MODE="${options.settings.routingMode}"
+export ${AGENT_REQUIRED_ENV}="${agentRequired ? "1" : "0"}"
 ${options.settings.experimentalRouteOwnershipMode !== "process"
   ? `export ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}="${options.settings.experimentalRouteOwnershipMode}"`
   : `unset ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}`}
@@ -3347,9 +3353,9 @@ export PORT_MANAGER_VIRTUAL_PORT_END="${options.settings.virtualPortRangeEnd}"
 export PORT_MANAGER_FIXED_PROTOCOL_PORTS="${options.settings.fixedProtocolPorts.join(",")}"
 export PORT_MANAGER_PRESERVE_LISTEN_PORTS="${options.settings.preservedListenPorts.join(",")}"
 export ${ROUTE_TABLE_TTL_SECONDS_ENV}="${options.settings.routeTableTtlSeconds}"
-	${escapedRuntimeShimDirectory !== undefined ? `export ${RUNTIME_SHIM_DIRECTORY_ENV}="${escapedRuntimeShimDirectory}"
-	${runtimeShimPathPrependScript}
-	hash -r 2>/dev/null || true` : ""}
+${escapedRuntimeShimDirectory !== undefined ? `export ${RUNTIME_SHIM_DIRECTORY_ENV}="${escapedRuntimeShimDirectory}"
+${runtimeShimPathPrependScript}
+hash -r 2>/dev/null || true` : ""}
 ${escapedShellEnvRestorePath !== undefined ? `if [ "\${PORT_MANAGER_HOOK:-0}" = "1" ]; then
   export PORT_MANAGER_DYLD_INSERT_LIBRARIES="${escapedHookLibraryPath}"
   export PORT_MANAGER_LD_PRELOAD="${escapedHookLibraryPath}"
@@ -3380,6 +3386,16 @@ __pm_networks_file_path() {
   fi
   unset __pm_candidate
   return 1
+}
+
+__pm_agent_required() {
+  if [ "\${${AGENT_REQUIRED_ENV}:-1}" = "0" ]; then
+    return 1
+  fi
+  if [ "\${${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}:-}" = "loopback-address-only" ]; then
+    return 1
+  fi
+  return 0
 }
 
 __pm_agent_version() {
@@ -3460,6 +3476,11 @@ pm() {
       printf '%s\n' 'Runtime shim dir: unset'
     fi
     printf 'Routing mode: %s\n' "\${PORT_MANAGER_ROUTING_MODE:-unset}"
+    if __pm_agent_required; then
+      printf '%s\n' 'Agent required: yes'
+    else
+      printf '%s\n' 'Agent required: no'
+    fi
     printf 'Network loopback host: %s\n' "\${PORT_MANAGER_NETWORK_LOOPBACK_HOST:--}"
     printf 'Actual loopback host: %s\n' "\${PORT_MANAGER_ACTUAL_LOOPBACK_HOST:--}"
     if [ -n "$__pm_routes_file" ] && [ -f "$__pm_routes_file" ]; then
@@ -3753,7 +3774,11 @@ __pm_routing_ready() {
     unset __pm_ready_network_id
     return 1
   fi
-  if [ "\${PORT_MANAGER_HOOK:-0}" != "1" ] || [ "\${PORT_MANAGER_HOOK_DISABLED:-0}" = "1" ] || [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" != "1" ]; then
+  if [ "\${PORT_MANAGER_HOOK:-0}" != "1" ] || [ "\${PORT_MANAGER_HOOK_DISABLED:-0}" = "1" ]; then
+    unset __pm_ready_network_id
+    return 1
+  fi
+  if __pm_agent_required && [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" != "1" ]; then
     unset __pm_ready_network_id
     return 1
   fi
@@ -3806,8 +3831,13 @@ __pm_repair() {
     fi
   fi
 
-  __pm_agent_ensure
-  __pm_status=$?
+  if __pm_agent_required; then
+    __pm_agent_ensure
+    __pm_status=$?
+  else
+    export PORT_MANAGER_HOOK_DAEMON_STARTED=0
+    __pm_status=0
+  fi
   if [ "$__pm_status" -eq 0 ]; then
     __pm_load_native_hook
     __pm_runtime_shim_check
@@ -3823,7 +3853,11 @@ __pm_repair() {
 }
 
 if [ "\${PORT_MANAGER_HOOK:-0}" = "1" ]; then
-  __pm_agent_ensure
+  if __pm_agent_required; then
+    __pm_agent_ensure
+  else
+    export PORT_MANAGER_HOOK_DAEMON_STARTED=0
+  fi
   __pm_load_native_hook
   __pm_runtime_shim_check
 fi

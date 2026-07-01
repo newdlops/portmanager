@@ -29,6 +29,7 @@ import {
   loopbackAddressForNetwork,
   NETWORK_LOOPBACK_HOST_ENV,
   resolveTerminalLoopbackAddressRoutingMode,
+  usesLoopbackAddressOnlyRouting,
 } from "../core/networks/loopback-address";
 import { findRoutesMatchingClientCwd } from "../core/networks/logical-route-selection";
 import { resolveProcessTreeNetworkLabel } from "../core/process-network-labels";
@@ -105,6 +106,7 @@ import type {
 } from "../shared/types";
 import {
   applyTerminalHookEnvironment,
+  AGENT_REQUIRED_ENV,
   DOCKER_SHIM_PATH_ENV,
   EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV,
   getAsdfShimLauncherRelativePath,
@@ -1362,7 +1364,7 @@ export class PortManagerNetworkService implements DisposableLike {
       this.scheduleTerminalWindowTitleRefresh(terminalWindow, network.name, processRows);
     } else if (runtime.kind === "nativeHelper") {
       const settings = readPortManagerSettings();
-      if (shouldInjectTerminalHook(settings)) {
+      if (shouldInjectTerminalHook(settings) && !usesLoopbackAddressOnlyRouting(settings)) {
         await this.processService?.start();
       }
       const result = await this.injectRoutingIntoTerminalWindow(terminalWindow.id, network.id, settings);
@@ -1433,7 +1435,9 @@ export class PortManagerNetworkService implements DisposableLike {
       resolveTerminalLoopbackAddressRoutingMode(settings),
       { interactive: true },
     );
-    await this.processService?.start();
+    if (!usesLoopbackAddressOnlyRouting(settings)) {
+      await this.processService?.start();
+    }
     await this.ensureNetworkComposeRoutingArtifacts(networkId);
     const binding: VscodeWindowTerminalBinding = {
       id: "vscode-window",
@@ -1495,7 +1499,9 @@ export class PortManagerNetworkService implements DisposableLike {
       throw new Error(`Native terminal routing is not supported on ${process.platform}.`);
     }
 
-    await this.processService?.start();
+    if (!usesLoopbackAddressOnlyRouting(settings)) {
+      await this.processService?.start();
+    }
     await this.ensureNetworkComposeRoutingArtifacts(networkId);
     return this.buildTerminalRoutingScript(network, settings);
   }
@@ -2733,7 +2739,7 @@ export class PortManagerNetworkService implements DisposableLike {
         continue;
       }
 
-      if (this.processService !== undefined) {
+      if (this.processService !== undefined && !usesLoopbackAddressOnlyRouting(readPortManagerSettings())) {
         await this.processService.start().catch(() => undefined);
         await Promise.all(
           attachment.ports
@@ -2934,6 +2940,9 @@ export class PortManagerNetworkService implements DisposableLike {
     if (this.processService === undefined) {
       return;
     }
+    if (usesLoopbackAddressOnlyRouting(readPortManagerSettings())) {
+      return;
+    }
 
     const daemon = this.processService.getSnapshot().daemon;
     if (daemon.status !== "running") {
@@ -2978,6 +2987,9 @@ export class PortManagerNetworkService implements DisposableLike {
     options: { readonly force?: boolean; readonly networkIds?: readonly string[] } = {},
   ): Promise<void> {
     if (this.processService === undefined) {
+      return;
+    }
+    if (usesLoopbackAddressOnlyRouting(readPortManagerSettings())) {
       return;
     }
 
@@ -3454,6 +3466,9 @@ export class PortManagerNetworkService implements DisposableLike {
     if (this.processService === undefined) {
       return;
     }
+    if (usesLoopbackAddressOnlyRouting(readPortManagerSettings())) {
+      return;
+    }
 
     await this.processService.start().catch(() => undefined);
     await this.processService.refresh().catch(() => undefined);
@@ -3470,6 +3485,9 @@ export class PortManagerNetworkService implements DisposableLike {
    */
   private async removeOrphanComposeRouteProcesses(attachments: readonly ComposeAttachment[]): Promise<void> {
     if (this.processService === undefined) {
+      return;
+    }
+    if (usesLoopbackAddressOnlyRouting(readPortManagerSettings())) {
       return;
     }
 
@@ -3509,6 +3527,9 @@ export class PortManagerNetworkService implements DisposableLike {
     livePorts: readonly ComposePublishedPort[],
   ): Promise<readonly ComposePublishedPort[]> {
     if (this.processService === undefined) {
+      return livePorts.map(dropComposeProcessId);
+    }
+    if (usesLoopbackAddressOnlyRouting(readPortManagerSettings())) {
       return livePorts.map(dropComposeProcessId);
     }
 
@@ -3588,6 +3609,9 @@ export class PortManagerNetworkService implements DisposableLike {
     const processService = this.processService;
     if (processService === undefined) {
       return ports;
+    }
+    if (usesLoopbackAddressOnlyRouting(readPortManagerSettings())) {
+      return ports.map(dropComposeProcessId);
     }
 
     if (ports.length === 0) {
@@ -3681,6 +3705,9 @@ export class PortManagerNetworkService implements DisposableLike {
     preserveProcessIds: ReadonlySet<string> = new Set<string>(),
   ): Promise<void> {
     if (this.processService === undefined) {
+      return;
+    }
+    if (usesLoopbackAddressOnlyRouting(readPortManagerSettings())) {
       return;
     }
 
@@ -5268,6 +5295,9 @@ export class PortManagerNetworkService implements DisposableLike {
       runtimeCommandShimPath,
     );
     const networkDnsAlias = normalizeBrowserDnsHostname(networkName);
+    // Address-only routing keeps isolation in the loopback IP itself, so the
+    // singleton agent socket is not part of the terminal attach invariant.
+    const agentRequired = !usesLoopbackAddressOnlyRouting(settings);
     const shellEnvRestorePath = prepareShellEnvRestoreScript(this.context.globalStorageUri.fsPath, hookLibraryPath, {
       networkId,
       networkDnsAlias,
@@ -5289,7 +5319,7 @@ export class PortManagerNetworkService implements DisposableLike {
       buildTerminalAttachmentMarkerRemoveShell(),
       shellRemovePathListEntry(preloadVariable, hookLibraryPath),
       ...(runtimeShimDirectory === undefined ? [] : [shellRemovePathListEntry("PATH", runtimeShimDirectory)]),
-      `unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}`,
+      `unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV} ${AGENT_REQUIRED_ENV}`,
       "unset PORT_MANAGER_HOOK_DISABLED",
       shellExport("PORT_MANAGER_HOOK", "1"),
       shellExport("PORT_MANAGER_RUNTIME_SHIM_READY", "0"),
@@ -5318,6 +5348,7 @@ export class PortManagerNetworkService implements DisposableLike {
       buildComposeProjectRoutingShell(this.getComposeProjectRoutingFilePath(networkId), nativeContainerMapPath),
       shellExport("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange)),
       shellExport("PORT_MANAGER_ROUTING_MODE", settings.routingMode),
+      shellExport(AGENT_REQUIRED_ENV, agentRequired ? "1" : "0"),
       settings.experimentalRouteOwnershipMode !== "process"
         ? shellExport(EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV, settings.experimentalRouteOwnershipMode)
         : `unset ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}`,
@@ -5329,8 +5360,12 @@ export class PortManagerNetworkService implements DisposableLike {
       shellPrependLibrary(preloadVariable, hookLibraryPath),
     ];
     commands.push(buildLoopbackAddressRoutingShell(loopbackAddressForNetwork(networkId), resolveTerminalLoopbackAddressRoutingMode(settings)));
-    commands.push(buildAgentDaemonEnsureShell(process.execPath));
-    commands.push(`if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" != "1" ]; then return 1 2>/dev/null || exit 1; fi`);
+    if (agentRequired) {
+      commands.push(buildAgentDaemonEnsureShell(process.execPath));
+      commands.push(`if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" != "1" ]; then return 1 2>/dev/null || exit 1; fi`);
+    } else {
+      commands.push(shellExport("PORT_MANAGER_HOOK_DAEMON_STARTED", "0"));
+    }
     commands.push(buildTerminalSessionIsolationShell());
 
     if (process.platform === "darwin" && shellEnvRestorePath !== undefined) {
@@ -5353,9 +5388,13 @@ export class PortManagerNetworkService implements DisposableLike {
       `if [ "\${PORT_MANAGER_RUNTIME_SHIM_READY:-0}" != "1" ]; then return 1 2>/dev/null || exit 1; fi`,
       buildTerminalAttachmentMarkerWriteShell(),
       buildTerminalTitleShell(buildPortManagerTerminalTitle(networkName)),
-      `if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" = "1" ]; then printf '%s\\n' ${shellQuote(
-        `Port Manager routing active for ${networkName} (${networkId}). Restart servers launched before attach.`,
-      )}; fi`,
+      agentRequired
+        ? `if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" = "1" ]; then printf '%s\\n' ${shellQuote(
+            `Port Manager routing active for ${networkName} (${networkId}). Restart servers launched before attach.`,
+          )}; fi`
+        : `printf '%s\\n' ${shellQuote(
+            `Port Manager loopback routing active for ${networkName} (${networkId}). Restart servers launched before attach.`,
+          )}`,
     );
 
     return commands.join("\n");
@@ -9164,13 +9203,12 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     'let done=false;',
     'const socket=net.createConnection(socketPath);',
     'function finish(code,remove){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.destroy();}catch{}if(remove)removeSocket();process.exit(code);}',
-    'function shutdownStale(){if(done)return;done=true;if(timer)clearTimeout(timer);try{socket.end(JSON.stringify({id:"probe-shutdown",method:"shutdownDaemon"})+"\\n");}catch{}setTimeout(()=>process.exit(2),75);}',
     'let buffer="";',
     'timer=setTimeout(()=>finish(1,false),350);',
     'socket.setEncoding("utf8");',
     'socket.once("connect",()=>{socket.write(JSON.stringify({id:"probe",method:"daemonStatus"})+"\\n");});',
     'socket.once("error",()=>finish(1,false));',
-    'socket.on("data",(chunk)=>{buffer+=chunk;const lineEnd=buffer.indexOf("\\n");if(lineEnd<0)return;try{const message=JSON.parse(buffer.slice(0,lineEnd));const daemon=message&&message.payload;const actual=normalize(daemon&&daemon.agentMainPath);const expectedPath=normalize(expected);if(!actual||actual!==expectedPath||isOlder(daemon&&daemon.startedAt,expected)){shutdownStale();return;}finish(0,false);}catch{finish(1,true);}});',
+    'socket.on("data",(chunk)=>{buffer+=chunk;const lineEnd=buffer.indexOf("\\n");if(lineEnd<0)return;try{const message=JSON.parse(buffer.slice(0,lineEnd));const daemon=message&&message.payload;const actual=normalize(daemon&&daemon.agentMainPath);const expectedPath=normalize(expected);if(!actual||actual!==expectedPath||isOlder(daemon&&daemon.startedAt,expected)){finish(1,false);return;}finish(0,false);}catch{finish(1,true);}});',
   ].join("");
   const staleLockScript = [
     'const fs=require("node:fs");',
