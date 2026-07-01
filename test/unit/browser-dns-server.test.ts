@@ -88,7 +88,11 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(networkServiceSource.includes("ifconfig lo0 alias"), true);
   assert.equal(networkServiceSource.includes("ifconfig lo0 -alias"), true);
   assert.equal(networkServiceSource.includes("with administrator privileges"), true);
+  assert.equal(networkServiceSource.includes("with prompt"), true);
   assert.equal(networkServiceSource.includes("maybeAutoInstallBrowserDnsResolvers"), true);
+  assert.equal(networkServiceSource.includes("BROWSER_DNS_AUTO_INSTALL_SIGNATURE_KEY"), true);
+  assert.equal(networkServiceSource.includes("rememberBrowserDnsAutoInstallSignature(signature)"), true);
+  assert.equal(networkServiceSource.includes("clearBrowserDnsAutoInstallSignature"), true);
   assert.equal(networkServiceSource.includes("BROWSER_SECURE_DNS_SUFFIX"), true);
   assert.equal(networkServiceSource.includes("BROWSER_LEGACY_SECURE_DNS_SUFFIXES"), true);
   assert.equal(networkServiceSource.includes("*.${BROWSER_SECURE_DNS_SUFFIX}"), true);
@@ -98,6 +102,7 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(networkServiceSource.includes("secureHostname"), true);
   assert.equal(networkServiceSource.includes("tlsConfigured"), true);
   assert.equal(networkServiceSource.includes("Port Manager browser TLS certificate"), true);
+  assert.equal(networkServiceSource.includes("trusted development TLS certificate for logical-network browser URLs"), true);
   assert.equal(networkServiceSource.includes("BROWSER_TLS_HOSTNAMES_MARKER_PATH"), true);
   assert.equal(networkServiceSource.includes("BROWSER_TLS_SERVER_CERT_PATH"), true);
   assert.equal(networkServiceSource.includes("security add-trusted-cert"), true);

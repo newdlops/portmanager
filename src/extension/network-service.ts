@@ -131,6 +131,7 @@ import type { PortManagerProcessService } from "./process-service";
 const NETWORK_STATE_KEY = "portManager.logicalNetworkState.v1";
 const BINDING_PRESETS_KEY = "portManager.bindingPresets.v1";
 const VSCODE_WINDOW_TERMINAL_BINDING_KEY = "portManager.vscodeWindowTerminalBinding.v1";
+const BROWSER_DNS_AUTO_INSTALL_SIGNATURE_KEY = "portManager.browserDnsAutoInstallSignature.v1";
 const COMPOSE_PROJECT_ROUTING_FILE_NAME = "compose-project-routing.tsv";
 const COMPOSE_PROJECT_ROUTING_FILE_PREFIX = "compose-project-routing-";
 const COMPOSE_PROJECT_ROUTING_COMPOSE_SEPARATOR = ".compose-";
@@ -1022,7 +1023,10 @@ export class PortManagerNetworkService implements DisposableLike {
       return status;
     }
 
-    await runShellScriptWithAdministratorPrivileges(buildBrowserDnsResolverCleanupScript(status.records));
+    await runShellScriptWithAdministratorPrivileges(
+      buildBrowserDnsResolverCleanupScript(status.records),
+      "Port Manager needs administrator privileges to remove its macOS browser DNS aliases, loopback aliases, and local hosts entries.",
+    );
     this.localChangeEvents.emit();
     return this.getBrowserDnsResolverStatus();
   }
@@ -1031,7 +1035,11 @@ export class PortManagerNetworkService implements DisposableLike {
     options: { readonly automatic?: boolean },
   ): Promise<BrowserDnsResolverStatus> {
     const status = this.getBrowserDnsResolverStatus();
-    if (!status.supported || status.records.length === 0 || status.missingCount === 0) {
+    if (!status.supported || status.records.length === 0) {
+      return status;
+    }
+    if (status.missingCount === 0) {
+      this.clearBrowserDnsAutoInstallSignature();
       return status;
     }
 
@@ -1040,6 +1048,7 @@ export class PortManagerNetworkService implements DisposableLike {
         status.records,
         status.dnsPort,
       ),
+      "Port Manager needs administrator privileges to configure macOS browser DNS aliases, loopback aliases, /etc/hosts entries, and a trusted development TLS certificate for logical-network browser URLs.",
     );
     await trustBrowserTlsCertificateForCurrentUser();
     this.localChangeEvents.emit();
@@ -1050,6 +1059,7 @@ export class PortManagerNetworkService implements DisposableLike {
       void vscode.window.showInformationMessage("Port Manager browser DNS aliases and dev TLS certificate installed.");
     }
 
+    this.clearBrowserDnsAutoInstallSignature();
     return this.getBrowserDnsResolverStatus();
   }
 
@@ -1058,7 +1068,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const status = this.getBrowserDnsResolverStatus();
     if (!status.supported || !status.dnsRunning || status.missingCount === 0) {
       if (status.supported && status.missingCount === 0) {
-        this.browserDnsAutoInstallSignature = undefined;
+        this.clearBrowserDnsAutoInstallSignature();
       }
       return;
     }
@@ -1078,18 +1088,46 @@ export class PortManagerNetworkService implements DisposableLike {
       )
       .sort()
       .join("|");
-    if (signature.length === 0 || this.browserDnsAutoInstallSignature === signature) {
+    if (
+      signature.length === 0 ||
+      this.browserDnsAutoInstallSignature === signature ||
+      this.context.globalState.get<string>(BROWSER_DNS_AUTO_INSTALL_SIGNATURE_KEY) === signature
+    ) {
       return;
     }
 
-    this.browserDnsAutoInstallSignature = signature;
+    this.rememberBrowserDnsAutoInstallSignature(signature);
     void this.installBrowserDnsResolvers({ automatic: true })
       .then((result) => {
         if (result.missingCount === 0) {
-          this.browserDnsAutoInstallSignature = undefined;
+          this.clearBrowserDnsAutoInstallSignature();
         }
       })
       .catch(() => undefined);
+  }
+
+  /**
+   * Automatic DNS/TLS setup is privileged. Remembering the attempted state in
+   * VS Code storage prevents the same admin prompt from returning every launch
+   * when the user cancels or the machine rejects the script; a network rename or
+   * changed alias set produces a new signature and can prompt again.
+   */
+  private rememberBrowserDnsAutoInstallSignature(signature: string): void {
+    this.browserDnsAutoInstallSignature = signature;
+    void this.context.globalState.update(BROWSER_DNS_AUTO_INSTALL_SIGNATURE_KEY, signature);
+  }
+
+  /** Clears the automatic prompt throttle after the current browser alias set is fully installed. */
+  private clearBrowserDnsAutoInstallSignature(): void {
+    if (
+      this.browserDnsAutoInstallSignature === undefined &&
+      this.context.globalState.get<string>(BROWSER_DNS_AUTO_INSTALL_SIGNATURE_KEY) === undefined
+    ) {
+      return;
+    }
+
+    this.browserDnsAutoInstallSignature = undefined;
+    void this.context.globalState.update(BROWSER_DNS_AUTO_INSTALL_SIGNATURE_KEY, undefined);
   }
 
   /** Starts the local DNS responder used for single-label browser aliases. */
@@ -4178,6 +4216,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     this.hostLocalGatewayRedirectInstallInFlight = runShellScriptWithAdministratorPrivileges(
       buildHostLocalGatewayRedirectSetupScript(redirects),
+      "Port Manager needs administrator privileges to configure macOS packet-filter redirects for logical-network host access. This lets host processes reach the selected network without occupying the original localhost port.",
     ).finally(() => {
       this.hostLocalGatewayRedirectInstallInFlight = undefined;
     });
@@ -7819,7 +7858,10 @@ async function ensureLoopbackAddressRoutingHostReady(
 
   try {
     if (options.interactive && mode !== "auto") {
-      await runShellScriptWithAdministratorPrivileges(buildLoopbackAliasSetupScript(address));
+      await runShellScriptWithAdministratorPrivileges(
+        buildLoopbackAliasSetupScript(address),
+        `Port Manager needs administrator privileges to add macOS loopback address ${address} for this logical network.`,
+      );
     } else {
       await execFileAsync("/bin/sh", ["-c", buildNonInteractiveLoopbackAliasSetupCommand(address)], {
         timeout: 5_000,
@@ -9102,10 +9144,10 @@ async function runAppleScript(script: string): Promise<boolean> {
   }
 }
 
-async function runShellScriptWithAdministratorPrivileges(script: string): Promise<void> {
+async function runShellScriptWithAdministratorPrivileges(script: string, prompt: string): Promise<void> {
   const encodedScript = Buffer.from(script, "utf8").toString("base64");
   const command = `printf %s ${shellQuote(encodedScript)} | /usr/bin/base64 -D | /bin/sh`;
-  const appleScript = `do shell script "${appleScriptString(command)}" with administrator privileges`;
+  const appleScript = `do shell script "${appleScriptString(command)}" with administrator privileges with prompt "${appleScriptString(prompt)}"`;
   await execFileAsync("osascript", ["-e", appleScript], { timeout: 120_000 });
 }
 
