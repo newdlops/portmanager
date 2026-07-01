@@ -3807,6 +3807,16 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
     return pm_real_bind(sockfd, addr, addrlen);
   }
 
+  if (!pm_has_current_network_scope()) {
+    /*
+     * A globally injected preload can survive after a terminal is detached from
+     * every logical network. In that state localhost belongs to the real host,
+     * so the hook must not allocate routes or rewrite loopback binds.
+     */
+    pm_debug("bind passthrough without network scope logical=%d", logical_port);
+    return pm_real_bind(sockfd, addr, addrlen);
+  }
+
   if (pm_loopback_address_only_mode()) {
     loopback_host = pm_network_loopback_host();
     if (loopback_host == NULL || !pm_sockaddr_is_local(addr)) {
@@ -4003,6 +4013,16 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
 
   logical_port = pm_sockaddr_port(addr);
   if (logical_port <= 0) {
+    return pm_real_connect(sockfd, addr, addrlen);
+  }
+
+  if (!pm_has_current_network_scope()) {
+    /*
+     * Without a network identity, localhost:<port> is the host's own endpoint.
+     * Looking up route tables here can bounce back into host proxies or router
+     * listeners and create the localhost -> route -> localhost loop.
+     */
+    pm_debug("connect passthrough without network scope logical=%d", logical_port);
     return pm_real_connect(sockfd, addr, addrlen);
   }
 

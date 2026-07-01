@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import type { HostPortExposure } from "../../shared/types";
@@ -101,6 +101,8 @@ export class HostPortProxyManager {
     if (this.listeners.has(exposure.id)) {
       return;
     }
+
+    await terminateSiblingNativeHostProxyProcesses(exposure);
 
     const nativeListener = await this.openNative(exposure);
     if (nativeListener !== undefined) {
@@ -463,6 +465,96 @@ function listen(server: net.Server, port: number, host: string): Promise<void> {
     server.once("listening", onListening);
     server.listen(port, host);
   });
+}
+
+/**
+ * Reclaims orphaned native helpers for the same endpoint before binding. A VS
+ * Code extension reload can leave an old helper alive briefly; if it keeps the
+ * port, the new owner cannot install its current target resolver.
+ */
+async function terminateSiblingNativeHostProxyProcesses(exposure: HostPortExposure): Promise<void> {
+  if (process.platform === "win32" || exposure.hostPort <= 0) {
+    return;
+  }
+
+  const siblingPids = findSiblingNativeHostProxyProcessIds(exposure);
+  if (siblingPids.length === 0) {
+    return;
+  }
+
+  for (const pid of siblingPids) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // Already-exited helpers are treated as reclaimed.
+    }
+  }
+
+  const deadline = Date.now() + 500;
+  while (Date.now() < deadline && siblingPids.some(isProcessAlive)) {
+    await delay(25);
+  }
+}
+
+function findSiblingNativeHostProxyProcessIds(
+  exposure: Pick<HostPortExposure, "hostAddress" | "hostPort">,
+): readonly number[] {
+  let output: string;
+  try {
+    output = execFileSync("ps", ["-Ao", "pid=,command="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    return [];
+  }
+
+  const pids: number[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s+([\s\S]+)$/.exec(line);
+    if (match === null) {
+      continue;
+    }
+
+    const pid = Number.parseInt(match[1], 10);
+    const command = match[2];
+    if (
+      Number.isInteger(pid) &&
+      pid > 0 &&
+      pid !== process.pid &&
+      isNativeHostProxyCommandForEndpoint(command, exposure.hostAddress, exposure.hostPort)
+    ) {
+      pids.push(pid);
+    }
+  }
+
+  return pids;
+}
+
+function isNativeHostProxyCommandForEndpoint(command: string, hostAddress: string, hostPort: number): boolean {
+  if (!/(?:^|[/\s])portmanager_host_exposure_proxy(?:\s|$)/.test(command)) {
+    return false;
+  }
+
+  return new RegExp(`\\s${escapeRegExp(hostAddress)}\\s+${hostPort}(?:\\s|$)`).test(command);
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
+    return code === "EPERM";
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function isExecutableFile(filePath: string): boolean {

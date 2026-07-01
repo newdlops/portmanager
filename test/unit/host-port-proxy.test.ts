@@ -150,6 +150,19 @@ test("native host exposure pending route requests time out instead of blocking f
   assert.equal(hostProxySource.includes("if (!route.resolved || route.failed"), true);
 });
 
+test("host exposure manager reclaims stale native helpers for the same endpoint", () => {
+  const root = path.resolve(__dirname, "../../..");
+  const source = fs.readFileSync(path.join(root, "src/platform/ports/host-port-proxy.ts"), "utf8");
+
+  assert.equal(source.includes("await terminateSiblingNativeHostProxyProcesses(exposure);"), true);
+  assert.equal(source.includes('execFileSync("ps", ["-Ao", "pid=,command="]'), true);
+  assert.equal(source.includes("function findSiblingNativeHostProxyProcessIds("), true);
+  assert.equal(source.includes("function isNativeHostProxyCommandForEndpoint("), true);
+  assert.equal(source.includes("portmanager_host_exposure_proxy"), true);
+  assert.equal(source.includes('process.kill(pid, "SIGTERM");'), true);
+  assert.equal(source.includes('child.kill("SIGKILL");'), true);
+});
+
 test(
   "forwards TCP bytes through the native host exposure helper when available",
   { skip: !isExecutableFile(getNativeHostExposureProxyPath()) },

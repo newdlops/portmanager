@@ -81,6 +81,25 @@ test("native hook route file cache is invalidated by path size and high-resoluti
   assert.equal(source.includes("if (!route->has_network_id) {\n    return 0;\n  }"), true);
 });
 
+test("native hook bypasses route logic when no network scope is attached", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const bindStart = source.indexOf("static int pm_bind_hook");
+  const bindEnd = source.indexOf("static int pm_connect_hook", bindStart);
+  const connectStart = source.indexOf("static int pm_connect_hook");
+  const connectEnd = source.indexOf("static int pm_getsockname_hook", connectStart);
+  const bindBody = source.slice(bindStart, bindEnd);
+  const connectBody = source.slice(connectStart, connectEnd);
+
+  assert.notEqual(bindStart, -1);
+  assert.notEqual(connectStart, -1);
+  assert.equal(bindBody.includes("if (!pm_has_current_network_scope())"), true);
+  assert.equal(connectBody.includes("if (!pm_has_current_network_scope())"), true);
+  assert.equal(bindBody.indexOf("if (!pm_has_current_network_scope())") < bindBody.indexOf("pm_loopback_address_only_mode()"), true);
+  assert.equal(connectBody.indexOf("if (!pm_has_current_network_scope())") < connectBody.indexOf("pm_connect_route_table_lookup"), true);
+  assert.equal(connectBody.indexOf("if (!pm_has_current_network_scope())") < connectBody.indexOf("pm_allocate_route("), true);
+});
+
 if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
   test("native hook allows current-network same-port compose routes", { skip: "native hook library is not built for this platform" }, () => undefined);
 } else {
@@ -282,6 +301,59 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
         PORT_MANAGER_COMPOSE_LOGICAL_PORTS: String(logicalPort),
         PORT_MANAGER_COMPOSE_ROUTE_WAIT_MS: "50",
         PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
+      },
+    });
+
+    assert.equal(result.exitCode, 23);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "ECONNREFUSED\n");
+  });
+
+  test("native hook leaves no-network localhost connects outside route resolution", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-connect-"));
+    const server = net.createServer((socket) => {
+      socket.end("leaked\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const logicalPort = await chooseUnusedTcpPort(address.port);
+    const routeTablePath = path.join(tempDir, "newdlops-portmanager-routes-detached-unscoped.json");
+    fs.writeFileSync(
+      routeTablePath,
+      JSON.stringify({
+        updatedAt: "2026-07-01T00:00:00.000Z",
+        routes: [
+          {
+            logicalPort,
+            actualPort: address.port,
+            routeDirection: "listen",
+            host: "127.0.0.1",
+            cwd: projectRoot,
+            processId: "managed-process-unscoped",
+            processName: "node server.js",
+            status: "running",
+            source: "managed",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const result = await runHookedNodeClient(logicalPort, routeTablePath, undefined, {
+      env: {
+        PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
+        PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
+        PORT_MANAGER_AGENT_ROUNDTRIP_TIMEOUT_MS: "50",
       },
     });
 

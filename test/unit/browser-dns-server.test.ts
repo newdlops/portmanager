@@ -74,6 +74,10 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(networkServiceSource.includes("# Port Manager browser DNS hosts begin"), true);
   assert.equal(networkServiceSource.includes("isBrowserDnsHostsEntryConfigured"), true);
   assert.equal(networkServiceSource.includes("hostsConfigured"), true);
+  assert.equal(networkServiceSource.includes("isBrowserDnsOwnedHostsEntryCurrent"), true);
+  assert.equal(networkServiceSource.includes("readBrowserDnsOwnedHostsEntries"), true);
+  assert.equal(networkServiceSource.includes("macOS hosts lookup can"), true);
+  assert.equal(networkServiceSource.includes("this.browserDnsAutoInstallSignature = undefined;"), true);
   assert.equal(networkServiceSource.includes("buildBrowserDnsResolverCleanupScript"), true);
   assert.equal(networkServiceSource.includes("ifconfig lo0 alias"), true);
   assert.equal(networkServiceSource.includes("ifconfig lo0 -alias"), true);
@@ -95,9 +99,10 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   const browserProxySyncSource = networkServiceSource.slice(browserProxySyncStart, browserProxySyncEnd);
   const browserProxyLeaseIndex = browserProxySyncSource.indexOf("this.ownsBrowserNetworkProxyLease = true;");
   const browserAliasReadyIndex = browserProxySyncSource.indexOf("ensureBrowserDnsLoopbackAliasesReady(dnsRecords)");
-  const directBrowserProxyClearIndex = browserProxySyncSource.indexOf(
-    "await this.browserNetworkProxy.sync([]).catch(() => undefined);",
-    browserAliasReadyIndex,
+  const browserProxyApplyIndex = browserProxySyncSource.indexOf("await this.browserNetworkProxy.sync(endpoints)");
+  const hostGatewaySyncIndex = browserProxySyncSource.indexOf(
+    "await this.syncHostGatewayProxies(",
+    browserProxyApplyIndex,
   );
   const reloadSharedStateStart = networkServiceSource.indexOf("private async reloadSharedNetworkState");
   const reloadSharedStateEnd = networkServiceSource.indexOf(
@@ -118,14 +123,25 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.notEqual(reloadSharedStateEnd, -1);
   assert.notEqual(convergeStart, -1);
   assert.notEqual(convergeEnd, -1);
-  assert.equal(browserProxySyncSource.includes("this.syncBrowserDnsRecordsForNetworks(networks, dnsRecordOptions)"), true);
+  assert.equal(browserProxySyncSource.includes("this.syncBrowserDnsRecordsForNetworks(networks)"), true);
   assert.equal(browserProxySyncSource.includes("const dnsRunning = this.browserDnsServer.isRunning();"), true);
   assert.equal(browserProxyLeaseIndex >= 0, true);
   assert.equal(browserAliasReadyIndex > browserProxyLeaseIndex, true);
-  assert.equal(directBrowserProxyClearIndex > browserAliasReadyIndex, true);
-  assert.equal(networkServiceSource.includes("shouldRouteBrowserDnsToNetworkLoopback(readPortManagerSettings())"), true);
-  assert.equal(networkServiceSource.includes("loopbackAddressForNetwork(network.id)"), true);
-  assert.equal(networkServiceSource.includes("buildDirectNetworkLoopbackUrl"), true);
+  assert.equal(browserProxyApplyIndex > browserAliasReadyIndex, true);
+  assert.equal(hostGatewaySyncIndex > browserProxyApplyIndex, true);
+  assert.equal(networkServiceSource.includes("private readonly hostGatewayProxy"), true);
+  assert.equal(networkServiceSource.includes("collectHostGatewayExposures"), true);
+  assert.match(networkServiceSource, /collectHostGatewayExposures\([\s\S]*registrySnapshot\.composeAttachments/);
+  assert.equal(networkServiceSource.includes("hostGatewayExposureId"), true);
+  assert.equal(
+    networkServiceSource.includes("const route = await this.findNetworkRoute(exposure.networkId, exposure.hostPort);"),
+    true,
+  );
+  assert.equal(networkServiceSource.includes("isRoutableComposeAttachment(attachment)"), true);
+  assert.equal(networkServiceSource.includes("targetPort: port.actualHostPort"), true);
+  assert.equal(networkServiceSource.includes("targetPort: route.actualPort"), true);
+  assert.equal(networkServiceSource.includes("buildDirectNetworkLoopbackUrl"), false);
+  assert.equal(networkServiceSource.includes("options.routeToNetworkLoopback === true"), false);
   assert.equal(reloadBrowserDnsIndex > reloadTerminalSelectionIndex, true);
   assert.equal(
     convergeSource.includes("await this.rehydrateBrowserDnsAndProxies().catch(() => undefined);"),
@@ -133,12 +149,12 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   );
   assert.match(browserProxySyncSource, /collectBrowserProxyEndpoints\([\s\S]*networks,/);
   assert.equal(networkServiceSource.includes("isPublicWebEntrypointProcess"), true);
-  assert.equal(networkServiceSource.includes("/\\bvite\\b/"), true);
-  assert.equal(networkServiceSource.includes("/\\bmanage\\.py\\s+runserver\\b/"), true);
-  assert.equal(networkServiceSource.includes("/\\bdjango-admin\\s+runserver\\b/"), true);
-  assert.equal(networkServiceSource.includes("/\\bdaphne\\b/"), true);
-  assert.equal(networkServiceSource.includes("/\\buvicorn\\b/"), true);
-  assert.equal(networkServiceSource.includes("/\\bgunicorn\\b/"), true);
+  assert.match(networkServiceSource, /\/\\bvite\\b\//);
+  assert.match(networkServiceSource, /\/\\bmanage\\\.py\\s\+runserver\\b\//);
+  assert.match(networkServiceSource, /\/\\bdjango-admin\\s\+runserver\\b\//);
+  assert.match(networkServiceSource, /\/\\bdaphne\\b\//);
+  assert.match(networkServiceSource, /\/\\buvicorn\\b\//);
+  assert.match(networkServiceSource, /\/\\bgunicorn\\b\//);
   assert.equal(networkServiceSource.includes("backend ports remain"), true);
   assert.equal(
     networkServiceSource.includes("grep -q '^# Port Manager browser DNS resolver$'"),
