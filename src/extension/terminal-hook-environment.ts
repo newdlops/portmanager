@@ -80,6 +80,8 @@ export const TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES: readonly string[] = [
   ...PRELOAD_PACKAGE_COMMAND_NAMES,
 ];
 const COMPOSE_REFRESH_WAIT_MS = "3000";
+const VITE_ADDITIONAL_ALLOWED_HOSTS_ENV = "__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS";
+const PORT_MANAGER_VITE_ALLOWED_HOSTS_ENV = "PORT_MANAGER_VITE_ALLOWED_HOSTS";
 
 export interface TerminalHookEnvironmentScope {
   /** Logical network applied to every new VS Code terminal in this extension host. */
@@ -404,7 +406,7 @@ function isStaleGeneratedRuntimeShim(filePath: string): boolean {
     }
 
     return [
-      "__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS",
+      VITE_ADDITIONAL_ALLOWED_HOSTS_ENV,
       ".portmanager-node",
       "PORT_MANAGER_HOOK_DISABLED",
       "__pm_package_manager_command_should_run_clean",
@@ -654,6 +656,61 @@ function replacePathAtomically(filePath: string, tempPath: string): void {
 
     throw error;
   }
+}
+
+/** Adds the current network DNS alias to Vite's safe host list while preserving user-provided entries. */
+function buildViteAllowedHostsExport(networkDnsAlias: string | undefined): string {
+  const aliasAssignment =
+    networkDnsAlias === undefined
+      ? `__pm_vite_next_allowed_host=""`
+      : `__pm_vite_next_allowed_host=${shellQuote(networkDnsAlias)}`;
+
+  return `${aliasAssignment}
+__pm_vite_allowed_hosts="\${${VITE_ADDITIONAL_ALLOWED_HOSTS_ENV}:-}"
+if [ -n "\${${PORT_MANAGER_VITE_ALLOWED_HOSTS_ENV}:-}" ]; then
+  __pm_vite_filtered_hosts=""
+  __pm_vite_old_ifs="\${IFS}"
+  IFS=,
+  for __pm_vite_host in \${__pm_vite_allowed_hosts}; do
+    __pm_vite_skip=0
+    for __pm_vite_owned_host in \${${PORT_MANAGER_VITE_ALLOWED_HOSTS_ENV}}; do
+      if [ "\${__pm_vite_host}" = "\${__pm_vite_owned_host}" ]; then
+        __pm_vite_skip=1
+        break
+      fi
+    done
+    if [ "\${__pm_vite_skip}" != "1" ]; then
+      if [ -z "\${__pm_vite_filtered_hosts}" ]; then
+        __pm_vite_filtered_hosts="\${__pm_vite_host}"
+      else
+        __pm_vite_filtered_hosts="\${__pm_vite_filtered_hosts},\${__pm_vite_host}"
+      fi
+    fi
+  done
+  IFS="\${__pm_vite_old_ifs}"
+  __pm_vite_allowed_hosts="\${__pm_vite_filtered_hosts}"
+fi
+if [ -n "\${__pm_vite_next_allowed_host}" ]; then
+  case ",\${__pm_vite_allowed_hosts}," in
+    *",\${__pm_vite_next_allowed_host},"*) ;;
+    *)
+      if [ -z "\${__pm_vite_allowed_hosts}" ]; then
+        __pm_vite_allowed_hosts="\${__pm_vite_next_allowed_host}"
+      else
+        __pm_vite_allowed_hosts="\${__pm_vite_allowed_hosts},\${__pm_vite_next_allowed_host}"
+      fi
+      ;;
+  esac
+  export ${PORT_MANAGER_VITE_ALLOWED_HOSTS_ENV}="\${__pm_vite_next_allowed_host}"
+else
+  unset ${PORT_MANAGER_VITE_ALLOWED_HOSTS_ENV}
+fi
+if [ -n "\${__pm_vite_allowed_hosts}" ]; then
+  export ${VITE_ADDITIONAL_ALLOWED_HOSTS_ENV}="\${__pm_vite_allowed_hosts}"
+else
+  unset ${VITE_ADDITIONAL_ALLOWED_HOSTS_ENV}
+fi
+unset __pm_vite_allowed_hosts __pm_vite_filtered_hosts __pm_vite_host __pm_vite_next_allowed_host __pm_vite_old_ifs __pm_vite_owned_host __pm_vite_skip`;
 }
 
 /**
@@ -1114,7 +1171,7 @@ else
   fi
   export PORT_MANAGER_HOOK=0
   export PORT_MANAGER_HOOK_DISABLED=1
-  unset BASH_ENV PORT_MANAGER_PRELOAD_REPAIR PORT_MANAGER_DYLD_INSERT_LIBRARIES PORT_MANAGER_LD_PRELOAD DYLD_INSERT_LIBRARIES LD_PRELOAD PORT_MANAGER_RUNTIME_SHIM_DIR PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_COMPOSE_LOGICAL_PORTS PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS PORT_MANAGER_DOCKER_SHIM ${NETWORK_DNS_ALIAS_ENV}
+  unset BASH_ENV PORT_MANAGER_PRELOAD_REPAIR PORT_MANAGER_DYLD_INSERT_LIBRARIES PORT_MANAGER_LD_PRELOAD DYLD_INSERT_LIBRARIES LD_PRELOAD PORT_MANAGER_RUNTIME_SHIM_DIR PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_COMPOSE_LOGICAL_PORTS PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS PORT_MANAGER_DOCKER_SHIM ${NETWORK_DNS_ALIAS_ENV} ${PORT_MANAGER_VITE_ALLOWED_HOSTS_ENV}
 fi
 
 exec "\${__pm_target}" "$@"
@@ -1175,6 +1232,7 @@ export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID=${shellQuote(scope.networkId)}
     scope.networkDnsAlias === undefined
       ? `unset ${NETWORK_DNS_ALIAS_ENV}`
       : `export ${NETWORK_DNS_ALIAS_ENV}=${shellQuote(scope.networkDnsAlias)}`;
+  const viteAllowedHostsExport = buildViteAllowedHostsExport(scope.networkDnsAlias);
   const composeRoutingExport =
     scope.composeRoutingFilePath === undefined
       ? ""
@@ -1237,6 +1295,7 @@ fi
 
 ${networkScope}
 ${networkDnsAliasExport}
+${viteAllowedHostsExport}
 ${routeTableExports}
 ${agentExports}
 ${routingExports}

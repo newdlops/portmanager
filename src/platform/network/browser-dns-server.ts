@@ -1,7 +1,7 @@
 import * as dgram from "node:dgram";
 
 export interface BrowserDnsRecord {
-  /** Single-label host exposed to browsers, such as alpha1. */
+  /** Browser-facing host exposed through the local resolver, such as alpha1 or alpha1.pm. */
   readonly hostname: string;
   /** Network-specific loopback address returned as an A record. */
   readonly address: string;
@@ -35,9 +35,10 @@ const RESPONSE_TTL_SECONDS = 1;
 /**
  * Tiny local DNS server for browser-facing development aliases.
  *
- * macOS can route single-label names through `/etc/resolver/<name>` files. The
- * extension keeps this unprivileged UDP server on a high port and only answers
- * A records for the current logical network names.
+ * macOS can route single-label names or private suffixes through
+ * `/etc/resolver/<name>` files. The extension keeps this unprivileged UDP
+ * server on a high port and only answers A records for current logical-network
+ * browser aliases.
  */
 export class BrowserDnsServer {
   /** UDP socket that answers local resolver queries. */
@@ -84,7 +85,7 @@ export class BrowserDnsServer {
     this.records.clear();
 
     for (const record of records) {
-      const hostname = normalizeHostname(record.hostname);
+      const hostname = normalizeDnsRecordName(record.hostname);
       const address = parseIpv4Address(record.address);
       if (hostname === undefined || address === undefined) {
         continue;
@@ -163,6 +164,25 @@ export function browserDnsPort(): number {
 
 export function normalizeBrowserDnsHostname(value: string): string | undefined {
   return normalizeHostname(value);
+}
+
+function normalizeDnsRecordName(value: string): string | undefined {
+  const normalized = value.trim().toLowerCase().replace(/\.$/, "");
+  const labels = normalized.split(".");
+  if (labels.length === 0 || normalized.length > 253) {
+    return undefined;
+  }
+
+  const normalizedLabels: string[] = [];
+  for (const label of labels) {
+    const normalizedLabel = normalizeHostname(label);
+    if (normalizedLabel === undefined) {
+      return undefined;
+    }
+    normalizedLabels.push(normalizedLabel);
+  }
+
+  return normalizedLabels.join(".");
 }
 
 function bind(socket: dgram.Socket, port: number, host: string): Promise<void> {

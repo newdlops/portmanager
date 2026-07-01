@@ -11,7 +11,7 @@ import type { ExperimentalRouteOwnershipMode, LoopbackAddressRoutingMode } from 
 export const ACTUAL_LOOPBACK_HOST_ENV = "PORT_MANAGER_ACTUAL_LOOPBACK_HOST";
 export const NETWORK_LOOPBACK_HOST_ENV = "PORT_MANAGER_NETWORK_LOOPBACK_HOST";
 export const LOOPBACK_ADDRESS_ONLY_ROUTE_OWNERSHIP_MODE: ExperimentalRouteOwnershipMode = "loopback-address-only";
-const DEFAULT_LOOPBACK_ADDRESS_ROUTING_MODE: LoopbackAddressRoutingMode = "high-port";
+const DEFAULT_LOOPBACK_ADDRESS_ROUTING_MODE: LoopbackAddressRoutingMode = "loopback";
 
 export function isLoopbackAddressRoutingEnabled(settings: {
   readonly enableLoopbackAddressRouting?: boolean;

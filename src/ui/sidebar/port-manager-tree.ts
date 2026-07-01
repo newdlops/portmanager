@@ -1252,15 +1252,18 @@ function buildBrowserDnsRecordRows(record: BrowserDnsResolverStatus["records"][n
   const resolverStatus = record.resolverConfigured ? "resolver ok" : "missing resolver";
   const aliasStatus = record.loopbackAliasConfigured ? "loopback ok" : "missing loopback";
   const hostsStatus = record.hostsConfigured ? "hosts ok" : "missing hosts";
-  const configured = record.configured ? "configured" : `${resolverStatus}, ${aliasStatus}, ${hostsStatus}`;
+  const tlsStatus = record.tlsConfigured ? "TLS ok" : "missing TLS";
+  const configured = record.configured ? "configured" : `${resolverStatus}, ${aliasStatus}, ${hostsStatus}, ${tlsStatus}`;
   const aliasTooltip = new vscode.MarkdownString(
     [
       `Network: ${record.networkName}`,
       `Alias: ${record.hostname}`,
+      `Secure alias: ${record.secureHostname}`,
       `Loopback: ${record.address}`,
       `Resolver: ${resolverStatus}`,
       `Loopback alias: ${aliasStatus}`,
       `Hosts entry: ${hostsStatus}`,
+      `Dev TLS: ${tlsStatus}`,
     ].join("\n\n"),
   );
   const rows: PortManagerTreeItem[] = [

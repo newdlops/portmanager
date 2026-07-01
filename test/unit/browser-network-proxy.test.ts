@@ -104,6 +104,39 @@ test("uses a fallback browser port when the logical port is already occupied", a
   }
 });
 
+test("formats HTTPS browser proxy endpoints when TLS is enabled", () => {
+  assert.equal(
+    formatBrowserNetworkProxyUrl({
+      ...createEndpoint({ publicHost: "production1", publicProtocol: "https" }),
+      listenPort: 3004,
+    }),
+    "https://production1:3004/",
+  );
+});
+
+test("does not open HTTPS browser proxy endpoints without TLS credentials", async () => {
+  const proxyPort = await getAvailablePort();
+  const proxy = new BrowserNetworkProxyManager({
+    resolve: () => ({
+      host: "127.0.0.1",
+      port: 3004,
+    }),
+  });
+
+  try {
+    const activeEndpoint = await proxy.ensure(
+      createEndpoint({
+        publicProtocol: "https",
+        listenPorts: [proxyPort],
+      }),
+    );
+
+    assert.equal(activeEndpoint, undefined);
+  } finally {
+    await proxy.dispose();
+  }
+});
+
 test("clears bind retry backoff when an owner handoff frees the browser proxy port", async () => {
   const occupied = http.createServer((_request, response) => {
     response.end("occupied");

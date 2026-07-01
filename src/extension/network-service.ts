@@ -22,6 +22,7 @@ import {
   terminalAttachmentsShareIdentity,
   type LogicalNetworkRegistryState,
 } from "../core/networks/logical-network-registry";
+import { selectHostDefaultGatewayExposure } from "../core/networks/host-default-gateway";
 import {
   ACTUAL_LOOPBACK_HOST_ENV,
   browserLoopbackAddressForNetwork,
@@ -38,7 +39,6 @@ import {
   runContainerCommand,
 } from "../platform/network/container-runtime";
 import { BrowserDnsServer, browserDnsPort, normalizeBrowserDnsHostname } from "../platform/network/browser-dns-server";
-import { openUrlWithSecureLocalOrigin } from "../platform/browser-opener";
 import {
   CONTAINER_ALIAS_SERVICE_PREFIX,
   mergeComposeContainerMappingLineage,
@@ -56,6 +56,7 @@ import {
   formatBrowserNetworkProxyUrl,
   type BrowserNetworkProxyEndpoint,
   type BrowserNetworkProxyTarget,
+  type BrowserNetworkProxyTlsCredentials,
 } from "../platform/ports/browser-network-proxy";
 import { HostPortProxyManager, type HostPortProxyTarget } from "../platform/ports/host-port-proxy";
 import {
@@ -156,6 +157,20 @@ const BROWSER_NETWORK_PROXY_OWNER_PATH = buildBrowserNetworkProxyOwnerControlPat
 const BROWSER_NETWORK_PROXY_OWNER_LOCK_PATH = buildBrowserNetworkProxyOwnerControlPath("lock");
 const BROWSER_DNS_HOSTS_BLOCK_BEGIN = "# Port Manager browser DNS hosts begin";
 const BROWSER_DNS_HOSTS_BLOCK_END = "# Port Manager browser DNS hosts end";
+const BROWSER_TLS_DIRECTORY = "/Library/Application Support/newdlops.portmanager/browser-tls";
+const BROWSER_TLS_CA_CERT_PATH = `${BROWSER_TLS_DIRECTORY}/portmanager-root-ca.crt`;
+const BROWSER_TLS_CA_KEY_PATH = `${BROWSER_TLS_DIRECTORY}/portmanager-root-ca.key`;
+const BROWSER_TLS_SERVER_CERT_PATH = `${BROWSER_TLS_DIRECTORY}/portmanager-browser.crt`;
+const BROWSER_TLS_SERVER_KEY_PATH = `${BROWSER_TLS_DIRECTORY}/portmanager-browser.key`;
+const BROWSER_TLS_HOSTNAMES_MARKER_PATH = `${BROWSER_TLS_DIRECTORY}/hostnames.txt`;
+const BROWSER_SECURE_DNS_SUFFIX = "pm";
+const BROWSER_LEGACY_SECURE_DNS_SUFFIXES = ["portmanager.test"] as const;
+const HOST_LOCAL_GATEWAY_PF_ANCHOR = "com.newdlops.portmanager.host-local";
+const HOST_LOCAL_GATEWAY_PF_ANCHOR_PATH = `/etc/pf.anchors/${HOST_LOCAL_GATEWAY_PF_ANCHOR}`;
+const HOST_LOCAL_GATEWAY_PF_RDR_ANCHOR_LINE = `rdr-anchor "${HOST_LOCAL_GATEWAY_PF_ANCHOR}"`;
+const HOST_LOCAL_GATEWAY_PF_LOAD_ANCHOR_LINE = `load anchor "${HOST_LOCAL_GATEWAY_PF_ANCHOR}" from "${HOST_LOCAL_GATEWAY_PF_ANCHOR_PATH}"`;
+const HOST_LOCAL_GATEWAY_PF_LEGACY_ANCHOR_LINE = `anchor "${HOST_LOCAL_GATEWAY_PF_ANCHOR}"`;
+const HOST_LOCAL_GATEWAY_PF_MARKER = "# Port Manager host-local gateway redirect";
 // The control-plane owner is the only VS Code extension host allowed to run
 // automatic Docker/terminal discovery, generated-file repair, and hook env
 // collection refresh. Other windows stay read-only unless the user triggers an
@@ -174,6 +189,8 @@ const FORCED_COMPOSE_RECONCILE_COALESCE_MS = 750;
 const TERMINAL_NETWORK_SERVICE_ENTRY_SEPARATOR = " || ";
 const BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS = 5_000;
 const BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS = 1_000;
+const BROWSER_PROXY_ROUTE_HINT_CACHE_TTL_MS = 30_000;
+const BROWSER_PROXY_ROUTE_HINT_MISS_CACHE_TTL_MS = 5_000;
 const execFileAsync = promisify(execFile);
 
 export interface BindingPresetSummary {
@@ -227,6 +244,7 @@ interface NetworkDnsRecord {
   readonly networkId: string;
   readonly networkName: string;
   readonly hostname: string;
+  readonly secureHostname: string;
   readonly address: string;
 }
 
@@ -237,6 +255,8 @@ interface LogicalRouterOwnerDocument {
   readonly focusPid?: number;
   /** User-facing title recorded by the owner window for worker diagnostics. */
   readonly title?: string;
+  /** Workspace or folder URI used as a fallback when OS-level focus cannot find the owner window. */
+  readonly workspaceUri?: string;
   /** Lease renewal time; stale leases can be stolen by another active window. */
   readonly updatedAt: string;
 }
@@ -351,6 +371,22 @@ interface BrowserProxyCommandTextCacheEntry {
   readonly commandText: string | undefined;
   /** Wall-clock deadline; process command text is cheap to refresh but noisy in bursts. */
   readonly expiresAtMs: number;
+}
+
+interface BrowserProxyRouteHintCacheEntry {
+  /** Cached cwd-derived dev-server hints used when daemon process rows lag behind route files. */
+  readonly hintText: string | undefined;
+  /** Wall-clock deadline; route hints are filesystem metadata and should stay cheap in refresh loops. */
+  readonly expiresAtMs: number;
+}
+
+interface HostLocalGatewayRedirect {
+  /** Logical client port that hookless host processes continue to call. */
+  readonly port: number;
+  /** Selected logical network for host fallback. */
+  readonly networkId: string;
+  /** Invisible per-network gateway already proxying this logical port. */
+  readonly targetAddress: string;
 }
 
 /** 
@@ -485,14 +521,26 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Hot-path index for browser proxy requests; rebuilt when the daemon snapshot object changes. */
   private browserProxyRouteTargetByEndpointId = new Map<string, BrowserNetworkProxyTarget>();
 
+  /** Route-file fallback targets used while the daemon snapshot is stale or incomplete. */
+  private browserProxyGeneratedRouteTargetByEndpointId = new Map<string, BrowserNetworkProxyTarget>();
+
   /** Short-lived PID command cache used by browser proxy sync classification. */
   private readonly browserProxyProcessCommandTextCache = new Map<number, BrowserProxyCommandTextCacheEntry>();
+
+  /** Short-lived cwd hint cache used to classify route-file web endpoints. */
+  private readonly browserProxyRouteHintTextCache = new Map<string, BrowserProxyRouteHintCacheEntry>();
 
   /** Guards privileged resolver installation so duplicate UI/registry events cannot stack prompts. */
   private browserDnsResolverInstallInFlight: Promise<BrowserDnsResolverStatus> | undefined;
 
   /** Last missing-resolver signature that already triggered an automatic admin prompt. */
   private browserDnsAutoInstallSignature: string | undefined;
+
+  /** Last host-local redirect signature that already triggered an automatic admin prompt. */
+  private hostLocalGatewayRedirectInstallSignature: string | undefined;
+
+  /** Guards privileged pf updates so route refresh bursts cannot stack admin prompts. */
+  private hostLocalGatewayRedirectInstallInFlight: Promise<void> | undefined;
 
   /** Serializes terminal picker rewrites so stale snapshots cannot win the last write. */
   private terminalNetworkSelectionWriteInFlight: Promise<void> | undefined;
@@ -586,6 +634,10 @@ export class PortManagerNetworkService implements DisposableLike {
     );
     this.browserNetworkProxy = new BrowserNetworkProxyManager({
       resolve: (endpoint) => this.resolveBrowserNetworkProxyTarget(endpoint),
+    }, {
+      tlsCredentials: {
+        getCredentials: () => readBrowserTlsCredentials(),
+      },
     });
     const nativeProcessLookupPath = this.context.asAbsolutePath(getProcessLookupHelperRelativePath());
     this.tcpConnectionProcessResolver = new NodeTcpConnectionProcessResolver({
@@ -657,6 +709,7 @@ export class PortManagerNetworkService implements DisposableLike {
           if (this.ownsControlPlaneLease) {
             void this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
             void this.writeTerminalNetworkSelectionFile();
+            void this.syncBrowserNetworkProxies();
           } else {
             this.applyVscodeWindowTerminalEnvironment();
           }
@@ -740,6 +793,9 @@ export class PortManagerNetworkService implements DisposableLike {
      * and Compose repair work so a cold VS Code launch can route immediately
      * instead of waiting for the slower control-plane reconciliation path.
      */
+    await this.startBrowserDnsServer();
+    this.syncBrowserDnsRecords();
+    void this.maybeAutoInstallBrowserDnsResolvers();
     await this.convergeDaemonAndRoutingState();
     await this.syncLogicalPortRouters();
     this.startRoutingSignalRefreshLoop();
@@ -754,9 +810,6 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.reconcileComposeAttachmentPublishedPorts({ force: true });
     await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });
     await this.writeTerminalNetworkSelectionFile();
-    await this.startBrowserDnsServer();
-    this.syncBrowserDnsRecords();
-    void this.maybeAutoInstallBrowserDnsResolvers();
     await this.refreshTerminals();
     void this.refreshContainerServices({ background: true });
     await this.syncLogicalPortRouters();
@@ -857,6 +910,7 @@ export class PortManagerNetworkService implements DisposableLike {
       ownerPid: owner?.pid,
       ownerFocusPid: owner?.focusPid,
       ownerTitle: owner?.title,
+      ownerWorkspaceUri: owner?.workspaceUri,
       ownerActive,
       ownerUpdatedAt: owner?.updatedAt,
       leaseExpiresAt,
@@ -880,7 +934,11 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     const processRows = await this.processTableProvider.list().catch(() => []);
-    return focusOwnerWindowByPid(controlPlane.ownerPid, controlPlane.ownerFocusPid, processRows);
+    if (await focusOwnerWindowByPid(controlPlane.ownerPid, controlPlane.ownerFocusPid, processRows)) {
+      return true;
+    }
+
+    return openControlPlaneOwnerWorkspace(controlPlane.ownerWorkspaceUri);
   }
 
   /** Returns daemon status when process service is available for the sidebar. */
@@ -913,14 +971,9 @@ export class PortManagerNetworkService implements DisposableLike {
     return endpoint === undefined ? undefined : formatBrowserNetworkProxyUrl(endpoint);
   }
 
-  /** Opens Port Manager local browser URLs with Chrome's secure-context override, then falls back to VS Code. */
+  /** Opens Port Manager browser URLs through the platform default browser. */
   async openBrowserUrl(url: string): Promise<void> {
-    const opened = await openUrlWithSecureLocalOrigin(url, {
-      userDataRoot: path.join(this.context.globalStorageUri.fsPath, "secure-browser-profiles"),
-    }).catch(() => false);
-    if (!opened) {
-      await vscode.env.openExternal(vscode.Uri.parse(url));
-    }
+    await vscode.env.openExternal(vscode.Uri.parse(url));
   }
 
   /** Builds a sudo shell script that points macOS single-label resolvers at Port Manager DNS. */
@@ -981,13 +1034,19 @@ export class PortManagerNetworkService implements DisposableLike {
       return status;
     }
 
-    await runShellScriptWithAdministratorPrivileges(buildBrowserDnsResolverSetupScript(status.records, status.dnsPort));
+    await runShellScriptWithAdministratorPrivileges(
+      buildBrowserDnsResolverSetupScript(
+        status.records,
+        status.dnsPort,
+      ),
+    );
+    await trustBrowserTlsCertificateForCurrentUser();
     this.localChangeEvents.emit();
     this.browserNetworkProxy.retryFailedEndpointsNow();
     await this.syncBrowserNetworkProxies().catch(() => undefined);
 
     if (options.automatic === true) {
-      void vscode.window.showInformationMessage("Port Manager browser DNS aliases installed.");
+      void vscode.window.showInformationMessage("Port Manager browser DNS aliases and dev TLS certificate installed.");
     }
 
     return this.getBrowserDnsResolverStatus();
@@ -1005,7 +1064,17 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const signature = status.records
       .filter((record) => !record.configured)
-      .map((record) => `${record.hostname}:${record.address}:${status.dnsPort}`)
+      .map((record) =>
+        [
+          record.hostname,
+          record.address,
+          status.dnsPort,
+          record.resolverConfigured ? "resolver-ok" : "resolver-missing",
+          record.loopbackAliasConfigured ? "loopback-ok" : "loopback-missing",
+          record.hostsConfigured ? "hosts-ok" : "hosts-missing",
+          record.tlsConfigured ? "tls-ok" : "tls-missing",
+        ].join(":"),
+      )
       .sort()
       .join("|");
     if (signature.length === 0 || this.browserDnsAutoInstallSignature === signature) {
@@ -1037,7 +1106,7 @@ export class PortManagerNetworkService implements DisposableLike {
     networks: readonly LogicalNetwork[],
   ): readonly NetworkDnsRecord[] {
     const records = buildBrowserDnsRecords(networks);
-    this.browserDnsServer.sync(records);
+    this.browserDnsServer.sync(expandBrowserDnsServerRecords(records));
     return records;
   }
 
@@ -1385,6 +1454,7 @@ export class PortManagerNetworkService implements DisposableLike {
     };
     this.vscodeWindowTerminalBinding = updatedBinding;
     this.saveVscodeWindowTerminalBinding();
+    await this.syncBrowserNetworkProxies().catch(() => undefined);
     this.localChangeEvents.emit();
 
     return {
@@ -1402,6 +1472,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const detachedTerminalCount = sendCommandToOpenVscodeTerminals(this.buildTerminalDetachScript());
     await this.refreshTerminals().catch(() => []);
+    await this.syncBrowserNetworkProxies().catch(() => undefined);
 
     this.localChangeEvents.emit();
     return {
@@ -3705,9 +3776,10 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Resolves the common browser proxy path from the current daemon snapshot without async refresh work. */
   private findBrowserProxyRouteTarget(networkId: string, logicalPort: number): BrowserNetworkProxyTarget | undefined {
+    const endpointId = browserNetworkProxyEndpointId(networkId, logicalPort);
     const snapshot = this.processService?.getSnapshot();
     if (snapshot === undefined) {
-      return undefined;
+      return this.browserProxyGeneratedRouteTargetByEndpointId.get(endpointId);
     }
 
     if (snapshot !== this.browserProxyRouteTargetSnapshot) {
@@ -3715,7 +3787,10 @@ export class PortManagerNetworkService implements DisposableLike {
       this.browserProxyRouteTargetByEndpointId = buildBrowserProxyRouteTargetIndex(snapshot.routes);
     }
 
-    return this.browserProxyRouteTargetByEndpointId.get(browserNetworkProxyEndpointId(networkId, logicalPort));
+    return (
+      this.browserProxyRouteTargetByEndpointId.get(endpointId) ??
+      this.browserProxyGeneratedRouteTargetByEndpointId.get(endpointId)
+    );
   }
 
   /**
@@ -3903,18 +3978,69 @@ export class PortManagerNetworkService implements DisposableLike {
       await ensureBrowserDnsLoopbackAliasesReady(dnsRecords).catch(() => undefined);
     }
 
+    const routes = mergeLogicalPortRoutes(
+      snapshot?.routes ?? [],
+      await this.readGeneratedRouteTableRoutesForNetworks(networks).catch(() => []),
+    );
     const processCommandTextByPid = await this.readBrowserProxyProcessCommandTexts(snapshot?.processes ?? []);
-    const endpoints = collectBrowserProxyEndpoints(
+    const processEndpoints = collectBrowserProxyEndpoints(
       snapshot?.processes ?? [],
       networks,
       dnsRunning,
       processCommandTextByPid,
     );
+    const routeHintTextByEndpointId = await this.readBrowserProxyRouteHintTexts(routes);
+    const endpoints = mergeBrowserProxyEndpoints(
+      processEndpoints,
+      collectBrowserProxyRouteEndpoints(routes, networks, dnsRunning, routeHintTextByEndpointId, processEndpoints),
+    );
+    this.browserProxyGeneratedRouteTargetByEndpointId = buildBrowserProxyRouteTargetIndex(routes);
+    const hostLocalGatewayPorts = new Set(readPortManagerSettings().fixedProtocolPorts);
+    const hostGatewayExposures = collectHostGatewayExposures(
+      routes,
+      networks,
+      endpoints,
+      registrySnapshot.composeAttachments,
+    );
+    const hostLocalGatewayRedirects = selectHostLocalGatewayRedirects(
+      hostGatewayExposures,
+      networks,
+      hostLocalGatewayPorts,
+      this.vscodeWindowTerminalBinding?.status === "attached" ? this.vscodeWindowTerminalBinding.networkId : undefined,
+    );
 
+    await this.releaseHostGatewayPortsForBrowserEndpoints(endpoints).catch(() => undefined);
     await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);
-    await this.syncHostGatewayProxies(
-      collectHostGatewayExposures(snapshot?.routes ?? [], networks, endpoints, registrySnapshot.composeAttachments),
-    ).catch(() => undefined);
+    await this.syncHostGatewayProxies(hostGatewayExposures).catch(() => undefined);
+    void this.syncHostLocalGatewayRedirects(hostLocalGatewayRedirects);
+  }
+
+  /**
+   * Browser endpoints own HTTP(S) alias ports. Older versions could leave a raw
+   * native host-gateway helper on the same loopback IP and port, so reclaim that
+   * concrete listener before the HTTPS browser proxy attempts to bind.
+   */
+  private async releaseHostGatewayPortsForBrowserEndpoints(
+    endpoints: readonly BrowserNetworkProxyEndpoint[],
+  ): Promise<void> {
+    const reclaimedNativeEndpoints = new Set<string>();
+
+    for (const endpoint of endpoints) {
+      const hostGatewayId = hostGatewayExposureId(endpoint.networkId, endpoint.logicalPort);
+      if (this.hostGatewayExposureIds.delete(hostGatewayId)) {
+        await this.hostGatewayProxy.close(hostGatewayId).catch(() => undefined);
+      }
+
+      for (const listenPort of endpoint.listenPorts) {
+        const nativeEndpointKey = `${endpoint.listenHost}:${listenPort}`;
+        if (reclaimedNativeEndpoints.has(nativeEndpointKey)) {
+          continue;
+        }
+
+        reclaimedNativeEndpoints.add(nativeEndpointKey);
+        await this.hostGatewayProxy.reclaimNativeEndpoint(endpoint.listenHost, listenPort).catch(() => undefined);
+      }
+    }
   }
 
   /** Keeps DNS-alias TCP gateways open for non-HTTP network ports. */
@@ -3938,6 +4064,40 @@ export class PortManagerNetworkService implements DisposableLike {
         () => undefined,
       );
     }
+  }
+
+  /**
+   * Installs macOS packet redirects for hookless host clients. This never binds
+   * 127.0.0.1:port; it only rewrites outbound loopback connect packets to the
+   * already-open invisible network gateway, so server listen calls stay free.
+   */
+  private async syncHostLocalGatewayRedirects(redirects: readonly HostLocalGatewayRedirect[]): Promise<void> {
+    if (process.platform !== "darwin") {
+      return;
+    }
+
+    if (this.hostLocalGatewayRedirectInstallInFlight !== undefined) {
+      return this.hostLocalGatewayRedirectInstallInFlight;
+    }
+
+    const signature = hostLocalGatewayRedirectSignature(redirects);
+    if (isHostLocalGatewayRedirectAnchorCurrent(redirects)) {
+      this.hostLocalGatewayRedirectInstallSignature = undefined;
+      return;
+    }
+
+    if (this.hostLocalGatewayRedirectInstallSignature === signature) {
+      return;
+    }
+    this.hostLocalGatewayRedirectInstallSignature = signature;
+
+    this.hostLocalGatewayRedirectInstallInFlight = runShellScriptWithAdministratorPrivileges(
+      buildHostLocalGatewayRedirectSetupScript(redirects),
+    ).finally(() => {
+      this.hostLocalGatewayRedirectInstallInFlight = undefined;
+    });
+
+    await this.hostLocalGatewayRedirectInstallInFlight.catch(() => undefined);
   }
 
   /** Wrapper-launched dev servers can register as `node`; inspect argv before classifying browser routes. */
@@ -3984,6 +4144,97 @@ export class PortManagerNetworkService implements DisposableLike {
         this.browserProxyProcessCommandTextCache.delete(pid);
       }
     }
+  }
+
+  /**
+   * Reads daemon-published route shards as a fallback signal for browser DNS
+   * proxies. The daemon socket snapshot is preferred, but under high load it
+   * can lag behind the native route files that already describe live listeners.
+   */
+  private async readGeneratedRouteTableRoutesForNetworks(
+    networks: readonly LogicalNetwork[],
+  ): Promise<readonly LogicalPortRoute[]> {
+    if (networks.length === 0) {
+      return [];
+    }
+
+    const baseRouteTablePath = getDefaultRouteTablePath();
+    const routeTableDirectory = path.dirname(baseRouteTablePath);
+    const filePaths = new Set<string>();
+
+    for (const network of networks) {
+      const networkRouteTablePath = getRouteTablePathForNetwork(network.id, baseRouteTablePath);
+      const parsedPath = path.parse(networkRouteTablePath);
+      const extension = parsedPath.ext.length > 0 ? parsedPath.ext : ".json";
+      const portShardPrefix = `${parsedPath.name}-port-`;
+
+      filePaths.add(networkRouteTablePath);
+
+      const entries = await fs.readdir(routeTableDirectory, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (entry.isFile() && entry.name.startsWith(portShardPrefix) && entry.name.endsWith(extension)) {
+          filePaths.add(path.join(routeTableDirectory, entry.name));
+        }
+      }
+    }
+
+    const routes: LogicalPortRoute[] = [];
+    for (const filePath of filePaths) {
+      routes.push(...(await readGeneratedRouteTableRoutes(filePath)));
+    }
+
+    return routes;
+  }
+
+  /** Builds cwd-derived browser endpoint hints for live route rows that have no managed process row yet. */
+  private async readBrowserProxyRouteHintTexts(
+    routes: readonly LogicalPortRoute[],
+  ): Promise<ReadonlyMap<string, string>> {
+    const nowMs = Date.now();
+    const routeByEndpointId = new Map<string, LogicalPortRoute>();
+    const activeCwds = new Set<string>();
+
+    for (const route of routes) {
+      if (route.networkId === undefined || route.cwd === undefined || !isLiveListenRoute(route) || !isTcpPort(route.logicalPort)) {
+        continue;
+      }
+
+      activeCwds.add(route.cwd);
+      routeByEndpointId.set(browserNetworkProxyEndpointId(route.networkId, route.logicalPort), route);
+    }
+
+    for (const [cwd, entry] of this.browserProxyRouteHintTextCache) {
+      if (!activeCwds.has(cwd) || entry.expiresAtMs <= nowMs) {
+        this.browserProxyRouteHintTextCache.delete(cwd);
+      }
+    }
+
+    const entries = await Promise.all(
+      [...routeByEndpointId.entries()].map(async ([endpointId, route]) => {
+        const hintText = await this.readBrowserProxyRouteHintText(route.cwd!);
+        const text = [route.processName, route.cwd, hintText].filter((part): part is string => part !== undefined).join(" ");
+        return [endpointId, text] as const;
+      }),
+    );
+
+    return new Map(entries);
+  }
+
+  /** Reads generic project metadata that identifies a route row as a browser dev server. */
+  private async readBrowserProxyRouteHintText(cwd: string): Promise<string | undefined> {
+    const cached = this.browserProxyRouteHintTextCache.get(cwd);
+    if (cached !== undefined && cached.expiresAtMs > Date.now()) {
+      return cached.hintText;
+    }
+
+    const hintText = await readBrowserProxyRouteHintText(cwd).catch(() => undefined);
+    this.browserProxyRouteHintTextCache.set(cwd, {
+      hintText,
+      expiresAtMs:
+        Date.now() + (hintText === undefined ? BROWSER_PROXY_ROUTE_HINT_MISS_CACHE_TTL_MS : BROWSER_PROXY_ROUTE_HINT_CACHE_TTL_MS),
+    });
+
+    return hintText;
   }
 
   /**
@@ -6602,6 +6853,76 @@ function findMatchingRoute(
   );
 }
 
+function mergeLogicalPortRoutes(
+  primaryRoutes: readonly LogicalPortRoute[],
+  fallbackRoutes: readonly LogicalPortRoute[],
+): readonly LogicalPortRoute[] {
+  const routes = new Map<string, LogicalPortRoute>();
+  for (const route of primaryRoutes) {
+    routes.set(logicalRouteIdentity(route), route);
+  }
+  for (const route of fallbackRoutes) {
+    const identity = logicalRouteIdentity(route);
+    if (!routes.has(identity)) {
+      routes.set(identity, route);
+    }
+  }
+
+  return [...routes.values()];
+}
+
+function logicalRouteIdentity(route: Pick<LogicalPortRoute, "networkId" | "logicalPort" | "routeDirection">): string {
+  return `${route.networkId ?? ""}:${route.logicalPort}:${route.routeDirection === "send" ? "send" : "listen"}`;
+}
+
+async function readGeneratedRouteTableRoutes(filePath: string): Promise<readonly LogicalPortRoute[]> {
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(await fs.readFile(filePath, "utf8"));
+  } catch {
+    return [];
+  }
+
+  const document = parsed as {
+    readonly expiresAtMs?: unknown;
+    readonly routes?: unknown;
+  };
+
+  if (
+    typeof document.expiresAtMs === "number" &&
+    Number.isFinite(document.expiresAtMs) &&
+    Date.now() > document.expiresAtMs + routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS)
+  ) {
+    return [];
+  }
+
+  if (!Array.isArray(document.routes)) {
+    return [];
+  }
+
+  return document.routes.filter(isLogicalPortRoute);
+}
+
+function isLogicalPortRoute(value: unknown): value is LogicalPortRoute {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const route = value as Partial<LogicalPortRoute>;
+  return (
+    isTcpPort(route.logicalPort as number) &&
+    isTcpPort(route.actualPort as number) &&
+    typeof route.host === "string" &&
+    typeof route.status === "string" &&
+    typeof route.source === "string" &&
+    (route.networkId === undefined || typeof route.networkId === "string") &&
+    (route.routeDirection === undefined || route.routeDirection === "listen" || route.routeDirection === "send") &&
+    (route.cwd === undefined || typeof route.cwd === "string") &&
+    (route.processName === undefined || typeof route.processName === "string")
+  );
+}
+
 /** Builds a stable first-match index matching findMatchingRoute's route precedence. */
 function buildBrowserProxyRouteTargetIndex(
   routes: readonly LogicalPortRoute[],
@@ -6758,6 +7079,60 @@ function collectBrowserProxyEndpoints(
   return [...endpoints.values()];
 }
 
+function collectBrowserProxyRouteEndpoints(
+  routes: readonly LogicalPortRoute[],
+  networks: readonly LogicalNetwork[],
+  useDnsAlias: boolean,
+  routeHintTextByEndpointId: ReadonlyMap<string, string>,
+  processEndpoints: readonly BrowserNetworkProxyEndpoint[],
+): readonly BrowserNetworkProxyEndpoint[] {
+  const endpoints = new Map<string, BrowserNetworkProxyEndpoint>();
+  const processEndpointIds = new Set(processEndpoints.map((endpoint) => endpoint.id));
+  const networkIds = new Set(networks.map((network) => network.id));
+
+  for (const route of routes) {
+    if (
+      route.networkId === undefined ||
+      !networkIds.has(route.networkId) ||
+      !isLiveListenRoute(route) ||
+      !isTcpPort(route.logicalPort)
+    ) {
+      continue;
+    }
+
+    const endpointId = browserNetworkProxyEndpointId(route.networkId, route.logicalPort);
+    if (processEndpointIds.has(endpointId) || endpoints.has(endpointId)) {
+      continue;
+    }
+
+    const hintText = routeHintTextByEndpointId.get(endpointId) ?? "";
+    if (!isPublicWebEntrypointText(`${route.processName ?? ""} ${route.cwd ?? ""} ${hintText}`)) {
+      continue;
+    }
+
+    endpoints.set(endpointId, buildBrowserProxyRouteEndpoint(route, route.networkId, networks, useDnsAlias));
+  }
+
+  return [...endpoints.values()];
+}
+
+function mergeBrowserProxyEndpoints(
+  primary: readonly BrowserNetworkProxyEndpoint[],
+  fallback: readonly BrowserNetworkProxyEndpoint[],
+): BrowserNetworkProxyEndpoint[] {
+  const endpoints = new Map<string, BrowserNetworkProxyEndpoint>();
+  for (const endpoint of primary) {
+    endpoints.set(endpoint.id, endpoint);
+  }
+  for (const endpoint of fallback) {
+    if (!endpoints.has(endpoint.id)) {
+      endpoints.set(endpoint.id, endpoint);
+    }
+  }
+
+  return [...endpoints.values()];
+}
+
 function collectHostGatewayExposures(
   routes: readonly LogicalPortRoute[],
   networks: readonly LogicalNetwork[],
@@ -6835,6 +7210,53 @@ function hostGatewayExposureId(networkId: string, logicalPort: number): string {
   return `host-gateway:${networkId}:${logicalPort}`;
 }
 
+function selectHostLocalGatewayRedirects(
+  exposures: readonly HostPortExposure[],
+  networks: readonly LogicalNetwork[],
+  hostLocalGatewayPorts: ReadonlySet<number>,
+  preferredHostDefaultNetworkId: string | undefined,
+): readonly HostLocalGatewayRedirect[] {
+  const exposuresByPort = new Map<number, HostPortExposure[]>();
+
+  for (const exposure of exposures) {
+    const existing = exposuresByPort.get(exposure.hostPort);
+    if (existing === undefined) {
+      exposuresByPort.set(exposure.hostPort, [exposure]);
+    } else {
+      existing.push(exposure);
+    }
+  }
+
+  const redirects: HostLocalGatewayRedirect[] = [];
+  for (const [hostPort, portExposures] of exposuresByPort) {
+    if (!hostLocalGatewayPorts.has(hostPort)) {
+      continue;
+    }
+
+    const exposure = selectHostDefaultGatewayExposure(portExposures, {
+      networks,
+      preferredNetworkId: preferredHostDefaultNetworkId,
+    });
+    if (exposure === undefined) {
+      continue;
+    }
+
+    /*
+     * Hookless host processes have no network identity. We route only connect
+     * packets for known client protocol ports to an invisible network gateway.
+     * Web/app listen ports are deliberately excluded so Port Manager cannot
+     * occupy localhost before Django, Daphne, Vite, or similar servers bind.
+     */
+    redirects.push({
+      port: hostPort,
+      networkId: exposure.networkId,
+      targetAddress: exposure.hostAddress,
+    });
+  }
+
+  return redirects.sort((left, right) => left.port - right.port || left.networkId.localeCompare(right.networkId));
+}
+
 function isBrowserProxyProcess(
   process: ManagedProcess,
   networks: readonly LogicalNetwork[],
@@ -6872,6 +7294,12 @@ function isPublicWebEntrypointProcess(process: ManagedProcess, processCommandTex
    * worker listener. Keep this as a positive classifier so backend ports remain
    * available through routing without taking browser cookie/DNS slots.
    */
+  return isPublicWebEntrypointText(text);
+}
+
+function isPublicWebEntrypointText(text: string): boolean {
+  const normalizedText = text.toLowerCase();
+
   return [
     /\bvite\b/,
     /\bnext\s+dev\b/,
@@ -6888,7 +7316,100 @@ function isPublicWebEntrypointProcess(process: ManagedProcess, processCommandTex
     /\bdaphne\b/,
     /\buvicorn\b/,
     /\bgunicorn\b/,
-  ].some((pattern) => pattern.test(text));
+  ].some((pattern) => pattern.test(normalizedText));
+}
+
+async function readBrowserProxyRouteHintText(cwd: string): Promise<string | undefined> {
+  const hints: string[] = [];
+
+  const packageJsonText = await readSmallTextFile(path.join(cwd, "package.json"));
+  if (packageJsonText !== undefined) {
+    hints.push(extractPackageBrowserRouteHints(packageJsonText));
+  }
+
+  for (const fileName of [
+    "vite.config.js",
+    "vite.config.mjs",
+    "vite.config.cjs",
+    "vite.config.ts",
+    "next.config.js",
+    "next.config.mjs",
+    "nuxt.config.js",
+    "nuxt.config.ts",
+    "astro.config.js",
+    "astro.config.mjs",
+    "astro.config.ts",
+    "svelte.config.js",
+    "webpack.config.js",
+    "vue.config.js",
+    "manage.py",
+  ]) {
+    if (await fileExists(path.join(cwd, fileName))) {
+      hints.push(fileName);
+    }
+  }
+
+  const pyprojectText = await readSmallTextFile(path.join(cwd, "pyproject.toml"));
+  if (pyprojectText !== undefined && /\b(django|uvicorn|gunicorn|daphne)\b/i.test(pyprojectText)) {
+    hints.push(pyprojectText);
+  }
+
+  const normalizedHints = hints.map((hint) => hint.trim()).filter((hint) => hint.length > 0);
+  return normalizedHints.length === 0 ? undefined : normalizedHints.join(" ");
+}
+
+function extractPackageBrowserRouteHints(packageJsonText: string): string {
+  try {
+    const packageJson = JSON.parse(packageJsonText) as {
+      readonly scripts?: unknown;
+      readonly dependencies?: unknown;
+      readonly devDependencies?: unknown;
+    };
+    const hints: string[] = [];
+
+    for (const value of Object.values(isRecord(packageJson.scripts) ? packageJson.scripts : {})) {
+      if (typeof value === "string") {
+        hints.push(value);
+      }
+    }
+
+    for (const dependencyBlock of [packageJson.dependencies, packageJson.devDependencies]) {
+      if (!isRecord(dependencyBlock)) {
+        continue;
+      }
+      hints.push(...Object.keys(dependencyBlock));
+    }
+
+    return hints.join(" ");
+  } catch {
+    return packageJsonText;
+  }
+}
+
+async function readSmallTextFile(filePath: string): Promise<string | undefined> {
+  try {
+    const stats = await fs.stat(filePath);
+    if (!stats.isFile() || stats.size > 128_000) {
+      return undefined;
+    }
+
+    return await fs.readFile(filePath, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    const stats = await fs.stat(filePath);
+    return stats.isFile();
+  } catch {
+    return false;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function buildBrowserProxyEndpoint(
@@ -6900,6 +7421,7 @@ function buildBrowserProxyEndpoint(
   const listenPorts =
     fallbackPort === process.requestedPort ? [process.requestedPort] : [process.requestedPort, fallbackPort];
   const publicHost = useDnsAlias ? browserPublicHostForNetwork(process.networkId, networks) : undefined;
+  const publicProtocol = browserProxyPublicProtocol(networks, useDnsAlias);
 
   return {
     id: browserNetworkProxyEndpointId(process.networkId, process.requestedPort),
@@ -6907,8 +7429,42 @@ function buildBrowserProxyEndpoint(
     logicalPort: process.requestedPort,
     listenHost: browserLoopbackAddressForNetwork(process.networkId),
     ...(publicHost === undefined ? {} : { publicHost }),
+    publicProtocol,
     listenPorts,
   };
+}
+
+function buildBrowserProxyRouteEndpoint(
+  route: LogicalPortRoute,
+  networkId: string,
+  networks: readonly LogicalNetwork[],
+  useDnsAlias: boolean,
+): BrowserNetworkProxyEndpoint {
+  const fallbackPort = browserNetworkProxyFallbackPort(route.logicalPort);
+  const listenPorts = fallbackPort === route.logicalPort ? [route.logicalPort] : [route.logicalPort, fallbackPort];
+  const publicHost = useDnsAlias ? browserPublicHostForNetwork(networkId, networks) : undefined;
+  const publicProtocol = browserProxyPublicProtocol(networks, useDnsAlias);
+
+  return {
+    id: browserNetworkProxyEndpointId(networkId, route.logicalPort),
+    networkId,
+    logicalPort: route.logicalPort,
+    listenHost: browserLoopbackAddressForNetwork(networkId),
+    ...(publicHost === undefined ? {} : { publicHost }),
+    publicProtocol,
+    listenPorts,
+  };
+}
+
+function browserProxyPublicProtocol(
+  networks: readonly LogicalNetwork[],
+  useDnsAlias: boolean,
+): BrowserNetworkProxyEndpoint["publicProtocol"] {
+  if (!useDnsAlias) {
+    return "http";
+  }
+
+  return isBrowserTlsCertificateConfigured(buildBrowserDnsRecords(networks)) ? "https" : "http";
 }
 
 function buildBrowserDnsRecords(networks: readonly LogicalNetwork[]): readonly NetworkDnsRecord[] {
@@ -6936,10 +7492,22 @@ function buildBrowserDnsRecords(networks: readonly LogicalNetwork[]): readonly N
         networkId: network.id,
         networkName: network.name,
         hostname,
+        secureHostname: browserSecureDnsHostname(hostname),
         address: browserLoopbackAddressForNetwork(network.id),
       };
     })
     .filter((record): record is NetworkDnsRecord => record !== undefined);
+}
+
+function browserSecureDnsHostname(hostname: string): string {
+  return `${hostname}.${BROWSER_SECURE_DNS_SUFFIX}`;
+}
+
+function expandBrowserDnsServerRecords(records: readonly NetworkDnsRecord[]): readonly { readonly hostname: string; readonly address: string }[] {
+  return records.flatMap((record) => [
+    { hostname: record.hostname, address: record.address },
+    { hostname: record.secureHostname, address: record.address },
+  ]);
 }
 
 function browserPublicHostForNetwork(networkId: string, networks: readonly LogicalNetwork[]): string | undefined {
@@ -6947,11 +7515,23 @@ function browserPublicHostForNetwork(networkId: string, networks: readonly Logic
   const address = browserLoopbackAddressForNetwork(networkId);
 
   const record = records.find((item) => item.address === address);
-  if (record === undefined || !isBrowserDnsResolverConfigured(record.hostname)) {
+  if (record === undefined) {
     return undefined;
   }
 
-  return record.hostname;
+  if (
+    isBrowserDnsResolverConfigured(record.hostname) ||
+    (isBrowserDnsHostsEntryConfigured(record.hostname, record.address) &&
+      isBrowserDnsOwnedHostsEntryCurrent(record.hostname, record.address))
+  ) {
+    return record.hostname;
+  }
+
+  if (isBrowserDnsResolverConfigured(BROWSER_SECURE_DNS_SUFFIX)) {
+    return record.secureHostname;
+  }
+
+  return undefined;
 }
 
 function isBrowserDnsResolverConfigured(hostname: string): boolean {
@@ -7131,6 +7711,125 @@ function isBrowserDnsLoopbackAliasConfigured(address: string): boolean {
   return isLoopbackAddressAliasConfigured(address);
 }
 
+function readBrowserTlsCredentials(): BrowserNetworkProxyTlsCredentials | undefined {
+  try {
+    return {
+      key: syncFs.readFileSync(BROWSER_TLS_SERVER_KEY_PATH),
+      cert: syncFs.readFileSync(BROWSER_TLS_SERVER_CERT_PATH),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+async function trustBrowserTlsCertificateForCurrentUser(): Promise<void> {
+  if (process.platform !== "darwin" || !syncFs.existsSync(BROWSER_TLS_CA_CERT_PATH)) {
+    return;
+  }
+
+  const homeDirectory = process.env.HOME?.trim();
+  if (homeDirectory === undefined || homeDirectory.length === 0) {
+    return;
+  }
+
+  const keychainPath = [
+    path.join(homeDirectory, "Library/Keychains/login.keychain-db"),
+    path.join(homeDirectory, "Library/Keychains/login.keychain"),
+  ].find((candidatePath) => syncFs.existsSync(candidatePath));
+  if (keychainPath === undefined) {
+    return;
+  }
+
+  try {
+    await execFileAsync(
+      "security",
+      ["add-trusted-cert", "-d", "-r", "trustRoot", "-k", keychainPath, BROWSER_TLS_CA_CERT_PATH],
+      { timeout: 30_000, maxBuffer: 256 * 1024 },
+    );
+  } catch (error) {
+    const output = trustRegistrationErrorText(error);
+    if (!/already exists/i.test(output)) {
+      throw new Error("Port Manager browser TLS CA trust registration failed.", { cause: error });
+    }
+  }
+}
+
+function trustRegistrationErrorText(error: unknown): string {
+  if (typeof error !== "object" || error === null) {
+    return String(error);
+  }
+
+  const record = error as { readonly stdout?: unknown; readonly stderr?: unknown; readonly message?: unknown };
+  return [record.stderr, record.stdout, record.message]
+    .filter((value): value is string => typeof value === "string")
+    .join("\n");
+}
+
+function isBrowserTlsCertificateConfigured(
+  records: readonly { readonly hostname: string; readonly secureHostname?: string }[],
+): boolean {
+  if (!syncFs.existsSync(BROWSER_TLS_SERVER_CERT_PATH) || !syncFs.existsSync(BROWSER_TLS_SERVER_KEY_PATH)) {
+    return false;
+  }
+
+  const expectedHostnames = new Set(buildBrowserTlsHostnames(records));
+  if (expectedHostnames.size === 0) {
+    return false;
+  }
+
+  let markerHostnames: Set<string>;
+  try {
+    markerHostnames = new Set(
+      syncFs
+        .readFileSync(BROWSER_TLS_HOSTNAMES_MARKER_PATH, "utf8")
+        .split(/\r?\n/)
+        .map((line) => normalizeBrowserTlsHostname(line))
+        .filter((hostname): hostname is string => hostname !== undefined),
+    );
+  } catch {
+    return false;
+  }
+
+  for (const hostname of expectedHostnames) {
+    if (!markerHostnames.has(hostname)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function buildBrowserTlsHostnames(
+  records: readonly { readonly hostname: string; readonly secureHostname?: string }[],
+): readonly string[] {
+  const hostnames = new Set<string>();
+  hostnames.add("localhost");
+
+  for (const record of records) {
+    const hostname = normalizeBrowserTlsHostname(record.hostname);
+    if (hostname !== undefined) {
+      hostnames.add(hostname);
+    }
+
+    const secureHostname =
+      record.secureHostname === undefined ? undefined : normalizeBrowserTlsHostname(record.secureHostname);
+    if (secureHostname !== undefined) {
+      hostnames.add(secureHostname);
+    }
+  }
+
+  return [...hostnames].sort();
+}
+
+function normalizeBrowserTlsHostname(hostname: string): string | undefined {
+  const normalized = hostname.trim().toLowerCase().replace(/^\[(.*)]$/, "$1");
+  if (normalized.length === 0 || normalized.includes(":") || normalized.includes("/")) {
+    return undefined;
+  }
+
+  return normalized;
+}
+
 /** Best-effort noninteractive preparation for browser-facing loopback aliases. */
 async function ensureBrowserDnsLoopbackAliasesReady(
   records: readonly { readonly address: string }[],
@@ -7168,6 +7867,7 @@ function buildBrowserDnsResolverStatus(
     readonly networkId: string;
     readonly networkName: string;
     readonly hostname: string;
+    readonly secureHostname: string;
     readonly address: string;
   }[],
   dnsPort: number,
@@ -7178,21 +7878,27 @@ function buildBrowserDnsResolverStatus(
   browserNetworkProxy: BrowserNetworkProxyManager,
 ): BrowserDnsResolverStatus {
   const supported = process.platform === "darwin";
+  const tlsConfigured = supported && isBrowserTlsCertificateConfigured(records);
   const recordStatuses = records.map((record) => {
-    const resolverConfigured = supported && isBrowserDnsResolverConfigured(record.hostname);
+    const resolverConfigured =
+      supported &&
+      isBrowserDnsResolverConfigured(record.hostname) &&
+      isBrowserDnsResolverConfigured(BROWSER_SECURE_DNS_SUFFIX);
     const loopbackAliasConfigured = supported && isBrowserDnsLoopbackAliasConfigured(record.address);
     const hostsConfigured =
       supported &&
       isBrowserDnsHostsEntryConfigured(record.hostname, record.address) &&
       isBrowserDnsOwnedHostsEntryCurrent(record.hostname, record.address);
+    const aliasRoutes = buildBrowserDnsAliasRouteStatus(record, processes, routes, networks, browserNetworkProxy);
 
     return {
       ...record,
-      configured: resolverConfigured && loopbackAliasConfigured && hostsConfigured,
+      configured: resolverConfigured && loopbackAliasConfigured && hostsConfigured && tlsConfigured,
       resolverConfigured,
       loopbackAliasConfigured,
       hostsConfigured,
-      routes: buildBrowserDnsAliasRouteStatus(record, processes, routes, networks, browserNetworkProxy),
+      tlsConfigured,
+      routes: aliasRoutes,
     };
   });
 
@@ -7210,6 +7916,7 @@ function buildBrowserDnsAliasRouteStatus(
   record: {
     readonly networkId: string;
     readonly hostname: string;
+    readonly secureHostname: string;
     readonly address: string;
   },
   processes: readonly ManagedProcess[],
@@ -7226,9 +7933,13 @@ function buildBrowserDnsAliasRouteStatus(
       const activeEndpoint = browserNetworkProxy.get(record.networkId, process.requestedPort);
       const proxyPort = activeEndpoint?.listenPort ?? endpoint.listenPorts[0] ?? process.requestedPort;
       const route = findMatchingRoute(routes, record.networkId, process.requestedPort);
+      const publicUrl = formatBrowserNetworkProxyUrl({
+        ...endpoint,
+        listenPort: proxyPort,
+      });
 
       return {
-        url: `http://${record.hostname}:${proxyPort}/`,
+        url: publicUrl,
         logicalPort: process.requestedPort,
         proxyHost: endpoint.listenHost,
         proxyPort,
@@ -7241,7 +7952,11 @@ function buildBrowserDnsAliasRouteStatus(
 }
 
 function buildBrowserDnsResolverSetupScript(
-  records: readonly { readonly hostname: string; readonly address: string }[],
+  records: readonly {
+    readonly hostname: string;
+    readonly secureHostname: string;
+    readonly address: string;
+  }[],
   dnsPort: number,
 ): string {
   const uniqueRecords = [...new Map(records.map((record) => [record.hostname, record])).values()];
@@ -7265,15 +7980,32 @@ function buildBrowserDnsResolverSetupScript(
       "PORTMANAGER_RESOLVER",
     );
   }
+  if (uniqueRecords.length > 0) {
+    lines.push(
+      `cat > ${shellQuote(path.join("/etc/resolver", BROWSER_SECURE_DNS_SUFFIX))} <<'PORTMANAGER_RESOLVER'`,
+      "# Port Manager browser DNS resolver",
+      `# *.${BROWSER_SECURE_DNS_SUFFIX} -> Port Manager browser DNS`,
+      "nameserver 127.0.0.1",
+      `port ${dnsPort}`,
+      "timeout 1",
+      "PORTMANAGER_RESOLVER",
+    );
+  }
+  appendLegacyBrowserDnsResolverCleanupLines(lines);
 
   appendBrowserDnsHostsInstallLines(lines, uniqueRecords);
+  appendBrowserTlsCertificateInstallLines(lines, uniqueRecords);
   lines.push("dscacheutil -flushcache >/dev/null 2>&1 || true");
   lines.push("killall -HUP mDNSResponder >/dev/null 2>&1 || true");
   return `${lines.join("\n")}\n`;
 }
 
 function buildBrowserDnsResolverCleanupScript(
-  records: readonly { readonly hostname: string; readonly address: string }[],
+  records: readonly {
+    readonly hostname: string;
+    readonly secureHostname: string;
+    readonly address: string;
+  }[],
 ): string {
   const uniqueRecords = [...new Map(records.map((record) => [record.hostname, record])).values()];
   const lines = ["#!/bin/sh", "set -eu"];
@@ -7287,11 +8019,146 @@ function buildBrowserDnsResolverCleanupScript(
       "fi",
     );
   }
+  const secureSuffixFilePath = path.join("/etc/resolver", BROWSER_SECURE_DNS_SUFFIX);
+  lines.push(
+    `if [ -f ${shellQuote(secureSuffixFilePath)} ] && grep -q '^# Port Manager browser DNS resolver$' ${shellQuote(secureSuffixFilePath)}; then`,
+    `  rm -f ${shellQuote(secureSuffixFilePath)}`,
+    "fi",
+  );
+  appendLegacyBrowserDnsResolverCleanupLines(lines);
 
   appendBrowserDnsHostsCleanupLines(lines);
   lines.push("dscacheutil -flushcache >/dev/null 2>&1 || true");
   lines.push("killall -HUP mDNSResponder >/dev/null 2>&1 || true");
   return `${lines.join("\n")}\n`;
+}
+
+function appendLegacyBrowserDnsResolverCleanupLines(lines: string[]): void {
+  for (const suffix of BROWSER_LEGACY_SECURE_DNS_SUFFIXES) {
+    const legacySuffixFilePath = path.join("/etc/resolver", suffix);
+    lines.push(
+      `if [ -f ${shellQuote(legacySuffixFilePath)} ] && grep -q '^# Port Manager browser DNS resolver$' ${shellQuote(legacySuffixFilePath)}; then`,
+      `  rm -f ${shellQuote(legacySuffixFilePath)}`,
+      "fi",
+    );
+  }
+}
+
+function buildHostLocalGatewayRedirectSetupScript(redirects: readonly HostLocalGatewayRedirect[]): string {
+  const uniqueRedirects = dedupeHostLocalGatewayRedirects(redirects);
+  const anchorBody = buildHostLocalGatewayRedirectAnchorBody(uniqueRedirects);
+  const lines = [
+    "#!/bin/sh",
+    "set -eu",
+    "mkdir -p /etc/pf.anchors",
+  ];
+
+  for (const redirect of uniqueRedirects) {
+    lines.push(
+      `if ! ifconfig lo0 2>/dev/null | grep -E ${shellQuote(`inet[[:space:]]+${redirect.targetAddress}([[:space:]]|$)`)} >/dev/null 2>&1; then`,
+      `  ifconfig lo0 alias ${shellQuote(redirect.targetAddress)} 255.255.255.255`,
+      "fi",
+    );
+  }
+
+  lines.push(
+    `cat > ${shellQuote(HOST_LOCAL_GATEWAY_PF_ANCHOR_PATH)} <<'PORTMANAGER_HOST_LOCAL_GATEWAY'`,
+    anchorBody.trimEnd(),
+    "PORTMANAGER_HOST_LOCAL_GATEWAY",
+  );
+  appendHostLocalGatewayPfConfigInstallLines(lines);
+  lines.push(
+    "pfctl -f /etc/pf.conf >/dev/null",
+    `pfctl -a ${shellQuote(HOST_LOCAL_GATEWAY_PF_ANCHOR)} -f ${shellQuote(HOST_LOCAL_GATEWAY_PF_ANCHOR_PATH)} >/dev/null`,
+    "pfctl -e >/dev/null 2>&1 || true",
+  );
+
+  return `${lines.join("\n")}\n`;
+}
+
+function buildHostLocalGatewayRedirectAnchorBody(redirects: readonly HostLocalGatewayRedirect[]): string {
+  const lines = [HOST_LOCAL_GATEWAY_PF_MARKER];
+  for (const redirect of dedupeHostLocalGatewayRedirects(redirects)) {
+    lines.push(
+      `rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port ${redirect.port} -> ${redirect.targetAddress} port ${redirect.port}`,
+    );
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+function isHostLocalGatewayRedirectAnchorCurrent(redirects: readonly HostLocalGatewayRedirect[]): boolean {
+  const expected = buildHostLocalGatewayRedirectAnchorBody(redirects).trim();
+  try {
+    const anchorCurrent = syncFs.readFileSync(HOST_LOCAL_GATEWAY_PF_ANCHOR_PATH, "utf8").trim() === expected;
+    return anchorCurrent && (redirects.length === 0 || isHostLocalGatewayRedirectMainConfigCurrent());
+  } catch {
+    return redirects.length === 0 && !isHostLocalGatewayRedirectMainConfigCurrent();
+  }
+}
+
+function appendHostLocalGatewayPfConfigInstallLines(lines: string[]): void {
+  lines.push(
+    `__pm_rdr_anchor=${shellQuote(HOST_LOCAL_GATEWAY_PF_RDR_ANCHOR_LINE)}`,
+    `__pm_load_anchor=${shellQuote(HOST_LOCAL_GATEWAY_PF_LOAD_ANCHOR_LINE)}`,
+    `__pm_legacy_anchor=${shellQuote(HOST_LOCAL_GATEWAY_PF_LEGACY_ANCHOR_LINE)}`,
+    'if ! grep -Fxq "$__pm_rdr_anchor" /etc/pf.conf || ! grep -Fxq "$__pm_load_anchor" /etc/pf.conf || grep -Fxq "$__pm_legacy_anchor" /etc/pf.conf; then',
+    '  __pm_pf_conf_tmp="$(mktemp /tmp/portmanager-pf.conf.XXXXXX)"',
+    "  awk -v rdr_anchor=\"$__pm_rdr_anchor\" -v load_anchor=\"$__pm_load_anchor\" -v legacy_anchor=\"$__pm_legacy_anchor\" '",
+    "    BEGIN { inserted = 0 }",
+    "    $0 == rdr_anchor || $0 == load_anchor || $0 == legacy_anchor { next }",
+    "    {",
+    "      print",
+    "      if (!inserted && $0 ~ /^rdr-anchor[[:space:]]/) {",
+    "        print rdr_anchor",
+    "        inserted = 1",
+    "      }",
+    "    }",
+    "    END {",
+    "      if (!inserted) {",
+    "        print rdr_anchor",
+    "      }",
+    "      print load_anchor",
+    "    }",
+    "  ' /etc/pf.conf > \"$__pm_pf_conf_tmp\"",
+    '  cat "$__pm_pf_conf_tmp" > /etc/pf.conf',
+    '  rm -f "$__pm_pf_conf_tmp"',
+    "fi",
+  );
+}
+
+function isHostLocalGatewayRedirectMainConfigCurrent(): boolean {
+  try {
+    const lines = syncFs.readFileSync("/etc/pf.conf", "utf8").split(/\r?\n/);
+    return (
+      lines.includes(HOST_LOCAL_GATEWAY_PF_RDR_ANCHOR_LINE) &&
+      lines.includes(HOST_LOCAL_GATEWAY_PF_LOAD_ANCHOR_LINE) &&
+      !lines.includes(HOST_LOCAL_GATEWAY_PF_LEGACY_ANCHOR_LINE)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function hostLocalGatewayRedirectSignature(redirects: readonly HostLocalGatewayRedirect[]): string {
+  return dedupeHostLocalGatewayRedirects(redirects)
+    .map((redirect) => `${redirect.port}:${redirect.networkId}:${redirect.targetAddress}`)
+    .join("|");
+}
+
+function dedupeHostLocalGatewayRedirects(
+  redirects: readonly HostLocalGatewayRedirect[],
+): readonly HostLocalGatewayRedirect[] {
+  const redirectsByPort = new Map<number, HostLocalGatewayRedirect>();
+  for (const redirect of redirects) {
+    if (!redirectsByPort.has(redirect.port)) {
+      redirectsByPort.set(redirect.port, redirect);
+    }
+  }
+
+  return [...redirectsByPort.values()].sort(
+    (left, right) => left.port - right.port || left.networkId.localeCompare(right.networkId),
+  );
 }
 
 function appendBrowserDnsHostsInstallLines(
@@ -7305,6 +8172,136 @@ function appendBrowserDnsHostsInstallLines(
     ...records.map((record) => `${record.address}\t${record.hostname}`),
     BROWSER_DNS_HOSTS_BLOCK_END,
     "PORTMANAGER_HOSTS",
+  );
+}
+
+function appendBrowserTlsCertificateInstallLines(
+  lines: string[],
+  records: readonly { readonly hostname: string; readonly secureHostname?: string }[],
+): void {
+  const hostnames = buildBrowserTlsHostnames(records);
+  if (hostnames.length === 0) {
+    return;
+  }
+
+  const currentUser = process.env.USER?.trim();
+  const sanLines = hostnames.map((hostname, index) => `DNS.${index + 1} = ${hostname}`);
+  const serverConfig = [
+    "[req]",
+    "prompt = no",
+    "distinguished_name = dn",
+    "req_extensions = v3_req",
+    "",
+    "[dn]",
+    "CN = Port Manager Development Browser Proxy",
+    "",
+    "[v3_req]",
+    "basicConstraints = critical,CA:FALSE",
+    "keyUsage = critical,digitalSignature,keyEncipherment",
+    "extendedKeyUsage = serverAuth",
+    "subjectAltName = @alt_names",
+    "",
+    "[alt_names]",
+    ...sanLines,
+    "IP.1 = 127.0.0.1",
+  ];
+  const caConfig = [
+    "[req]",
+    "prompt = no",
+    "distinguished_name = dn",
+    "x509_extensions = v3_ca",
+    "",
+    "[dn]",
+    "CN = Port Manager Development Root CA",
+    "",
+    "[v3_ca]",
+    "basicConstraints = critical,CA:TRUE,pathlen:0",
+    "keyUsage = critical,keyCertSign,cRLSign",
+    "subjectKeyIdentifier = hash",
+  ];
+
+  lines.push(
+    "# Port Manager browser TLS certificate",
+    `__pm_tls_dir=${shellQuote(BROWSER_TLS_DIRECTORY)}`,
+    `__pm_tls_ca_cert=${shellQuote(BROWSER_TLS_CA_CERT_PATH)}`,
+    `__pm_tls_ca_key=${shellQuote(BROWSER_TLS_CA_KEY_PATH)}`,
+    `__pm_tls_server_cert=${shellQuote(BROWSER_TLS_SERVER_CERT_PATH)}`,
+    `__pm_tls_server_key=${shellQuote(BROWSER_TLS_SERVER_KEY_PATH)}`,
+    `__pm_tls_hosts_file=${shellQuote(BROWSER_TLS_HOSTNAMES_MARKER_PATH)}`,
+    `__pm_tls_owner_user=${shellQuote(currentUser ?? "")}`,
+    'mkdir -p "$__pm_tls_dir"',
+    "if ! command -v openssl >/dev/null 2>&1; then",
+    "  echo 'Port Manager browser TLS setup requires openssl.' >&2",
+    "  exit 1",
+    "fi",
+    'if [ ! -f "$__pm_tls_ca_cert" ] || [ ! -f "$__pm_tls_ca_key" ]; then',
+    '  rm -f "$__pm_tls_ca_cert" "$__pm_tls_ca_key"',
+    '  __pm_tls_ca_conf="$__pm_tls_dir/root-ca.conf"',
+    "  cat > \"$__pm_tls_ca_conf\" <<'PORTMANAGER_TLS_CA_CONF'",
+    ...caConfig,
+    "PORTMANAGER_TLS_CA_CONF",
+    '  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -sha256 -keyout "$__pm_tls_ca_key" -out "$__pm_tls_ca_cert" -config "$__pm_tls_ca_conf" -extensions v3_ca',
+    "fi",
+    'if [ -n "$__pm_tls_owner_user" ]; then',
+    '  __pm_tls_owner_group=$(id -gn "$__pm_tls_owner_user" 2>/dev/null || printf staff)',
+    '  chown "$__pm_tls_owner_user:$__pm_tls_owner_group" "$__pm_tls_ca_cert" 2>/dev/null || true',
+    "fi",
+    'chmod 600 "$__pm_tls_ca_key" 2>/dev/null || true',
+    'chmod 644 "$__pm_tls_ca_cert" 2>/dev/null || true',
+    'cat > "$__pm_tls_hosts_file.tmp" <<\'PORTMANAGER_TLS_HOSTS\'',
+    ...hostnames,
+    "PORTMANAGER_TLS_HOSTS",
+    "__pm_tls_needs_leaf=1",
+    'if [ -f "$__pm_tls_server_cert" ] && [ -f "$__pm_tls_server_key" ] && [ -f "$__pm_tls_hosts_file" ] && cmp -s "$__pm_tls_hosts_file.tmp" "$__pm_tls_hosts_file"; then',
+    "  __pm_tls_needs_leaf=0",
+    "fi",
+    'if [ "$__pm_tls_needs_leaf" = "1" ]; then',
+    '  __pm_tls_server_conf="$__pm_tls_dir/server.conf"',
+    '  __pm_tls_server_csr="$__pm_tls_dir/server.csr"',
+    "  cat > \"$__pm_tls_server_conf\" <<'PORTMANAGER_TLS_SERVER_CONF'",
+    ...serverConfig,
+    "PORTMANAGER_TLS_SERVER_CONF",
+    '  openssl req -new -newkey rsa:2048 -nodes -sha256 -keyout "$__pm_tls_server_key" -out "$__pm_tls_server_csr" -config "$__pm_tls_server_conf"',
+    '  openssl x509 -req -in "$__pm_tls_server_csr" -CA "$__pm_tls_ca_cert" -CAkey "$__pm_tls_ca_key" -CAcreateserial -days 825 -sha256 -out "$__pm_tls_server_cert" -extfile "$__pm_tls_server_conf" -extensions v3_req',
+    '  mv "$__pm_tls_hosts_file.tmp" "$__pm_tls_hosts_file"',
+    '  rm -f "$__pm_tls_server_csr"',
+    "else",
+    '  rm -f "$__pm_tls_hosts_file.tmp"',
+    "fi",
+    'if [ -n "$__pm_tls_owner_user" ]; then',
+    '  __pm_tls_owner_group=$(id -gn "$__pm_tls_owner_user" 2>/dev/null || printf staff)',
+    '  chown "$__pm_tls_owner_user:$__pm_tls_owner_group" "$__pm_tls_server_cert" "$__pm_tls_server_key" "$__pm_tls_hosts_file" 2>/dev/null || true',
+    "fi",
+    'chmod 600 "$__pm_tls_server_key" 2>/dev/null || true',
+    'chmod 644 "$__pm_tls_server_cert" "$__pm_tls_hosts_file" 2>/dev/null || true',
+    '__pm_tls_trusted=0',
+    '__pm_tls_trust_error="$__pm_tls_dir/trust-error.log"',
+    'if security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$__pm_tls_ca_cert" 2>"$__pm_tls_trust_error"; then',
+    "  __pm_tls_trusted=1",
+    "elif grep -qi 'already exists' \"$__pm_tls_trust_error\"; then",
+    "  __pm_tls_trusted=1",
+    "fi",
+    'if [ "$__pm_tls_trusted" != "1" ] && [ -n "$__pm_tls_owner_user" ]; then',
+    '  __pm_tls_owner_home="$(dscl . -read "/Users/$__pm_tls_owner_user" NFSHomeDirectory 2>/dev/null | awk \'{print $2}\' || true)"',
+    '  if [ -n "$__pm_tls_owner_home" ]; then',
+    '    __pm_tls_owner_keychain="$__pm_tls_owner_home/Library/Keychains/login.keychain-db"',
+    '    if [ ! -f "$__pm_tls_owner_keychain" ]; then',
+    '      __pm_tls_owner_keychain="$__pm_tls_owner_home/Library/Keychains/login.keychain"',
+    "    fi",
+    '    if [ -f "$__pm_tls_owner_keychain" ]; then',
+    '      if sudo -u "$__pm_tls_owner_user" security add-trusted-cert -d -r trustRoot -k "$__pm_tls_owner_keychain" "$__pm_tls_ca_cert" 2>"$__pm_tls_trust_error"; then',
+    "        __pm_tls_trusted=1",
+    "      elif grep -qi 'already exists' \"$__pm_tls_trust_error\"; then",
+    "        __pm_tls_trusted=1",
+    "      fi",
+    "    fi",
+    "  fi",
+    "fi",
+    'if [ "$__pm_tls_trusted" != "1" ]; then',
+    "  echo 'Port Manager browser TLS CA trust registration failed. The HTTPS proxy certificate was generated, but browsers may warn until the CA is trusted.' >&2",
+    "fi",
+    'rm -f "$__pm_tls_trust_error"',
+    "unset __pm_tls_dir __pm_tls_ca_cert __pm_tls_ca_key __pm_tls_server_cert __pm_tls_server_key __pm_tls_hosts_file __pm_tls_owner_user __pm_tls_trust_error __pm_tls_trusted __pm_tls_needs_leaf __pm_tls_owner_home __pm_tls_owner_keychain",
   );
 }
 
@@ -7858,6 +8855,20 @@ async function focusOwnerWindowByPid(
   return focusMacApplicationProcessByPid(pids);
 }
 
+/** Reopens the owner project when the OS cannot surface an existing VS Code window by PID. */
+async function openControlPlaneOwnerWorkspace(ownerWorkspaceUri: string | undefined): Promise<boolean> {
+  if (ownerWorkspaceUri === undefined) {
+    return false;
+  }
+
+  try {
+    await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.parse(ownerWorkspaceUri), true);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Builds a nearest-first PID list so UI process hints are tried before generic ancestors. */
 function collectProcessAndAncestorPids(
   candidatePids: readonly (number | undefined)[],
@@ -8391,6 +9402,7 @@ function writeControlPlaneOwnerLease(nowMs: number): boolean {
         pid: process.pid,
         focusPid: resolveControlPlaneFocusPid(),
         title: buildCurrentVsCodeWindowTitle(),
+        workspaceUri: buildCurrentVsCodeProjectUri(),
         updatedAt: new Date(nowMs).toISOString(),
       })}\n`,
       "utf8",
@@ -8592,6 +9604,9 @@ function readOwnerDocument(filePath: string): LogicalRouterOwnerDocument | undef
       ? { focusPid: owner.focusPid }
       : {}),
     ...(typeof owner.title === "string" && owner.title.trim().length > 0 ? { title: owner.title.trim() } : {}),
+    ...(typeof owner.workspaceUri === "string" && owner.workspaceUri.trim().length > 0
+      ? { workspaceUri: owner.workspaceUri.trim() }
+      : {}),
     updatedAt: owner.updatedAt,
   };
 }
@@ -8602,6 +9617,10 @@ function buildCurrentVsCodeWindowTitle(): string {
   const title = workspaceName && workspaceName.length > 0 ? workspaceName : folderName;
 
   return title === undefined || title.length === 0 ? vscode.env.appName : `${title} - ${vscode.env.appName}`;
+}
+
+function buildCurrentVsCodeProjectUri(): string | undefined {
+  return vscode.workspace.workspaceFile?.toString() ?? vscode.workspace.workspaceFolders?.[0]?.uri.toString();
 }
 
 function readBrowserNetworkProxyOwner(): LogicalRouterOwnerDocument | undefined {

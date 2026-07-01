@@ -108,13 +108,19 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(typesSource.includes("export interface ControlPlaneStatus"), true);
   assert.equal(typesSource.includes("readonly ownerFocusPid?: number;"), true);
   assert.equal(typesSource.includes("readonly ownerTitle?: string;"), true);
+  assert.equal(typesSource.includes("readonly ownerWorkspaceUri?: string;"), true);
   assert.equal(typesSource.includes("readonly controlPlane?: ControlPlaneStatus;"), true);
   assert.equal(networkServiceSource.includes("getControlPlaneStatus(): ControlPlaneStatus"), true);
   assert.equal(networkServiceSource.includes("controlPlane: this.getControlPlaneStatus()"), true);
   assert.equal(networkServiceSource.includes("ownerTitle: owner?.title"), true);
+  assert.equal(networkServiceSource.includes("ownerWorkspaceUri: owner?.workspaceUri"), true);
   assert.equal(networkServiceSource.includes("title: buildCurrentVsCodeWindowTitle()"), true);
+  assert.equal(networkServiceSource.includes("workspaceUri: buildCurrentVsCodeProjectUri()"), true);
   assert.equal(networkServiceSource.includes("function buildCurrentVsCodeWindowTitle()"), true);
+  assert.equal(networkServiceSource.includes("function buildCurrentVsCodeProjectUri()"), true);
   assert.equal(networkServiceSource.includes("focusControlPlaneOwnerWindow(): Promise<boolean>"), true);
+  assert.equal(networkServiceSource.includes("openControlPlaneOwnerWorkspace(controlPlane.ownerWorkspaceUri)"), true);
+  assert.equal(networkServiceSource.includes('vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.parse(ownerWorkspaceUri), true)'), true);
   assert.equal(networkServiceSource.includes("requestControlPlaneOwnerUiFocus"), false);
   assert.equal(networkServiceSource.includes("CONTROL_PLANE_OWNER_UI_REQUEST_PATH"), false);
   assert.equal(networkServiceSource.includes("watchOwnerUiFocusRequests"), false);
@@ -135,6 +141,7 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(commandsSource.includes('"portManager.openOwnerUi"'), true);
   assert.equal(commandsSource.includes("focusControlPlaneOwnerWindow()"), true);
   assert.equal(commandsSource.includes("Port Manager owner window:"), true);
+  assert.equal(commandsSource.includes("Opened or focused Port Manager owner window:"), true);
   assert.equal(commandsSource.includes("formatOwnerWindowTitle(snapshot)"), true);
   assert.equal(commandsSource.includes("requestControlPlaneOwnerUiFocus()"), false);
   assert.equal(commandsSource.includes('action: "ownerOnly" as const'), true);

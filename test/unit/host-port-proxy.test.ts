@@ -155,6 +155,8 @@ test("host exposure manager reclaims stale native helpers for the same endpoint"
   const source = fs.readFileSync(path.join(root, "src/platform/ports/host-port-proxy.ts"), "utf8");
 
   assert.equal(source.includes("await terminateSiblingNativeHostProxyProcesses(exposure);"), true);
+  assert.equal(source.includes("async reclaimNativeEndpoint(hostAddress: string, hostPort: number)"), true);
+  assert.equal(source.includes("await terminateSiblingNativeHostProxyProcesses({ hostAddress, hostPort });"), true);
   assert.equal(source.includes('execFileSync("ps", ["-Ao", "pid=,command="]'), true);
   assert.equal(source.includes("function findSiblingNativeHostProxyProcessIds("), true);
   assert.equal(source.includes("function isNativeHostProxyCommandForEndpoint("), true);

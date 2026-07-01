@@ -5,6 +5,7 @@ import { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import { LocalAgentClient } from "./local-agent-client";
 import { PortManagerCommandController } from "./commands";
 import { PortManagerNetworkService } from "./network-service";
+import { PortManagerTerminalSecureBrowserLinkProvider } from "./terminal-secure-browser-link-provider";
 import type { DisposableLike, LogicalNetwork, NetworkSnapshot } from "../shared/types";
 
 export interface PortManagerExtensionApi {
@@ -45,6 +46,7 @@ export function activate(context: vscode.ExtensionContext): PortManagerExtension
     treeProvider,
     commandController,
     statusBar,
+    new PortManagerTerminalSecureBrowserLinkProvider(networkService),
   );
 
   commandController.register(context);

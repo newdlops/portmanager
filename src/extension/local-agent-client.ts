@@ -130,14 +130,11 @@ export class LocalAgentClient implements PortManagerProcessService {
   async start(): Promise<void> {
     await this.ensureConnected();
     await this.loadDaemonStatusForStartup();
-    if (this.snapshot.daemon.restartRequired) {
-      await this.restartDaemon();
-      return;
-    }
     /*
      * Opening several VS Code windows must not make every UI client request an
-     * immediate listener scan. The daemon marks extension sockets as event
-     * clients through daemonStatus and publishes coalesced snapshots itself.
+     * immediate listener scan or restart a busy data-plane daemon. Stale daemon
+     * builds are surfaced as warnings; the explicit Restart Daemon command is
+     * the only path that may send SIGTERM during normal activation.
      */
   }
 
@@ -288,7 +285,9 @@ export class LocalAgentClient implements PortManagerProcessService {
       await this.loadDaemonStatus();
     } catch (error) {
       if (isUnsupportedDaemonStatusError(error)) {
-        await this.restartDaemon();
+        this.applyDaemonStatusError(
+          new Error("Connected daemon does not expose daemonStatus metadata; use Restart Daemon after active terminals are stable."),
+        );
         return;
       }
 

@@ -1441,7 +1441,7 @@ export class PortManagerCommandController implements DisposableLike {
     await this.dependencies.networkService.openBrowserUrl(url);
   }
 
-  /** Installs macOS resolver rows needed for single-label browser aliases. */
+  /** Installs macOS resolver rows and the dev TLS certificate for browser aliases. */
   private async installBrowserDnsResolvers(): Promise<void> {
     try {
       const status = await this.dependencies.networkService.installBrowserDnsResolvers();
@@ -1450,7 +1450,7 @@ export class PortManagerCommandController implements DisposableLike {
         return;
       }
       await vscode.window.showInformationMessage(
-        `Browser DNS aliases installed: ${status.installedCount}/${status.records.length}`,
+        `Browser DNS aliases and dev TLS certificate installed: ${status.installedCount}/${status.records.length}`,
       );
     } catch (error) {
       await vscode.window.showWarningMessage(`Browser DNS install failed: ${toErrorMessage(error)}`);
@@ -3084,7 +3084,7 @@ function formatOwnerUiNavigationMessage(snapshot: NetworkSnapshot, focused: bool
   }
 
   if (focused && snapshot.controlPlane?.role === "worker") {
-    return `Focused Port Manager owner window: ${ownerTitle} (pid ${ownerPid}).`;
+    return `Opened or focused Port Manager owner window: ${ownerTitle} (pid ${ownerPid}).`;
   }
 
   if (snapshot.controlPlane?.role === "worker") {

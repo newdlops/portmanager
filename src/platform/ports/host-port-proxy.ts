@@ -134,6 +134,15 @@ export class HostPortProxyManager {
     await listener.close();
   }
 
+  /**
+   * Reclaims an orphaned native helper for a concrete endpoint.
+   * Browser-facing proxies use this during migration because an older extension
+   * host may have opened the same DNS alias port as a raw TCP gateway.
+   */
+  async reclaimNativeEndpoint(hostAddress: string, hostPort: number): Promise<void> {
+    await terminateSiblingNativeHostProxyProcesses({ hostAddress, hostPort });
+  }
+
   /** Closes every listener during extension shutdown. */
   async dispose(): Promise<void> {
     const listeners = [...this.listeners.entries()];
@@ -472,7 +481,9 @@ function listen(server: net.Server, port: number, host: string): Promise<void> {
  * Code extension reload can leave an old helper alive briefly; if it keeps the
  * port, the new owner cannot install its current target resolver.
  */
-async function terminateSiblingNativeHostProxyProcesses(exposure: HostPortExposure): Promise<void> {
+async function terminateSiblingNativeHostProxyProcesses(
+  exposure: Pick<HostPortExposure, "hostAddress" | "hostPort">,
+): Promise<void> {
   if (process.platform === "win32" || exposure.hostPort <= 0) {
     return;
   }

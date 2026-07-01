@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8096",
+  "version": "0.0.8123",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -766,6 +766,7 @@
         "portManager.routingMode": {
           "type": "string",
           "default": "hashed",
+          "included": false,
           "enum": [
             "nearest",
             "hashed"
@@ -774,7 +775,8 @@
         },
         "portManager.experimentalRouteOwnershipMode": {
           "type": "string",
-          "default": "process",
+          "default": "loopback-address-only",
+          "included": false,
           "enum": [
             "process",
             "terminal-scope-listener",
@@ -789,13 +791,15 @@
         },
         "portManager.enableLoopbackAddressRouting": {
           "type": "boolean",
-          "default": false,
+          "default": true,
+          "included": false,
           "description": "Legacy toggle for per-network loopback IP routing. Prefer portManager.loopbackAddressRoutingMode.",
           "deprecationMessage": "Use portManager.loopbackAddressRoutingMode instead."
         },
         "portManager.loopbackAddressRoutingMode": {
           "type": "string",
-          "default": "high-port",
+          "default": "loopback",
+          "included": false,
           "enum": [
             "high-port",
             "auto",
@@ -811,6 +815,7 @@
         "portManager.virtualPortRangeStart": {
           "type": "number",
           "default": 53000,
+          "included": false,
           "minimum": 1,
           "maximum": 65535,
           "description": "First actual TCP port used by hashed logical routing."
@@ -818,6 +823,7 @@
         "portManager.virtualPortRangeEnd": {
           "type": "number",
           "default": 59999,
+          "included": false,
           "minimum": 1,
           "maximum": 65535,
           "description": "Last actual TCP port used by hashed logical routing."
@@ -853,6 +859,7 @@
             995,
             1433,
             1521,
+            15432,
             1883,
             3306,
             33060,

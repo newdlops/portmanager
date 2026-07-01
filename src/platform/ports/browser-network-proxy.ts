@@ -1,4 +1,5 @@
 import * as http from "node:http";
+import * as https from "node:https";
 import * as net from "node:net";
 
 export interface BrowserNetworkProxyEndpoint {
@@ -12,6 +13,8 @@ export interface BrowserNetworkProxyEndpoint {
   readonly listenHost: string;
   /** Browser-facing hostname that resolves to listenHost when local DNS is configured. */
   readonly publicHost?: string;
+  /** Browser-facing protocol. HTTPS is used when the extension owns a trusted dev certificate. */
+  readonly publicProtocol?: "http" | "https";
   /** Ports tried in order; the logical port is preferred when it is not already occupied. */
   readonly listenPorts: readonly number[];
 }
@@ -41,6 +44,23 @@ export interface BrowserNetworkProxyOptions {
   readonly retryDelayMs?: number;
   /** Grace window before closing endpoints that briefly disappear from route snapshots. */
   readonly retireDelayMs?: number;
+  /** Supplies the dev TLS certificate used by HTTPS browser-facing endpoints. */
+  readonly tlsCredentials?: BrowserNetworkProxyTlsCredentialsProvider;
+}
+
+export interface BrowserNetworkProxyTlsCredentials {
+  /** PEM private key for the browser-facing HTTPS listener. */
+  readonly key: string | Buffer;
+  /** PEM certificate chain for the browser-facing HTTPS listener. */
+  readonly cert: string | Buffer;
+}
+
+export interface BrowserNetworkProxyTlsCredentialsProvider {
+  /**
+   * Returns the active TLS identity. The manager calls this when opening a
+   * listener so certificate refreshes are picked up on the next reconciliation.
+   */
+  getCredentials(): BrowserNetworkProxyTlsCredentials | undefined;
 }
 
 interface BrowserNetworkProxyListener {
@@ -48,13 +68,15 @@ interface BrowserNetworkProxyListener {
   readonly endpoint: ActiveBrowserNetworkProxyEndpoint;
   /** Precomputed host/origin strings reused by every request on this endpoint. */
   readonly metadata: BrowserNetworkProxyEndpointMetadata;
-  /** HTTP/WebSocket server that owns the browser-facing socket. */
-  readonly server: http.Server;
+  /** HTTP(S)/WebSocket server that owns the browser-facing socket. */
+  readonly server: BrowserNetworkProxyServer;
   /** Upstream HTTP connection pool scoped to this browser-facing endpoint. */
   readonly agent: http.Agent;
   /** Client and upstream sockets closed together during reconciliation. */
   readonly sockets: Set<net.Socket>;
 }
+
+type BrowserNetworkProxyServer = http.Server | https.Server;
 
 interface BrowserNetworkProxyEndpointMetadata {
   /** Browser-facing origin used in response rewrites. */
@@ -244,9 +266,16 @@ export class BrowserNetworkProxyManager {
         maxFreeSockets: UPSTREAM_KEEP_ALIVE_MAX_FREE_SOCKETS,
       });
       const sockets = new Set<net.Socket>();
-      const server = http.createServer((request, response) => {
-        void this.forwardHttp(activeEndpoint, metadata, agent, request, response);
-      });
+      let server: BrowserNetworkProxyServer;
+      try {
+        server = this.createServer(activeEndpoint, (request, response) => {
+          void this.forwardHttp(activeEndpoint, metadata, agent, request, response);
+        });
+      } catch (error) {
+        agent.destroy();
+        errors.push(error instanceof Error ? error : new Error(String(error)));
+        continue;
+      }
 
       server.on("connection", (socket) => {
         sockets.add(socket);
@@ -352,6 +381,22 @@ export class BrowserNetworkProxyManager {
       upstream.pipe(socket);
     });
   }
+
+  private createServer(
+    endpoint: ActiveBrowserNetworkProxyEndpoint,
+    handler: http.RequestListener,
+  ): BrowserNetworkProxyServer {
+    if ((endpoint.publicProtocol ?? "http") !== "https") {
+      return http.createServer(handler);
+    }
+
+    const credentials = this.options.tlsCredentials?.getCredentials();
+    if (credentials === undefined) {
+      throw new Error(`TLS credentials unavailable for browser proxy ${endpoint.id}.`);
+    }
+
+    return https.createServer(credentials, handler);
+  }
 }
 
 export function browserNetworkProxyEndpointId(networkId: string, logicalPort: number): string {
@@ -379,6 +424,7 @@ function normalizeEndpoint(endpoint: BrowserNetworkProxyEndpoint): BrowserNetwor
   const listenPorts = [...new Set(endpoint.listenPorts.filter(isTcpPort))];
   return {
     ...endpoint,
+    publicProtocol: endpoint.publicProtocol ?? "http",
     listenPorts,
   };
 }
@@ -397,6 +443,7 @@ function isEndpointCurrent(
     activeEndpoint.logicalPort === desiredEndpoint.logicalPort &&
     activeEndpoint.listenHost === desiredEndpoint.listenHost &&
     activeEndpoint.publicHost === desiredEndpoint.publicHost &&
+    (activeEndpoint.publicProtocol ?? "http") === (desiredEndpoint.publicProtocol ?? "http") &&
     desiredEndpoint.listenPorts.includes(activeEndpoint.listenPort)
   );
 }
@@ -536,7 +583,8 @@ function appendHeaderLines(lines: string[], name: string, value: number | string
 }
 
 function buildEndpointMetadata(endpoint: ActiveBrowserNetworkProxyEndpoint): BrowserNetworkProxyEndpointMetadata {
-  const publicOrigin = `http://${formatHostForUrl(endpoint.publicHost ?? endpoint.listenHost)}:${endpoint.listenPort}`;
+  const publicProtocol = endpoint.publicProtocol ?? "http";
+  const publicOrigin = `${publicProtocol}://${formatHostForUrl(endpoint.publicHost ?? endpoint.listenHost)}:${endpoint.listenPort}`;
   const upstreamHostHeader = `${LOCALHOST_UPSTREAM_HOST}:${endpoint.logicalPort}`;
   const upstreamOrigin = `http://${upstreamHostHeader}`;
 
@@ -578,7 +626,7 @@ function writeGatewayError(response: http.ServerResponse): void {
   response.end("Port Manager browser proxy could not reach the routed target.");
 }
 
-function listen(server: http.Server, port: number, host: string): Promise<void> {
+function listen(server: BrowserNetworkProxyServer, port: number, host: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const onError = (error: Error) => {
       cleanup();
@@ -599,7 +647,7 @@ function listen(server: http.Server, port: number, host: string): Promise<void> 
   });
 }
 
-function closeServer(server: http.Server): Promise<void> {
+function closeServer(server: BrowserNetworkProxyServer): Promise<void> {
   return new Promise((resolve, reject) => {
     server.close((error) => {
       if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {

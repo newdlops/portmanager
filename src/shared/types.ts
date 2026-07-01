@@ -451,6 +451,8 @@ export interface ControlPlaneStatus {
   readonly ownerFocusPid?: number;
   /** User-facing title for the elected owner window. */
   readonly ownerTitle?: string;
+  /** Folder or workspace URI that can reopen the elected owner project. */
+  readonly ownerWorkspaceUri?: string;
   /** True when the owner lease is fresh and its PID is still alive. */
   readonly ownerActive: boolean;
   /** Last owner lease renewal time. */
@@ -932,6 +934,8 @@ export interface BrowserDnsResolverRecordStatus {
   readonly networkName: string;
   /** Single-label browser hostname derived from a logical network name. */
   readonly hostname: string;
+  /** Dotted browser hostname kept for compatibility with previous browser aliases. */
+  readonly secureHostname: string;
   /** Per-network loopback address returned by the local DNS responder. */
   readonly address: string;
   /** True when both the resolver file and loopback alias are ready for browser traffic. */
@@ -942,6 +946,8 @@ export interface BrowserDnsResolverRecordStatus {
   readonly loopbackAliasConfigured: boolean;
   /** True when /etc/hosts contains the exact single-label hostname entry. */
   readonly hostsConfigured: boolean;
+  /** True when Port Manager has a trusted dev TLS certificate for this alias set. */
+  readonly tlsConfigured: boolean;
   /** Browser-visible port routes currently known for this alias. */
   readonly routes: readonly BrowserDnsAliasRouteStatus[];
 }

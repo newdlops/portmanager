@@ -22,6 +22,7 @@ VS Code 확장의 활성화 지점과 명령 등록을 담당한다.
 - `network-service.ts`
 - `terminal-hook-environment.ts`
 - `terminal-conflict-monitor.ts`
+- `terminal-secure-browser-link-provider.ts`
 
 ## 외부 의존성
 
