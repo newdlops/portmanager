@@ -174,9 +174,10 @@ export interface TerminalAttachment {
 }
 
 /**
- * Current VS Code window/workspace terminal default. Existing terminals receive
+ * Current VS Code window/workspace routing default. Existing terminals receive
  * the same routing script best-effort; new terminals inherit the environment
- * through VS Code's terminal environment collection.
+ * through VS Code's terminal environment collection. The owning extension-host
+ * PID is also labeled so window-owned host clients resolve to this network.
  */
 export interface VscodeWindowTerminalBinding {
   /** Stable row id for the current VS Code workspace/window scope. */

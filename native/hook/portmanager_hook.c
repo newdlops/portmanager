@@ -3781,6 +3781,69 @@ static int pm_wait_for_compose_route(
     is_compose_route);
 }
 
+static int pm_bind_ephemeral_local_port(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+  struct sockaddr_storage actual_addr;
+  struct sockaddr_storage rewritten;
+  const char *loopback_host;
+  socklen_t actual_addrlen;
+  int actual_port;
+  int result;
+
+  if (!pm_sockaddr_is_local(addr)) {
+    if (pm_loopback_address_only_mode()) {
+      errno = EADDRNOTAVAIL;
+      return -1;
+    }
+    return pm_real_bind(sockfd, addr, addrlen);
+  }
+
+  loopback_host = pm_network_loopback_host();
+  if (loopback_host == NULL) {
+    loopback_host = pm_actual_loopback_host();
+  }
+  if (loopback_host == NULL) {
+    if (pm_loopback_address_only_mode()) {
+      errno = EADDRNOTAVAIL;
+      return -1;
+    }
+    return pm_real_bind(sockfd, addr, addrlen);
+  }
+
+  /*
+   * bind(..., port 0) is still a network-owned listener. Any framework that
+   * uses an ephemeral loopback coordination port must stay inside the attached
+   * logical network instead of escaping to host 127.0.0.1.
+   */
+  memcpy(&rewritten, addr, addrlen);
+  pm_set_sockaddr_host((struct sockaddr *)&rewritten, loopback_host);
+  pm_debug("bind ephemeral loopback host=%s", loopback_host);
+  result = pm_real_bind(sockfd, (struct sockaddr *)&rewritten, addrlen);
+  if (result != 0 || pm_real_getsockname == NULL) {
+    return result;
+  }
+
+  actual_addrlen = sizeof(actual_addr);
+  if (pm_real_getsockname(sockfd, (struct sockaddr *)&actual_addr, &actual_addrlen) == 0) {
+    actual_port = pm_sockaddr_port((struct sockaddr *)&actual_addr);
+    if (actual_port > 0) {
+      char actual_text[16];
+
+      /*
+       * Hookless host clients attached by PID still dial localhost. Publishing
+       * the kernel's ephemeral port lets the compatibility router expose
+       * 127.0.0.1:port while the real listener stays on the network loopback.
+       */
+      pm_remember_route(actual_port, actual_port, loopback_host, "", 0);
+      snprintf(actual_text, sizeof(actual_text), "%d", actual_port);
+      setenv("PORT_MANAGER_LOGICAL_PORT", actual_text, 1);
+      setenv("PORT_MANAGER_ACTUAL_PORT", actual_text, 1);
+      pm_register_process(actual_port, actual_port, loopback_host, "");
+    }
+  }
+
+  return result;
+}
+
 static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   struct sockaddr_storage rewritten;
   char host[128];
@@ -3803,10 +3866,6 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
   }
 
   logical_port = pm_sockaddr_port(addr);
-  if (logical_port <= 0) {
-    return pm_real_bind(sockfd, addr, addrlen);
-  }
-
   if (!pm_has_current_network_scope()) {
     /*
      * A globally injected preload can survive after a terminal is detached from
@@ -3815,6 +3874,10 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
      */
     pm_debug("bind passthrough without network scope logical=%d", logical_port);
     return pm_real_bind(sockfd, addr, addrlen);
+  }
+
+  if (logical_port == 0) {
+    return pm_bind_ephemeral_local_port(sockfd, addr, addrlen);
   }
 
   if (pm_loopback_address_only_mode()) {

@@ -1196,6 +1196,15 @@ test("automatic control plane side effects use a single cross-window owner lease
   const applyStart = source.indexOf("private applyVscodeWindowTerminalEnvironment(): void");
   const applyEnd = source.indexOf("  /**\n   * Prepares the loopback host", applyStart);
   const applyBody = source.slice(applyStart, applyEnd);
+  const windowAttachStart = source.indexOf("async attachVscodeWindowTerminalsToNetwork(networkId: string)");
+  const windowAttachEnd = source.indexOf("  /** Clears the current VS Code window", windowAttachStart);
+  const windowAttachBody = source.slice(windowAttachStart, windowAttachEnd);
+  const windowDetachStart = source.indexOf("async detachVscodeWindowTerminalsFromNetwork()");
+  const windowDetachEnd = source.indexOf("  /** Returns true when", windowDetachStart);
+  const windowDetachBody = source.slice(windowDetachStart, windowDetachEnd);
+  const vscodeProcessSyncStart = source.indexOf("private syncVscodeWindowProcessAttachment(): void");
+  const vscodeProcessSyncEnd = source.indexOf("  /**\n   * Injects routing variables", vscodeProcessSyncStart);
+  const vscodeProcessSyncBody = source.slice(vscodeProcessSyncStart, vscodeProcessSyncEnd);
   const refreshRuntimeStart = source.indexOf("private async refreshRuntimeDescriptors(");
   const refreshRuntimeEnd = source.indexOf("  /** Looks up the latest route", refreshRuntimeStart);
   const refreshRuntimeBody = source.slice(refreshRuntimeStart, refreshRuntimeEnd);
@@ -1243,7 +1252,7 @@ test("automatic control plane side effects use a single cross-window owner lease
   assert.equal(source.includes("if (this.ownsControlPlaneLease) {\n            void this.syncLogicalPortRouters();"), true);
   assert.equal(startBody.includes("this.watchOwnerLeaseFiles()"), true);
   assert.equal(startBody.includes("await this.refreshRuntimeDescriptors({ includeContainerRuntime: false });"), true);
-  assert.equal(startBody.includes("this.applyVscodeWindowTerminalEnvironment();"), true);
+  assert.equal(startBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });"), true);
   assert.equal(startBody.includes("await this.startControlPlaneOwnerIfAvailable();"), true);
   assert.equal(startBody.includes("this.startRoutingSignalRefreshLoop();"), false);
   assert.equal(startBody.includes("this.startTerminalAttachmentMarkerPolling();"), false);
@@ -1272,8 +1281,8 @@ test("automatic control plane side effects use a single cross-window owner lease
   assert.equal(composePublishedPortsIndex < containerRefreshIndex, true);
   assert.equal(registrySideEffectBody.includes("!this.ownsControlPlaneLease || !tryAcquireControlPlaneOwnerLease()"), true);
   assert.equal(registrySideEffectBody.includes("void this.writeHostAccessBindingsFile();"), true);
-  assert.equal(applyBody.includes("if (!this.ownsControlPlaneLease)"), true);
-  assert.equal(applyBody.includes("applyTerminalHookEnvironment(this.context, undefined);"), true);
+  assert.equal(applyBody.includes("if (!this.ownsControlPlaneLease)"), false);
+  assert.equal(applyBody.includes("networkId === undefined\n        ? undefined"), true);
   assert.equal(refreshRuntimeBody.includes("options.includeContainerRuntime !== false"), true);
   assert.equal(refreshRuntimeBody.includes("this.containerRuntime.getDescriptor()"), true);
   assert.equal(refreshContainerBody.includes("options.background === true && !this.ownsControlPlaneLease"), true);
@@ -1281,7 +1290,8 @@ test("automatic control plane side effects use a single cross-window owner lease
   assert.equal(ownerSignalBody.includes("CONTROL_PLANE_OWNER_PATH"), true);
   assert.equal(ownerSignalBody.includes("void this.startControlPlaneOwnerIfAvailable();"), true);
   assert.equal(demoteBody.includes("for (const disposable of this.controlPlaneOwnerDisposables.splice(0))"), true);
-  assert.equal(demoteBody.includes("this.context.environmentVariableCollection.clear();"), true);
+  assert.equal(demoteBody.includes("this.applyVscodeWindowTerminalEnvironment();"), true);
+  assert.equal(demoteBody.includes("this.context.environmentVariableCollection.clear();"), false);
   assert.equal(demoteBody.includes("releaseControlPlaneOwnerLease();"), true);
   assert.equal(demoteBody.includes("this.proxyManager.dispose();"), false);
   assert.equal(demoteBody.includes("this.browserNetworkProxy.dispose();"), false);
@@ -1290,7 +1300,14 @@ test("automatic control plane side effects use a single cross-window owner lease
   assert.equal(demoteBody.includes("releaseLogicalRouterOwnerLease();"), false);
   assert.equal(demoteBody.includes("releaseBrowserNetworkProxyOwnerLease();"), false);
   assert.equal(source.includes("data-plane brokers alive"), true);
-  assert.equal(source.includes("Another Port Manager window owns terminal routing control."), true);
+  assert.equal(windowAttachBody.includes("Another Port Manager window owns terminal routing control."), false);
+  assert.equal(windowAttachBody.includes("this.syncVscodeWindowProcessAttachment();"), true);
+  assert.equal(windowDetachBody.includes("this.syncVscodeWindowProcessAttachment();"), true);
+  assert.notEqual(vscodeProcessSyncStart, -1);
+  assert.equal(source.includes('VSCODE_WINDOW_PROCESS_ATTACHMENT_ID_PREFIX = "vscode-window-process:"'), true);
+  assert.equal(vscodeProcessSyncBody.includes("createVscodeWindowProcessAttachmentId(process.pid)"), true);
+  assert.equal(vscodeProcessSyncBody.includes("rootPid: process.pid"), true);
+  assert.equal(source.includes("A VS Code window can act as a host-side client"), true);
   assert.equal(source.includes("Another Port Manager window owns Compose routing control."), true);
 });
 
@@ -1352,6 +1369,9 @@ test("terminal hook markers refresh attached UI state without manual refresh", (
   const restoreStart = source.indexOf("private async restoreMissingManualTerminalAttachmentMarkers");
   const restoreEnd = source.indexOf("private syncProcessAttachmentLiveness", restoreStart);
   const restoreBody = source.slice(restoreStart, restoreEnd);
+  const livenessStart = source.indexOf("private syncProcessAttachmentLiveness");
+  const livenessEnd = source.indexOf("  /** Reads all manually pasted", livenessStart);
+  const livenessBody = source.slice(livenessStart, livenessEnd);
 
   assert.equal(source.includes("TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500"), true);
   assert.equal(source.includes("private watchTerminalAttachmentMarkers(directoryPath: string): DisposableLike"), true);
@@ -1359,12 +1379,14 @@ test("terminal hook markers refresh attached UI state without manual refresh", (
   assert.equal(source.includes("private scheduleTerminalAttachmentRefreshBurst(networkIds: readonly string[] = []): void"), true);
   assert.equal(source.includes("private async refreshTerminalAttachmentsWhenMarkersChanged(): Promise<void>"), true);
   assert.notEqual(restoreStart, -1);
+  assert.notEqual(livenessStart, -1);
   assert.equal(
     refreshBody.indexOf("await this.restoreMissingManualTerminalAttachmentMarkers(processRows).catch(() => undefined);") <
       refreshBody.indexOf("await this.syncManualTerminalAttachmentMarkers(processRows).catch(() => undefined);"),
     true,
   );
   assert.equal(restoreBody.includes("attachment.id.startsWith(MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX)"), true);
+  assert.equal(livenessBody.includes("VSCODE_WINDOW_PROCESS_ATTACHMENT_ID_PREFIX"), true);
   assert.equal(restoreBody.includes("writeManualTerminalAttachmentMarker"), true);
   assert.equal(restoreBody.includes("await writeTextFileAtomically(markerPath"), true);
   assert.equal(source.includes("selectLatestTerminalAttachmentMarkerCandidates"), true);
@@ -1544,6 +1566,8 @@ test("compose override yaml is force-refreshed on attach startup and repair", ()
   );
   assert.equal(terminalAttachBody.includes("await this.ensureNetworkComposeRoutingArtifacts(networkId);"), true);
   assert.equal(windowAttachBody.includes("await this.ensureNetworkComposeRoutingArtifacts(networkId);"), true);
+  assert.equal(windowAttachBody.includes("await this.reloadSharedNetworkState();"), true);
+  assert.equal(windowAttachBody.includes("startControlPlaneOwnerIfAvailable"), false);
   assert.equal(scriptBody.includes("await this.ensureNetworkComposeRoutingArtifacts(networkId);"), true);
   assert.equal(helperBody.includes("private async reconcileComposeOverrideFileForAttachment("), true);
   assert.equal(helperBody.includes("recoverToStorageDirectory: true"), true);
@@ -1811,7 +1835,11 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   const connectStart = source.indexOf("static int pm_connect_hook");
   const connectEnd = source.indexOf("static int pm_getsockname_hook", connectStart);
   const connectBody = source.slice(connectStart, connectEnd);
+  const ephemeralHelperStart = source.indexOf("static int pm_bind_ephemeral_local_port");
+  const ephemeralHelperEnd = source.indexOf("static int pm_bind_hook", ephemeralHelperStart);
+  const ephemeralHelperBody = source.slice(ephemeralHelperStart, ephemeralHelperEnd);
   const addressOnlyBindStart = source.indexOf("if (pm_loopback_address_only_mode())", bindStart);
+  const ephemeralBindStart = source.indexOf("if (logical_port == 0)", bindStart);
   const addressOnlyConnectStart = connectBody.indexOf("if (pm_loopback_address_only_mode())");
   const addressOnlyConnectEnd = connectBody.indexOf("target_host[0] = '\\0';", addressOnlyConnectStart);
   const addressOnlyConnectBlock = connectBody.slice(addressOnlyConnectStart, addressOnlyConnectEnd);
@@ -1821,6 +1849,8 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   assert.notEqual(allocationStart, -1);
   assert.notEqual(matchLevelStart, -1);
   assert.notEqual(connectStart, -1);
+  assert.notEqual(ephemeralHelperStart, -1);
+  assert.notEqual(ephemeralBindStart, -1);
   assert.notEqual(addressOnlyBindStart, -1);
   assert.notEqual(addressOnlyConnectStart, -1);
   assert.equal(
@@ -1848,6 +1878,14 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   assert.equal(connectBody.includes("falling back to routed allocation"), true);
   assert.equal(connectBody.includes("loopback_connect_errno != ECONNREFUSED"), true);
   assert.equal(source.includes('PM_LOOPBACK_ADDRESS_ONLY_MODE "loopback-address-only"'), true);
+  assert.equal(source.includes("pm_bind_ephemeral_local_port"), true);
+  assert.equal(source.includes("uses an ephemeral loopback coordination port must stay inside the attached"), true);
+  assert.equal(source.includes("Hookless host clients attached by PID still dial localhost"), true);
+  assert.equal(ephemeralHelperBody.includes("pm_real_getsockname(sockfd"), true);
+  assert.equal(ephemeralHelperBody.includes("pm_remember_route(actual_port, actual_port, loopback_host, \"\", 0);"), true);
+  assert.equal(ephemeralHelperBody.includes("pm_register_process(actual_port, actual_port, loopback_host, \"\");"), true);
+  assert.equal(source.includes("errno = EADDRNOTAVAIL;\n      return -1;"), true);
+  assert.equal(ephemeralBindStart < addressOnlyBindStart, true);
   assert.equal(source.includes("bind address-only logical=%d host=%s"), true);
   assert.equal(addressOnlyBindStart < allocationStart, true);
   assert.equal(addressOnlyConnectBlock.includes("pm_allocate_route("), false);
@@ -1887,7 +1925,7 @@ test("native preload repair is opt-in at runtime shim boundaries", () => {
   assert.equal(asdfShimSource.includes('setenv("PORT_MANAGER_PRELOAD_REPAIR", "1", 1);'), true);
 });
 
-test("logical routers leave network-owned localhost ports to host processes", () => {
+test("logical routers expose host-client networks without taking unrelated network ports", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
   const collectStart = source.indexOf("function collectLogicalRouterPorts");
@@ -1900,11 +1938,16 @@ test("logical routers leave network-owned localhost ports to host processes", ()
   const syncEnd = source.indexOf("private async findClientNetworkForRouter", syncStart);
   const syncBody = source.slice(syncStart, syncEnd);
 
-  assert.equal(source.includes("collectLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? [])"), true);
+  assert.equal(source.includes("collectLogicalRouterPorts(\n      snapshot?.routes ?? [],\n      snapshot?.listeners ?? [],"), true);
   assert.equal(source.includes("Host loopback belongs to processes outside logical networks"), true);
+  assert.equal(source.includes("Host-side client attachments are the exception"), true);
   assert.equal(collectLogicalRouterPorts.includes('route.source === "compose"'), false);
   assert.equal(collectLogicalRouterPorts.includes("routeNeedsLogicalRouter(route)"), true);
-  assert.equal(collectLogicalRouterPorts.includes("route.networkId === undefined"), true);
+  assert.equal(collectLogicalRouterPorts.includes("route.networkId === undefined || hostClientNetworkIds.has(route.networkId)"), true);
+  assert.equal(source.includes("function collectHostClientAttachmentNetworkIds"), true);
+  assert.equal(source.includes("function isHooklessHostClientAttachment"), true);
+  assert.equal(source.includes("attachment.id.startsWith(PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX)"), true);
+  assert.equal(source.includes("attachment.id.startsWith(VSCODE_WINDOW_PROCESS_ATTACHMENT_ID_PREFIX)"), true);
   assert.equal(source.includes("function isDetachedNetworkRoute"), false);
   assert.equal(collectLogicalRouterPorts.includes("!externallyOwnedPorts.has(route.logicalPort)"), true);
   assert.equal(routeNeedsLogicalRouter.includes("route.actualPort !== route.logicalPort"), true);
@@ -2013,6 +2056,7 @@ test("logical network service persists registry-normalized shared state", () => 
   assert.equal(constructorBody.includes("const loadedState = this.loadState();"), true);
   assert.equal(constructorBody.includes("this.saveNormalizedPersistedStateIfChanged();"), true);
   assert.equal(reloadBody.includes("this.saveNormalizedPersistedStateIfChanged();"), true);
+  assert.equal(reloadBody.includes("this.syncVscodeWindowProcessAttachment();"), true);
   assert.equal(helperBody.includes("this.registry.getPersistedState()"), true);
   assert.equal(helperBody.includes("this.saveState({ force: true });"), true);
 });

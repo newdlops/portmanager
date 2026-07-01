@@ -140,6 +140,7 @@ const TERMINAL_NETWORK_SELECTION_FILE_NAME = "terminal-networks.tsv";
 const RUNTIME_SHIM_DIRECTORY_NAME = "runtime-shims";
 const MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX = "manual-terminal:";
 const PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX = "process-terminal:";
+const VSCODE_WINDOW_PROCESS_ATTACHMENT_ID_PREFIX = "vscode-window-process:";
 const ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 10_000;
 const BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS = 60_000;
 const BACKGROUND_CONTAINER_REFRESH_LOCK_STALE_MS = 120_000;
@@ -687,8 +688,8 @@ export class PortManagerNetworkService implements DisposableLike {
       }),
       this.watchOwnerLeaseFiles(),
       vscode.window.onDidOpenTerminal((terminal) => {
+        this.scheduleVscodeTerminalTitleRefresh(terminal);
         if (this.ownsControlPlaneLease) {
-          this.scheduleVscodeTerminalTitleRefresh(terminal);
           void this.refreshTerminals();
         }
       }),
@@ -708,12 +709,10 @@ export class PortManagerNetworkService implements DisposableLike {
           }
         }
         if (event.affectsConfiguration("portManager")) {
+          void this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
           if (this.ownsControlPlaneLease) {
-            void this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
             void this.writeTerminalNetworkSelectionFile();
             void this.syncBrowserNetworkProxies();
-          } else {
-            this.applyVscodeWindowTerminalEnvironment();
           }
         }
       }),
@@ -722,7 +721,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.reloadSharedNetworkState();
     await this.refreshRuntimeDescriptors({ includeContainerRuntime: false });
     this.reconcileVscodeWindowTerminalBinding();
-    this.applyVscodeWindowTerminalEnvironment();
+    await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
     await this.startControlPlaneOwnerIfAvailable();
   }
 
@@ -871,7 +870,7 @@ export class PortManagerNetworkService implements DisposableLike {
      * under their own leases so browser aliases, host exposures, and logical
      * routers do not drop every connection while another window takes over.
      */
-    this.context.environmentVariableCollection.clear();
+    this.applyVscodeWindowTerminalEnvironment();
     releaseControlPlaneOwnerLease();
     if (wasControlPlaneOwner) {
       this.localChangeEvents.emit();
@@ -1414,10 +1413,7 @@ export class PortManagerNetworkService implements DisposableLike {
    * changes retroactively.
    */
   async attachVscodeWindowTerminalsToNetwork(networkId: string): Promise<VscodeWindowTerminalAttachSummary> {
-    if (!(await this.startControlPlaneOwnerIfAvailable())) {
-      throw new Error("Another Port Manager window owns terminal routing control. Try the command from that window.");
-    }
-
+    await this.reloadSharedNetworkState();
     const network = requireNetwork(this.registry.getNetwork(networkId), networkId);
     const runtime = requireRuntime(this.registry.getSnapshot().runtimes, network.runtimeKind);
     requireNativeHelperRuntime(runtime);
@@ -1450,6 +1446,7 @@ export class PortManagerNetworkService implements DisposableLike {
     this.vscodeWindowTerminalBinding = binding;
     this.saveVscodeWindowTerminalBinding();
     this.applyVscodeWindowTerminalEnvironment();
+    this.syncVscodeWindowProcessAttachment();
 
     const injectedTerminalCount = await this.injectRoutingIntoOpenVscodeTerminals(network, settings);
     const updatedBinding = {
@@ -1473,6 +1470,7 @@ export class PortManagerNetworkService implements DisposableLike {
     this.vscodeWindowTerminalBinding = undefined;
     this.saveVscodeWindowTerminalBinding();
     this.applyVscodeWindowTerminalEnvironment();
+    this.syncVscodeWindowProcessAttachment();
 
     const detachedTerminalCount = sendCommandToOpenVscodeTerminals(this.buildTerminalDetachScript());
     await this.refreshTerminals().catch(() => []);
@@ -1615,6 +1613,58 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     return this.registry.addAttachment(attachment);
+  }
+
+  /**
+   * Mirrors the current VS Code extension-host PID into the process label registry.
+   *
+   * A VS Code window can act as a host-side client for processes in its selected
+   * logical network even when the client socket is opened outside an integrated
+   * terminal. Labeling this PID reuses the same routing model as explicit
+   * process attachments.
+   */
+  private syncVscodeWindowProcessAttachment(): void {
+    const attachmentId = createVscodeWindowProcessAttachmentId(process.pid);
+    const binding = this.vscodeWindowTerminalBinding;
+    const existing = this.registry.getSnapshot().attachments.find((attachment) => attachment.id === attachmentId);
+    const settings = readPortManagerSettings();
+
+    if (
+      binding?.status !== "attached" ||
+      !shouldInjectTerminalHook(settings) ||
+      this.registry.getNetwork(binding.networkId) === undefined
+    ) {
+      if (existing !== undefined) {
+        this.registry.removeAttachment(existing.id);
+      }
+      return;
+    }
+
+    const nextAttachment: TerminalAttachment = {
+      id: attachmentId,
+      networkId: binding.networkId,
+      rootPid: process.pid,
+      terminalWindowId: `vscode-window:${process.pid}`,
+      terminalTitle: `VS Code Window: ${buildCurrentVsCodeWindowTitle()}`,
+      mode: "logical",
+      status: "attached",
+      attachedAt: existing?.attachedAt ?? binding.attachedAt,
+    };
+
+    if (
+      existing !== undefined &&
+      existing.networkId === nextAttachment.networkId &&
+      existing.rootPid === nextAttachment.rootPid &&
+      existing.terminalWindowId === nextAttachment.terminalWindowId &&
+      existing.terminalTitle === nextAttachment.terminalTitle &&
+      existing.mode === nextAttachment.mode &&
+      existing.status === nextAttachment.status &&
+      existing.attachedAt === nextAttachment.attachedAt
+    ) {
+      return;
+    }
+
+    this.registry.addAttachment(nextAttachment);
   }
 
   /**
@@ -2486,6 +2536,7 @@ export class PortManagerNetworkService implements DisposableLike {
       this.applyingSharedNetworkState = false;
     }
     this.saveNormalizedPersistedStateIfChanged();
+    this.syncVscodeWindowProcessAttachment();
 
     if (this.ownsControlPlaneLease && tryAcquireControlPlaneOwnerLease()) {
       await this.reopenPersistedExposures();
@@ -2528,16 +2579,12 @@ export class PortManagerNetworkService implements DisposableLike {
     this.vscodeWindowTerminalBinding = undefined;
     this.saveVscodeWindowTerminalBinding();
     this.applyVscodeWindowTerminalEnvironment();
+    this.syncVscodeWindowProcessAttachment();
     this.localChangeEvents.emit();
   }
 
   /** Updates VS Code's new-terminal environment for the current window/workspace. */
   private applyVscodeWindowTerminalEnvironment(): void {
-    if (!this.ownsControlPlaneLease) {
-      applyTerminalHookEnvironment(this.context, undefined);
-      return;
-    }
-
     const binding = this.vscodeWindowTerminalBinding;
     const networkId = binding?.status === "attached" ? binding.networkId : undefined;
 
@@ -2545,14 +2592,14 @@ export class PortManagerNetworkService implements DisposableLike {
       this.context,
       networkId === undefined
         ? undefined
-            : {
-                networkId,
-                networkName: this.registry.getNetwork(networkId)?.name,
-                networkDnsAlias: normalizeBrowserDnsHostname(this.registry.getNetwork(networkId)?.name ?? ""),
-                composeRoutingFilePath: this.getComposeProjectRoutingFilePath(networkId),
-                terminalAttachmentMarkerDirectoryPath: this.getTerminalAttachmentMarkerDirectoryPath(),
-                composeLogicalPorts: this.getComposeLogicalPortsForNetwork(networkId),
-              },
+        : {
+            networkId,
+            networkName: this.registry.getNetwork(networkId)?.name,
+            networkDnsAlias: normalizeBrowserDnsHostname(this.registry.getNetwork(networkId)?.name ?? ""),
+            composeRoutingFilePath: this.getComposeProjectRoutingFilePath(networkId),
+            terminalAttachmentMarkerDirectoryPath: this.getTerminalAttachmentMarkerDirectoryPath(),
+            composeLogicalPorts: this.getComposeLogicalPortsForNetwork(networkId),
+          },
     );
   }
 
@@ -2591,6 +2638,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     this.applyVscodeWindowTerminalEnvironment();
+    this.syncVscodeWindowProcessAttachment();
   }
 
   /** Sends the current network routing script to all already-open VS Code terminals. */
@@ -3946,11 +3994,16 @@ export class PortManagerNetworkService implements DisposableLike {
   private async syncLogicalPortRoutersExclusive(): Promise<void> {
     /*
      * Host loopback belongs to processes outside logical networks. Network-owned
-     * routes must stay reachable through hooks, DNS aliases, or explicit browser
-     * proxies without reserving 127.0.0.1:logicalPort in the host namespace.
+     * routes normally stay reachable through hooks, DNS aliases, or browser
+     * proxies. Host-side client attachments are the exception: those processes
+     * keep dialing 127.0.0.1, so their networks need compatibility listeners.
      */
     const snapshot = this.processService?.getSnapshot();
-    const logicalPorts = collectLogicalRouterPorts(snapshot?.routes ?? [], snapshot?.listeners ?? []);
+    const logicalPorts = collectLogicalRouterPorts(
+      snapshot?.routes ?? [],
+      snapshot?.listeners ?? [],
+      this.registry.getSnapshot().attachments,
+    );
 
     if (!tryAcquireLogicalRouterOwnerLease()) {
       if (this.ownsLogicalRouterLease) {
@@ -5095,7 +5148,8 @@ export class PortManagerNetworkService implements DisposableLike {
 
     for (const attachment of this.registry.getSnapshot().attachments) {
       if (
-        attachment.id.startsWith(PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX) &&
+        (attachment.id.startsWith(PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX) ||
+          attachment.id.startsWith(VSCODE_WINDOW_PROCESS_ATTACHMENT_ID_PREFIX)) &&
         !liveProcessIds.has(attachment.rootPid)
       ) {
         this.registry.removeAttachment(attachment.id);
@@ -7056,8 +7110,10 @@ function isListenRoute(route: LogicalPortRoute): boolean {
 function collectLogicalRouterPorts(
   routes: readonly LogicalPortRoute[],
   listeners: readonly ListeningPort[] = [],
+  attachments: readonly TerminalAttachment[] = [],
 ): readonly number[] {
   const ports = new Set<number>();
+  const hostClientNetworkIds = collectHostClientAttachmentNetworkIds(attachments);
   const externallyOwnedPorts = new Set(
     listeners
       .filter((listener) => listener.protocol === "tcp" && !isPortManagerLogicalRouterListener(listener))
@@ -7068,7 +7124,7 @@ function collectLogicalRouterPorts(
   for (const route of routes) {
     if (
       isLiveListenRoute(route) &&
-      route.networkId === undefined &&
+      (route.networkId === undefined || hostClientNetworkIds.has(route.networkId)) &&
       isTcpPort(route.logicalPort) &&
       routeNeedsLogicalRouter(route) &&
       !externallyOwnedPorts.has(route.logicalPort)
@@ -7078,6 +7134,27 @@ function collectLogicalRouterPorts(
   }
 
   return [...ports].sort((left, right) => left - right);
+}
+
+/**
+ * Hookless host-side clients attached to a network still see localhost as their
+ * default gateway. Opening routers for their networks makes that host namespace
+ * behave like the selected logical network without requiring preload injection.
+ */
+function collectHostClientAttachmentNetworkIds(attachments: readonly TerminalAttachment[]): ReadonlySet<string> {
+  return new Set(
+    attachments
+      .filter(isHooklessHostClientAttachment)
+      .map((attachment) => attachment.networkId),
+  );
+}
+
+function isHooklessHostClientAttachment(attachment: TerminalAttachment): boolean {
+  return (
+    attachment.status === "attached" &&
+    (attachment.id.startsWith(PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX) ||
+      attachment.id.startsWith(VSCODE_WINDOW_PROCESS_ATTACHMENT_ID_PREFIX))
+  );
 }
 
 /**
@@ -8654,6 +8731,11 @@ function createManualTerminalAttachmentId(
 /** Keeps explicit process attachments stable across repeated user actions. */
 function createProcessTerminalAttachmentId(networkId: string, pid: number): string {
   return `${PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX}${encodeURIComponent(networkId)}:${pid}`;
+}
+
+/** Keeps the current VS Code window PID label stable as the window switches networks. */
+function createVscodeWindowProcessAttachmentId(pid: number): string {
+  return `${VSCODE_WINDOW_PROCESS_ATTACHMENT_ID_PREFIX}${pid}`;
 }
 
 /** Collapses competing marker files so each terminal keeps the latest network label. */

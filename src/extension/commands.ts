@@ -1290,18 +1290,22 @@ export class PortManagerCommandController implements DisposableLike {
           detail: statusSummary.detail,
           action: "current" as const,
         },
-        ...(ownsControlPlane
+        {
+          label: "$(vm) Switch VS Code Terminal Network",
+          description: "Choose the network inherited by new terminals in this window",
+          action: "switch" as const,
+        },
+        ...(snapshot.vscodeWindowTerminalBinding !== undefined || ownsControlPlane
           ? [
-              {
-                label: "$(vm) Switch VS Code Terminal Network",
-                description: "Choose the network inherited by new terminals",
-                action: "switch" as const,
-              },
               {
                 label: "$(debug-disconnect) Detach",
                 description: statusSummary.detachDescription,
                 action: "detach" as const,
               },
+            ]
+          : []),
+        ...(ownsControlPlane
+          ? [
               {
                 label: "$(refresh) Refresh",
                 description: "Rescan terminals and services",
@@ -1342,7 +1346,9 @@ export class PortManagerCommandController implements DisposableLike {
           await this.detachVscodeWindowTerminalsFromNetwork();
           return;
         }
-        await this.detachTerminalFromNetwork(undefined);
+        if (ownsControlPlane) {
+          await this.detachTerminalFromNetwork(undefined);
+        }
         return;
       case "refresh":
         await this.refresh();

@@ -290,7 +290,7 @@ export class PortManagerTreeProvider
             ]
           : []),
         ...(windowTerminalBinding !== undefined
-          ? [new VscodeWindowTerminalBindingTreeItem(windowTerminalBinding, element.network, ownerAction)]
+          ? [new VscodeWindowTerminalBindingTreeItem(windowTerminalBinding, element.network)]
           : []),
         ...attachments.map((attachment) => new TerminalAttachmentTreeItem(attachment)),
         ...composeAttachments.map((attachment) => new ComposeAttachmentTreeItem(attachment)),
@@ -330,7 +330,6 @@ export class PortManagerTreeProvider
             "terminal",
             "Make this window default",
             element.network,
-            ownerAction,
           ),
           new ActionTreeItem(
             "Attach Service",
@@ -510,7 +509,6 @@ export class PortManagerTreeProvider
                 new VscodeWindowTerminalBindingTreeItem(
                   snapshot.vscodeWindowTerminalBinding,
                   snapshot.networks.find((network) => network.id === snapshot.vscodeWindowTerminalBinding?.networkId),
-                  ownerAction,
                 ),
               ]
             : []),

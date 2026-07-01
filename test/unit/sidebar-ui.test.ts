@@ -97,7 +97,6 @@ test("non-owner windows show owner status and disable owner actions", () => {
     "portManager.attachActiveTerminalToNetwork",
     "portManager.attachContainerToNetwork",
     "portManager.refreshContainerServices",
-    "portManager.attachVscodeWindowTerminalsToNetwork",
     "portManager.restartDaemon",
     "portManager.fixStaleRouting",
     "portManager.clearGlobalStorageFiles",
@@ -134,6 +133,9 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(source.includes("formatOwnerOnlyActionReason(controlPlane)"), true);
   assert.equal(source.includes("buildOwnerUiActionRows(snapshot.controlPlane)"), true);
   assert.equal(source.includes("formatOwnerWindowTitle(controlPlane)"), true);
+  assert.equal(source.includes('new VscodeWindowTerminalBindingTreeItem(windowTerminalBinding, element.network, ownerAction)'), false);
+  assert.equal(source.includes('"Use for VS Code Terminals"'), true);
+  assert.equal(source.includes('"Make this window default"'), true);
   assert.equal(source.includes('"Open Owner UI"'), true);
   assert.equal(commandsSource.includes('label: "$(lock) Owner actions disabled"'), true);
   assert.equal(commandsSource.includes('label: "$(window) Open Owner UI"'), true);
@@ -156,6 +158,19 @@ test("non-owner windows show owner status and disable owner actions", () => {
       `${command} context menu entries must require owner context`,
     );
   }
+
+  assert.equal(
+    menuItems
+      .filter((item) => item.command === "portManager.attachVscodeWindowTerminalsToNetwork")
+      .some((item) => (item.when ?? "").includes("viewItem == logicalNetwork") && !(item.when ?? "").includes("portManager.isControlPlaneOwner")),
+    true,
+  );
+  assert.equal(
+    menuItems
+      .filter((item) => item.command === "portManager.detachVscodeWindowTerminalsFromNetwork")
+      .some((item) => (item.when ?? "").includes("vscodeWindowTerminalBinding") && !(item.when ?? "").includes("portManager.isControlPlaneOwner")),
+    true,
+  );
 
   assert.equal(
     viewTitleItems

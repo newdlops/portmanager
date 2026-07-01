@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8125",
+  "version": "0.0.8126",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -548,7 +548,7 @@
         },
         {
           "command": "portManager.attachVscodeWindowTerminalsToNetwork",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@8"
         },
         {
@@ -613,7 +613,7 @@
         },
         {
           "command": "portManager.attachVscodeWindowTerminalsToNetwork",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == section.daemon || viewItem == vscodeWindowTerminalBinding)",
+          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == vscodeWindowTerminalBinding)",
           "group": "terminal@2"
         },
         {
@@ -623,7 +623,7 @@
         },
         {
           "command": "portManager.detachVscodeWindowTerminalsFromNetwork",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == section.daemon || viewItem == vscodeWindowTerminalBinding)",
+          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == vscodeWindowTerminalBinding)",
           "group": "terminal@3"
         },
         {
