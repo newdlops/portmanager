@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import * as http from "node:http";
 import * as https from "node:https";
 import * as net from "node:net";
+import * as tls from "node:tls";
 import test from "node:test";
 
 import {
@@ -195,6 +196,67 @@ test("terminates HTTPS browser proxy requests and returns upstream responses", a
     assert.equal(response.body, "secure-target");
     assert.equal(response.headers.location, `${publicOrigin}/secure`);
     assert.equal(response.headers["access-control-allow-origin"], publicOrigin);
+  } finally {
+    await proxy.dispose();
+    await closeServer(upstream);
+  }
+});
+
+test("reopens HTTPS browser proxy listeners when TLS credentials rotate", async () => {
+  const upstream = http.createServer((_request, response) => {
+    response.end("rotated-target");
+  });
+  await listen(upstream, 0, "127.0.0.1");
+
+  const proxyPort = await getAvailablePort();
+  let credentials = {
+    key: TEST_TLS_KEY,
+    cert: TEST_TLS_CERTIFICATE,
+  };
+  const proxy = new BrowserNetworkProxyManager(
+    {
+      resolve: () => ({
+        host: "127.0.0.1",
+        port: getServerPort(upstream),
+      }),
+    },
+    {
+      tlsCredentials: {
+        getCredentials: () => credentials,
+      },
+    },
+  );
+  const endpoint = createEndpoint({
+    publicHost: "alpha1",
+    publicProtocol: "https",
+    listenPorts: [proxyPort],
+  });
+
+  try {
+    const activeEndpoint = await proxy.ensure(endpoint);
+
+    assert.ok(activeEndpoint);
+
+    const initialFingerprint = await readHttpsPeerCertificateFingerprint(activeEndpoint.listenPort);
+    credentials = {
+      key: ROTATED_TEST_TLS_KEY,
+      cert: ROTATED_TEST_TLS_CERTIFICATE,
+    };
+
+    const reopenedEndpoint = await proxy.ensure(endpoint);
+
+    assert.equal(reopenedEndpoint?.listenPort, activeEndpoint.listenPort);
+    assert.notEqual(await readHttpsPeerCertificateFingerprint(activeEndpoint.listenPort), initialFingerprint);
+    assert.equal(
+      (
+        await requestHttps({
+          host: "127.0.0.1",
+          port: activeEndpoint.listenPort,
+          path: "/",
+        })
+      ).body,
+      "rotated-target",
+    );
   } finally {
     await proxy.dispose();
     await closeServer(upstream);
@@ -647,6 +709,25 @@ function requestHttps(options: {
   });
 }
 
+function readHttpsPeerCertificateFingerprint(port: number): Promise<string | undefined> {
+  return new Promise((resolve, reject) => {
+    const socket = tls.connect(
+      {
+        host: "127.0.0.1",
+        port,
+        rejectUnauthorized: false,
+        servername: "localhost",
+      },
+      () => {
+        const certificate = socket.getPeerCertificate();
+        socket.end();
+        resolve(typeof certificate.fingerprint256 === "string" ? certificate.fingerprint256 : undefined);
+      },
+    );
+    socket.once("error", reject);
+  });
+}
+
 function sendUpgradeRequest(port: number, message: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection({ host: "127.0.0.1", port });
@@ -691,6 +772,37 @@ const TEST_TLS_CERTIFICATE = [
   "lILCDRzp9r39s6MeMBwwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqG",
   "SM49BAMCA0kAMEYCIQDcaODSRujrhUdKGuUamG0d2/E5ZPqRQhGKFc2aoEN0BgIh",
   "AJ2jn5A6mS9hO3n71Qg38NpLWD9pG8kjc9ItMwZmb/8f",
+  "-----END CERTIFICATE-----",
+].join("\n");
+
+const ROTATED_TEST_TLS_KEY = [
+  "-----BEGIN PRIVATE KEY-----",
+  "MIIBeQIBADCCAQMGByqGSM49AgEwgfcCAQEwLAYHKoZIzj0BAQIhAP////8AAAAB",
+  "AAAAAAAAAAAAAAAA////////////////MFsEIP////8AAAABAAAAAAAAAAAAAAAA",
+  "///////////////8BCBaxjXYqjqT57PrvVV2mIa8ZR0GsMxTsPY7zjw+J9JgSwMV",
+  "AMSdNgiG5wSTamZ44ROdJreBn36QBEEEaxfR8uEsQkf4vOblY6RA8ncDfYEt6zOg",
+  "9KE5RdiYwpZP40Li/hp/m47n60p8D54WK84zV2sxXs7LtkBoN79R9QIhAP////8A",
+  "AAAA//////////+85vqtpxeehPO5ysL8YyVRAgEBBG0wawIBAQQgo2hB1z6OKSmH",
+  "bU5wxdztTZiUXhqcSS65JVdAXdLeahChRANCAAQtnHTGdhp5to+lRUzNkT9CJVo6",
+  "Go1aLPQwhOp0v+VFhc738CPmz+Ms34xqtkl1PpCupe5Px4t6EctXGaS7yGma",
+  "-----END PRIVATE KEY-----",
+].join("\n");
+
+const ROTATED_TEST_TLS_CERTIFICATE = [
+  "-----BEGIN CERTIFICATE-----",
+  "MIICQDCCAeegAwIBAgIJAPME19MV3WTYMAoGCCqGSM49BAMCMBwxGjAYBgNVBAMM",
+  "EWxvY2FsaG9zdC1yb3RhdGVkMB4XDTI2MDcwMjAzMzczOFoXDTI2MDcwOTAzMzcz",
+  "OFowHDEaMBgGA1UEAwwRbG9jYWxob3N0LXJvdGF0ZWQwggFLMIIBAwYHKoZIzj0C",
+  "ATCB9wIBATAsBgcqhkjOPQEBAiEA/////wAAAAEAAAAAAAAAAAAAAAD/////////",
+  "//////8wWwQg/////wAAAAEAAAAAAAAAAAAAAAD///////////////wEIFrGNdiq",
+  "OpPns+u9VXaYhrxlHQawzFOw9jvOPD4n0mBLAxUAxJ02CIbnBJNqZnjhE50mt4Gf",
+  "fpAEQQRrF9Hy4SxCR/i85uVjpEDydwN9gS3rM6D0oTlF2JjClk/jQuL+Gn+bjufr",
+  "SnwPnhYrzjNXazFezsu2QGg3v1H1AiEA/////wAAAAD//////////7zm+q2nF56E",
+  "87nKwvxjJVECAQEDQgAELZx0xnYaebaPpUVMzZE/QiVaOhqNWiz0MITqdL/lRYXO",
+  "9/Aj5s/jLN+MarZJdT6QrqXuT8eLehHLVxmku8hpmqMeMBwwGgYDVR0RBBMwEYIJ",
+  "bG9jYWxob3N0hwR/AAABMAoGCCqGSM49BAMCA0cAMEQCIFZDrL/9LB09cfynmus5",
+  "mWcmUal/hI29gehxLOAWpkH4AiA4EVUP6ckuo0uovqe/6664DtRG2+p9IzNjCpyz",
+  "l7Wh8g==",
   "-----END CERTIFICATE-----",
 ].join("\n");
 

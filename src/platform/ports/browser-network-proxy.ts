@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as http from "node:http";
 import * as https from "node:https";
 import * as net from "node:net";
@@ -79,9 +80,16 @@ interface BrowserNetworkProxyListener {
   readonly httpsAgent: https.Agent;
   /** Client and upstream sockets closed together during reconciliation. */
   readonly sockets: Set<net.Socket>;
+  /** Fingerprint of the TLS identity loaded when this HTTPS listener opened. */
+  readonly tlsCredentialsFingerprint?: string;
 }
 
 type BrowserNetworkProxyServer = http.Server | https.Server;
+
+interface BrowserNetworkProxyServerBuild {
+  readonly server: BrowserNetworkProxyServer;
+  readonly tlsCredentialsFingerprint?: string;
+}
 
 interface BrowserNetworkProxyEndpointMetadata {
   /** Browser-facing origin used in response rewrites. */
@@ -146,7 +154,7 @@ export class BrowserNetworkProxyManager {
       }
 
       this.cancelRetire(id);
-      if (!isEndpointCurrent(listener.endpoint, endpoint)) {
+      if (!isEndpointCurrent(listener.endpoint, endpoint) || !this.isTlsCredentialsCurrent(listener, endpoint)) {
         await this.close(id);
       }
     }
@@ -172,7 +180,11 @@ export class BrowserNetworkProxyManager {
   async ensure(endpoint: BrowserNetworkProxyEndpoint): Promise<ActiveBrowserNetworkProxyEndpoint | undefined> {
     const normalizedEndpoint = normalizeEndpoint(endpoint);
     const listener = this.listeners.get(normalizedEndpoint.id);
-    if (listener !== undefined && isEndpointCurrent(listener.endpoint, normalizedEndpoint)) {
+    if (
+      listener !== undefined &&
+      isEndpointCurrent(listener.endpoint, normalizedEndpoint) &&
+      this.isTlsCredentialsCurrent(listener, normalizedEndpoint)
+    ) {
       this.cancelRetire(normalizedEndpoint.id);
       return listener.endpoint;
     }
@@ -278,9 +290,9 @@ export class BrowserNetworkProxyManager {
         rejectUnauthorized: false,
       });
       const sockets = new Set<net.Socket>();
-      let server: BrowserNetworkProxyServer;
+      let serverBuild: BrowserNetworkProxyServerBuild;
       try {
-        server = this.createServer(activeEndpoint, (request, response) => {
+        serverBuild = this.createServer(activeEndpoint, (request, response) => {
           void this.forwardHttp(activeEndpoint, metadata, httpAgent, httpsAgent, request, response);
         });
       } catch (error) {
@@ -290,6 +302,7 @@ export class BrowserNetworkProxyManager {
         continue;
       }
 
+      const { server, tlsCredentialsFingerprint } = serverBuild;
       server.on("connection", (socket) => {
         sockets.add(socket);
         socket.once("close", () => sockets.delete(socket));
@@ -300,7 +313,15 @@ export class BrowserNetworkProxyManager {
 
       try {
         await listen(server, listenPort, endpoint.listenHost);
-        this.listeners.set(endpoint.id, { endpoint: activeEndpoint, metadata, server, httpAgent, httpsAgent, sockets });
+        this.listeners.set(endpoint.id, {
+          endpoint: activeEndpoint,
+          metadata,
+          server,
+          httpAgent,
+          httpsAgent,
+          sockets,
+          tlsCredentialsFingerprint,
+        });
         return activeEndpoint;
       } catch (error) {
         httpAgent.destroy();
@@ -415,9 +436,9 @@ export class BrowserNetworkProxyManager {
   private createServer(
     endpoint: ActiveBrowserNetworkProxyEndpoint,
     handler: http.RequestListener,
-  ): BrowserNetworkProxyServer {
+  ): BrowserNetworkProxyServerBuild {
     if ((endpoint.publicProtocol ?? "http") !== "https") {
-      return http.createServer(handler);
+      return { server: http.createServer(handler) };
     }
 
     const credentials = this.options.tlsCredentials?.getCredentials();
@@ -425,7 +446,39 @@ export class BrowserNetworkProxyManager {
       throw new Error(`TLS credentials unavailable for browser proxy ${endpoint.id}.`);
     }
 
-    return https.createServer(credentials, handler);
+    return {
+      server: https.createServer(credentials, handler),
+      tlsCredentialsFingerprint: fingerprintTlsCredentials(credentials),
+    };
+  }
+
+  /**
+   * Browser certificates are regenerated when DNS aliases change. Existing
+   * HTTPS servers keep their SecureContext, so reconciliation must reopen them
+   * once the certificate files contain a different identity.
+   */
+  private isTlsCredentialsCurrent(
+    listener: BrowserNetworkProxyListener,
+    desiredEndpoint: BrowserNetworkProxyEndpoint,
+  ): boolean {
+    if ((desiredEndpoint.publicProtocol ?? "http") !== "https") {
+      return true;
+    }
+
+    if (listener.tlsCredentialsFingerprint === undefined) {
+      return false;
+    }
+
+    const credentials = this.options.tlsCredentials?.getCredentials();
+    if (credentials === undefined) {
+      /*
+       * Certificate renewal writes multiple files. Keep the old HTTPS listener
+       * alive during transient read gaps and rotate on the next successful read.
+       */
+      return true;
+    }
+
+    return fingerprintTlsCredentials(credentials) === listener.tlsCredentialsFingerprint;
   }
 }
 
@@ -661,6 +714,15 @@ function normalizeTargetHost(host: string): string {
   }
 
   return host;
+}
+
+function fingerprintTlsCredentials(credentials: BrowserNetworkProxyTlsCredentials): string {
+  const hash = createHash("sha256");
+  hash.update("key\0");
+  hash.update(credentials.key);
+  hash.update("\0cert\0");
+  hash.update(credentials.cert);
+  return hash.digest("hex");
 }
 
 function formatHostForUrl(host: string): string {
