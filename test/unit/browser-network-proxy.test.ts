@@ -65,6 +65,81 @@ test("rewrites browser alias HTTP requests as localhost upstream requests", asyn
   }
 });
 
+test("keeps Vite-facing requests on localhost while rewriting localhost response links to the public protocol", async () => {
+  const upstreamRequests: http.IncomingHttpHeaders[] = [];
+  const upstreamBody = [
+    '<a href="http://localhost:3004/dashboard">dashboard</a>',
+    '<a href="http://127.0.0.1:8004/api">api</a>',
+    '<script type="module">',
+    '  const socket = "ws://[::1]:3004/@vite/client";',
+    '  const asset = "//localhost:3004/src/main.ts";',
+    '  const secureApi = "https://localhost:9443/secure";',
+    "</script>",
+  ].join("\n");
+  const upstream = http.createServer((request, response) => {
+    upstreamRequests.push(request.headers);
+    response.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "content-length": String(Buffer.byteLength(upstreamBody)),
+    });
+    response.end(upstreamBody);
+  });
+  await listen(upstream, 0, "127.0.0.1");
+
+  const proxyPort = await getAvailablePort();
+  const proxy = new BrowserNetworkProxyManager(
+    {
+      resolve: () => ({
+        host: "127.0.0.1",
+        port: getServerPort(upstream),
+      }),
+    },
+    {
+      tlsCredentials: {
+        getCredentials: () => ({
+          key: TEST_TLS_KEY,
+          cert: TEST_TLS_CERTIFICATE,
+        }),
+      },
+    },
+  );
+
+  try {
+    const activeEndpoint = await proxy.ensure(
+      createEndpoint({
+        publicHost: "product1",
+        publicProtocol: "https",
+        listenPorts: [proxyPort],
+      }),
+    );
+
+    assert.ok(activeEndpoint);
+
+    const response = await requestHttps({
+      host: "127.0.0.1",
+      port: activeEndpoint.listenPort,
+      path: "/",
+      headers: {
+        host: `product1:${activeEndpoint.listenPort}`,
+        "accept-encoding": "gzip, deflate, br",
+      },
+    });
+
+    assert.equal(upstreamRequests[0]?.host, "localhost:3004");
+    assert.equal(upstreamRequests[0]?.["accept-encoding"], "identity");
+    assert.match(response.body, new RegExp(`https://product1:${activeEndpoint.listenPort}/dashboard`));
+    assert.match(response.body, /https:\/\/product1:8004\/api/);
+    assert.match(response.body, new RegExp(`wss://product1:${activeEndpoint.listenPort}/@vite/client`));
+    assert.match(response.body, new RegExp(`//product1:${activeEndpoint.listenPort}/src/main.ts`));
+    assert.match(response.body, /https:\/\/product1:9443\/secure/);
+    assert.doesNotMatch(response.body, /localhost|127\.0\.0\.1|\[::1\]/);
+    assert.equal(response.headers["content-length"], String(Buffer.byteLength(response.body)));
+  } finally {
+    await proxy.dispose();
+    await closeServer(upstream);
+  }
+});
+
 test("uses a fallback browser port when the logical port is already occupied", async () => {
   const occupied = http.createServer((_request, response) => {
     response.end("occupied");

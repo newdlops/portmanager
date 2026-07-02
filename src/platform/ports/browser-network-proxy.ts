@@ -94,6 +94,14 @@ interface BrowserNetworkProxyServerBuild {
 interface BrowserNetworkProxyEndpointMetadata {
   /** Browser-facing origin used in response rewrites. */
   readonly publicOrigin: string;
+  /** Browser-facing protocol selected for HTTP URL rewrites. */
+  readonly publicProtocol: "http" | "https";
+  /** Browser-facing hostname formatted for URLs. */
+  readonly publicHost: string;
+  /** Concrete browser-facing port. The current logical port may use a fallback. */
+  readonly publicPort: number;
+  /** Current logical port whose localhost origin maps to publicPort. */
+  readonly logicalPort: number;
   /** Localhost origin presented to development servers. */
   readonly upstreamOrigin: string;
   /** Host header value sent to development servers. */
@@ -113,7 +121,13 @@ const RESPONSE_ORIGIN_REWRITE_HEADER_NAMES = new Set([
   "refresh",
   "access-control-allow-origin",
   "link",
+  "content-security-policy",
+  "content-security-policy-report-only",
 ]);
+const ABSOLUTE_LOCALHOST_ORIGIN_PATTERN =
+  /\b(https?|wss?):\/\/(localhost|127\.0\.0\.1|\[::1\]):(\d{1,5})(?=\/|[?#"'`\s<);]|$)/gi;
+const PROTOCOL_RELATIVE_LOCALHOST_ORIGIN_PATTERN =
+  /(^|[^:])\/\/(localhost|127\.0\.0\.1|\[::1\]):(\d{1,5})(?=\/|[?#"'`\s<);]|$)/gi;
 
 /**
  * Development-only browser isolation proxy.
@@ -362,12 +376,7 @@ export class BrowserNetworkProxyManager {
       headers: rewriteRequestHeaders(request.headers, upstreamMetadata),
     };
     const responseHandler = (upstreamResponse: http.IncomingMessage) => {
-      response.writeHead(
-        upstreamResponse.statusCode ?? 502,
-        upstreamResponse.statusMessage,
-        rewriteResponseHeaders(upstreamResponse.headers, upstreamMetadata),
-      );
-      upstreamResponse.pipe(response);
+      forwardUpstreamResponse(request, upstreamResponse, response, upstreamMetadata);
     };
     const upstreamRequest =
       upstreamProtocol === "https"
@@ -535,6 +544,7 @@ function rewriteRequestHeaders(headers: http.IncomingHttpHeaders, metadata: Brow
   const nextHeaders: http.OutgoingHttpHeaders = {
     ...headers,
     host: metadata.upstreamHostHeader,
+    "accept-encoding": "identity",
   };
 
   const origin = rewriteHeaderOrigin(headers.origin, metadata.publicOrigin, metadata.upstreamOrigin);
@@ -572,6 +582,44 @@ function rewriteResponseHeaders(headers: http.IncomingHttpHeaders, metadata: Bro
   return nextHeaders;
 }
 
+function forwardUpstreamResponse(
+  request: http.IncomingMessage,
+  upstreamResponse: http.IncomingMessage,
+  response: http.ServerResponse,
+  metadata: BrowserNetworkProxyEndpointMetadata,
+): void {
+  const shouldRewriteBody = shouldRewriteResponseBody(request, upstreamResponse);
+
+  if (!shouldRewriteBody) {
+    response.writeHead(
+      upstreamResponse.statusCode ?? 502,
+      upstreamResponse.statusMessage,
+      rewriteResponseHeaders(upstreamResponse.headers, metadata),
+    );
+    upstreamResponse.pipe(response);
+    return;
+  }
+
+  const chunks: Buffer[] = [];
+  upstreamResponse.on("data", (chunk: Buffer | string) => {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+  upstreamResponse.once("error", () => writeGatewayError(response));
+  upstreamResponse.once("end", () => {
+    const body = Buffer.concat(chunks).toString("utf8");
+    const rewrittenBody = rewriteLocalhostOrigins(body, metadata);
+    const rewrittenBodyBuffer = Buffer.from(rewrittenBody, "utf8");
+    const headers = rewriteResponseHeaders(upstreamResponse.headers, metadata);
+
+    removeHeader(headers, "content-length");
+    removeHeader(headers, "transfer-encoding");
+    headers["content-length"] = rewrittenBodyBuffer.byteLength;
+
+    response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.statusMessage, headers);
+    response.end(rewrittenBodyBuffer);
+  });
+}
+
 function rewriteResponseHeaderValue(
   value: string | string[],
   metadata: BrowserNetworkProxyEndpointMetadata,
@@ -584,16 +632,11 @@ function rewriteResponseHeaderValue(
 }
 
 function rewriteResponseHeaderString(value: string, metadata: BrowserNetworkProxyEndpointMetadata): string {
-  if (!metadata.upstreamOrigins.some((origin) => value.includes(origin))) {
+  if (!shouldRewriteLocalhostOrigins(value, metadata)) {
     return value;
   }
 
-  let rewritten = value;
-  for (const origin of metadata.upstreamOrigins) {
-    rewritten = rewritten.replaceAll(origin, metadata.publicOrigin);
-  }
-
-  return rewritten;
+  return rewriteLocalhostOrigins(value, metadata);
 }
 
 function rewriteSetCookieHeader(value: string | string[]): string | string[] {
@@ -621,6 +664,57 @@ function headerValueIncludesAny(value: string | string[], needles: readonly stri
 
 function stringIncludesAny(value: string, needles: readonly string[]): boolean {
   return needles.some((needle) => value.includes(needle));
+}
+
+function shouldRewriteLocalhostOrigins(value: string, metadata: BrowserNetworkProxyEndpointMetadata): boolean {
+  return (
+    metadata.upstreamOrigins.some((origin) => value.includes(origin)) ||
+    regexMatches(ABSOLUTE_LOCALHOST_ORIGIN_PATTERN, value) ||
+    regexMatches(PROTOCOL_RELATIVE_LOCALHOST_ORIGIN_PATTERN, value)
+  );
+}
+
+function regexMatches(pattern: RegExp, value: string): boolean {
+  pattern.lastIndex = 0;
+  const matches = pattern.test(value);
+  pattern.lastIndex = 0;
+  return matches;
+}
+
+function rewriteLocalhostOrigins(value: string, metadata: BrowserNetworkProxyEndpointMetadata): string {
+  ABSOLUTE_LOCALHOST_ORIGIN_PATTERN.lastIndex = 0;
+  PROTOCOL_RELATIVE_LOCALHOST_ORIGIN_PATTERN.lastIndex = 0;
+
+  const absoluteRewritten = value.replace(
+    ABSOLUTE_LOCALHOST_ORIGIN_PATTERN,
+    (_match, protocol: string, _host: string, portText: string) =>
+      `${publicProtocolForLocalhostRewrite(protocol, metadata)}://${metadata.publicHost}:${publicPortForLocalhostRewrite(portText, metadata)}`,
+  );
+
+  return absoluteRewritten.replace(
+    PROTOCOL_RELATIVE_LOCALHOST_ORIGIN_PATTERN,
+    (match, prefix: string, _host: string, portText: string) => {
+      const separator = match.startsWith("//") ? "" : prefix;
+      return `${separator}//${metadata.publicHost}:${publicPortForLocalhostRewrite(portText, metadata)}`;
+    },
+  );
+}
+
+function publicProtocolForLocalhostRewrite(
+  protocol: string,
+  metadata: BrowserNetworkProxyEndpointMetadata,
+): "http" | "https" | "ws" | "wss" {
+  const normalizedProtocol = protocol.toLowerCase();
+  if (normalizedProtocol === "ws" || normalizedProtocol === "wss") {
+    return metadata.publicProtocol === "https" ? "wss" : "ws";
+  }
+
+  return metadata.publicProtocol;
+}
+
+function publicPortForLocalhostRewrite(portText: string, metadata: BrowserNetworkProxyEndpointMetadata): number {
+  const port = Number(portText);
+  return port === metadata.logicalPort ? metadata.publicPort : port;
 }
 
 function setCookieHasDomainAttribute(value: string): boolean {
@@ -667,12 +761,17 @@ function appendHeaderLines(lines: string[], name: string, value: number | string
 
 function buildEndpointMetadata(endpoint: ActiveBrowserNetworkProxyEndpoint): BrowserNetworkProxyEndpointMetadata {
   const publicProtocol = endpoint.publicProtocol ?? "http";
-  const publicOrigin = `${publicProtocol}://${formatHostForUrl(endpoint.publicHost ?? endpoint.listenHost)}:${endpoint.listenPort}`;
+  const publicHost = formatHostForUrl(endpoint.publicHost ?? endpoint.listenHost);
+  const publicOrigin = `${publicProtocol}://${publicHost}:${endpoint.listenPort}`;
   const upstreamHostHeader = `${LOCALHOST_UPSTREAM_HOST}:${endpoint.logicalPort}`;
   const upstreamOrigin = `http://${upstreamHostHeader}`;
 
   return {
     publicOrigin,
+    publicProtocol,
+    publicHost,
+    publicPort: endpoint.listenPort,
+    logicalPort: endpoint.logicalPort,
     upstreamOrigin,
     upstreamHostHeader,
     upstreamOrigins: buildUpstreamOrigins(endpoint.logicalPort),
@@ -737,6 +836,76 @@ function writeGatewayError(response: http.ServerResponse): void {
 
   response.writeHead(502, "Bad Gateway");
   response.end("Port Manager browser proxy could not reach the routed target.");
+}
+
+function shouldRewriteResponseBody(
+  request: http.IncomingMessage,
+  upstreamResponse: http.IncomingMessage,
+): boolean {
+  if (!responseMayHaveBody(request, upstreamResponse)) {
+    return false;
+  }
+
+  if (!isIdentityEncoded(upstreamResponse.headers["content-encoding"])) {
+    return false;
+  }
+
+  return isRewritableContentType(upstreamResponse.headers["content-type"]);
+}
+
+function responseMayHaveBody(request: http.IncomingMessage, upstreamResponse: http.IncomingMessage): boolean {
+  if (request.method?.toUpperCase() === "HEAD") {
+    return false;
+  }
+
+  const statusCode = upstreamResponse.statusCode ?? 200;
+  return statusCode !== 204 && statusCode !== 304 && (statusCode < 100 || statusCode >= 200);
+}
+
+function isIdentityEncoded(value: string | string[] | undefined): boolean {
+  const encoding = Array.isArray(value) ? value.join(",") : value;
+  return encoding === undefined || encoding.trim().length === 0 || /^identity$/i.test(encoding.trim());
+}
+
+function isRewritableContentType(value: string | string[] | undefined): boolean {
+  const contentType = Array.isArray(value) ? value[0] : value;
+  if (contentType === undefined) {
+    return false;
+  }
+
+  const parts = contentType.split(";").map((part) => part.trim().toLowerCase());
+  const mediaType = parts[0] ?? "";
+  if (mediaType === "text/event-stream") {
+    return false;
+  }
+
+  const charset = parts.find((part) => part.startsWith("charset="))?.slice("charset=".length).replace(/^"|"$/g, "");
+  if (charset !== undefined && charset !== "utf-8" && charset !== "utf8" && charset !== "us-ascii") {
+    return false;
+  }
+
+  return (
+    mediaType.startsWith("text/") ||
+    mediaType === "application/javascript" ||
+    mediaType === "application/x-javascript" ||
+    mediaType === "application/ecmascript" ||
+    mediaType === "application/json" ||
+    mediaType === "application/manifest+json" ||
+    mediaType === "application/xml" ||
+    mediaType === "application/xhtml+xml" ||
+    mediaType === "image/svg+xml" ||
+    mediaType.endsWith("+json") ||
+    mediaType.endsWith("+xml")
+  );
+}
+
+function removeHeader(headers: http.OutgoingHttpHeaders, name: string): void {
+  const normalizedName = name.toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === normalizedName) {
+      delete headers[key];
+    }
+  }
 }
 
 function listen(server: BrowserNetworkProxyServer, port: number, host: string): Promise<void> {
