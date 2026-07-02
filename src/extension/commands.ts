@@ -3276,6 +3276,33 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     'socket.once("error",()=>finish(1));',
     'socket.on("data",(chunk)=>{buffer+=chunk;const lineEnd=buffer.indexOf("\\n");if(lineEnd<0)return;try{const message=JSON.parse(buffer.slice(0,lineEnd));if(!message||message.ok!==true)finish(1);print(message.payload);finish(0);}catch{finish(1);}});',
   ].join("");
+  const workerEnvScript = [
+    'const fs=require("node:fs");',
+    'const cp=require("node:child_process");',
+    'const path=require("node:path");',
+    'const expected=process.argv[1]||"unknown";',
+    'const currentNetwork=process.argv[2]||"";',
+    'const currentCwd=process.argv[3]||process.cwd();',
+    'const mode=process.argv[4]||"check";',
+    'const signal=process.argv[5]||"SIGTERM";',
+    'function known(value){return value&&value!=="unknown"&&value!=="-";}',
+    'function envValue(line,name){const match=line.match(new RegExp("(?:^|\\\\s)"+name+"=([^\\\\s]*)"));return match?match[1]:"";}',
+    'function normalize(value){if(!value)return "";try{return fs.realpathSync.native(value);}catch{return path.resolve(value);}}',
+    'function isSubPath(parent,child){if(!parent||!child)return false;const relative=path.relative(parent,child);return relative===""||(!relative.startsWith("..")&&!path.isAbsolute(relative));}',
+    'function pathsRelated(a,b){return isSubPath(a,b)||isSubPath(b,a);}',
+    'function workerLike(line){return /(?:^|[\\/\\s])python[^\\s]*\\s+-m\\s+celery\\s+worker|(?:^|[\\/\\s])celery(?:\\s|$).*\\sworker(?:\\s|$)|CELERY_APP=|DJANGO_SETTINGS_MODULE=.*worker/i.test(line);}',
+    'function networkValue(line){return envValue(line,"PORT_MANAGER_NETWORK_ID")||envValue(line,"PORT_MANAGER_ROUTE_TABLE_NETWORK_ID")||envValue(line,"PORT_MANAGER_BORROWED_NETWORK_ID")||envValue(line,"NEWDLOPS_PM_NETWORK_ID")||envValue(line,"NEWDLOPS_PM_BORROWED_NETWORK_ID");}',
+    'function display(value){return value&&value.length>0?value:"-";}',
+    'let psOutput="";',
+    'try{psOutput=cp.execFileSync("ps",["eww","-Ao","pid=,ppid=,pgid=,tty=,command="],{encoding:"utf8",stdio:["ignore","pipe","ignore"]});}catch{}',
+    'const currentRoot=normalize(currentCwd);',
+    'const warnings=[];',
+    'let checked=0;',
+    'for(const rawLine of psOutput.split(/\\r?\\n/)){if(!workerLike(rawLine))continue;if(rawLine.includes("PORT_MANAGER_WORKER_ENV_SCAN=1"))continue;const row=rawLine.match(/^\\s*(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\S+)\\s+([\\s\\S]+)$/);if(!row)continue;const command=row[5];const cwd=envValue(command,"PWD")||envValue(command,"INIT_CWD");const normalizedCwd=normalize(cwd);const related=Boolean(normalizedCwd&&pathsRelated(currentRoot,normalizedCwd))||command.includes(currentRoot);if(!related)continue;checked+=1;const hook=envValue(command,"PORT_MANAGER_HOOK")||"unset";const hookDisabled=envValue(command,"PORT_MANAGER_HOOK_DISABLED")==="1"||hook==="0";const version=envValue(command,"PORT_MANAGER_EXPECTED_VERSION")||"unknown";const network=networkValue(command);const reasons=[];if(hookDisabled)reasons.push("hook-disabled");if(known(expected)&&known(version)&&version!==expected)reasons.push("stale-version:"+version);if(known(expected)&&!known(version))reasons.push("missing-version");if(currentNetwork&&network&&network!==currentNetwork)reasons.push("other-network:"+network);if(currentNetwork&&!network)reasons.push("no-network");if(reasons.length>0){warnings.push({pid:row[1],pgid:row[3],tty:row[4],hook,version,network:network||"none",cwd:cwd||"-",reason:reasons.join(",")});}if(warnings.length>=8)break;}',
+    'function printWarning(item,prefix){console.log(prefix+" pid "+item.pid+" tty="+item.tty+" pgid="+item.pgid+" hook="+display(item.hook)+" version="+display(item.version)+" network="+display(item.network)+" reason="+item.reason+" cwd="+display(item.cwd));}',
+    'if(mode==="clean"){if(checked===0){console.log("Worker clean: no matching workers");process.exit(0);}if(warnings.length===0){console.log("Worker clean: no stale workers ("+checked+" checked)");process.exit(0);}let killed=0;let failed=0;console.log("Worker clean: "+warnings.length+" stale worker"+(warnings.length===1?"":"s")+" ("+checked+" checked)");for(const item of warnings){try{process.kill(Number(item.pid),signal);killed+=1;printWarning(item,"  terminated");}catch(error){failed+=1;console.log("  failed pid "+item.pid+" reason="+item.reason+" error="+(error&&error.code||error&&error.message||String(error)));}}console.log("Worker clean: sent "+signal+" to "+killed+" process"+(killed===1?"":"es")+(failed>0?", "+failed+" failed":""));process.exit(failed>0?1:0);}',
+    'if(checked===0){console.log("Worker env check: no matching workers");}else if(warnings.length===0){console.log("Worker env check: ok ("+checked+" checked)");}else{console.log("Worker env check: "+warnings.length+" warning"+(warnings.length===1?"":"s")+" ("+checked+" checked)");for(const item of warnings){printWarning(item,"  ");}}',
+  ].join("");
   const nodeProbeScript = [
     'const net=require("node:net");',
     'const fs=require("node:fs");',
@@ -3427,22 +3454,53 @@ __pm_agent_version() {
   return $__pm_status
 }
 
+__pm_worker_env_check() {
+  __pm_worker_current_id="\${1:-}"
+  PORT_MANAGER_WORKER_ENV_SCAN=1 ${helperRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
+    workerEnvScript,
+  )}" "\${PORT_MANAGER_EXPECTED_VERSION:-unknown}" "$__pm_worker_current_id" "$PWD" 2>/dev/null || true
+  unset __pm_worker_current_id
+}
+
+__pm_worker_env_clean() {
+  __pm_worker_current_id="\${1:-}"
+  PORT_MANAGER_WORKER_ENV_SCAN=1 ${helperRuntimePrefix} "${escapedNodeExecutablePath}" -e "${shellDoubleQuote(
+    workerEnvScript,
+  )}" "\${PORT_MANAGER_EXPECTED_VERSION:-unknown}" "$__pm_worker_current_id" "$PWD" clean SIGTERM
+  __pm_status=$?
+  unset __pm_worker_current_id
+  return $__pm_status
+}
+
 pm() {
   if [ "\${1:-}" = "help" ] || [ "\${1:-}" = "--help" ] || [ "\${1:-}" = "-h" ]; then
-    printf '%s\n' 'Usage: pm [current|status|version|doctor|routes|repair|detach|network-number|network-name|network-id]' >&2
+    printf '%s\n' 'Usage: pm [current|status|version|doctor|routes|repair|clean|detach|network-number|network-name|network-id]' >&2
     printf '%s\n' 'Run without arguments to choose a Port Manager logical network for this shell.' >&2
     printf '%s\n' 'Run "pm current" to print the network currently attached to this shell.' >&2
     printf '%s\n' 'Run "pm version" to print the daemon package version visible to this shell.' >&2
     printf '%s\n' 'Run "pm doctor" to inspect shell routing files and daemon readiness.' >&2
     printf '%s\n' 'Run "pm routes" to print routes visible to this shell.' >&2
     printf '%s\n' 'Run "pm repair" to remove stale daemon startup state and reapply this shell network.' >&2
+    printf '%s\n' 'Run "pm clean" to terminate stale worker processes for this workspace.' >&2
     printf '%s\n' 'Run "pm detach" to remove Port Manager routing from this shell.' >&2
     return 0
   fi
 
   if [ "\${1:-}" = "version" ] || [ "\${1:-}" = "--version" ] || [ "\${1:-}" = "-v" ]; then
     __pm_agent_version version
-    return $?
+    __pm_status=$?
+    __pm_current_id="$(__pm_current_network_id 2>/dev/null || true)"
+    __pm_worker_env_check "$__pm_current_id"
+    unset __pm_current_id
+    return $__pm_status
+  fi
+
+  if [ "\${1:-}" = "clean" ]; then
+    __pm_current_id="$(__pm_current_network_id 2>/dev/null || true)"
+    __pm_worker_env_clean "$__pm_current_id"
+    __pm_status=$?
+    unset __pm_current_id
+    return $__pm_status
   fi
 
   if [ "\${1:-}" = "doctor" ]; then

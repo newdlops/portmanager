@@ -4057,6 +4057,7 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
   int route_is_compose;
   int logical_port;
   int actual_port;
+  int loopback_fallback_errno;
 
   pm_ensure_symbols();
   if (pm_real_connect == NULL) {
@@ -4106,6 +4107,7 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
 
   target_host[0] = '\0';
   route_is_compose = 0;
+  loopback_fallback_errno = 0;
   actual_port = pm_memory_actual_for_logical(logical_port, target_host, sizeof(target_host));
   if (actual_port == 0) {
     actual_port = pm_connect_route_table_lookup(logical_port, target_host, sizeof(target_host), &route_is_compose);
@@ -4138,7 +4140,7 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
   }
 
   loopback_host = pm_network_loopback_host();
-  if (actual_port == 0 && loopback_host != NULL && !pm_is_fixed_protocol_port(logical_port)) {
+  if (actual_port == 0 && loopback_host != NULL) {
     int loopback_connect_result;
     int loopback_connect_errno;
 
@@ -4163,15 +4165,16 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
       return -1;
     }
 
+    loopback_fallback_errno = loopback_connect_errno;
     pm_debug(
-      "connect loopback-network unavailable logical=%d host=%s error=%s; falling back to routed allocation",
+      "connect loopback-network unavailable logical=%d host=%s error=%s; falling back to route resolution",
       logical_port,
       loopback_host,
       strerror(loopback_connect_errno));
     errno = loopback_connect_errno;
   }
 
-  if (actual_port == 0 && pm_has_current_network_scope() && !pm_is_fixed_protocol_port(logical_port)) {
+  if (actual_port == 0 && pm_has_current_network_scope()) {
     /*
      * DBs and brokers often connect before the extension has flushed the
      * listener row. Wait for the current network route before creating a
@@ -4186,6 +4189,17 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
       target_host,
       sizeof(target_host),
       &route_is_compose);
+  }
+
+  if (actual_port == 0 && pm_is_fixed_protocol_port(logical_port)) {
+    /*
+     * Fixed service ports such as RabbitMQ, Postgres, and Redis are commonly
+     * shared on host localhost. Inside a logical network, an unresolved route
+     * must fail instead of falling through to another network's host service.
+     */
+    pm_debug("connect blocked fixed protocol host fallback logical=%d", logical_port);
+    errno = loopback_fallback_errno != 0 ? loopback_fallback_errno : ECONNREFUSED;
+    return -1;
   }
 
   if (actual_port == 0 && !pm_is_fixed_protocol_port(logical_port)) {

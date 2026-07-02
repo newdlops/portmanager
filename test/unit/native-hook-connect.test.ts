@@ -100,6 +100,30 @@ test("native hook bypasses route logic when no network scope is attached", () =>
   assert.equal(connectBody.indexOf("if (!pm_has_current_network_scope())") < connectBody.indexOf("pm_allocate_route("), true);
 });
 
+test("native hook blocks fixed protocol localhost fallback inside a logical network", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const connectStart = source.indexOf("static int pm_connect_hook");
+  const connectEnd = source.indexOf("static int pm_getsockname_hook", connectStart);
+  const connectBody = source.slice(connectStart, connectEnd);
+  const loopbackStart = connectBody.indexOf("if (actual_port == 0 && loopback_host != NULL)");
+  const loopbackConditionEnd = connectBody.indexOf("{", loopbackStart);
+  const waitStart = connectBody.indexOf("if (actual_port == 0 && pm_has_current_network_scope())", loopbackStart);
+  const waitConditionEnd = connectBody.indexOf("{", waitStart);
+  const fixedBlockStart = connectBody.indexOf("connect blocked fixed protocol host fallback logical=%d");
+  const hostFallbackStart = connectBody.indexOf("if (actual_port <= 0)", fixedBlockStart);
+
+  assert.notEqual(connectStart, -1);
+  assert.notEqual(loopbackStart, -1);
+  assert.notEqual(waitStart, -1);
+  assert.notEqual(fixedBlockStart, -1);
+  assert.notEqual(hostFallbackStart, -1);
+  assert.equal(connectBody.slice(loopbackStart, loopbackConditionEnd).includes("!pm_is_fixed_protocol_port(logical_port)"), false);
+  assert.equal(connectBody.slice(waitStart, waitConditionEnd).includes("!pm_is_fixed_protocol_port(logical_port)"), false);
+  assert.equal(fixedBlockStart < hostFallbackStart, true);
+  assert.equal(connectBody.includes("errno = loopback_fallback_errno != 0 ? loopback_fallback_errno : ECONNREFUSED;"), true);
+});
+
 if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
   test("native hook allows current-network same-port compose routes", { skip: "native hook library is not built for this platform" }, () => undefined);
 } else {
@@ -353,6 +377,42 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
       env: {
         PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
         PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
+        PORT_MANAGER_AGENT_ROUNDTRIP_TIMEOUT_MS: "50",
+      },
+    });
+
+    assert.equal(result.exitCode, 23);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "ECONNREFUSED\n");
+  });
+
+  test("native hook does not leak fixed protocol connects to host localhost", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-fixed-connect-"));
+    const server = net.createServer((socket) => {
+      socket.end("leaked\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-fixed-protocol";
+    const routeTablePath = path.join(tempDir, `newdlops-portmanager-routes-${process.getuid?.() ?? "user"}-${networkId}.json`);
+    fs.writeFileSync(routeTablePath, JSON.stringify({ updatedAt: "2026-07-02T00:00:00.000Z", routes: [] }), "utf8");
+
+    const result = await runHookedNodeClient(address.port, routeTablePath, networkId, {
+      env: {
+        PORT_MANAGER_FIXED_PROTOCOL_PORTS: String(address.port),
+        PORT_MANAGER_NETWORK_LOOPBACK_HOST: "",
+        PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
+        PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
         PORT_MANAGER_AGENT_ROUNDTRIP_TIMEOUT_MS: "50",
       },
     });
@@ -1004,6 +1064,11 @@ async function runHookedNodeClient(
       PORT_MANAGER_BORROWED_NETWORK_ID: "",
       NEWDLOPS_PM_NETWORK_ID: "",
       NEWDLOPS_PM_BORROWED_NETWORK_ID: "",
+      PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE: "",
+      PORT_MANAGER_ROUTING_MODE: "",
+      PORT_MANAGER_NETWORK_LOOPBACK_HOST: "",
+      PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "",
+      PORT_MANAGER_FIXED_PROTOCOL_PORTS: "",
       ...options.env,
     },
     stdio: ["ignore", "pipe", "pipe"],
