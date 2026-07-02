@@ -178,6 +178,37 @@ test("parses compose containers with published TCP ports as attach candidates", 
   );
 });
 
+test("discovers Docker Desktop compose published ports from labels", () => {
+  const candidates = parseContainerRows("docker", [
+    {
+      ID: "desktop123",
+      Names: "captain_db",
+      Image: "postgres:17-alpine",
+      Status: "Up 5 minutes",
+      Ports: "5432/tcp",
+      Labels:
+        "com.docker.compose.project=docker,com.docker.compose.service=db," +
+        "com.docker.compose.project.working_dir=/Users/lky/project/captain/docker," +
+        "com.docker.compose.project.config_files=/Users/lky/project/captain/docker/development.yaml," +
+        "desktop.docker.io/ports.scheme=v2,desktop.docker.io/ports/5432/tcp=:15432",
+    },
+  ]);
+
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0]?.composeProject, "docker");
+  assert.equal(candidates[0]?.composeService, "db");
+  assert.deepEqual(candidates[0]?.composeConfigFiles, ["/Users/lky/project/captain/docker/development.yaml"]);
+  assert.deepEqual(candidates[0]?.ports[0], {
+    serviceName: "db",
+    logicalPort: 15432,
+    actualHostAddress: "127.0.0.1",
+    actualHostPort: 15432,
+    containerPort: 5432,
+    protocol: "tcp",
+    protocolName: "postgresql",
+  });
+});
+
 test("infers common broker and RPC protocol labels from published compose ports", () => {
   const candidates = parseContainerRows("docker", [
     {
@@ -1007,12 +1038,18 @@ test("mutates compose services into a hidden network-scoped project", async (con
     readonly executable: string;
     readonly args: readonly string[];
     readonly cwd?: string;
+    readonly timeoutMs?: number;
   }> = [];
   let containerListCount = 0;
   const mutator = new ComposePublishMutator({
     storageDirectory: tempDir,
     runCommand: async (executable, args, options) => {
-      calls.push({ executable, args, ...(options?.cwd !== undefined ? { cwd: options.cwd } : {}) });
+      calls.push({
+        executable,
+        args,
+        ...(options?.cwd !== undefined ? { cwd: options.cwd } : {}),
+        ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      });
       if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
         return { stdout: "postgres\nlanggraph_server\n", stderr: "" };
       }
@@ -1180,6 +1217,12 @@ test("mutates compose services into a hidden network-scoped project", async (con
   assert.equal(calls[8]?.args.includes(`${initdbDir}:/from:ro`), true);
   assert.equal(calls[0]?.cwd, tempDir);
   assert.equal(calls[4]?.cwd, tempDir);
+  assert.deepEqual(
+    calls
+      .filter((call) => call.args[0] === "container" && call.args[1] === "inspect")
+      .map((call) => call.timeoutMs),
+    [30_000, 30_000, 30_000],
+  );
 });
 
 test("compose hidden publish can preserve logical ports on network loopback hosts", async (context) => {

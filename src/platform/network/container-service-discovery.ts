@@ -439,7 +439,13 @@ function toContainerServiceCandidate(
   );
   const serviceName = composeService ?? containerName;
   const logicalPortOverrides = readPortManagerLogicalPortLabels(labels);
-  const parsedPorts = parsePublishedPorts(row.Ports ?? "", serviceName, logicalPortOverrides);
+  const dockerDesktopPublishedPorts = readDockerDesktopPublishedPortEndpoints(labels);
+  const parsedPorts = parsePublishedPorts(
+    row.Ports ?? "",
+    serviceName,
+    logicalPortOverrides,
+    dockerDesktopPublishedPorts,
+  );
   const ports = recoverCloneLogicalPortsFromContext(context, composeConfigFiles, composeService, parsedPorts);
   const portManagerClone = buildPortManagerCloneCandidateMetadata(
     context,
@@ -553,6 +559,7 @@ function parsePublishedPorts(
   portsText: string,
   serviceName: string,
   logicalPortOverrides: ReadonlyMap<string, number>,
+  labeledPublishedPorts: ReadonlyMap<string, PublishedPortEndpoint> = new Map(),
 ): readonly ComposePublishedPort[] {
   const portsByIdentity = new Map<string, ComposePublishedPort>();
 
@@ -562,6 +569,28 @@ function parsePublishedPorts(
       continue;
     }
 
+    const identity = `${parsedPort.actualHostAddress}:${parsedPort.actualHostPort}:${parsedPort.containerPort}:${parsedPort.protocol}`;
+    if (!portsByIdentity.has(identity)) {
+      portsByIdentity.set(identity, parsedPort);
+    }
+  }
+
+  for (const [key, hostEndpoint] of labeledPublishedPorts) {
+    const [containerPortText, protocol] = key.split("/");
+    const containerPort = Number.parseInt(containerPortText ?? "", 10);
+    if (!isTcpPort(containerPort) || protocol !== "tcp") {
+      continue;
+    }
+
+    const parsedPort: ComposePublishedPort = {
+      serviceName,
+      logicalPort: logicalPortOverrides.get(key) ?? hostEndpoint.port,
+      actualHostAddress: normalizeHostAddress(hostEndpoint.host),
+      actualHostPort: hostEndpoint.port,
+      containerPort,
+      protocol: "tcp",
+      protocolName: inferProtocolName(containerPort),
+    };
     const identity = `${parsedPort.actualHostAddress}:${parsedPort.actualHostPort}:${parsedPort.containerPort}:${parsedPort.protocol}`;
     if (!portsByIdentity.has(identity)) {
       portsByIdentity.set(identity, parsedPort);
@@ -1206,8 +1235,16 @@ function readPortManagerLogicalPortLabels(labels: ReadonlyMap<string, string>): 
   return ports;
 }
 
-function readDockerDesktopPublishedPortLabels(labels: ReadonlyMap<string, string>): ReadonlyMap<string, number> {
-  const ports = new Map<string, number>();
+interface PublishedPortEndpoint {
+  readonly host: string;
+  readonly port: number;
+}
+
+/** Reads Docker Desktop labels that carry host-published ports absent from `docker ps` Ports text. */
+function readDockerDesktopPublishedPortEndpoints(
+  labels: ReadonlyMap<string, string>,
+): ReadonlyMap<string, PublishedPortEndpoint> {
+  const ports = new Map<string, PublishedPortEndpoint>();
   const prefix = "desktop.docker.io/ports/";
 
   for (const [label, value] of labels) {
@@ -1218,10 +1255,19 @@ function readDockerDesktopPublishedPortLabels(labels: ReadonlyMap<string, string
     const parts = label.slice(prefix.length).split("/");
     const containerPort = Number.parseInt(parts[0] ?? "", 10);
     const protocol = parts[1] ?? "";
-    const hostPort = Number.parseInt(value.replace(/^.*:/, ""), 10);
-    if (isTcpPort(containerPort) && isTcpPort(hostPort) && protocol === "tcp") {
-      ports.set(buildPortOverrideKey(containerPort, protocol), hostPort);
+    const hostEndpoint = parseHostEndpoint(value);
+    if (isTcpPort(containerPort) && hostEndpoint !== undefined && protocol === "tcp") {
+      ports.set(buildPortOverrideKey(containerPort, protocol), hostEndpoint);
     }
+  }
+
+  return ports;
+}
+
+function readDockerDesktopPublishedPortLabels(labels: ReadonlyMap<string, string>): ReadonlyMap<string, number> {
+  const ports = new Map<string, number>();
+  for (const [key, endpoint] of readDockerDesktopPublishedPortEndpoints(labels)) {
+    ports.set(key, endpoint.port);
   }
 
   return ports;

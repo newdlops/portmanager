@@ -33,6 +33,9 @@ import {
 
 const COMPOSE_TIMEOUT_MS = 60_000;
 const LIST_TIMEOUT_MS = 5_000;
+// Docker Desktop can take multiple seconds to materialize inspect metadata for
+// a compose project, especially when several containers are inspected together.
+const INSPECT_TIMEOUT_MS = 30_000;
 const VOLUME_COPY_TIMEOUT_MS = 120_000;
 const HIDDEN_PORT_DISCOVERY_ATTEMPTS = 8;
 const HIDDEN_PORT_DISCOVERY_DELAY_MS = 250;
@@ -1088,7 +1091,7 @@ export class ComposePublishMutator {
         : parseContainerInspectRows(
             (
               await this.runCommand(runtime, ["container", "inspect", ...containers.map((container) => container.id)], {
-                timeoutMs: LIST_TIMEOUT_MS,
+                timeoutMs: INSPECT_TIMEOUT_MS,
               })
             ).stdout,
           );
@@ -1308,7 +1311,7 @@ export class ComposePublishMutator {
 
       try {
         await this.runCommand(runtime, ["container", "inspect", containerName], {
-          timeoutMs: LIST_TIMEOUT_MS,
+          timeoutMs: INSPECT_TIMEOUT_MS,
         });
         occupiedNames.add(containerName);
       } catch {
@@ -1398,7 +1401,7 @@ export class ComposePublishMutator {
 
     try {
       const inspectResult = await this.runCommand(runtime, ["container", "inspect", ...containerIds], {
-        timeoutMs: LIST_TIMEOUT_MS,
+        timeoutMs: INSPECT_TIMEOUT_MS,
       });
       const inspectedRows = parseContainerInspectRows(inspectResult.stdout);
       return {
