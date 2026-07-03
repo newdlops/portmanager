@@ -132,6 +132,11 @@ export function readContainerRuntimeSettings(): ContainerRuntimeSettings {
   };
 }
 
+/** Reads whether the owner window may keep a container lifecycle event stream open. */
+export function readContainerEventsWatchEnabled(): boolean {
+  return vscode.workspace.getConfiguration("portManager").get<boolean>("containerEventsWatch", true);
+}
+
 /** Opens the Settings UI already filtered to this extension's namespace. */
 export async function openPortManagerSettings(): Promise<void> {
   await vscode.commands.executeCommand("workbench.action.openSettings", "@ext:newdlops.portmanager portManager");

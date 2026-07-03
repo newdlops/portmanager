@@ -1285,9 +1285,28 @@ export class PortManagerAgent implements DisposableLike {
     }
 
     this.listenerScanTimer = setInterval(() => {
+      if (this.shouldSkipIdleListenerScan()) {
+        return;
+      }
+
       void this.pollListeningPorts();
     }, this.listenerScanIntervalMs);
     this.listenerScanTimer.unref();
+  }
+
+  /**
+   * With no subscribed clients and no registered state, a periodic scan has
+   * neither a consumer nor anything to reconcile, so the idle daemon skips the
+   * OS listener spawn. Client connects and route registrations request fresh
+   * scans on their own paths, which re-primes this loop's inputs.
+   */
+  private shouldSkipIdleListenerScan(): boolean {
+    return (
+      !this.hasEventClients() &&
+      this.registry.list().length === 0 &&
+      this.pendingRouteAllocations.size === 0 &&
+      this.reservedListeningEndpoints.length === 0
+    );
   }
 
   /** Starts a light route-table writer heartbeat independent of client traffic. */

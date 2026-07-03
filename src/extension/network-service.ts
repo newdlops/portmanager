@@ -1,5 +1,5 @@
 import { execFile, execFileSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, X509Certificate } from "node:crypto";
 import * as syncFs from "node:fs";
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -16,7 +16,11 @@ import {
   ROUTE_TABLE_TTL_SECONDS_ENV,
   ROUTE_TABLE_TTL_MS,
 } from "../agent/route-table";
-import { readContainerRuntimeSettings, readPortManagerSettings } from "../config/vscode-settings";
+import {
+  readContainerEventsWatchEnabled,
+  readContainerRuntimeSettings,
+  readPortManagerSettings,
+} from "../config/vscode-settings";
 import {
   LogicalNetworkRegistry,
   terminalAttachmentsShareIdentity,
@@ -49,6 +53,19 @@ import {
   ContainerServiceDiscoveryAdapter,
   type ContainerServiceDiscoverySession,
 } from "../platform/network/container-service-discovery";
+import {
+  BROWSER_TLS_CA_CERT_PATH,
+  BROWSER_TLS_CA_KEY_PATH,
+  BROWSER_TLS_CA_OPENSSL_CONFIG_LINES,
+  BROWSER_TLS_DIRECTORY,
+  BROWSER_TLS_HOSTNAMES_MARKER_PATH,
+  BROWSER_TLS_RENEW_WINDOW_MS,
+  BROWSER_TLS_RENEW_WINDOW_SECONDS,
+  BROWSER_TLS_SERVER_CERT_PATH,
+  BROWSER_TLS_SERVER_KEY_PATH,
+  BROWSER_TLS_SERVER_OPENSSL_CONFIG_HEADER_LINES,
+} from "../platform/network/browser-tls-assets";
+import { ContainerEventsWatcher } from "../platform/network/container-events-watcher";
 import { SharedLogicalNetworkStateStore } from "../platform/network/shared-network-state-store";
 import {
   BrowserNetworkProxyManager,
@@ -143,6 +160,17 @@ const MANUAL_TERMINAL_ATTACHMENT_ID_PREFIX = "manual-terminal:";
 const PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX = "process-terminal:";
 const VSCODE_WINDOW_PROCESS_ATTACHMENT_ID_PREFIX = "vscode-window-process:";
 const ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 10_000;
+// Idle backoff bounds for the routing signal loop. Quiet ticks stretch the
+// interval so an untouched workspace stops rescanning terminals and Docker
+// every 10 seconds; any routing activity snaps back to the fast interval.
+const ROUTING_SIGNAL_REFRESH_MAX_INTERVAL_MS = 60_000;
+// When compose attachments exist but the container-event stream is unavailable,
+// polling stays the only change detector, so idle backoff is capped tighter.
+const ROUTING_SIGNAL_REFRESH_DEGRADED_MAX_INTERVAL_MS = 30_000;
+// Native docker shims fail closed when a scoped compose TSV's mtime is older
+// than the route-table TTL (15s). Freshness touches are decoupled from the
+// heavy reconcile loop so idle backoff cannot expire live compose routing.
+const COMPOSE_ROUTING_FRESHNESS_INTERVAL_MS = 10_000;
 const BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS = 60_000;
 const BACKGROUND_CONTAINER_REFRESH_LOCK_STALE_MS = 120_000;
 const BACKGROUND_CONTAINER_REFRESH_STAMP_PATH = buildBackgroundContainerRefreshControlPath("stamp");
@@ -161,12 +189,6 @@ const BROWSER_NETWORK_PROXY_OWNER_PATH = buildBrowserNetworkProxyOwnerControlPat
 const BROWSER_NETWORK_PROXY_OWNER_LOCK_PATH = buildBrowserNetworkProxyOwnerControlPath("lock");
 const BROWSER_DNS_HOSTS_BLOCK_BEGIN = "# Port Manager browser DNS hosts begin";
 const BROWSER_DNS_HOSTS_BLOCK_END = "# Port Manager browser DNS hosts end";
-const BROWSER_TLS_DIRECTORY = "/Library/Application Support/newdlops.portmanager/browser-tls";
-const BROWSER_TLS_CA_CERT_PATH = `${BROWSER_TLS_DIRECTORY}/portmanager-root-ca.crt`;
-const BROWSER_TLS_CA_KEY_PATH = `${BROWSER_TLS_DIRECTORY}/portmanager-root-ca.key`;
-const BROWSER_TLS_SERVER_CERT_PATH = `${BROWSER_TLS_DIRECTORY}/portmanager-browser.crt`;
-const BROWSER_TLS_SERVER_KEY_PATH = `${BROWSER_TLS_DIRECTORY}/portmanager-browser.key`;
-const BROWSER_TLS_HOSTNAMES_MARKER_PATH = `${BROWSER_TLS_DIRECTORY}/hostnames.txt`;
 const BROWSER_SECURE_DNS_SUFFIX = "pm";
 const BROWSER_LEGACY_SECURE_DNS_SUFFIXES = ["portmanager.test"] as const;
 const HOST_LOCAL_GATEWAY_PF_ANCHOR = "com.newdlops.portmanager.host-local";
@@ -184,17 +206,39 @@ const CONTROL_PLANE_OWNER_LOCK_STALE_MS = 30_000;
 const CONTROL_PLANE_OWNER_PATH = buildControlPlaneOwnerControlPath("owner");
 const CONTROL_PLANE_OWNER_LOCK_PATH = buildControlPlaneOwnerControlPath("lock");
 const OWNER_LEASE_HANDOFF_RETRY_DELAY_MS = 1_000;
+// Owner lease documents only need rewriting a few times per lease period.
+// Rewriting them on every refresh tick makes every other VS Code window's
+// lease-file watcher fire, so renewals are throttled well below the lease TTL.
+const OWNER_LEASE_RENEW_INTERVAL_MS = 25_000;
 const DAEMON_RESTART_BACKOFF_MS = 30_000;
 const TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500;
+// The marker poll is a fallback for missed file events. Outside a refresh
+// burst the native and VS Code watchers carry change detection, so the
+// fallback can tick slowly instead of statting the marker directory at 500ms.
+const TERMINAL_ATTACHMENT_MARKER_POLL_IDLE_INTERVAL_MS = 2_000;
 const TERMINAL_ATTACHMENT_REFRESH_DEBOUNCE_MS = 50;
 const TERMINAL_ATTACHMENT_REFRESH_BURST_WINDOW_MS = 2_000;
 const TERMINAL_ATTACHMENT_REFRESH_BURST_INTERVAL_MS = 250;
 const FORCED_COMPOSE_RECONCILE_COALESCE_MS = 750;
 const TERMINAL_NETWORK_SERVICE_ENTRY_SEPARATOR = " || ";
-const BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS = 5_000;
-const BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS = 1_000;
+// A live PID's command line is immutable, so hits can outlive many sync
+// passes; rows are pruned as soon as the PID leaves the process snapshot.
+const BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS = 600_000;
+const BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS = 15_000;
 const BROWSER_PROXY_ROUTE_HINT_CACHE_TTL_MS = 30_000;
 const BROWSER_PROXY_ROUTE_HINT_MISS_CACHE_TTL_MS = 5_000;
+// One `ifconfig lo0` answers every alias membership question, so its parsed
+// address set is shared by all checks instead of spawning per address.
+const LOOPBACK_ALIAS_CACHE_TTL_MS = 5_000;
+// Non-interactive alias setup that failed (no sudo ticket) will keep failing;
+// retrying it on every proxy sync would spawn a shell every few seconds.
+const LOOPBACK_ALIAS_SETUP_RETRY_BACKOFF_MS = 300_000;
+// Display reads of the owner lease are watcher-invalidated, so a short TTL
+// only bounds staleness when file watching is unavailable.
+const CONTROL_PLANE_STATUS_CACHE_TTL_MS = 2_000;
+// Container-runtime probing at owner startup is deferred past the extension
+// host's activation burst; routing correctness never depends on it.
+const OWNER_STARTUP_CONTAINER_PROBE_DELAY_MS = 3_000;
 const execFileAsync = promisify(execFile);
 
 export interface BindingPresetSummary {
@@ -562,10 +606,31 @@ export class PortManagerNetworkService implements DisposableLike {
   private terminalRefreshQueued = false;
 
   /** Background poller that keeps terminals, containers, and compose routes current. */
-  private routingSignalRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  private routingSignalRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Current adaptive delay of the routing signal loop. */
+  private routingSignalRefreshDelayMs = ROUTING_SIGNAL_REFRESH_INTERVAL_MS;
+
+  /** Set by activity signals so the next reschedule returns to the fast interval. */
+  private routingSignalActivityObserved = false;
+
+  /** Cheap state fingerprint used to detect quiet ticks for idle backoff. */
+  private routingSignalActivitySignature = "";
+
+  /** Touches live compose routing TSVs so shim-side mtime TTLs survive idle backoff. */
+  private composeRoutingFreshnessTimer: ReturnType<typeof setInterval> | undefined;
+
+  /** Compose routing files written by the last publish; the freshness heartbeat touches exactly these. */
+  private composeRoutingFreshnessPaths: readonly string[] = [];
+
+  /** Container lifecycle event stream that replaces fast Docker polling while it is healthy. */
+  private containerEventsWatcher: ContainerEventsWatcher | undefined;
+
+  /** True while the sidebar tree view is visible in this window. */
+  private sidebarVisible = false;
 
   /** Lightweight marker poller used when VS Code file events miss global storage writes. */
-  private terminalAttachmentMarkerPollTimer: ReturnType<typeof setInterval> | undefined;
+  private terminalAttachmentMarkerPollTimer: ReturnType<typeof setTimeout> | undefined;
 
   /** Debounces marker file events before scanning terminals. */
   private terminalAttachmentRefreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -663,6 +728,11 @@ export class PortManagerNetworkService implements DisposableLike {
     this.disposables.push(
       this.registry.onDidChange(() => {
         this.saveState();
+        this.notifyRoutingActivity();
+        if (this.ownsControlPlaneLease) {
+          this.syncComposeRoutingFreshnessHeartbeat();
+          this.syncContainerEventsWatcher();
+        }
         void this.runControlPlaneRegistrySideEffects();
         this.reconcileVscodeWindowTerminalBinding();
       }),
@@ -670,6 +740,7 @@ export class PortManagerNetworkService implements DisposableLike {
     if (this.processService !== undefined) {
       this.disposables.push(
         this.processService.onDidChange(() => {
+          this.notifyRoutingActivity();
           if (this.ownsControlPlaneLease) {
             void this.syncLogicalPortRouters();
             void this.syncBrowserNetworkProxies();
@@ -690,11 +761,13 @@ export class PortManagerNetworkService implements DisposableLike {
       this.watchOwnerLeaseFiles(),
       vscode.window.onDidOpenTerminal((terminal) => {
         this.scheduleVscodeTerminalTitleRefresh(terminal);
+        this.notifyRoutingActivity();
         if (this.ownsControlPlaneLease) {
           void this.refreshTerminals();
         }
       }),
       vscode.window.onDidCloseTerminal(() => {
+        this.notifyRoutingActivity();
         if (this.ownsControlPlaneLease) {
           void this.refreshTerminals();
         }
@@ -803,7 +876,6 @@ export class PortManagerNetworkService implements DisposableLike {
     this.startRoutingSignalRefreshLoop();
     this.startTerminalAttachmentMarkerPolling();
 
-    await this.refreshRuntimeDescriptors({ includeContainerRuntime: true });
     await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
@@ -812,10 +884,49 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.reconcileComposeAttachmentPublishedPorts({ force: true });
     await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });
     await this.writeTerminalNetworkSelectionFile();
-    await this.refreshTerminals();
-    void this.refreshContainerServices({ background: true });
+    /*
+     * Terminal and container discovery only feed the sidebar and live
+     * attachments, so cold start defers them: the consumer gates skip the
+     * scans entirely in an untouched workspace, and the container-runtime
+     * probe waits out the activation burst that a cold VS Code launch already
+     * spends on other extensions.
+     */
+    await this.refreshTerminals({ background: true });
     await this.syncLogicalPortRouters();
     await this.syncBrowserNetworkProxies();
+    this.syncComposeRoutingFreshnessHeartbeat();
+    this.syncContainerEventsWatcher();
+    this.scheduleDeferredOwnerStartupProbes();
+  }
+
+  /** Runs container-runtime probing after the cold-start burst has settled. */
+  private scheduleDeferredOwnerStartupProbes(): void {
+    const timer = setTimeout(() => {
+      if (!this.ownsControlPlaneLease) {
+        return;
+      }
+
+      void this.refreshRuntimeDescriptors({ includeContainerRuntime: true })
+        .catch(() => undefined)
+        .then(() => {
+          if (this.ownsControlPlaneLease) {
+            void this.refreshContainerServices({ background: true }).catch(() => []);
+          }
+        });
+    }, OWNER_STARTUP_CONTAINER_PROBE_DELAY_MS);
+    timer.unref?.();
+  }
+
+  /**
+   * Detects the container runtime on demand for flows that need an up-to-date
+   * runtime list before the deferred startup probe has run.
+   */
+  async ensureContainerRuntimeDetected(): Promise<void> {
+    if (this.containerRuntime.getDescriptor() !== undefined) {
+      return;
+    }
+
+    await this.refreshRuntimeDescriptors({ includeContainerRuntime: true }).catch(() => undefined);
   }
 
   /** Runs registry side effects only in the control-plane owner window. */
@@ -849,17 +960,20 @@ export class PortManagerNetworkService implements DisposableLike {
 
     this.ownsControlPlaneLease = false;
     if (this.routingSignalRefreshTimer !== undefined) {
-      clearInterval(this.routingSignalRefreshTimer);
+      clearTimeout(this.routingSignalRefreshTimer);
       this.routingSignalRefreshTimer = undefined;
     }
+    this.routingSignalRefreshDelayMs = ROUTING_SIGNAL_REFRESH_INTERVAL_MS;
     if (this.terminalAttachmentMarkerPollTimer !== undefined) {
-      clearInterval(this.terminalAttachmentMarkerPollTimer);
+      clearTimeout(this.terminalAttachmentMarkerPollTimer);
       this.terminalAttachmentMarkerPollTimer = undefined;
     }
     if (this.terminalAttachmentRefreshTimer !== undefined) {
       clearTimeout(this.terminalAttachmentRefreshTimer);
       this.terminalAttachmentRefreshTimer = undefined;
     }
+    this.stopComposeRoutingFreshnessHeartbeat();
+    this.stopContainerEventsWatcher();
 
     for (const disposable of this.controlPlaneOwnerDisposables.splice(0)) {
       disposable.dispose();
@@ -892,7 +1006,7 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Returns this extension host's current role in the cross-window control plane. */
   getControlPlaneStatus(): ControlPlaneStatus {
     const nowMs = Date.now();
-    const owner = readControlPlaneOwner();
+    const owner = readControlPlaneOwnerForDisplay(nowMs);
     const ownerActive = isActiveControlPlaneOwner(owner, nowMs);
     const ownerUpdatedAtMs = owner === undefined ? undefined : Date.parse(owner.updatedAt);
     const leaseExpiresAt =
@@ -1003,7 +1117,13 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /** Installs macOS resolver rows so browser URLs can use network names as hosts. */
-  async installBrowserDnsResolvers(options: { readonly automatic?: boolean } = {}): Promise<BrowserDnsResolverStatus> {
+  async installBrowserDnsResolvers(
+    options: {
+      readonly automatic?: boolean;
+      readonly forceTlsRenewal?: boolean;
+      readonly triggerDescription?: string;
+    } = {},
+  ): Promise<BrowserDnsResolverStatus> {
     if (this.browserDnsResolverInstallInFlight !== undefined) {
       return this.browserDnsResolverInstallInFlight;
     }
@@ -1016,6 +1136,109 @@ export class PortManagerNetworkService implements DisposableLike {
     }
   }
 
+  /**
+   * Reissues the dev TLS leaf certificate for the current alias set even when
+   * it is not due yet. The root CA is preserved so existing keychain trust
+   * keeps working; browser HTTPS listeners rotate on the next proxy sync.
+   */
+  async renewBrowserTlsCertificate(): Promise<BrowserDnsResolverStatus> {
+    return this.installBrowserDnsResolvers({
+      forceTlsRenewal: true,
+      triggerDescription: "a browser TLS certificate renewal was requested",
+    });
+  }
+
+  /**
+   * Repairs the browser alias for one network. A stale certificate (expired,
+   * expiring, or missing this alias's hostname) forces a leaf reissue; other
+   * gaps reuse the idempotent resolver/hosts/alias install path.
+   */
+  async repairBrowserDnsAlias(networkId: string): Promise<BrowserDnsResolverStatus> {
+    const record = this.getBrowserDnsResolverStatus().records.find(
+      (candidate) => candidate.networkId === networkId,
+    );
+
+    return this.installBrowserDnsResolvers({
+      forceTlsRenewal: record?.tlsStale === true,
+      triggerDescription:
+        record === undefined
+          ? "a browser alias repair was requested"
+          : `the browser alias for logical network "${record.networkName}" needs repair (${record.tlsStatusDetail ?? "alias setup missing"})`,
+    });
+  }
+
+  /** Terminal-band loopback addresses for every network, for consolidated alias setup. */
+  private collectTerminalLoopbackAddresses(): readonly string[] {
+    return [
+      ...new Set(
+        this.registry
+          .getSnapshot()
+          .networks.map((network) => loopbackAddressForNetwork(network.id))
+          .filter((address) => address !== "127.0.0.1"),
+      ),
+    ];
+  }
+
+  /**
+   * Interactive alias preparation for attach flows. One osascript approval
+   * configures every network's loopback aliases plus the full browser DNS
+   * setup, so attaching another network later does not prompt again. The
+   * prompt names the network that triggered the request.
+   */
+  async ensureTerminalRoutingHostReadyForNetwork(
+    network: Pick<LogicalNetwork, "id" | "name">,
+    mode: "auto" | "loopback" | "high-port",
+  ): Promise<void> {
+    const address = loopbackAddressForNetwork(network.id);
+    if (await isLoopbackAddressAliasConfiguredAsync(address)) {
+      return;
+    }
+
+    if (mode === "auto") {
+      await ensureLoopbackAddressRoutingHostReady(address, mode);
+      return;
+    }
+
+    try {
+      const networks = this.registry.getSnapshot().networks;
+      const records = this.buildBrowserDnsRecordsForCurrentSettings(networks);
+      const terminalAddresses = this.collectTerminalLoopbackAddresses();
+      const script =
+        records.length > 0
+          ? buildBrowserDnsResolverSetupScript(records, this.browserDnsServer.getPort(), {
+              additionalLoopbackAddresses: terminalAddresses,
+            })
+          : buildLoopbackAliasSetupScript(terminalAddresses.length > 0 ? terminalAddresses : [address]);
+
+      await runShellScriptWithAdministratorPrivileges(
+        script,
+        buildNetworkAdminSetupPromptMessage({
+          triggerDescription: `terminal routing was attached to logical network "${network.name}"`,
+          networkNames: networks.map((item) => item.name),
+          includesBrowserDnsSetup: records.length > 0,
+        }),
+      );
+      invalidateLoopbackAliasCache();
+      if (records.length > 0) {
+        await trustBrowserTlsCertificateForCurrentUser().catch(() => undefined);
+        // The approval already covered the full browser DNS setup, so the
+        // automatic installer must not prompt again for the same state.
+        this.clearBrowserDnsAutoInstallSignature();
+        this.browserNetworkProxy.retryFailedEndpointsNow();
+        void this.syncBrowserNetworkProxies().catch(() => undefined);
+      }
+      this.localChangeEvents.emit();
+    } catch (error) {
+      throw new Error(loopbackAddressRoutingFailureMessage(mode, "VS Code terminal default not applied."), {
+        cause: error,
+      });
+    }
+
+    if (!(await isLoopbackAddressAliasConfiguredAsync(address))) {
+      throw new Error(loopbackAddressRoutingFailureMessage(mode, "VS Code terminal default not applied."));
+    }
+  }
+
   /** Removes only Port Manager-owned browser resolver files for current aliases. */
   async cleanupBrowserDnsResolvers(): Promise<BrowserDnsResolverStatus> {
     const status = this.getBrowserDnsResolverStatus();
@@ -1025,30 +1248,56 @@ export class PortManagerNetworkService implements DisposableLike {
 
     await runShellScriptWithAdministratorPrivileges(
       buildBrowserDnsResolverCleanupScript(status.records),
-      "Port Manager needs administrator privileges to remove its macOS browser DNS aliases, loopback aliases, and local hosts entries.",
+      `Port Manager needs administrator privileges to remove its macOS browser DNS aliases, loopback aliases, and local hosts entries for logical networks: ${formatNetworkNameList(
+        status.records.map((record) => record.networkName),
+      )}.`,
     );
     this.localChangeEvents.emit();
     return this.getBrowserDnsResolverStatus();
   }
 
   private async installBrowserDnsResolversExclusive(
-    options: { readonly automatic?: boolean },
+    options: {
+      readonly automatic?: boolean;
+      readonly forceTlsRenewal?: boolean;
+      readonly triggerDescription?: string;
+    },
   ): Promise<BrowserDnsResolverStatus> {
     const status = this.getBrowserDnsResolverStatus();
     if (!status.supported || status.records.length === 0) {
       return status;
     }
-    if (status.missingCount === 0) {
+    // Forced TLS renewal must run even when every alias currently reports
+    // configured: renewal exists precisely for certificates that still work
+    // but are inside the renewal window.
+    if (status.missingCount === 0 && options.forceTlsRenewal !== true) {
       this.clearBrowserDnsAutoInstallSignature();
       return status;
     }
+
+    const unconfiguredNames = status.records
+      .filter((record) => !record.configured)
+      .map((record) => record.networkName);
+    const triggerDescription =
+      options.triggerDescription ??
+      (unconfiguredNames.length > 0
+        ? `browser alias setup is missing for logical network${unconfiguredNames.length === 1 ? "" : "s"} ${formatNetworkNameList(unconfiguredNames)}`
+        : "browser alias setup was requested");
 
     await runShellScriptWithAdministratorPrivileges(
       buildBrowserDnsResolverSetupScript(
         status.records,
         status.dnsPort,
+        {
+          forceTlsRenewal: options.forceTlsRenewal === true,
+          additionalLoopbackAddresses: this.collectTerminalLoopbackAddresses(),
+        },
       ),
-      "Port Manager needs administrator privileges to configure macOS browser DNS aliases, loopback aliases, /etc/hosts entries, and a trusted development TLS certificate for logical-network browser URLs.",
+      buildNetworkAdminSetupPromptMessage({
+        triggerDescription,
+        networkNames: status.records.map((record) => record.networkName),
+        includesBrowserDnsSetup: true,
+      }),
     );
     await trustBrowserTlsCertificateForCurrentUser();
     this.localChangeEvents.emit();
@@ -1146,6 +1395,11 @@ export class PortManagerNetworkService implements DisposableLike {
   ): readonly NetworkDnsRecord[] {
     const records = buildBrowserDnsRecords(networks);
     this.browserDnsServer.sync(expandBrowserDnsServerRecords(records));
+    if (process.platform === "darwin" && records.length > 0) {
+      // Warm the shared lo0 alias cache off the event loop so synchronous
+      // status reads (tree renders) almost never pay the ifconfig spawn.
+      void readLoopbackAliasAddresses();
+    }
     return records;
   }
 
@@ -1247,6 +1501,16 @@ export class PortManagerNetworkService implements DisposableLike {
       }
     }
 
+    /*
+     * Background discovery exists to keep visible terminal rows and live
+     * attachments honest. With the sidebar hidden and nothing attached there is
+     * no consumer, so the poll skips its process-table and AppleScript scans.
+     * Command paths refresh in the foreground and are unaffected.
+     */
+    if (options.background === true && !this.hasBackgroundTerminalDiscoveryConsumers()) {
+      return this.registry.getSnapshot().terminalWindows;
+    }
+
     if (this.terminalRefreshInFlight !== undefined) {
       this.terminalRefreshQueued = true;
       return this.terminalRefreshInFlight;
@@ -1257,6 +1521,19 @@ export class PortManagerNetworkService implements DisposableLike {
     });
 
     return this.terminalRefreshInFlight;
+  }
+
+  /** True when background terminal discovery has an observer or live state to maintain. */
+  private hasBackgroundTerminalDiscoveryConsumers(): boolean {
+    if (this.sidebarVisible || this.vscodeWindowTerminalBinding !== undefined) {
+      return true;
+    }
+
+    if (this.terminalAttachmentMarkerRows.length > 0) {
+      return true;
+    }
+
+    return this.registry.getSnapshot().attachments.length > 0;
   }
 
   /** Runs terminal refreshes sequentially while preserving one queued follow-up scan. */
@@ -1292,6 +1569,16 @@ export class PortManagerNetworkService implements DisposableLike {
     options: BackgroundRefreshOptions = {},
   ): Promise<readonly ContainerServiceCandidate[]> {
     if (options.background === true && !this.ownsControlPlaneLease) {
+      return this.registry.getSnapshot().containerServiceCandidates;
+    }
+
+    /*
+     * Candidate discovery only feeds the sidebar and container-backed routing.
+     * With the view hidden and no container features in use, background polling
+     * would wake the Docker daemon for rows nobody reads. The view-visibility
+     * handler forces one refresh the moment discovery gains a consumer again.
+     */
+    if (options.background === true && options.force !== true && !this.hasBackgroundContainerDiscoveryConsumers()) {
       return this.registry.getSnapshot().containerServiceCandidates;
     }
 
@@ -1331,6 +1618,33 @@ export class PortManagerNetworkService implements DisposableLike {
     });
 
     return this.containerServiceRefreshInFlight;
+  }
+
+  /** True when container discovery results have a live consumer in this window. */
+  private hasBackgroundContainerDiscoveryConsumers(): boolean {
+    if (this.sidebarVisible) {
+      return true;
+    }
+
+    const snapshot = this.registry.getSnapshot();
+    return (
+      snapshot.composeAttachments.some(isRestorableComposeAttachment) ||
+      snapshot.networks.some((network) => network.runtimeKind === "container")
+    );
+  }
+
+  /** Notifies the service of sidebar visibility so background discovery can idle with the view. */
+  setSidebarVisible(visible: boolean): void {
+    if (this.sidebarVisible === visible) {
+      return;
+    }
+
+    this.sidebarVisible = visible;
+    if (visible && this.ownsControlPlaneLease) {
+      // Catch the UI up immediately after discovery was idled while hidden.
+      this.lastContainerServiceRefreshAtMs = 0;
+      this.notifyRoutingActivity({ refreshNow: true });
+    }
   }
 
   /** Forces generated network routing artifacts to match durable state and live Compose endpoints. */
@@ -1464,10 +1778,9 @@ export class PortManagerNetworkService implements DisposableLike {
       throw new Error(`Native terminal routing is not supported on ${process.platform}.`);
     }
 
-    await ensureLoopbackAddressRoutingHostReady(
-      loopbackAddressForNetwork(networkId),
+    await this.ensureTerminalRoutingHostReadyForNetwork(
+      network,
       resolveTerminalLoopbackAddressRoutingMode(settings),
-      { interactive: true },
     );
     if (!usesLoopbackAddressOnlyRouting(settings)) {
       await this.processService?.start();
@@ -1913,11 +2226,7 @@ export class PortManagerNetworkService implements DisposableLike {
         const portSettings = readPortManagerSettings();
         const hiddenHostAddress = loopbackAddressForNetwork(network.id);
         const loopbackMode = resolveTerminalLoopbackAddressRoutingMode(portSettings);
-        await ensureLoopbackAddressRoutingHostReady(
-          hiddenHostAddress,
-          loopbackMode,
-          { interactive: true },
-        );
+        await this.ensureTerminalRoutingHostReadyForNetwork(network, loopbackMode);
         const mutationResult = await this.composePublishMutator.hidePublishedPorts({
           mode: input.composeMutation.mode,
           allowStatefulClone: input.composeMutation.allowStatefulClone,
@@ -2471,17 +2780,19 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Releases listeners and event subscriptions. */
   dispose(): void {
     if (this.routingSignalRefreshTimer !== undefined) {
-      clearInterval(this.routingSignalRefreshTimer);
+      clearTimeout(this.routingSignalRefreshTimer);
       this.routingSignalRefreshTimer = undefined;
     }
     if (this.terminalAttachmentMarkerPollTimer !== undefined) {
-      clearInterval(this.terminalAttachmentMarkerPollTimer);
+      clearTimeout(this.terminalAttachmentMarkerPollTimer);
       this.terminalAttachmentMarkerPollTimer = undefined;
     }
     if (this.terminalAttachmentRefreshTimer !== undefined) {
       clearTimeout(this.terminalAttachmentRefreshTimer);
       this.terminalAttachmentRefreshTimer = undefined;
     }
+    this.stopComposeRoutingFreshnessHeartbeat();
+    this.stopContainerEventsWatcher();
     if (this.ownerLeaseHandoffRetryTimer !== undefined) {
       clearTimeout(this.ownerLeaseHandoffRetryTimer);
       this.ownerLeaseHandoffRetryTimer = undefined;
@@ -2658,7 +2969,6 @@ export class PortManagerNetworkService implements DisposableLike {
           await ensureLoopbackAddressRoutingHostReady(
             loopbackAddressForNetwork(binding.networkId),
             resolveTerminalLoopbackAddressRoutingMode(settings),
-            options,
           );
           if (binding.status === "error") {
             nextBinding = { ...binding, status: "attached", errorMessage: undefined };
@@ -2849,16 +3159,120 @@ export class PortManagerNetworkService implements DisposableLike {
    * hidden containers without an extension event. This loop reconciles terminal
    * markers, container candidates, generated routing files, and then lets
    * registry events refresh the UI only when the observed state changed.
+   *
+   * The cadence is adaptive: quiet ticks stretch the interval toward a cap so
+   * an idle workspace stops burning process scans, and any activity signal
+   * snaps back to the fast interval.
    */
   private startRoutingSignalRefreshLoop(): void {
     if (this.routingSignalRefreshTimer !== undefined) {
       return;
     }
 
-    this.routingSignalRefreshTimer = setInterval(() => {
-      void this.refreshRoutingSignals();
-    }, ROUTING_SIGNAL_REFRESH_INTERVAL_MS);
+    this.routingSignalRefreshDelayMs = ROUTING_SIGNAL_REFRESH_INTERVAL_MS;
+    this.scheduleNextRoutingSignalRefresh();
+  }
+
+  private scheduleNextRoutingSignalRefresh(): void {
+    if (!this.ownsControlPlaneLease || this.routingSignalRefreshTimer !== undefined) {
+      return;
+    }
+
+    this.routingSignalRefreshTimer = setTimeout(() => {
+      this.routingSignalRefreshTimer = undefined;
+      void this.refreshRoutingSignals().finally(() => {
+        this.updateRoutingSignalRefreshDelay();
+        this.scheduleNextRoutingSignalRefresh();
+      });
+    }, this.routingSignalRefreshDelayMs);
     this.routingSignalRefreshTimer.unref?.();
+  }
+
+  /**
+   * Doubles the idle interval after quiet ticks and resets it after activity.
+   * "Quiet" means no activity signal arrived and the cheap state fingerprint
+   * did not move since the previous tick.
+   */
+  private updateRoutingSignalRefreshDelay(): void {
+    const nextSignature = this.buildRoutingActivitySignature();
+    const changed = this.routingSignalActivityObserved || nextSignature !== this.routingSignalActivitySignature;
+    this.routingSignalActivityObserved = false;
+    this.routingSignalActivitySignature = nextSignature;
+
+    if (changed) {
+      this.routingSignalRefreshDelayMs = ROUTING_SIGNAL_REFRESH_INTERVAL_MS;
+      return;
+    }
+
+    this.routingSignalRefreshDelayMs = Math.min(
+      this.routingSignalRefreshDelayMs * 2,
+      this.maxRoutingSignalRefreshDelayMs(),
+    );
+  }
+
+  /**
+   * Compose attachments rely on container lifecycle events for fast reaction.
+   * Without a healthy event stream, polling is the only external-change
+   * detector, so idle backoff stays tighter while compose routing is live.
+   */
+  private maxRoutingSignalRefreshDelayMs(): number {
+    const composeAttached = this.registry
+      .getSnapshot()
+      .composeAttachments.some(isRestorableComposeAttachment);
+
+    if (composeAttached && this.containerEventsWatcher?.isHealthy() !== true) {
+      return ROUTING_SIGNAL_REFRESH_DEGRADED_MAX_INTERVAL_MS;
+    }
+
+    return ROUTING_SIGNAL_REFRESH_MAX_INTERVAL_MS;
+  }
+
+  /** Cheap fingerprint of routing-relevant state; scans and spawns stay out of this path. */
+  private buildRoutingActivitySignature(): string {
+    const snapshot = this.registry.getSnapshot();
+    const agentSnapshot = this.processService?.getSnapshot();
+
+    return [
+      snapshot.networks.length,
+      snapshot.attachments.length,
+      snapshot.composeAttachments.length,
+      snapshot.exposures.length,
+      snapshot.hostAccessBindings.length,
+      snapshot.terminalWindows.length,
+      snapshot.containerServiceCandidates.length,
+      agentSnapshot?.routes.length ?? 0,
+      agentSnapshot?.processes.length ?? 0,
+      this.terminalAttachmentMarkerSignature,
+      vscode.window.terminals.length,
+    ].join("|");
+  }
+
+  /**
+   * Snaps the background loop back to its fast cadence. Called from paths that
+   * indicate routing state is moving: user commands, registry mutations,
+   * terminal lifecycle events, marker changes, and container events.
+   */
+  private notifyRoutingActivity(options: { readonly refreshNow?: boolean } = {}): void {
+    this.routingSignalActivityObserved = true;
+    const wasIdle = this.routingSignalRefreshDelayMs > ROUTING_SIGNAL_REFRESH_INTERVAL_MS;
+    this.routingSignalRefreshDelayMs = ROUTING_SIGNAL_REFRESH_INTERVAL_MS;
+
+    if (!this.ownsControlPlaneLease) {
+      return;
+    }
+
+    // Re-arm a long pending idle timer so the fast cadence applies immediately.
+    // Fast-cadence timers are left alone: constant activity must not keep
+    // pushing the reconcile-of-last-resort further into the future.
+    if (wasIdle && this.routingSignalRefreshTimer !== undefined) {
+      clearTimeout(this.routingSignalRefreshTimer);
+      this.routingSignalRefreshTimer = undefined;
+    }
+    this.scheduleNextRoutingSignalRefresh();
+
+    if (options.refreshNow === true) {
+      void this.refreshRoutingSignals();
+    }
   }
 
   /** Performs one serialized background refresh of terminals and container-backed routes. */
@@ -2880,8 +3294,10 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
+    this.syncComposeRoutingFreshnessHeartbeat();
+    this.syncContainerEventsWatcher();
     await Promise.all([
-      this.refreshTerminals().catch(() => []),
+      this.refreshTerminals({ background: true }).catch(() => []),
       this.refreshContainerServices({ background: true }).catch(() => []),
     ]);
     await this.reconcileComposeAttachmentPublishedPorts({ background: true, force: true }).catch(() => undefined);
@@ -2892,6 +3308,100 @@ export class PortManagerNetworkService implements DisposableLike {
       this.syncBrowserNetworkProxies().catch(() => undefined),
     ]);
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
+  }
+
+  /**
+   * Native docker shims fail closed when a scoped compose TSV mtime exceeds the
+   * route-table TTL, so live compose attachments need touches on a cadence the
+   * adaptive reconcile loop no longer guarantees. Touching is a handful of
+   * utimes calls; the heavy reconcile work stays on the adaptive loop.
+   */
+  private syncComposeRoutingFreshnessHeartbeat(): void {
+    const composeAttached = this.registry
+      .getSnapshot()
+      .composeAttachments.some(isRestorableComposeAttachment);
+
+    if (!composeAttached || !this.ownsControlPlaneLease) {
+      this.stopComposeRoutingFreshnessHeartbeat();
+      return;
+    }
+
+    if (this.composeRoutingFreshnessTimer !== undefined) {
+      return;
+    }
+
+    this.composeRoutingFreshnessTimer = setInterval(() => {
+      void this.touchComposeRoutingFreshnessPaths();
+    }, COMPOSE_ROUTING_FRESHNESS_INTERVAL_MS);
+    this.composeRoutingFreshnessTimer.unref?.();
+  }
+
+  private stopComposeRoutingFreshnessHeartbeat(): void {
+    if (this.composeRoutingFreshnessTimer !== undefined) {
+      clearInterval(this.composeRoutingFreshnessTimer);
+      this.composeRoutingFreshnessTimer = undefined;
+    }
+  }
+
+  private async touchComposeRoutingFreshnessPaths(): Promise<void> {
+    const refreshedAt = new Date();
+    await Promise.all(
+      this.composeRoutingFreshnessPaths.map((filePath) =>
+        fs.utimes(filePath, refreshedAt, refreshedAt).catch(() => undefined),
+      ),
+    );
+  }
+
+  /**
+   * Keeps a container lifecycle event stream open while compose attachments or
+   * container-backed networks exist. Events replace fast polling: the stream is
+   * silent when Docker is quiet and wakes the reconcile loop immediately when a
+   * container starts, stops, or is recreated.
+   */
+  private syncContainerEventsWatcher(): void {
+    const snapshot = this.registry.getSnapshot();
+    const containerFeaturesActive =
+      snapshot.composeAttachments.some(isRestorableComposeAttachment) ||
+      snapshot.networks.some((network) => network.runtimeKind === "container");
+
+    if (!containerFeaturesActive || !this.ownsControlPlaneLease || !readContainerEventsWatchEnabled()) {
+      this.stopContainerEventsWatcher();
+      return;
+    }
+
+    if (this.containerEventsWatcher !== undefined) {
+      return;
+    }
+
+    this.containerEventsWatcher = new ContainerEventsWatcher({
+      readSettings: () => readContainerRuntimeSettings(),
+      onEvent: () => {
+        void this.handleContainerRuntimeEvent();
+      },
+    });
+    this.containerEventsWatcher.start();
+  }
+
+  private stopContainerEventsWatcher(): void {
+    this.containerEventsWatcher?.dispose();
+    this.containerEventsWatcher = undefined;
+  }
+
+  /**
+   * Reacts to a container lifecycle event with a targeted converge. This is a
+   * foreground-style pass: background gates (shared refresh stamp, interval
+   * throttles) must not delay reconciliation the event already justified.
+   */
+  private async handleContainerRuntimeEvent(): Promise<void> {
+    if (!this.ownsControlPlaneLease) {
+      return;
+    }
+
+    this.notifyRoutingActivity();
+    this.lastContainerServiceRefreshAtMs = 0;
+    await this.refreshContainerServices({ background: true, force: true }).catch(() => []);
+    await this.reconcileComposeAttachmentPublishedPorts({ force: true, coalesceForce: true }).catch(() => undefined);
+    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
   }
 
   /**
@@ -3216,6 +3726,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Attempts ownership handoff for lease files touched by another extension host. */
   private refreshOwnerLeaseFromFileSignal(changedName: string | undefined): void {
     const controlPlaneChanged = changedName === undefined || changedName === path.basename(CONTROL_PLANE_OWNER_PATH);
+    if (controlPlaneChanged) {
+      invalidateControlPlaneOwnerDisplayCache();
+    }
     const shouldRefreshControl =
       controlPlaneChanged &&
       !this.ownsControlPlaneLease &&
@@ -3288,15 +3801,35 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     void this.refreshTerminalAttachmentsWhenMarkersChanged();
-    this.terminalAttachmentMarkerPollTimer = setInterval(() => {
-      void this.refreshTerminalAttachmentsWhenMarkersChanged();
-    }, TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS);
+    this.scheduleNextTerminalAttachmentMarkerPoll();
+  }
+
+  /**
+   * Polls fast only around recent attachment activity. Steady state relies on
+   * the native and VS Code marker watchers, so the fallback ticks slowly
+   * instead of statting the marker directory twice per second forever.
+   */
+  private scheduleNextTerminalAttachmentMarkerPoll(): void {
+    const withinBurstWindow = Date.now() < this.terminalAttachmentRefreshBurstUntilMs;
+    const delayMs = withinBurstWindow
+      ? TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS
+      : TERMINAL_ATTACHMENT_MARKER_POLL_IDLE_INTERVAL_MS;
+
+    this.terminalAttachmentMarkerPollTimer = setTimeout(() => {
+      this.terminalAttachmentMarkerPollTimer = undefined;
+      void this.refreshTerminalAttachmentsWhenMarkersChanged().finally(() => {
+        if (this.ownsControlPlaneLease && this.terminalAttachmentMarkerPollTimer === undefined) {
+          this.scheduleNextTerminalAttachmentMarkerPoll();
+        }
+      });
+    }, delayMs);
     this.terminalAttachmentMarkerPollTimer.unref?.();
   }
 
   /** Schedules a short refresh burst so process-table discovery can catch up to the shell marker. */
   private scheduleTerminalAttachmentRefreshBurst(networkIds: readonly string[] = []): void {
     this.terminalAttachmentRefreshBurstUntilMs = Date.now() + TERMINAL_ATTACHMENT_REFRESH_BURST_WINDOW_MS;
+    this.notifyRoutingActivity();
     for (const networkId of networkIds) {
       this.terminalAttachmentComposeRefreshNetworkIds.add(networkId);
     }
@@ -3367,6 +3900,7 @@ export class PortManagerNetworkService implements DisposableLike {
   private async readTerminalAttachmentMarkerState(): Promise<TerminalAttachmentMarkerState> {
     const markerDirectory = this.getTerminalAttachmentMarkerDirectoryPath();
     const entries = await fs.readdir(markerDirectory, { withFileTypes: true }).catch(() => []);
+    const previousRowsByPath = new Map(this.terminalAttachmentMarkerRows.map((row) => [row.filePath, row]));
     const rows = await Promise.all(
       entries
         .filter((entry) => entry.isFile() && entry.name.endsWith(".tsv"))
@@ -3380,10 +3914,18 @@ export class PortManagerNetworkService implements DisposableLike {
             };
           }
 
+          const signature = `${entry.name}:${stats.size}:${Math.trunc(stats.mtimeMs)}`;
+          // Marker contents are immutable for a given size+mtime, so the poll
+          // stays stat-only until a marker actually changes on disk.
+          const previousRow = previousRowsByPath.get(filePath);
+          if (previousRow !== undefined && previousRow.signature === signature) {
+            return previousRow;
+          }
+
           const marker = await this.readManualTerminalAttachmentMarker(filePath);
           return {
             filePath,
-            signature: `${entry.name}:${stats.size}:${Math.trunc(stats.mtimeMs)}`,
+            signature,
             ...(marker !== undefined ? { networkId: marker.networkId } : {}),
           };
         }),
@@ -3455,10 +3997,26 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
-    await this.refreshComposeRouteProcessSnapshot();
     const attachments = this.registry
       .getSnapshot()
       .composeAttachments.filter(isRestorableComposeAttachment);
+
+    /*
+     * Background ticks with no compose attachments and no compose rows in the
+     * cached daemon snapshot have nothing to reconcile or clean. Skipping the
+     * daemon poke here keeps an idle workspace from forcing agent refreshes.
+     * Foreground and startup passes still inspect the daemon unconditionally,
+     * which is what cleans stale rows left by an older extension session.
+     */
+    if (
+      options.background === true &&
+      attachments.length === 0 &&
+      !this.processService.getSnapshot().processes.some((process) => process.source === "compose")
+    ) {
+      return;
+    }
+
+    await this.refreshComposeRouteProcessSnapshot();
     await this.removeOrphanComposeRouteProcesses(attachments);
     const targetAttachments = filterComposeAttachmentsByNetworkIds(attachments, options.networkIds);
 
@@ -4612,10 +5170,12 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     if (networkIdsToWrite.size === 0) {
+      this.composeRoutingFreshnessPaths = [];
       await this.removeStaleComposeProjectRoutingFiles(undefined, new Set());
       return;
     }
 
+    const freshnessPaths: string[] = [];
     for (const networkId of [...networkIdsToWrite].sort()) {
       await withSharedFileGenerationLock(this.getComposeProjectRoutingLockPath(networkId), async () => {
         const networkFilePath = this.getComposeProjectRoutingFilePath(networkId);
@@ -4633,9 +5193,14 @@ export class PortManagerNetworkService implements DisposableLike {
           await writeTextFileAtomicallyOrTouch(scopedFilePath, serializeComposeProjectRoutingRows(scopedRows));
         }
 
+        freshnessPaths.push(...currentScopedPaths);
         await this.removeStaleComposeProjectRoutingFiles(networkId, currentScopedPaths);
       });
     }
+
+    // Shim-side mtime TTLs stay alive through the cheap freshness heartbeat
+    // between full publishes, so only files from the latest generation count.
+    this.composeRoutingFreshnessPaths = freshnessPaths;
   }
 
   /** Recreates or refreshes generated compose overrides before shell wrappers can route compose commands. */
@@ -7740,22 +8305,53 @@ function browserPublicHostForNetwork(networkId: string, networks: readonly Logic
   return undefined;
 }
 
+interface StatValidatedTextCacheEntry {
+  readonly sizeBytes: number;
+  readonly mtimeMs: number;
+  readonly content: string | undefined;
+}
+
+/** Contents of small system config files, revalidated by stat instead of rereading per tree render. */
+const statValidatedTextCache = new Map<string, StatValidatedTextCacheEntry>();
+
+function readTextFileWithStatCache(filePath: string): string | undefined {
+  let stats: syncFs.Stats;
+  try {
+    stats = syncFs.statSync(filePath);
+  } catch {
+    statValidatedTextCache.set(filePath, { sizeBytes: -1, mtimeMs: -1, content: undefined });
+    return undefined;
+  }
+
+  const cached = statValidatedTextCache.get(filePath);
+  if (cached !== undefined && cached.sizeBytes === stats.size && cached.mtimeMs === stats.mtimeMs) {
+    return cached.content;
+  }
+
+  try {
+    const content = syncFs.readFileSync(filePath, "utf8");
+    statValidatedTextCache.set(filePath, { sizeBytes: stats.size, mtimeMs: stats.mtimeMs, content });
+    return content;
+  } catch {
+    statValidatedTextCache.set(filePath, { sizeBytes: stats.size, mtimeMs: stats.mtimeMs, content: undefined });
+    return undefined;
+  }
+}
+
 function isBrowserDnsResolverConfigured(hostname: string): boolean {
   if (process.platform !== "darwin") {
     return false;
   }
 
-  const filePath = path.join("/etc/resolver", hostname);
-
-  try {
-    const content = syncFs.readFileSync(filePath, "utf8");
-    return (
-      /^nameserver[ \t]+127\.0\.0\.1$/m.test(content) &&
-      new RegExp(`^port[ \\t]+${browserDnsPort()}$`, "m").test(content)
-    );
-  } catch {
+  const content = readTextFileWithStatCache(path.join("/etc/resolver", hostname));
+  if (content === undefined) {
     return false;
   }
+
+  return (
+    /^nameserver[ \t]+127\.0\.0\.1$/m.test(content) &&
+    new RegExp(`^port[ \\t]+${browserDnsPort()}$`, "m").test(content)
+  );
 }
 
 function isBrowserDnsHostsEntryConfigured(hostname: string, address: string): boolean {
@@ -7763,15 +8359,15 @@ function isBrowserDnsHostsEntryConfigured(hostname: string, address: string): bo
     return false;
   }
 
-  try {
-    const content = syncFs.readFileSync("/etc/hosts", "utf8");
-    return content.split(/\r?\n/).some((line) => {
-      const [hostAddress, ...hostnames] = line.replace(/#.*/, "").trim().split(/\s+/);
-      return hostAddress === address && hostnames.includes(hostname);
-    });
-  } catch {
+  const content = readTextFileWithStatCache("/etc/hosts");
+  if (content === undefined) {
     return false;
   }
+
+  return content.split(/\r?\n/).some((line) => {
+    const [hostAddress, ...hostnames] = line.replace(/#.*/, "").trim().split(/\s+/);
+    return hostAddress === address && hostnames.includes(hostname);
+  });
 }
 
 /**
@@ -7791,10 +8387,8 @@ function isBrowserDnsOwnedHostsEntryCurrent(hostname: string, address: string): 
 
 /** Reads only the Port Manager-owned hosts block, ignoring unrelated user rows. */
 function readBrowserDnsOwnedHostsEntries(): readonly { readonly hostname: string; readonly address: string }[] {
-  let content: string;
-  try {
-    content = syncFs.readFileSync("/etc/hosts", "utf8");
-  } catch {
+  const content = readTextFileWithStatCache("/etc/hosts");
+  if (content === undefined) {
     return [];
   }
 
@@ -7828,68 +8422,164 @@ function readBrowserDnsOwnedHostsEntries(): readonly { readonly hostname: string
   return entries;
 }
 
+interface LoopbackAliasCacheState {
+  readonly readAtMs: number;
+  readonly addresses: ReadonlySet<string>;
+}
+
+let loopbackAliasCache: LoopbackAliasCacheState | undefined;
+let loopbackAliasCacheRefreshInFlight: Promise<LoopbackAliasCacheState> | undefined;
+
+/** Collects every inet address on lo0 so one spawn answers all alias checks. */
+function parseLoopbackAliasAddresses(output: string): ReadonlySet<string> {
+  const addresses = new Set<string>();
+  for (const match of output.matchAll(/inet[ \t]+(\d+\.\d+\.\d+\.\d+)/g)) {
+    addresses.add(match[1]);
+  }
+
+  return addresses;
+}
+
+/** Alias additions and removals must be visible before the TTL elapses. */
+function invalidateLoopbackAliasCache(): void {
+  loopbackAliasCache = undefined;
+}
+
+function readLoopbackAliasAddressesSync(): ReadonlySet<string> {
+  const cache = loopbackAliasCache;
+  if (cache !== undefined && Date.now() - cache.readAtMs < LOOPBACK_ALIAS_CACHE_TTL_MS) {
+    return cache.addresses;
+  }
+
+  try {
+    const output = execFileSync("ifconfig", ["lo0"], { encoding: "utf8", timeout: 1000 });
+    loopbackAliasCache = { readAtMs: Date.now(), addresses: parseLoopbackAliasAddresses(output) };
+  } catch {
+    // Failures are cached too; retrying on every check would spawn ifconfig in a loop.
+    loopbackAliasCache = { readAtMs: Date.now(), addresses: cache?.addresses ?? new Set<string>() };
+  }
+
+  return loopbackAliasCache.addresses;
+}
+
+/** Async variant used by activation and sync paths so the event loop never blocks on ifconfig. */
+async function readLoopbackAliasAddresses(): Promise<ReadonlySet<string>> {
+  const cache = loopbackAliasCache;
+  if (cache !== undefined && Date.now() - cache.readAtMs < LOOPBACK_ALIAS_CACHE_TTL_MS) {
+    return cache.addresses;
+  }
+
+  if (loopbackAliasCacheRefreshInFlight !== undefined) {
+    return (await loopbackAliasCacheRefreshInFlight).addresses;
+  }
+
+  loopbackAliasCacheRefreshInFlight = execFileAsync("ifconfig", ["lo0"], { timeout: 1000 })
+    .then(({ stdout }) => {
+      const next: LoopbackAliasCacheState = {
+        readAtMs: Date.now(),
+        addresses: parseLoopbackAliasAddresses(String(stdout)),
+      };
+      loopbackAliasCache = next;
+      return next;
+    })
+    .catch(() => {
+      const next: LoopbackAliasCacheState = {
+        readAtMs: Date.now(),
+        addresses: cache?.addresses ?? new Set<string>(),
+      };
+      loopbackAliasCache = next;
+      return next;
+    })
+    .finally(() => {
+      loopbackAliasCacheRefreshInFlight = undefined;
+    });
+
+  return (await loopbackAliasCacheRefreshInFlight).addresses;
+}
+
 /** Non-default 127.x.x.x hosts must exist on macOS lo0 before local binds work. */
 function isLoopbackAddressAliasConfigured(address: string): boolean {
   if (process.platform !== "darwin") {
     return true;
   }
 
+  return readLoopbackAliasAddressesSync().has(address);
+}
+
+/** Awaitable alias check used by paths that run during activation or background syncs. */
+async function isLoopbackAddressAliasConfiguredAsync(address: string): Promise<boolean> {
+  if (process.platform !== "darwin") {
+    return true;
+  }
+
+  return (await readLoopbackAliasAddresses()).has(address);
+}
+
+/** Next allowed non-interactive alias setup attempt per address. */
+const loopbackAliasSetupBackoffUntilMsByAddress = new Map<string, number>();
+
+/** Runs the sudo-less alias setup, remembering failures so background syncs stop respawning shells. */
+async function runNonInteractiveLoopbackAliasSetup(address: string): Promise<void> {
+  const backoffUntilMs = loopbackAliasSetupBackoffUntilMsByAddress.get(address);
+  if (backoffUntilMs !== undefined && Date.now() < backoffUntilMs) {
+    throw new Error(`Loopback alias setup for ${address} is backing off after a recent failure.`);
+  }
+
   try {
-    const output = execFileSync("ifconfig", ["lo0"], { encoding: "utf8", timeout: 1000 });
-    return new RegExp(`inet[ \\t]+${escapeRegExp(address)}(?:[ \\t]|$)`).test(output);
-  } catch {
-    return false;
+    await execFileAsync("/bin/sh", ["-c", buildNonInteractiveLoopbackAliasSetupCommand(address)], {
+      timeout: 5_000,
+      maxBuffer: 128 * 1024,
+    });
+    loopbackAliasSetupBackoffUntilMsByAddress.delete(address);
+  } catch (error) {
+    loopbackAliasSetupBackoffUntilMsByAddress.set(address, Date.now() + LOOPBACK_ALIAS_SETUP_RETRY_BACKOFF_MS);
+    throw error;
+  } finally {
+    invalidateLoopbackAliasCache();
   }
 }
 
 /**
  * Ensures terminal hook routing can bind actual high ports on the network's
- * dedicated loopback host. This is a low-level macOS preparation step; routing
- * policy decides separately whether the requested port is kept or remapped.
+ * dedicated loopback host without any privilege prompt. Interactive flows go
+ * through the service's consolidated setup so one admin approval prepares
+ * every network instead of prompting per attach.
  */
 async function ensureLoopbackAddressRoutingHostReady(
   address: string,
   mode: "auto" | "loopback" | "high-port",
-  options: { readonly interactive: boolean },
 ): Promise<void> {
-  if (isLoopbackAddressAliasConfigured(address)) {
+  if (await isLoopbackAddressAliasConfiguredAsync(address)) {
     return;
   }
 
   try {
-    if (options.interactive && mode !== "auto") {
-      await runShellScriptWithAdministratorPrivileges(
-        buildLoopbackAliasSetupScript(address),
-        `Port Manager needs administrator privileges to add macOS loopback address ${address} for this logical network.`,
-      );
-    } else {
-      await execFileAsync("/bin/sh", ["-c", buildNonInteractiveLoopbackAliasSetupCommand(address)], {
-        timeout: 5_000,
-        maxBuffer: 128 * 1024,
-      });
-    }
+    await runNonInteractiveLoopbackAliasSetup(address);
   } catch (error) {
     throw new Error(loopbackAddressRoutingFailureMessage(mode, "VS Code terminal default not applied."), {
       cause: error,
     });
   }
 
-  if (!isLoopbackAddressAliasConfigured(address)) {
+  if (!(await isLoopbackAddressAliasConfiguredAsync(address))) {
     throw new Error(loopbackAddressRoutingFailureMessage(mode, "VS Code terminal default not applied."));
   }
 }
 
-function buildLoopbackAliasSetupScript(address: string): string {
-  const quotedAddress = shellQuote(address);
-  const aliasPattern = shellQuote(`inet[[:space:]]+${address}([[:space:]]|$)`);
+/** Emits idempotent alias-add lines for every address in one privileged script. */
+function buildLoopbackAliasSetupScript(addresses: readonly string[]): string {
+  const lines = ["#!/bin/sh", "set -eu"];
+  for (const address of addresses) {
+    const quotedAddress = shellQuote(address);
+    const aliasPattern = shellQuote(`inet[[:space:]]+${address}([[:space:]]|$)`);
+    lines.push(
+      `if ! ifconfig lo0 2>/dev/null | grep -E ${aliasPattern} >/dev/null 2>&1; then`,
+      `  ifconfig lo0 alias ${quotedAddress} 255.255.255.255`,
+      "fi",
+    );
+  }
 
-  return [
-    "#!/bin/sh",
-    "set -eu",
-    `if ! ifconfig lo0 2>/dev/null | grep -E ${aliasPattern} >/dev/null 2>&1; then`,
-    `  ifconfig lo0 alias ${quotedAddress} 255.255.255.255`,
-    "fi",
-  ].join("\n");
+  return lines.join("\n");
 }
 
 function buildNonInteractiveLoopbackAliasSetupCommand(address: string): string {
@@ -7974,38 +8664,129 @@ function trustRegistrationErrorText(error: unknown): string {
     .join("\n");
 }
 
-function isBrowserTlsCertificateConfigured(
-  records: readonly { readonly hostname: string; readonly secureHostname?: string }[],
-): boolean {
-  if (!syncFs.existsSync(BROWSER_TLS_SERVER_CERT_PATH) || !syncFs.existsSync(BROWSER_TLS_SERVER_KEY_PATH)) {
-    return false;
+export interface BrowserTlsCertificateState {
+  /** True when the leaf certificate, key, and hostname marker all exist. */
+  readonly available: boolean;
+  /** Hostnames covered by the current leaf certificate's marker file. */
+  readonly markerHostnames: ReadonlySet<string>;
+  /** Leaf certificate expiry instant when the PEM parses. */
+  readonly validToMs?: number;
+  /** True when the leaf certificate is past its expiry. */
+  readonly expired: boolean;
+  /** True when the leaf certificate expires inside the renewal window. */
+  readonly expiresSoon: boolean;
+}
+
+let parsedBrowserTlsLeafCache: { readonly pem: string; readonly validToMs: number | undefined } | undefined;
+
+/** Parses the leaf expiry once per certificate content; stat caching handles file churn. */
+function readBrowserTlsLeafValidToMs(pem: string): number | undefined {
+  if (parsedBrowserTlsLeafCache?.pem === pem) {
+    return parsedBrowserTlsLeafCache.validToMs;
   }
 
-  const expectedHostnames = new Set(buildBrowserTlsHostnames(records));
-  if (expectedHostnames.size === 0) {
-    return false;
-  }
-
-  let markerHostnames: Set<string>;
+  let validToMs: number | undefined;
   try {
-    markerHostnames = new Set(
-      syncFs
-        .readFileSync(BROWSER_TLS_HOSTNAMES_MARKER_PATH, "utf8")
-        .split(/\r?\n/)
-        .map((line) => normalizeBrowserTlsHostname(line))
-        .filter((hostname): hostname is string => hostname !== undefined),
-    );
+    const parsed = Date.parse(new X509Certificate(pem).validTo);
+    validToMs = Number.isNaN(parsed) ? undefined : parsed;
   } catch {
+    validToMs = undefined;
+  }
+
+  parsedBrowserTlsLeafCache = { pem, validToMs };
+  return validToMs;
+}
+
+/**
+ * Reads the current dev TLS material state: which hostnames the leaf covers
+ * and whether it is expired or inside the renewal window. All reads go through
+ * the stat-validated cache, so status/tree renders stay spawn- and parse-free
+ * until the certificate files actually change.
+ */
+function readBrowserTlsCertificateState(nowMs = Date.now()): BrowserTlsCertificateState {
+  const certPem = readTextFileWithStatCache(BROWSER_TLS_SERVER_CERT_PATH);
+  const markerText = readTextFileWithStatCache(BROWSER_TLS_HOSTNAMES_MARKER_PATH);
+  const keyExists = syncFs.existsSync(BROWSER_TLS_SERVER_KEY_PATH);
+
+  if (certPem === undefined || markerText === undefined || !keyExists) {
+    return { available: false, markerHostnames: new Set(), expired: false, expiresSoon: false };
+  }
+
+  const markerHostnames = new Set(
+    markerText
+      .split(/\r?\n/)
+      .map((line) => normalizeBrowserTlsHostname(line))
+      .filter((hostname): hostname is string => hostname !== undefined),
+  );
+  const validToMs = readBrowserTlsLeafValidToMs(certPem);
+  const expired = validToMs !== undefined && nowMs >= validToMs;
+  const expiresSoon = validToMs !== undefined && !expired && validToMs - nowMs < BROWSER_TLS_RENEW_WINDOW_MS;
+
+  return {
+    available: true,
+    markerHostnames,
+    ...(validToMs === undefined ? {} : { validToMs }),
+    expired,
+    expiresSoon,
+  };
+}
+
+/** True when this record's alias hostnames are all covered by the leaf certificate. */
+function browserTlsStateCoversRecord(
+  state: BrowserTlsCertificateState,
+  record: { readonly hostname: string; readonly secureHostname?: string },
+): boolean {
+  if (!state.available) {
     return false;
   }
 
-  for (const hostname of expectedHostnames) {
-    if (!markerHostnames.has(hostname)) {
+  for (const candidate of [record.hostname, record.secureHostname]) {
+    const hostname = candidate === undefined ? undefined : normalizeBrowserTlsHostname(candidate);
+    if (hostname !== undefined && !state.markerHostnames.has(hostname)) {
       return false;
     }
   }
 
   return true;
+}
+
+/** Human-readable renewal detail shown next to per-network TLS status rows. */
+function buildBrowserTlsStatusDetail(state: BrowserTlsCertificateState, covered: boolean, nowMs = Date.now()): string {
+  if (!state.available) {
+    return "TLS not installed";
+  }
+  if (!covered) {
+    return "TLS certificate missing this alias";
+  }
+  if (state.expired) {
+    return `TLS expired ${formatWholeDays(nowMs - (state.validToMs ?? nowMs))} ago`;
+  }
+  if (state.expiresSoon) {
+    return `TLS expires in ${formatWholeDays((state.validToMs ?? nowMs) - nowMs)}`;
+  }
+
+  return "TLS ok";
+}
+
+function formatWholeDays(durationMs: number): string {
+  const days = Math.max(0, Math.floor(durationMs / (24 * 60 * 60 * 1000)));
+  return days === 1 ? "1 day" : `${days} days`;
+}
+
+function isBrowserTlsCertificateConfigured(
+  records: readonly { readonly hostname: string; readonly secureHostname?: string }[],
+): boolean {
+  const state = readBrowserTlsCertificateState();
+  if (!state.available || state.expired) {
+    return false;
+  }
+
+  const expectedHostnames = buildBrowserTlsHostnames(records);
+  if (expectedHostnames.length === 0) {
+    return false;
+  }
+
+  return expectedHostnames.every((hostname) => state.markerHostnames.has(hostname));
 }
 
 function buildBrowserTlsHostnames(
@@ -8043,18 +8824,20 @@ function normalizeBrowserTlsHostname(hostname: string): string | undefined {
 async function ensureBrowserDnsLoopbackAliasesReady(
   records: readonly { readonly address: string }[],
 ): Promise<void> {
+  if (process.platform !== "darwin" || records.length === 0) {
+    return;
+  }
+
+  const configuredAddresses = await readLoopbackAliasAddresses();
   const uniqueAddresses = [...new Set(records.map((record) => record.address))];
 
   await Promise.all(
     uniqueAddresses.map(async (address) => {
-      if (isBrowserDnsLoopbackAliasConfigured(address)) {
+      if (configuredAddresses.has(address)) {
         return;
       }
 
-      await execFileAsync("/bin/sh", ["-c", buildNonInteractiveLoopbackAliasSetupCommand(address)], {
-        timeout: 5_000,
-        maxBuffer: 128 * 1024,
-      });
+      await runNonInteractiveLoopbackAliasSetup(address);
     }),
   );
 }
@@ -8087,7 +8870,8 @@ function buildBrowserDnsResolverStatus(
   browserNetworkProxy: BrowserNetworkProxyManager,
 ): BrowserDnsResolverStatus {
   const supported = process.platform === "darwin";
-  const tlsConfigured = supported && isBrowserTlsCertificateConfigured(records);
+  const nowMs = Date.now();
+  const tlsState = readBrowserTlsCertificateState(nowMs);
   const recordStatuses = records.map((record) => {
     const resolverConfigured =
       supported &&
@@ -8098,6 +8882,14 @@ function buildBrowserDnsResolverStatus(
       supported &&
       isBrowserDnsHostsEntryConfigured(record.hostname, record.address) &&
       isBrowserDnsOwnedHostsEntryCurrent(record.hostname, record.address);
+    /*
+     * TLS state is judged per alias: an expired leaf or a hostname absent from
+     * the certificate makes only the affected rows repairable instead of
+     * collapsing every network into one global boolean.
+     */
+    const tlsCoversRecord = supported && browserTlsStateCoversRecord(tlsState, record);
+    const tlsConfigured = tlsCoversRecord && !tlsState.expired;
+    const tlsStale = supported && tlsState.available && (tlsState.expired || tlsState.expiresSoon || !tlsCoversRecord);
     const aliasRoutes = buildBrowserDnsAliasRouteStatus(record, processes, routes, networks, browserNetworkProxy);
 
     return {
@@ -8107,6 +8899,8 @@ function buildBrowserDnsResolverStatus(
       loopbackAliasConfigured,
       hostsConfigured,
       tlsConfigured,
+      tlsStale,
+      ...(supported ? { tlsStatusDetail: buildBrowserTlsStatusDetail(tlsState, tlsCoversRecord, nowMs) } : {}),
       routes: aliasRoutes,
     };
   });
@@ -8118,6 +8912,8 @@ function buildBrowserDnsResolverStatus(
     records: recordStatuses,
     installedCount: recordStatuses.filter((record) => record.configured).length,
     missingCount: recordStatuses.filter((record) => !record.configured).length,
+    tlsStaleCount: recordStatuses.filter((record) => record.tlsStale).length,
+    ...(tlsState.validToMs === undefined ? {} : { tlsValidTo: new Date(tlsState.validToMs).toISOString() }),
   };
 }
 
@@ -8167,6 +8963,7 @@ function buildBrowserDnsResolverSetupScript(
     readonly address: string;
   }[],
   dnsPort: number,
+  options: { readonly forceTlsRenewal?: boolean; readonly additionalLoopbackAddresses?: readonly string[] } = {},
 ): string {
   const uniqueRecords = [...new Map(records.map((record) => [record.hostname, record])).values()];
   const lines = [
@@ -8174,6 +8971,23 @@ function buildBrowserDnsResolverSetupScript(
     "set -eu",
     "mkdir -p /etc/resolver",
   ];
+
+  /*
+   * Terminal-band loopback aliases ride along so a single admin approval also
+   * prepares terminal routing for every network, not only browser aliases.
+   */
+  const recordAddresses = new Set(uniqueRecords.map((record) => record.address));
+  for (const address of options.additionalLoopbackAddresses ?? []) {
+    if (recordAddresses.has(address)) {
+      continue;
+    }
+
+    lines.push(
+      `if ! ifconfig lo0 2>/dev/null | grep -E ${shellQuote(`inet[[:space:]]+${address}([[:space:]]|$)`)} >/dev/null 2>&1; then`,
+      `  ifconfig lo0 alias ${shellQuote(address)} 255.255.255.255`,
+      "fi",
+    );
+  }
 
   for (const record of uniqueRecords) {
     lines.push(
@@ -8203,10 +9017,42 @@ function buildBrowserDnsResolverSetupScript(
   appendLegacyBrowserDnsResolverCleanupLines(lines);
 
   appendBrowserDnsHostsInstallLines(lines, uniqueRecords);
-  appendBrowserTlsCertificateInstallLines(lines, uniqueRecords);
+  appendBrowserTlsCertificateInstallLines(lines, uniqueRecords, options);
   lines.push("dscacheutil -flushcache >/dev/null 2>&1 || true");
   lines.push("killall -HUP mDNSResponder >/dev/null 2>&1 || true");
   return `${lines.join("\n")}\n`;
+}
+
+/** Formats network names for prompt text: `"A", "B", "C" and 2 more`. */
+function formatNetworkNameList(names: readonly string[], maxNames = 4): string {
+  const uniqueNames = [...new Set(names.filter((name) => name.trim().length > 0))];
+  if (uniqueNames.length === 0) {
+    return "none";
+  }
+
+  const shown = uniqueNames.slice(0, maxNames).map((name) => `"${name}"`);
+  const remaining = uniqueNames.length - shown.length;
+  return remaining > 0 ? `${shown.join(", ")} and ${remaining} more` : shown.join(", ");
+}
+
+/**
+ * Builds the osascript authorization prompt. It always names the network (or
+ * action) that triggered the request and lists every network the single
+ * approval will prepare, because the setup script covers all of them at once.
+ */
+function buildNetworkAdminSetupPromptMessage(input: {
+  readonly triggerDescription: string;
+  readonly networkNames: readonly string[];
+  readonly includesBrowserDnsSetup: boolean;
+}): string {
+  const scope = input.includesBrowserDnsSetup
+    ? "loopback aliases, browser DNS aliases, /etc/hosts entries, and the dev TLS certificate"
+    : "loopback aliases";
+
+  return (
+    `Port Manager needs administrator privileges because ${input.triggerDescription}. ` +
+    `This single approval configures ${scope} for all logical networks: ${formatNetworkNameList(input.networkNames)}.`
+  );
 }
 
 function buildBrowserDnsResolverCleanupScript(
@@ -8387,6 +9233,7 @@ function appendBrowserDnsHostsInstallLines(
 function appendBrowserTlsCertificateInstallLines(
   lines: string[],
   records: readonly { readonly hostname: string; readonly secureHostname?: string }[],
+  options: { readonly forceTlsRenewal?: boolean } = {},
 ): void {
   const hostnames = buildBrowserTlsHostnames(records);
   if (hostnames.length === 0) {
@@ -8396,38 +9243,11 @@ function appendBrowserTlsCertificateInstallLines(
   const currentUser = process.env.USER?.trim();
   const sanLines = hostnames.map((hostname, index) => `DNS.${index + 1} = ${hostname}`);
   const serverConfig = [
-    "[req]",
-    "prompt = no",
-    "distinguished_name = dn",
-    "req_extensions = v3_req",
-    "",
-    "[dn]",
-    "CN = Port Manager Development Browser Proxy",
-    "",
-    "[v3_req]",
-    "basicConstraints = critical,CA:FALSE",
-    "keyUsage = critical,digitalSignature,keyEncipherment",
-    "extendedKeyUsage = serverAuth",
-    "subjectAltName = @alt_names",
-    "",
-    "[alt_names]",
+    ...BROWSER_TLS_SERVER_OPENSSL_CONFIG_HEADER_LINES,
     ...sanLines,
     "IP.1 = 127.0.0.1",
   ];
-  const caConfig = [
-    "[req]",
-    "prompt = no",
-    "distinguished_name = dn",
-    "x509_extensions = v3_ca",
-    "",
-    "[dn]",
-    "CN = Port Manager Development Root CA",
-    "",
-    "[v3_ca]",
-    "basicConstraints = critical,CA:TRUE,pathlen:0",
-    "keyUsage = critical,keyCertSign,cRLSign",
-    "subjectKeyIdentifier = hash",
-  ];
+  const caConfig = BROWSER_TLS_CA_OPENSSL_CONFIG_LINES;
 
   lines.push(
     "# Port Manager browser TLS certificate",
@@ -8443,8 +9263,17 @@ function appendBrowserTlsCertificateInstallLines(
     "  echo 'Port Manager browser TLS setup requires openssl.' >&2",
     "  exit 1",
     "fi",
-    'if [ ! -f "$__pm_tls_ca_cert" ] || [ ! -f "$__pm_tls_ca_key" ]; then',
+    ...(options.forceTlsRenewal === true
+      ? [
+          "# Forced renewal always reissues the leaf certificate; the root CA is",
+          "# kept so existing keychain trust keeps working.",
+          'rm -f "$__pm_tls_server_cert" "$__pm_tls_server_key" "$__pm_tls_hosts_file"',
+        ]
+      : []),
+    "__pm_tls_ca_rotated=0",
+    `if [ ! -f "$__pm_tls_ca_cert" ] || [ ! -f "$__pm_tls_ca_key" ] || ! openssl x509 -checkend ${BROWSER_TLS_RENEW_WINDOW_SECONDS} -noout -in "$__pm_tls_ca_cert" >/dev/null 2>&1; then`,
     '  rm -f "$__pm_tls_ca_cert" "$__pm_tls_ca_key"',
+    "  __pm_tls_ca_rotated=1",
     '  __pm_tls_ca_conf="$__pm_tls_dir/root-ca.conf"',
     "  cat > \"$__pm_tls_ca_conf\" <<'PORTMANAGER_TLS_CA_CONF'",
     ...caConfig,
@@ -8461,7 +9290,9 @@ function appendBrowserTlsCertificateInstallLines(
     ...hostnames,
     "PORTMANAGER_TLS_HOSTS",
     "__pm_tls_needs_leaf=1",
-    'if [ -f "$__pm_tls_server_cert" ] && [ -f "$__pm_tls_server_key" ] && [ -f "$__pm_tls_hosts_file" ] && cmp -s "$__pm_tls_hosts_file.tmp" "$__pm_tls_hosts_file"; then',
+    // The leaf is reused only when its hostname set matches, its issuer CA was
+    // not rotated, and it stays valid past the renewal window.
+    `if [ "$__pm_tls_ca_rotated" = "0" ] && [ -f "$__pm_tls_server_cert" ] && [ -f "$__pm_tls_server_key" ] && [ -f "$__pm_tls_hosts_file" ] && cmp -s "$__pm_tls_hosts_file.tmp" "$__pm_tls_hosts_file" && openssl x509 -checkend ${BROWSER_TLS_RENEW_WINDOW_SECONDS} -noout -in "$__pm_tls_server_cert" >/dev/null 2>&1; then`,
     "  __pm_tls_needs_leaf=0",
     "fi",
     'if [ "$__pm_tls_needs_leaf" = "1" ]; then',
@@ -8510,7 +9341,7 @@ function appendBrowserTlsCertificateInstallLines(
     "  echo 'Port Manager browser TLS CA trust registration failed. The HTTPS proxy certificate was generated, but browsers may warn until the CA is trusted.' >&2",
     "fi",
     'rm -f "$__pm_tls_trust_error"',
-    "unset __pm_tls_dir __pm_tls_ca_cert __pm_tls_ca_key __pm_tls_server_cert __pm_tls_server_key __pm_tls_hosts_file __pm_tls_owner_user __pm_tls_trust_error __pm_tls_trusted __pm_tls_needs_leaf __pm_tls_owner_home __pm_tls_owner_keychain",
+    "unset __pm_tls_dir __pm_tls_ca_cert __pm_tls_ca_key __pm_tls_server_cert __pm_tls_server_key __pm_tls_hosts_file __pm_tls_owner_user __pm_tls_trust_error __pm_tls_trusted __pm_tls_needs_leaf __pm_tls_ca_rotated __pm_tls_owner_home __pm_tls_owner_keychain",
   );
 }
 
@@ -8532,10 +9363,6 @@ function isPortManagerLogicalRouterListener(listener: ListeningPort): boolean {
 
 function isTcpPort(port: number): boolean {
   return Number.isInteger(port) && port > 0 && port <= 65_535;
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function escapeSedBasicPattern(value: string): string {
@@ -9538,11 +10365,22 @@ function buildControlPlaneOwnerControlPath(kind: "owner" | "lock"): string {
  * This keeps Docker/Podman discovery, terminal marker polling, generated-file
  * repair, and terminal env collection refresh from multiplying by window count.
  */
+/**
+ * True when this process' own lease document is fresh enough to skip a rewrite.
+ * Owner lease contents are constant per process apart from updatedAt, so
+ * rewriting more often than the renew interval only churns disks and wakes
+ * every other window's lease-file watcher.
+ */
+function isOwnOwnerLeaseRenewalCurrent(owner: LogicalRouterOwnerDocument, nowMs: number): boolean {
+  const updatedAtMs = Date.parse(owner.updatedAt);
+  return !Number.isNaN(updatedAtMs) && nowMs - updatedAtMs < OWNER_LEASE_RENEW_INTERVAL_MS && nowMs >= updatedAtMs;
+}
+
 function tryAcquireControlPlaneOwnerLease(): boolean {
   const nowMs = Date.now();
   const owner = readControlPlaneOwner();
   if (owner?.pid === process.pid) {
-    return writeControlPlaneOwnerLease(nowMs);
+    return isOwnOwnerLeaseRenewalCurrent(owner, nowMs) || writeControlPlaneOwnerLease(nowMs);
   }
 
   if (isActiveControlPlaneOwner(owner, nowMs)) {
@@ -9599,11 +10437,40 @@ function releaseControlPlaneOwnerLease(): void {
     syncFs.rmSync(CONTROL_PLANE_OWNER_PATH, { force: true });
   } catch {
     // Stale owner leases expire naturally when another window refreshes routing.
+  } finally {
+    invalidateControlPlaneOwnerDisplayCache();
   }
 }
 
 function readControlPlaneOwner(): LogicalRouterOwnerDocument | undefined {
   return readOwnerDocument(CONTROL_PLANE_OWNER_PATH);
+}
+
+interface ControlPlaneOwnerDisplayCache {
+  readonly readAtMs: number;
+  readonly owner: LogicalRouterOwnerDocument | undefined;
+}
+
+let controlPlaneOwnerDisplayCache: ControlPlaneOwnerDisplayCache | undefined;
+
+function invalidateControlPlaneOwnerDisplayCache(): void {
+  controlPlaneOwnerDisplayCache = undefined;
+}
+
+/**
+ * Display-only owner read used by snapshot construction. Tree renders call
+ * getSnapshot several times per repaint; the lease-file watcher invalidates
+ * this cache, so election paths keep their direct uncached reads.
+ */
+function readControlPlaneOwnerForDisplay(nowMs: number): LogicalRouterOwnerDocument | undefined {
+  const cache = controlPlaneOwnerDisplayCache;
+  if (cache !== undefined && nowMs - cache.readAtMs < CONTROL_PLANE_STATUS_CACHE_TTL_MS) {
+    return cache.owner;
+  }
+
+  const owner = readControlPlaneOwner();
+  controlPlaneOwnerDisplayCache = { readAtMs: nowMs, owner };
+  return owner;
 }
 
 function writeControlPlaneOwnerLease(nowMs: number): boolean {
@@ -9620,6 +10487,7 @@ function writeControlPlaneOwnerLease(nowMs: number): boolean {
       })}\n`,
       "utf8",
     );
+    invalidateControlPlaneOwnerDisplayCache();
     return true;
   } catch {
     return false;
@@ -9662,7 +10530,7 @@ function tryAcquireLogicalRouterOwnerLease(): boolean {
   const nowMs = Date.now();
   const owner = readLogicalRouterOwner();
   if (owner?.pid === process.pid) {
-    return writeLogicalRouterOwnerLease(nowMs);
+    return isOwnOwnerLeaseRenewalCurrent(owner, nowMs) || writeLogicalRouterOwnerLease(nowMs);
   }
 
   if (isActiveLogicalRouterOwner(owner, nowMs)) {
@@ -9731,7 +10599,7 @@ function tryAcquireBrowserNetworkProxyOwnerLease(): boolean {
   const nowMs = Date.now();
   const owner = readBrowserNetworkProxyOwner();
   if (owner?.pid === process.pid) {
-    return writeBrowserNetworkProxyOwnerLease(nowMs);
+    return isOwnOwnerLeaseRenewalCurrent(owner, nowMs) || writeBrowserNetworkProxyOwnerLease(nowMs);
   }
 
   if (isActiveBrowserNetworkProxyOwner(owner, nowMs)) {

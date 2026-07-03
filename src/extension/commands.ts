@@ -25,6 +25,10 @@ import {
   getTerminalAttachmentFromCommandArgument,
   getTerminalWindowFromCommandArgument,
 } from "../ui/sidebar/port-manager-tree";
+import {
+  buildBrowserTlsRenewalShellScript,
+  buildBrowserTlsRepairShellFunctions,
+} from "../platform/network/browser-tls-assets";
 import type { PortManagerNetworkService } from "./network-service";
 import type { PortManagerProcessService } from "./process-service";
 import {
@@ -198,6 +202,12 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.cleanupBrowserDnsResolvers", () =>
       this.cleanupBrowserDnsResolvers(),
     );
+    this.registerCommand(context, "portManager.renewBrowserTlsCertificate", () =>
+      this.renewBrowserTlsCertificate(),
+    );
+    this.registerCommand(context, "portManager.repairBrowserDnsRecord", (argument) =>
+      this.repairBrowserDnsRecord(argument),
+    );
     this.registerCommand(context, "portManager.installShellHook", () => this.installShellHook(context));
     this.registerCommand(context, "portManager.installExternalCli", () => this.installExternalCli(context));
     this.registerCommand(context, "portManager.openOwnerUi", () => this.openOwnerUi());
@@ -215,6 +225,9 @@ export class PortManagerCommandController implements DisposableLike {
 
   /** Creates a logical network row backed by the selected runtime adapter. */
   private async createLogicalNetwork(): Promise<void> {
+    // Container-runtime probing is deferred out of activation, so make sure the
+    // runtime list is current before offering runtime choices.
+    await this.dependencies.networkService.ensureContainerRuntimeDetected();
     const runtimeKind = await promptForRuntimeKind(this.dependencies.networkService.getSnapshot().runtimes);
     if (runtimeKind === undefined) {
       return;
@@ -1468,6 +1481,59 @@ export class PortManagerCommandController implements DisposableLike {
     }
   }
 
+  /** Reissues the dev TLS certificate for browser aliases without waiting for expiry. */
+  private async renewBrowserTlsCertificate(): Promise<void> {
+    try {
+      const status = await this.dependencies.networkService.renewBrowserTlsCertificate();
+      if (!status.supported) {
+        await vscode.window.showInformationMessage("Browser TLS certificates are only supported on macOS.");
+        return;
+      }
+      if (status.records.length === 0) {
+        await vscode.window.showInformationMessage(
+          "No logical network browser aliases exist yet, so there is no TLS certificate to renew.",
+        );
+        return;
+      }
+      await vscode.window.showInformationMessage(
+        status.tlsValidTo === undefined
+          ? "Browser TLS certificate renewed."
+          : `Browser TLS certificate renewed. Valid until ${new Date(status.tlsValidTo).toLocaleDateString()}.`,
+      );
+    } catch (error) {
+      await vscode.window.showWarningMessage(`Browser TLS renewal failed: ${toErrorMessage(error)}`);
+    }
+  }
+
+  /** Repairs one network's browser alias, reissuing the TLS certificate when it is stale. */
+  private async repairBrowserDnsRecord(argument: unknown): Promise<void> {
+    const networkId =
+      typeof argument === "object" && argument !== null && typeof (argument as { networkId?: unknown }).networkId === "string"
+        ? (argument as { networkId: string }).networkId
+        : undefined;
+    if (networkId === undefined) {
+      return;
+    }
+
+    try {
+      const status = await this.dependencies.networkService.repairBrowserDnsAlias(networkId);
+      const record = status.records.find((candidate) => candidate.networkId === networkId);
+      if (record === undefined) {
+        await vscode.window.showInformationMessage("The network no longer has a browser alias to repair.");
+        return;
+      }
+      if (record.configured && !record.tlsStale) {
+        await vscode.window.showInformationMessage(`Browser alias ${record.hostname} repaired.`);
+      } else {
+        await vscode.window.showWarningMessage(
+          `Browser alias ${record.hostname} still needs attention: ${record.tlsStatusDetail ?? "run Install Browser DNS"}.`,
+        );
+      }
+    } catch (error) {
+      await vscode.window.showWarningMessage(`Browser alias repair failed: ${toErrorMessage(error)}`);
+    }
+  }
+
   /** Removes Port Manager-owned macOS resolver rows for browser aliases. */
   private async cleanupBrowserDnsResolvers(): Promise<void> {
     try {
@@ -1528,7 +1594,9 @@ export class PortManagerCommandController implements DisposableLike {
 
   /** Installs the native socket hook into the user's shell startup file. */
   private async installShellHook(context: vscode.ExtensionContext): Promise<void> {
-    const assets = await this.writeShellHookAssets(context);
+    // The explicit install command repairs tampered assets, so it bypasses the
+    // unchanged-signature fast paths used by background refreshes.
+    const assets = await this.writeShellHookAssets(context, { force: true });
 
     for (const shellProfilePath of assets.shellProfilePaths) {
       await appendLineOnce(shellProfilePath, assets.sourceLine);
@@ -1546,7 +1614,10 @@ export class PortManagerCommandController implements DisposableLike {
   }
 
   /** Writes the generated shell hook that external terminals source on startup. */
-  private async writeShellHookAssets(context: vscode.ExtensionContext): Promise<ShellHookAssets> {
+  private async writeShellHookAssets(
+    context: vscode.ExtensionContext,
+    options: { readonly force?: boolean } = {},
+  ): Promise<ShellHookAssets> {
     const settings = readPortManagerSettings();
     const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
     const asdfShimLauncherPath = context.asAbsolutePath(getAsdfShimLauncherRelativePath());
@@ -1569,6 +1640,7 @@ export class PortManagerCommandController implements DisposableLike {
       hookDirectory,
       asdfShimLauncherPath,
       runtimeCommandShimPath,
+      { force: options.force },
     );
     const shellEnvRestorePath = prepareShellEnvRestoreScript(hookDirectory, hookLibraryPath, {
       agentSocketPath: getAgentSocketPath(),
@@ -1580,26 +1652,46 @@ export class PortManagerCommandController implements DisposableLike {
       settings,
       dockerShimPath: runtimeCommandShimPath,
     });
-    await fs.writeFile(
-      hookScriptPath,
-      buildShellHookScript({
-        hookLibraryPath,
-        agentMainPath,
-        nativeAgentPath,
-        nativeContainerMapPath,
-        dockerShimPath: runtimeCommandShimPath,
-        nodeExecutablePath: process.execPath,
-        socketPath: getAgentSocketPath(),
-        routeTablePath: getDefaultRouteTablePath(),
-        hostAccessFilePath: getDefaultHostAccessBindingsPath(),
-        terminalNetworkSelectionFilePath,
-        packageVersion,
-        settings,
-        runtimeShimDirectory,
-        shellEnvRestorePath,
-      }),
-      "utf8",
-    );
+    /*
+     * `pm repair` renews a stale dev TLS certificate with sudo directly in the
+     * user's terminal. The renewal script is standalone (it reads the SAN set
+     * from the hostname marker), so it keeps working when VS Code is closed.
+     */
+    const tlsRenewalScriptPath =
+      process.platform === "darwin" ? path.join(hookDirectory, "portmanager-renew-browser-tls.sh") : undefined;
+    if (tlsRenewalScriptPath !== undefined) {
+      const renewalContents = buildBrowserTlsRenewalShellScript();
+      const existingRenewalScript = await fs.readFile(tlsRenewalScriptPath, "utf8").catch(() => undefined);
+      if (existingRenewalScript !== renewalContents) {
+        await fs.writeFile(tlsRenewalScriptPath, renewalContents, "utf8");
+      }
+      await fs.chmod(tlsRenewalScriptPath, 0o700).catch(() => undefined);
+    }
+    const hookScriptContents = buildShellHookScript({
+      hookLibraryPath,
+      agentMainPath,
+      nativeAgentPath,
+      nativeContainerMapPath,
+      dockerShimPath: runtimeCommandShimPath,
+      nodeExecutablePath: process.execPath,
+      socketPath: getAgentSocketPath(),
+      routeTablePath: getDefaultRouteTablePath(),
+      hostAccessFilePath: getDefaultHostAccessBindingsPath(),
+      terminalNetworkSelectionFilePath,
+      packageVersion,
+      settings,
+      runtimeShimDirectory,
+      shellEnvRestorePath,
+      tlsRenewalScriptPath,
+    });
+
+    // Every window regenerates these assets at activation; identical content
+    // means the shared-file write (and last-writer churn across windows) can
+    // be skipped.
+    const existingHookScript = await fs.readFile(hookScriptPath, "utf8").catch(() => undefined);
+    if (existingHookScript !== hookScriptContents) {
+      await fs.writeFile(hookScriptPath, hookScriptContents, "utf8");
+    }
 
     if (process.platform !== "win32") {
       await fs.chmod(hookScriptPath, 0o700).catch(() => undefined);
@@ -1735,6 +1827,9 @@ export class PortManagerCommandController implements DisposableLike {
       return terminalWindow;
     }
 
+    // Background terminal discovery idles while nothing consumes it, so a
+    // user-facing picker refreshes in the foreground before listing windows.
+    await this.dependencies.networkService.refreshTerminals({ force: true }).catch(() => []);
     const windows = this.dependencies.networkService.getSnapshot().terminalWindows;
     if (windows.length === 0) {
       await vscode.window.showInformationMessage("No terminal windows discovered.");
@@ -3024,6 +3119,8 @@ interface ShellHookScriptOptions {
   readonly runtimeShimDirectory?: string;
   /** Optional BASH_ENV fragment that restores DYLD after protected shebang boundaries. */
   readonly shellEnvRestorePath?: string;
+  /** Optional sudo renewal script that `pm repair` runs when the dev TLS certificate is stale. */
+  readonly tlsRenewalScriptPath?: string;
 }
 
 interface ShellHookAssets {
@@ -3184,6 +3281,13 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
       `if command -v setsid >/dev/null 2>&1; then setsid ${command} </dev/null >/tmp/newdlops-portmanager-agent.log 2>&1 & else nohup ${command} </dev/null >/tmp/newdlops-portmanager-agent.log 2>&1 & fi`,
     );
   const helperRuntimePrefix = `PORT_MANAGER_HOOK_DISABLED=1 PORT_MANAGER_HOOK=0 DYLD_INSERT_LIBRARIES= LD_PRELOAD= ${ELECTRON_RUN_AS_NODE}=1`;
+  // `pm repair` reissues a stale dev TLS certificate before reapplying routing.
+  const browserTlsRepairFunctions =
+    options.tlsRenewalScriptPath === undefined
+      ? ""
+      : buildBrowserTlsRepairShellFunctions(options.tlsRenewalScriptPath);
+  const browserTlsRepairCall =
+    options.tlsRenewalScriptPath === undefined ? "" : "  __pm_browser_tls_repair_if_stale\n";
   const routeCountScript = [
     'const fs=require("node:fs");',
     'const file=process.argv[1]||"";',
@@ -3854,8 +3958,8 @@ __pm_routing_ready() {
   return 0
 }
 
-__pm_repair() {
-  __pm_current_id="$(__pm_current_network_id 2>/dev/null || true)"
+${browserTlsRepairFunctions}__pm_repair() {
+${browserTlsRepairCall}  __pm_current_id="$(__pm_current_network_id 2>/dev/null || true)"
   if [ -z "$__pm_current_id" ]; then
     printf '%s\n' 'Port Manager repair cannot reapply routing because this shell is not attached to a network.' >&2
     __pm_networks_file="$(__pm_networks_file_path 2>/dev/null || true)"

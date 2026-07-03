@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { readPortManagerPackageVersion } from "../shared/package-version";
 import { getAgentSocketPath } from "../agent/agent-socket";
 import {
   getDefaultHostAccessBindingsPath,
@@ -306,9 +308,26 @@ export function prepareRuntimeShimLauncherDirectory(
   baseDirectory: string,
   launcherPath: string,
   runtimeCommandShimPath?: string,
+  options: { readonly force?: boolean } = {},
 ): string | undefined {
   const sourceShimDirectory = getAsdfShimDirectory();
   const targetDirectory = path.join(baseDirectory, "runtime-shims");
+  const stampSignature = buildRuntimeShimDirectorySignature(
+    launcherPath,
+    runtimeCommandShimPath,
+    sourceShimDirectory,
+  );
+
+  /*
+   * A full rebuild re-enumerates the user's asdf shims and rewrites every
+   * generated shim, which several call sites repeat per refresh and per
+   * window. The signature captures every rebuild input, so an unchanged stamp
+   * means the directory already matches what a rebuild would produce.
+   */
+  if (options.force !== true && runtimeShimDirectoryMatchesStamp(targetDirectory, stampSignature)) {
+    return targetDirectory;
+  }
+
   fs.mkdirSync(targetDirectory, { recursive: true });
   removeStaleRuntimeShimArtifacts(targetDirectory);
   writeRuntimeCommandShims(targetDirectory, runtimeCommandShimPath);
@@ -316,6 +335,7 @@ export function prepareRuntimeShimLauncherDirectory(
   writePreloadPackageCommandShims(targetDirectory);
 
   if (process.platform !== "darwin" || !fs.existsSync(launcherPath)) {
+    writeRuntimeShimDirectoryStamp(targetDirectory, stampSignature);
     return targetDirectory;
   }
 
@@ -339,7 +359,71 @@ export function prepareRuntimeShimLauncherDirectory(
     }
   }
 
+  writeRuntimeShimDirectoryStamp(targetDirectory, stampSignature);
   return targetDirectory;
+}
+
+const RUNTIME_SHIM_STAMP_FILE_NAME = ".portmanager-shim-stamp";
+
+/**
+ * Fingerprint of everything a shim-directory rebuild depends on: generated
+ * shim templates change only with the extension build, alias targets change
+ * with the packaged helper paths, and the alias set follows the user's asdf
+ * shim directory (whose mtime moves when shims are added or removed).
+ */
+function buildRuntimeShimDirectorySignature(
+  launcherPath: string,
+  runtimeCommandShimPath: string | undefined,
+  sourceShimDirectory: string | undefined,
+): string {
+  let sourceShimDirectoryMtimeMs = -1;
+  if (sourceShimDirectory !== undefined) {
+    try {
+      sourceShimDirectoryMtimeMs = fs.statSync(sourceShimDirectory).mtimeMs;
+    } catch {
+      sourceShimDirectoryMtimeMs = -1;
+    }
+  }
+
+  return createHash("sha1")
+    .update(
+      JSON.stringify([
+        readPortManagerPackageVersion() ?? "unknown",
+        process.platform,
+        launcherPath,
+        runtimeCommandShimPath ?? "",
+        sourceShimDirectory ?? "",
+        sourceShimDirectoryMtimeMs,
+      ]),
+    )
+    .digest("hex");
+}
+
+function runtimeShimDirectoryMatchesStamp(targetDirectory: string, signature: string): boolean {
+  try {
+    if (fs.readFileSync(path.join(targetDirectory, RUNTIME_SHIM_STAMP_FILE_NAME), "utf8").trim() !== signature) {
+      return false;
+    }
+
+    // Guard against wholesale directory tampering: the stamp only counts when
+    // a representative generated entry is still present next to it.
+    const sentinelName = process.platform === "darwin" ? PRELOAD_RUNTIME_LAUNCHER_NAMES[0] : RUNTIME_COMMAND_SHIM_NAMES[0];
+    if (sentinelName !== undefined) {
+      fs.lstatSync(path.join(targetDirectory, sentinelName));
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function writeRuntimeShimDirectoryStamp(targetDirectory: string, signature: string): void {
+  try {
+    fs.writeFileSync(path.join(targetDirectory, RUNTIME_SHIM_STAMP_FILE_NAME), `${signature}\n`, "utf8");
+  } catch {
+    // A missing stamp only means the next refresh rebuilds the directory.
+  }
 }
 
 /** Compatibility wrapper for older call sites and external imports. */
@@ -464,8 +548,21 @@ export function prepareShellEnvRestoreScript(
   }
 
   const targetPath = path.join(baseDirectory, shellEnvRestoreFileName(scope));
+  const contents = buildShellEnvRestoreScript(scope, targetPath);
+
+  // Refresh loops regenerate this script far more often than its inputs
+  // change; matching content means the write (and its watcher fan-out) can be
+  // skipped entirely.
+  try {
+    if (fs.readFileSync(targetPath, "utf8") === contents) {
+      return targetPath;
+    }
+  } catch {
+    // Missing or unreadable scripts are (re)written below.
+  }
+
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-  fs.writeFileSync(targetPath, buildShellEnvRestoreScript(scope, targetPath), "utf8");
+  fs.writeFileSync(targetPath, contents, "utf8");
   return targetPath;
 }
 

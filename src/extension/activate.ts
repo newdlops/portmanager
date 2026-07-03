@@ -36,11 +36,17 @@ export function activate(context: vscode.ExtensionContext): PortManagerExtension
   });
   const statusBar = new PortManagerStatusBar(networkService);
 
+  const treeView = vscode.window.createTreeView("portManager.processes", {
+    treeDataProvider: treeProvider,
+    dragAndDropController: treeProvider,
+  });
+  // Background terminal/container discovery idles while the view is hidden;
+  // visibility changes wake it so the sidebar catches up immediately.
+  networkService.setSidebarVisible(treeView.visible);
+
   context.subscriptions.push(
-    vscode.window.createTreeView("portManager.processes", {
-      treeDataProvider: treeProvider,
-      dragAndDropController: treeProvider,
-    }),
+    treeView,
+    treeView.onDidChangeVisibility((event) => networkService.setSidebarVisible(event.visible)),
     networkService,
     processService,
     treeProvider,

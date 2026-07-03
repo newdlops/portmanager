@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8136",
+  "version": "0.0.8137",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -89,6 +89,7 @@
     "onCommand:portManager.removeProcess",
     "onCommand:portManager.installShellHook",
     "onCommand:portManager.installExternalCli",
+    "onCommand:portManager.renewBrowserTlsCertificate",
     "onCommand:portManager.openOwnerUi",
     "onCommand:portManager.openSettings"
   ],
@@ -417,6 +418,12 @@
         "title": "Port Manager: Install Shell Hook",
         "category": "Port Manager",
         "icon": "$(plug)"
+      },
+      {
+        "command": "portManager.renewBrowserTlsCertificate",
+        "title": "Port Manager: Renew Browser TLS Certificate",
+        "category": "Port Manager",
+        "icon": "$(shield)"
       },
       {
         "command": "portManager.openSettings",
@@ -911,6 +918,11 @@
           "type": "string",
           "default": "alpine:3.20",
           "description": "Lightweight image used only to keep a logical network namespace alive. Application processes do not run inside this image."
+        },
+        "portManager.containerEventsWatch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Keep a container lifecycle event stream open while compose attachments or container-backed networks exist, so routing reacts to container changes without fast Docker polling."
         },
         "portManager.autoOpenBrowser": {
           "type": "boolean",

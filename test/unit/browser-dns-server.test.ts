@@ -102,7 +102,9 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(networkServiceSource.includes("secureHostname"), true);
   assert.equal(networkServiceSource.includes("tlsConfigured"), true);
   assert.equal(networkServiceSource.includes("Port Manager browser TLS certificate"), true);
-  assert.equal(networkServiceSource.includes("trusted development TLS certificate for logical-network browser URLs"), true);
+  // Install prompts are built centrally and must disclose the TLS certificate scope.
+  assert.equal(networkServiceSource.includes("and the dev TLS certificate"), true);
+  assert.equal(networkServiceSource.includes("buildNetworkAdminSetupPromptMessage"), true);
   assert.equal(networkServiceSource.includes("BROWSER_TLS_HOSTNAMES_MARKER_PATH"), true);
   assert.equal(networkServiceSource.includes("BROWSER_TLS_SERVER_CERT_PATH"), true);
   assert.equal(networkServiceSource.includes("security add-trusted-cert"), true);

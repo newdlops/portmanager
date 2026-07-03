@@ -1218,15 +1218,16 @@ function buildBrowserDnsDiagnosticRows(
     return [new DaemonStatusTreeItem("Browser DNS", "unsupported", "circle-slash")];
   }
 
+  const staleSuffix = browserDns.tlsStaleCount > 0 ? `, ${browserDns.tlsStaleCount} TLS stale` : "";
   const description =
     browserDns.records.length === 0
       ? "no aliases"
-      : `${browserDns.installedCount}/${browserDns.records.length} installed`;
-  const icon = browserDns.missingCount === 0 ? "globe" : "warning";
+      : `${browserDns.installedCount}/${browserDns.records.length} installed${staleSuffix}`;
+  const icon = browserDns.missingCount === 0 && browserDns.tlsStaleCount === 0 ? "globe" : "warning";
 
   return [
     new DaemonStatusTreeItem("Browser DNS", `${description}, port ${browserDns.dnsPort}`, icon),
-    ...browserDns.records.flatMap((record) => buildBrowserDnsRecordRows(record)),
+    ...browserDns.records.flatMap((record) => buildBrowserDnsRecordRows(record, ownerAction)),
     new ActionTreeItem(
       "Install Browser DNS",
       "portManager.installBrowserDnsResolvers",
@@ -1235,6 +1236,20 @@ function buildBrowserDnsDiagnosticRows(
       undefined,
       ownerAction,
     ),
+    ...(browserDns.records.length === 0
+      ? []
+      : [
+          new ActionTreeItem(
+            "Renew TLS Certificate",
+            "portManager.renewBrowserTlsCertificate",
+            "shield",
+            browserDns.tlsValidTo === undefined
+              ? "Reissue dev certificate"
+              : `Valid until ${formatBrowserTlsValidTo(browserDns.tlsValidTo)}`,
+            undefined,
+            ownerAction,
+          ),
+        ]),
     new ActionTreeItem(
       "Clean Browser DNS",
       "portManager.cleanupBrowserDnsResolvers",
@@ -1246,12 +1261,24 @@ function buildBrowserDnsDiagnosticRows(
   ];
 }
 
-function buildBrowserDnsRecordRows(record: BrowserDnsResolverStatus["records"][number]): PortManagerTreeItem[] {
+function formatBrowserTlsValidTo(validTo: string): string {
+  const parsed = Date.parse(validTo);
+  return Number.isNaN(parsed) ? validTo : new Date(parsed).toISOString().slice(0, 10);
+}
+
+function buildBrowserDnsRecordRows(
+  record: BrowserDnsResolverStatus["records"][number],
+  ownerAction: ActionAvailability,
+): PortManagerTreeItem[] {
   const resolverStatus = record.resolverConfigured ? "resolver ok" : "missing resolver";
   const aliasStatus = record.loopbackAliasConfigured ? "loopback ok" : "missing loopback";
   const hostsStatus = record.hostsConfigured ? "hosts ok" : "missing hosts";
-  const tlsStatus = record.tlsConfigured ? "TLS ok" : "missing TLS";
-  const configured = record.configured ? "configured" : `${resolverStatus}, ${aliasStatus}, ${hostsStatus}, ${tlsStatus}`;
+  const tlsStatus = record.tlsStatusDetail ?? (record.tlsConfigured ? "TLS ok" : "missing TLS");
+  const configured = record.configured
+    ? record.tlsStale
+      ? `configured, ${tlsStatus}`
+      : "configured"
+    : `${resolverStatus}, ${aliasStatus}, ${hostsStatus}, ${tlsStatus}`;
   const aliasTooltip = new vscode.MarkdownString(
     [
       `Network: ${record.networkName}`,
@@ -1268,10 +1295,25 @@ function buildBrowserDnsRecordRows(record: BrowserDnsResolverStatus["records"][n
     new DaemonStatusTreeItem(
       `DNS ${record.hostname}`,
       `${record.address}, ${configured}`,
-      record.configured ? "globe" : "warning",
+      record.configured && !record.tlsStale ? "globe" : "warning",
       aliasTooltip,
     ),
   ];
+
+  // A stale or broken alias gets its own repair action so one network can be
+  // fixed without re-running the whole install flow by hand.
+  if (record.tlsStale || !record.configured) {
+    rows.push(
+      new ActionTreeItem(
+        `Repair ${record.hostname}`,
+        "portManager.repairBrowserDnsRecord",
+        "shield",
+        record.tlsStale ? tlsStatus : "Reinstall alias",
+        { networkId: record.networkId },
+        ownerAction,
+      ),
+    );
+  }
 
   if (record.routes.length === 0) {
     rows.push(new DaemonStatusTreeItem(`DNS ${record.hostname}:ports`, "no running browser routes", "circle-slash"));

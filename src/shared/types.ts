@@ -949,6 +949,10 @@ export interface BrowserDnsResolverRecordStatus {
   readonly hostsConfigured: boolean;
   /** True when Port Manager has a trusted dev TLS certificate for this alias set. */
   readonly tlsConfigured: boolean;
+  /** True when the dev TLS certificate needs renewal for this alias (expired, expiring, or hostname missing). */
+  readonly tlsStale: boolean;
+  /** Human-readable TLS state used by diagnostics rows, e.g. "expires in 12 days". */
+  readonly tlsStatusDetail?: string;
   /** Browser-visible port routes currently known for this alias. */
   readonly routes: readonly BrowserDnsAliasRouteStatus[];
 }
@@ -983,6 +987,10 @@ export interface BrowserDnsResolverStatus {
   readonly installedCount: number;
   /** Number of resolver rows missing or pointing somewhere else. */
   readonly missingCount: number;
+  /** Number of aliases whose dev TLS certificate needs renewal. */
+  readonly tlsStaleCount: number;
+  /** Expiry instant of the current dev TLS leaf certificate, when readable. */
+  readonly tlsValidTo?: string;
 }
 
 export interface DisposableLike {

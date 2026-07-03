@@ -1169,8 +1169,8 @@ test("logical port routers use a single cross-window owner lease", () => {
   assert.equal(browserSyncBody.includes("this.ownsBrowserNetworkProxyLease = false;"), true);
   assert.equal(browserSyncBody.includes("this.ownsBrowserNetworkProxyLease = true;"), true);
   assert.equal(browserSyncBody.includes("await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);"), true);
-  assert.equal(source.includes("BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS = 5_000"), true);
-  assert.equal(source.includes("BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS = 1_000"), true);
+  assert.equal(source.includes("BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS = 600_000"), true);
+  assert.equal(source.includes("BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS = 15_000"), true);
   assert.equal(source.includes("browserProxyProcessCommandTextCache"), true);
   assert.equal(source.includes("pruneBrowserProxyProcessCommandTextCache"), true);
   assert.equal(
@@ -1229,9 +1229,7 @@ test("automatic control plane side effects use a single cross-window owner lease
   const ownerSignalEnd = source.indexOf("private startTerminalAttachmentMarkerPolling", ownerSignalStart);
   const ownerSignalBody = source.slice(ownerSignalStart, ownerSignalEnd);
   const routingConvergeIndex = ownerServicesBody.indexOf("await this.convergeDaemonAndRoutingState();");
-  const runtimeRefreshIndex = ownerServicesBody.indexOf(
-    "await this.refreshRuntimeDescriptors({ includeContainerRuntime: true });",
-  );
+  const deferredProbeIndex = ownerServicesBody.indexOf("this.scheduleDeferredOwnerStartupProbes();");
   const terminalEnvironmentRefreshIndex = ownerServicesBody.indexOf(
     "await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });",
   );
@@ -1242,7 +1240,6 @@ test("automatic control plane side effects use a single cross-window owner lease
   const composePublishedPortsIndex = ownerServicesBody.indexOf(
     "await this.reconcileComposeAttachmentPublishedPorts({ force: true });",
   );
-  const containerRefreshIndex = ownerServicesBody.indexOf("void this.refreshContainerServices({ background: true });");
   const routingSignalIndex = ownerServicesBody.indexOf("this.startRoutingSignalRefreshLoop();");
   const markerPollingIndex = ownerServicesBody.indexOf("this.startTerminalAttachmentMarkerPolling();");
 
@@ -1273,23 +1270,35 @@ test("automatic control plane side effects use a single cross-window owner lease
   assert.equal(ownerWatcherBody.includes("ownerUiRequestWatcher.onDidChange"), false);
   assert.equal(ownerWatcherBody.includes("void this.openOwnerUiFromFocusRequest();"), false);
   assert.equal(ownerWatcherBody.includes("this.controlPlaneOwnerDisposables.push("), true);
-  assert.equal(ownerServicesBody.includes("await this.refreshRuntimeDescriptors({ includeContainerRuntime: true });"), true);
+  /*
+   * Container-runtime probing and candidate discovery are deferred out of the
+   * owner's activation chain: `scheduleDeferredOwnerStartupProbes` runs the
+   * `docker info`/`container ls` work after the cold-start burst settles, and
+   * initial terminal discovery goes through the background consumer gate.
+   */
+  assert.equal(ownerServicesBody.includes("this.scheduleDeferredOwnerStartupProbes();"), true);
+  assert.equal(
+    ownerServicesBody.includes("void this.refreshRuntimeDescriptors({ includeContainerRuntime: true })"),
+    true,
+  );
+  assert.equal(ownerServicesBody.includes("void this.refreshContainerServices({ background: true }).catch(() => []);"), true);
+  assert.equal(ownerServicesBody.includes("OWNER_STARTUP_CONTAINER_PROBE_DELAY_MS"), true);
+  assert.equal(ownerServicesBody.includes("await this.refreshTerminals({ background: true });"), true);
   assert.equal(ownerServicesBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });"), true);
-  assert.equal(ownerServicesBody.includes("void this.refreshContainerServices({ background: true });"), true);
   assert.equal(ownerServicesBody.includes("await this.convergeDaemonAndRoutingState();"), true);
   assert.equal(ownerServicesBody.includes("this.startRoutingSignalRefreshLoop();"), true);
   assert.equal(ownerServicesBody.includes("this.startTerminalAttachmentMarkerPolling();"), true);
   assert.equal(ownerServicesBody.includes("Terminal hook agent calls have a short startup budget."), true);
-  assert.equal(routingConvergeIndex < runtimeRefreshIndex, true);
-  assert.equal(routingSignalIndex < runtimeRefreshIndex, true);
-  assert.equal(markerPollingIndex < runtimeRefreshIndex, true);
-  assert.equal(runtimeRefreshIndex < terminalEnvironmentRefreshIndex, true);
+  assert.equal(routingConvergeIndex < deferredProbeIndex, true);
+  assert.equal(routingSignalIndex < deferredProbeIndex, true);
+  assert.equal(markerPollingIndex < deferredProbeIndex, true);
+  assert.equal(terminalEnvironmentRefreshIndex < deferredProbeIndex, true);
   assert.equal(routingConvergeIndex < persistedExposureIndex, true);
   assert.equal(routingConvergeIndex < composeRepairIndex, true);
   assert.equal(routingConvergeIndex < composePublishedPortsIndex, true);
   assert.equal(routingSignalIndex < composeRepairIndex, true);
   assert.equal(markerPollingIndex < composeRepairIndex, true);
-  assert.equal(composePublishedPortsIndex < containerRefreshIndex, true);
+  assert.equal(composePublishedPortsIndex < deferredProbeIndex, true);
   assert.equal(registrySideEffectBody.includes("!this.ownsControlPlaneLease || !tryAcquireControlPlaneOwnerLease()"), true);
   assert.equal(registrySideEffectBody.includes("void this.writeHostAccessBindingsFile();"), true);
   assert.equal(applyBody.includes("if (!this.ownsControlPlaneLease)"), false);
@@ -2081,7 +2090,9 @@ test("compose mutation publishes hidden ports on the network loopback host", () 
 
   assert.notEqual(attachStart, -1);
   assert.equal(attachBody.includes("const hiddenHostAddress = loopbackAddressForNetwork(network.id);"), true);
-  assert.equal(attachBody.includes("await ensureLoopbackAddressRoutingHostReady("), true);
+  // Interactive attach goes through the consolidated setup so one admin
+  // approval prepares aliases for every network, not just the attached one.
+  assert.equal(attachBody.includes("await this.ensureTerminalRoutingHostReadyForNetwork(network, loopbackMode);"), true);
   assert.equal(attachBody.includes("resolveTerminalLoopbackAddressRoutingMode(portSettings)"), true);
   assert.equal(attachBody.includes("hiddenHostAddress,"), true);
 });
