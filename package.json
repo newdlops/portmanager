@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8137",
+  "version": "0.0.8142",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -955,6 +955,11 @@
           "type": "boolean",
           "default": true,
           "description": "Show all listening TCP ports reported by the local agent, not only preferred ports."
+        },
+        "portManager.logicalPortGateway": {
+          "type": "boolean",
+          "default": true,
+          "description": "Let Port Manager own logical ports on localhost and route each connection to its logical network by identifying the source process. Turn off to route only through the in-process terminal hook (no daemon-owned localhost listeners)."
         },
         "portManager.detectTerminalListenFailures": {
           "type": "boolean",

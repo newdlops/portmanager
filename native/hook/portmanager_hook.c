@@ -36,7 +36,6 @@
 #define PM_MAX_REQUEST 8192
 #define PM_MAX_TEXT 512
 #define PM_MAX_PATH 1024
-#define PM_MAX_SHEBANG 4096
 #define PM_MAX_SCRIPT_LINE 4096
 #define PM_ROUTE_MAPPING_INITIAL_CAPACITY 128
 #define PM_ROUTE_MAPPING_MAX_CAPACITY 65535
@@ -213,16 +212,6 @@ typedef struct {
   char **envp;
   char *preload_assignment;
 } pm_child_environment;
-
-typedef struct {
-  const char *target;
-  char **argv;
-  char *resolved_script_path;
-  char *interpreter_path;
-  char *argv_storage;
-  char **envp;
-  char **envp_storage;
-} pm_child_exec_plan;
 
 static const char *pm_envp_value(char *const envp[], const char *name) {
   size_t name_length;
@@ -440,13 +429,6 @@ static int pm_same_path_text(const char *left, const char *right) {
 
   return strcmp(left_resolved, right_resolved) == 0;
 }
-
-static int pm_is_node_package_binary_path(const char *path) {
-  return path != NULL &&
-    (strstr(path, "/node_modules/.bin/") != NULL ||
-     strncmp(path, "node_modules/.bin/", 18) == 0);
-}
-
 static int pm_find_executable_on_env_path(
   const char *tool_name,
   char *const envp[],
@@ -523,680 +505,6 @@ static int pm_resolve_exec_path(
 
   return pm_find_executable_on_env_path(path, envp, buffer, size, 1);
 }
-
-static int pm_read_shebang(const char *path, char *buffer, size_t size) {
-  FILE *file;
-
-  if (path == NULL || buffer == NULL || size == 0) {
-    return -1;
-  }
-
-  file = fopen(path, "r");
-  if (file == NULL) {
-    return -1;
-  }
-
-  if (fgets(buffer, (int)size, file) == NULL) {
-    fclose(file);
-    return -1;
-  }
-  fclose(file);
-
-  return strncmp(buffer, "#!", 2) == 0 ? 0 : -1;
-}
-
-static char *pm_trim_text(char *value) {
-  char *end;
-
-  while (value != NULL && (*value == ' ' || *value == '\t')) {
-    value++;
-  }
-
-  if (value == NULL) {
-    return NULL;
-  }
-
-  end = value + strlen(value);
-  while (end > value && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) {
-    *--end = '\0';
-  }
-
-  return value;
-}
-
-static char *pm_duplicate_text(const char *value) {
-  size_t size;
-  char *copy;
-
-  if (value == NULL) {
-    return NULL;
-  }
-
-  size = strlen(value) + 1;
-  copy = malloc(size);
-  if (copy == NULL) {
-    return NULL;
-  }
-
-  memcpy(copy, value, size);
-  return copy;
-}
-
-static int pm_shebang_env_tool(const char *script_path, char *tool_name, size_t tool_name_size) {
-  char line[PM_MAX_SHEBANG];
-  char *cursor;
-  char *tool_start;
-  size_t tool_length;
-
-  if (tool_name == NULL || tool_name_size == 0) {
-    return -1;
-  }
-
-  tool_name[0] = '\0';
-  if (pm_read_shebang(script_path, line, sizeof(line)) != 0) {
-    return -1;
-  }
-
-  cursor = pm_trim_text(line + 2);
-  if (cursor == NULL ||
-      strncmp(cursor, "/usr/bin/env", 12) != 0 ||
-      (cursor[12] != '\0' && cursor[12] != ' ' && cursor[12] != '\t')) {
-    return -1;
-  }
-
-  cursor += 12;
-  while (*cursor == ' ' || *cursor == '\t') {
-    cursor++;
-  }
-
-  tool_start = cursor;
-  while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
-    cursor++;
-  }
-
-  tool_length = (size_t)(cursor - tool_start);
-  if (tool_length == 0 || tool_length >= tool_name_size) {
-    return -1;
-  }
-
-  while (*cursor == ' ' || *cursor == '\t') {
-    cursor++;
-  }
-  if (*cursor != '\0') {
-    return -1;
-  }
-
-  memcpy(tool_name, tool_start, tool_length);
-  tool_name[tool_length] = '\0';
-  return 0;
-}
-
-static int pm_is_regular_file(const char *path) {
-  struct stat stat_buffer;
-
-  return path != NULL &&
-    path[0] != '\0' &&
-    stat(path, &stat_buffer) == 0 &&
-    S_ISREG(stat_buffer.st_mode);
-}
-
-static int pm_shell_script_uses_shell(const char *script_path) {
-  char line[PM_MAX_SHEBANG];
-  char *cursor;
-
-  if (pm_read_shebang(script_path, line, sizeof(line)) != 0) {
-    return 0;
-  }
-
-  cursor = pm_trim_text(line + 2);
-  if (cursor == NULL) {
-    return 0;
-  }
-
-  return strcmp(cursor, "/bin/sh") == 0 ||
-    strcmp(cursor, "/bin/bash") == 0 ||
-    strcmp(cursor, "/bin/zsh") == 0 ||
-    strcmp(cursor, "/usr/bin/env sh") == 0 ||
-    strcmp(cursor, "/usr/bin/env bash") == 0 ||
-    strcmp(cursor, "/usr/bin/env zsh") == 0;
-}
-
-static int pm_shell_script_node_exec_target(
-  const char *script_path,
-  char *interpreter_path,
-  size_t interpreter_size,
-  char *node_script_path,
-  size_t node_script_size) {
-  FILE *file;
-  char line[PM_MAX_SCRIPT_LINE];
-
-  if (!pm_shell_script_uses_shell(script_path) ||
-      interpreter_path == NULL ||
-      interpreter_size == 0 ||
-      node_script_path == NULL ||
-      node_script_size == 0) {
-    return -1;
-  }
-
-  file = fopen(script_path, "r");
-  if (file == NULL) {
-    return -1;
-  }
-
-  while (fgets(line, sizeof(line), file) != NULL) {
-    char *trimmed = pm_trim_text(line);
-    char *exec_position;
-    char *target_start;
-    char *target_end;
-    char *script_start;
-    char *script_end;
-    const char *target_name;
-    size_t target_length;
-    size_t script_length;
-
-    if (trimmed == NULL) {
-      continue;
-    }
-
-    exec_position = strstr(trimmed, "exec \"");
-    if (exec_position == NULL) {
-      continue;
-    }
-
-    target_start = exec_position + strlen("exec \"");
-    target_end = strchr(target_start, '"');
-    if (target_start[0] != '/' || target_end == NULL) {
-      continue;
-    }
-
-    script_start = target_end + 1;
-    while (*script_start == ' ' || *script_start == '\t') {
-      script_start++;
-    }
-    if (*script_start != '"') {
-      continue;
-    }
-    script_start++;
-    script_end = strchr(script_start, '"');
-    if (script_start[0] != '/' || script_end == NULL || strstr(script_end + 1, "\"$@\"") == NULL) {
-      continue;
-    }
-
-    target_length = (size_t)(target_end - target_start);
-    script_length = (size_t)(script_end - script_start);
-    if (target_length == 0 ||
-        target_length >= interpreter_size ||
-        script_length == 0 ||
-        script_length >= node_script_size) {
-      fclose(file);
-      return -1;
-    }
-
-    memcpy(interpreter_path, target_start, target_length);
-    interpreter_path[target_length] = '\0';
-    memcpy(node_script_path, script_start, script_length);
-    node_script_path[script_length] = '\0';
-    target_name = pm_path_basename(interpreter_path);
-    if ((target_name == NULL || (strcmp(target_name, "node") != 0 && strcmp(target_name, "nodejs") != 0)) ||
-        !pm_is_executable_file(interpreter_path) ||
-        !pm_is_regular_file(node_script_path)) {
-      continue;
-    }
-
-    fclose(file);
-    return 0;
-  }
-
-  fclose(file);
-  return -1;
-}
-
-static int pm_resolve_shebang_interpreter(
-  const char *tool_name,
-  char *const envp[],
-  char *buffer,
-  size_t size) {
-  const char *node_env;
-
-  if (strcmp(tool_name, "node") != 0) {
-    return -1;
-  }
-
-  node_env = pm_envp_value(envp, "NODE");
-  if (pm_is_executable_file(node_env)) {
-    snprintf(buffer, size, "%s", node_env);
-    return 0;
-  }
-
-  return pm_find_executable_on_env_path(tool_name, envp, buffer, size, 1);
-}
-
-static int pm_is_shell_name(const char *target) {
-  const char *name = pm_path_basename(target);
-
-  return name != NULL &&
-    (strcmp(name, "sh") == 0 ||
-     strcmp(name, "bash") == 0 ||
-     strcmp(name, "zsh") == 0);
-}
-
-static const char *pm_shell_command_arg(char *const argv[]) {
-  for (size_t index = 1; argv != NULL && argv[index] != NULL; index++) {
-    if (strcmp(argv[index], "-c") == 0) {
-      return argv[index + 1];
-    }
-  }
-
-  return NULL;
-}
-
-static int pm_shell_meta_character(char value) {
-  return value == '|' ||
-    value == '&' ||
-    value == ';' ||
-    value == '<' ||
-    value == '>' ||
-    value == '(' ||
-    value == ')' ||
-    value == '`' ||
-    value == '$' ||
-    value == '\\' ||
-    value == '\n' ||
-    value == '\r';
-}
-
-static int pm_tokenize_simple_shell_command(char *command, char **tokens, size_t max_tokens, size_t *token_count) {
-  char *cursor = command;
-  size_t count = 0;
-
-  if (command == NULL || tokens == NULL || token_count == NULL || max_tokens == 0) {
-    return -1;
-  }
-
-  while (*cursor != '\0') {
-    char quote = '\0';
-    char *start;
-
-    while (*cursor == ' ' || *cursor == '\t') {
-      cursor++;
-    }
-    if (*cursor == '\0') {
-      break;
-    }
-    if (pm_shell_meta_character(*cursor)) {
-      return -1;
-    }
-    if (count >= max_tokens) {
-      return -1;
-    }
-
-    if (*cursor == '\'' || *cursor == '"') {
-      quote = *cursor;
-      start = ++cursor;
-      while (*cursor != '\0' && *cursor != quote) {
-        if (pm_shell_meta_character(*cursor)) {
-          return -1;
-        }
-        cursor++;
-      }
-      if (*cursor != quote) {
-        return -1;
-      }
-      *cursor++ = '\0';
-      if (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
-        return -1;
-      }
-    } else {
-      start = cursor;
-      while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
-        if (pm_shell_meta_character(*cursor)) {
-          return -1;
-        }
-        cursor++;
-      }
-      if (*cursor != '\0') {
-        *cursor++ = '\0';
-      }
-    }
-
-    if (start[0] == '\0') {
-      return -1;
-    }
-    tokens[count++] = start;
-  }
-
-  *token_count = count;
-  return count > 0 ? 0 : -1;
-}
-
-static int pm_is_shell_env_assignment_token(const char *token) {
-  if (token == NULL || token[0] == '\0' || !(isalpha((unsigned char)token[0]) || token[0] == '_')) {
-    return 0;
-  }
-
-  for (size_t index = 1; token[index] != '\0'; index++) {
-    unsigned char ch = (unsigned char)token[index];
-    if (token[index] == '=') {
-      return 1;
-    }
-    if (!(isalnum(ch) || ch == '_')) {
-      return 0;
-    }
-  }
-
-  return 0;
-}
-
-static size_t pm_shell_env_assignment_prefix_count(char **tokens, size_t token_count) {
-  size_t count = 0;
-
-  while (count < token_count && pm_is_shell_env_assignment_token(tokens[count])) {
-    count++;
-  }
-
-  return count;
-}
-
-static size_t pm_env_assignment_name_length(const char *assignment) {
-  const char *equals = assignment == NULL ? NULL : strchr(assignment, '=');
-  return equals == NULL ? 0 : (size_t)(equals - assignment);
-}
-
-static int pm_env_entry_matches_assignment(const char *entry, const char *assignment) {
-  size_t name_length = pm_env_assignment_name_length(assignment);
-
-  return entry != NULL &&
-    name_length > 0 &&
-    strncmp(entry, assignment, name_length) == 0 &&
-    entry[name_length] == '=';
-}
-
-static char **pm_envp_with_shell_assignments(char *const envp[], char **assignments, size_t assignment_count) {
-  char **updated_envp;
-  size_t env_count = 0;
-  size_t used = 0;
-
-  if (assignment_count == 0) {
-    return NULL;
-  }
-
-  while (envp != NULL && envp[env_count] != NULL) {
-    env_count++;
-  }
-
-  updated_envp = calloc(env_count + assignment_count + 1, sizeof(char *));
-  if (updated_envp == NULL) {
-    return NULL;
-  }
-
-  for (size_t env_index = 0; env_index < env_count; env_index++) {
-    int replaced = 0;
-
-    for (size_t assignment_index = 0; assignment_index < assignment_count; assignment_index++) {
-      if (pm_env_entry_matches_assignment(envp[env_index], assignments[assignment_index])) {
-        replaced = 1;
-        break;
-      }
-    }
-
-    if (!replaced) {
-      updated_envp[used++] = envp[env_index];
-    }
-  }
-
-  for (size_t assignment_index = 0; assignment_index < assignment_count; assignment_index++) {
-    updated_envp[used++] = assignments[assignment_index];
-  }
-
-  updated_envp[used] = NULL;
-  return updated_envp;
-}
-
-static pm_child_exec_plan pm_prepare_shell_node_package_exec_plan(
-  const char *target,
-  char *const argv[],
-  char *const envp[]) {
-  pm_child_exec_plan plan = { target, (char **)argv, NULL, NULL, NULL, NULL, NULL };
-  const char *command = pm_shell_command_arg(argv);
-  char script_path[PM_MAX_PATH];
-  char interpreter_path[PM_MAX_PATH];
-  char tool_name[64];
-  char *tokens[64];
-  size_t token_count = 0;
-  size_t assignment_count = 0;
-  size_t command_index = 0;
-  size_t command_token_count = 0;
-  char **next_argv;
-
-  /*
-   * Yarn classic runs package binaries through "/bin/sh -c". That protected
-   * shell drops DYLD before the .bin shebang can be rewritten. For the narrow
-   * case of a simple node_modules/.bin command, skip the shell and launch the
-   * Node script directly with the repaired child environment.
-   */
-  if (!pm_is_shell_name(target) ||
-      command == NULL ||
-      (plan.argv_storage = pm_duplicate_text(command)) == NULL ||
-      pm_tokenize_simple_shell_command(plan.argv_storage, tokens, sizeof(tokens) / sizeof(tokens[0]), &token_count) != 0 ||
-      (assignment_count = pm_shell_env_assignment_prefix_count(tokens, token_count)) >= token_count ||
-      pm_resolve_exec_path(tokens[assignment_count], envp, 1, script_path, sizeof(script_path)) != 0 ||
-      !pm_is_node_package_binary_path(script_path) ||
-      pm_shebang_env_tool(script_path, tool_name, sizeof(tool_name)) != 0 ||
-      pm_resolve_shebang_interpreter(tool_name, envp, interpreter_path, sizeof(interpreter_path)) != 0) {
-    free(plan.argv_storage);
-    plan.argv_storage = NULL;
-    return plan;
-  }
-
-  command_index = assignment_count;
-  command_token_count = token_count - command_index;
-  next_argv = calloc(command_token_count + 2, sizeof(char *));
-  if (next_argv == NULL) {
-    free(plan.argv_storage);
-    plan.argv_storage = NULL;
-    return plan;
-  }
-
-  plan.resolved_script_path = pm_duplicate_text(script_path);
-  plan.interpreter_path = pm_duplicate_text(interpreter_path);
-  if (plan.resolved_script_path == NULL || plan.interpreter_path == NULL) {
-    free(next_argv);
-    free(plan.argv_storage);
-    free(plan.resolved_script_path);
-    free(plan.interpreter_path);
-    plan.argv_storage = NULL;
-    plan.resolved_script_path = NULL;
-    plan.interpreter_path = NULL;
-    return plan;
-  }
-
-  if (assignment_count > 0) {
-    plan.envp_storage = pm_envp_with_shell_assignments(envp, tokens, assignment_count);
-    if (plan.envp_storage == NULL) {
-      free(next_argv);
-      free(plan.argv_storage);
-      free(plan.resolved_script_path);
-      free(plan.interpreter_path);
-      plan.argv_storage = NULL;
-      plan.resolved_script_path = NULL;
-      plan.interpreter_path = NULL;
-      return plan;
-    }
-    plan.envp = plan.envp_storage;
-  }
-
-  next_argv[0] = plan.interpreter_path;
-  next_argv[1] = plan.resolved_script_path;
-  for (size_t index = command_index + 1; index < token_count; index++) {
-    next_argv[index - command_index + 1] = tokens[index];
-  }
-
-  plan.target = plan.interpreter_path;
-  plan.argv = next_argv;
-  pm_debug(
-    "shell package-bin rewrite command=%s script=%s interpreter=%s assignments=%zu",
-    command,
-    plan.resolved_script_path,
-    plan.interpreter_path,
-    assignment_count);
-  return plan;
-}
-
-static pm_child_exec_plan pm_prepare_simple_node_wrapper_exec_plan(
-  const char *target,
-  char *const argv[],
-  char *const envp[],
-  int allow_path_lookup) {
-  pm_child_exec_plan plan = { target, (char **)argv, NULL, NULL, NULL, NULL, NULL };
-  char wrapper_path[PM_MAX_PATH];
-  char interpreter_path[PM_MAX_PATH];
-  char node_script_path[PM_MAX_PATH];
-  size_t argc = 0;
-  char **next_argv;
-
-  /*
-   * Yarn creates temporary shell wrappers that execute
-   *   exec "/path/to/node" "/path/to/yarn.js" "$@"
-   * and puts them before extension-owned shims in PATH. If a hooked process
-   * launches that wrapper directly, macOS strips DYLD at the /bin/sh boundary.
-   * Skip the wrapper and exec the Node entrypoint while the repaired envp is
-   * still intact.
-   */
-  if (pm_resolve_exec_path(target, envp, allow_path_lookup, wrapper_path, sizeof(wrapper_path)) != 0 ||
-      pm_shell_script_node_exec_target(
-        wrapper_path,
-        interpreter_path,
-        sizeof(interpreter_path),
-        node_script_path,
-        sizeof(node_script_path)) != 0) {
-    return plan;
-  }
-
-  while (argv != NULL && argv[argc] != NULL) {
-    argc++;
-  }
-
-  next_argv = calloc(argc + 2, sizeof(char *));
-  if (next_argv == NULL) {
-    return plan;
-  }
-
-  plan.interpreter_path = pm_duplicate_text(interpreter_path);
-  plan.resolved_script_path = pm_duplicate_text(node_script_path);
-  if (plan.interpreter_path == NULL || plan.resolved_script_path == NULL) {
-    free(next_argv);
-    free(plan.interpreter_path);
-    free(plan.resolved_script_path);
-    plan.interpreter_path = NULL;
-    plan.resolved_script_path = NULL;
-    return plan;
-  }
-
-  next_argv[0] = plan.interpreter_path;
-  next_argv[1] = plan.resolved_script_path;
-  for (size_t index = 1; index < argc; index++) {
-    next_argv[index + 1] = argv[index];
-  }
-
-  plan.target = plan.interpreter_path;
-  plan.argv = next_argv;
-  pm_debug("shell node-wrapper rewrite wrapper=%s script=%s interpreter=%s", wrapper_path, plan.resolved_script_path, plan.interpreter_path);
-  return plan;
-}
-
-static pm_child_exec_plan pm_prepare_child_exec_plan(
-  const char *target,
-  char *const argv[],
-  char *const envp[],
-  int allow_path_lookup) {
-  pm_child_exec_plan plan = { target, (char **)argv, NULL, NULL, NULL, NULL, NULL };
-  char script_path[PM_MAX_PATH];
-  char interpreter_path[PM_MAX_PATH];
-  char tool_name[64];
-  size_t argc = 0;
-  char **next_argv;
-
-  /*
-   * Node package binaries usually have "#!/usr/bin/env node". On macOS that
-   * protected /usr/bin/env boundary can drop DYLD_INSERT_LIBRARIES even when
-   * the spawning package manager is already hooked. Rewrite only package-bin
-   * scripts with the simple env-node shebang so CLI tools such as wait-on keep
-   * the repaired envp without changing arbitrary script shebang semantics.
-   */
-  if (!pm_hook_enabled() || pm_hook_depth > 0 || envp == NULL ||
-      pm_envp_value_is(envp, "PORT_MANAGER_HOOK_DISABLED", "1") ||
-      pm_envp_value_is(envp, "PORT_MANAGER_HOOK", "0")) {
-    return plan;
-  }
-
-  plan = pm_prepare_shell_node_package_exec_plan(target, argv, envp);
-  if (plan.interpreter_path != NULL) {
-    return plan;
-  }
-
-  plan = pm_prepare_simple_node_wrapper_exec_plan(target, argv, envp, allow_path_lookup);
-  if (plan.interpreter_path != NULL) {
-    return plan;
-  }
-
-  if (pm_resolve_exec_path(target, envp, allow_path_lookup, script_path, sizeof(script_path)) != 0 ||
-      !pm_is_node_package_binary_path(script_path) ||
-      pm_shebang_env_tool(script_path, tool_name, sizeof(tool_name)) != 0 ||
-      pm_resolve_shebang_interpreter(tool_name, envp, interpreter_path, sizeof(interpreter_path)) != 0) {
-    return plan;
-  }
-
-  while (argv != NULL && argv[argc] != NULL) {
-    argc++;
-  }
-
-  next_argv = calloc(argc + 2, sizeof(char *));
-  if (next_argv == NULL) {
-    return plan;
-  }
-
-  plan.resolved_script_path = pm_duplicate_text(script_path);
-  plan.interpreter_path = pm_duplicate_text(interpreter_path);
-  if (plan.resolved_script_path == NULL || plan.interpreter_path == NULL) {
-    free(next_argv);
-    free(plan.resolved_script_path);
-    free(plan.interpreter_path);
-    plan.resolved_script_path = NULL;
-    plan.interpreter_path = NULL;
-    return plan;
-  }
-
-  next_argv[0] = plan.interpreter_path;
-  next_argv[1] = plan.resolved_script_path;
-  for (size_t index = 1; index < argc; index++) {
-    next_argv[index + 1] = argv[index];
-  }
-
-  plan.target = plan.interpreter_path;
-  plan.argv = next_argv;
-  pm_debug("shebang rewrite script=%s interpreter=%s", plan.resolved_script_path, plan.interpreter_path);
-  return plan;
-}
-
-static void pm_release_child_exec_plan(pm_child_exec_plan *plan) {
-  if (plan == NULL || plan->interpreter_path == NULL) {
-    return;
-  }
-
-  free(plan->argv);
-  free(plan->resolved_script_path);
-  free(plan->interpreter_path);
-  free(plan->argv_storage);
-  free(plan->envp_storage);
-  plan->target = NULL;
-  plan->argv = NULL;
-  plan->resolved_script_path = NULL;
-  plan->interpreter_path = NULL;
-  plan->argv_storage = NULL;
-  plan->envp = NULL;
-  plan->envp_storage = NULL;
-}
-
 static int pm_is_container_runtime_name(const char *name) {
   return name != NULL &&
     (strcmp(name, "docker") == 0 ||
@@ -1707,6 +1015,23 @@ static void pm_route_compose_claim_path(const char *route_table_path, int port, 
   }
 
   snprintf(buffer, size, "%s-compose-claim-port-%d.json", route_table_path, port);
+}
+
+static void pm_route_gateway_claim_path(const char *route_table_path, int port, char *buffer, size_t size) {
+  const char *file_name;
+  const char *extension;
+
+  file_name = strrchr(route_table_path, '/');
+  file_name = file_name == NULL ? route_table_path : file_name + 1;
+  extension = strrchr(file_name, '.');
+
+  if (extension != NULL) {
+    size_t prefix_length = (size_t)(extension - route_table_path);
+    snprintf(buffer, size, "%.*s-mux-claim-port-%d%s", (int)prefix_length, route_table_path, port, extension);
+    return;
+  }
+
+  snprintf(buffer, size, "%s-mux-claim-port-%d.json", route_table_path, port);
 }
 
 static void pm_default_host_access_path(char *buffer, size_t size) {
@@ -3844,6 +3169,91 @@ static int pm_bind_ephemeral_local_port(int sockfd, const struct sockaddr *addr,
   return result;
 }
 
+/*
+ * True when the logical port gateway currently owns this port on localhost.
+ *
+ * The extension writes a small claim file per gateway-owned port and refreshes
+ * it faster than the route-table TTL. A scope-less bind consults this so a
+ * non-attached terminal's server relocates to a high port (becoming the
+ * non-network passthrough target) instead of being shadowed by the gateway's
+ * localhost listener. Absence or staleness means the port is free to bind.
+ */
+static int pm_gateway_claim_fresh(int logical_port) {
+  char base_path[PM_MAX_PATH];
+  char claim_path[PM_MAX_PATH];
+  struct stat stat_buffer;
+  FILE *file;
+  char buffer[256];
+  size_t read_length;
+
+  pm_default_global_route_table_path(base_path, sizeof(base_path));
+  pm_route_gateway_claim_path(base_path, logical_port, claim_path, sizeof(claim_path));
+
+  if (stat(claim_path, &stat_buffer) != 0 || pm_route_file_stat_expired(&stat_buffer)) {
+    return 0;
+  }
+
+  file = fopen(claim_path, "r");
+  if (file == NULL) {
+    return 0;
+  }
+  read_length = fread(buffer, 1, sizeof(buffer) - 1, file);
+  fclose(file);
+  buffer[read_length] = '\0';
+
+  return pm_route_file_buffer_expired(buffer) ? 0 : 1;
+}
+
+/*
+ * Relocates a scope-less server off a gateway-owned port.
+ *
+ * The bind is moved to a daemon-allocated high port on 127.0.0.1 and registered
+ * as a network-less listen route, which is exactly the coordinate the gateway
+ * forwards a non-network client to. Returns 0 on success (and completes the
+ * bind), or -1 to let the caller fall back to a normal passthrough bind (e.g.
+ * the daemon is unavailable or the socket cannot bind the loopback address).
+ */
+static int pm_bind_gateway_relocation(int sockfd, const struct sockaddr *addr, socklen_t addrlen, int logical_port) {
+  struct sockaddr_storage rewritten;
+  char allocation_id[PM_MAX_TEXT];
+  const char *relocate_host = "127.0.0.1";
+  int actual_port = logical_port;
+  int result;
+
+  allocation_id[0] = '\0';
+  pm_hook_depth++;
+  if (pm_allocate_route(logical_port, relocate_host, NULL, "listen", &actual_port, allocation_id, sizeof(allocation_id), NULL, 0) != 0) {
+    pm_hook_depth--;
+    return -1;
+  }
+  pm_hook_depth--;
+
+  memcpy(&rewritten, addr, addrlen);
+  pm_set_sockaddr_host((struct sockaddr *)&rewritten, relocate_host);
+  pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
+
+  result = pm_real_bind(sockfd, (struct sockaddr *)&rewritten, addrlen);
+  if (result != 0) {
+    pm_release_allocation(allocation_id);
+    return -1;
+  }
+
+  {
+    char logical_text[16];
+    char actual_text[16];
+
+    pm_remember_route(logical_port, actual_port, relocate_host, allocation_id, 0);
+    snprintf(logical_text, sizeof(logical_text), "%d", logical_port);
+    snprintf(actual_text, sizeof(actual_text), "%d", actual_port);
+    setenv("PORT_MANAGER_LOGICAL_PORT", logical_text, 1);
+    setenv("PORT_MANAGER_ACTUAL_PORT", actual_text, 1);
+    pm_register_process(logical_port, actual_port, relocate_host, allocation_id);
+    pm_debug("bind gateway relocation logical=%d actual=%d", logical_port, actual_port);
+  }
+
+  return 0;
+}
+
 static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   struct sockaddr_storage rewritten;
   char host[128];
@@ -3870,8 +3280,20 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
     /*
      * A globally injected preload can survive after a terminal is detached from
      * every logical network. In that state localhost belongs to the real host,
-     * so the hook must not allocate routes or rewrite loopback binds.
+     * so the hook does not rewrite loopback binds. The one exception is a port
+     * the gateway currently owns: a server there must relocate so non-network
+     * clients can still reach it through the gateway's passthrough.
      */
+    if (
+      logical_port > 0 &&
+      !pm_is_fixed_protocol_port(logical_port) &&
+      pm_sockaddr_is_local(addr) &&
+      pm_gateway_claim_fresh(logical_port) &&
+      pm_bind_gateway_relocation(sockfd, addr, addrlen, logical_port) == 0
+    ) {
+      return 0;
+    }
+
     pm_debug("bind passthrough without network scope logical=%d", logical_port);
     return pm_real_bind(sockfd, addr, addrlen);
   }
@@ -4317,10 +3739,8 @@ static int pm_exec_with_prepared_child(
   int allow_path_lookup) {
   const char *target;
   const char *exec_target;
-  char **exec_envp;
   char resolved_target[PM_MAX_PATH];
   pm_child_environment child_environment;
-  pm_child_exec_plan exec_plan;
   int result;
   int saved_errno;
 
@@ -4336,24 +3756,26 @@ static int pm_exec_with_prepared_child(
     allow_path_lookup = 0;
   }
 
+  /*
+   * The child only needs the preload environment re-injected; the PATH runtime
+   * shims restore it across protected launchers, so the hook no longer parses
+   * shebangs or wrapper scripts to redirect the target.
+   */
   child_environment = pm_prepare_child_environment(envp);
-  exec_plan = pm_prepare_child_exec_plan(target, argv, child_environment.envp, allow_path_lookup);
-  exec_target = exec_plan.target;
-  exec_envp = exec_plan.envp != NULL ? exec_plan.envp : child_environment.envp;
+  exec_target = target;
 
   /*
-   * execvp searches PATH before execve. When no shebang rewrite is needed we
-   * still call execve so the repaired child environment is used.
+   * execvp searches PATH before execve. Resolve it here so the repaired child
+   * environment is used for the exec.
    */
-  if (exec_plan.target == target && allow_path_lookup && target != NULL && strchr(target, '/') == NULL) {
-    if (pm_resolve_exec_path(target, exec_envp, 1, resolved_target, sizeof(resolved_target)) == 0) {
+  if (allow_path_lookup && target != NULL && strchr(target, '/') == NULL) {
+    if (pm_resolve_exec_path(target, child_environment.envp, 1, resolved_target, sizeof(resolved_target)) == 0) {
       exec_target = resolved_target;
     }
   }
 
-  result = pm_real_execve(exec_target, exec_plan.argv, exec_envp);
+  result = pm_real_execve(exec_target, argv, child_environment.envp);
   saved_errno = errno;
-  pm_release_child_exec_plan(&exec_plan);
   pm_release_child_environment(&child_environment);
   errno = saved_errno;
   return result;
@@ -4380,7 +3802,6 @@ static int pm_posix_spawn_hook(
   char *const envp[]) {
   const char *target;
   pm_child_environment child_environment;
-  pm_child_exec_plan exec_plan;
   int result;
 
   pm_ensure_symbols();
@@ -4395,15 +3816,7 @@ static int pm_posix_spawn_hook(
   }
 
   child_environment = pm_prepare_child_environment(envp);
-  exec_plan = pm_prepare_child_exec_plan(target, argv, child_environment.envp, 0);
-  result = pm_real_posix_spawn(
-    pid,
-    exec_plan.target,
-    file_actions,
-    attrp,
-    exec_plan.argv,
-    exec_plan.envp != NULL ? exec_plan.envp : child_environment.envp);
-  pm_release_child_exec_plan(&exec_plan);
+  result = pm_real_posix_spawn(pid, target, file_actions, attrp, argv, child_environment.envp);
   pm_release_child_environment(&child_environment);
   return result;
 }
@@ -4417,7 +3830,6 @@ static int pm_posix_spawnp_hook(
   char *const envp[]) {
   const char *target;
   pm_child_environment child_environment;
-  pm_child_exec_plan exec_plan;
   int result;
 
   pm_ensure_symbols();
@@ -4427,36 +3839,19 @@ static int pm_posix_spawnp_hook(
   }
 
   target = pm_runtime_exec_target(file, argv);
-  if (target != file) {
-    pm_debug("runtime posix_spawnp rewrite file=%s target=%s", file != NULL ? file : "(null)", target);
-    child_environment = pm_prepare_child_environment(envp);
-    exec_plan = pm_prepare_child_exec_plan(target, argv, child_environment.envp, 0);
-    result = pm_real_posix_spawn(
-      pid,
-      exec_plan.target,
-      file_actions,
-      attrp,
-      exec_plan.argv,
-      exec_plan.envp != NULL ? exec_plan.envp : child_environment.envp);
-    pm_release_child_exec_plan(&exec_plan);
-    pm_release_child_environment(&child_environment);
-    return result;
-  }
-
   child_environment = pm_prepare_child_environment(envp);
-  exec_plan = pm_prepare_child_exec_plan(file, argv, child_environment.envp, 1);
-  if (exec_plan.target != file) {
-    result = pm_real_posix_spawn(
-      pid,
-      exec_plan.target,
-      file_actions,
-      attrp,
-      exec_plan.argv,
-      exec_plan.envp != NULL ? exec_plan.envp : child_environment.envp);
+
+  if (target != file) {
+    /*
+     * The runtime target was rewritten to an absolute shim path, so spawn it
+     * directly instead of letting posix_spawnp re-search PATH.
+     */
+    pm_debug("runtime posix_spawnp rewrite file=%s target=%s", file != NULL ? file : "(null)", target);
+    result = pm_real_posix_spawn(pid, target, file_actions, attrp, argv, child_environment.envp);
   } else {
     result = pm_real_posix_spawnp(pid, file, file_actions, attrp, argv, child_environment.envp);
   }
-  pm_release_child_exec_plan(&exec_plan);
+
   pm_release_child_environment(&child_environment);
   return result;
 }

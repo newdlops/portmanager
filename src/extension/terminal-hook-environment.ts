@@ -139,6 +139,13 @@ export function applyTerminalHookEnvironment(
   collection.description = "Port Manager routes terminal TCP binds through the local daemon.";
 
   if (scope === undefined) {
+    // A terminal not attached to any network still gets a minimal hook so a
+    // server it launches on a gateway-owned port relocates instead of being
+    // shadowed by the gateway listener. No network id is injected, so the hook
+    // stays in pure passthrough for everything except that relocation.
+    if (settings.logicalPortGateway && shouldInjectTerminalHook(settings)) {
+      applyScopelessGatewayEnvironment(context, collection, settings);
+    }
     return;
   }
 
@@ -218,6 +225,34 @@ export function applyTerminalHookEnvironment(
   if (shellEnvRestorePath !== undefined) {
     collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_MUTATOR_OPTIONS);
   }
+}
+
+/**
+ * Injects the smallest hook environment needed for gateway bind relocation into
+ * a terminal with no network attachment. It carries no network id, so the hook
+ * treats every bind and connect as passthrough except a bind to a port the
+ * gateway currently claims, which it relocates to a daemon-assigned high port.
+ */
+function applyScopelessGatewayEnvironment(
+  context: vscode.ExtensionContext,
+  collection: vscode.EnvironmentVariableCollection,
+  settings: PortManagerSettings,
+): void {
+  const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
+  const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
+  const preloadHintVariable = process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD";
+
+  collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_PRELOAD_REPAIR", "1", TERMINAL_MUTATOR_OPTIONS);
+  applyRoutingSettings(collection, settings);
+  collection.replace(
+    preloadVariable,
+    prependUniquePathListEntry(hookLibraryPath, process.env[preloadVariable]),
+    TERMINAL_MUTATOR_OPTIONS,
+  );
+  collection.replace(preloadHintVariable, hookLibraryPath, TERMINAL_MUTATOR_OPTIONS);
 }
 
 /** Mirrors the per-network bind hosts used by native high-port and same-port routing. */
@@ -814,125 +849,13 @@ unset __pm_vite_allowed_hosts __pm_vite_filtered_hosts __pm_vite_host __pm_vite_
 }
 
 /**
- * Vite prints every available network interface when it receives a bare or
- * wildcard --host. In attached terminals that includes every logical loopback
- * alias, so constrain unsafe and Port Manager DNS-alias host forms to localhost.
- */
-function buildViteHostNarrowingShell(): string {
-  return `if [ "\${__pm_name:-}" = "vite" ]; then
-  __pm_vite_host="localhost"
-  __pm_vite_alias="\${PORT_MANAGER_NETWORK_DNS_ALIAS:-}"
-  __pm_vite_args_initialized=0
-  __pm_vite_host_pending=0
-  for __pm_arg in "$@"; do
-    if [ "\${__pm_vite_args_initialized}" = "0" ]; then
-      set --
-      __pm_vite_args_initialized=1
-    fi
-
-    if [ "\${__pm_vite_host_pending}" = "1" ]; then
-      __pm_vite_host_pending=0
-      if [ -n "\${__pm_vite_alias}" ]; then
-        __pm_arg_lc="$(printf '%s' "\${__pm_arg}" | tr '[:upper:]' '[:lower:]')"
-        if [ "\${__pm_arg_lc}" = "\${__pm_vite_alias}" ]; then
-          set -- "$@" "\${__pm_vite_host}"
-          unset __pm_arg_lc
-          continue
-        fi
-        unset __pm_arg_lc
-      fi
-      case "\${__pm_arg}" in
-        -*)
-          set -- "$@" "\${__pm_vite_host}" "\${__pm_arg}"
-          ;;
-        ""|"0.0.0.0"|"::"|"*")
-          set -- "$@" "\${__pm_vite_host}"
-          ;;
-        *)
-          set -- "$@" "\${__pm_arg}"
-          ;;
-      esac
-      continue
-    fi
-
-    case "\${__pm_arg}" in
-      --host)
-        set -- "$@" "--host"
-        __pm_vite_host_pending=1
-        ;;
-      --host=|--host=0.0.0.0|--host=::|--host=\\*)
-        set -- "$@" "--host=\${__pm_vite_host}"
-        ;;
-      --host=*)
-        __pm_vite_host_value="\${__pm_arg#--host=}"
-        if [ -n "\${__pm_vite_alias}" ]; then
-          __pm_vite_host_value_lc="$(printf '%s' "\${__pm_vite_host_value}" | tr '[:upper:]' '[:lower:]')"
-          if [ "\${__pm_vite_host_value_lc}" = "\${__pm_vite_alias}" ]; then
-            set -- "$@" "--host=\${__pm_vite_host}"
-          else
-            set -- "$@" "\${__pm_arg}"
-          fi
-          unset __pm_vite_host_value_lc
-        else
-          set -- "$@" "\${__pm_arg}"
-        fi
-        unset __pm_vite_host_value
-        ;;
-      *)
-        set -- "$@" "\${__pm_arg}"
-        ;;
-    esac
-  done
-
-  if [ "\${__pm_vite_host_pending}" = "1" ]; then
-    set -- "$@" "\${__pm_vite_host}"
-  fi
-  unset __pm_vite_host __pm_vite_alias __pm_vite_args_initialized __pm_vite_host_pending __pm_arg
-fi`;
-}
-
-/**
- * Protected shebang launchers such as /usr/bin/env can strip DYLD before Node
- * starts. This shell fragment resolves the JavaScript entrypoint first and runs
- * it through the extension-owned runtime shim so the real runtime receives the
- * preload environment directly.
+ * Execs the resolved target with the preload environment the caller already
+ * restored. Script-content and shebang parsing was removed: the extension-owned
+ * PATH runtime shims (node/python/…) restore the preload across protected
+ * launchers such as /usr/bin/env, so no shell-side target rewriting is needed.
  */
 function buildPreloadNodeEntrypointBypassShell(): string {
-  return `${buildViteHostNarrowingShell()}
-__pm_unwrapped="\${__pm_target}"
-__pm_exec_target="$(sed -n 's/.*exec "\\([^"]*\\)".*/\\1/p' "\${__pm_target}" 2>/dev/null | head -n 1)"
-__pm_exec_script="$(sed -n 's/.*exec "[^"]*" "\\([^"]*\\)".*/\\1/p' "\${__pm_target}" 2>/dev/null | head -n 1)"
-case "\${__pm_exec_target##*/}:\${__pm_exec_script}" in
-  node:/*|nodejs:/*)
-    if [ -f "\${__pm_exec_script}" ]; then
-      __pm_node="\${PORT_MANAGER_RUNTIME_SHIM_DIR:-}/node"
-      if [ -x "\${__pm_node}" ]; then
-        exec "\${__pm_node}" "\${__pm_exec_script}" "$@"
-      fi
-      exec "\${__pm_exec_target}" "\${__pm_exec_script}" "$@"
-    fi
-    ;;
-esac
-case "\${__pm_exec_target}" in
-  /*)
-    if [ -f "\${__pm_exec_target}" ]; then
-      __pm_unwrapped="\${__pm_exec_target}"
-    fi
-    ;;
-esac
-
-__pm_first_line="$(IFS= read -r __pm_line < "\${__pm_unwrapped}" && printf '%s' "\${__pm_line}")"
-case "\${__pm_first_line}" in
-  '#!'*'/usr/bin/env node'*|'#!'*' env node'*)
-    __pm_node="\${PORT_MANAGER_RUNTIME_SHIM_DIR:-}/node"
-    if [ -x "\${__pm_node}" ]; then
-      exec "\${__pm_node}" "\${__pm_unwrapped}" "$@"
-    fi
-    exec node "\${__pm_unwrapped}" "$@"
-    ;;
-esac
-
-exec "\${__pm_target}" "$@"`;
+  return `exec "\${__pm_target}" "$@"`;
 }
 
 /**
@@ -944,71 +867,12 @@ exec "\${__pm_target}" "$@"`;
  * hooked-parent path because they can launch node_modules/.bin by absolute path.
  */
 function buildCleanPackageManagerEntrypointShell(): string {
-  return `__pm_find_real_runtime() {
-  __pm_runtime_name="$1"
-  __pm_runtime_result=""
-  __pm_old_ifs="\${IFS}"
-  IFS=:
-  for __pm_dir in \${PATH:-}; do
-    [ -n "\${__pm_dir}" ] || __pm_dir="."
-    __pm_dir_physical="$(CDPATH= cd "\${__pm_dir}" 2>/dev/null && pwd -P)"
-    [ -n "\${__pm_dir_physical}" ] || __pm_dir_physical="\${__pm_dir}"
-    if [ "\${__pm_dir_physical}" = "\${__pm_shim_dir}" ]; then
-      continue
-    fi
-    __pm_candidate="\${__pm_dir}/\${__pm_runtime_name}"
-    if [ -f "\${__pm_candidate}" ] && [ -x "\${__pm_candidate}" ]; then
-      __pm_runtime_result="\${__pm_candidate}"
-      break
-    fi
-  done
-  IFS="\${__pm_old_ifs}"
-  if [ -n "\${__pm_runtime_result}" ]; then
-    printf '%s\\n' "\${__pm_runtime_result}"
-    unset __pm_runtime_name __pm_runtime_result __pm_old_ifs __pm_dir __pm_dir_physical __pm_candidate
-    return 0
-  fi
-  unset __pm_runtime_name __pm_runtime_result __pm_old_ifs __pm_dir __pm_dir_physical __pm_candidate
-  return 1
-}
-
-__pm_exec_clean() {
+  return `__pm_exec_clean() {
   case "$(uname -s)" in
     Darwin) unset DYLD_INSERT_LIBRARIES ;;
   esac
   exec "$@"
 }
-
-__pm_unwrapped="\${__pm_target}"
-__pm_exec_target="$(sed -n 's/.*exec "\\([^"]*\\)".*/\\1/p' "\${__pm_target}" 2>/dev/null | head -n 1)"
-__pm_exec_script="$(sed -n 's/.*exec "[^"]*" "\\([^"]*\\)".*/\\1/p' "\${__pm_target}" 2>/dev/null | head -n 1)"
-case "\${__pm_exec_target##*/}:\${__pm_exec_script}" in
-  node:/*|nodejs:/*)
-    if [ -f "\${__pm_exec_script}" ]; then
-      __pm_real_node="$(__pm_find_real_runtime "\${__pm_exec_target##*/}" 2>/dev/null || true)"
-      [ -n "\${__pm_real_node}" ] || __pm_real_node="\${__pm_exec_target}"
-      __pm_exec_clean "\${__pm_real_node}" "\${__pm_exec_script}" "$@"
-    fi
-    ;;
-esac
-case "\${__pm_exec_target}" in
-  /*)
-    if [ -f "\${__pm_exec_target}" ]; then
-      __pm_unwrapped="\${__pm_exec_target}"
-    fi
-    ;;
-esac
-
-__pm_first_line="$(IFS= read -r __pm_line < "\${__pm_unwrapped}" && printf '%s' "\${__pm_line}")"
-case "\${__pm_first_line}" in
-  '#!'*'/usr/bin/env node'*|'#!'*' env node'*)
-    __pm_real_node="$(__pm_find_real_runtime node 2>/dev/null || true)"
-    [ -n "\${__pm_real_node}" ] || __pm_real_node="$(__pm_find_real_runtime nodejs 2>/dev/null || true)"
-    if [ -n "\${__pm_real_node}" ]; then
-      __pm_exec_clean "\${__pm_real_node}" "\${__pm_unwrapped}" "$@"
-    fi
-    ;;
-esac
 
 __pm_exec_clean "\${__pm_target}" "$@"`;
 }

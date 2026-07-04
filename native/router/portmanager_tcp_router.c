@@ -21,11 +21,17 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../shared/pm_peer_process.h"
+
 #define PM_ROUTER_BACKLOG 1024
 #define PM_ROUTER_BUFFER_SIZE 65536
 #define PM_ROUTER_HOST_SIZE 256
 #define PM_ROUTER_LINE_SIZE 1024
+#define PM_ROUTER_ATTRIBUTION_SIZE 64
 #define PM_ROUTER_ROUTE_RESPONSE_TIMEOUT_MS 5000
+#define PM_ROUTER_ROUTE_RESPONSE_TIMEOUT_ENV "PORT_MANAGER_ROUTER_RESPONSE_TIMEOUT_MS"
+/* Bumped whenever the CONNECT/READY wire format changes; see pm_send_route_request. */
+#define PM_ROUTER_CONTROL_PROTOCOL_VERSION 2
 #if defined(MSG_NOSIGNAL)
 #define PM_ROUTER_SEND_FLAGS MSG_NOSIGNAL
 #else
@@ -49,6 +55,14 @@ typedef struct accepted_connection {
   int local_port;
   char remote_address[PM_ROUTER_HOST_SIZE];
   int remote_port;
+  /*
+   * Source attribution resolved from the loopback peer before the route query.
+   * Empty strings mean "unresolved" and are emitted as "-" on the CONNECT line
+   * so the TypeScript resolver falls back to its own lsof-based lookup.
+   */
+  char client_pid[PM_ROUTER_ATTRIBUTION_SIZE];
+  char client_start_time[PM_ROUTER_ATTRIBUTION_SIZE];
+  char client_network_id[PM_ROUTER_HOST_SIZE];
 } accepted_connection_t;
 
 typedef struct logical_listener {
@@ -82,6 +96,13 @@ static pthread_mutex_t pm_pending_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t pm_stdout_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pending_route_t *pm_pending_routes = NULL;
 static uint64_t pm_next_route_id = 1;
+/*
+ * How long a connection worker waits for the resolver to answer its CONNECT
+ * query. Made configurable so the extension can widen the budget for slow
+ * first-connection cases (a dev server still starting, compose warmup) without
+ * a rebuild. The default matches the historical fixed timeout.
+ */
+static long pm_route_response_timeout_ms = PM_ROUTER_ROUTE_RESPONSE_TIMEOUT_MS;
 #if PM_ROUTER_USE_KQUEUE
 static int pm_kqueue_fd = -1;
 #endif
@@ -249,18 +270,33 @@ static void pm_handle_control_line(listener_list_t *listeners, char *line) {
   pm_parse_response_line(line);
 }
 
+/** Renders an attribution field, substituting "-" for the unresolved (empty) case. */
+static const char *pm_field_or_dash(const char *value) {
+  return (value == NULL || value[0] == '\0') ? "-" : value;
+}
+
 static int pm_send_route_request(const accepted_connection_t *connection, uint64_t route_id) {
   char line[PM_ROUTER_LINE_SIZE];
+  /*
+   * Protocol v2 appends the source attribution the router resolved natively:
+   * client pid, its start time (pid-reuse guard), and the network id read from
+   * the client's environment. Older fields keep their positions so a v1 parser
+   * that reads exactly seven fields still works; the resolver uses the extras
+   * when present and skips its own lsof lookup.
+   */
   int length = snprintf(
     line,
     sizeof(line),
-    "CONNECT\t%llu\t%d\t%s\t%d\t%s\t%d\n",
+    "CONNECT\t%llu\t%d\t%s\t%d\t%s\t%d\t%s\t%s\t%s\n",
     (unsigned long long)route_id,
     connection->logical_port,
     connection->local_address,
     connection->local_port,
     connection->remote_address,
-    connection->remote_port);
+    connection->remote_port,
+    pm_field_or_dash(connection->client_pid),
+    pm_field_or_dash(connection->client_start_time),
+    pm_field_or_dash(connection->client_network_id));
 
   if (length <= 0 || (size_t)length >= sizeof(line)) {
     return -1;
@@ -291,7 +327,7 @@ static int pm_resolve_route(const accepted_connection_t *connection, char *host,
     pthread_cond_destroy(&route.condition);
     return -1;
   }
-  pm_add_milliseconds(&deadline, PM_ROUTER_ROUTE_RESPONSE_TIMEOUT_MS);
+  pm_add_milliseconds(&deadline, pm_route_response_timeout_ms);
 
   pm_add_pending_route(&route);
   if (pm_send_route_request(connection, route.id) != 0) {
@@ -593,11 +629,58 @@ static void pm_proxy_connection(int client_fd, int target_fd) {
   free(backward_buffer);
 }
 
+/*
+ * Resolves the source process for an accepted connection and records it on the
+ * connection so pm_send_route_request can pass it to the resolver. From the
+ * router's point of view the connection's remote endpoint is the client's local
+ * endpoint and the accepted local endpoint is the client's foreign endpoint.
+ * Runs on the per-connection worker thread so the pcb scan never blocks accept.
+ */
+static void pm_attribute_connection(accepted_connection_t *connection) {
+  long start_time = 0;
+  int pid = pm_peer_resolve_client_pid(
+      connection->remote_address,
+      connection->remote_port,
+      connection->local_address,
+      connection->local_port,
+      &start_time);
+  char network_id[PM_ROUTER_HOST_SIZE];
+
+  if (pid <= 0) {
+    return;
+  }
+
+  snprintf(connection->client_pid, sizeof(connection->client_pid), "%d", pid);
+  if (start_time > 0) {
+    snprintf(connection->client_start_time, sizeof(connection->client_start_time), "%ld", start_time);
+  }
+
+  if (pm_peer_read_network_id(pid, network_id, sizeof(network_id)) == 0) {
+    /*
+     * Network ids are already restricted to [A-Za-z0-9_.-], but any control
+     * character would corrupt the tab-delimited CONNECT line, so drop the id
+     * if one ever appears rather than emit a malformed frame.
+     */
+    int has_control = 0;
+    for (const char *cursor = network_id; *cursor != '\0'; cursor++) {
+      if ((unsigned char)*cursor < 0x20 || *cursor == '\t' || *cursor == 0x7f) {
+        has_control = 1;
+        break;
+      }
+    }
+    if (!has_control) {
+      snprintf(connection->client_network_id, sizeof(connection->client_network_id), "%s", network_id);
+    }
+  }
+}
+
 static void *pm_connection_thread(void *raw_connection) {
   accepted_connection_t *connection = (accepted_connection_t *)raw_connection;
   char host[PM_ROUTER_HOST_SIZE];
   int port = 0;
   int target_fd;
+
+  pm_attribute_connection(connection);
 
   if (pm_resolve_route(connection, host, sizeof(host), &port) != 0) {
     close(connection->client_fd);
@@ -911,6 +994,24 @@ static int pm_parse_port(const char *value) {
   return (int)port;
 }
 
+/** Reads the optional resolver-response timeout override before the event loop starts. */
+static void pm_load_route_response_timeout(void) {
+  const char *value = getenv(PM_ROUTER_ROUTE_RESPONSE_TIMEOUT_ENV);
+  char *end = NULL;
+  long parsed;
+
+  if (value == NULL || value[0] == '\0') {
+    return;
+  }
+
+  parsed = strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < 100 || parsed > 600000) {
+    return;
+  }
+
+  pm_route_response_timeout_ms = parsed;
+}
+
 static int pm_line_buffer_reserve(line_buffer_t *buffer, size_t required) {
   char *next;
   size_t capacity;
@@ -1092,6 +1193,7 @@ int main(int argc, char **argv) {
   }
 
   signal(SIGPIPE, SIG_IGN);
+  pm_load_route_response_timeout();
 #if PM_ROUTER_USE_KQUEUE
   pm_kqueue_fd = kqueue();
   if (pm_kqueue_fd < 0) {
@@ -1107,7 +1209,13 @@ int main(int argc, char **argv) {
 #endif
   control_mode = argc == 2 && strcmp(argv[1], "--control") == 0;
   if (control_mode) {
-    if (pm_write_protocol_line("READY\tcontrol\n") != 0) {
+    /*
+     * The trailing version field lets the resolver detect the richer CONNECT
+     * format. A v1 peer parsed "READY\tcontrol" by exact match, so callers now
+     * compare by prefix instead.
+     */
+    snprintf(ready_line, sizeof(ready_line), "READY\tcontrol\t%d\n", PM_ROUTER_CONTROL_PROTOCOL_VERSION);
+    if (pm_write_protocol_line(ready_line) != 0) {
       return 5;
     }
   } else {

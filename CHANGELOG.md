@@ -2,6 +2,15 @@
 
 All notable changes to Port Manager are documented in this file.
 
+## Unreleased
+
+- Promote the logical port gateway to the primary client routing path. Port Manager now owns each in-use logical port on `127.0.0.1`/`::1` and forwards every accepted connection to the caller's logical network by identifying the source process, so clients route correctly regardless of how the address and port were passed (environment variables, shell variables, computed values).
+- Resolve the connection source natively in the router (client pid, start time, and network id from the process environment) instead of shelling out to `lsof` on the hot path, with a per-client verdict cache.
+- Route unidentified (non-network) clients to a network-less passthrough owner on `127.0.0.1`, or refuse the connection when no such owner exists, instead of guessing a route from cwd or a lone unscoped route. **Behavior change:** tooling that relied on the old cwd/unique-route guess (including Docker Desktop loopback traffic dialing back into a network's logical port) now needs an explicit Host Access Binding or exposure.
+- Relocate a server started in a non-attached terminal off a gateway-owned port to a high port so it stays reachable through the gateway instead of being shadowed by the gateway listener.
+- Add the `portManager.logicalPortGateway` setting (default on) to disable the gateway and fall back to in-process hook routing only.
+- Remove shebang/script-content shell parsing from the native hook, the generated PATH shims, and the asdf shim. Preload survival now relies on the PATH runtime shims; a server launched by an absolute-path `#!` interpreter (not `/usr/bin/env`) in an attached terminal is the remaining case that can lose per-network isolation.
+
 ## 0.0.1
 
 Initial release.

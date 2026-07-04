@@ -93,6 +93,20 @@ Logical Network 생성 시 사용자는 해당 네트워크가 사용할 runtime
 
 초기 격리 runtime은 Docker/Podman container adapter와 Native Socket Hook adapter다. Docker/Podman은 Linux에서만 extension 전역의 bridge network를 하나 만들고, 각 Logical Network마다 최소 holder container를 하나 두어 network namespace만 유지한다. terminal attach는 Linux에서 `nsenter --net`로 holder의 network namespace만 빌려 쓰며, 사용자의 파일시스템, 언어 런타임, shell 환경은 host terminal 그대로 유지해야 한다. macOS에서는 Docker Desktop의 Linux VM network namespace를 host 프로세스가 직접 빌릴 수 없으므로 Docker/Podman을 terminal attach runtime으로 사용하지 않는다. macOS의 Borrowed Network는 Native Socket Hook이 담당하며, 새 컨테이너를 만들지 않고 선택한 터미널 shell에 hook 환경을 주입한다. attach 이후 시작한 개발 서버만 Logical Network 내부 포트로 간주한다.
 
+#### Logical Port Gateway
+
+Native Socket Hook 기반 Logical Network의 클라이언트 라우팅 1차 경로다. Port Manager가 사용 중인 각 논리 포트를 `127.0.0.1`/`::1`에서 직접 점유(L4 mux)하고, accept한 연결마다 **소스 프로세스**를 식별해 그 프로세스가 속한 논리 네트워크의 백엔드로 L4 포워딩한다.
+
+소스 식별은 연결의 루프백 4-tuple로 클라이언트 pid를 구하고, 그 프로세스(및 조상)의 환경에서 네트워크 스코프를 읽어 수행한다. 이 방식은 주소·포트가 환경변수, 셸 변수, 계산된 값 중 무엇으로 전달됐는지와 무관하므로, shell 구문을 파싱하지 않고도 `connect(localhost:<logicalPort>)`를 올바른 네트워크로 보낸다. 포트 번호는 보존되므로 페이로드(HTTP Host/TLS SNI) 인지가 필요 없다.
+
+- 네트워크에 귀속된 클라이언트: 해당 네트워크의 route row가 있으면 그 백엔드로, 없으면 per-network loopback alias의 같은 포트로 합성해 포워딩한다.
+- 식별되지 않은(non-network) 클라이언트: `127.0.0.1`의 network-less passthrough owner로 보낸다. owner가 없으면 연결을 거부한다(닫힌 포트와 동일 의미). 이전의 cwd/유일-route 추측 fallback은 제거한다.
+- 고정 프로토콜 포트: 네트워크 클라이언트가 라우트 없이 접근하면 fail-closed로 거부한다. 호스트가 실제로 그 포트를 점유 중이면 게이트웨이는 그 포트를 점유하지 않는다(never-evict).
+
+게이트웨이가 논리 포트를 점유하는 동안 non-attached 터미널에서 시작된 서버가 같은 포트에 bind하면, hook이 그 서버를 고포트로 재배치해 passthrough owner로 등록한다. 게이트웨이는 `portManager.logicalPortGateway` 설정으로 끌 수 있으며, 끄면 in-process hook fast-path만 사용한다.
+
+hook의 `bind`는 서버를 per-network loopback alias로 옮기는 in-process 재작성을 계속 담당한다(프로세스 밖에서는 불가능). preload를 잃은 서버(보호 경계 뒤 절대경로 `#!` 인터프리터)는 alias bind를 못 받아 같은 포트 다중 네트워크 격리가 서버 측에서 깨질 수 있으며, 이는 명시적 실패로 드러난다.
+
 #### Terminal Discovery
 
 VS Code 통합 터미널만이 아니라 macOS Terminal/iTerm2, Linux terminal emulator, Windows Terminal, PowerShell, cmd, WSL 터미널의 shell/process tree를 조회하고, 이를 터미널 창/세션 단위로 그룹화해 사용자가 연결할 대상을 선택할 수 있게 하는 기능이다. 플랫폼이 window/tab title을 제공하면 그 title을 기본 표시명으로 사용한다.
@@ -105,7 +119,7 @@ VS Code 통합 터미널만이 아니라 macOS Terminal/iTerm2, Linux terminal e
   - 권한 제한으로 전체 정보를 얻지 못하면 식별 가능한 범위만 표시하고 제한 사유를 남긴다.
 - 사용자는 새 Logical Network를 만들고 이름을 지정할 수 있어야 한다.
 - 사용자는 탐색된 터미널 창/세션을 선택해 Logical Network에 attach할 수 있어야 한다.
-- attach 이후 해당 터미널에서 실행되는 개발 서버는 같은 Logical Network 안에서 동작해야 하며, 명시적인 Host Port Exposure가 없는 한 호스트 머신의 동일 포트를 점유하지 않아야 한다.
+- attach 이후 해당 터미널에서 실행되는 개발 서버는 같은 Logical Network 안에서 동작해야 하며, 명시적인 Host Port Exposure가 없는 한 호스트 머신의 동일 포트를 애플리케이션 서버로 점유하지 않아야 한다. 단, Logical Port Gateway는 그 논리 포트를 `127.0.0.1`에서 라우팅 mux로 점유할 수 있다. 이 리스너는 애플리케이션 서버가 아니라 소스 프로세스별로 각 네트워크 백엔드로 포워딩하는 게이트웨이이며, 식별되지 않은 클라이언트는 network-less passthrough owner로만 보내거나 거부한다.
 - 같은 내부 포트 조합을 사용하는 여러 앱이 서로 다른 Logical Network에서 동시에 실행될 수 있어야 한다.
 - 사용자는 호스트 노출 포트를 직접 설정해야 한다.
   - 예: `localhost:3004 -> A network:3004`

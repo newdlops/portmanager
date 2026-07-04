@@ -45,6 +45,40 @@ export function findRoutesMatchingClientCwd(
 }
 
 /**
+ * Selects the network-less relocated listen route that owns a logical port.
+ *
+ * A non-network server that wanted a gateway-owned port is relocated to a high
+ * port and registered as a listen route with no network id. That row is the
+ * real 127.0.0.1 coordinate the logical port gateway passes non-network clients
+ * through to. When sibling non-network servers share a logical port, the client
+ * cwd disambiguates; an ambiguous or empty set returns undefined so the gateway
+ * refuses rather than leaking an unrelated server.
+ */
+export function selectNonNetworkOwnerRoute(
+  routes: readonly LogicalPortRoute[],
+  logicalPort: number,
+  clientCwd: string | undefined,
+): LogicalPortRoute | undefined {
+  const candidates = routes.filter(
+    (route) =>
+      route.logicalPort === logicalPort &&
+      route.networkId === undefined &&
+      (route.routeDirection === undefined || route.routeDirection === "listen") &&
+      route.status === "running",
+  );
+
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+  if (candidates.length === 0 || clientCwd === undefined) {
+    return undefined;
+  }
+
+  const cwdMatches = findRoutesMatchingClientCwd(candidates, logicalPort, clientCwd);
+  return cwdMatches.length === 1 ? cwdMatches[0] : undefined;
+}
+
+/**
  * Returns true when two paths describe the same directory scope.
  *
  * Either side may be the direct project root while the other is a child working

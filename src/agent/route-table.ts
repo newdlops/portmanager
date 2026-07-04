@@ -140,6 +140,25 @@ export function getRouteTablePathForComposeClaimPort(
   return path.join(parsedPath.dir, `${parsedPath.name}-compose-claim-port-${port}${extension}`);
 }
 
+/**
+ * Builds the global logical-port-gateway claim index for one logical port.
+ *
+ * When the gateway opens a localhost router for a port, it writes this small
+ * per-port file. The native hook checks it on a scope-less bind so a
+ * non-attached terminal's server that wants a gateway-owned port relocates to a
+ * high port (becoming the passthrough target) instead of being silently
+ * shadowed by the router's listener.
+ */
+export function getRouteTablePathForGatewayClaimPort(
+  port: number,
+  baseRouteTablePath = getDefaultRouteTablePath(),
+): string {
+  const parsedPath = path.parse(baseRouteTablePath);
+  const extension = parsedPath.ext.length > 0 ? parsedPath.ext : ".json";
+
+  return path.join(parsedPath.dir, `${parsedPath.name}-mux-claim-port-${port}${extension}`);
+}
+
 /** Builds the per-user network-to-host binding file path shared with native hooks. */
 export function getDefaultHostAccessBindingsPath(): string {
   const userId = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;

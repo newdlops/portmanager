@@ -100,6 +100,7 @@ export function readPortManagerSettings(): PortManagerSettings {
       "monitorAllListeningPorts",
       DEFAULT_SETTINGS.monitorAllListeningPorts,
     ),
+    logicalPortGateway: config.get<boolean>("logicalPortGateway", DEFAULT_SETTINGS.logicalPortGateway),
     detectTerminalListenFailures: config.get<boolean>(
       "detectTerminalListenFailures",
       DEFAULT_SETTINGS.detectTerminalListenFailures,

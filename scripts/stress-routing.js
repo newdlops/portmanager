@@ -289,7 +289,7 @@ async function stressNativeRouter(count) {
       stdoutBuffer = stdoutBuffer.slice(lineEnd + 1);
       const parts = line.split("\t");
 
-      if (line === "READY\tcontrol") {
+      if (line === "READY\tcontrol" || line.startsWith("READY\tcontrol\t")) {
         controlReady.resolve();
         continue;
       }

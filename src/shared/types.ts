@@ -519,6 +519,12 @@ export interface PortManagerSettings {
   readonly notifyOnDetectedConflict: boolean;
   /** Whether the local agent should report every listening TCP port. */
   readonly monitorAllListeningPorts: boolean;
+  /**
+   * Whether the logical port gateway owns logical ports on localhost and routes
+   * connections by source-process attribution. When off, routing falls back to
+   * the in-process hook fast path only (no daemon-owned localhost listeners).
+   */
+  readonly logicalPortGateway: boolean;
   /** Whether terminal output should be scanned for bind/listen failures. */
   readonly detectTerminalListenFailures: boolean;
   /** Whether explicit terminal port commands should be offered daemon routing at start. */

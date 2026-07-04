@@ -120,6 +120,39 @@ test("parses native logical router control requests", () => {
   });
 });
 
+test("parses native logical router v2 requests with source attribution", () => {
+  const query = parseNativeRouterQueryLine(
+    "CONNECT\t42\t15432\t127.0.0.1\t15432\t127.0.0.1\t49152\t8123\t1751600000\tnetwork-a",
+  );
+
+  assert.deepEqual(query, {
+    id: "42",
+    logicalPort: 15432,
+    localAddress: "127.0.0.1",
+    localPort: 15432,
+    remoteAddress: "127.0.0.1",
+    remotePort: 49152,
+    clientPid: 8123,
+    clientStartTime: "1751600000",
+    clientNetworkId: "network-a",
+  });
+});
+
+test("treats v2 dash placeholders as unresolved attribution", () => {
+  const query = parseNativeRouterQueryLine(
+    "CONNECT\t42\t15432\t127.0.0.1\t15432\t127.0.0.1\t49152\t-\t-\t-",
+  );
+
+  assert.deepEqual(query, {
+    id: "42",
+    logicalPort: 15432,
+    localAddress: "127.0.0.1",
+    localPort: 15432,
+    remoteAddress: "127.0.0.1",
+    remotePort: 49152,
+  });
+});
+
 test("native logical router helper starts without inherited hook environment", async () => {
   const logicalPort = 61234;
   const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pm-router-env-"));
@@ -195,7 +228,7 @@ test("native logical router pending route requests time out instead of blocking 
   assert.equal(routerSource.includes("if (!route.resolved || route.failed"), true);
   assert.equal(routerSource.includes("listener_list_t"), true);
   assert.equal(routerSource.includes("\"LISTEN\\t\""), true);
-  assert.equal(routerSource.includes("\"READY\\tcontrol\\n\""), true);
+  assert.equal(routerSource.includes("\"READY\\tcontrol\\t%d\\n\""), true);
   assert.equal(routerSource.includes("\"LISTEN_ERROR\\t%d\\n\""), true);
   assert.equal(routerSource.includes("PM_ROUTER_USE_KQUEUE"), true);
   assert.equal(routerSource.includes("kevent(pm_kqueue_fd"), true);

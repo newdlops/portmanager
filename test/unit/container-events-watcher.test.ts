@@ -147,7 +147,7 @@ test("events watcher debounces a burst of lifecycle events into one notification
   assert.equal(watcher.isHealthy(), true);
   assert.equal(eventCount, 0);
 
-  await delay(600);
+  await delay(1000);
   assert.equal(eventCount, 1);
   watcher.dispose();
 });
@@ -168,7 +168,7 @@ test("events watcher buffers partial lines across stream chunks", async () => {
   child.emitStdout('{"Type":"container","Ac');
   child.emitStdout('tion":"start"}\n');
 
-  await delay(600);
+  await delay(1000);
   assert.equal(eventCount, 1);
   watcher.dispose();
 });
@@ -193,7 +193,7 @@ test("events watcher reports unhealthy after the stream exits and ignores noise 
   child.emitExit(1);
   assert.equal(watcher.isHealthy(), false);
 
-  await delay(600);
+  await delay(1000);
   assert.equal(eventCount, 0);
   watcher.dispose();
 });

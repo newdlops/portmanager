@@ -4,41 +4,57 @@ import * as path from "node:path";
 import test from "node:test";
 
 /**
- * Regression checks for the native asdf launcher source.
+ * Regression checks for the native runtime launcher source.
  *
- * The binary is exercised by build:hook, while this test protects the policy
- * that prevents asdf's own resolver helpers from re-entering Port Manager
- * runtime shims before the requested runtime can be exec'd.
+ * The launcher is installed on PATH under runtime names (node, python, ...) so
+ * that when a protected launcher (`/usr/bin/env`, `/bin/sh`) strips DYLD, the
+ * next `env node` re-enters this launcher, which restores the preload and execs
+ * the REAL runtime. It must be runtime-manager agnostic: the real runtime is
+ * simply the next PATH entry of its own name — no asdf/nvm/Homebrew probing and
+ * no script parsing.
  */
 
-test("asdf resolver runs outside Port Manager hook and runtime shim PATH", () => {
-  const sourcePath = path.resolve(__dirname, "../../../native/asdf-shim/portmanager_asdf_shim.c");
+const sourcePath = path.resolve(__dirname, "../../../native/asdf-shim/portmanager_asdf_shim.c");
+
+test("runtime launcher resolves the real runtime as the next PATH entry, manager agnostic", () => {
   const source = fs.readFileSync(sourcePath, "utf8");
 
-  assert.equal(source.includes('setenv("PORT_MANAGER_HOOK_DISABLED", "1", 1);'), true);
-  assert.equal(source.includes("unsetenv(PM_PRELOAD_ENV);"), true);
-  assert.equal(source.includes("unsetenv(PM_PRELOAD_HINT_ENV);"), true);
-  assert.equal(source.includes('unsetenv("BASH_ENV");'), true);
-  assert.equal(source.includes("pm_path_without_runtime_shims(tool_name, self_path)"), true);
+  // Resolution is pure next-in-PATH: skip our own shim dir and our own file.
+  assert.equal(source.includes("static int pm_resolve_tool("), true);
+  assert.equal(source.includes("pm_same_directory(directory, shim_directory)"), true);
   assert.equal(source.includes("pm_candidate_is_current_shim(candidate, self_path)"), true);
+  assert.equal(source.includes("pm_is_executable_file(candidate)"), true);
+  assert.equal(source.includes("pm_resolve_tool(tool_name, resolved_self_path"), true);
+
+  // No manager-specific probing or script parsing survives.
+  assert.equal(source.includes("pm_asdf_which"), false, "must not shell out to `asdf which`");
+  assert.equal(source.includes("pm_is_asdf_shim_candidate"), false, "must not special-case asdf shim paths");
+  assert.equal(source.includes("ASDF_NODEJS_CANON_NPM_PATH"), false, "must not carry asdf-nodejs npm wrapper logic");
+  assert.equal(source.includes("pm_prepare_asdf_nodejs_npm_wrapper"), false);
+  assert.equal(source.includes("pm_disable_hook_for_tool_resolution"), false);
+  assert.equal(source.includes("pm_read_shebang"), false, "must not parse script shebangs");
+  assert.equal(source.includes("exec \\\""), false, "must not parse exec lines from scripts");
 });
 
-test("asdf shim fallback skips hard-linked Port Manager aliases", () => {
-  const sourcePath = path.resolve(__dirname, "../../../native/asdf-shim/portmanager_asdf_shim.c");
+test("runtime launcher restores preload and network scope then execs the real runtime", () => {
   const source = fs.readFileSync(sourcePath, "utf8");
 
+  // Skips its own hard-linked aliases by device/inode identity.
   assert.equal(source.includes("left_stat.st_dev == right_stat.st_dev"), true);
   assert.equal(source.includes("left_stat.st_ino == right_stat.st_ino"), true);
   assert.equal(source.includes("pm_resolve_self_path(tool_name, argv[0], self_path"), true);
-  assert.equal(source.includes("pm_resolve_tool(tool_name, resolved_self_path"), true);
+
+  // Restores the preload + network scope, then execs the resolved real runtime.
+  assert.equal(source.includes("pm_restore_network_scope();"), true);
+  assert.equal(source.includes("pm_restore_dyld();"), true);
+  assert.equal(source.includes("execv(executable_path, next_argv);"), true);
 });
 
-test("asdf nodejs npm wrapper receives canonical npm path", () => {
-  const sourcePath = path.resolve(__dirname, "../../../native/asdf-shim/portmanager_asdf_shim.c");
+test("runtime launcher guards against a resolution loop", () => {
   const source = fs.readFileSync(sourcePath, "utf8");
 
-  assert.equal(source.includes("pm_prepare_asdf_nodejs_npm_wrapper(tool_name, executable_path, resolved_self_path);"), true);
-  assert.equal(source.includes('setenv("ASDF_NODEJS_CANON_NPM_PATH", canonical_npm, 1);'), true);
-  assert.equal(source.includes("pm_find_on_path_excluding(\"npm\", self_path, executable_path"), true);
-  assert.equal(source.includes("pm_is_asdf_shim_candidate(candidate)"), true);
+  // A depth counter caps re-entry when the next PATH entry is itself a shim.
+  assert.equal(source.includes("PM_RUNTIME_SHIM_DEPTH_ENV"), true);
+  assert.equal(source.includes("depth >= PM_RUNTIME_SHIM_DEPTH_LIMIT"), true);
+  assert.equal(source.includes("runtime resolution loop"), true);
 });

@@ -106,251 +106,61 @@ test("package command shims rerun client tools without native runtime alias sema
   const launcherList = /const PRELOAD_RUNTIME_LAUNCHER_NAMES = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
   const packageCommandList = /const PRELOAD_PACKAGE_COMMAND_NAMES(?::[^=]+)? = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
   const packageManagerList = /const PRELOAD_PACKAGE_MANAGER_NAMES(?::[^=]+)? = \[([\s\S]*?)\];/.exec(source)?.[1] ?? "";
-  const packageManagerShimStart = source.indexOf("function buildPreloadPackageManagerCommandShimScript");
-  const packageManagerShimEnd = source.indexOf("function shellEnvRestoreFileName", packageManagerShimStart);
-  const packageManagerShim = source.slice(packageManagerShimStart, packageManagerShimEnd);
-  const packageManagerProjectCommandStart = packageManagerShim.indexOf("if __pm_package_manager_command_runs_project_code");
-  const packageManagerProjectCommandEnd = packageManagerShim.indexOf('exec "\\${__pm_target}" "$@"', packageManagerProjectCommandStart);
-  const packageManagerProjectCommandBlock = packageManagerShim.slice(
-    packageManagerProjectCommandStart,
-    packageManagerProjectCommandEnd,
-  );
-  const preloadedManagerStart = source.indexOf("function buildPreloadedPackageManagerEntrypointShell");
-  const preloadedManagerEnd = source.indexOf("function buildPreloadPackageCommandShimScript", preloadedManagerStart);
-  const preloadedManagerBlock = source.slice(preloadedManagerStart, preloadedManagerEnd);
-  const hookedManagerStart = source.indexOf("function buildHookedPackageManagerEntrypointShell");
-  const hookedManagerEnd = source.indexOf("function buildPreloadedPackageManagerEntrypointShell", hookedManagerStart);
-  const hookedManagerBlock = source.slice(hookedManagerStart, hookedManagerEnd);
-  const viteHostNarrowingStart = source.indexOf("function buildViteHostNarrowingShell");
-  const viteHostNarrowingEnd = source.indexOf("/**\n * Protected shebang launchers", viteHostNarrowingStart);
-  const viteHostNarrowingBlock = source.slice(viteHostNarrowingStart, viteHostNarrowingEnd);
-  const nodeEntrypointBypassStart = source.indexOf("function buildPreloadNodeEntrypointBypassShell");
-  const nodeEntrypointBypassEnd = source.indexOf("function buildCleanPackageManagerEntrypointShell", nodeEntrypointBypassStart);
-  const nodeEntrypointBypassBlock = source.slice(nodeEntrypointBypassStart, nodeEntrypointBypassEnd);
+  const bypassStart = source.indexOf("function buildPreloadNodeEntrypointBypassShell");
+  const bypassEnd = source.indexOf("function buildCleanPackageManagerEntrypointShell", bypassStart);
+  const bypassBlock = source.slice(bypassStart, bypassEnd);
+  const cleanStart = source.indexOf("function buildCleanPackageManagerEntrypointShell");
+  const cleanEnd = source.indexOf("function buildHookedPackageManagerEntrypointShell", cleanStart);
+  const cleanBlock = source.slice(cleanStart, cleanEnd);
 
+  // Package binaries still classify as command-capturing preload shims, not runtime-launcher aliases.
   for (const packageBinary of ["concurrently", "wait-on", "retry", "vite", "dotenv", "celery", "uvicorn", "gunicorn", "daphne"]) {
-    assert.equal(
-      launcherList.includes(`"${packageBinary}"`),
-      false,
-      `${packageBinary} must not use the native runtime launcher argv semantics`,
-    );
-    assert.equal(
-      packageCommandList.includes(`"${packageBinary}"`),
-      true,
-      `${packageBinary} must use the command-capturing preload shim`,
-    );
+    assert.equal(launcherList.includes(`"${packageBinary}"`), false, `${packageBinary} must not use the native runtime launcher argv semantics`);
+    assert.equal(packageCommandList.includes(`"${packageBinary}"`), true, `${packageBinary} must use the command-capturing preload shim`);
   }
-
   for (const packageManager of ["npm", "npx", "pnpm", "pnpx", "corepack", "uv", "uvx", "yarn", "yarnpkg"]) {
-    assert.equal(
-      launcherList.includes(`"${packageManager}"`),
-      false,
-      `${packageManager} must not be hooked as a runtime launcher`,
-    );
-    assert.equal(
-      packageCommandList.includes(`"${packageManager}"`),
-      false,
-      `${packageManager} must not be hooked as a package command shim`,
-    );
-    assert.equal(
-      packageManagerList.includes(`"${packageManager}"`),
-      true,
-      `${packageManager} must use the package-manager project-command detector shim`,
-    );
+    assert.equal(launcherList.includes(`"${packageManager}"`), false, `${packageManager} must not be hooked as a runtime launcher`);
+    assert.equal(packageCommandList.includes(`"${packageManager}"`), false, `${packageManager} must not be hooked as a package command shim`);
+    assert.equal(packageManagerList.includes(`"${packageManager}"`), true, `${packageManager} must use the package-manager project-command detector shim`);
   }
 
   assert.equal(source.includes("buildPreloadPackageCommandShimScript"), true);
   assert.equal(source.includes("buildPreloadPackageManagerCommandShimScript"), true);
   assert.equal(source.includes("writePreloadPackageManagerCommandShims"), true);
-  assert.equal(source.includes("__pm_package_manager_command_runs_project_code()"), true);
-  assert.equal(source.includes("__pm_dependency_command_name()"), true);
-  assert.equal(source.includes("run|tool|x|uvx) return 0"), true);
-  assert.equal(source.includes("install|i|ci|add|remove|rm|uninstall|unlink|link"), true);
-  assert.equal(source.includes("preinstall|install:clean|postinstall|prepare"), true);
-  assert.equal(source.includes("__pm_text_looks_like_dev_server()"), true);
-  assert.equal(source.includes("__pm_package_script_text()"), true);
-  assert.equal(source.includes("*vite*"), true);
-  assert.equal(source.includes("*celery*"), true);
-  assert.equal(source.includes("*uvicorn*"), true);
-  assert.equal(source.includes("removeLegacyPreloadPackageManagerShims"), false);
-  assert.equal(source.includes("PRELOAD_PACKAGE_MANAGER_NAMES.includes(entry.name)"), true);
-  assert.equal(source.includes("__pm_is_package_command_shim()"), true);
   assert.equal(source.includes("export PORT_MANAGER_PRELOAD_REPAIR=1"), true);
-  assert.equal(
-    source.includes('collection.replace("PORT_MANAGER_COMPOSE_LOGICAL_PORTS", composeLogicalPorts, TERMINAL_MUTATOR_OPTIONS);'),
-    true,
-    "terminal env collection must clear stale compose logical ports when the current network has none",
-  );
-  assert.equal(
-    source.includes("const composeLogicalPortsExport = `export PORT_MANAGER_COMPOSE_LOGICAL_PORTS=${shellQuote(composeLogicalPorts)}`;"),
-    true,
-    "BASH_ENV restore must clear stale compose logical ports when the current network has none",
-  );
+
+  // Preload restoration stays, but script/shebang parsing is gone: the bypass
+  // shell now execs the target directly with the already-restored preload.
+  assert.equal(source.includes("function buildPreloadNodeEntrypointBypassShell"), true);
+  assert.equal(bypassBlock.includes("sed -n"), false, "the node entrypoint bypass must not parse script contents");
+  assert.equal(bypassBlock.includes("__pm_first_line"), false, "the node entrypoint bypass must not read shebang lines");
+  assert.equal(bypassBlock.includes('exec "\\${__pm_target}" "$@"'), true, "the bypass must exec the target with the restored preload");
+  assert.equal(source.includes("function buildViteHostNarrowingShell"), false, "vite --host argument parsing must be removed");
+  assert.equal(source.includes("__pm_vite_host_pending"), false, "no shell-side vite --host rewriting should remain");
+
+  // The clean package-manager exec still unsets DYLD for the manager layer but no longer parses scripts.
+  assert.equal(source.includes("function buildCleanPackageManagerEntrypointShell"), true);
+  assert.equal(cleanBlock.includes("Darwin) unset DYLD_INSERT_LIBRARIES ;;"), true, "the clean exec must still drop macOS DYLD from the manager layer");
+  assert.equal(cleanBlock.includes("sed -n"), false, "the clean package-manager exec must not parse script contents");
+  assert.equal(cleanBlock.includes("__pm_find_real_runtime"), false, "the clean exec must not resolve runtimes by parsing PATH scripts");
+
+  // Vite safe-host env injection is retained (environment, not argument parsing).
+  assert.equal(source.includes("function buildViteAllowedHostsExport"), true);
+  assert.equal(source.includes("PORT_MANAGER_VITE_ALLOWED_HOSTS"), true);
+
+  // Package-manager project-command detection (preload retention heuristic) is unchanged.
+  assert.equal(source.includes("__pm_package_manager_command_runs_project_code()"), true);
+  assert.equal(source.includes("__pm_text_looks_like_dev_server()"), true);
+  assert.equal(source.includes("__pm_package_manager_requires_preload_parent()"), true);
+  assert.equal(source.includes("function buildHookedPackageManagerEntrypointShell"), true);
+  assert.equal(source.includes("function buildPreloadedPackageManagerEntrypointShell"), true);
+
+  // BASH_ENV preload repair stays gated on the hook remaining enabled.
   assert.equal(
     source.includes(
       'if [ "\\${PORT_MANAGER_HOOK_DISABLED:-}" != "1" ] && [ "\\${PORT_MANAGER_HOOK:-1}" != "0" ] && [ "\\${PORT_MANAGER_PRELOAD_REPAIR:-}" = "1" ] && [ -n "\\${PORT_MANAGER_DYLD_INSERT_LIBRARIES:-}" ]; then',
     ),
     true,
-    "BASH_ENV must repair DYLD only while the Port Manager hook remains enabled",
-  );
-  assert.equal(source.includes("unset BASH_ENV PORT_MANAGER_PRELOAD_REPAIR PORT_MANAGER_DYLD_INSERT_LIBRARIES"), true);
-  assert.equal(source.includes("PORT_MANAGER_COMPOSE_LOGICAL_PORTS"), true);
-  assert.equal(source.includes("PORT_MANAGER_TERMINAL_ATTACHMENT_DIR"), true);
-  assert.equal(
-    source.includes('if __pm_is_package_command_shim "\\${__pm_candidate}"; then'),
-    true,
-    "package command shim must skip sibling Port Manager package shims in later PATH entries",
-  );
-  assert.equal(source.includes('exec "\\${__pm_node}" "\\${__pm_unwrapped}" "$@"'), true);
-  assert.equal(
-    source.includes('__pm_exec_script="$(sed -n'),
-    true,
-    "package command shim must parse Yarn temporary wrappers that exec node plus a JS entrypoint",
-  );
-  assert.equal(
-    source.includes('exec "\\${__pm_node}" "\\${__pm_exec_script}" "$@"'),
-    true,
-    "package command shim must bypass temporary shell wrappers before they strip DYLD again",
-  );
-  assert.equal(
-    source.includes("function buildPreloadNodeEntrypointBypassShell"),
-    true,
-    "package-bin shims must keep the Node entrypoint bypass for protected shebangs",
-  );
-  assert.equal(
-    source.includes("function buildViteHostNarrowingShell"),
-    true,
-    "Vite package-bin shims must constrain unsafe --host forms to localhost",
-  );
-  assert.equal(
-    nodeEntrypointBypassBlock.includes("${buildViteHostNarrowingShell()}"),
-    true,
-    "package-bin shims must normalize Vite args before executing protected Node entrypoints",
-  );
-  assert.equal(
-    viteHostNarrowingBlock.includes('[ "\\${__pm_name:-}" = "vite" ]'),
-    true,
-    "host narrowing must apply only to Vite command shims",
-  );
-  assert.equal(
-    viteHostNarrowingBlock.includes('__pm_vite_host="localhost"'),
-    true,
-    "host narrowing must keep Vite listening as localhost",
-  );
-  assert.equal(
-    viteHostNarrowingBlock.includes("PORT_MANAGER_NETWORK_DNS_ALIAS"),
-    true,
-    "host narrowing must fold the active DNS alias back to localhost",
-  );
-  assert.equal(
-    source.includes("function buildViteAllowedHostsExport"),
-    true,
-    "network DNS aliases must be registered as Vite safe hosts in attached terminals",
-  );
-  assert.equal(
-    source.includes("PORT_MANAGER_VITE_ALLOWED_HOSTS"),
-    true,
-    "Port Manager-owned safe host entries must be tracked separately from user Vite hosts",
-  );
-  assert.equal(
-    source.includes("${viteAllowedHostsExport}"),
-    true,
-    "BASH_ENV restore must publish DNS aliases to the Vite safe-host environment",
-  );
-  assert.equal(
-    viteHostNarrowingBlock.includes("--host=|--host=0.0.0.0|--host=::|--host=\\\\*)"),
-    true,
-    "wildcard --host forms must be rewritten to localhost",
-  );
-  assert.equal(
-    viteHostNarrowingBlock.includes('set -- "$@" "\\${__pm_vite_host}" "\\${__pm_arg}"'),
-    true,
-    "bare --host before another option must insert localhost before preserving that option",
-  );
-  assert.equal(
-    source.includes("function buildCleanPackageManagerEntrypointShell"),
-    true,
-    "package-manager shims must clean-run manager layers before child runtime shims restore preload",
-  );
-  assert.equal(
-    source.includes("function buildHookedPackageManagerEntrypointShell"),
-    true,
-    "script-based package managers must keep native exec interception for absolute node_modules/.bin launches",
-  );
-  assert.equal(
-    source.includes("function buildPreloadedPackageManagerEntrypointShell"),
-    true,
-    "package-manager shims must preserve preload for managers that exec runtimes by absolute path",
-  );
-  assert.equal(
-    source.includes("__pm_package_manager_requires_preload_parent()"),
-    true,
-    "package-manager shim must classify managers that need parent preload",
-  );
-  assert.equal(
-    source.includes("uv|uvx) return 0"),
-    true,
-    "uv and uvx must stay preloaded so uv-run Python children keep routing hooks",
-  );
-  assert.equal(
-    source.includes("npm|npx|pnpm|pnpx|corepack|yarn|yarnpkg) return 0"),
-    true,
-    "Node package managers must keep the parent hook during project scripts so Yarn shell launches can be rewritten",
-  );
-  assert.equal(
-    source.includes("__pm_package_manager_is_native_binary()"),
-    true,
-    "package-manager shim must keep native binaries out of script parsing",
-  );
-  assert.equal(
-    packageManagerProjectCommandBlock.includes("${buildCleanPackageManagerEntrypointShell()}"),
-    true,
-    "package-manager project commands must keep a clean fallback for Node manager layers",
-  );
-  assert.equal(
-    packageManagerProjectCommandBlock.includes("${buildPreloadedPackageManagerEntrypointShell()}"),
-    true,
-    "package-manager project commands must preserve preload before clean fallback when needed",
-  );
-  assert.equal(
-    packageManagerProjectCommandBlock.includes("${buildHookedPackageManagerEntrypointShell()}"),
-    true,
-    "package-manager project commands must run script-based managers with a hooked parent",
-  );
-  assert.equal(
-    packageManagerProjectCommandBlock.includes("__pm_package_manager_is_native_binary"),
-    true,
-    "package-manager project commands must avoid Node wrapper parsing for native package managers",
-  );
-  assert.equal(
-    packageManagerProjectCommandBlock.includes("export PORT_MANAGER_PRELOAD_REPAIR=1"),
-    true,
-    "package-manager shim must repair runtime commands while keeping dependency lifecycle commands clean",
-  );
-  assert.equal(
-    source.includes('buildShellPrependVariablePathListEntry("DYLD_INSERT_LIBRARIES", "PORT_MANAGER_DYLD_INSERT_LIBRARIES")'),
-    true,
-    "preload-parent package managers must restore macOS DYLD before running project code",
-  );
-  assert.equal(
-    hookedManagerBlock.includes("buildPreloadNodeEntrypointBypassShell"),
-    true,
-    "hooked script package managers must bypass protected Node shebangs while preserving preload",
-  );
-  assert.equal(
-    preloadedManagerBlock.includes('exec "\\${__pm_target}" "$@"`;'),
-    true,
-    "preload-parent package managers should exec the native manager directly instead of parsing it as a Node wrapper",
-  );
-  assert.equal(
-    preloadedManagerBlock.includes("buildPreloadNodeEntrypointBypassShell"),
-    false,
-    "preload-parent package managers must not parse native binaries with the Node wrapper bypass",
-  );
-  assert.equal(
-    source.includes("Darwin) unset DYLD_INSERT_LIBRARIES ;;"),
-    true,
-    "package-manager clean exec should remove macOS DYLD only from the manager layer",
   );
 });
 
@@ -1009,7 +819,10 @@ test("background routing refresh converges daemon version and generated route fi
   assert.equal(convergeBody.includes("await this.processService.refresh().catch(() => undefined);"), false);
   assert.equal(convergeBody.includes("await this.syncLogicalPortRouters().catch(() => undefined);"), true);
   assert.equal(ensureBody.includes('daemon.status !== "running"'), true);
-  assert.equal(ensureBody.includes("usesLoopbackAddressOnlyRouting(readPortManagerSettings())"), true);
+  assert.equal(
+    ensureBody.includes("usesLoopbackAddressOnlyRouting(settings) && !this.shouldRunLogicalPortGatewayDaemon(settings)"),
+    true,
+  );
   assert.equal(ensureBody.includes("await this.processService.start();"), true);
   assert.equal(ensureBody.includes("daemon.restartRequired"), true);
   assert.equal(ensureBody.includes("await this.processService.restartDaemon();"), true);
@@ -1100,7 +913,10 @@ test("global storage cleanup rehydrates generated routing from live attachment s
     true,
   );
   assert.equal(source.includes("async function routeTableFileIsFresh"), true);
-  assert.equal(materializeBody.includes("usesLoopbackAddressOnlyRouting(readPortManagerSettings())"), true);
+  assert.equal(
+    materializeBody.includes("usesLoopbackAddressOnlyRouting(settings) && !this.shouldRunLogicalPortGatewayDaemon(settings)"),
+    true,
+  );
   assert.equal(materializeBody.includes("await this.processService.start();"), true);
   assert.equal(materializeBody.includes("await this.processService.refresh();"), true);
   assert.equal(source.includes("missing marker"), true);
@@ -1963,7 +1779,11 @@ test("logical routers expose host-client networks without taking unrelated netwo
   assert.equal(source.includes("Host-side client attachments are the exception"), true);
   assert.equal(collectLogicalRouterPorts.includes('route.source === "compose"'), false);
   assert.equal(collectLogicalRouterPorts.includes("routeNeedsLogicalRouter(route)"), true);
-  assert.equal(collectLogicalRouterPorts.includes("route.networkId === undefined || hostClientNetworkIds.has(route.networkId)"), true);
+  // With the gateway on, every attached network's routes open a router; the
+  // hookless host-client scope remains the legacy fallback when it is off.
+  assert.equal(collectLogicalRouterPorts.includes("options.gatewayEnabled === true"), true);
+  assert.equal(collectLogicalRouterPorts.includes("hostClientNetworkIds.has(route.networkId)"), true);
+  assert.equal(syncBody.includes("gatewayEnabled: readPortManagerSettings().logicalPortGateway"), true);
   assert.equal(source.includes("function collectHostClientAttachmentNetworkIds"), true);
   assert.equal(source.includes("function isHooklessHostClientAttachment"), true);
   assert.equal(source.includes("attachment.id.startsWith(PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX)"), true);
@@ -1989,15 +1809,12 @@ test("logical router classifies clients by process tree label before hook enviro
   const methodStart = source.indexOf("private async findClientNetworkForRouter");
   const methodEnd = source.indexOf("private async findNetworkRouteForRouter", methodStart);
   const findClientNetworkForRouter = source.slice(methodStart, methodEnd);
-  const networkRouteStart = source.indexOf("private async findNetworkRouteForRouter");
-  const networkRouteEnd = source.indexOf("private async findUniqueRouteForRouter", networkRouteStart);
-  const findNetworkRouteForRouter = source.slice(networkRouteStart, networkRouteEnd);
-  const uniqueRouteStart = source.indexOf("private async findUniqueRouteForRouter");
-  const uniqueRouteEnd = source.indexOf("private findClientCwdRouteForRouter", uniqueRouteStart);
-  const findUniqueRouteForRouter = source.slice(uniqueRouteStart, uniqueRouteEnd);
-  const cwdRouteStart = source.indexOf("private findClientCwdRouteForRouter");
-  const cwdRouteEnd = source.indexOf("private findAttachedNetworkForPid", cwdRouteStart);
-  const findClientCwdRouteForRouter = source.slice(cwdRouteStart, cwdRouteEnd);
+  const verdictStart = source.indexOf("private async resolveRouterClientVerdict");
+  const verdictEnd = source.indexOf("private async resolveNetworkClientTarget", verdictStart);
+  const resolveRouterClientVerdict = source.slice(verdictStart, verdictEnd);
+  const networkTargetStart = source.indexOf("private async resolveNetworkClientTarget");
+  const networkTargetEnd = source.indexOf("private resolveNonNetworkClientTarget", networkTargetStart);
+  const resolveNetworkClientTarget = source.slice(networkTargetStart, networkTargetEnd);
 
   assert.equal(source.includes('from "../core/process-network-labels"'), true);
   assert.equal(
@@ -2007,22 +1824,24 @@ test("logical router classifies clients by process tree label before hook enviro
     "process tree labels must be the primary router signal; inherited hook env remains fallback",
   );
   assert.equal(findClientNetworkForRouter.includes("return environmentNetworkId;"), true);
-  assert.equal(
-    findNetworkRouteForRouter.includes("return candidates.length === 1 ? candidates[0] : undefined;"),
-    false,
-    "known-network router clients must not fall back to another network's sole route",
-  );
-  assert.equal(source.includes("explicit unscoped host routes"), true);
-  assert.equal(findUniqueRouteForRouter.includes("route.networkId === undefined"), true);
-  assert.equal(findUniqueRouteForRouter.includes("candidates.filter((route) => !isNetworkScopedComposeRoute(route))"), false);
-  assert.equal(source.includes("function isNetworkScopedComposeRoute"), false);
-  assert.equal(source.includes("findSingleAttachedRouteForRouter"), false);
-  assert.equal(findUniqueRouteForRouter.includes("return undefined;"), true);
-  assert.equal(findClientCwdRouteForRouter.includes("return undefined;"), true);
-  assert.equal(
-    findClientCwdRouteForRouter.includes(".attachments.filter((attachment) => attachment.status === \"attached\")"),
-    false,
-  );
+
+  // Native attribution short-circuits the lookups and verdicts are memoized.
+  assert.equal(resolveRouterClientVerdict.includes("connection.clientNetworkId !== undefined"), true);
+  assert.equal(resolveRouterClientVerdict.includes("this.routerVerdictCache.read("), true);
+  assert.equal(resolveRouterClientVerdict.includes("this.routerVerdictCache.store("), true);
+  assert.equal(resolveRouterClientVerdict.includes("ROUTER_NON_NETWORK_VERDICT"), true);
+
+  // Attributed network clients fail closed on fixed-protocol ports and otherwise
+  // synthesize the per-network loopback backend; they never inherit another
+  // network's sole route.
+  assert.equal(resolveNetworkClientTarget.includes("this.isFixedProtocolPort(logicalPort)"), true);
+  assert.equal(resolveNetworkClientTarget.includes("loopbackAddressForNetwork(networkId)"), true);
+
+  // The older cwd/unique-route guessing fallbacks are removed; the non-network
+  // path forwards only to an explicit relocated owner.
+  assert.equal(source.includes("private async findUniqueRouteForRouter"), false);
+  assert.equal(source.includes("private findClientCwdRouteForRouter"), false);
+  assert.equal(source.includes("selectNonNetworkOwnerRoute"), true);
 });
 
 test("compose reconciliation removes orphan daemon route rows before runtime refresh", () => {

@@ -3,6 +3,7 @@ import { createHash, randomUUID, X509Certificate } from "node:crypto";
 import * as syncFs from "node:fs";
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as net from "node:net";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import * as vscode from "vscode";
@@ -11,6 +12,7 @@ import {
   getDefaultHostAccessBindingsPath,
   getDefaultRouteTablePath,
   getLegacyDefaultRouteTablePath,
+  getRouteTablePathForGatewayClaimPort,
   getRouteTablePathForNetwork,
   routeTableRefreshMarginMs,
   ROUTE_TABLE_TTL_SECONDS_ENV,
@@ -35,7 +37,11 @@ import {
   resolveTerminalLoopbackAddressRoutingMode,
   usesLoopbackAddressOnlyRouting,
 } from "../core/networks/loopback-address";
-import { findRoutesMatchingClientCwd } from "../core/networks/logical-route-selection";
+import { selectNonNetworkOwnerRoute } from "../core/networks/logical-route-selection";
+import {
+  ROUTER_NON_NETWORK_VERDICT,
+  RouterVerdictCache,
+} from "../core/networks/router-verdict-cache";
 import { resolveProcessTreeNetworkLabel } from "../core/process-network-labels";
 import { SimpleEventEmitter } from "../shared/events";
 import {
@@ -83,6 +89,7 @@ import {
   type LogicalPortRouterTarget,
 } from "../platform/ports/logical-port-router";
 import { NodeTcpConnectionProcessResolver } from "../platform/ports/tcp-connection-process-resolver";
+import { ProcessTrackerManager } from "../platform/process/process-tracker-manager";
 import {
   buildProcessTreeContext,
   NodeProcessTableProvider,
@@ -220,6 +227,14 @@ const TERMINAL_ATTACHMENT_REFRESH_DEBOUNCE_MS = 50;
 const TERMINAL_ATTACHMENT_REFRESH_BURST_WINDOW_MS = 2_000;
 const TERMINAL_ATTACHMENT_REFRESH_BURST_INTERVAL_MS = 250;
 const FORCED_COMPOSE_RECONCILE_COALESCE_MS = 750;
+// While the container daemon is unreachable, forced override regeneration
+// cannot succeed; skipping retries for a short window prevents every refresh
+// tick from spawning doomed docker/compose commands for each attachment.
+const DOCKER_DAEMON_UNAVAILABLE_RETRY_BACKOFF_MS = 30_000;
+// Removing every packet-filter redirect needs an admin prompt. A transient
+// blink to zero redirects (daemon restart, attachment repair) must not ask for
+// a password, so empty sets only clear rules after staying empty this long.
+const HOST_LOCAL_GATEWAY_EMPTY_REDIRECT_STABLE_MS = 30_000;
 const TERMINAL_NETWORK_SERVICE_ENTRY_SEPARATOR = " || ";
 // A live PID's command line is immutable, so hits can outlive many sync
 // passes; rows are pruned as soon as the PID leaves the process snapshot.
@@ -227,6 +242,36 @@ const BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS = 600_000;
 const BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS = 15_000;
 const BROWSER_PROXY_ROUTE_HINT_CACHE_TTL_MS = 30_000;
 const BROWSER_PROXY_ROUTE_HINT_MISS_CACHE_TTL_MS = 5_000;
+/*
+ * Logical port gateway attribution verdicts.
+ *
+ * Each accepted connection is classified once per client process and cached by
+ * (pid, startTime) so a connection storm from the same client does not re-run
+ * the native/process lookups. Network verdicts expire faster than non-network
+ * ones because a terminal can detach without the pid changing; both are also
+ * cleared outright when the attachment set changes (see the registry handler).
+ */
+const ROUTER_NETWORK_VERDICT_TTL_MS = 10_000;
+const ROUTER_NON_NETWORK_VERDICT_TTL_MS = 30_000;
+const ROUTER_VERDICT_CACHE_MAX_ENTRIES = 4096;
+// How long the resolver waits for a synthesized same-port backend to accept
+// before answering optimistically, giving a just-starting dev server parity
+// with the in-process hook's connect wait while staying under the router's
+// response timeout.
+const ROUTER_LATE_BACKEND_PROBE_BUDGET_MS = 1_000;
+const ROUTER_LATE_BACKEND_PROBE_INTERVAL_MS = 100;
+const ROUTER_LATE_BACKEND_PROBE_CONNECT_TIMEOUT_MS = 200;
+
+/** Outcome of classifying one router client, shared by the network/non-network paths. */
+interface RouterClientVerdict {
+  readonly networkId?: string;
+  readonly processRows: readonly ProcessTableRow[];
+  readonly clientCwd?: string;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
 // One `ifconfig lo0` answers every alias membership question, so its parsed
 // address set is shared by all checks instead of spawning per address.
 const LOOPBACK_ALIAS_CACHE_TTL_MS = 5_000;
@@ -467,6 +512,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Legacy localhost listener router kept only so active listeners can be closed. */
   private readonly logicalPortRouter: LogicalPortRouterManager;
 
+  /** Native process-membership tracker driving env-free source attribution. */
+  private readonly processTracker: ProcessTrackerManager;
+
   /** Development browser entrypoints that isolate cookie jars by network loopback host. */
   private readonly browserNetworkProxy: BrowserNetworkProxyManager;
 
@@ -572,6 +620,19 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Route-file fallback targets used while the daemon snapshot is stale or incomplete. */
   private browserProxyGeneratedRouteTargetByEndpointId = new Map<string, BrowserNetworkProxyTarget>();
 
+  /** Logical port gateway attribution verdicts keyed by client (pid, startTime). */
+  private readonly routerVerdictCache = new RouterVerdictCache({
+    networkTtlMs: ROUTER_NETWORK_VERDICT_TTL_MS,
+    nonNetworkTtlMs: ROUTER_NON_NETWORK_VERDICT_TTL_MS,
+    maxEntries: ROUTER_VERDICT_CACHE_MAX_ENTRIES,
+  });
+
+  /** Attachment signature that last invalidated the verdict cache. */
+  private lastRouterAttachmentSignature = "";
+
+  /** Logical ports for which a gateway bind-claim file is currently published. */
+  private readonly gatewayClaimPorts = new Set<number>();
+
   /** Short-lived PID command cache used by browser proxy sync classification. */
   private readonly browserProxyProcessCommandTextCache = new Map<number, BrowserProxyCommandTextCacheEntry>();
 
@@ -586,6 +647,12 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Last host-local redirect signature that already triggered an automatic admin prompt. */
   private hostLocalGatewayRedirectInstallSignature: string | undefined;
+
+  /** First time the redirect selection was observed empty while rules are still installed. */
+  private hostLocalGatewayEmptyRedirectSinceMs = 0;
+
+  /** Retry gate set when compose regeneration fails because the container daemon is down. */
+  private dockerDaemonUnavailableUntilMs = 0;
 
   /** Guards privileged pf updates so route refresh bursts cannot stack admin prompts. */
   private hostLocalGatewayRedirectInstallInFlight: Promise<void> | undefined;
@@ -701,6 +768,9 @@ export class PortManagerNetworkService implements DisposableLike {
         nativeRouterPath: this.context.asAbsolutePath(getTcpRouterHelperRelativePath()),
       },
     );
+    this.processTracker = new ProcessTrackerManager({
+      trackerPath: this.context.asAbsolutePath(getProcessTrackerHelperRelativePath()),
+    });
     this.browserNetworkProxy = new BrowserNetworkProxyManager({
       resolve: (endpoint) => this.resolveBrowserNetworkProxyTarget(endpoint),
     }, {
@@ -729,6 +799,8 @@ export class PortManagerNetworkService implements DisposableLike {
       this.registry.onDidChange(() => {
         this.saveState();
         this.notifyRoutingActivity();
+        this.invalidateRouterVerdictsOnAttachmentChange();
+        this.syncProcessTrackerRoots();
         if (this.ownsControlPlaneLease) {
           this.syncComposeRoutingFreshnessHeartbeat();
           this.syncContainerEventsWatcher();
@@ -1782,7 +1854,7 @@ export class PortManagerNetworkService implements DisposableLike {
       network,
       resolveTerminalLoopbackAddressRoutingMode(settings),
     );
-    if (!usesLoopbackAddressOnlyRouting(settings)) {
+    if (!usesLoopbackAddressOnlyRouting(settings) || this.shouldRunLogicalPortGatewayDaemon(settings)) {
       await this.processService?.start();
     }
     await this.ensureNetworkComposeRoutingArtifacts(networkId);
@@ -1848,7 +1920,7 @@ export class PortManagerNetworkService implements DisposableLike {
       throw new Error(`Native terminal routing is not supported on ${process.platform}.`);
     }
 
-    if (!usesLoopbackAddressOnlyRouting(settings)) {
+    if (!usesLoopbackAddressOnlyRouting(settings) || this.shouldRunLogicalPortGatewayDaemon(settings)) {
       await this.processService?.start();
     }
     await this.ensureNetworkComposeRoutingArtifacts(networkId);
@@ -2812,6 +2884,7 @@ export class PortManagerNetworkService implements DisposableLike {
     void this.browserNetworkProxy.dispose();
     this.browserDnsServer.dispose();
     this.logicalPortRouter.dispose();
+    this.processTracker.dispose();
     releaseControlPlaneOwnerLease();
     releaseLogicalRouterOwnerLease();
     releaseBrowserNetworkProxyOwnerLease();
@@ -3532,11 +3605,22 @@ export class PortManagerNetworkService implements DisposableLike {
    * build. Restart failures are backed off because route convergence continues
    * through file regeneration and compose rehydration on later passes.
    */
+  /**
+   * True when this window should run the daemon so the logical port gateway can
+   * discover live logical ports (via the listener scan) and relocate
+   * non-network servers, even in loopback-address-only mode where routing would
+   * otherwise need no daemon. Gated by the gateway setting and native support.
+   */
+  private shouldRunLogicalPortGatewayDaemon(settings: PortManagerSettings = readPortManagerSettings()): boolean {
+    return settings.logicalPortGateway && shouldInjectTerminalHook(settings);
+  }
+
   private async ensureCurrentProcessDaemon(): Promise<void> {
     if (this.processService === undefined) {
       return;
     }
-    if (usesLoopbackAddressOnlyRouting(readPortManagerSettings())) {
+    const settings = readPortManagerSettings();
+    if (usesLoopbackAddressOnlyRouting(settings) && !this.shouldRunLogicalPortGatewayDaemon(settings)) {
       return;
     }
 
@@ -3585,7 +3669,8 @@ export class PortManagerNetworkService implements DisposableLike {
     if (this.processService === undefined) {
       return;
     }
-    if (usesLoopbackAddressOnlyRouting(readPortManagerSettings())) {
+    const settings = readPortManagerSettings();
+    if (usesLoopbackAddressOnlyRouting(settings) && !this.shouldRunLogicalPortGatewayDaemon(settings)) {
       return;
     }
 
@@ -4518,51 +4603,207 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * Resolves a raw localhost logical-port connection to a network route.
-   * This path is intentionally application-agnostic: it uses only the accepted
-   * TCP tuple, process table ancestry, terminal attachments, and route rows.
+   * Resolves a raw localhost logical-port connection to a forwarding target.
+   *
+   * The decision is source-first and application-agnostic: attribute the client
+   * process to a logical network (native attribution when available, else the
+   * process table ancestry and environment), then forward to that network's
+   * backend. Clients with no network identity are passed through to a
+   * non-network owner on 127.0.0.1 and refused when none exists, replacing the
+   * older cwd/unique-route guessing that could silently misroute.
    */
   private async resolveLogicalPortRouterTarget(
     connection: LogicalPortRouterConnection,
   ): Promise<LogicalPortRouterTarget> {
-    const clientProcess = await this.tcpConnectionProcessResolver.resolveClientProcess(connection);
+    const verdict = await this.resolveRouterClientVerdict(connection);
+
+    if (verdict.networkId !== undefined) {
+      return this.resolveNetworkClientTarget(verdict.networkId, connection.logicalPort, verdict.processRows);
+    }
+
+    return this.resolveNonNetworkClientTarget(connection.logicalPort, verdict.clientCwd);
+  }
+
+  /**
+   * Classifies one router client into a network or the non-network bucket.
+   *
+   * The native router already resolves pid/startTime/networkId for most
+   * connections; those short-circuit the lsof + process-table path. Results are
+   * memoized per client process so repeat connections skip the lookups.
+   */
+  private async resolveRouterClientVerdict(connection: LogicalPortRouterConnection): Promise<RouterClientVerdict> {
+    const nativePid = connection.clientPid;
+    const nativeStartTime = connection.clientStartTime;
+
+    // Native attribution carried the network id directly (fast path).
+    if (connection.clientNetworkId !== undefined && nativePid !== undefined) {
+      this.routerVerdictCache.store(nativePid, nativeStartTime, connection.clientNetworkId);
+      return { networkId: connection.clientNetworkId, processRows: [] };
+    }
+
+    if (nativePid !== undefined) {
+      const cached = this.routerVerdictCache.read(nativePid, nativeStartTime);
+      if (cached !== undefined) {
+        return cached === ROUTER_NON_NETWORK_VERDICT ? { processRows: [] } : { networkId: cached, processRows: [] };
+      }
+    }
+
+    let pid = nativePid;
+    let clientCwd: string | undefined;
+    if (pid === undefined) {
+      const clientProcess = await this.tcpConnectionProcessResolver.resolveClientProcess(connection);
+      pid = clientProcess?.pid;
+      clientCwd = clientProcess?.cwd;
+    }
+
+    if (pid === undefined) {
+      // The peer could not be attributed at all; treat it as non-network for
+      // this connection without caching (a later connection may resolve).
+      return { processRows: [] };
+    }
+
+    // Primary attribution: the native process tracker maps the client to its
+    // network from the attached-shell subtree with no env var, and survives
+    // fork/daemonize/reparent. Fall back to the process-tree/env resolver.
+    const trackedNetworkId = await this.processTracker.queryNetwork(pid);
+    if (trackedNetworkId !== undefined) {
+      this.routerVerdictCache.store(pid, nativeStartTime, trackedNetworkId);
+      return { networkId: trackedNetworkId, processRows: [] };
+    }
+
     const processRows = await this.processTableProvider.list().catch(() => []);
-    const networkId =
-      clientProcess === undefined ? undefined : await this.findClientNetworkForRouter(clientProcess.pid, processRows);
+    const networkId = await this.findClientNetworkForRouter(pid, processRows);
+    this.routerVerdictCache.store(pid, nativeStartTime, networkId ?? ROUTER_NON_NETWORK_VERDICT);
 
-    if (networkId === undefined) {
-      const cwdRoute =
-        clientProcess?.cwd === undefined
-          ? undefined
-          : this.findClientCwdRouteForRouter(connection.logicalPort, clientProcess.cwd);
+    return networkId === undefined ? { processRows, clientCwd } : { networkId, processRows };
+  }
 
-      if (cwdRoute !== undefined) {
-        return {
-          host: cwdRoute.host,
-          port: cwdRoute.actualPort,
-        };
+  /** Resolves the backend for a client attributed to a logical network. */
+  private async resolveNetworkClientTarget(
+    networkId: string,
+    logicalPort: number,
+    processRows: readonly ProcessTableRow[],
+  ): Promise<LogicalPortRouterTarget> {
+    const route = await this.findNetworkRouteForRouter(networkId, logicalPort, processRows);
+    if (route !== undefined) {
+      return { host: route.host, port: route.actualPort };
+    }
+
+    // Fixed-protocol ports must fail closed rather than dial a possibly wrong
+    // host, matching the in-process hook's connect behavior for these ports.
+    if (this.isFixedProtocolPort(logicalPort)) {
+      throw new Error(`No route for fixed-protocol port ${logicalPort} in ${networkId}; refusing.`);
+    }
+
+    // Same-port (loopback-address-only) networks may have no route row yet, or
+    // the server may still be starting. Synthesize the per-network loopback
+    // backend and give a starting server a brief grace window before answering.
+    const host = loopbackAddressForNetwork(networkId);
+    await this.waitForBackendReachable(host, logicalPort);
+    return { host, port: logicalPort };
+  }
+
+  /**
+   * Resolves the passthrough target for a client with no network identity.
+   *
+   * A non-network server that wanted this logical port was relocated to a high
+   * port and registered as a network-less listen route; that row is the real
+   * 127.0.0.1 coordinate. With no such owner the connection is refused so a
+   * network's port is never leaked to an unrelated client.
+   */
+  private resolveNonNetworkClientTarget(logicalPort: number, clientCwd: string | undefined): LogicalPortRouterTarget {
+    const ownerRoute = this.findNonNetworkOwnerRoute(logicalPort, clientCwd);
+    if (ownerRoute === undefined) {
+      throw new Error(`No non-network owner for localhost:${logicalPort}; refusing.`);
+    }
+
+    return { host: ownerRoute.host, port: ownerRoute.actualPort };
+  }
+
+  /** Finds the network-less relocated listen route that owns a logical port. */
+  private findNonNetworkOwnerRoute(logicalPort: number, clientCwd: string | undefined): LogicalPortRoute | undefined {
+    const snapshot = this.processService?.getSnapshot();
+    if (snapshot === undefined) {
+      return undefined;
+    }
+
+    return selectNonNetworkOwnerRoute(snapshot.routes, logicalPort, clientCwd);
+  }
+
+  /** True when a logical port number is a fixed-protocol port per user settings. */
+  private isFixedProtocolPort(logicalPort: number): boolean {
+    return readPortManagerSettings().fixedProtocolPorts.includes(logicalPort);
+  }
+
+  /** Waits briefly for a synthesized backend to accept, swallowing failures. */
+  private async waitForBackendReachable(host: string, port: number): Promise<void> {
+    const deadline = Date.now() + ROUTER_LATE_BACKEND_PROBE_BUDGET_MS;
+    for (;;) {
+      if (await this.isBackendReachable(host, port)) {
+        return;
       }
-
-      const uniqueRoute = await this.findUniqueRouteForRouter(connection.logicalPort);
-      if (uniqueRoute === undefined) {
-        throw new Error(`No attached logical network found for localhost:${connection.logicalPort} client.`);
+      if (Date.now() >= deadline) {
+        return;
       }
+      await delay(ROUTER_LATE_BACKEND_PROBE_INTERVAL_MS);
+    }
+  }
 
-      return {
-        host: uniqueRoute.host,
-        port: uniqueRoute.actualPort,
+  /** Attempts one short TCP connect to test backend reachability. */
+  private isBackendReachable(host: string, port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const socket = net.connect({ host, port });
+      let settled = false;
+      const settle = (reachable: boolean) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        socket.destroy();
+        resolve(reachable);
       };
+
+      socket.setTimeout(ROUTER_LATE_BACKEND_PROBE_CONNECT_TIMEOUT_MS);
+      socket.once("connect", () => settle(true));
+      socket.once("timeout", () => settle(false));
+      socket.once("error", () => settle(false));
+    });
+  }
+
+  /**
+   * Clears verdicts when the attachment set changes so a newly attached (or
+   * detached) client is reclassified immediately instead of after TTL. The
+   * attachment signature guards against unrelated registry churn (compose
+   * heartbeats, host exposures) clearing the cache needlessly.
+   */
+  private invalidateRouterVerdictsOnAttachmentChange(): void {
+    const signature = this.registry
+      .getSnapshot()
+      .attachments.map((attachment) => `${attachment.id}:${attachment.status}:${attachment.networkId ?? ""}`)
+      .sort()
+      .join("|");
+    if (signature === this.lastRouterAttachmentSignature) {
+      return;
     }
 
-    const route = await this.findNetworkRouteForRouter(networkId, connection.logicalPort, processRows);
-    if (route === undefined) {
-      throw new Error(`No route for logical port ${connection.logicalPort} in ${networkId}.`);
-    }
+    this.lastRouterAttachmentSignature = signature;
+    this.routerVerdictCache.clear();
+  }
 
-    return {
-      host: route.host,
-      port: route.actualPort,
-    };
+  /**
+   * Declares the attached shell roots to the native process tracker so it can
+   * attribute their subtrees to networks without an injected env var, surviving
+   * fork/daemonize/reparent. Root pids are valid host-wide, so a single tracker
+   * covers every attached terminal.
+   */
+  private syncProcessTrackerRoots(): void {
+    const roots = new Map<number, string>();
+    for (const attachment of this.registry.getSnapshot().attachments) {
+      if (attachment.status === "attached" && Number.isInteger(attachment.rootPid) && attachment.rootPid > 0) {
+        roots.set(attachment.rootPid, attachment.networkId);
+      }
+    }
+    this.processTracker.syncTrackedRoots(roots);
   }
 
   /** Opens localhost routers for live logical routes that unhooked clients may need. */
@@ -4599,18 +4840,59 @@ export class PortManagerNetworkService implements DisposableLike {
       snapshot?.routes ?? [],
       snapshot?.listeners ?? [],
       this.registry.getSnapshot().attachments,
+      { gatewayEnabled: readPortManagerSettings().logicalPortGateway },
     );
 
     if (!tryAcquireLogicalRouterOwnerLease()) {
       if (this.ownsLogicalRouterLease) {
         this.ownsLogicalRouterLease = false;
         await this.logicalPortRouter.sync([]).catch(() => undefined);
+        await this.syncGatewayClaimFiles([]).catch(() => undefined);
       }
       return;
     }
 
     this.ownsLogicalRouterLease = true;
+    // Publish claims before opening listeners so a scope-less server that races
+    // the router relocates instead of losing the port.
+    await this.syncGatewayClaimFiles(logicalPorts).catch(() => undefined);
     await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);
+  }
+
+  /**
+   * Reconciles the gateway bind-claim files with the ports the router owns.
+   *
+   * A fresh claim tells the native hook that a scope-less bind to this port must
+   * relocate to a high port (becoming the non-network passthrough target). Files
+   * are rewritten each sync so their TTL acts as a heartbeat: if this window
+   * dies, the claims expire and scope-less binds pass through normally again.
+   */
+  private async syncGatewayClaimFiles(ports: readonly number[]): Promise<void> {
+    const desired = new Set(ports);
+    const baseRouteTablePath = getDefaultRouteTablePath();
+    const expiresAtMs = Date.now() + ROUTE_TABLE_TTL_MS;
+    const document = JSON.stringify({ expiresAtMs });
+
+    for (const port of desired) {
+      try {
+        await fs.writeFile(getRouteTablePathForGatewayClaimPort(port, baseRouteTablePath), document, "utf8");
+        this.gatewayClaimPorts.add(port);
+      } catch {
+        // A missed claim only means the next sync retries; binds pass through meanwhile.
+      }
+    }
+
+    for (const port of [...this.gatewayClaimPorts]) {
+      if (desired.has(port)) {
+        continue;
+      }
+      try {
+        await fs.rm(getRouteTablePathForGatewayClaimPort(port, baseRouteTablePath), { force: true });
+      } catch {
+        // A stale claim file expires on its own via the TTL the hook enforces.
+      }
+      this.gatewayClaimPorts.delete(port);
+    }
   }
 
   /** Keeps per-network browser entrypoints in sync with running web process rows. */
@@ -4764,7 +5046,28 @@ export class PortManagerNetworkService implements DisposableLike {
     const signature = hostLocalGatewayRedirectSignature(redirects);
     if (isHostLocalGatewayRedirectAnchorCurrent(redirects)) {
       this.hostLocalGatewayRedirectInstallSignature = undefined;
+      this.hostLocalGatewayEmptyRedirectSinceMs = 0;
       return;
+    }
+
+    /*
+     * Clearing installed rules is an admin prompt. Redirect selections can
+     * blink to empty while attachments repair or the container daemon
+     * restarts, so rules are only removed after the selection stays empty for
+     * a stability window. Non-empty changes stay immediate: they come from
+     * explicit attach flows that expect localhost routing to work right away.
+     */
+    if (redirects.length === 0) {
+      const nowMs = Date.now();
+      if (this.hostLocalGatewayEmptyRedirectSinceMs === 0) {
+        this.hostLocalGatewayEmptyRedirectSinceMs = nowMs;
+        return;
+      }
+      if (nowMs - this.hostLocalGatewayEmptyRedirectSinceMs < HOST_LOCAL_GATEWAY_EMPTY_REDIRECT_STABLE_MS) {
+        return;
+      }
+    } else {
+      this.hostLocalGatewayEmptyRedirectSinceMs = 0;
     }
 
     if (this.hostLocalGatewayRedirectInstallSignature === signature) {
@@ -4977,52 +5280,6 @@ export class PortManagerNetworkService implements DisposableLike {
    * Allows host-side tooling to reach explicit unscoped host routes without
    * letting scoped network routes occupy host localhost ports.
    */
-  private async findUniqueRouteForRouter(
-    logicalPort: number,
-  ): Promise<LogicalPortRoute | undefined> {
-    if (this.processService === undefined) {
-      return undefined;
-    }
-
-    const snapshot = this.processService.getSnapshot();
-    const candidates = snapshot.routes.filter(
-      (route) =>
-        route.logicalPort === logicalPort &&
-        route.actualPort !== route.logicalPort &&
-        route.networkId === undefined &&
-        isLiveListenRoute(route),
-    );
-
-    if (candidates.length === 1) {
-      return candidates[0];
-    }
-
-    return undefined;
-  }
-
-  /**
-   * Uses client cwd as a deterministic fallback when environment variables and
-   * terminal ancestry are unavailable. This keeps simultaneous logical ports in
-   * sibling projects from collapsing into the global "unique route" fallback.
-   */
-  private findClientCwdRouteForRouter(
-    logicalPort: number,
-    clientCwd: string,
-  ): LogicalPortRoute | undefined {
-    if (this.processService === undefined) {
-      return undefined;
-    }
-
-    const snapshot = this.processService.getSnapshot();
-    const candidates = findRoutesMatchingClientCwd(snapshot.routes, logicalPort, clientCwd);
-
-    if (candidates.length === 1) {
-      return candidates[0];
-    }
-
-    return undefined;
-  }
-
   /** Maps an arbitrary process PID back to the network label attached to its process tree. */
   private findAttachedNetworkForPid(pid: number, processRows: readonly ProcessTableRow[]): string | undefined {
     return resolveProcessTreeNetworkLabel(this.registry.getSnapshot().attachments, processRows, pid)?.networkId;
@@ -5247,6 +5504,20 @@ export class PortManagerNetworkService implements DisposableLike {
       return this.reconcileMutationlessComposeOverrideFile(attachment, options);
     }
 
+    /*
+     * Forced regeneration needs the container daemon. While it is known to be
+     * down and the existing override still covers routing, retrying would only
+     * spawn doomed docker commands and flip the attachment into an error state
+     * that tears down live gateways.
+     */
+    if (
+      options.force === true &&
+      Date.now() < this.dockerDaemonUnavailableUntilMs &&
+      (await this.composeOverrideFileIsReadable(attachment))
+    ) {
+      return attachment;
+    }
+
     try {
       const overrideFile = await this.composePublishMutator.restoreHiddenPortsOverride(mutation, {
         ...options,
@@ -5273,6 +5544,21 @@ export class PortManagerNetworkService implements DisposableLike {
 
       return attachment;
     } catch (error) {
+      /*
+       * A stopped Docker Desktop must not oscillate attachments between
+       * attached and error on every refresh: the error teardown would close
+       * every host gateway and flip packet-filter redirects, while the
+       * next non-forced pass restores them again. With a readable override
+       * the previous routing state remains correct, so keep it untouched
+       * until the daemon returns.
+       */
+      if (isDockerDaemonUnavailableError(error)) {
+        this.dockerDaemonUnavailableUntilMs = Date.now() + DOCKER_DAEMON_UNAVAILABLE_RETRY_BACKOFF_MS;
+        if (await this.composeOverrideFileIsReadable(attachment)) {
+          return attachment;
+        }
+      }
+
       const nextAttachment = this.registry.updateComposeAttachment({
         ...attachment,
         status: "error",
@@ -5281,6 +5567,12 @@ export class PortManagerNetworkService implements DisposableLike {
       await this.removeComposeRouteProcesses(nextAttachment, nextAttachment.ports).catch(() => undefined);
       return nextAttachment;
     }
+  }
+
+  /** True when the attachment's generated override file exists and is readable. */
+  private async composeOverrideFileIsReadable(attachment: ComposeAttachment): Promise<boolean> {
+    const overrideFile = composeAttachmentOverrideFile(attachment);
+    return overrideFile !== undefined && fileIsReadable(overrideFile);
   }
 
   /** Mutationless clone rows cannot be regenerated, so missing overrides must not reach TSV routing. */
@@ -6672,6 +6964,23 @@ function composeAttachmentOverrideFile(attachment: ComposeAttachment): string | 
   return splitGeneratedComposeRoutingFiles(attachment.composeFiles).overrideFile;
 }
 
+/**
+ * Matches CLI failures that mean the container daemon itself is unreachable
+ * (Docker Desktop stopped, socket missing) rather than a problem with the
+ * attachment. These are transient environment states, not attachment errors.
+ */
+function isDockerDaemonUnavailableError(error: unknown): boolean {
+  const message = formatError(error);
+  return (
+    /cannot connect to the docker daemon/i.test(message) ||
+    /is the docker daemon running/i.test(message) ||
+    /docker daemon is not running/i.test(message) ||
+    /error while dialing.*docker.*\.sock/i.test(message) ||
+    /connect ENOENT .*docker\.sock/i.test(message) ||
+    /unable to connect to podman/i.test(message)
+  );
+}
+
 function isComposeOverrideRecoveryError(message: string | undefined): boolean {
   return message?.startsWith("Generated Compose override") === true;
 }
@@ -7163,6 +7472,11 @@ function getTtyInputHelperRelativePath(): string {
 /** Returns the packaged native TCP router helper used for the logical-router data plane. */
 function getTcpRouterHelperRelativePath(): string {
   return path.join("media", "native", "portmanager_tcp_router");
+}
+
+/** Returns the packaged native process-membership tracker helper. */
+function getProcessTrackerHelperRelativePath(): string {
+  return path.join("media", "native", "portmanager_process_tracker");
 }
 
 /** Returns the packaged native TCP proxy helper used for host exposure data plane. */
@@ -7715,6 +8029,7 @@ function collectLogicalRouterPorts(
   routes: readonly LogicalPortRoute[],
   listeners: readonly ListeningPort[] = [],
   attachments: readonly TerminalAttachment[] = [],
+  options: { readonly gatewayEnabled?: boolean } = {},
 ): readonly number[] {
   const ports = new Set<number>();
   const hostClientNetworkIds = collectHostClientAttachmentNetworkIds(attachments);
@@ -7726,9 +8041,20 @@ function collectLogicalRouterPorts(
   );
 
   for (const route of routes) {
+    /*
+     * With the logical port gateway on, every attached network's live listen
+     * routes get a localhost router so preload-stripped clients reach their
+     * network by source attribution. Without it, only unscoped routes and
+     * networks with a hookless host-side client open routers (legacy behavior).
+     */
+    const networkScopeQualifies =
+      options.gatewayEnabled === true ||
+      route.networkId === undefined ||
+      hostClientNetworkIds.has(route.networkId);
+
     if (
       isLiveListenRoute(route) &&
-      (route.networkId === undefined || hostClientNetworkIds.has(route.networkId)) &&
+      networkScopeQualifies &&
       isTcpPort(route.logicalPort) &&
       routeNeedsLogicalRouter(route) &&
       !externallyOwnedPorts.has(route.logicalPort)

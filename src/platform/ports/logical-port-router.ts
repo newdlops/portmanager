@@ -15,6 +15,16 @@ export interface LogicalPortRouterConnection {
   readonly remoteAddress?: string;
   /** Client-side ephemeral TCP port used to identify the caller process. */
   readonly remotePort?: number;
+  /**
+   * Source attribution resolved natively by the router (protocol v2+). When
+   * present the resolver can skip its own lsof-based peer lookup. Absent for a
+   * v1 helper or when native resolution failed for this connection.
+   */
+  readonly clientPid?: number;
+  /** Client process start time, used with clientPid to guard against PID reuse. */
+  readonly clientStartTime?: string;
+  /** Network id read from the client process environment by the native router. */
+  readonly clientNetworkId?: string;
 }
 
 export interface LogicalPortRouterTarget {
@@ -478,7 +488,9 @@ class NativeLogicalPortRouterProcess {
   }
 
   private async handleProtocolLine(line: string): Promise<void> {
-    if (line === "READY\tcontrol") {
+    // Protocol v2 appends a version field ("READY\tcontrol\t2"); match by prefix
+    // so both the versioned and the original bare form resolve startup.
+    if (line === "READY\tcontrol" || line.startsWith("READY\tcontrol\t")) {
       this.resolveStartup();
       return;
     }
@@ -608,7 +620,9 @@ class NativeLogicalPortRouterPortHandle implements LogicalPortRouterListenerHand
 /** Parses one CONNECT request emitted by the native TCP router helper. */
 export function parseNativeRouterQueryLine(line: string): NativeLogicalPortRouterQuery | undefined {
   const parts = line.split("\t");
-  if (parts.length !== 7 || parts[0] !== "CONNECT") {
+  // v1 emits exactly 7 fields; v2 appends pid/startTime/networkId. Accept any
+  // length >= 7 so a newer helper does not require a lockstep parser change.
+  if (parts.length < 7 || parts[0] !== "CONNECT") {
     return undefined;
   }
 
@@ -619,6 +633,11 @@ export function parseNativeRouterQueryLine(line: string): NativeLogicalPortRoute
     return undefined;
   }
 
+  const clientPid = parseNativeRouterField(parts[7]);
+  const clientPidNumber = clientPid === undefined ? undefined : Number.parseInt(clientPid, 10);
+  const clientStartTime = parseNativeRouterField(parts[8]);
+  const clientNetworkId = parseNativeRouterField(parts[9]);
+
   return {
     id: parts[1] ?? "",
     logicalPort,
@@ -626,7 +645,20 @@ export function parseNativeRouterQueryLine(line: string): NativeLogicalPortRoute
     ...(localPort === undefined ? {} : { localPort }),
     remoteAddress: parts[5],
     ...(remotePort === undefined ? {} : { remotePort }),
+    ...(clientPidNumber === undefined || Number.isNaN(clientPidNumber) ? {} : { clientPid: clientPidNumber }),
+    ...(clientStartTime === undefined ? {} : { clientStartTime }),
+    ...(clientNetworkId === undefined ? {} : { clientNetworkId }),
   };
+}
+
+/** Reads an optional tab field, treating the "-" placeholder and empty string as absent. */
+function parseNativeRouterField(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  return trimmed === "" || trimmed === "-" ? undefined : trimmed;
 }
 
 function parseNativeRouterPortStatusLine(line: string, status: string): number | undefined {

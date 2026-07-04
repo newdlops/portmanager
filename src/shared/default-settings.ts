@@ -57,6 +57,7 @@ export const DEFAULT_PORT_MANAGER_SETTINGS: PortManagerSettings = {
   watchIntervalMs: 3000,
   notifyOnDetectedConflict: true,
   monitorAllListeningPorts: true,
+  logicalPortGateway: true,
   detectTerminalListenFailures: false,
   routeTerminalCommandsOnStart: false,
   processKillSignal: "SIGTERM",
