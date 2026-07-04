@@ -619,6 +619,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Route-file fallback targets used while the daemon snapshot is stale or incomplete. */
   private browserProxyGeneratedRouteTargetByEndpointId = new Map<string, BrowserNetworkProxyTarget>();
+  private browserProxyComposeTargetByEndpointId = new Map<string, BrowserNetworkProxyTarget>();
 
   /** Logical port gateway attribution verdicts keyed by client (pid, startTime). */
   private readonly routerVerdictCache = new RouterVerdictCache({
@@ -4514,6 +4515,14 @@ export class PortManagerNetworkService implements DisposableLike {
       return indexedTarget;
     }
 
+    // Compose ports are published to a docker host port, not the route table.
+    const composeTarget = this.browserProxyComposeTargetByEndpointId.get(
+      browserNetworkProxyEndpointId(endpoint.networkId, endpoint.logicalPort),
+    );
+    if (composeTarget !== undefined) {
+      return composeTarget;
+    }
+
     const route = await this.findNetworkRoute(endpoint.networkId, endpoint.logicalPort);
     if (route === undefined || !isLiveListenRoute(route)) {
       const fallbackTarget = await this.findBrowserProxyFallbackListenerTarget(endpoint.networkId, endpoint.logicalPort);
@@ -4952,21 +4961,30 @@ export class PortManagerNetworkService implements DisposableLike {
     const routeHintTextByEndpointId = await this.readBrowserProxyRouteHintTexts(routes);
     const endpoints = mergeBrowserProxyEndpoints(
       processEndpoints,
-      collectBrowserProxyRouteEndpoints(routes, networks, dnsRunning, routeHintTextByEndpointId, processEndpoints),
+      mergeBrowserProxyEndpoints(
+        collectBrowserProxyRouteEndpoints(routes, networks, dnsRunning, routeHintTextByEndpointId, processEndpoints),
+        collectBrowserProxyComposeEndpoints(registrySnapshot.composeAttachments, networks, dnsRunning),
+      ),
     );
     this.browserProxyGeneratedRouteTargetByEndpointId = buildBrowserProxyRouteTargetIndex(
       routes,
       snapshot?.processes ?? [],
     );
+    this.browserProxyComposeTargetByEndpointId = buildBrowserProxyComposeTargetIndex(registrySnapshot.composeAttachments);
     const hostLocalGatewayPorts = new Set(readPortManagerSettings().fixedProtocolPorts);
+    // The native L4 forwarder must not bind coordinates the sniffing browser
+    // proxy already owns, so browser endpoints are excluded from its exposures.
     const hostGatewayExposures = collectHostGatewayExposures(
       routes,
       networks,
       endpoints,
       registrySnapshot.composeAttachments,
     );
+    // Host-local fixed-protocol redirects still target those coordinates (now
+    // served by the sniffing proxy, which forwards raw TCP), so they are
+    // computed from the full exposure set, ignoring browser-endpoint ownership.
     const hostLocalGatewayRedirects = selectHostLocalGatewayRedirects(
-      hostGatewayExposures,
+      collectHostGatewayExposures(routes, networks, [], registrySnapshot.composeAttachments),
       networks,
       hostLocalGatewayPorts,
       this.vscodeWindowTerminalBinding?.status === "attached" ? this.vscodeWindowTerminalBinding.networkId : undefined,
@@ -8202,11 +8220,13 @@ function collectBrowserProxyRouteEndpoints(
       continue;
     }
 
-    const hintText = routeHintTextByEndpointId.get(endpointId) ?? "";
-    if (!isPublicWebEntrypointText(`${route.processName ?? ""} ${route.cwd ?? ""} ${hintText}`)) {
-      continue;
-    }
-
+    // Every live TCP listener gets a sniffing proxy endpoint: TLS clients are
+    // terminated with the browser certificate and proxied as HTTP, while raw TCP
+    // clients are forwarded untouched. Because the listener demultiplexes by the
+    // first byte, there is no need to classify the port as web vs raw ahead of
+    // time — the classification heuristic broke exactly here for containerized
+    // (Docker Compose) web services, which serve plain and reject HTTPS.
+    void routeHintTextByEndpointId;
     endpoints.set(endpointId, buildBrowserProxyRouteEndpoint(route, route.networkId, networks, useDnsAlias));
   }
 
@@ -8537,20 +8557,97 @@ function buildBrowserProxyRouteEndpoint(
   networks: readonly LogicalNetwork[],
   useDnsAlias: boolean,
 ): BrowserNetworkProxyEndpoint {
-  const fallbackPort = browserNetworkProxyFallbackPort(route.logicalPort);
-  const listenPorts = fallbackPort === route.logicalPort ? [route.logicalPort] : [route.logicalPort, fallbackPort];
+  return buildBrowserProxyEndpointFor(networkId, route.logicalPort, networks, useDnsAlias);
+}
+
+function buildBrowserProxyEndpointFor(
+  networkId: string,
+  logicalPort: number,
+  networks: readonly LogicalNetwork[],
+  useDnsAlias: boolean,
+): BrowserNetworkProxyEndpoint {
+  const fallbackPort = browserNetworkProxyFallbackPort(logicalPort);
+  const listenPorts = fallbackPort === logicalPort ? [logicalPort] : [logicalPort, fallbackPort];
   const publicHost = useDnsAlias ? browserPublicHostForNetwork(networkId, networks) : undefined;
   const publicProtocol = browserProxyPublicProtocol(networks, useDnsAlias);
 
   return {
-    id: browserNetworkProxyEndpointId(networkId, route.logicalPort),
+    id: browserNetworkProxyEndpointId(networkId, logicalPort),
     networkId,
-    logicalPort: route.logicalPort,
+    logicalPort,
     listenHost: browserLoopbackAddressForNetwork(networkId),
     ...(publicHost === undefined ? {} : { publicHost }),
     publicProtocol,
     listenPorts,
   };
+}
+
+/**
+ * Compose service ports live in attachments, not the route table, so they get a
+ * sniffing browser endpoint here. The listener terminates TLS for HTTPS browsers
+ * and forwards raw TCP for database wire protocols, so a single endpoint covers
+ * every published compose port without classifying it as web vs raw.
+ */
+function collectBrowserProxyComposeEndpoints(
+  composeAttachments: readonly ComposeAttachment[],
+  networks: readonly LogicalNetwork[],
+  useDnsAlias: boolean,
+): readonly BrowserNetworkProxyEndpoint[] {
+  const networkIds = new Set(networks.map((network) => network.id));
+  const endpoints = new Map<string, BrowserNetworkProxyEndpoint>();
+
+  for (const attachment of composeAttachments) {
+    if (!isRoutableComposeAttachment(attachment) || !networkIds.has(attachment.networkId)) {
+      continue;
+    }
+
+    for (const port of attachment.ports) {
+      if (port.protocol !== "tcp" || !isTcpPort(port.logicalPort) || !isTcpPort(port.actualHostPort)) {
+        continue;
+      }
+
+      const id = browserNetworkProxyEndpointId(attachment.networkId, port.logicalPort);
+      if (endpoints.has(id)) {
+        continue;
+      }
+
+      endpoints.set(id, buildBrowserProxyEndpointFor(attachment.networkId, port.logicalPort, networks, useDnsAlias));
+    }
+  }
+
+  return [...endpoints.values()];
+}
+
+/** Indexes compose published ports so the proxy can reach their docker-published host target. */
+function buildBrowserProxyComposeTargetIndex(
+  composeAttachments: readonly ComposeAttachment[],
+): Map<string, BrowserNetworkProxyTarget> {
+  const index = new Map<string, BrowserNetworkProxyTarget>();
+
+  for (const attachment of composeAttachments) {
+    if (!isRoutableComposeAttachment(attachment)) {
+      continue;
+    }
+
+    for (const port of attachment.ports) {
+      if (port.protocol !== "tcp" || !isTcpPort(port.logicalPort) || !isTcpPort(port.actualHostPort)) {
+        continue;
+      }
+
+      const id = browserNetworkProxyEndpointId(attachment.networkId, port.logicalPort);
+      if (index.has(id)) {
+        continue;
+      }
+
+      index.set(id, {
+        host: port.actualHostAddress.length > 0 ? port.actualHostAddress : "127.0.0.1",
+        port: port.actualHostPort,
+        protocol: "http",
+      });
+    }
+  }
+
+  return index;
 }
 
 function browserProxyPublicProtocol(

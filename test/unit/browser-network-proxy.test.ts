@@ -191,12 +191,18 @@ test("formats HTTPS browser proxy endpoints when TLS is enabled", () => {
   );
 });
 
-test("does not open HTTPS browser proxy endpoints without TLS credentials", async () => {
+test("opens sniffing endpoints without TLS credentials, still proxying plain HTTP", async () => {
+  const upstream = http.createServer((_request, response) => {
+    response.writeHead(200);
+    response.end("plain-upstream");
+  });
+  await listen(upstream, 0, "127.0.0.1");
+
   const proxyPort = await getAvailablePort();
   const proxy = new BrowserNetworkProxyManager({
     resolve: () => ({
       host: "127.0.0.1",
-      port: 3004,
+      port: getServerPort(upstream),
     }),
   });
 
@@ -208,9 +214,20 @@ test("does not open HTTPS browser proxy endpoints without TLS credentials", asyn
       }),
     );
 
-    assert.equal(activeEndpoint, undefined);
+    // The sniffing listener opens without a certificate; it simply cannot
+    // terminate TLS. Plain HTTP (and raw TCP) are still proxied so the endpoint
+    // is not silently dead while a certificate is being provisioned.
+    assert.ok(activeEndpoint);
+    const response = await requestHttp({
+      host: "127.0.0.1",
+      port: activeEndpoint.listenPort,
+      path: "/",
+      headers: { host: `alpha1:${activeEndpoint.listenPort}` },
+    });
+    assert.equal(response.body, "plain-upstream");
   } finally {
     await proxy.dispose();
+    await closeServer(upstream);
   }
 });
 

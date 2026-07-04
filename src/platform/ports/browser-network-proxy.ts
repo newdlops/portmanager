@@ -72,8 +72,10 @@ interface BrowserNetworkProxyListener {
   readonly endpoint: ActiveBrowserNetworkProxyEndpoint;
   /** Precomputed host/origin strings reused by every request on this endpoint. */
   readonly metadata: BrowserNetworkProxyEndpointMetadata;
-  /** HTTP(S)/WebSocket server that owns the browser-facing socket. */
+  /** TLS-sniffing listener that owns the browser-facing socket. */
   readonly server: BrowserNetworkProxyServer;
+  /** Inner HTTPS terminator for connections sniffed as TLS; absent without credentials. */
+  readonly tlsServer?: https.Server;
   /** Upstream HTTP connection pool scoped to this browser-facing endpoint. */
   readonly httpAgent: http.Agent;
   /** Upstream HTTPS connection pool scoped to this browser-facing endpoint. */
@@ -84,10 +86,35 @@ interface BrowserNetworkProxyListener {
   readonly tlsCredentialsFingerprint?: string;
 }
 
-type BrowserNetworkProxyServer = http.Server | https.Server;
+type BrowserNetworkProxyServer = net.Server;
+
+/** First byte of a TLS record for a handshake (ContentType handshake = 22). */
+const TLS_HANDSHAKE_RECORD_TYPE = 0x16;
+
+/** HTTP request-line method prefixes used to sniff plaintext HTTP from raw TCP. */
+const HTTP_REQUEST_METHOD_PREFIXES = [
+  "GET ",
+  "HEAD ",
+  "POST ",
+  "PUT ",
+  "DELETE ",
+  "OPTIONS ",
+  "PATCH ",
+  "CONNECT ",
+  "TRACE ",
+];
+
+/** True when a peeked chunk begins with an HTTP request line (method + space). */
+function looksLikeHttpRequestLine(chunk: Buffer): boolean {
+  const prefix = chunk.subarray(0, 8).toString("latin1");
+  return HTTP_REQUEST_METHOD_PREFIXES.some((method) => prefix.startsWith(method));
+}
 
 interface BrowserNetworkProxyServerBuild {
-  readonly server: BrowserNetworkProxyServer;
+  /** Outer listener that sniffs each connection and demultiplexes TLS from raw TCP. */
+  readonly server: net.Server;
+  /** Inner HTTPS terminator, fed sniffed TLS connections; absent without credentials. */
+  readonly tlsServer?: https.Server;
   readonly tlsCredentialsFingerprint?: string;
 }
 
@@ -306,9 +333,18 @@ export class BrowserNetworkProxyManager {
       const sockets = new Set<net.Socket>();
       let serverBuild: BrowserNetworkProxyServerBuild;
       try {
-        serverBuild = this.createServer(activeEndpoint, (request, response) => {
-          void this.forwardHttp(activeEndpoint, metadata, httpAgent, httpsAgent, request, response);
-        });
+        serverBuild = this.createServer(
+          activeEndpoint,
+          (request, response) => {
+            void this.forwardHttp(activeEndpoint, metadata, httpAgent, httpsAgent, request, response);
+          },
+          (request, socket, head) => {
+            void this.forwardUpgrade(activeEndpoint, metadata, request, socket as net.Socket, head, sockets);
+          },
+          (socket) => {
+            void this.rawForward(activeEndpoint, socket, sockets);
+          },
+        );
       } catch (error) {
         httpAgent.destroy();
         httpsAgent.destroy();
@@ -316,13 +352,10 @@ export class BrowserNetworkProxyManager {
         continue;
       }
 
-      const { server, tlsCredentialsFingerprint } = serverBuild;
+      const { server, tlsServer, tlsCredentialsFingerprint } = serverBuild;
       server.on("connection", (socket) => {
         sockets.add(socket);
         socket.once("close", () => sockets.delete(socket));
-      });
-      server.on("upgrade", (request, socket, head) => {
-        void this.forwardUpgrade(activeEndpoint, metadata, request, socket as net.Socket, head, sockets);
       });
 
       try {
@@ -331,6 +364,7 @@ export class BrowserNetworkProxyManager {
           endpoint: activeEndpoint,
           metadata,
           server,
+          ...(tlsServer === undefined ? {} : { tlsServer }),
           httpAgent,
           httpsAgent,
           sockets,
@@ -442,22 +476,101 @@ export class BrowserNetworkProxyManager {
     });
   }
 
+  /**
+   * Forwards a non-TLS connection to the upstream as raw TCP. This carries any
+   * protocol transparently (plain HTTP, WebSocket, database wire protocols), so
+   * a single per-port listener serves both HTTPS browsers and raw TCP clients
+   * without classifying the port ahead of time.
+   */
+  private async rawForward(
+    endpoint: ActiveBrowserNetworkProxyEndpoint,
+    clientSocket: net.Socket,
+    sockets: Set<net.Socket>,
+  ): Promise<void> {
+    let target: BrowserNetworkProxyTarget;
+
+    try {
+      target = await this.targetResolver.resolve(endpoint);
+    } catch {
+      clientSocket.destroy();
+      return;
+    }
+
+    const upstream = net.createConnection({ host: normalizeTargetHost(target.host), port: target.port });
+    sockets.add(upstream);
+    upstream.once("close", () => sockets.delete(upstream));
+
+    const destroyBoth = () => {
+      clientSocket.destroy();
+      upstream.destroy();
+    };
+    clientSocket.once("error", destroyBoth);
+    upstream.once("error", destroyBoth);
+    clientSocket.once("close", () => upstream.destroy());
+    upstream.once("close", () => clientSocket.destroy());
+    upstream.once("connect", () => {
+      clientSocket.pipe(upstream);
+      upstream.pipe(clientSocket);
+    });
+  }
+
+  /**
+   * Builds a protocol-sniffing listener. Each accepted connection is peeked and
+   * demultiplexed by its first bytes:
+   *   - a TLS ClientHello (record type 0x16) is terminated with the dev
+   *     certificate and proxied as HTTP (Host rewriting, response rewriting);
+   *   - a plaintext HTTP request line is proxied as HTTP the same way;
+   *   - anything else is forwarded as raw TCP (databases, other wire protocols).
+   * This removes the need to guess whether a port speaks HTTP(S) or raw TCP —
+   * the heuristic that classified ports ahead of time broke for containerized
+   * (Docker Compose) web services, serving them plain so browsers rejected the
+   * HTTPS handshake with ERR_SSL_PROTOCOL_ERROR.
+   */
   private createServer(
     endpoint: ActiveBrowserNetworkProxyEndpoint,
     handler: http.RequestListener,
+    onUpgrade: (request: http.IncomingMessage, socket: net.Socket, head: Buffer) => void,
+    onRawConnection: (socket: net.Socket) => void,
   ): BrowserNetworkProxyServerBuild {
-    if ((endpoint.publicProtocol ?? "http") !== "https") {
-      return { server: http.createServer(handler) };
-    }
-
     const credentials = this.options.tlsCredentials?.getCredentials();
-    if (credentials === undefined) {
-      throw new Error(`TLS credentials unavailable for browser proxy ${endpoint.id}.`);
+    const httpServer = http.createServer(handler);
+    httpServer.on("upgrade", (request, socket, head) => onUpgrade(request, socket as net.Socket, head));
+
+    let tlsServer: https.Server | undefined;
+    let tlsCredentialsFingerprint: string | undefined;
+    if (credentials !== undefined) {
+      tlsServer = https.createServer(credentials, handler);
+      tlsServer.on("upgrade", (request, socket, head) => onUpgrade(request, socket as net.Socket, head));
+      tlsCredentialsFingerprint = fingerprintTlsCredentials(credentials);
     }
 
+    const server = net.createServer((socket) => {
+      socket.once("readable", () => {
+        const chunk = socket.read() as Buffer | null;
+        if (chunk === null || chunk.length === 0) {
+          // Nothing to sniff; let the upstream decide what an empty stream means.
+          onRawConnection(socket);
+          return;
+        }
+
+        socket.unshift(chunk);
+        if (chunk[0] === TLS_HANDSHAKE_RECORD_TYPE && tlsServer !== undefined) {
+          tlsServer.emit("connection", socket);
+        } else if (looksLikeHttpRequestLine(chunk)) {
+          httpServer.emit("connection", socket);
+        } else {
+          onRawConnection(socket);
+        }
+      });
+      socket.once("error", () => socket.destroy());
+    });
+
+    // httpServer/tlsServer are never listened on; they are fed sockets by the
+    // sniffer and kept alive by its connection-listener closure.
     return {
-      server: https.createServer(credentials, handler),
-      tlsCredentialsFingerprint: fingerprintTlsCredentials(credentials),
+      server,
+      ...(tlsServer === undefined ? {} : { tlsServer }),
+      ...(tlsCredentialsFingerprint === undefined ? {} : { tlsCredentialsFingerprint }),
     };
   }
 
@@ -468,25 +581,21 @@ export class BrowserNetworkProxyManager {
    */
   private isTlsCredentialsCurrent(
     listener: BrowserNetworkProxyListener,
-    desiredEndpoint: BrowserNetworkProxyEndpoint,
+    _desiredEndpoint: BrowserNetworkProxyEndpoint,
   ): boolean {
-    if ((desiredEndpoint.publicProtocol ?? "http") !== "https") {
-      return true;
-    }
-
-    if (listener.tlsCredentialsFingerprint === undefined) {
-      return false;
-    }
-
     const credentials = this.options.tlsCredentials?.getCredentials();
     if (credentials === undefined) {
       /*
-       * Certificate renewal writes multiple files. Keep the old HTTPS listener
-       * alive during transient read gaps and rotate on the next successful read.
+       * Certificate renewal writes multiple files. Keep the old listener alive
+       * during transient read gaps and rotate on the next successful read. The
+       * sniffing listener still forwards raw TCP without credentials.
        */
       return true;
     }
 
+    // The sniffing listener terminates TLS whenever credentials exist, so a
+    // listener opened before the identity changed (or before any cert existed)
+    // must reopen to pick up the new certificate.
     return fingerprintTlsCredentials(credentials) === listener.tlsCredentialsFingerprint;
   }
 }
