@@ -10,6 +10,8 @@ All notable changes to Port Manager are documented in this file.
 - Relocate a server started in a non-attached terminal off a gateway-owned port to a high port so it stays reachable through the gateway instead of being shadowed by the gateway listener.
 - Add the `portManager.logicalPortGateway` setting (default on) to disable the gateway and fall back to in-process hook routing only.
 - Remove shebang/script-content shell parsing from the native hook, the generated PATH shims, and the asdf shim. Preload survival now relies on the PATH runtime shims; a server launched by an absolute-path `#!` interpreter (not `/usr/bin/env`) in an attached terminal is the remaining case that can lose per-network isolation.
+- Attribute connections to networks with a native process-membership tracker that follows the attached shell's process subtree without injecting an environment variable, keeping membership after a process daemonizes or reparents to launchd. The router queries it as the primary attribution source ahead of the process-tree/environment fallback.
+- Isolate the interface view of a network-scoped process: the hook interposes `getifaddrs` so `os.networkInterfaces()` reports only `127.0.0.1` and the process's own network loopback alias, hiding other networks' host-global `lo0` aliases (e.g. dev servers like vite no longer enumerate every network's loopback).
 
 ## 0.0.1
 

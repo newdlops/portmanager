@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -65,6 +66,7 @@
 typedef int (*pm_bind_fn)(int, const struct sockaddr *, socklen_t);
 typedef int (*pm_connect_fn)(int, const struct sockaddr *, socklen_t);
 typedef int (*pm_getsockname_fn)(int, struct sockaddr *, socklen_t *);
+typedef int (*pm_getifaddrs_fn)(struct ifaddrs **);
 typedef int (*pm_execve_fn)(const char *, char *const [], char *const []);
 typedef int (*pm_execv_fn)(const char *, char *const []);
 typedef int (*pm_execvp_fn)(const char *, char *const []);
@@ -118,6 +120,7 @@ typedef struct pm_cached_route {
 static pm_bind_fn pm_real_bind = bind;
 static pm_connect_fn pm_real_connect = connect;
 static pm_getsockname_fn pm_real_getsockname = getsockname;
+static pm_getifaddrs_fn pm_real_getifaddrs = getifaddrs;
 static pm_execve_fn pm_real_execve = execve;
 static pm_execv_fn pm_real_execv = execv;
 static pm_execvp_fn pm_real_execvp = execvp;
@@ -127,6 +130,7 @@ static pm_posix_spawnp_fn pm_real_posix_spawnp = posix_spawnp;
 static pm_bind_fn pm_real_bind = NULL;
 static pm_connect_fn pm_real_connect = NULL;
 static pm_getsockname_fn pm_real_getsockname = NULL;
+static pm_getifaddrs_fn pm_real_getifaddrs = NULL;
 static pm_execve_fn pm_real_execve = NULL;
 static pm_execv_fn pm_real_execv = NULL;
 static pm_execvp_fn pm_real_execvp = NULL;
@@ -648,6 +652,10 @@ static void pm_ensure_symbols(void) {
 
   if (pm_real_getsockname == NULL) {
     pm_real_getsockname = (pm_getsockname_fn)pm_resolve_symbol("getsockname");
+  }
+
+  if (pm_real_getifaddrs == NULL) {
+    pm_real_getifaddrs = (pm_getifaddrs_fn)pm_resolve_symbol("getifaddrs");
   }
 
   if (pm_real_execve == NULL) {
@@ -3856,6 +3864,79 @@ static int pm_posix_spawnp_hook(
   return result;
 }
 
+/*
+ * True when a host-order IPv4 address is one this process is allowed to see:
+ * 127.0.0.1, or this process's own per-network / actual loopback alias. Every
+ * other 127.x address belongs to a different logical network.
+ */
+static int pm_loopback_addr_is_visible(uint32_t host_order_ip) {
+  const char *own_hosts[2];
+  size_t index;
+
+  if (host_order_ip == 0x7f000001u) {
+    return 1;
+  }
+
+  own_hosts[0] = pm_network_loopback_host();
+  own_hosts[1] = pm_actual_loopback_host();
+  for (index = 0; index < sizeof(own_hosts) / sizeof(own_hosts[0]); index++) {
+    struct in_addr parsed;
+    if (own_hosts[index] != NULL && inet_pton(AF_INET, own_hosts[index], &parsed) == 1 &&
+        ntohl(parsed.s_addr) == host_order_ip) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+/*
+ * Isolates the interface view for a network-scoped process. The per-network
+ * loopback aliases live on the host-global lo0, so any process could otherwise
+ * enumerate every other network's alias via getifaddrs()/os.networkInterfaces().
+ * We detach the address of foreign aliases (getifaddrs(3) permits a NULL
+ * ifa_addr, which every well-behaved caller skips) instead of restructuring or
+ * freeing the list, so the caller's freeifaddrs() stays correct on every libc.
+ */
+static int pm_getifaddrs_hook(struct ifaddrs **ifap) {
+  struct ifaddrs *entry;
+  int result;
+
+  pm_ensure_symbols();
+  if (pm_real_getifaddrs == NULL) {
+    errno = ENOSYS;
+    return -1;
+  }
+
+  result = pm_real_getifaddrs(ifap);
+  if (result != 0 || ifap == NULL || *ifap == NULL) {
+    return result;
+  }
+
+  if (!pm_hook_enabled() || !pm_has_current_network_scope()) {
+    return result;
+  }
+
+  for (entry = *ifap; entry != NULL; entry = entry->ifa_next) {
+    const struct sockaddr *addr = entry->ifa_addr;
+    uint32_t ip;
+
+    if (addr == NULL || addr->sa_family != AF_INET) {
+      continue;
+    }
+    ip = ntohl(((const struct sockaddr_in *)addr)->sin_addr.s_addr);
+    if ((ip >> 24) != 127 || pm_loopback_addr_is_visible(ip)) {
+      continue;
+    }
+
+    /* A different network's loopback alias: hide it from this process. */
+    entry->ifa_addr = NULL;
+    entry->ifa_netmask = NULL;
+  }
+
+  return result;
+}
+
 #if defined(__APPLE__)
 #define PM_DYLD_INTERPOSE(_replacement, _replacee) \
   __attribute__((used)) static struct { const void *replacement; const void *replacee; } \
@@ -3866,6 +3947,7 @@ static int pm_posix_spawnp_hook(
 PM_DYLD_INTERPOSE(pm_bind_hook, bind);
 PM_DYLD_INTERPOSE(pm_connect_hook, connect);
 PM_DYLD_INTERPOSE(pm_getsockname_hook, getsockname);
+PM_DYLD_INTERPOSE(pm_getifaddrs_hook, getifaddrs);
 PM_DYLD_INTERPOSE(pm_execve_hook, execve);
 PM_DYLD_INTERPOSE(pm_execv_hook, execv);
 PM_DYLD_INTERPOSE(pm_execvp_hook, execvp);
@@ -3882,6 +3964,10 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
   return pm_getsockname_hook(sockfd, addr, addrlen);
+}
+
+int getifaddrs(struct ifaddrs **ifap) {
+  return pm_getifaddrs_hook(ifap);
 }
 
 int execve(const char *path, char *const argv[], char *const envp[]) {
