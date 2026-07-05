@@ -262,10 +262,15 @@ const ROUTER_VERDICT_CACHE_MAX_ENTRIES = 4096;
 const ROUTER_LATE_BACKEND_PROBE_BUDGET_MS = 1_000;
 const ROUTER_LATE_BACKEND_PROBE_INTERVAL_MS = 100;
 const ROUTER_LATE_BACKEND_PROBE_CONNECT_TIMEOUT_MS = 200;
-// Escaped-server respawn: minimum gap between scans, and per-pid cooldown so a
-// failed push (no hooked ancestor yet) or a slow relaunch does not loop.
+// Escaped-server respawn: minimum gap between scans. Respawns are tracked per
+// (networkId, port) — never per pid — because a relaunch that fails to hook
+// lands on a fresh pid, so a per-pid guard cannot stop a storm. Each logical
+// target gets a hard attempt cap with exponential backoff and then gives up, so
+// a server that will not become hooked can never cascade across a network.
 const ESCAPED_RESPAWN_SCAN_MIN_INTERVAL_MS = 5_000;
-const ESCAPED_RESPAWN_PID_COOLDOWN_MS = 30_000;
+const ESCAPED_RESPAWN_MAX_ATTEMPTS = 4;
+const ESCAPED_RESPAWN_BACKOFF_BASE_MS = 5_000;
+const ESCAPED_RESPAWN_BACKOFF_MAX_MS = 60_000;
 
 /** Outcome of classifying one router client, shared by the network/non-network paths. */
 interface RouterClientVerdict {
@@ -638,8 +643,16 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Reads argv/env/cwd/ancestry for composing an escaped-server respawn. */
   private readonly nativeProcessLookup: NativeProcessLookupProvider;
 
-  /** Escaped-server respawn dedupe: pid -> last respawn attempt (ms). */
-  private readonly escapedRespawnAttemptAtByPid = new Map<number, number>();
+  /**
+   * Escaped-server respawn convergence guard, keyed by `${networkId}\t${port}`
+   * (never pid: a failed relaunch lands on a new pid, so a per-pid guard cannot
+   * stop a storm). Bounds attempts per logical target and gives up rather than
+   * looping, so a server that will not hook can never cascade across a network.
+   */
+  private readonly escapedRespawnStateByKey = new Map<
+    string,
+    { attempts: number; lastAttemptAtMs: number; gaveUp: boolean }
+  >();
 
   /** Throttles the escaped-server scan so bursty snapshots don't re-capture repeatedly. */
   private lastEscapedRespawnScanAtMs = 0;
@@ -4917,15 +4930,10 @@ export class PortManagerNetworkService implements DisposableLike {
     const networkIds = new Set(this.registry.getSnapshot().networks.map((network) => network.id));
     const fixedProtocolPorts = new Set(readPortManagerSettings().fixedProtocolPorts);
 
-    // Drop dedupe entries for pids that are gone and past their cooldown.
-    const livePids = new Set(
-      snapshot.listeners.map((listener) => listener.pid).filter((pid): pid is number => pid !== undefined),
-    );
-    for (const [pid, attemptAtMs] of [...this.escapedRespawnAttemptAtByPid]) {
-      if (!livePids.has(pid) && attemptAtMs + ESCAPED_RESPAWN_PID_COOLDOWN_MS < nowMs) {
-        this.escapedRespawnAttemptAtByPid.delete(pid);
-      }
-    }
+    // Ports that still carry a wildcard (escaped) TCP listener this scan. A guard
+    // whose port has left this set has converged or vanished and is cleared below
+    // so a later legitimate relaunch on that port can be re-hooked from scratch.
+    const escapedPorts = new Set<number>();
 
     for (const listener of snapshot.listeners) {
       const pid = listener.pid;
@@ -4938,20 +4946,9 @@ export class PortManagerNetworkService implements DisposableLike {
       ) {
         continue;
       }
-
-      const attemptAtMs = this.escapedRespawnAttemptAtByPid.get(pid);
-      if (attemptAtMs !== undefined && attemptAtMs + ESCAPED_RESPAWN_PID_COOLDOWN_MS > nowMs) {
-        continue;
-      }
-
-      // A live hooked route already owns this port: not an escaped server.
-      if (
-        snapshot.routes.some(
-          (route) => route.actualPort === listener.port && isLiveListenRoute(route) && route.source === "hooked",
-        )
-      ) {
-        continue;
-      }
+      // Record before capture so a capture failure still holds the guard (a still
+      // escaped target must not have its attempt counter reset by a transient miss).
+      escapedPorts.add(listener.port);
 
       const details = await this.nativeProcessLookup.captureProcess(pid).catch(() => undefined);
       if (
@@ -4965,15 +4962,71 @@ export class PortManagerNetworkService implements DisposableLike {
         continue;
       }
 
+      // Ownership is scoped to (networkId, port): two networks sharing a port
+      // range must never mask each other. A live hooked route for THIS network's
+      // port means the target converged — clear its guard and stop.
+      const key = `${details.networkId}\t${listener.port}`;
+      if (
+        snapshot.routes.some(
+          (route) =>
+            route.actualPort === listener.port &&
+            route.networkId === details.networkId &&
+            isLiveListenRoute(route) &&
+            route.source === "hooked",
+        )
+      ) {
+        this.escapedRespawnStateByKey.delete(key);
+        continue;
+      }
+
+      const state = this.escapedRespawnStateByKey.get(key) ?? {
+        attempts: 0,
+        lastAttemptAtMs: 0,
+        gaveUp: false,
+      };
+      if (state.gaveUp) {
+        continue;
+      }
+      if (state.attempts >= ESCAPED_RESPAWN_MAX_ATTEMPTS) {
+        // Bounded and done: a target that never becomes hooked is abandoned rather
+        // than relaunched forever (each relaunch would kill+spawn and could cascade).
+        state.gaveUp = true;
+        this.escapedRespawnStateByKey.set(key, state);
+        console.warn(
+          `[port-manager] giving up re-hooking escaped server on network ${details.networkId} ` +
+            `port ${listener.port} after ${state.attempts} attempts; it never became hooked`,
+        );
+        continue;
+      }
+      // Exponential backoff between attempts so a slow relaunch is not re-fired
+      // before the replacement has had a chance to bind and register a route.
+      const backoffMs = Math.min(
+        ESCAPED_RESPAWN_BACKOFF_BASE_MS * 2 ** state.attempts,
+        ESCAPED_RESPAWN_BACKOFF_MAX_MS,
+      );
+      if (state.attempts > 0 && nowMs - state.lastAttemptAtMs < backoffMs) {
+        continue;
+      }
+
       const line = buildEscapedRespawnLine(pid, details.cwd ?? "", details.argv, details.env ?? []);
-      // Mark before the request so a concurrent scan does not double-fire; the
-      // cooldown also throttles retries when no hooked ancestor exists yet.
-      this.escapedRespawnAttemptAtByPid.set(pid, nowMs);
+      // Count the attempt before the request so a concurrent scan cannot double-fire.
+      state.attempts += 1;
+      state.lastAttemptAtMs = nowMs;
+      this.escapedRespawnStateByKey.set(key, state);
       try {
         await this.processService.requestRespawnChild(details.ancestorPids, line);
       } catch {
-        // No hooked ancestor with a control channel yet, or the push failed;
-        // the cooldown lets a later scan retry once the tree is (re)hooked.
+        // No hooked ancestor with a control channel yet, or the push failed; the
+        // attempt cap + backoff bound retries and eventually give up.
+      }
+    }
+
+    // Clear guards for targets no longer escaped (converged or gone) so a future
+    // legitimate relaunch on the same port starts with a fresh attempt budget.
+    for (const key of [...this.escapedRespawnStateByKey.keys()]) {
+      const port = Number(key.slice(key.indexOf("\t") + 1));
+      if (!escapedPorts.has(port)) {
+        this.escapedRespawnStateByKey.delete(key);
       }
     }
   }
