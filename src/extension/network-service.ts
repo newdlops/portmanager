@@ -268,6 +268,9 @@ const ROUTER_LATE_BACKEND_PROBE_CONNECT_TIMEOUT_MS = 200;
 // target gets a hard attempt cap with exponential backoff and then gives up, so
 // a server that will not become hooked can never cascade across a network.
 const ESCAPED_RESPAWN_SCAN_MIN_INTERVAL_MS = 5_000;
+// Reaping is event-driven (fires on process-change events), so it only needs a
+// short guard to coalesce bursts — not the slow respawn-scan cadence.
+const ESCAPED_REAP_MIN_INTERVAL_MS = 500;
 const ESCAPED_RESPAWN_MAX_ATTEMPTS = 4;
 const ESCAPED_RESPAWN_BACKOFF_BASE_MS = 5_000;
 const ESCAPED_RESPAWN_BACKOFF_MAX_MS = 60_000;
@@ -667,6 +670,9 @@ export class PortManagerNetworkService implements DisposableLike {
    */
   private readonly respawnChildAnchorByPid = new Map<number, number | null>();
 
+  /** Coalesces bursts of process-change events so the event-driven reap stays cheap. */
+  private lastReapAtMs = 0;
+
   /** Logical port gateway attribution verdicts keyed by client (pid, startTime). */
   private readonly routerVerdictCache = new RouterVerdictCache({
     networkTtlMs: ROUTER_NETWORK_VERDICT_TTL_MS,
@@ -866,6 +872,11 @@ export class PortManagerNetworkService implements DisposableLike {
             void this.syncBrowserNetworkProxies();
             void this.writeTerminalNetworkSelectionFile();
             void this.detectAndRespawnEscapedServers();
+            // Event-driven, decoupled from the 5s respawn scan: the tracker's
+            // kqueue surfaces a launcher exit as a process change here, so a
+            // respawned orphan is reaped near-instantly when its run ends
+            // instead of up to 5s later.
+            void this.reapOrphanedRespawns();
           }
           this.localChangeEvents.emit();
         }),
@@ -5067,8 +5078,6 @@ export class PortManagerNetworkService implements DisposableLike {
         this.escapedRespawnStateByKey.delete(key);
       }
     }
-
-    await this.reapOrphanedRespawns(snapshot);
   }
 
   /**
@@ -5128,7 +5137,17 @@ export class PortManagerNetworkService implements DisposableLike {
    * the tree's lifecycle intact by having the daemon watch it, rather than moving
    * the server out of its tree.
    */
-  private async reapOrphanedRespawns(snapshot: AgentSnapshot): Promise<void> {
+  private async reapOrphanedRespawns(): Promise<void> {
+    if (this.processService === undefined || !readPortManagerSettings().escapedServerRespawn) {
+      return;
+    }
+    const nowMs = Date.now();
+    if (nowMs - this.lastReapAtMs < ESCAPED_REAP_MIN_INTERVAL_MS) {
+      return;
+    }
+    this.lastReapAtMs = nowMs;
+
+    const snapshot = this.processService.getSnapshot();
     const hookedPids = new Set<number>();
     for (const listener of snapshot.listeners) {
       if (
