@@ -3783,7 +3783,10 @@ static int pm_getsockname_hook(int sockfd, struct sockaddr *addr, socklen_t *add
  * pushed command; RESPAWN execution and syscall virtualization follow.
  */
 #define PM_CONTROL_RECONNECT_BACKOFF_US 1000000
-#define PM_CONTROL_LINE_SIZE 8192
+/* A RESPAWN line carries the escaped child's full argv+env (base64), which for
+ * a deep monorepo shell/yarn chain is tens of KB. Sized generously and heap-
+ * allocated so the control thread's stack is not blown. */
+#define PM_CONTROL_LINE_SIZE 262144
 
 static volatile sig_atomic_t pm_control_should_run = 0;
 static volatile sig_atomic_t pm_control_started = 0;
@@ -4177,21 +4180,26 @@ static int pm_control_connect(void) {
 }
 
 static void pm_control_read_loop(int fd) {
-  char buffer[PM_CONTROL_LINE_SIZE];
+  char *buffer = (char *)malloc(PM_CONTROL_LINE_SIZE);
   size_t length = 0;
+
+  if (buffer == NULL) {
+    return;
+  }
 
   for (;;) {
     ssize_t count;
 
-    if (length >= sizeof(buffer) - 1) {
+    if (length >= PM_CONTROL_LINE_SIZE - 1) {
       /* Overlong line without a newline: reset rather than grow unbounded. */
       length = 0;
     }
-    count = read(fd, buffer + length, sizeof(buffer) - 1 - length);
+    count = read(fd, buffer + length, PM_CONTROL_LINE_SIZE - 1 - length);
     if (count <= 0) {
       if (count < 0 && errno == EINTR) {
         continue;
       }
+      free(buffer);
       return;
     }
     length += (size_t)count;

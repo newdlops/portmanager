@@ -14,7 +14,9 @@
 #include <unistd.h>
 
 #define PM_CLIENT_BUFFER_INITIAL 2048
-#define PM_CLIENT_BUFFER_MAX 32768
+/* Large enough for a respawnChild request carrying an escaped child's full
+ * argv+env (base64), which reaches tens of KB in deep shell/yarn chains. */
+#define PM_CLIENT_BUFFER_MAX 262144
 #define PM_CLIENT_READ_CHUNK 4096
 #define PM_LISTEN_BACKLOG 16384
 #define PM_LISTENER_POLL_IDLE_GRACE_SECONDS 2
@@ -73,6 +75,38 @@ static int pm_control_registry_fd_for_pid(int pid) {
     }
   }
   return -1;
+}
+
+/*
+ * Writes an entire buffer to a nonblocking control socket, waiting for
+ * writability between partial writes. A RESPAWN line carries the escaped
+ * child's full env and exceeds the socket send buffer, so a single write()
+ * returns short; without draining it the push silently fails. Bounded so a
+ * stuck reader cannot hang the daemon's poll loop.
+ */
+static int pm_write_all_to_control(int fd, const char *data, size_t length) {
+  size_t written = 0;
+
+  while (written < length) {
+    ssize_t count = write(fd, data + written, length - written);
+    if (count > 0) {
+      written += (size_t)count;
+      continue;
+    }
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      struct pollfd writable = {.fd = fd, .events = POLLOUT, .revents = 0};
+      if (poll(&writable, 1, 5000) <= 0 || (writable.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        return -1;
+      }
+      continue;
+    }
+    return -1;
+  }
+
+  return 0;
 }
 
 static void pm_control_registry_remove_fd(int fd) {
@@ -549,7 +583,7 @@ static void pm_handle_line(pm_client *client, pm_agent_state *state, const char 
             line[length + 1] = '\0';
             length++;
           }
-          pushed = write(target_fd, line, length) == (ssize_t)length;
+          pushed = pm_write_all_to_control(target_fd, line, length) == 0;
         }
         free(line);
       }
