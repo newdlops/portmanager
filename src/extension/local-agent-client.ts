@@ -38,7 +38,8 @@ type AgentMethod =
   | "registerExistingProcess"
   | "stopProcess"
   | "restartProcess"
-  | "removeProcess";
+  | "removeProcess"
+  | "respawnChild";
 
 interface AgentRequest {
   /** Correlates one line-delimited request with its response. */
@@ -722,6 +723,16 @@ export class LocalAgentClient implements PortManagerProcessService {
     }
 
     pending.resolve(response.payload);
+  }
+
+  /**
+   * Asks the daemon to push a preformatted RESPAWN command to a parent hook's
+   * control channel, so that parent relaunches an escaped (unhooked) child as a
+   * true child of itself. The daemon only routes the opaque line to the parent
+   * pid's control connection; the detector composes the line.
+   */
+  async requestRespawnChild(parentPid: number, line: string): Promise<void> {
+    await this.request<null>("respawnChild", { parentPid, line });
   }
 
   /** Sends one request and waits for the correlated response. */
