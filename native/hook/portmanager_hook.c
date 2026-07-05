@@ -3964,6 +3964,7 @@ static void pm_control_handle_respawn(const char *fields) {
   int dyld_index = -1;
   const char *dyld_value;
   pid_t new_pid = -1;
+  int spawn_result = -1;
   size_t decoded_capacity = 1 << 16;
 
   if (copy == NULL) {
@@ -4076,27 +4077,28 @@ static void pm_control_handle_respawn(const char *fields) {
   }
 
   pm_hook_depth++;
-  if (pm_real_posix_spawn(
-        &new_pid,
-        argv[0],
-        have_file_actions ? &file_actions : NULL,
-        NULL,
-        argv,
-        envp) == 0 && new_pid > 0) {
-    pm_hook_depth--;
+  spawn_result = pm_real_posix_spawn(
+    &new_pid,
+    argv[0],
+    have_file_actions ? &file_actions : NULL,
+    NULL,
+    argv,
+    envp);
+  pm_hook_depth--;
+  if (spawn_result == 0 && new_pid > 0) {
     pm_respawn_map_record((pid_t)old_pid_long, new_pid);
     pm_debug("respawned old=%ld new=%d argv0=%s", old_pid_long, (int)new_pid, argv[0]);
     /*
      * Free the escaped child's coordinates so the replacement (hooked, on the
-     * network alias) owns them. Stage 4 makes this parent's own wait/kill see
-     * the replacement in place of the killed original.
+     * network alias) owns them. The wait/kill virtualization makes this parent's
+     * own process management see the replacement in place of the killed original.
      */
     if (old_pid_long > 0) {
       kill((pid_t)old_pid_long, SIGTERM);
     }
   } else {
-    pm_hook_depth--;
-    pm_debug("respawn failed old=%ld argv0=%s error=%s", old_pid_long, argv[0], strerror(errno));
+    /* posix_spawn returns the error code directly (does not set errno). */
+    pm_debug("respawn failed old=%ld argv0=%s posix_spawn=%d (%s)", old_pid_long, argv[0], spawn_result, strerror(spawn_result));
   }
 
 cleanup:

@@ -41,6 +41,13 @@ export interface PortManagerProcessService {
   restartProcess(id: string, settings: PortManagerSettings): Promise<ManagedProcess | undefined>;
   /** Removes a row from the shared agent registry or suppresses it from the view. */
   removeProcess(id: string): Promise<ManagedProcess | undefined>;
+  /**
+   * Routes a preformatted RESPAWN command to the first of `parentPids`
+   * (nearest-first) that owns a hook control connection, so it relaunches an
+   * escaped child as a true child of itself. Resolves even if no ancestor is
+   * hooked yet (the daemon reports it and the detector retries).
+   */
+  requestRespawnChild(parentPids: readonly number[], line: string): Promise<void>;
   /** Releases sockets or event subscriptions during extension deactivation. */
   dispose(): void;
 }

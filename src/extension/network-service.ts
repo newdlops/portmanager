@@ -96,7 +96,7 @@ import {
   NodeProcessTableProvider,
   type ProcessTableRow,
 } from "../platform/process/node-process-table";
-import { getProcessLookupHelperRelativePath } from "../platform/process/native-process-lookup";
+import { getProcessLookupHelperRelativePath, NativeProcessLookupProvider } from "../platform/process/native-process-lookup";
 import { NodeProcessEnvironmentProvider } from "../platform/process/node-process-environment";
 import { NodeTerminalCandidateProvider } from "../platform/process/node-terminal-candidate-provider";
 import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
@@ -262,6 +262,10 @@ const ROUTER_VERDICT_CACHE_MAX_ENTRIES = 4096;
 const ROUTER_LATE_BACKEND_PROBE_BUDGET_MS = 1_000;
 const ROUTER_LATE_BACKEND_PROBE_INTERVAL_MS = 100;
 const ROUTER_LATE_BACKEND_PROBE_CONNECT_TIMEOUT_MS = 200;
+// Escaped-server respawn: minimum gap between scans, and per-pid cooldown so a
+// failed push (no hooked ancestor yet) or a slow relaunch does not loop.
+const ESCAPED_RESPAWN_SCAN_MIN_INTERVAL_MS = 5_000;
+const ESCAPED_RESPAWN_PID_COOLDOWN_MS = 30_000;
 
 /** Outcome of classifying one router client, shared by the network/non-network paths. */
 interface RouterClientVerdict {
@@ -631,6 +635,15 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Host exposures served by the sniffing browser proxy, keyed by their endpoint id. */
   private browserProxyExposureByEndpointId = new Map<string, HostPortExposure>();
 
+  /** Reads argv/env/cwd/ancestry for composing an escaped-server respawn. */
+  private readonly nativeProcessLookup: NativeProcessLookupProvider;
+
+  /** Escaped-server respawn dedupe: pid -> last respawn attempt (ms). */
+  private readonly escapedRespawnAttemptAtByPid = new Map<number, number>();
+
+  /** Throttles the escaped-server scan so bursty snapshots don't re-capture repeatedly. */
+  private lastEscapedRespawnScanAtMs = 0;
+
   /** Logical port gateway attribution verdicts keyed by client (pid, startTime). */
   private readonly routerVerdictCache = new RouterVerdictCache({
     networkTtlMs: ROUTER_NETWORK_VERDICT_TTL_MS,
@@ -790,6 +803,7 @@ export class PortManagerNetworkService implements DisposableLike {
       },
     });
     const nativeProcessLookupPath = this.context.asAbsolutePath(getProcessLookupHelperRelativePath());
+    this.nativeProcessLookup = new NativeProcessLookupProvider({ helperPath: nativeProcessLookupPath });
     this.tcpConnectionProcessResolver = new NodeTcpConnectionProcessResolver({
       nativeLookupPath: nativeProcessLookupPath,
     });
@@ -828,6 +842,7 @@ export class PortManagerNetworkService implements DisposableLike {
             void this.syncLogicalPortRouters();
             void this.syncBrowserNetworkProxies();
             void this.writeTerminalNetworkSelectionFile();
+            void this.detectAndRespawnEscapedServers();
           }
           this.localChangeEvents.emit();
         }),
@@ -4880,6 +4895,89 @@ export class PortManagerNetworkService implements DisposableLike {
     return this.logicalRouterSyncInFlight;
   }
 
+  /**
+   * Detects dev servers that escaped the preload through a version-manager/shell
+   * shim (network-scoped but bound to 0.0.0.0 unhooked) and asks a hooked
+   * ancestor to relaunch them hooked. Opt-in and destructive (kills+respawns the
+   * detected process), so it is gated on `escapedServerRespawn` and guarded hard
+   * against false positives: only a wildcard bind, scoped to an ATTACHED
+   * network, on a routable non-fixed port, with no live hooked route, qualifies.
+   */
+  private async detectAndRespawnEscapedServers(): Promise<void> {
+    if (this.processService === undefined || !readPortManagerSettings().escapedServerRespawn) {
+      return;
+    }
+    const nowMs = Date.now();
+    if (nowMs - this.lastEscapedRespawnScanAtMs < ESCAPED_RESPAWN_SCAN_MIN_INTERVAL_MS) {
+      return;
+    }
+    this.lastEscapedRespawnScanAtMs = nowMs;
+
+    const snapshot = this.processService.getSnapshot();
+    const networkIds = new Set(this.registry.getSnapshot().networks.map((network) => network.id));
+    const fixedProtocolPorts = new Set(readPortManagerSettings().fixedProtocolPorts);
+
+    // Drop dedupe entries for pids that are gone and past their cooldown.
+    const livePids = new Set(
+      snapshot.listeners.map((listener) => listener.pid).filter((pid): pid is number => pid !== undefined),
+    );
+    for (const [pid, attemptAtMs] of [...this.escapedRespawnAttemptAtByPid]) {
+      if (!livePids.has(pid) && attemptAtMs + ESCAPED_RESPAWN_PID_COOLDOWN_MS < nowMs) {
+        this.escapedRespawnAttemptAtByPid.delete(pid);
+      }
+    }
+
+    for (const listener of snapshot.listeners) {
+      const pid = listener.pid;
+      if (
+        listener.protocol !== "tcp" ||
+        pid === undefined ||
+        !isWildcardBindAddress(listener.localAddress) ||
+        !isTcpPort(listener.port) ||
+        fixedProtocolPorts.has(listener.port)
+      ) {
+        continue;
+      }
+
+      const attemptAtMs = this.escapedRespawnAttemptAtByPid.get(pid);
+      if (attemptAtMs !== undefined && attemptAtMs + ESCAPED_RESPAWN_PID_COOLDOWN_MS > nowMs) {
+        continue;
+      }
+
+      // A live hooked route already owns this port: not an escaped server.
+      if (
+        snapshot.routes.some(
+          (route) => route.actualPort === listener.port && isLiveListenRoute(route) && route.source === "hooked",
+        )
+      ) {
+        continue;
+      }
+
+      const details = await this.nativeProcessLookup.captureProcess(pid).catch(() => undefined);
+      if (
+        details?.networkId === undefined ||
+        !networkIds.has(details.networkId) ||
+        details.argv === undefined ||
+        details.argv.length === 0 ||
+        !details.argv[0].startsWith("/") ||
+        details.ancestorPids.length === 0
+      ) {
+        continue;
+      }
+
+      const line = buildEscapedRespawnLine(pid, details.cwd ?? "", details.argv, details.env ?? []);
+      // Mark before the request so a concurrent scan does not double-fire; the
+      // cooldown also throttles retries when no hooked ancestor exists yet.
+      this.escapedRespawnAttemptAtByPid.set(pid, nowMs);
+      try {
+        await this.processService.requestRespawnChild(details.ancestorPids, line);
+      } catch {
+        // No hooked ancestor with a control channel yet, or the push failed;
+        // the cooldown lets a later scan retry once the tree is (re)hooked.
+      }
+    }
+  }
+
   /** Runs router reconciliation until one queued refresh has seen the latest snapshot. */
   private async syncLogicalPortRoutersQueued(): Promise<void> {
     do {
@@ -8134,6 +8232,37 @@ function browserProxyTargetProtocolFromUrl(url: string | undefined): BrowserNetw
  * actually completed bind/register. Opening a logical router for that state can
  * keep the requested port occupied after the real listener fails to start.
  */
+/** True for a wildcard/all-interfaces bind — the signature of an unhooked escaped server. */
+function isWildcardBindAddress(address: string): boolean {
+  const normalized = address.trim().toLowerCase();
+  return (
+    normalized === "0.0.0.0" ||
+    normalized === "*" ||
+    normalized === "::" ||
+    normalized === "[::]" ||
+    normalized === ""
+  );
+}
+
+/** Composes the tab-delimited, base64-per-field RESPAWN line the parent hook parses. */
+function buildEscapedRespawnLine(
+  oldPid: number,
+  cwd: string,
+  argv: readonly string[],
+  env: readonly string[],
+): string {
+  const encode = (value: string): string => Buffer.from(value, "utf8").toString("base64");
+  return [
+    "RESPAWN",
+    String(oldPid),
+    encode(cwd),
+    String(argv.length),
+    ...argv.map(encode),
+    String(env.length),
+    ...env.map(encode),
+  ].join("\t");
+}
+
 function isLiveListenRoute(route: LogicalPortRoute): boolean {
   return isListenRoute(route) && route.status === "running";
 }

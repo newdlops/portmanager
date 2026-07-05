@@ -28,6 +28,10 @@ export interface NativeProcessLookupDetails {
   readonly cwd?: string;
   /** Port Manager routing network inherited through process environment. */
   readonly networkId?: string;
+  /** Full argument vector (only populated by captureProcess). */
+  readonly argv?: readonly string[];
+  /** Full environment as KEY=VALUE entries (only populated by captureProcess). */
+  readonly env?: readonly string[];
 }
 
 /**
@@ -78,6 +82,25 @@ export class NativeProcessLookupProvider {
       return undefined;
     }
   }
+
+  /**
+   * Like inspectProcess but also captures the exact argv and environment, used
+   * to compose a faithful respawn of an escaped (unhooked) server. Kept separate
+   * so the hot inspect path stays compact.
+   */
+  async captureProcess(pid: number): Promise<NativeProcessLookupDetails | undefined> {
+    if (this.disabled || process.platform === "win32" || !isPositiveInteger(pid)) {
+      return undefined;
+    }
+
+    try {
+      const { stdout } = await this.runCommand(this.helperPath, ["capture", String(pid)]);
+      return parseNativeProcessLookupDetails(toText(stdout));
+    } catch {
+      this.disabled = true;
+      return undefined;
+    }
+  }
 }
 
 export function getProcessLookupHelperRelativePath(): string {
@@ -103,12 +126,20 @@ export function parseNativeProcessLookupDetails(output: string): NativeProcessLo
     : [];
   const cwd = parseNonEmptyString(parsed?.cwd);
   const networkId = parseNonEmptyString(parsed?.networkId);
+  const argv = Array.isArray(parsed?.argv)
+    ? parsed.argv.filter((entry): entry is string => typeof entry === "string")
+    : undefined;
+  const env = Array.isArray(parsed?.env)
+    ? parsed.env.filter((entry): entry is string => typeof entry === "string")
+    : undefined;
 
   return {
     ...(row === undefined ? {} : { row }),
     ancestorPids,
     ...(cwd === undefined ? {} : { cwd }),
     ...(networkId === undefined ? {} : { networkId }),
+    ...(argv === undefined ? {} : { argv }),
+    ...(env === undefined ? {} : { env }),
   };
 }
 

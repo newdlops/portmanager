@@ -513,13 +513,30 @@ static void pm_handle_line(pm_client *client, pm_agent_state *state, const char 
   }
 
   /*
-   * Routes a preformatted RESPAWN line to the parent's control connection. The
-   * detector (extension) computes the escaped child's argv/env/cwd and target
-   * parent; the daemon only forwards the opaque line to that parent's hook.
+   * Routes a preformatted RESPAWN line to a parent's control connection. The
+   * detector (extension) computes the escaped child's argv/env/cwd and a
+   * nearest-first list of candidate ancestor pids (comma-separated); the daemon
+   * forwards the opaque line to the first candidate that owns a control
+   * connection, since only the daemon knows which ancestors are hooked.
    */
   if (strcmp(request.method, "respawnChild") == 0) {
-    int parent_pid = pm_json_get_int(request.payload == NULL ? "" : request.payload, "parentPid", 0);
-    int target_fd = parent_pid > 0 ? pm_control_registry_fd_for_pid(parent_pid) : -1;
+    char parent_pids[PM_TEXT];
+    int target_fd = -1;
+
+    parent_pids[0] = '\0';
+    pm_json_get_string(request.payload == NULL ? "" : request.payload, "parentPids", parent_pids, sizeof(parent_pids));
+    {
+      char *saveptr = NULL;
+      char *token = strtok_r(parent_pids, ",", &saveptr);
+      while (token != NULL && target_fd < 0) {
+        int candidate = atoi(token);
+        if (candidate > 0) {
+          target_fd = pm_control_registry_fd_for_pid(candidate);
+        }
+        token = strtok_r(NULL, ",", &saveptr);
+      }
+    }
+
     int pushed = 0;
 
     if (target_fd >= 0) {

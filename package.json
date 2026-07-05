@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8146",
+  "version": "0.0.8147",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -960,6 +960,11 @@
           "type": "boolean",
           "default": true,
           "description": "Let Port Manager own logical ports on localhost and route each connection to its logical network by identifying the source process. Turn off to route only through the in-process terminal hook (no daemon-owned localhost listeners)."
+        },
+        "portManager.escapedServerRespawn": {
+          "type": "boolean",
+          "default": false,
+          "description": "Experimental. When a network-scoped dev server escapes the preload through a version-manager/shell shim (yarn/asdf) and binds 0.0.0.0 unhooked, let Port Manager relaunch it hooked by asking a hooked ancestor process to respawn it. This kills and restarts the detected server, so it is off by default until validated in your setup."
         },
         "portManager.detectTerminalListenFailures": {
           "type": "boolean",

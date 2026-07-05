@@ -460,6 +460,74 @@ static int pm_read_network_id(int pid, char *buffer, size_t size) {
   return -1;
 }
 
+/*
+ * Emits ,"argv":[...],"env":[...] parsed from KERN_PROCARGS2 for one pid, used
+ * by the escaped-server detector to compose an exact respawn. Layout:
+ *   [int argc][exec_path \0][\0 padding][argv0 \0]..[argvN \0][env0 \0]..
+ */
+static void pm_print_argv_env(int pid) {
+  char *buffer = NULL;
+  size_t size = 0;
+  size_t offset;
+  int arg_count;
+  int printed;
+
+  if (pm_read_environment_buffer(pid, &buffer, &size) != 0 || size < sizeof(int)) {
+    fputs(",\"argv\":[],\"env\":[]", stdout);
+    free(buffer);
+    return;
+  }
+
+  memcpy(&arg_count, buffer, sizeof(int));
+  offset = sizeof(int);
+
+  /* Skip exec_path, then the NUL padding that precedes argv[0]. */
+  while (offset < size && buffer[offset] != '\0') {
+    offset++;
+  }
+  while (offset < size && buffer[offset] == '\0') {
+    offset++;
+  }
+
+  fputs(",\"argv\":[", stdout);
+  printed = 0;
+  for (int index = 0; index < arg_count && offset < size; index++) {
+    const char *entry = buffer + offset;
+    size_t remaining = size - offset;
+    size_t length = strnlen(entry, remaining);
+    if (length == remaining) {
+      break; /* no terminating NUL: truncated buffer */
+    }
+    if (printed++ > 0) {
+      putchar(',');
+    }
+    pm_json_string(entry);
+    offset += length + 1;
+  }
+  fputs("]", stdout);
+
+  fputs(",\"env\":[", stdout);
+  printed = 0;
+  while (offset < size) {
+    const char *entry = buffer + offset;
+    size_t remaining = size - offset;
+    size_t length = strnlen(entry, remaining);
+    if (length == remaining) {
+      break;
+    }
+    if (length > 0) {
+      if (printed++ > 0) {
+        putchar(',');
+      }
+      pm_json_string(entry);
+    }
+    offset += length + 1;
+  }
+  fputs("]", stdout);
+
+  free(buffer);
+}
+
 static void pm_print_table(pm_process_table *table) {
   fputs("{\"rows\":[", stdout);
   for (size_t index = 0; index < table->count; index++) {
@@ -507,7 +575,7 @@ static void pm_print_ancestor_pids(pm_process_table *table, const pm_process_row
   putchar(']');
 }
 
-static void pm_print_inspect(pm_process_table *table, int pid) {
+static void pm_print_inspect(pm_process_table *table, int pid, int include_args) {
   pm_process_row *row = pm_find_row(table, pid);
   char cwd[PM_TEXT_SIZE] = "";
   char network_id[PM_TEXT_SIZE] = "";
@@ -526,6 +594,10 @@ static void pm_print_inspect(pm_process_table *table, int pid) {
   if (pm_read_network_id(pid, network_id, sizeof(network_id)) == 0) {
     fputs(",\"networkId\":", stdout);
     pm_json_string(network_id);
+  }
+  if (include_args) {
+    /* argv/env are only emitted for `capture` so `inspect` stays compact. */
+    pm_print_argv_env(pid);
   }
   fputs("}\n", stdout);
 }
@@ -547,9 +619,12 @@ int main(int argc, char **argv) {
   if (strcmp(argv[1], "list") == 0) {
     pm_print_table(&table);
   } else if (strcmp(argv[1], "inspect") == 0 && argc == 3 && pm_is_positive_pid_text(argv[2])) {
-    pm_print_inspect(&table, atoi(argv[2]));
+    pm_print_inspect(&table, atoi(argv[2]), 0);
+  } else if (strcmp(argv[1], "capture") == 0 && argc == 3 && pm_is_positive_pid_text(argv[2])) {
+    /* Adds argv/env for composing an exact escaped-server respawn. */
+    pm_print_inspect(&table, atoi(argv[2]), 1);
   } else {
-    fprintf(stderr, "usage: portmanager_process_lookup list|inspect <pid>\n");
+    fprintf(stderr, "usage: portmanager_process_lookup list|inspect|capture <pid>\n");
     result = 2;
   }
 

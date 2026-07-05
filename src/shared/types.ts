@@ -525,6 +525,13 @@ export interface PortManagerSettings {
    * the in-process hook fast path only (no daemon-owned localhost listeners).
    */
   readonly logicalPortGateway: boolean;
+  /**
+   * EXPERIMENTAL, default off. When on, the daemon detects a network-scoped dev
+   * server that escaped the preload through a version-manager/shell shim (bound
+   * 0.0.0.0 unhooked) and asks a hooked ancestor to relaunch it hooked. This
+   * KILLS and respawns the detected process, so it stays opt-in until validated.
+   */
+  readonly escapedServerRespawn: boolean;
   /** Whether terminal output should be scanned for bind/listen failures. */
   readonly detectTerminalListenFailures: boolean;
   /** Whether explicit terminal port commands should be offered daemon routing at start. */
