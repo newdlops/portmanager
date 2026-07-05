@@ -4371,6 +4371,105 @@ static void pm_control_channel_init(void) {
   pthread_attr_destroy(&attr);
 }
 
+/*
+ * A non-interactive `sh -c <cmd>` reads NO startup file (not BASH_ENV, not ENV),
+ * and SIP strips DYLD_INSERT_LIBRARIES when exec'ing the protected shell, so a
+ * server launched through `sh -c` (yarn/npm scripts, child_process.exec, make,
+ * dotenv — the universal command path) escapes the preload. This is the only
+ * hook point for that boundary: prepend an in-command restore so the shell
+ * re-establishes the preload for ITS children from the surviving hint. The shell
+ * itself stays unhooked (fine); its children (the real server) become hooked.
+ * `: pmdyld;` is a no-op sentinel making the rewrite idempotent.
+ */
+#define PM_SH_C_SENTINEL ": pmdyld;"
+#define PM_SH_C_PREAMBLE \
+  ": pmdyld;if [ -n \"$PORT_MANAGER_DYLD_INSERT_LIBRARIES\" ] && [ \"${PORT_MANAGER_HOOK_DISABLED:-0}\" != 1 ] && [ \"${PORT_MANAGER_HOOK:-1}\" != 0 ]; then DYLD_INSERT_LIBRARIES=\"$PORT_MANAGER_DYLD_INSERT_LIBRARIES\"; export DYLD_INSERT_LIBRARIES; fi;"
+
+static int pm_basename_is_shell(const char *path) {
+  const char *base;
+  if (path == NULL) {
+    return 0;
+  }
+  base = strrchr(path, '/');
+  base = (base == NULL) ? path : base + 1;
+  return strcmp(base, "sh") == 0 || strcmp(base, "bash") == 0 || strcmp(base, "zsh") == 0 ||
+         strcmp(base, "dash") == 0;
+}
+
+/*
+ * If (path/argv[0]) is a shell invoked as `-c <cmd>`, returns a new NULL-terminated
+ * argv whose command has the DYLD-restore preamble prepended; otherwise NULL (use
+ * the original argv). Only argv[cmd_index] is heap-allocated; free with
+ * pm_free_rewritten_argv().
+ */
+static char **pm_rewrite_shell_c_argv(const char *path, char *const argv[], char *const envp[]) {
+  size_t argc = 0;
+  size_t cmd_index = 0;
+  char **new_argv;
+  char *new_cmd;
+  size_t new_cmd_length;
+  const char *hint;
+
+  if (argv == NULL || pm_hook_depth > 0 || !pm_hook_enabled() || envp == NULL) {
+    return NULL;
+  }
+  if (pm_envp_value_is(envp, "PORT_MANAGER_HOOK_DISABLED", "1") ||
+      pm_envp_value_is(envp, "PORT_MANAGER_HOOK", "0") ||
+      !pm_envp_value_is(envp, "PORT_MANAGER_PRELOAD_REPAIR", "1")) {
+    return NULL;
+  }
+  hint = pm_envp_value(envp, PM_PRELOAD_HINT_ENV);
+  if (hint == NULL || hint[0] == '\0') {
+    return NULL;
+  }
+  if (!pm_basename_is_shell(path) && !(argv[0] != NULL && pm_basename_is_shell(argv[0]))) {
+    return NULL;
+  }
+
+  for (size_t index = 0; argv[index] != NULL; index++) {
+    if (cmd_index == 0 && strcmp(argv[index], "-c") == 0 && argv[index + 1] != NULL) {
+      cmd_index = index + 1;
+    }
+    argc++;
+  }
+  if (cmd_index == 0) {
+    return NULL;
+  }
+  if (strncmp(argv[cmd_index], PM_SH_C_SENTINEL, strlen(PM_SH_C_SENTINEL)) == 0) {
+    return NULL; /* already rewritten */
+  }
+
+  new_cmd_length = strlen(PM_SH_C_PREAMBLE) + strlen(argv[cmd_index]) + 1;
+  new_cmd = (char *)malloc(new_cmd_length);
+  if (new_cmd == NULL) {
+    return NULL;
+  }
+  snprintf(new_cmd, new_cmd_length, "%s%s", PM_SH_C_PREAMBLE, argv[cmd_index]);
+
+  new_argv = (char **)malloc((argc + 1) * sizeof(char *));
+  if (new_argv == NULL) {
+    free(new_cmd);
+    return NULL;
+  }
+  for (size_t index = 0; index < argc; index++) {
+    new_argv[index] = (index == cmd_index) ? new_cmd : argv[index];
+  }
+  new_argv[argc] = NULL;
+  return new_argv;
+}
+
+static void pm_free_rewritten_argv(char **rewritten, char *const original[]) {
+  if (rewritten == NULL) {
+    return;
+  }
+  for (size_t index = 0; rewritten[index] != NULL; index++) {
+    if (original == NULL || rewritten[index] != original[index]) {
+      free(rewritten[index]);
+    }
+  }
+  free(rewritten);
+}
+
 static int pm_exec_with_prepared_child(
   const char *path,
   char *const argv[],
@@ -4413,8 +4512,12 @@ static int pm_exec_with_prepared_child(
     }
   }
 
-  result = pm_real_execve(exec_target, argv, child_environment.envp);
-  saved_errno = errno;
+  {
+    char **rewritten_argv = pm_rewrite_shell_c_argv(exec_target, argv, child_environment.envp);
+    result = pm_real_execve(exec_target, rewritten_argv != NULL ? rewritten_argv : argv, child_environment.envp);
+    saved_errno = errno;
+    pm_free_rewritten_argv(rewritten_argv, argv);
+  }
   pm_release_child_environment(&child_environment);
   errno = saved_errno;
   return result;
@@ -4458,7 +4561,12 @@ static int pm_posix_spawn_hook(
   }
 
   child_environment = pm_prepare_child_environment(envp);
-  result = pm_real_posix_spawn(pid, target, file_actions, attrp, argv, child_environment.envp);
+  {
+    char **rewritten_argv = pm_rewrite_shell_c_argv(target, argv, child_environment.envp);
+    result = pm_real_posix_spawn(
+      pid, target, file_actions, attrp, rewritten_argv != NULL ? rewritten_argv : argv, child_environment.envp);
+    pm_free_rewritten_argv(rewritten_argv, argv);
+  }
   pm_release_child_environment(&child_environment);
   return result;
 }
@@ -4486,15 +4594,20 @@ static int pm_posix_spawnp_hook(
   target = pm_runtime_exec_target(file, argv);
   child_environment = pm_prepare_child_environment(envp);
 
-  if (target != file) {
-    /*
-     * The runtime target was rewritten to an absolute shim path, so spawn it
-     * directly instead of letting posix_spawnp re-search PATH.
-     */
-    pm_debug("runtime posix_spawnp rewrite file=%s target=%s", file != NULL ? file : "(null)", target);
-    result = pm_real_posix_spawn(pid, target, file_actions, attrp, argv, child_environment.envp);
-  } else {
-    result = pm_real_posix_spawnp(pid, file, file_actions, attrp, argv, child_environment.envp);
+  {
+    char **rewritten_argv = pm_rewrite_shell_c_argv(target != file ? target : file, argv, child_environment.envp);
+    char *const *effective_argv = rewritten_argv != NULL ? rewritten_argv : argv;
+    if (target != file) {
+      /*
+       * The runtime target was rewritten to an absolute shim path, so spawn it
+       * directly instead of letting posix_spawnp re-search PATH.
+       */
+      pm_debug("runtime posix_spawnp rewrite file=%s target=%s", file != NULL ? file : "(null)", target);
+      result = pm_real_posix_spawn(pid, target, file_actions, attrp, effective_argv, child_environment.envp);
+    } else {
+      result = pm_real_posix_spawnp(pid, file, file_actions, attrp, effective_argv, child_environment.envp);
+    }
+    pm_free_rewritten_argv(rewritten_argv, argv);
   }
 
   pm_release_child_environment(&child_environment);
