@@ -47,7 +47,7 @@ export interface PortManagerProcessService {
    * escaped child as a true child of itself. Resolves even if no ancestor is
    * hooked yet (the daemon reports it and the detector retries).
    */
-  requestRespawnChild(parentPids: readonly number[], line: string): Promise<void>;
+  requestRespawnChild(parentPids: readonly number[], networkId: string, line: string): Promise<void>;
   /** Releases sockets or event subscriptions during extension deactivation. */
   dispose(): void;
 }

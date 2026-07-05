@@ -732,8 +732,8 @@ export class LocalAgentClient implements PortManagerProcessService {
    * the daemon routes to the first that owns a control connection (only it
    * knows which ancestors are hooked). The detector composes the opaque line.
    */
-  async requestRespawnChild(parentPids: readonly number[], line: string): Promise<void> {
-    await this.request<null>("respawnChild", { parentPids: parentPids.join(","), line });
+  async requestRespawnChild(parentPids: readonly number[], networkId: string, line: string): Promise<void> {
+    await this.request<null>("respawnChild", { parentPids: parentPids.join(","), networkId, line });
   }
 
   /** Sends one request and waits for the correlated response. */

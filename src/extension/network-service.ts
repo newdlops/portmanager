@@ -5008,13 +5008,15 @@ export class PortManagerNetworkService implements DisposableLike {
         continue;
       }
 
-      const line = buildEscapedRespawnLine(pid, details.cwd ?? "", details.argv, details.env ?? []);
+      const line = buildEscapedRespawnLine(pid, details.networkId, details.cwd ?? "", details.argv, details.env ?? []);
       // Count the attempt before the request so a concurrent scan cannot double-fire.
       state.attempts += 1;
       state.lastAttemptAtMs = nowMs;
       this.escapedRespawnStateByKey.set(key, state);
       try {
-        await this.processService.requestRespawnChild(details.ancestorPids, line);
+        // Pass the target network so the daemon routes only to a same-network
+        // hooked ancestor and the hook confines its spawn/kill to this scope.
+        await this.processService.requestRespawnChild(details.ancestorPids, details.networkId, line);
       } catch {
         // No hooked ancestor with a control channel yet, or the push failed; the
         // attempt cap + backoff bound retries and eventually give up.
@@ -8300,14 +8302,19 @@ function isWildcardBindAddress(address: string): boolean {
 /** Composes the tab-delimited, base64-per-field RESPAWN line the parent hook parses. */
 function buildEscapedRespawnLine(
   oldPid: number,
+  networkId: string,
   cwd: string,
   argv: readonly string[],
   env: readonly string[],
 ): string {
   const encode = (value: string): string => Buffer.from(value, "utf8").toString("base64");
+  // networkId is the target scope: the executing hook refuses unless its own
+  // scope matches, and the kill only fires if the victim pid is in this network.
+  // Keep this field order in sync with pm_control_handle_respawn (native hook).
   return [
     "RESPAWN",
     String(oldPid),
+    encode(networkId),
     encode(cwd),
     String(argv.length),
     ...argv.map(encode),

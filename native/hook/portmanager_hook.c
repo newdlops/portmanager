@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/types.h>
@@ -3949,6 +3950,66 @@ static int pm_base64_decode(const char *input, char *output, size_t output_capac
  * and the hook loads. It inherits this parent's fds/pgroup/session, so terminal
  * output and job control are preserved.
  */
+/*
+ * Reads a target pid's Port Manager network id from its environment via
+ * KERN_PROCARGS2, using the SAME variable precedence as the detector's
+ * process-lookup helper (so the value equals the RESPAWN target for the genuine
+ * escaped child). Lets a respawn refuse to signal any pid that is not in the
+ * intended network — the guarantee that a respawn's kill can never cross a
+ * network boundary, even under pid reuse. Returns 0 with buf filled, else -1.
+ */
+static int pm_read_process_network_id(pid_t pid, char *buf, size_t size) {
+  static const char *const variables[] = {
+    "PORT_MANAGER_NETWORK_ID",
+    "PORT_MANAGER_ROUTE_TABLE_NETWORK_ID",
+    "PORT_MANAGER_BORROWED_NETWORK_ID",
+    "NEWDLOPS_PM_NETWORK_ID",
+    "NEWDLOPS_PM_BORROWED_NETWORK_ID",
+  };
+  int mib[3] = {CTL_KERN, KERN_PROCARGS2, (int)pid};
+  size_t buffer_size = 0;
+  char *buffer;
+
+  if (buf == NULL || size == 0) {
+    return -1;
+  }
+  buf[0] = '\0';
+
+  if (sysctl(mib, 3, NULL, &buffer_size, NULL, 0) != 0 || buffer_size == 0) {
+    return -1;
+  }
+  buffer = (char *)malloc(buffer_size);
+  if (buffer == NULL) {
+    return -1;
+  }
+  if (sysctl(mib, 3, buffer, &buffer_size, NULL, 0) != 0) {
+    free(buffer);
+    return -1;
+  }
+
+  for (size_t variable_index = 0; variable_index < sizeof(variables) / sizeof(variables[0]); variable_index++) {
+    const char *name = variables[variable_index];
+    size_t name_length = strlen(name);
+    size_t offset = 0;
+
+    while (offset < buffer_size) {
+      const char *entry = buffer + offset;
+      size_t remaining = buffer_size - offset;
+      size_t entry_length = strnlen(entry, remaining);
+
+      if (entry_length > name_length && entry[name_length] == '=' && strncmp(entry, name, name_length) == 0) {
+        snprintf(buf, size, "%s", entry + name_length + 1);
+        free(buffer);
+        return buf[0] == '\0' ? -1 : 0;
+      }
+      offset += entry_length + 1;
+    }
+  }
+
+  free(buffer);
+  return -1;
+}
+
 static void pm_control_handle_respawn(const char *fields) {
   char *copy = strdup(fields);
   char *saveptr = NULL;
@@ -3958,6 +4019,7 @@ static void pm_control_handle_respawn(const char *fields) {
   posix_spawn_file_actions_t file_actions;
   int have_file_actions = 0;
   char cwd[PM_MAX_PATH];
+  char target_network_id[128];
   const char *token;
   long old_pid_long;
   long argc_long;
@@ -3985,6 +4047,24 @@ static void pm_control_handle_respawn(const char *fields) {
     goto cleanup;
   }
   old_pid_long = strtol(token, NULL, 10);
+
+  /* target network id (base64): confine this respawn to one network. The
+   * executing hook must itself be in that network, else refuse entirely so a
+   * shared or cross-network ancestor is never armed (its kill/wait
+   * virtualization would otherwise leak signals across network boundaries). */
+  token = strtok_r(NULL, "\t", &saveptr);
+  if (token == NULL || pm_base64_decode(token, target_network_id, sizeof(target_network_id), NULL) != 0) {
+    goto cleanup;
+  }
+  {
+    const char *own_network_id = pm_current_network_id();
+    if (own_network_id == NULL || own_network_id[0] == '\0' ||
+        strcmp(own_network_id, target_network_id) != 0) {
+      pm_debug("respawn REFUSED own_net=%s target_net=%s (scope mismatch)",
+               own_network_id != NULL ? own_network_id : "(none)", target_network_id);
+      goto cleanup;
+    }
+  }
 
   /* cwd (base64) */
   token = strtok_r(NULL, "\t", &saveptr);
@@ -4097,7 +4177,19 @@ static void pm_control_handle_respawn(const char *fields) {
      * own process management see the replacement in place of the killed original.
      */
     if (old_pid_long > 0) {
-      kill((pid_t)old_pid_long, SIGTERM);
+      /* Cross-network kill guard: signal the victim only if it is genuinely in
+       * the target network right now. A recycled pid, or any process outside
+       * this network, fails the check — so a respawn's SIGTERM can never cross
+       * a network boundary. */
+      char victim_network_id[128];
+      victim_network_id[0] = '\0';
+      if (pm_read_process_network_id((pid_t)old_pid_long, victim_network_id, sizeof(victim_network_id)) == 0 &&
+          strcmp(victim_network_id, target_network_id) == 0) {
+        kill((pid_t)old_pid_long, SIGTERM);
+      } else {
+        pm_debug("respawn kill SKIPPED old=%ld victim_net=%s target_net=%s (cross-network guard)",
+                 old_pid_long, victim_network_id, target_network_id);
+      }
     }
   } else {
     /* posix_spawn returns the error code directly (does not set errno). */
@@ -4136,8 +4228,9 @@ static void pm_control_dispatch_line(const char *line) {
 static int pm_control_connect(void) {
   char socket_path[PM_MAX_PATH];
   struct sockaddr_un address;
-  char hello[192];
+  char hello[320];
   size_t hello_length;
+  const char *network_id;
   int fd;
 
   pm_ensure_symbols();
@@ -4165,12 +4258,16 @@ static int pm_control_connect(void) {
   }
   pm_debug("control connected socket=%s", socket_path);
 
+  /* Register the network scope so the daemon routes a RESPAWN only to a
+   * same-network ancestor (network ids are [a-z0-9-], so JSON-safe unescaped). */
+  network_id = pm_current_network_id();
   hello_length = (size_t)snprintf(
     hello,
     sizeof(hello),
-    "{\"id\":\"hook-control-%ld\",\"method\":\"controlChannel\",\"payload\":{\"pid\":%ld}}\n",
+    "{\"id\":\"hook-control-%ld\",\"method\":\"controlChannel\",\"payload\":{\"pid\":%ld,\"networkId\":\"%s\"}}\n",
     (long)getpid(),
-    (long)getpid());
+    (long)getpid(),
+    network_id != NULL ? network_id : "");
   if (hello_length >= sizeof(hello) || write(fd, hello, hello_length) != (ssize_t)hello_length) {
     close(fd);
     return -1;

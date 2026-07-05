@@ -41,16 +41,23 @@ typedef struct {
 typedef struct {
   int pid;
   int fd;
+  /* Network scope the hooked parent registered with, so a respawn is routed
+   * only to an ancestor in the escaped child's own network (never a shared or
+   * cross-network ancestor, whose kill/wait virtualization would leak signals
+   * across network boundaries). */
+  char network_id[128];
 } pm_control_entry;
 
 static pm_control_entry *pm_control_entries = NULL;
 static size_t pm_control_entry_count = 0;
 static size_t pm_control_entry_capacity = 0;
 
-static void pm_control_registry_set(int pid, int fd) {
+static void pm_control_registry_set(int pid, int fd, const char *network_id) {
   for (size_t index = 0; index < pm_control_entry_count; index++) {
     if (pm_control_entries[index].pid == pid) {
       pm_control_entries[index].fd = fd;
+      snprintf(pm_control_entries[index].network_id, sizeof(pm_control_entries[index].network_id), "%s",
+               network_id != NULL ? network_id : "");
       return;
     }
   }
@@ -65,13 +72,24 @@ static void pm_control_registry_set(int pid, int fd) {
   }
   pm_control_entries[pm_control_entry_count].pid = pid;
   pm_control_entries[pm_control_entry_count].fd = fd;
+  snprintf(pm_control_entries[pm_control_entry_count].network_id, sizeof(pm_control_entries[pm_control_entry_count].network_id), "%s",
+           network_id != NULL ? network_id : "");
   pm_control_entry_count++;
 }
 
-static int pm_control_registry_fd_for_pid(int pid) {
+/*
+ * Returns the control fd for pid only when its registered network matches
+ * want_network_id. A pid whose network differs returns -1 so the caller falls
+ * through to the next candidate ancestor rather than routing cross-network.
+ */
+static int pm_control_registry_fd_for_pid(int pid, const char *want_network_id) {
   for (size_t index = 0; index < pm_control_entry_count; index++) {
     if (pm_control_entries[index].pid == pid) {
-      return pm_control_entries[index].fd;
+      if (want_network_id == NULL || want_network_id[0] == '\0' ||
+          strcmp(pm_control_entries[index].network_id, want_network_id) == 0) {
+        return pm_control_entries[index].fd;
+      }
+      return -1;
     }
   }
   return -1;
@@ -536,10 +554,13 @@ static void pm_handle_line(pm_client *client, pm_agent_state *state, const char 
    */
   if (strcmp(request.method, "controlChannel") == 0) {
     int pid = pm_json_get_int(request.payload == NULL ? "" : request.payload, "pid", 0);
+    char network_id[128];
+    network_id[0] = '\0';
+    pm_json_get_string(request.payload == NULL ? "" : request.payload, "networkId", network_id, sizeof(network_id));
     if (pid > 0) {
       client->is_control = 1;
       client->control_pid = pid;
-      pm_control_registry_set(pid, client->fd);
+      pm_control_registry_set(pid, client->fd, network_id);
     }
     pm_send_response(client->fd, &request, 1, NULL, NULL);
     pm_buffer_free(&payload);
@@ -555,17 +576,21 @@ static void pm_handle_line(pm_client *client, pm_agent_state *state, const char 
    */
   if (strcmp(request.method, "respawnChild") == 0) {
     char parent_pids[PM_TEXT];
+    char target_network_id[128];
     int target_fd = -1;
 
     parent_pids[0] = '\0';
+    target_network_id[0] = '\0';
     pm_json_get_string(request.payload == NULL ? "" : request.payload, "parentPids", parent_pids, sizeof(parent_pids));
+    pm_json_get_string(request.payload == NULL ? "" : request.payload, "networkId", target_network_id, sizeof(target_network_id));
     {
       char *saveptr = NULL;
       char *token = strtok_r(parent_pids, ",", &saveptr);
       while (token != NULL && target_fd < 0) {
         int candidate = atoi(token);
         if (candidate > 0) {
-          target_fd = pm_control_registry_fd_for_pid(candidate);
+          /* Same-network ancestors only: never route across network scope. */
+          target_fd = pm_control_registry_fd_for_pid(candidate, target_network_id);
         }
         token = strtok_r(NULL, ",", &saveptr);
       }
