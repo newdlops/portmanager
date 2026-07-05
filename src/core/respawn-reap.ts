@@ -12,9 +12,10 @@
  * A replacement is reaped ONLY when every one of these holds:
  *  - network scope: its CURRENT network still equals the network recorded at
  *    respawn (a mismatch — e.g. pid reuse or misattribution — never reaps);
- *  - whole invocation subtree dead: EVERY launcher-subtree ancestor recorded at
- *    respawn is gone (one transient intermediate dying is never enough — the
- *    long-lived launcher must also be gone, i.e. the run truly ended);
+ *  - run ended: EVERY recorded run-liveness pid is gone. The caller records the
+ *    run's process-group LEADER (the shell job leader, e.g. `./zz run`), which
+ *    survives the respawn's own kill of the escaped server and dies only when the
+ *    whole run ends — so its death is real run-end, not a respawn side effect;
  *  - confirmation delay: the subtree has stayed fully dead for >= confirmMs, so a
  *    momentary disappearance during startup/respawn churn cannot trigger a kill.
  */

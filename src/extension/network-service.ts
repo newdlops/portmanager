@@ -5052,16 +5052,17 @@ export class PortManagerNetworkService implements DisposableLike {
         continue;
       }
 
-      // Tag the replacement with its run's launcher-subtree ancestor pids so the
-      // reaper can retire it (and only it) once that whole subtree is gone — the
-      // daemon keeps the tree's lifecycle without a reparent API. No stable
-      // subtree → no tag → the replacement is simply never auto-reaped.
-      const invocationAncestors = this.computeInvocationAncestors(details.ancestorPids, details.networkId);
+      // Tag the replacement with its run's process-group LEADER so the reaper can
+      // retire it (and only it) once the RUN ends — the daemon keeps the tree's
+      // lifecycle without a reparent API. The leader survives the respawn's own
+      // kill of this escaped server, so it never falsely signals run-end. No
+      // usable leader → no tag → the replacement is simply never auto-reaped.
+      const anchorPids = this.computeRunAnchorPids(pid, details.row?.processGroupId);
       const respawnEnv =
-        invocationAncestors.length > 0
+        anchorPids.length > 0
           ? [
               ...(details.env ?? []),
-              `PORT_MANAGER_RESPAWN_INVOCATION=${encodeRespawnInvocationMarker(details.networkId, invocationAncestors)}`,
+              `PORT_MANAGER_RESPAWN_INVOCATION=${encodeRespawnInvocationMarker(details.networkId, anchorPids)}`,
             ]
           : (details.env ?? []);
       const line = buildEscapedRespawnLine(pid, details.networkId, details.cwd ?? "", details.argv, respawnEnv);
@@ -5090,34 +5091,25 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * The launcher-subtree ancestors of an escaped server's run: every ancestor
-   * BELOW the network's attached shell (nearest-first, up to but excluding that
-   * shell). The run has ended only when ALL of these are gone, so a single
-   * transient intermediate exiting never looks like the run ended. Empty when no
-   * attached shell is found in the chain (then the replacement is never reaped).
+   * The run's process-group LEADER — the anchor whose death means the dev-server
+   * run ended. Its pid equals the escaped server's process group id (the shell
+   * job leader, e.g. `./zz run`). Crucially it SURVIVES the respawn's kill of an
+   * individual escaped server (that server is a group member, not the leader), so
+   * — unlike the escaped server's immediate parent — its death is not a side
+   * effect of respawning. Returns [] (⇒ no marker, never auto-reaped) when the
+   * group id is unknown or the escaped server is itself the group leader (killing
+   * it would falsely look like the run ended).
    */
-  private computeInvocationAncestors(ancestorPids: readonly number[], networkId: string): number[] {
-    const attachedRoots = new Set(
-      this.registry
-        .getSnapshot()
-        .attachments.filter(
-          (attachment) =>
-            attachment.networkId === networkId &&
-            attachment.status === "attached" &&
-            attachment.mode !== "logical" &&
-            Number.isInteger(attachment.rootPid) &&
-            (attachment.rootPid as number) > 0,
-        )
-        .map((attachment) => attachment.rootPid as number),
-    );
-    if (attachedRoots.size === 0) {
+  private computeRunAnchorPids(escapedPid: number, processGroupId: number | undefined): number[] {
+    if (
+      processGroupId === undefined ||
+      !Number.isInteger(processGroupId) ||
+      processGroupId <= 1 ||
+      processGroupId === escapedPid
+    ) {
       return [];
     }
-    const rootIndex = ancestorPids.findIndex((ancestorPid) => attachedRoots.has(ancestorPid));
-    if (rootIndex <= 0) {
-      return [];
-    }
-    return ancestorPids.slice(0, rootIndex);
+    return [processGroupId];
   }
 
   /** True unless the pid definitively does not exist (EPERM still means alive). */
