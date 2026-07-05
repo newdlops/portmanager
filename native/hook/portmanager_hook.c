@@ -4380,10 +4380,18 @@ static void pm_control_channel_init(void) {
  * re-establishes the preload for ITS children from the surviving hint. The shell
  * itself stays unhooked (fine); its children (the real server) become hooked.
  * `: pmdyld;` is a no-op sentinel making the rewrite idempotent.
+ *
+ * Restoring DYLD in the shell is not enough: the orig command routinely execs a
+ * `#!/usr/bin/env node` script (every npm `.bin` shim, nvm) and /usr/bin/env is
+ * SIP-protected, so the kernel strips DYLD again at that exec. Defeat this by also
+ * front-loading the runtime-shim dir in PATH: it holds node/yarn/npm/npx shims that
+ * re-restore DYLD (from the surviving hint) before exec'ing the real interpreter, so
+ * `/usr/bin/env node` resolves to the shim and the child stays hooked. The shim just
+ * re-execs the real tool, so prepending it is transparent.
  */
 #define PM_SH_C_SENTINEL ": pmdyld;"
 #define PM_SH_C_PREAMBLE \
-  ": pmdyld;if [ -n \"$PORT_MANAGER_DYLD_INSERT_LIBRARIES\" ] && [ \"${PORT_MANAGER_HOOK_DISABLED:-0}\" != 1 ] && [ \"${PORT_MANAGER_HOOK:-1}\" != 0 ]; then DYLD_INSERT_LIBRARIES=\"$PORT_MANAGER_DYLD_INSERT_LIBRARIES\"; export DYLD_INSERT_LIBRARIES; fi;"
+  ": pmdyld;if [ -n \"$PORT_MANAGER_DYLD_INSERT_LIBRARIES\" ] && [ \"${PORT_MANAGER_HOOK_DISABLED:-0}\" != 1 ] && [ \"${PORT_MANAGER_HOOK:-1}\" != 0 ]; then DYLD_INSERT_LIBRARIES=\"$PORT_MANAGER_DYLD_INSERT_LIBRARIES\"; export DYLD_INSERT_LIBRARIES; if [ -n \"$PORT_MANAGER_RUNTIME_SHIM_DIR\" ] && [ -d \"$PORT_MANAGER_RUNTIME_SHIM_DIR\" ]; then case \":$PATH:\" in \":$PORT_MANAGER_RUNTIME_SHIM_DIR:\"*) ;; *) PATH=\"$PORT_MANAGER_RUNTIME_SHIM_DIR:$PATH\"; export PATH ;; esac; fi; fi;"
 
 static int pm_basename_is_shell(const char *path) {
   const char *base;
