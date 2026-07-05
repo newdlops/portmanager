@@ -657,6 +657,16 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Throttles the escaped-server scan so bursty snapshots don't re-capture repeatedly. */
   private lastEscapedRespawnScanAtMs = 0;
 
+  /**
+   * Classifies each hooked loopback listener as a respawn replacement and, if so,
+   * caches its invocation-anchor pid (the dev-server launcher, read from its
+   * PORT_MANAGER_RESPAWN_ANCHOR env). `null` marks a listener that is NOT a
+   * respawn (so it is never re-captured). When a cached anchor is no longer alive
+   * the run has ended and its orphaned replacement is reaped, so a fresh run binds
+   * the base port instead of drifting past a stale generation.
+   */
+  private readonly respawnChildAnchorByPid = new Map<number, number | null>();
+
   /** Logical port gateway attribution verdicts keyed by client (pid, startTime). */
   private readonly routerVerdictCache = new RouterVerdictCache({
     networkTtlMs: ROUTER_NETWORK_VERDICT_TTL_MS,
@@ -5024,7 +5034,17 @@ export class PortManagerNetworkService implements DisposableLike {
         continue;
       }
 
-      const line = buildEscapedRespawnLine(pid, details.networkId, details.cwd ?? "", details.argv, details.env ?? []);
+      // Tag the replacement with its invocation launcher pid so a later scan can
+      // reap the orphan once that launcher (the dev-server run) is gone — see
+      // reapOrphanedRespawns. Preserves the process tree's lifecycle without a
+      // reparent API: the daemon watches the tree and retires the replacement
+      // with its run.
+      const anchorPid = this.computeInvocationAnchorPid(details.ancestorPids, details.networkId);
+      const respawnEnv =
+        anchorPid !== undefined
+          ? [...(details.env ?? []), `PORT_MANAGER_RESPAWN_ANCHOR=${anchorPid}`]
+          : (details.env ?? []);
+      const line = buildEscapedRespawnLine(pid, details.networkId, details.cwd ?? "", details.argv, respawnEnv);
       // Count the attempt before the request so a concurrent scan cannot double-fire.
       state.attempts += 1;
       state.lastAttemptAtMs = nowMs;
@@ -5045,6 +5065,105 @@ export class PortManagerNetworkService implements DisposableLike {
       const port = Number(key.slice(key.indexOf("\t") + 1));
       if (!escapedPorts.has(port)) {
         this.escapedRespawnStateByKey.delete(key);
+      }
+    }
+
+    await this.reapOrphanedRespawns(snapshot);
+  }
+
+  /**
+   * The dev-server launcher a respawn replacement should live and die with: the
+   * ancestor the user ran inside the attached shell (the shell's child in the
+   * escaped server's chain). Persistent shells above it are excluded so a restart
+   * — which exits that launcher but not the shell — retires the replacement.
+   * Returns undefined when no stable launcher can be identified (then no anchor
+   * is tagged and the replacement is never auto-reaped).
+   */
+  private computeInvocationAnchorPid(ancestorPids: readonly number[], networkId: string): number | undefined {
+    const attachedRoots = new Set(
+      this.registry
+        .getSnapshot()
+        .attachments.filter(
+          (attachment) =>
+            attachment.networkId === networkId &&
+            attachment.status === "attached" &&
+            attachment.mode !== "logical" &&
+            Number.isInteger(attachment.rootPid) &&
+            (attachment.rootPid as number) > 0,
+        )
+        .map((attachment) => attachment.rootPid as number),
+    );
+    if (attachedRoots.size === 0) {
+      return undefined;
+    }
+    // ancestorPids is nearest-first; the attached shell is a far ancestor and its
+    // child (one step toward the server) is the launcher of this run.
+    const rootIndex = ancestorPids.findIndex((ancestorPid) => attachedRoots.has(ancestorPid));
+    if (rootIndex <= 0) {
+      return undefined;
+    }
+    return ancestorPids[rootIndex - 1];
+  }
+
+  /** True unless the pid definitively does not exist (EPERM still means alive). */
+  private isPidAlive(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) {
+      return false;
+    }
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EPERM";
+    }
+  }
+
+  /**
+   * Retires respawn replacements whose dev-server run has ended. macOS has no
+   * reparent API, so a replacement is orphaned to launchd; left alone, an old
+   * generation survives restarts and forces new runs to drift to higher ports.
+   * Each replacement carries PORT_MANAGER_RESPAWN_ANCHOR = its launcher pid; when
+   * that launcher is gone the replacement is stale and is killed (single, verified
+   * pid — never a group), so the next run binds the base port cleanly. This keeps
+   * the tree's lifecycle intact by having the daemon watch it, rather than moving
+   * the server out of its tree.
+   */
+  private async reapOrphanedRespawns(snapshot: AgentSnapshot): Promise<void> {
+    const hookedPids = new Set<number>();
+    for (const listener of snapshot.listeners) {
+      if (
+        listener.pid !== undefined &&
+        listener.protocol === "tcp" &&
+        listener.localAddress !== undefined &&
+        !isWildcardBindAddress(listener.localAddress)
+      ) {
+        hookedPids.add(listener.pid);
+      }
+    }
+
+    for (const pid of hookedPids) {
+      if (!this.respawnChildAnchorByPid.has(pid)) {
+        // Classify once: a respawn replacement carries its launcher pid in env.
+        const details = await this.nativeProcessLookup.captureProcess(pid).catch(() => undefined);
+        const entry = details?.env?.find((value) => value.startsWith("PORT_MANAGER_RESPAWN_ANCHOR="));
+        const anchor = entry === undefined ? NaN : Number(entry.slice("PORT_MANAGER_RESPAWN_ANCHOR=".length));
+        this.respawnChildAnchorByPid.set(pid, Number.isInteger(anchor) && anchor > 0 ? anchor : null);
+      }
+      const anchorPid = this.respawnChildAnchorByPid.get(pid);
+      if (anchorPid != null && !this.isPidAlive(anchorPid)) {
+        try {
+          process.kill(pid, "SIGTERM");
+        } catch {
+          // Already exited or not permitted — nothing to reap.
+        }
+        this.respawnChildAnchorByPid.delete(pid);
+      }
+    }
+
+    // Drop cache entries for pids that no longer hold a hooked listener.
+    for (const pid of [...this.respawnChildAnchorByPid.keys()]) {
+      if (!hookedPids.has(pid)) {
+        this.respawnChildAnchorByPid.delete(pid);
       }
     }
   }
