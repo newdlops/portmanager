@@ -40,11 +40,6 @@ import {
 } from "../core/networks/loopback-address";
 import { selectNonNetworkOwnerRoute } from "../core/networks/logical-route-selection";
 import {
-  decodeRespawnInvocationMarker,
-  encodeRespawnInvocationMarker,
-  evaluateRespawnReap,
-} from "../core/respawn-reap";
-import {
   ROUTER_NON_NETWORK_VERDICT,
   RouterVerdictCache,
 } from "../core/networks/router-verdict-cache";
@@ -273,11 +268,6 @@ const ROUTER_LATE_BACKEND_PROBE_CONNECT_TIMEOUT_MS = 200;
 // target gets a hard attempt cap with exponential backoff and then gives up, so
 // a server that will not become hooked can never cascade across a network.
 const ESCAPED_RESPAWN_SCAN_MIN_INTERVAL_MS = 5_000;
-// Reaping runs on process-change events; a short guard coalesces bursts. A stale
-// respawn orphan is reaped only after its whole run subtree has stayed dead for
-// the confirm window, so startup/respawn churn can never trigger a premature kill.
-const ESCAPED_REAP_MIN_INTERVAL_MS = 500;
-const ESCAPED_REAP_CONFIRM_MS = 3_000;
 const ESCAPED_RESPAWN_MAX_ATTEMPTS = 4;
 const ESCAPED_RESPAWN_BACKOFF_BASE_MS = 5_000;
 const ESCAPED_RESPAWN_BACKOFF_MAX_MS = 60_000;
@@ -667,20 +657,6 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Throttles the escaped-server scan so bursty snapshots don't re-capture repeatedly. */
   private lastEscapedRespawnScanAtMs = 0;
 
-  /**
-   * Respawn-orphan reaping state. `respawnReapCacheByPid` classifies each hooked
-   * loopback listener once as a respawn replacement (its decoded invocation
-   * marker) or `null` (not one). `respawnAllDeadSinceByPid` stamps when a
-   * replacement's whole run subtree was first seen fully dead, for the
-   * confirmation delay. `lastReapAtMs` coalesces bursts of process-change events.
-   */
-  private readonly respawnReapCacheByPid = new Map<
-    number,
-    { networkId: string; invocationAncestorPids: number[] } | null
-  >();
-  private readonly respawnAllDeadSinceByPid = new Map<number, number>();
-  private lastReapAtMs = 0;
-
   /** Logical port gateway attribution verdicts keyed by client (pid, startTime). */
   private readonly routerVerdictCache = new RouterVerdictCache({
     networkTtlMs: ROUTER_NETWORK_VERDICT_TTL_MS,
@@ -880,10 +856,6 @@ export class PortManagerNetworkService implements DisposableLike {
             void this.syncBrowserNetworkProxies();
             void this.writeTerminalNetworkSelectionFile();
             void this.detectAndRespawnEscapedServers();
-            // Event-driven: a launcher exit surfaces here as a process change, so a
-            // stale respawn orphan is reaped once its run's whole subtree has been
-            // dead for the confirm window (never on transient churn, never cross-network).
-            void this.reapOrphanedRespawns();
           }
           this.localChangeEvents.emit();
         }),
@@ -5052,20 +5024,7 @@ export class PortManagerNetworkService implements DisposableLike {
         continue;
       }
 
-      // Tag the replacement with its run's process-group LEADER so the reaper can
-      // retire it (and only it) once the RUN ends — the daemon keeps the tree's
-      // lifecycle without a reparent API. The leader survives the respawn's own
-      // kill of this escaped server, so it never falsely signals run-end. No
-      // usable leader → no tag → the replacement is simply never auto-reaped.
-      const anchorPids = this.computeRunAnchorPids(pid, details.row?.processGroupId);
-      const respawnEnv =
-        anchorPids.length > 0
-          ? [
-              ...(details.env ?? []),
-              `PORT_MANAGER_RESPAWN_INVOCATION=${encodeRespawnInvocationMarker(details.networkId, anchorPids)}`,
-            ]
-          : (details.env ?? []);
-      const line = buildEscapedRespawnLine(pid, details.networkId, details.cwd ?? "", details.argv, respawnEnv);
+      const line = buildEscapedRespawnLine(pid, details.networkId, details.cwd ?? "", details.argv, details.env ?? []);
       // Count the attempt before the request so a concurrent scan cannot double-fire.
       state.attempts += 1;
       state.lastAttemptAtMs = nowMs;
@@ -5086,145 +5045,6 @@ export class PortManagerNetworkService implements DisposableLike {
       const port = Number(key.slice(key.indexOf("\t") + 1));
       if (!escapedPorts.has(port)) {
         this.escapedRespawnStateByKey.delete(key);
-      }
-    }
-  }
-
-  /**
-   * The run's process-group LEADER — the anchor whose death means the dev-server
-   * run ended. Its pid equals the escaped server's process group id (the shell
-   * job leader, e.g. `./zz run`). Crucially it SURVIVES the respawn's kill of an
-   * individual escaped server (that server is a group member, not the leader), so
-   * — unlike the escaped server's immediate parent — its death is not a side
-   * effect of respawning. Returns [] (⇒ no marker, never auto-reaped) when the
-   * group id is unknown or the escaped server is itself the group leader (killing
-   * it would falsely look like the run ended).
-   */
-  private computeRunAnchorPids(escapedPid: number, processGroupId: number | undefined): number[] {
-    if (
-      processGroupId === undefined ||
-      !Number.isInteger(processGroupId) ||
-      processGroupId <= 1 ||
-      processGroupId === escapedPid
-    ) {
-      return [];
-    }
-    return [processGroupId];
-  }
-
-  /** True unless the pid definitively does not exist (EPERM still means alive). */
-  private isPidAlive(pid: number): boolean {
-    if (!Number.isInteger(pid) || pid <= 0) {
-      return false;
-    }
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (error) {
-      return (error as NodeJS.ErrnoException).code === "EPERM";
-    }
-  }
-
-  /**
-   * Retires respawn replacements whose dev-server run has ended. macOS cannot
-   * reparent, so a replacement is orphaned to launchd; left alone an old
-   * generation survives restarts and forces the next run to drift to higher
-   * ports. The KILL DECISION lives in evaluateRespawnReap (unit-tested): reap only
-   * when the replacement's whole run subtree has stayed dead for the confirm
-   * window, and never across a network boundary. Before each kill the replacement
-   * is re-captured to confirm it is still the same process (guards pid reuse), and
-   * only a single pid is signalled — never a group.
-   */
-  private async reapOrphanedRespawns(): Promise<void> {
-    if (this.processService === undefined || !readPortManagerSettings().escapedServerRespawn) {
-      return;
-    }
-    const nowMs = Date.now();
-    if (nowMs - this.lastReapAtMs < ESCAPED_REAP_MIN_INTERVAL_MS) {
-      return;
-    }
-    this.lastReapAtMs = nowMs;
-
-    const snapshot = this.processService.getSnapshot();
-    const hookedPids = new Set<number>();
-    for (const listener of snapshot.listeners) {
-      if (
-        listener.pid !== undefined &&
-        listener.protocol === "tcp" &&
-        listener.localAddress !== undefined &&
-        !isWildcardBindAddress(listener.localAddress)
-      ) {
-        hookedPids.add(listener.pid);
-      }
-    }
-
-    const readInvocationMarker = (
-      env: readonly string[] | undefined,
-    ): { networkId: string; invocationAncestorPids: number[] } | undefined => {
-      const entry = env?.find((value) => value.startsWith("PORT_MANAGER_RESPAWN_INVOCATION="));
-      return entry === undefined
-        ? undefined
-        : decodeRespawnInvocationMarker(entry.slice("PORT_MANAGER_RESPAWN_INVOCATION=".length));
-    };
-
-    for (const pid of hookedPids) {
-      if (!this.respawnReapCacheByPid.has(pid)) {
-        // Classify once: a respawn replacement carries its run's marker in env.
-        const details = await this.nativeProcessLookup.captureProcess(pid).catch(() => undefined);
-        this.respawnReapCacheByPid.set(pid, readInvocationMarker(details?.env) ?? null);
-      }
-      const record = this.respawnReapCacheByPid.get(pid);
-      if (record == null) {
-        continue;
-      }
-
-      const decision = evaluateRespawnReap({
-        recordedNetworkId: record.networkId,
-        // Kill-time re-capture below is the real pid-reuse guard; the cached
-        // network satisfies the scope check on the fast path.
-        currentNetworkId: record.networkId,
-        invocationAncestorPids: record.invocationAncestorPids,
-        isAncestorAlive: (ancestorPid) => this.isPidAlive(ancestorPid),
-        allDeadSinceMs: this.respawnAllDeadSinceByPid.get(pid),
-        nowMs,
-        confirmMs: ESCAPED_REAP_CONFIRM_MS,
-      });
-
-      if (decision.subtreeDeadNow) {
-        if (!this.respawnAllDeadSinceByPid.has(pid)) {
-          this.respawnAllDeadSinceByPid.set(pid, nowMs);
-        }
-      } else {
-        this.respawnAllDeadSinceByPid.delete(pid);
-      }
-
-      if (decision.reap) {
-        // Re-capture immediately before killing: only signal if this pid is STILL
-        // the exact same replacement (same network + same recorded run subtree).
-        const fresh = await this.nativeProcessLookup.captureProcess(pid).catch(() => undefined);
-        const freshRecord = readInvocationMarker(fresh?.env);
-        const identityHolds =
-          freshRecord !== undefined &&
-          freshRecord.networkId === record.networkId &&
-          freshRecord.invocationAncestorPids.length === record.invocationAncestorPids.length &&
-          freshRecord.invocationAncestorPids.every((value, index) => value === record.invocationAncestorPids[index]);
-        if (identityHolds) {
-          try {
-            process.kill(pid, "SIGTERM");
-          } catch {
-            // Already exited or not permitted — nothing to reap.
-          }
-        }
-        this.respawnReapCacheByPid.delete(pid);
-        this.respawnAllDeadSinceByPid.delete(pid);
-      }
-    }
-
-    // Drop state for pids that no longer hold a hooked listener.
-    for (const pid of [...this.respawnReapCacheByPid.keys()]) {
-      if (!hookedPids.has(pid)) {
-        this.respawnReapCacheByPid.delete(pid);
-        this.respawnAllDeadSinceByPid.delete(pid);
       }
     }
   }
