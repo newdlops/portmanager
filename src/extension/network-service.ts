@@ -4883,11 +4883,27 @@ export class PortManagerNetworkService implements DisposableLike {
    * attribute their subtrees to networks without an injected env var, surviving
    * fork/daemonize/reparent. Root pids are valid host-wide, so a single tracker
    * covers every attached terminal.
+   *
+   * ONLY isolated (hooked-terminal) roots are declared. `logical`-mode
+   * attachments — the VS Code window process (rootPid = this extension host) and
+   * manual `attachProcessToNetwork` — are client-only: they cannot hook a server
+   * subtree, and they are SHARED COMMON ANCESTORS. The tracker attributes by
+   * ancestry with no ambiguity guard (pm_resolve_pid_network walks up to a
+   * tracked ancestor), so tracking a shared ancestor collapses processes of
+   * OTHER networks into one — the source of cross-network isolation loss. Client
+   * classification for those attachments still works through the ambiguity-
+   * guarded TS resolver (findAttachedNetworkForPid / resolveProcessTreeNetworkLabel),
+   * which is the correct layer for a shared ancestor.
    */
   private syncProcessTrackerRoots(): void {
     const roots = new Map<number, string>();
     for (const attachment of this.registry.getSnapshot().attachments) {
-      if (attachment.status === "attached" && Number.isInteger(attachment.rootPid) && attachment.rootPid > 0) {
+      if (
+        attachment.status === "attached" &&
+        attachment.mode !== "logical" &&
+        Number.isInteger(attachment.rootPid) &&
+        attachment.rootPid > 0
+      ) {
         roots.set(attachment.rootPid, attachment.networkId);
       }
     }
