@@ -3740,6 +3740,419 @@ static int pm_getsockname_hook(int sockfd, struct sockaddr *addr, socklen_t *add
   return result;
 }
 
+/* ---- Control channel (daemon -> hook push) --------------------------------
+ * Foundation of the escaped-server respawn path. A version-manager or shell
+ * shim (yarn's `#!/bin/sh` node shim, asdf, `/usr/bin/env`) strips the preload
+ * before the runtime binds, so a dev server can end up unhooked. The daemon,
+ * which alone sees the final resolved process, pushes a RESPAWN command to the
+ * server's PARENT; because this hook runs inside that parent, the relaunched
+ * child becomes a true child of it (tree, stdio, job control preserved).
+ *
+ * Only a scoped process that actually spawns children opens the channel, so
+ * leaf commands in an attached terminal never connect. Stage 1 observes the
+ * pushed command; RESPAWN execution and syscall virtualization follow.
+ */
+#define PM_CONTROL_RECONNECT_BACKOFF_US 1000000
+#define PM_CONTROL_LINE_SIZE 8192
+
+static volatile sig_atomic_t pm_control_should_run = 0;
+static volatile sig_atomic_t pm_control_started = 0;
+static pthread_mutex_t pm_control_start_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Escaped-child -> replacement PID mapping. When this parent respawns an
+ * unhooked child, later stages virtualize wait4/kill/kqueue against this map so
+ * the parent's own process management transparently follows the replacement.
+ */
+#define PM_RESPAWN_MAP_MAX 256
+typedef struct {
+  pid_t old_pid;
+  pid_t new_pid;
+} pm_respawn_pair;
+static pm_respawn_pair pm_respawn_pairs[PM_RESPAWN_MAP_MAX];
+static size_t pm_respawn_pair_count = 0;
+static pthread_mutex_t pm_respawn_map_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void pm_respawn_map_record(pid_t old_pid, pid_t new_pid) {
+  pthread_mutex_lock(&pm_respawn_map_mutex);
+  if (pm_respawn_pair_count < PM_RESPAWN_MAP_MAX) {
+    pm_respawn_pairs[pm_respawn_pair_count].old_pid = old_pid;
+    pm_respawn_pairs[pm_respawn_pair_count].new_pid = new_pid;
+    pm_respawn_pair_count++;
+  }
+  pthread_mutex_unlock(&pm_respawn_map_mutex);
+}
+
+/* Standard-alphabet base64 decode; returns 0 on success and NUL-terminates. */
+static int pm_base64_decode(const char *input, char *output, size_t output_capacity, size_t *output_length) {
+  static const char alphabet[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  signed char table[256];
+  size_t out = 0;
+  int bits = 0;
+  int accumulator = 0;
+
+  memset(table, -1, sizeof(table));
+  for (int index = 0; index < 64; index++) {
+    table[(unsigned char)alphabet[index]] = (signed char)index;
+  }
+
+  for (const char *cursor = input; *cursor != '\0'; cursor++) {
+    signed char value = table[(unsigned char)*cursor];
+    if (value < 0) {
+      continue; /* skip '=', whitespace, and any stray delimiter */
+    }
+    accumulator = (accumulator << 6) | value;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      if (out + 1 >= output_capacity) {
+        return -1;
+      }
+      output[out++] = (char)((accumulator >> bits) & 0xff);
+    }
+  }
+
+  if (out >= output_capacity) {
+    return -1;
+  }
+  output[out] = '\0';
+  if (output_length != NULL) {
+    *output_length = out;
+  }
+  return 0;
+}
+
+/*
+ * Relaunches an escaped child as a true child of this parent process.
+ *
+ * Wire format (all payload fields base64 so argv/env may hold any bytes):
+ *   RESPAWN \t oldpid \t cwd \t argc \t arg0 \t .. \t argN \t envc \t env0 \t ..
+ *
+ * The child is spawned via the REAL posix_spawn on the resolved interpreter
+ * (argv[0], captured by the daemon after the version-manager/shell shim already
+ * resolved it), bypassing the shim entirely so DYLD_INSERT_LIBRARIES survives
+ * and the hook loads. It inherits this parent's fds/pgroup/session, so terminal
+ * output and job control are preserved.
+ */
+static void pm_control_handle_respawn(const char *fields) {
+  char *copy = strdup(fields);
+  char *saveptr = NULL;
+  char **argv = NULL;
+  char **envp = NULL;
+  char *decoded = NULL;
+  posix_spawn_file_actions_t file_actions;
+  int have_file_actions = 0;
+  char cwd[PM_MAX_PATH];
+  const char *token;
+  long old_pid_long;
+  long argc_long;
+  long envc_long;
+  int argc;
+  int envc;
+  int dyld_index = -1;
+  const char *dyld_value;
+  pid_t new_pid = -1;
+  size_t decoded_capacity = 1 << 16;
+
+  if (copy == NULL) {
+    return;
+  }
+  decoded = (char *)malloc(decoded_capacity);
+  if (decoded == NULL) {
+    free(copy);
+    return;
+  }
+
+  /* oldpid */
+  token = strtok_r(copy, "\t", &saveptr);
+  if (token == NULL) {
+    goto cleanup;
+  }
+  old_pid_long = strtol(token, NULL, 10);
+
+  /* cwd (base64) */
+  token = strtok_r(NULL, "\t", &saveptr);
+  if (token == NULL || pm_base64_decode(token, cwd, sizeof(cwd), NULL) != 0) {
+    goto cleanup;
+  }
+
+  /* argc */
+  token = strtok_r(NULL, "\t", &saveptr);
+  if (token == NULL) {
+    goto cleanup;
+  }
+  argc_long = strtol(token, NULL, 10);
+  if (argc_long <= 0 || argc_long > 4096) {
+    goto cleanup;
+  }
+  argc = (int)argc_long;
+  argv = (char **)calloc((size_t)argc + 1, sizeof(char *));
+  if (argv == NULL) {
+    goto cleanup;
+  }
+  for (int index = 0; index < argc; index++) {
+    size_t decoded_length = 0;
+    token = strtok_r(NULL, "\t", &saveptr);
+    if (token == NULL || pm_base64_decode(token, decoded, decoded_capacity, &decoded_length) != 0) {
+      goto cleanup;
+    }
+    argv[index] = (char *)malloc(decoded_length + 1);
+    if (argv[index] == NULL) {
+      goto cleanup;
+    }
+    memcpy(argv[index], decoded, decoded_length + 1);
+  }
+
+  /* envc */
+  token = strtok_r(NULL, "\t", &saveptr);
+  if (token == NULL) {
+    goto cleanup;
+  }
+  envc_long = strtol(token, NULL, 10);
+  if (envc_long < 0 || envc_long > 65536) {
+    goto cleanup;
+  }
+  envc = (int)envc_long;
+  /* +2: room to append DYLD_INSERT_LIBRARIES if the child env lacked it. */
+  envp = (char **)calloc((size_t)envc + 2, sizeof(char *));
+  if (envp == NULL) {
+    goto cleanup;
+  }
+  dyld_value = getenv("PORT_MANAGER_DYLD_INSERT_LIBRARIES");
+  for (int index = 0; index < envc; index++) {
+    size_t decoded_length = 0;
+    token = strtok_r(NULL, "\t", &saveptr);
+    if (token == NULL || pm_base64_decode(token, decoded, decoded_capacity, &decoded_length) != 0) {
+      goto cleanup;
+    }
+    envp[index] = (char *)malloc(decoded_length + 1);
+    if (envp[index] == NULL) {
+      goto cleanup;
+    }
+    memcpy(envp[index], decoded, decoded_length + 1);
+    if (strncmp(envp[index], "DYLD_INSERT_LIBRARIES=", 22) == 0) {
+      dyld_index = index;
+    }
+  }
+
+  /*
+   * Ensure the interpreter receives DYLD_INSERT_LIBRARIES. The escaped child's
+   * env usually still carries it (it survives as a string; only the injection
+   * was stripped by the shim), but restore it from the always-surviving
+   * PORT_MANAGER_DYLD_INSERT_LIBRARIES when absent so the spawn is hooked.
+   */
+  if (dyld_index < 0 && dyld_value != NULL && dyld_value[0] != '\0') {
+    size_t entry_length = strlen("DYLD_INSERT_LIBRARIES=") + strlen(dyld_value);
+    char *entry = (char *)malloc(entry_length + 1);
+    if (entry != NULL) {
+      snprintf(entry, entry_length + 1, "DYLD_INSERT_LIBRARIES=%s", dyld_value);
+      envp[envc] = entry;
+      envc++;
+    }
+  }
+
+  if (posix_spawn_file_actions_init(&file_actions) == 0) {
+    have_file_actions = 1;
+    if (cwd[0] != '\0') {
+      /* _np spelling is kept for macOS < 26 portability (the POSIX-2024
+       * non-_np name only exists on macOS 26+); silence the 26 deprecation. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+      posix_spawn_file_actions_addchdir_np(&file_actions, cwd);
+#pragma clang diagnostic pop
+    }
+  }
+
+  pm_hook_depth++;
+  if (pm_real_posix_spawn(
+        &new_pid,
+        argv[0],
+        have_file_actions ? &file_actions : NULL,
+        NULL,
+        argv,
+        envp) == 0 && new_pid > 0) {
+    pm_hook_depth--;
+    pm_respawn_map_record((pid_t)old_pid_long, new_pid);
+    pm_debug("respawned old=%ld new=%d argv0=%s", old_pid_long, (int)new_pid, argv[0]);
+    /*
+     * Free the escaped child's coordinates so the replacement (hooked, on the
+     * network alias) owns them. Stage 4 makes this parent's own wait/kill see
+     * the replacement in place of the killed original.
+     */
+    if (old_pid_long > 0) {
+      kill((pid_t)old_pid_long, SIGTERM);
+    }
+  } else {
+    pm_hook_depth--;
+    pm_debug("respawn failed old=%ld argv0=%s error=%s", old_pid_long, argv[0], strerror(errno));
+  }
+
+cleanup:
+  if (have_file_actions) {
+    posix_spawn_file_actions_destroy(&file_actions);
+  }
+  if (argv != NULL) {
+    for (int index = 0; argv[index] != NULL; index++) {
+      free(argv[index]);
+    }
+    free(argv);
+  }
+  if (envp != NULL) {
+    for (int index = 0; envp[index] != NULL; index++) {
+      free(envp[index]);
+    }
+    free(envp);
+  }
+  free(decoded);
+  free(copy);
+}
+
+static void pm_control_dispatch_line(const char *line) {
+  if (strncmp(line, "RESPAWN\t", 8) == 0) {
+    pm_control_handle_respawn(line + 8);
+    return;
+  }
+  /* Other lines (e.g. the controlChannel response frame) are ignored. */
+  pm_debug("control line ignored: %.120s", line);
+}
+
+static int pm_control_connect(void) {
+  char socket_path[PM_MAX_PATH];
+  struct sockaddr_un address;
+  char hello[192];
+  size_t hello_length;
+  int fd;
+
+  pm_ensure_symbols();
+  if (pm_real_connect == NULL) {
+    return -1;
+  }
+
+  pm_default_socket_path(socket_path, sizeof(socket_path));
+  fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return -1;
+  }
+  memset(&address, 0, sizeof(address));
+  address.sun_family = AF_UNIX;
+  snprintf(address.sun_path, sizeof(address.sun_path), "%s", socket_path);
+
+  /*
+   * Runs on the dedicated control thread (its own thread-local hook depth), and
+   * calls the real connect directly, so the socket hook is never re-entered.
+   */
+  if (pm_real_connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+    pm_debug("control connect failed socket=%s error=%s", socket_path, strerror(errno));
+    close(fd);
+    return -1;
+  }
+  pm_debug("control connected socket=%s", socket_path);
+
+  hello_length = (size_t)snprintf(
+    hello,
+    sizeof(hello),
+    "{\"id\":\"hook-control-%ld\",\"method\":\"controlChannel\",\"payload\":{\"pid\":%ld}}\n",
+    (long)getpid(),
+    (long)getpid());
+  if (hello_length >= sizeof(hello) || write(fd, hello, hello_length) != (ssize_t)hello_length) {
+    close(fd);
+    return -1;
+  }
+
+  return fd;
+}
+
+static void pm_control_read_loop(int fd) {
+  char buffer[PM_CONTROL_LINE_SIZE];
+  size_t length = 0;
+
+  for (;;) {
+    ssize_t count;
+
+    if (length >= sizeof(buffer) - 1) {
+      /* Overlong line without a newline: reset rather than grow unbounded. */
+      length = 0;
+    }
+    count = read(fd, buffer + length, sizeof(buffer) - 1 - length);
+    if (count <= 0) {
+      if (count < 0 && errno == EINTR) {
+        continue;
+      }
+      return;
+    }
+    length += (size_t)count;
+
+    for (;;) {
+      char *newline = memchr(buffer, '\n', length);
+      size_t line_length;
+
+      if (newline == NULL) {
+        break;
+      }
+      line_length = (size_t)(newline - buffer);
+      buffer[line_length] = '\0';
+      if (line_length > 0) {
+        pm_control_dispatch_line(buffer);
+      }
+      memmove(buffer, newline + 1, length - line_length - 1);
+      length -= line_length + 1;
+    }
+  }
+}
+
+static void *pm_control_thread_main(void *unused) {
+  (void)unused;
+
+  while (pm_control_should_run) {
+    int fd = pm_control_connect();
+    if (fd >= 0) {
+      pm_control_read_loop(fd);
+      close(fd);
+    }
+    if (!pm_control_should_run) {
+      break;
+    }
+    usleep(PM_CONTROL_RECONNECT_BACKOFF_US);
+  }
+
+  return NULL;
+}
+
+/*
+ * Opens the control channel once for a scoped process that spawns children.
+ * Called from the spawn hooks so only real parents connect; leaf commands that
+ * never spawn stay off the daemon entirely.
+ */
+static void pm_control_channel_init(void) {
+  pthread_attr_t attr;
+  pthread_t thread;
+
+  pm_debug("control init enabled=%d scope=%d started=%d", pm_hook_enabled(), pm_has_current_network_scope(), (int)pm_control_started);
+  if (!pm_hook_enabled() || !pm_has_current_network_scope()) {
+    return;
+  }
+
+  pthread_mutex_lock(&pm_control_start_mutex);
+  if (pm_control_started) {
+    pthread_mutex_unlock(&pm_control_start_mutex);
+    return;
+  }
+  pm_control_started = 1;
+  pthread_mutex_unlock(&pm_control_start_mutex);
+
+  pm_control_should_run = 1;
+  if (pthread_attr_init(&attr) != 0) {
+    pm_control_should_run = 0;
+    return;
+  }
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  if (pthread_create(&thread, &attr, pm_control_thread_main, NULL) != 0) {
+    pm_control_should_run = 0;
+  }
+  pthread_attr_destroy(&attr);
+}
+
 static int pm_exec_with_prepared_child(
   const char *path,
   char *const argv[],
@@ -3818,6 +4231,9 @@ static int pm_posix_spawn_hook(
     return ENOSYS;
   }
 
+  /* This process spawns children, so it is a potential respawn parent. */
+  pm_control_channel_init();
+
   target = pm_runtime_exec_target(path, argv);
   if (target != path) {
     pm_debug("runtime posix_spawn rewrite path=%s target=%s", path != NULL ? path : "(null)", target);
@@ -3845,6 +4261,9 @@ static int pm_posix_spawnp_hook(
     errno = ENOSYS;
     return ENOSYS;
   }
+
+  /* This process spawns children, so it is a potential respawn parent. */
+  pm_control_channel_init();
 
   target = pm_runtime_exec_target(file, argv);
   child_environment = pm_prepare_child_environment(envp);

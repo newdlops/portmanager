@@ -23,10 +23,72 @@
 typedef struct {
   int fd;
   int wants_events;
+  int is_control;
+  int control_pid;
   char *buffer;
   size_t length;
   size_t capacity;
 } pm_client;
+
+/*
+ * Persistent control connections keyed by pid. A hooked parent opens one and
+ * the daemon pushes a RESPAWN command to it so the parent relaunches an escaped
+ * child as a true child of itself (preserving the process tree, stdio, and job
+ * control that no reparenting API can restore afterward on macOS).
+ */
+typedef struct {
+  int pid;
+  int fd;
+} pm_control_entry;
+
+static pm_control_entry *pm_control_entries = NULL;
+static size_t pm_control_entry_count = 0;
+static size_t pm_control_entry_capacity = 0;
+
+static void pm_control_registry_set(int pid, int fd) {
+  for (size_t index = 0; index < pm_control_entry_count; index++) {
+    if (pm_control_entries[index].pid == pid) {
+      pm_control_entries[index].fd = fd;
+      return;
+    }
+  }
+  if (pm_control_entry_count + 1 > pm_control_entry_capacity) {
+    size_t next_capacity = pm_control_entry_capacity == 0 ? 32 : pm_control_entry_capacity * 2;
+    pm_control_entry *next = (pm_control_entry *)realloc(pm_control_entries, next_capacity * sizeof(pm_control_entry));
+    if (next == NULL) {
+      return;
+    }
+    pm_control_entries = next;
+    pm_control_entry_capacity = next_capacity;
+  }
+  pm_control_entries[pm_control_entry_count].pid = pid;
+  pm_control_entries[pm_control_entry_count].fd = fd;
+  pm_control_entry_count++;
+}
+
+static int pm_control_registry_fd_for_pid(int pid) {
+  for (size_t index = 0; index < pm_control_entry_count; index++) {
+    if (pm_control_entries[index].pid == pid) {
+      return pm_control_entries[index].fd;
+    }
+  }
+  return -1;
+}
+
+static void pm_control_registry_remove_fd(int fd) {
+  size_t index = 0;
+  while (index < pm_control_entry_count) {
+    if (pm_control_entries[index].fd == fd) {
+      memmove(
+        &pm_control_entries[index],
+        &pm_control_entries[index + 1],
+        (pm_control_entry_count - index - 1) * sizeof(pm_control_entry));
+      pm_control_entry_count--;
+    } else {
+      index++;
+    }
+  }
+}
 
 typedef struct {
   char socket_path[PM_TEXT];
@@ -433,6 +495,58 @@ static void pm_handle_line(pm_client *client, pm_agent_state *state, const char 
     client->wants_events = 1;
   }
 
+  /*
+   * A hooked parent registers a persistent control connection here. The socket
+   * stays open (unlike request/response clients) so the daemon can push a
+   * RESPAWN command to it later.
+   */
+  if (strcmp(request.method, "controlChannel") == 0) {
+    int pid = pm_json_get_int(request.payload == NULL ? "" : request.payload, "pid", 0);
+    if (pid > 0) {
+      client->is_control = 1;
+      client->control_pid = pid;
+      pm_control_registry_set(pid, client->fd);
+    }
+    pm_send_response(client->fd, &request, 1, NULL, NULL);
+    pm_buffer_free(&payload);
+    return;
+  }
+
+  /*
+   * Routes a preformatted RESPAWN line to the parent's control connection. The
+   * detector (extension) computes the escaped child's argv/env/cwd and target
+   * parent; the daemon only forwards the opaque line to that parent's hook.
+   */
+  if (strcmp(request.method, "respawnChild") == 0) {
+    int parent_pid = pm_json_get_int(request.payload == NULL ? "" : request.payload, "parentPid", 0);
+    int target_fd = parent_pid > 0 ? pm_control_registry_fd_for_pid(parent_pid) : -1;
+    int pushed = 0;
+
+    if (target_fd >= 0) {
+      char *line = (char *)malloc(PM_CLIENT_BUFFER_MAX);
+      if (line != NULL) {
+        if (pm_json_get_string(request.payload == NULL ? "" : request.payload, "line", line, PM_CLIENT_BUFFER_MAX) == 0) {
+          size_t length = strlen(line);
+          if (length + 1 < PM_CLIENT_BUFFER_MAX) {
+            line[length] = '\n';
+            line[length + 1] = '\0';
+            length++;
+          }
+          pushed = write(target_fd, line, length) == (ssize_t)length;
+        }
+        free(line);
+      }
+    }
+
+    if (pushed) {
+      pm_send_response(client->fd, &request, 1, NULL, NULL);
+    } else {
+      pm_send_response(client->fd, &request, 0, NULL, "No control channel for the requested parent pid.");
+    }
+    pm_buffer_free(&payload);
+    return;
+  }
+
   if (pm_dispatch(state, &request, &payload, &state_changed, &shutdown_requested, error, sizeof(error)) != 0) {
     pm_send_response(client->fd, &request, 0, NULL, error);
     pm_buffer_free(&payload);
@@ -474,6 +588,8 @@ static int pm_add_client(pm_client **clients, size_t *count, size_t *capacity, i
 
   (*clients)[*count].fd = fd;
   (*clients)[*count].wants_events = 0;
+  (*clients)[*count].is_control = 0;
+  (*clients)[*count].control_pid = 0;
   (*clients)[*count].buffer = NULL;
   (*clients)[*count].length = 0;
   (*clients)[*count].capacity = 0;
@@ -483,6 +599,7 @@ static int pm_add_client(pm_client **clients, size_t *count, size_t *capacity, i
 
 static void pm_remove_client(pm_client *clients, size_t *count, size_t index) {
   if (clients[index].fd >= 0) {
+    pm_control_registry_remove_fd(clients[index].fd);
     close(clients[index].fd);
   }
   free(clients[index].buffer);
