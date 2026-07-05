@@ -19,8 +19,10 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /*
@@ -84,6 +86,10 @@ typedef int (*pm_posix_spawnp_fn)(
   const posix_spawnattr_t *,
   char *const [],
   char *const []);
+typedef pid_t (*pm_wait4_fn)(pid_t, int *, int, struct rusage *);
+typedef pid_t (*pm_waitpid_fn)(pid_t, int *, int);
+typedef pid_t (*pm_wait3_fn)(int *, int, struct rusage *);
+typedef int (*pm_kill_fn)(pid_t, int);
 
 typedef struct {
   int logical_port;
@@ -126,6 +132,10 @@ static pm_execv_fn pm_real_execv = execv;
 static pm_execvp_fn pm_real_execvp = execvp;
 static pm_posix_spawn_fn pm_real_posix_spawn = posix_spawn;
 static pm_posix_spawnp_fn pm_real_posix_spawnp = posix_spawnp;
+static pm_wait4_fn pm_real_wait4 = wait4;
+static pm_waitpid_fn pm_real_waitpid = waitpid;
+static pm_wait3_fn pm_real_wait3 = wait3;
+static pm_kill_fn pm_real_kill = kill;
 #else
 static pm_bind_fn pm_real_bind = NULL;
 static pm_connect_fn pm_real_connect = NULL;
@@ -136,6 +146,10 @@ static pm_execv_fn pm_real_execv = NULL;
 static pm_execvp_fn pm_real_execvp = NULL;
 static pm_posix_spawn_fn pm_real_posix_spawn = NULL;
 static pm_posix_spawnp_fn pm_real_posix_spawnp = NULL;
+static pm_wait4_fn pm_real_wait4 = NULL;
+static pm_waitpid_fn pm_real_waitpid = NULL;
+static pm_wait3_fn pm_real_wait3 = NULL;
+static pm_kill_fn pm_real_kill = NULL;
 #endif
 static __thread int pm_hook_depth = 0;
 static pm_route_mapping *pm_routes = NULL;
@@ -676,6 +690,22 @@ static void pm_ensure_symbols(void) {
 
   if (pm_real_posix_spawnp == NULL) {
     pm_real_posix_spawnp = (pm_posix_spawnp_fn)pm_resolve_symbol("posix_spawnp");
+  }
+
+  if (pm_real_wait4 == NULL) {
+    pm_real_wait4 = (pm_wait4_fn)pm_resolve_symbol("wait4");
+  }
+
+  if (pm_real_waitpid == NULL) {
+    pm_real_waitpid = (pm_waitpid_fn)pm_resolve_symbol("waitpid");
+  }
+
+  if (pm_real_wait3 == NULL) {
+    pm_real_wait3 = (pm_wait3_fn)pm_resolve_symbol("wait3");
+  }
+
+  if (pm_real_kill == NULL) {
+    pm_real_kill = (pm_kill_fn)pm_resolve_symbol("kill");
   }
 }
 
@@ -3765,13 +3795,38 @@ static pthread_mutex_t pm_control_start_mutex = PTHREAD_MUTEX_INITIALIZER;
  * the parent's own process management transparently follows the replacement.
  */
 #define PM_RESPAWN_MAP_MAX 256
+#define PM_RESPAWN_GRAVEYARD_MAX 256
 typedef struct {
   pid_t old_pid;
   pid_t new_pid;
 } pm_respawn_pair;
 static pm_respawn_pair pm_respawn_pairs[PM_RESPAWN_MAP_MAX];
 static size_t pm_respawn_pair_count = 0;
+/*
+ * Killed originals whose death must never be reported to the parent's own
+ * wait(). A pid stays here after its pair is retired so a late zombie surfacing
+ * in a wildcard wait is still consumed instead of double-reported. Ring buffer:
+ * old pids are short-lived and the count of concurrent respawns is tiny.
+ */
+static pid_t pm_respawn_graveyard[PM_RESPAWN_GRAVEYARD_MAX];
+static size_t pm_respawn_graveyard_head = 0;
+static int pm_respawn_active = 0; /* fast-path flag: any mapping/graveyard entry? */
 static pthread_mutex_t pm_respawn_map_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void pm_respawn_graveyard_add_locked(pid_t old_pid) {
+  pm_respawn_graveyard[pm_respawn_graveyard_head] = old_pid;
+  pm_respawn_graveyard_head = (pm_respawn_graveyard_head + 1) % PM_RESPAWN_GRAVEYARD_MAX;
+  pm_respawn_active = 1;
+}
+
+static int pm_respawn_in_graveyard_locked(pid_t pid) {
+  for (size_t index = 0; index < PM_RESPAWN_GRAVEYARD_MAX; index++) {
+    if (pm_respawn_graveyard[index] == pid) {
+      return 1;
+    }
+  }
+  return 0;
+}
 
 static void pm_respawn_map_record(pid_t old_pid, pid_t new_pid) {
   pthread_mutex_lock(&pm_respawn_map_mutex);
@@ -3779,8 +3834,64 @@ static void pm_respawn_map_record(pid_t old_pid, pid_t new_pid) {
     pm_respawn_pairs[pm_respawn_pair_count].old_pid = old_pid;
     pm_respawn_pairs[pm_respawn_pair_count].new_pid = new_pid;
     pm_respawn_pair_count++;
+    pm_respawn_active = 1;
   }
   pthread_mutex_unlock(&pm_respawn_map_mutex);
+}
+
+/* Replacement pid for a mapped original, or -1. */
+static pid_t pm_respawn_new_for_old(pid_t old_pid) {
+  pid_t result = -1;
+  pthread_mutex_lock(&pm_respawn_map_mutex);
+  for (size_t index = 0; index < pm_respawn_pair_count; index++) {
+    if (pm_respawn_pairs[index].old_pid == old_pid) {
+      result = pm_respawn_pairs[index].new_pid;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&pm_respawn_map_mutex);
+  return result;
+}
+
+/*
+ * If new_pid is a replacement, retire the pair (moving the original to the
+ * graveyard so its own zombie is never reported) and return the original pid;
+ * otherwise return -1.
+ */
+static pid_t pm_respawn_retire_by_new(pid_t new_pid) {
+  pid_t old_pid = -1;
+  pthread_mutex_lock(&pm_respawn_map_mutex);
+  for (size_t index = 0; index < pm_respawn_pair_count; index++) {
+    if (pm_respawn_pairs[index].new_pid == new_pid) {
+      old_pid = pm_respawn_pairs[index].old_pid;
+      pm_respawn_graveyard_add_locked(old_pid);
+      pm_respawn_pairs[index] = pm_respawn_pairs[pm_respawn_pair_count - 1];
+      pm_respawn_pair_count--;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&pm_respawn_map_mutex);
+  return old_pid;
+}
+
+/* True if pid is a mapped original (its death should be suppressed). */
+static int pm_respawn_is_suppressed_old(pid_t pid) {
+  int result = 0;
+  pthread_mutex_lock(&pm_respawn_map_mutex);
+  if (pm_respawn_in_graveyard_locked(pid)) {
+    result = 1;
+  } else {
+    for (size_t index = 0; index < pm_respawn_pair_count; index++) {
+      if (pm_respawn_pairs[index].old_pid == pid) {
+        /* First sighting of the killed original: retire it to the graveyard. */
+        pm_respawn_graveyard_add_locked(pid);
+        result = 1;
+        break;
+      }
+    }
+  }
+  pthread_mutex_unlock(&pm_respawn_map_mutex);
+  return result;
 }
 
 /* Standard-alphabet base64 decode; returns 0 on success and NUL-terminates. */
@@ -4356,6 +4467,99 @@ static int pm_getifaddrs_hook(struct ifaddrs **ifap) {
   return result;
 }
 
+/*
+ * ---- Transparent respawn: wait()/kill() virtualization ---------------------
+ * After this parent respawns an escaped child (kills original P, spawns
+ * replacement N as its own child), its own libuv/shell process management must
+ * keep seeing "P" alive and then see "P" exit when N exits. macOS cannot
+ * reparent N onto P, so the parent's own wait()/kill() are virtualized against
+ * the P<->N map:
+ *   - wait for P              -> wait for N, report the result as P
+ *   - wildcard wait yields N  -> report as P (retire the pair)
+ *   - wildcard wait yields P  -> the killed original; consume silently
+ *   - kill(P)                 -> kill(N)
+ * With no respawn active (pm_respawn_active == 0) every path is a straight
+ * pass-through, so unrelated processes and the common case pay nothing.
+ */
+static pid_t pm_wait_virtualized(pid_t pid, int *status, int options, struct rusage *rusage) {
+  pm_ensure_symbols();
+  if (pm_real_wait4 == NULL) {
+    errno = ENOSYS;
+    return -1;
+  }
+  if (pm_hook_depth > 0 || !pm_respawn_active) {
+    return pm_real_wait4(pid, status, options, rusage);
+  }
+
+  if (pid > 0) {
+    pid_t new_pid = pm_respawn_new_for_old(pid);
+    if (new_pid > 0) {
+      pid_t result = pm_real_wait4(new_pid, status, options, rusage);
+      if (result == new_pid) {
+        pm_respawn_retire_by_new(new_pid);
+        pm_hook_depth++;
+        pm_real_wait4(pid, NULL, WNOHANG, NULL); /* reap the killed original's zombie */
+        pm_hook_depth--;
+        return pid; /* report the replacement's exit as the original */
+      }
+      return result; /* 0 (WNOHANG, replacement still running) or -1 */
+    }
+    if (pm_respawn_is_suppressed_old(pid)) {
+      pm_hook_depth++;
+      pm_real_wait4(pid, NULL, WNOHANG, NULL);
+      pm_hook_depth--;
+      errno = ECHILD;
+      return -1;
+    }
+    return pm_real_wait4(pid, status, options, rusage);
+  }
+
+  /* Wildcard / process-group wait: loop, suppressing killed originals. */
+  for (;;) {
+    pid_t result = pm_real_wait4(pid, status, options, rusage);
+    pid_t old_pid;
+
+    if (result <= 0) {
+      return result;
+    }
+    old_pid = pm_respawn_retire_by_new(result);
+    if (old_pid > 0) {
+      return old_pid; /* replacement exited: report as the original */
+    }
+    if (pm_respawn_is_suppressed_old(result)) {
+      continue; /* killed original consumed; keep looking for real events */
+    }
+    return result;
+  }
+}
+
+static pid_t pm_wait4_hook(pid_t pid, int *status, int options, struct rusage *rusage) {
+  return pm_wait_virtualized(pid, status, options, rusage);
+}
+
+static pid_t pm_waitpid_hook(pid_t pid, int *status, int options) {
+  return pm_wait_virtualized(pid, status, options, NULL);
+}
+
+static pid_t pm_wait3_hook(int *status, int options, struct rusage *rusage) {
+  return pm_wait_virtualized((pid_t)-1, status, options, rusage);
+}
+
+static int pm_kill_hook(pid_t pid, int sig) {
+  pm_ensure_symbols();
+  if (pm_real_kill == NULL) {
+    errno = ENOSYS;
+    return -1;
+  }
+  if (pm_hook_depth == 0 && pm_respawn_active && pid > 0) {
+    pid_t new_pid = pm_respawn_new_for_old(pid);
+    if (new_pid > 0) {
+      return pm_real_kill(new_pid, sig);
+    }
+  }
+  return pm_real_kill(pid, sig);
+}
+
 #if defined(__APPLE__)
 #define PM_DYLD_INTERPOSE(_replacement, _replacee) \
   __attribute__((used)) static struct { const void *replacement; const void *replacee; } \
@@ -4372,6 +4576,10 @@ PM_DYLD_INTERPOSE(pm_execv_hook, execv);
 PM_DYLD_INTERPOSE(pm_execvp_hook, execvp);
 PM_DYLD_INTERPOSE(pm_posix_spawn_hook, posix_spawn);
 PM_DYLD_INTERPOSE(pm_posix_spawnp_hook, posix_spawnp);
+PM_DYLD_INTERPOSE(pm_wait4_hook, wait4);
+PM_DYLD_INTERPOSE(pm_waitpid_hook, waitpid);
+PM_DYLD_INTERPOSE(pm_wait3_hook, wait3);
+PM_DYLD_INTERPOSE(pm_kill_hook, kill);
 #else
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   return pm_bind_hook(sockfd, addr, addrlen);
@@ -4419,5 +4627,21 @@ int posix_spawnp(
   char *const argv[],
   char *const envp[]) {
   return pm_posix_spawnp_hook(pid, file, file_actions, attrp, argv, envp);
+}
+
+pid_t wait4(pid_t pid, int *status, int options, struct rusage *rusage) {
+  return pm_wait4_hook(pid, status, options, rusage);
+}
+
+pid_t waitpid(pid_t pid, int *status, int options) {
+  return pm_waitpid_hook(pid, status, options);
+}
+
+pid_t wait3(int *status, int options, struct rusage *rusage) {
+  return pm_wait3_hook(status, options, rusage);
+}
+
+int kill(pid_t pid, int sig) {
+  return pm_kill_hook(pid, sig);
 }
 #endif
