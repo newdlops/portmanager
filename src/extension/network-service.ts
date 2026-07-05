@@ -32,6 +32,7 @@ import { selectHostDefaultGatewayExposure } from "../core/networks/host-default-
 import {
   ACTUAL_LOOPBACK_HOST_ENV,
   browserLoopbackAddressForNetwork,
+  hostLocalGatewayLoopbackAddressForNetwork,
   loopbackAddressForNetwork,
   NETWORK_LOOPBACK_HOST_ENV,
   resolveTerminalLoopbackAddressRoutingMode,
@@ -478,7 +479,13 @@ interface HostLocalGatewayRedirect {
   readonly port: number;
   /** Selected logical network for host fallback. */
   readonly networkId: string;
-  /** Invisible per-network gateway already proxying this logical port. */
+  /**
+   * Hidden per-network redirect alias the pf rule rewrites packets to. This is
+   * deliberately NOT the browser alias: macOS pf mangles replies for every
+   * connection to an rdr target coordinate, so a user-visible listener there
+   * becomes undialable (SYN_RCVD hangs). A sniffing listener is bound on this
+   * address for each redirected port.
+   */
   readonly targetAddress: string;
 }
 
@@ -620,6 +627,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Route-file fallback targets used while the daemon snapshot is stale or incomplete. */
   private browserProxyGeneratedRouteTargetByEndpointId = new Map<string, BrowserNetworkProxyTarget>();
   private browserProxyComposeTargetByEndpointId = new Map<string, BrowserNetworkProxyTarget>();
+
+  /** Host exposures served by the sniffing browser proxy, keyed by their endpoint id. */
+  private browserProxyExposureByEndpointId = new Map<string, HostPortExposure>();
 
   /** Logical port gateway attribution verdicts keyed by client (pid, startTime). */
   private readonly routerVerdictCache = new RouterVerdictCache({
@@ -1547,7 +1557,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const composeAttachments = snapshot.composeAttachments.filter((attachment) => attachment.networkId === networkId);
 
     for (const exposure of exposures) {
-      await this.proxyManager.close(exposure.id);
+      await this.closeHostExposureListener(exposure.id);
     }
 
     for (const attachment of composeAttachments) {
@@ -2174,15 +2184,44 @@ export class PortManagerNetworkService implements DisposableLike {
     };
 
     try {
-      await this.proxyManager.open(exposure);
+      await this.openHostExposureListener(exposure);
       return this.registry.addExposure({
         ...exposure,
         status: "active",
       });
     } catch (error) {
-      await this.proxyManager.close(exposure.id);
+      await this.closeHostExposureListener(exposure.id);
       throw new Error(`Failed to expose ${input.hostAddress}:${input.hostPort}: ${formatError(error)}`);
     }
+  }
+
+  /**
+   * Opens the concrete listener for one exposure. Loopback TCP exposures ride
+   * the protocol-sniffing browser proxy so `https://localhost:<port>` is
+   * terminated with the dev certificate instead of raw-forwarding TLS bytes to
+   * a plaintext upstream (the ERR_SSL_PROTOCOL_ERROR path); everything else
+   * keeps the raw forwarder.
+   */
+  private async openHostExposureListener(exposure: HostPortExposure): Promise<void> {
+    const browserEndpoint = buildHostExposureBrowserEndpoint(exposure);
+    if (browserEndpoint === undefined) {
+      await this.proxyManager.open(exposure);
+      return;
+    }
+
+    this.browserProxyExposureByEndpointId.set(browserEndpoint.id, exposure);
+    const activeEndpoint = await this.browserNetworkProxy.ensure(browserEndpoint);
+    if (activeEndpoint === undefined) {
+      this.browserProxyExposureByEndpointId.delete(browserEndpoint.id);
+      throw new Error(`Could not listen on ${exposure.hostAddress}:${exposure.hostPort}. The port may be in use.`);
+    }
+  }
+
+  /** Closes whichever listener implementation currently serves one exposure. */
+  private async closeHostExposureListener(exposureId: string): Promise<void> {
+    this.browserProxyExposureByEndpointId.delete(browserProxyExposureEndpointId(exposureId));
+    await this.browserNetworkProxy.close(browserProxyExposureEndpointId(exposureId)).catch(() => undefined);
+    await this.proxyManager.close(exposureId).catch(() => undefined);
   }
 
   /** Closes and removes one host exposure. */
@@ -2191,7 +2230,7 @@ export class PortManagerNetworkService implements DisposableLike {
       throw new Error("Another Port Manager window owns host exposure control. Try the command from that window.");
     }
 
-    await this.proxyManager.close(exposureId);
+    await this.closeHostExposureListener(exposureId);
     return this.registry.removeExposure(exposureId);
   }
 
@@ -3169,7 +3208,7 @@ export class PortManagerNetworkService implements DisposableLike {
       }
 
       try {
-        await this.proxyManager.open(exposure);
+        await this.openHostExposureListener(exposure);
       } catch (error) {
         this.registry.updateExposure({
           ...exposure,
@@ -4508,8 +4547,20 @@ export class PortManagerNetworkService implements DisposableLike {
    * socket target from the daemon route table.
    */
   private async resolveBrowserNetworkProxyTarget(
-    endpoint: Pick<BrowserNetworkProxyEndpoint, "networkId" | "logicalPort">,
+    endpoint: Pick<BrowserNetworkProxyEndpoint, "networkId" | "logicalPort"> &
+      Partial<Pick<BrowserNetworkProxyEndpoint, "id">>,
   ): Promise<BrowserNetworkProxyTarget> {
+    // Host exposures keep their own resolution chain (container runtime, then
+    // route table, then the persisted static target) instead of the alias one.
+    const exposure = endpoint.id === undefined ? undefined : this.browserProxyExposureByEndpointId.get(endpoint.id);
+    if (exposure !== undefined) {
+      const exposureTarget = await this.resolveHostExposureTarget(exposure);
+      return {
+        host: normalizeBrowserProxyTargetHost(exposureTarget.host),
+        port: exposureTarget.port,
+      };
+    }
+
     const indexedTarget = this.findBrowserProxyRouteTarget(endpoint.networkId, endpoint.logicalPort);
     if (indexedTarget !== undefined) {
       return indexedTarget;
@@ -4959,11 +5010,42 @@ export class PortManagerNetworkService implements DisposableLike {
       processCommandTextByPid,
     );
     const routeHintTextByEndpointId = await this.readBrowserProxyRouteHintTexts(routes);
+    /*
+     * Active loopback host exposures ride the sniffing listener so browsers can
+     * open https://localhost:<port>; they must stay in the desired endpoint set
+     * or reconciliation would retire them between syncs.
+     */
+    const exposureEndpointPairs = registrySnapshot.exposures.flatMap((exposure) => {
+      if (exposure.status !== "active") {
+        return [];
+      }
+      const exposureEndpoint = buildHostExposureBrowserEndpoint(exposure);
+      return exposureEndpoint === undefined ? [] : [[exposureEndpoint, exposure] as const];
+    });
+    this.browserProxyExposureByEndpointId = new Map(
+      exposureEndpointPairs.map(([exposureEndpoint, exposure]) => [exposureEndpoint.id, exposure]),
+    );
+    const hostLocalGatewayPorts = new Set(readPortManagerSettings().fixedProtocolPorts);
+    // Host-local fixed-protocol redirects are computed from the full exposure
+    // set, ignoring browser-endpoint ownership; their sniffing listeners live
+    // on the hidden redirect alias rather than the browser alias.
+    const hostLocalGatewayRedirects = selectHostLocalGatewayRedirects(
+      collectHostGatewayExposures(routes, networks, [], registrySnapshot.composeAttachments),
+      networks,
+      hostLocalGatewayPorts,
+      this.vscodeWindowTerminalBinding?.status === "attached" ? this.vscodeWindowTerminalBinding.networkId : undefined,
+    );
     const endpoints = mergeBrowserProxyEndpoints(
-      processEndpoints,
+      exposureEndpointPairs.map(([exposureEndpoint]) => exposureEndpoint),
       mergeBrowserProxyEndpoints(
-        collectBrowserProxyRouteEndpoints(routes, networks, dnsRunning, routeHintTextByEndpointId, processEndpoints),
-        collectBrowserProxyComposeEndpoints(registrySnapshot.composeAttachments, networks, dnsRunning),
+        processEndpoints,
+        mergeBrowserProxyEndpoints(
+          collectBrowserProxyRouteEndpoints(routes, networks, dnsRunning, routeHintTextByEndpointId, processEndpoints),
+          mergeBrowserProxyEndpoints(
+            collectBrowserProxyComposeEndpoints(registrySnapshot.composeAttachments, networks, dnsRunning),
+            collectHostLocalGatewayRedirectEndpoints(hostLocalGatewayRedirects),
+          ),
+        ),
       ),
     );
     this.browserProxyGeneratedRouteTargetByEndpointId = buildBrowserProxyRouteTargetIndex(
@@ -4971,7 +5053,6 @@ export class PortManagerNetworkService implements DisposableLike {
       snapshot?.processes ?? [],
     );
     this.browserProxyComposeTargetByEndpointId = buildBrowserProxyComposeTargetIndex(registrySnapshot.composeAttachments);
-    const hostLocalGatewayPorts = new Set(readPortManagerSettings().fixedProtocolPorts);
     // The native L4 forwarder must not bind coordinates the sniffing browser
     // proxy already owns, so browser endpoints are excluded from its exposures.
     const hostGatewayExposures = collectHostGatewayExposures(
@@ -4980,15 +5061,13 @@ export class PortManagerNetworkService implements DisposableLike {
       endpoints,
       registrySnapshot.composeAttachments,
     );
-    // Host-local fixed-protocol redirects still target those coordinates (now
-    // served by the sniffing proxy, which forwards raw TCP), so they are
-    // computed from the full exposure set, ignoring browser-endpoint ownership.
-    const hostLocalGatewayRedirects = selectHostLocalGatewayRedirects(
-      collectHostGatewayExposures(routes, networks, [], registrySnapshot.composeAttachments),
-      networks,
-      hostLocalGatewayPorts,
-      this.vscodeWindowTerminalBinding?.status === "attached" ? this.vscodeWindowTerminalBinding.networkId : undefined,
-    );
+    // Redirect targets live on hidden per-network aliases; recreate them
+    // (best-effort, e.g. after a reboot) before their listeners try to bind.
+    if (hostLocalGatewayRedirects.length > 0) {
+      await ensureBrowserDnsLoopbackAliasesReady(
+        hostLocalGatewayRedirects.map((redirect) => ({ address: redirect.targetAddress })),
+      ).catch(() => undefined);
+    }
 
     await this.releaseHostGatewayPortsForBrowserEndpoints(endpoints).catch(() => undefined);
     await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);
@@ -5004,23 +5083,44 @@ export class PortManagerNetworkService implements DisposableLike {
   private async releaseHostGatewayPortsForBrowserEndpoints(
     endpoints: readonly BrowserNetworkProxyEndpoint[],
   ): Promise<void> {
-    const reclaimedNativeEndpoints = new Set<string>();
+    const nativeEndpointsToReclaim = new Map<string, { hostAddress: string; hostPort: number }>();
 
     for (const endpoint of endpoints) {
-      const hostGatewayId = hostGatewayExposureId(endpoint.networkId, endpoint.logicalPort);
-      if (this.hostGatewayExposureIds.delete(hostGatewayId)) {
-        await this.hostGatewayProxy.close(hostGatewayId).catch(() => undefined);
+      /*
+       * Only alias browser endpoints displace the raw host gateway for their
+       * network/port. Exposure and redirect endpoints bind other coordinates
+       * (localhost, hidden redirect alias), so the alias gateway stays open.
+       */
+      if (endpoint.id === browserNetworkProxyEndpointId(endpoint.networkId, endpoint.logicalPort)) {
+        const hostGatewayId = hostGatewayExposureId(endpoint.networkId, endpoint.logicalPort);
+        if (this.hostGatewayExposureIds.delete(hostGatewayId)) {
+          await this.hostGatewayProxy.close(hostGatewayId).catch(() => undefined);
+        }
+      }
+
+      /*
+       * Reclaiming only matters before this coordinate binds; once the sniffing
+       * listener owns the endpoint no orphaned helper can occupy it. Skipping
+       * open endpoints keeps the steady-state sync free of process-table scans,
+       * which used to block the extension host event loop for seconds.
+       */
+      if (this.browserNetworkProxy.has(endpoint.id)) {
+        continue;
       }
 
       for (const listenPort of endpoint.listenPorts) {
         const nativeEndpointKey = `${endpoint.listenHost}:${listenPort}`;
-        if (reclaimedNativeEndpoints.has(nativeEndpointKey)) {
-          continue;
+        if (!nativeEndpointsToReclaim.has(nativeEndpointKey)) {
+          nativeEndpointsToReclaim.set(nativeEndpointKey, {
+            hostAddress: endpoint.listenHost,
+            hostPort: listenPort,
+          });
         }
-
-        reclaimedNativeEndpoints.add(nativeEndpointKey);
-        await this.hostGatewayProxy.reclaimNativeEndpoint(endpoint.listenHost, listenPort).catch(() => undefined);
       }
+    }
+
+    if (nativeEndpointsToReclaim.size > 0) {
+      await this.hostGatewayProxy.reclaimNativeEndpoints([...nativeEndpointsToReclaim.values()]).catch(() => undefined);
     }
   }
 
@@ -8363,15 +8463,37 @@ function selectHostLocalGatewayRedirects(
      * packets for known client protocol ports to an invisible network gateway.
      * Web/app listen ports are deliberately excluded so Port Manager cannot
      * occupy localhost before Django, Daphne, Vite, or similar servers bind.
+     * The target is the hidden redirect alias, never the browser alias the
+     * exposure row carries — pf reply translation breaks direct dials to the
+     * rdr target coordinate.
      */
     redirects.push({
       port: hostPort,
       networkId: exposure.networkId,
-      targetAddress: exposure.hostAddress,
+      targetAddress: hostLocalGatewayLoopbackAddressForNetwork(exposure.networkId),
     });
   }
 
   return redirects.sort((left, right) => left.port - right.port || left.networkId.localeCompare(right.networkId));
+}
+
+/**
+ * Binds one sniffing listener on each hidden pf-redirect coordinate. Redirected
+ * hookless clients believed they dialed 127.0.0.1, so rewrites present
+ * localhost; raw protocols (databases, brokers) pass through untouched.
+ */
+function collectHostLocalGatewayRedirectEndpoints(
+  redirects: readonly HostLocalGatewayRedirect[],
+): readonly BrowserNetworkProxyEndpoint[] {
+  return dedupeHostLocalGatewayRedirects(redirects).map((redirect) => ({
+    id: `host-local-gateway:${redirect.networkId}:${redirect.port}`,
+    networkId: redirect.networkId,
+    logicalPort: redirect.port,
+    listenHost: redirect.targetAddress,
+    publicHost: "localhost",
+    publicProtocol: localhostBrowserTlsProtocol(),
+    listenPorts: [redirect.port],
+  }));
 }
 
 function isBrowserProxyProcess(
@@ -8616,6 +8738,58 @@ function collectBrowserProxyComposeEndpoints(
   }
 
   return [...endpoints.values()];
+}
+
+/** Endpoint id namespace for host exposure listeners served by the sniffing browser proxy. */
+function browserProxyExposureEndpointId(exposureId: string): string {
+  return `exposure:${exposureId}`;
+}
+
+/** True for host addresses the dev TLS certificate can legitimately terminate. */
+function isLoopbackExposureHostAddress(hostAddress: string): boolean {
+  const normalized = hostAddress.trim().toLowerCase();
+  return (
+    normalized === "localhost" ||
+    normalized === "::1" ||
+    normalized === "[::1]" ||
+    /^127(?:\.\d{1,3}){3}$/.test(normalized)
+  );
+}
+
+/**
+ * Serves a loopback host exposure through the protocol-sniffing listener.
+ *
+ * The raw native forwarder answered a browser's TLS ClientHello with the
+ * upstream's plaintext bytes, so `https://localhost:<port>` failed with
+ * ERR_SSL_PROTOCOL_ERROR — and Chrome's HTTPS-First upgrade steers even plain
+ * `localhost:<port>` entries onto that path. Non-loopback exposures keep the
+ * raw forwarder because the dev certificate only covers localhost names.
+ */
+function buildHostExposureBrowserEndpoint(exposure: HostPortExposure): BrowserNetworkProxyEndpoint | undefined {
+  if (
+    exposure.protocol !== "tcp" ||
+    !isLoopbackExposureHostAddress(exposure.hostAddress) ||
+    !isTcpPort(exposure.hostPort) ||
+    !isTcpPort(exposure.targetPort)
+  ) {
+    return undefined;
+  }
+
+  return {
+    id: browserProxyExposureEndpointId(exposure.id),
+    networkId: exposure.networkId,
+    logicalPort: exposure.targetPort,
+    listenHost: exposure.hostAddress,
+    publicHost: "localhost",
+    publicProtocol: localhostBrowserTlsProtocol(),
+    listenPorts: [exposure.hostPort],
+  };
+}
+
+/** HTTPS only when the current dev certificate actually covers the localhost name. */
+function localhostBrowserTlsProtocol(): "http" | "https" {
+  const state = readBrowserTlsCertificateState();
+  return state.available && !state.expired && state.markerHostnames.has("localhost") ? "https" : "http";
 }
 
 /** Indexes compose published ports so the proxy can reach their docker-published host target. */

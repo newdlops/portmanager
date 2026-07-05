@@ -111,6 +111,10 @@ per-network loopback alias는 호스트 전역 `lo0`에 존재하므로(macOS엔
 
 호스트 브라우저용 경로는 네트워크마다 별도의 브라우저 대역 loopback alias(`127.112~143`)와 DNS 별칭·개발 인증서를 두고, 각 네트워크 포트를 그 alias 위에서 **단일 프로토콜 스니핑 리스너**로 노출한다. 리스너는 연결의 첫 바이트로 분기한다: TLS ClientHello(`0x16`)는 개발 인증서로 종단해 HTTP로 프록시(Host 재작성·응답 본문 오리진 재작성)하고, 평문 HTTP 요청줄은 동일하게 HTTP로 프록시하며, 그 외는 raw TCP로 그대로 포워딩한다. 포트가 HTTP인지 raw인지 미리 분류하지 않으므로, 컨테이너(Docker Compose) 웹 서비스처럼 명령어 문자열로 웹 여부를 알 수 없는 경우에도 브라우저 HTTPS가 동작하고(이전에는 평문 노출로 `ERR_SSL_PROTOCOL_ERROR`), 같은 alias의 데이터베이스 등 raw 프로토콜은 raw 경로로 계속 동작한다.
 
+`localhost`/`127.0.0.1` 대상 Host Port Exposure도 같은 스니핑 리스너로 서빙한다. 개발 인증서의 SAN은 `localhost`와 `127.0.0.1`을 포함하므로 `https://localhost:<hostPort>`는 인증서로 종단되어 HTTP로 프록시되고, 평문 HTTP와 raw 프로토콜은 기존과 동일하게 동작한다. raw 네이티브 포워더만 쓰던 이전 구현에서는 브라우저의 TLS ClientHello가 평문 업스트림으로 그대로 전달되어 `ERR_SSL_PROTOCOL_ERROR`가 났고, Chrome의 HTTPS 자동 업그레이드 때문에 사용자가 `localhost:<port>`만 입력해도 이 경로를 밟았다. loopback이 아닌 호스트 주소의 exposure는 인증서가 그 이름을 커버하지 않으므로 raw 포워더를 유지한다.
+
+호스트 로컬 고정 프로토콜 리다이렉트(pf `rdr`)의 타깃은 브라우저 alias가 아니라 네트워크별 **히든 redirect 대역 alias(`127.144~175`)**다. macOS pf는 `rdr` 타깃 좌표로 향하는 모든 연결의 응답 패킷을 역변환하므로, 사용자가 직접 접속하는 리스너 좌표를 rdr 타깃으로 쓰면 그 좌표로의 직접 접속이 SYN_RCVD 상태로 영구히 멈춘다. 따라서 직접 접속 좌표(브라우저 alias)와 NAT 타깃 좌표(히든 alias)를 분리하고, 리다이렉트되는 각 고정 포트마다 히든 alias 위에 스니핑 리스너를 바인드한다. 히든 alias는 관리자 설치 스크립트가 생성하며, 재부팅 후에는 비대화식 alias 셋업이 best-effort로 복구한다.
+
 #### Terminal Discovery
 
 VS Code 통합 터미널만이 아니라 macOS Terminal/iTerm2, Linux terminal emulator, Windows Terminal, PowerShell, cmd, WSL 터미널의 shell/process tree를 조회하고, 이를 터미널 창/세션 단위로 그룹화해 사용자가 연결할 대상을 선택할 수 있게 하는 기능이다. 플랫폼이 window/tab title을 제공하면 그 title을 기본 표시명으로 사용한다.

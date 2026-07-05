@@ -1,4 +1,4 @@
-import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import type { HostPortExposure } from "../../shared/types";
@@ -102,7 +102,7 @@ export class HostPortProxyManager {
       return;
     }
 
-    await terminateSiblingNativeHostProxyProcesses(exposure);
+    await terminateSiblingNativeHostProxyProcesses([exposure]);
 
     const nativeListener = await this.openNative(exposure);
     if (nativeListener !== undefined) {
@@ -140,7 +140,18 @@ export class HostPortProxyManager {
    * host may have opened the same DNS alias port as a raw TCP gateway.
    */
   async reclaimNativeEndpoint(hostAddress: string, hostPort: number): Promise<void> {
-    await terminateSiblingNativeHostProxyProcesses({ hostAddress, hostPort });
+    await terminateSiblingNativeHostProxyProcesses([{ hostAddress, hostPort }]);
+  }
+
+  /**
+   * Reclaims orphaned native helpers for many endpoints with one process-table
+   * read. Reconciliation passes every endpoint it is about to bind here, so the
+   * scan cost stays constant instead of growing per endpoint.
+   */
+  async reclaimNativeEndpoints(
+    endpoints: readonly Pick<HostPortExposure, "hostAddress" | "hostPort">[],
+  ): Promise<void> {
+    await terminateSiblingNativeHostProxyProcesses(endpoints);
   }
 
   /** Closes every listener during extension shutdown. */
@@ -477,18 +488,22 @@ function listen(server: net.Server, port: number, host: string): Promise<void> {
 }
 
 /**
- * Reclaims orphaned native helpers for the same endpoint before binding. A VS
+ * Reclaims orphaned native helpers for the same endpoints before binding. A VS
  * Code extension reload can leave an old helper alive briefly; if it keeps the
- * port, the new owner cannot install its current target resolver.
+ * port, the new owner cannot install its current target resolver. The process
+ * table is read asynchronously and once per call: a synchronous per-endpoint
+ * scan here used to freeze the extension host event loop for seconds, stalling
+ * every proxy connection.
  */
 async function terminateSiblingNativeHostProxyProcesses(
-  exposure: Pick<HostPortExposure, "hostAddress" | "hostPort">,
+  exposures: readonly Pick<HostPortExposure, "hostAddress" | "hostPort">[],
 ): Promise<void> {
-  if (process.platform === "win32" || exposure.hostPort <= 0) {
+  const endpoints = exposures.filter((exposure) => exposure.hostPort > 0);
+  if (process.platform === "win32" || endpoints.length === 0) {
     return;
   }
 
-  const siblingPids = findSiblingNativeHostProxyProcessIds(exposure);
+  const siblingPids = await findSiblingNativeHostProxyProcessIds(endpoints);
   if (siblingPids.length === 0) {
     return;
   }
@@ -507,15 +522,12 @@ async function terminateSiblingNativeHostProxyProcesses(
   }
 }
 
-function findSiblingNativeHostProxyProcessIds(
-  exposure: Pick<HostPortExposure, "hostAddress" | "hostPort">,
-): readonly number[] {
+async function findSiblingNativeHostProxyProcessIds(
+  exposures: readonly Pick<HostPortExposure, "hostAddress" | "hostPort">[],
+): Promise<readonly number[]> {
   let output: string;
   try {
-    output = execFileSync("ps", ["-Ao", "pid=,command="], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
+    output = await listProcessTable();
   } catch {
     return [];
   }
@@ -533,13 +545,31 @@ function findSiblingNativeHostProxyProcessIds(
       Number.isInteger(pid) &&
       pid > 0 &&
       pid !== process.pid &&
-      isNativeHostProxyCommandForEndpoint(command, exposure.hostAddress, exposure.hostPort)
+      exposures.some((exposure) => isNativeHostProxyCommandForEndpoint(command, exposure.hostAddress, exposure.hostPort))
     ) {
       pids.push(pid);
     }
   }
 
   return pids;
+}
+
+function listProcessTable(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "ps",
+      ["-Ao", "pid=,command="],
+      { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 },
+      (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve(stdout);
+      },
+    );
+  });
 }
 
 function isNativeHostProxyCommandForEndpoint(command: string, hostAddress: string, hostPort: number): boolean {

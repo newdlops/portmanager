@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   ACTUAL_LOOPBACK_HOST_ENV,
   browserLoopbackAddressForNetwork,
+  hostLocalGatewayLoopbackAddressForNetwork,
   isLoopbackAddressRoutingEnabled,
   loopbackAddressForNetwork,
   NETWORK_LOOPBACK_HOST_ENV,
@@ -33,6 +34,19 @@ test("browser loopback addresses are stable and separate from app bind addresses
   assert.equal(browserAddress, browserLoopbackAddressForNetwork("network-a"));
   assert.notEqual(browserAddress, appAddress);
   assert.match(browserAddress, /^127\.(11[2-9]|12[0-9]|13[0-9]|14[0-3])\.\d{1,3}\.\d{1,3}$/);
+});
+
+test("host-local gateway redirect addresses live in their own hidden band", () => {
+  const appAddress = loopbackAddressForNetwork("network-a");
+  const browserAddress = browserLoopbackAddressForNetwork("network-a");
+  const redirectAddress = hostLocalGatewayLoopbackAddressForNetwork("network-a");
+
+  assert.equal(redirectAddress, hostLocalGatewayLoopbackAddressForNetwork("network-a"));
+  // pf reply translation breaks direct dials to an rdr target coordinate, so
+  // the redirect target must never collide with a user-dialable alias band.
+  assert.notEqual(redirectAddress, appAddress);
+  assert.notEqual(redirectAddress, browserAddress);
+  assert.match(redirectAddress, /^127\.(14[4-9]|15[0-9]|16[0-9]|17[0-5])\.\d{1,3}\.\d{1,3}$/);
 });
 
 test("loopback address routing mode uses loopback as the default actual-port policy", () => {

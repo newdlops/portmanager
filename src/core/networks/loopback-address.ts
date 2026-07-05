@@ -79,6 +79,21 @@ export function browserLoopbackAddressForNetwork(networkId: string): string {
   return `127.${secondOctet}.${thirdOctet}.${fourthOctet}`;
 }
 
+/**
+ * Hidden per-network alias used only as the pf host-local redirect target
+ * (127.144–175 band). macOS pf mangles replies for every connection to an
+ * `rdr` target coordinate — direct dials hang in SYN_RCVD — so the target must
+ * be an address nothing ever dials directly, separate from the browser alias.
+ */
+export function hostLocalGatewayLoopbackAddressForNetwork(networkId: string): string {
+  const hash = fnv1a32(`host-local:${networkId}`);
+  const secondOctet = 144 + (hash & 0x1f);
+  const thirdOctet = (hash >>> 8) & 0xff;
+  const fourthOctet = 1 + ((hash >>> 16) % 254);
+
+  return `127.${secondOctet}.${thirdOctet}.${fourthOctet}`;
+}
+
 function fnv1a32(value: string): number {
   let hash = 0x811c9dc5;
 

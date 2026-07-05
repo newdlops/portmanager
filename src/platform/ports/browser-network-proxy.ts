@@ -249,6 +249,11 @@ export class BrowserNetworkProxyManager {
     return this.listeners.get(browserNetworkProxyEndpointId(networkId, logicalPort))?.endpoint;
   }
 
+  /** True when this manager already owns an open listener for the endpoint id. */
+  has(endpointId: string): boolean {
+    return this.listeners.has(endpointId);
+  }
+
   /** Clears bind retry throttles when an external owner handoff may have freed the socket. */
   retryFailedEndpointsNow(): void {
     this.retryAfterById.clear();

@@ -177,7 +177,12 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(hostGatewaySyncIndex > browserProxyApplyIndex, true);
   assert.equal(hostLocalGatewayRedirectSyncIndex > hostGatewaySyncIndex, true);
   assert.equal(networkServiceSource.includes("releaseHostGatewayPortsForBrowserEndpoints"), true);
-  assert.equal(networkServiceSource.includes("reclaimNativeEndpoint(endpoint.listenHost, listenPort)"), true);
+  // Reclaim must stay batched (one async process-table read per sync) and skip
+  // endpoints the sniffing proxy already owns; the per-endpoint sync scan froze
+  // the extension host event loop for seconds on every reconciliation.
+  assert.equal(networkServiceSource.includes("this.hostGatewayProxy.reclaimNativeEndpoints("), true);
+  assert.equal(networkServiceSource.includes("this.browserNetworkProxy.has(endpoint.id)"), true);
+  assert.equal(networkServiceSource.includes("reclaimNativeEndpoint(endpoint.listenHost, listenPort)"), false);
   assert.equal(networkServiceSource.includes("private readonly hostGatewayProxy"), true);
   assert.equal(networkServiceSource.includes("collectHostGatewayExposures"), true);
   assert.match(networkServiceSource, /collectHostGatewayExposures\([\s\S]*registrySnapshot\.composeAttachments/);
@@ -187,6 +192,21 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(networkServiceSource.includes('createdAt: "hidden-host-local-gateway"'), false);
   assert.equal(networkServiceSource.includes("selectHostLocalGatewayRedirects"), true);
   assert.equal(networkServiceSource.includes("syncHostLocalGatewayRedirects"), true);
+  // The pf rdr target must be the hidden redirect alias, not the browser alias:
+  // macOS pf reply translation breaks every direct dial to an rdr target
+  // coordinate (SYN_RCVD hangs), and a sniffing listener must be bound there.
+  assert.equal(
+    networkServiceSource.includes("targetAddress: hostLocalGatewayLoopbackAddressForNetwork(exposure.networkId)"),
+    true,
+  );
+  assert.equal(networkServiceSource.includes("targetAddress: exposure.hostAddress"), false);
+  assert.equal(networkServiceSource.includes("collectHostLocalGatewayRedirectEndpoints(hostLocalGatewayRedirects)"), true);
+  // Loopback host exposures ride the sniffing listener so https://localhost:<port>
+  // terminates TLS instead of raw-forwarding the ClientHello to a plaintext upstream.
+  assert.equal(networkServiceSource.includes("buildHostExposureBrowserEndpoint"), true);
+  assert.equal(networkServiceSource.includes("await this.openHostExposureListener(exposure);"), true);
+  assert.equal(networkServiceSource.includes("await this.closeHostExposureListener(exposureId);"), true);
+  assert.equal(networkServiceSource.includes("this.browserProxyExposureByEndpointId"), true);
   assert.equal(networkServiceSource.includes("HOST_LOCAL_GATEWAY_PF_ANCHOR"), true);
   assert.equal(networkServiceSource.includes("buildHostLocalGatewayRedirectSetupScript"), true);
   assert.equal(networkServiceSource.includes('rdr-anchor "${HOST_LOCAL_GATEWAY_PF_ANCHOR}"'), true);
