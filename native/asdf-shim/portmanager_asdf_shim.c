@@ -409,6 +409,74 @@ static int pm_candidate_is_current_shim(const char *candidate, const char *self_
 }
 
 /*
+ * A candidate that is a POSIX-shell script wrapper (`#!/bin/sh`, `#!/bin/bash`,
+ * …) is a preload dead end: exec'ing it runs a SIP-protected shell that strips
+ * DYLD_INSERT_LIBRARIES, and such wrappers almost always re-exec a real binary
+ * by ABSOLUTE path (e.g. yarn's temp `node`/`yarn` shims: `exec "/…/node" "$@"`),
+ * which bypasses this shim entirely — so the preload can never be recovered
+ * downstream. Resolving PAST such a wrapper to a native binary (preload survives
+ * the exec) or to a `#!/usr/bin/env X` script (which re-searches PATH for X and
+ * thus routes back through this shim, where the preload is restored) keeps the
+ * hook alive. `#!/usr/bin/env` and native Mach-O binaries are NOT wrappers.
+ * Runtime-manager agnostic: no yarn/nvm/asdf specifics, just the shebang.
+ */
+static int pm_candidate_is_shell_wrapper(const char *path) {
+  FILE *file;
+  char header[128];
+  size_t got;
+  const char *cursor;
+  const char *interpreter_start;
+  const char *interpreter_end;
+  const char *base;
+  char base_name[64];
+  size_t base_length;
+
+  file = fopen(path, "rb");
+  if (file == NULL) {
+    return 0;
+  }
+  got = fread(header, 1, sizeof(header) - 1, file);
+  fclose(file);
+
+  if (got < 2 || header[0] != '#' || header[1] != '!') {
+    return 0;
+  }
+  header[got] = '\0';
+
+  cursor = header + 2;
+  while (*cursor == ' ' || *cursor == '\t') {
+    cursor++;
+  }
+  interpreter_start = cursor;
+  while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t' && *cursor != '\n' && *cursor != '\r') {
+    cursor++;
+  }
+  interpreter_end = cursor;
+  if (interpreter_end == interpreter_start) {
+    return 0;
+  }
+
+  base = interpreter_end;
+  while (base > interpreter_start && base[-1] != '/') {
+    base--;
+  }
+  base_length = (size_t)(interpreter_end - base);
+  if (base_length == 0 || base_length >= sizeof(base_name)) {
+    return 0;
+  }
+  memcpy(base_name, base, base_length);
+  base_name[base_length] = '\0';
+
+  /* env re-routes through PATH back into this shim → recoverable, not a dead end. */
+  if (strcmp(base_name, "env") == 0) {
+    return 0;
+  }
+  return strcmp(base_name, "sh") == 0 || strcmp(base_name, "bash") == 0 ||
+         strcmp(base_name, "zsh") == 0 || strcmp(base_name, "dash") == 0 ||
+         strcmp(base_name, "ksh") == 0;
+}
+
+/*
  * Resolves the real runtime by finding the next PATH entry of this launcher's
  * own name, skipping this launcher's own directory and file. This is runtime
  * manager agnostic on purpose: whatever `node`/`python`/etc. the shell would
@@ -419,6 +487,9 @@ static int pm_resolve_tool(const char *tool_name, const char *self_path, char *b
   const char *path_env = getenv("PATH");
   const char *shim_directory = getenv(PM_RUNTIME_SHIM_DIR_ENV);
   const char *cursor;
+  char fallback[PM_MAX_PATH];
+
+  fallback[0] = '\0';
 
   if (tool_name == NULL || tool_name[0] == '\0' || strchr(tool_name, '/') != NULL ||
       path_env == NULL || path_env[0] == '\0') {
@@ -452,7 +523,19 @@ static int pm_resolve_tool(const char *tool_name, const char *self_path, char *b
     }
 
     if (pm_is_executable_file(candidate)) {
-      return pm_realpath_or_copy(candidate, buffer, size);
+      /*
+       * Prefer a target that keeps the preload alive: a native binary (survives
+       * the exec) or an env-shebang script (re-routes through this shim). Skip
+       * shell-script wrappers that would strip DYLD and absolute-exec past us,
+       * but remember the first one so a tool that ONLY exists as such a wrapper
+       * still resolves.
+       */
+      if (!pm_candidate_is_shell_wrapper(candidate)) {
+        return pm_realpath_or_copy(candidate, buffer, size);
+      }
+      if (fallback[0] == '\0') {
+        snprintf(fallback, sizeof(fallback), "%s", candidate);
+      }
     }
 
 next_path_entry:
@@ -460,6 +543,10 @@ next_path_entry:
       break;
     }
     cursor = separator + 1;
+  }
+
+  if (fallback[0] != '\0') {
+    return pm_realpath_or_copy(fallback, buffer, size);
   }
 
   return -1;
