@@ -587,17 +587,43 @@ static void pm_resolve_self_path(const char *tool_name, const char *argv0, char 
 
 /*
  * Guards against a resolution loop. If the "next on PATH" runtime is itself a
- * shell-script shim that re-enters `env <runtime>`, PATH resolution could bounce
- * back into this launcher. A depth counter caps that; legitimate trees never
- * approach the limit because a real runtime binary does not re-enter us.
+ * shim that re-enters `env <runtime>`, PATH resolution could bounce back into
+ * this launcher. A depth counter caps that. The counter tracks only CONSECUTIVE
+ * shim-to-shim hops: when this launcher hands off to a real (non-shim) tool the
+ * count resets to 0, so it measures resolution recursion, not process-tree
+ * depth. Without the reset a deeply nested toolchain (many tools each resolved
+ * through one or more shim directories) would accumulate the inherited count
+ * across the whole tree and trip the limit even though no loop exists.
  */
 #define PM_RUNTIME_SHIM_DEPTH_ENV "PORT_MANAGER_RUNTIME_SHIM_DEPTH"
 #define PM_RUNTIME_SHIM_DEPTH_LIMIT 24
+/* Marker file the extension writes into every generated runtime-shim directory. */
+#define PM_RUNTIME_SHIM_STAMP_FILE ".portmanager-shim-stamp"
 
 static int pm_next_runtime_shim_depth(void) {
   const char *value = getenv(PM_RUNTIME_SHIM_DEPTH_ENV);
   long depth = value == NULL ? 0 : strtol(value, NULL, 10);
   return depth < 0 ? 0 : (int)depth;
+}
+
+/*
+ * True when the resolved target lives in a Port Manager runtime-shim directory
+ * (marked by the stamp file), i.e. it is another shim rather than a real tool.
+ * Handing off to a real tool ends the resolution, so the loop counter resets;
+ * handing off to another shim keeps counting so a genuine cycle is still caught.
+ */
+static int pm_target_is_runtime_shim(const char *executable_path) {
+  char stamp_path[PM_MAX_PATH];
+  const char *slash = strrchr(executable_path, '/');
+  size_t dir_length = slash == NULL ? 0 : (size_t)(slash - executable_path);
+
+  if (dir_length == 0 || dir_length + sizeof("/" PM_RUNTIME_SHIM_STAMP_FILE) >= sizeof(stamp_path)) {
+    return 0;
+  }
+
+  memcpy(stamp_path, executable_path, dir_length);
+  snprintf(stamp_path + dir_length, sizeof(stamp_path) - dir_length, "/%s", PM_RUNTIME_SHIM_STAMP_FILE);
+  return access(stamp_path, F_OK) == 0;
 }
 
 int main(int argc, char **argv) {
@@ -659,7 +685,12 @@ int main(int argc, char **argv) {
     next_argv[index] = argv[index];
   }
 
-  snprintf(depth_text, sizeof(depth_text), "%d", depth + 1);
+  /*
+   * Reset the loop counter when handing off to a real tool; only keep counting
+   * across consecutive shim-to-shim hops. This keeps a genuine resolution cycle
+   * bounded while letting arbitrarily deep (but loop-free) toolchains through.
+   */
+  snprintf(depth_text, sizeof(depth_text), "%d", pm_target_is_runtime_shim(executable_path) ? depth + 1 : 0);
   setenv(PM_RUNTIME_SHIM_DEPTH_ENV, depth_text, 1);
   pm_restore_network_scope();
   pm_restore_dyld();
