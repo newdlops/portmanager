@@ -1934,43 +1934,39 @@ test("compose mutation publishes hidden ports on the network loopback host", () 
   assert.equal(attachBody.includes("hiddenHostAddress,"), true);
 });
 
-test("native hook self-discovers .portmanager/state-paths by walking up from cwd", () => {
+test("native hook virtualizes gethostname/uname to the per-network name", () => {
   const hook = fs.readFileSync(
     path.resolve(__dirname, "../../../native/hook/portmanager_hook.c"),
     "utf8",
   );
-  // The config is tied to the process's own cwd/repo, not any editor workspace:
-  // walk up from getcwd() looking for `.portmanager/state-paths`, read via the
-  // real syscalls (so config reading never re-enters the interpose).
-  assert.equal(hook.includes('"%s/.portmanager/state-paths"'), true);
-  assert.equal(hook.includes("getcwd(dir, sizeof(dir))"), true);
-  assert.equal(hook.includes("pm_real_access(candidate, R_OK) == 0"), true);
-  assert.equal(hook.includes("fd = pm_real_open(candidate, O_RDONLY)"), true);
-  // Entries classify glob vs prefix; segment marker is stable.
-  assert.equal(hook.includes('strpbrk(trimmed, "*?[")'), true);
-  assert.equal(hook.includes('#define PM_STATE_MARKER "__pmnet__"'), true);
+  // Identity is made per-network generically at the hostname layer, so any app
+  // that keys off its hostname (celery `@%h`, pidfiles, locks, metrics)
+  // distinguishes automatically — the extension holds no app-specific logic.
+  assert.equal(hook.includes("PM_DYLD_INTERPOSE(pm_gethostname_hook, gethostname);"), true);
+  assert.equal(hook.includes("PM_DYLD_INTERPOSE(pm_uname_hook, uname);"), true);
+  // Value is the network name; opt-in + fail-safe (no network id / hook off => real hostname).
+  assert.equal(hook.includes('getenv("PORT_MANAGER_NETWORK_NAME")'), true);
+  assert.equal(hook.includes("if (!pm_hook_enabled()) {"), true);
+  assert.equal(hook.includes("snprintf(buf->nodename, sizeof(buf->nodename)"), true);
 });
 
-test("native hook interposes the path-taking calls and gates redirection safely", () => {
+test("native hook no longer redirects filesystem paths (reverted for the hostname approach)", () => {
   const hook = fs.readFileSync(
     path.resolve(__dirname, "../../../native/hook/portmanager_hook.c"),
     "utf8",
   );
-  // The full path-taking set is interposed so an app's existence check (stat)
-  // and its write (open) resolve to the same per-network file.
-  for (const fn of ["open", "openat", "stat", "lstat", "access", "unlink", "rename", "mkdir"]) {
-    assert.equal(hook.includes(`PM_DYLD_INTERPOSE(pm_${fn}_hook, ${fn});`), true, `interpose ${fn}`);
+  // The per-network filesystem redirection was replaced by hostname virtualization.
+  for (const dead of ["PM_STATE_MARKER", "pm_state_redirect_path", "PM_DYLD_INTERPOSE(pm_open_hook", "state-paths"]) {
+    assert.equal(hook.includes(dead), false, `remnant ${dead}`);
   }
-  // Redirection is opt-in and bound to the master hook switch (fail-safe).
-  assert.equal(hook.includes("pm_hook_depth == 0 && pm_hook_enabled()"), true);
 });
 
-test("terminal hook environment no longer resolves state paths from the editor workspace", () => {
+test("terminal hook environment carries no per-network filesystem-state logic", () => {
   const source = fs.readFileSync(
     path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts"),
     "utf8",
   );
-  // The workspace-folder indirection was replaced by hook-side cwd discovery.
   assert.equal(source.includes("applyPerNetworkStateEnvironment"), false);
-  assert.equal(source.includes("PORT_MANAGER_PER_NETWORK_STATE_ROOTS"), false);
+  assert.equal(source.includes("PER_NETWORK_STATE_ROOTS"), false);
+  assert.equal(source.includes("state-paths"), false);
 });

@@ -188,9 +188,10 @@ export function applyTerminalHookEnvironment(
   if (scope.networkName !== undefined) {
     collection.replace("PORT_MANAGER_NETWORK_NAME", scope.networkName, TERMINAL_MUTATOR_OPTIONS);
   }
-  // Per-network local-state redirection needs no env here: the hook discovers
-  // `.portmanager/state-paths` by walking up from each process's own cwd (tied
-  // to the repo it runs in, not the editor workspace). See docs/per-network-state.md.
+  // Per-network identity needs no extra env here: the hook virtualizes
+  // gethostname()/uname() to PORT_MANAGER_NETWORK_NAME for this shell and its
+  // children, so hostname-derived identity (celery `@%h`, etc.) is per-network.
+  // See docs/per-network-hostname.md.
   if (networkDnsAlias !== undefined) {
     collection.replace(NETWORK_DNS_ALIAS_ENV, networkDnsAlias, TERMINAL_MUTATOR_OPTIONS);
   }

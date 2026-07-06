@@ -171,15 +171,16 @@ routing/attribution decisions to that one file; `tail -f` it. Empty disables it
 (zero overhead). Full reference, line format, and how to extend it:
 [docs/dev-logging.md](docs/dev-logging.md).
 
-### Per-network local state
+### Per-network identity
 
-Running the **same repo directory** in two logical networks makes the app's
-local state collide (e.g. celery's `.celery/celery1.pid`, unix sockets, sqlite),
-because it is literally the same path on one disk — network isolation can't fix
-a filesystem collision. Declare the colliding paths in a committed
-`.portmanager/state-paths` file and the native hook namespaces them per network
-(`.celery/__pmnet__/<network>/…`) with **no app changes**. See
-[docs/per-network-state.md](docs/per-network-state.md).
+Running the **same repo directory** in two logical networks makes hostname-keyed
+app identity collide (celery node name `@%h`, pidfiles/logs, locks, metrics),
+because every process still thinks it is on the one machine hostname. The native
+hook virtualizes `gethostname()`/`uname()` to the **network name** for a hooked
+process and all its children, so any app that keys off its hostname distinguishes
+itself per network automatically — no app-specific logic in the extension. Apps
+use it by keeping standard hostname templates (celery `%h`/`%n`). See
+[docs/per-network-hostname.md](docs/per-network-hostname.md).
 
 For Marketplace release steps, publisher identity, VSIX verification, and native hook packaging checks, see [PUBLISHING.MD](PUBLISHING.MD). The Marketplace publisher ID is `newdlops`.
 
