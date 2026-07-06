@@ -220,12 +220,12 @@ attach하면 앱의 **로컬 상태 파일**(celery pidfile/logfile, 소켓, sql
 hook이 경로-계열 libc 호출(`open/openat/stat/lstat/access/unlink/rename/mkdir`)을
 인터포즈해, 네트워크 id를 가진 훅된 프로세스가 **설정된 상태 루트** 아래 경로를
 열면 `<root>/__pmnet__/<network>/…`로 투명 재작성한다(비매칭은 바이트 동일 통과,
-opt-in, fail-safe). 설정은 레포의 `.portmanager/state-paths`(커밋 → 모든 워크트리
-공통)에서 읽어 `terminal-hook-environment.ts`가 env로 전달한다.
+opt-in, fail-safe). 설정 `.portmanager/state-paths`(레포에 커밋 → 모든 워크트리
+공통)는 **hook이 프로세스 cwd에서 상향 탐색으로 직접 찾아 읽는다** — 에디터
+workspace 폴더에 의존하지 않으므로 프로세스가 실제 도는 repo에 정확히 묶인다.
 
 - 전체 문서: **`docs/per-network-state.md`**
-- hook: `pm_state_redirect_path` / `pm_*_hook` / 인터포즈 테이블 (`portmanager_hook.c`)
-- 전달: `readPerNetworkStatePaths` / `applyPerNetworkStateEnvironment` (`terminal-hook-environment.ts`)
+- hook: `pm_state_init`(cwd 상향 탐색) / `pm_state_redirect_path` / `pm_*_hook` / 인터포즈 테이블 (`portmanager_hook.c`)
 
 앱이 하드코딩한 로컬 상태 경로(pidfile 등) 때문에 다중 네트워크 인스턴스가 깨지면
 앱을 고치지 말고 `.portmanager/state-paths`에 그 경로를 선언한다 (제네릭 격리 원칙).

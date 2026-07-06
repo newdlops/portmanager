@@ -126,76 +126,6 @@ export function configureTerminalHookEnvironment(
   };
 }
 
-interface PerNetworkStatePaths {
-  /** Repo root that owns `.portmanager/state-paths`; bounds glob matches. */
-  readonly repoRoot: string;
-  /** Absolute directory/file prefixes whose subtree is namespaced per network. */
-  readonly roots: readonly string[];
-  /** Basename globs (fnmatch) namespaced per network, bounded to the repo root. */
-  readonly globs: readonly string[];
-}
-
-/**
- * Reads the repo's `.portmanager/state-paths` (one pattern per line, `#`
- * comments allowed) that declares which local-state paths the native hook
- * should redirect per network — so the same working directory attached to
- * multiple networks doesn't collide on pidfiles/sockets/etc. Entries with glob
- * metacharacters are basename globs; others are prefixes resolved against the
- * repo root. Returns undefined when no workspace folder declares any. See
- * docs/per-network-state.md.
- */
-function readPerNetworkStatePaths(): PerNetworkStatePaths | undefined {
-  const folders = vscode.workspace.workspaceFolders;
-  if (folders === undefined) {
-    return undefined;
-  }
-  for (const folder of folders) {
-    const repoRoot = folder.uri.fsPath;
-    let content: string;
-    try {
-      content = fs.readFileSync(path.join(repoRoot, ".portmanager", "state-paths"), "utf8");
-    } catch {
-      continue; // this folder declares nothing
-    }
-    const roots: string[] = [];
-    const globs: string[] = [];
-    for (const rawLine of content.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (line.length === 0 || line.startsWith("#")) {
-        continue;
-      }
-      if (/[*?[]/.test(line)) {
-        globs.push(line);
-      } else {
-        roots.push(path.resolve(repoRoot, line));
-      }
-    }
-    if (roots.length > 0 || globs.length > 0) {
-      return { repoRoot, roots, globs };
-    }
-  }
-  return undefined;
-}
-
-/**
- * Injects the per-network state redirection config the native hook consumes.
- * Colon-joined to match the hook's parser; only meaningful once a network name
- * is present in the same environment (the hook no-ops without one).
- */
-function applyPerNetworkStateEnvironment(collection: vscode.EnvironmentVariableCollection): void {
-  const statePaths = readPerNetworkStatePaths();
-  if (statePaths === undefined) {
-    return;
-  }
-  collection.replace("PORT_MANAGER_STATE_REPO_ROOT", statePaths.repoRoot, TERMINAL_MUTATOR_OPTIONS);
-  if (statePaths.roots.length > 0) {
-    collection.replace("PORT_MANAGER_PER_NETWORK_STATE_ROOTS", statePaths.roots.join(":"), TERMINAL_MUTATOR_OPTIONS);
-  }
-  if (statePaths.globs.length > 0) {
-    collection.replace("PORT_MANAGER_PER_NETWORK_STATE_GLOBS", statePaths.globs.join(":"), TERMINAL_MUTATOR_OPTIONS);
-  }
-}
-
 /** Replaces the extension-owned terminal env collection from current settings. */
 export function applyTerminalHookEnvironment(
   context: vscode.ExtensionContext,
@@ -258,10 +188,9 @@ export function applyTerminalHookEnvironment(
   if (scope.networkName !== undefined) {
     collection.replace("PORT_MANAGER_NETWORK_NAME", scope.networkName, TERMINAL_MUTATOR_OPTIONS);
   }
-  // Per-network local-state redirection: the hook namespaces configured paths
-  // (.portmanager/state-paths) so the same repo attached to multiple networks
-  // keeps separate pidfiles/sockets/state. See docs/per-network-state.md.
-  applyPerNetworkStateEnvironment(collection);
+  // Per-network local-state redirection needs no env here: the hook discovers
+  // `.portmanager/state-paths` by walking up from each process's own cwd (tied
+  // to the repo it runs in, not the editor workspace). See docs/per-network-state.md.
   if (networkDnsAlias !== undefined) {
     collection.replace(NETWORK_DNS_ALIAS_ENV, networkDnsAlias, TERMINAL_MUTATOR_OPTIONS);
   }

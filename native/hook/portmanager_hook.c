@@ -4819,13 +4819,14 @@ static int pm_kill_hook(pid_t pid, int sig) {
  * to insert a per-network segment `<root>/__pmnet__/<network>/…`, so each
  * network keeps its own copy. Every non-matching path passes through
  * byte-identical. Opt-in (no config => total no-op), fail-safe (any error or
- * overflow => original path). Config comes from the repo's
- * `.portmanager/state-paths`, delivered by terminal-hook-environment.ts via:
- *   PORT_MANAGER_PER_NETWORK_STATE_ROOTS  ':'-joined absolute dir/file prefixes
- *   PORT_MANAGER_PER_NETWORK_STATE_GLOBS  ':'-joined basename globs (fnmatch)
- *   PORT_MANAGER_STATE_REPO_ROOT          repo root that bounds glob matches
- * The per-network segment uses PORT_MANAGER_NETWORK_NAME (else NETWORK_ID).
- * See docs/per-network-state.md and AGENTS.md.
+ * overflow => original path).
+ *
+ * Config lives in the repo's `.portmanager/state-paths` (one pattern per line,
+ * '#' comments; entries with glob metacharacters are basename globs, others are
+ * prefixes resolved against the repo root). The hook DISCOVERS it by walking up
+ * from the process's cwd — so it is tied to the repo the process actually runs
+ * in, independent of the editor's workspace folder. The per-network segment
+ * uses PORT_MANAGER_NETWORK_NAME (else NETWORK_ID). See docs/per-network-state.md.
  * ============================================================================
  */
 #define PM_STATE_MARKER "__pmnet__"
@@ -4872,48 +4873,88 @@ static char *pm_state_globs[PM_STATE_MAX_GLOBS];
 static size_t pm_state_glob_count = 0;
 static pthread_once_t pm_state_once = PTHREAD_ONCE_INIT;
 
-/* Splits a ':'-delimited env value, strdup'ing each non-empty token into out[]. */
-static size_t pm_state_split(const char *value, char **out, size_t *lens, size_t max) {
-  size_t count = 0;
-  const char *cursor = value;
-  while (cursor != NULL && *cursor != '\0' && count < max) {
-    const char *sep = strchr(cursor, ':');
-    size_t len = (sep != NULL) ? (size_t)(sep - cursor) : strlen(cursor);
-    if (len > 0) {
-      char *token = (char *)malloc(len + 1);
-      if (token != NULL) {
-        memcpy(token, cursor, len);
-        token[len] = '\0';
-        if (lens != NULL) {
-          lens[count] = len;
-        }
-        out[count++] = token;
-      }
-    }
-    if (sep == NULL) {
-      break;
-    }
-    cursor = sep + 1;
+/* Records an absolute prefix root, trimming trailing slashes for uniform match. */
+static void pm_state_add_root(const char *abs_path) {
+  if (pm_state_root_count >= PM_STATE_MAX_ROOTS) {
+    return;
   }
-  return count;
+  char *copy = strdup(abs_path);
+  if (copy == NULL) {
+    return;
+  }
+  size_t len = strlen(copy);
+  while (len > 1 && copy[len - 1] == '/') {
+    copy[--len] = '\0';
+  }
+  pm_state_roots[pm_state_root_count] = copy;
+  pm_state_root_lens[pm_state_root_count] = len;
+  pm_state_root_count++;
+}
+
+static void pm_state_add_glob(const char *pattern) {
+  if (pm_state_glob_count >= PM_STATE_MAX_GLOBS) {
+    return;
+  }
+  char *copy = strdup(pattern);
+  if (copy != NULL) {
+    pm_state_globs[pm_state_glob_count++] = copy;
+  }
+}
+
+/* Parses one `.portmanager/state-paths` entry: blank/'#' ignored; entries with
+ * glob metacharacters become basename globs, others become prefixes resolved
+ * against the repo root. */
+static void pm_state_add_entry(const char *line, const char *repo_root) {
+  char trimmed[PATH_MAX];
+  size_t n = 0;
+  const char *start = line;
+  const char *end;
+
+  while (*start == ' ' || *start == '\t') {
+    start++;
+  }
+  end = start + strlen(start);
+  while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) {
+    end--;
+  }
+  while (start < end && n + 1 < sizeof(trimmed)) {
+    trimmed[n++] = *start++;
+  }
+  trimmed[n] = '\0';
+
+  if (trimmed[0] == '\0' || trimmed[0] == '#') {
+    return;
+  }
+  if (strpbrk(trimmed, "*?[") != NULL) {
+    pm_state_add_glob(trimmed);
+    return;
+  }
+  if (trimmed[0] == '/') {
+    pm_state_add_root(trimmed);
+  } else {
+    char resolved[PATH_MAX];
+    if ((size_t)snprintf(resolved, sizeof(resolved), "%s/%s", repo_root, trimmed) < sizeof(resolved)) {
+      pm_state_add_root(resolved);
+    }
+  }
 }
 
 static void pm_state_init(void) {
-  const char *roots = getenv("PORT_MANAGER_PER_NETWORK_STATE_ROOTS");
-  const char *globs = getenv("PORT_MANAGER_PER_NETWORK_STATE_GLOBS");
-  const char *repo_root = getenv("PORT_MANAGER_STATE_REPO_ROOT");
   const char *network = getenv("PORT_MANAGER_NETWORK_NAME");
   char sanitized[128];
   size_t out_index = 0;
+  char dir[PATH_MAX];
+  char candidate[PATH_MAX];
+  char content[8192];
+  int found = 0;
+  int fd;
+  size_t total = 0;
 
   if (network == NULL || network[0] == '\0') {
     network = getenv("PORT_MANAGER_NETWORK_ID");
   }
   if (network == NULL || network[0] == '\0') {
     return; /* no network identity => never redirect */
-  }
-  if ((roots == NULL || roots[0] == '\0') && (globs == NULL || globs[0] == '\0')) {
-    return; /* feature not configured => total no-op */
   }
 
   /* Sanitize the network segment to a filesystem-safe token. */
@@ -4926,28 +4967,58 @@ static void pm_state_init(void) {
   if (sanitized[0] == '\0') {
     return;
   }
+
+  /*
+   * Discover `.portmanager/state-paths` by walking up from the process cwd, so
+   * the config is tied to the repo the process actually runs in — not the
+   * editor's workspace folder, which need not match. Uses the real syscalls
+   * (pm_real_*, already resolved by the calling hook) so reading the config
+   * never re-enters the interpose / pthread_once.
+   */
+  if (getcwd(dir, sizeof(dir)) == NULL) {
+    return;
+  }
+  for (;;) {
+    if ((size_t)snprintf(candidate, sizeof(candidate), "%s/.portmanager/state-paths", dir) < sizeof(candidate) &&
+        pm_real_access(candidate, R_OK) == 0) {
+      found = 1;
+      break;
+    }
+    char *slash = strrchr(dir, '/');
+    if (slash == NULL || slash == dir) {
+      break; /* reached the filesystem root */
+    }
+    *slash = '\0';
+  }
+  if (!found) {
+    return; /* repo declares nothing => total no-op */
+  }
+
+  fd = pm_real_open(candidate, O_RDONLY);
+  if (fd < 0) {
+    return;
+  }
+  for (;;) {
+    ssize_t got = read(fd, content + total, sizeof(content) - 1 - total);
+    if (got <= 0 || total + 1 >= sizeof(content)) {
+      break;
+    }
+    total += (size_t)got;
+  }
+  close(fd);
+  content[total] = '\0';
+
   snprintf(pm_state_segment, sizeof(pm_state_segment), "%s/%s", PM_STATE_MARKER, sanitized);
+  snprintf(pm_state_repo_root, sizeof(pm_state_repo_root), "%s", dir);
+  pm_state_repo_root_len = strlen(dir);
 
-  if (repo_root != NULL && repo_root[0] == '/') {
-    snprintf(pm_state_repo_root, sizeof(pm_state_repo_root), "%s", repo_root);
-    pm_state_repo_root_len = strlen(pm_state_repo_root);
-    /* Drop any trailing slash so prefix comparisons are uniform. */
-    while (pm_state_repo_root_len > 1 && pm_state_repo_root[pm_state_repo_root_len - 1] == '/') {
-      pm_state_repo_root[--pm_state_repo_root_len] = '\0';
+  for (char *line = content; line != NULL;) {
+    char *newline = strchr(line, '\n');
+    if (newline != NULL) {
+      *newline = '\0';
     }
-  }
-
-  if (roots != NULL) {
-    pm_state_root_count = pm_state_split(roots, pm_state_roots, pm_state_root_lens, PM_STATE_MAX_ROOTS);
-    /* Normalize away trailing slashes so "<root>/" and "<root>" match alike. */
-    for (size_t i = 0; i < pm_state_root_count; i++) {
-      while (pm_state_root_lens[i] > 1 && pm_state_roots[i][pm_state_root_lens[i] - 1] == '/') {
-        pm_state_roots[i][--pm_state_root_lens[i]] = '\0';
-      }
-    }
-  }
-  if (globs != NULL) {
-    pm_state_glob_count = pm_state_split(globs, pm_state_globs, NULL, PM_STATE_MAX_GLOBS);
+    pm_state_add_entry(line, dir);
+    line = (newline != NULL) ? newline + 1 : NULL;
   }
 
   pm_state_active = (pm_state_root_count > 0 || pm_state_glob_count > 0);
@@ -4988,7 +5059,15 @@ static int pm_state_absolutize(const char *in, char *abs, size_t abs_size) {
 static int pm_state_redirect_path(const char *in, char *out, size_t out_size) {
   char abs[PATH_MAX];
 
+  /*
+   * One-time config discovery reads files and calls getcwd, whose libc
+   * internals may themselves invoke interposed calls. Raise the reentrancy
+   * depth across the once-init so those nested calls pass straight through
+   * instead of recursing into this (in-progress) pthread_once and deadlocking.
+   */
+  pm_hook_depth++;
   pthread_once(&pm_state_once, pm_state_init);
+  pm_hook_depth--;
   if (!pm_state_active || in == NULL || in[0] == '\0') {
     return 0;
   }

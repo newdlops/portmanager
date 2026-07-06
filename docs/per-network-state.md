@@ -57,21 +57,22 @@ tmp/sockets
 The network segment is `PORT_MANAGER_NETWORK_NAME` (e.g. `alphac`), sanitized to
 `[A-Za-z0-9._-]`; it falls back to the network id when no name is set.
 
-## Delivery (setting → hook)
+## Discovery (hook reads the file itself)
 
-`src/extension/terminal-hook-environment.ts` reads `.portmanager/state-paths`
-from each workspace folder (`readPerNetworkStatePaths`) and injects, for
-network-scoped terminals only, three env vars the hook parses:
+The hook does **not** rely on the editor to locate the config — the editor's
+workspace folder need not match the directory a process actually runs in. On the
+first redirected call (once per process), the hook walks **up from the process's
+own `getcwd()`** looking for `.portmanager/state-paths`; the directory that
+holds it becomes the repo root. Prefix entries resolve against that root; globs
+are bounded to it. The config file is read with the real syscalls so it never
+re-enters the interpose.
 
-| Env var | Meaning |
-|---------|---------|
-| `PORT_MANAGER_PER_NETWORK_STATE_ROOTS` | `:`-joined absolute prefixes |
-| `PORT_MANAGER_PER_NETWORK_STATE_GLOBS` | `:`-joined basename globs |
-| `PORT_MANAGER_STATE_REPO_ROOT` | repo root that bounds glob matches |
-
-Children of a hooked process inherit these automatically, so workers spawned by
-`./zz` etc. redirect consistently. **Reload the window after adding/editing
-`.portmanager/state-paths`** so already-running processes pick it up.
+The only env the hook needs is `PORT_MANAGER_NETWORK_NAME` (already injected for
+attached terminals; falls back to `PORT_MANAGER_NETWORK_ID`). Children of a
+hooked process inherit that automatically, so workers spawned by `./zz` etc.
+redirect consistently. **Restart the process (or the terminal) after
+adding/editing `.portmanager/state-paths`** — the config is cached per process
+at first use.
 
 ## Verifying
 
@@ -100,6 +101,5 @@ lsof -p <worker-pid> | grep .celery
 
 | Concern | Location |
 |---------|----------|
-| Hook interposition + rewrite | `native/hook/portmanager_hook.c` (`pm_state_redirect_path`, `pm_*_hook`, interpose table) |
-| Config read + env delivery | `src/extension/terminal-hook-environment.ts` (`readPerNetworkStatePaths`, `applyPerNetworkStateEnvironment`) |
-| Repo config | `<repo>/.portmanager/state-paths` |
+| Hook interpose + rewrite + config discovery | `native/hook/portmanager_hook.c` (`pm_state_init` cwd walk-up, `pm_state_redirect_path`, `pm_*_hook`, interpose table) |
+| Repo config | `<repo>/.portmanager/state-paths` (discovered by the hook from the process cwd) |
