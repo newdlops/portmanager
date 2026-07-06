@@ -1138,7 +1138,7 @@ function buildDaemonChildren(
       buildControlPlaneTooltip(snapshot.controlPlane),
       {
         command: "portManager.openOwnerUi",
-        title: "Show Owner Window",
+        title: "Make This Window Owner",
       },
     ),
     ...buildOwnerUiActionRows(snapshot.controlPlane),
@@ -1172,7 +1172,7 @@ function buildOwnerUiActionRows(controlPlane: ControlPlaneStatus | undefined): P
 
   return [
     new ActionTreeItem(
-      "Open Owner UI",
+      "Make This Window Owner",
       "portManager.openOwnerUi",
       "window",
       formatOpenOwnerUiDescription(controlPlane),
@@ -1182,14 +1182,14 @@ function buildOwnerUiActionRows(controlPlane: ControlPlaneStatus | undefined): P
 
 function formatOpenOwnerUiDescription(controlPlane: ControlPlaneStatus | undefined): string {
   if (controlPlane?.role === "worker") {
-    return `${formatOwnerWindowTitle(controlPlane)}, pid ${controlPlane.ownerPid ?? "unknown"}`;
+    return `take ownership from ${formatOwnerWindowTitle(controlPlane)}, pid ${controlPlane.ownerPid ?? "unknown"}`;
   }
 
   if (controlPlane?.role === "unowned") {
-    return "no owner elected";
+    return "claim ownership for this window";
   }
 
-  return "owner unknown";
+  return "make this window the owner";
 }
 
 function formatOwnerWindowTitle(controlPlane: ControlPlaneStatus | undefined): string {

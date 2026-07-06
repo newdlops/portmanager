@@ -1168,6 +1168,29 @@ export class PortManagerNetworkService implements DisposableLike {
     return openControlPlaneOwnerWorkspace(controlPlane.ownerWorkspaceUri);
   }
 
+  /**
+   * Transfers control-plane ownership to THIS window instead of navigating to
+   * the current owner. Steals the owner lease for this process and boots the
+   * owner watchers/services here; the previous owner observes the lease-file
+   * change through watchOwnerLeaseFiles and demotes itself in
+   * refreshOwnerLeaseFromFileSignal, so exactly one window keeps running the
+   * automatic control-plane side effects. Returns true when this window holds
+   * the owner lease afterwards.
+   */
+  async takeControlPlaneOwnership(): Promise<boolean> {
+    if (this.ownsControlPlaneLease && readControlPlaneOwner()?.pid === process.pid) {
+      return true;
+    }
+
+    if (!writeControlPlaneOwnerLease(Date.now())) {
+      return false;
+    }
+
+    const acquired = await this.startControlPlaneOwnerIfAvailable();
+    this.localChangeEvents.emit();
+    return acquired;
+  }
+
   /** Returns daemon status when process service is available for the sidebar. */
   getDaemonStatus(): AgentDaemonStatus {
     return this.processService?.getSnapshot().daemon ?? createDisconnectedDaemonStatus();
@@ -3882,6 +3905,22 @@ export class PortManagerNetworkService implements DisposableLike {
     if (controlPlaneChanged) {
       invalidateControlPlaneOwnerDisplayCache();
     }
+
+    /*
+     * Another window may take control-plane ownership on demand (the "make this
+     * window owner" action steals the lease). When this window still owns the
+     * lease but the file now names a different, active owner, step down so only
+     * one window runs the automatic side effects.
+     */
+    if (controlPlaneChanged && this.ownsControlPlaneLease) {
+      const currentOwner = readControlPlaneOwner();
+      if (currentOwner?.pid !== process.pid && isActiveControlPlaneOwner(currentOwner, Date.now())) {
+        this.demoteControlPlaneOwner();
+        this.localChangeEvents.emit();
+        return;
+      }
+    }
+
     const shouldRefreshControl =
       controlPlaneChanged &&
       !this.ownsControlPlaneLease &&

@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8162",
+  "version": "0.0.8163",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -367,7 +367,7 @@
       },
       {
         "command": "portManager.openOwnerUi",
-        "title": "Port Manager: Open Owner UI",
+        "title": "Port Manager: Make This Window Control Owner",
         "category": "Port Manager",
         "icon": "$(window)"
       },

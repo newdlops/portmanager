@@ -210,7 +210,7 @@ export class PortManagerCommandController implements DisposableLike {
     );
     this.registerCommand(context, "portManager.installShellHook", () => this.installShellHook(context));
     this.registerCommand(context, "portManager.installExternalCli", () => this.installExternalCli(context));
-    this.registerCommand(context, "portManager.openOwnerUi", () => this.openOwnerUi());
+    this.registerCommand(context, "portManager.openOwnerUi", () => this.switchControlOwnerToThisWindow());
     this.registerCommand(context, "portManager.openSettings", () => openPortManagerSettings());
   }
 
@@ -1367,7 +1367,7 @@ export class PortManagerCommandController implements DisposableLike {
         await this.refresh();
         return;
       case "ownerUi":
-        await this.openOwnerUi();
+        await this.switchControlOwnerToThisWindow();
         return;
       case "ownerOnly":
         return;
@@ -1375,21 +1375,31 @@ export class PortManagerCommandController implements DisposableLike {
   }
 
   /**
-   * Opens the Port Manager view locally or focuses the elected owner window.
-   * Worker windows do not request remote command execution from the owner.
+   * Makes THIS window the control-plane owner instead of navigating to the
+   * elected owner window. When this window is already the owner it just focuses
+   * the local Port Manager view; otherwise it transfers ownership here (steals
+   * the owner lease) so the automatic control-plane side effects run in the
+   * window the user is looking at.
    */
-  private async openOwnerUi(): Promise<void> {
+  private async switchControlOwnerToThisWindow(): Promise<void> {
     const snapshot = this.dependencies.networkService.getSnapshot();
 
     if (snapshot.controlPlane?.role === "owner") {
       await vscode.commands.executeCommand("workbench.view.extension.portManager");
       await vscode.commands.executeCommand("portManager.processes.focus");
-      await vscode.window.showInformationMessage(formatOwnerUiNavigationMessage(snapshot, true));
+      await vscode.window.showInformationMessage(formatControlOwnerSwitchMessage(snapshot, true));
       return;
     }
 
-    const focused = await this.dependencies.networkService.focusControlPlaneOwnerWindow();
-    await vscode.window.showInformationMessage(formatOwnerUiNavigationMessage(snapshot, focused));
+    const became = await this.dependencies.networkService.takeControlPlaneOwnership();
+    if (became) {
+      await vscode.commands.executeCommand("workbench.view.extension.portManager");
+      await vscode.commands.executeCommand("portManager.processes.focus");
+      await this.refresh();
+    }
+    await vscode.window.showInformationMessage(
+      formatControlOwnerSwitchMessage(this.dependencies.networkService.getSnapshot(), became),
+    );
   }
 
   /**
@@ -3183,27 +3193,18 @@ function formatStatusMenuOwnerDescription(snapshot: NetworkSnapshot): string {
   return "Routing changes are available only in the owner window";
 }
 
-function formatOwnerUiNavigationMessage(snapshot: NetworkSnapshot, focused: boolean): string {
-  const ownerTitle = formatOwnerWindowTitle(snapshot);
-  const ownerPid = snapshot.controlPlane?.ownerPid ?? "unknown";
+function formatControlOwnerSwitchMessage(snapshot: NetworkSnapshot, became: boolean): string {
+  const pid = snapshot.controlPlane?.currentPid ?? process.pid;
 
-  if (focused && snapshot.controlPlane?.role === "owner") {
-    return `Port Manager owner window: ${ownerTitle} (pid ${ownerPid}).`;
+  if (became && snapshot.controlPlane?.role === "owner") {
+    return `Port Manager: this window is now the control owner (pid ${pid}).`;
   }
 
-  if (focused && snapshot.controlPlane?.role === "worker") {
-    return `Opened or focused Port Manager owner window: ${ownerTitle} (pid ${ownerPid}).`;
+  if (became) {
+    return `Port Manager: switched control ownership to this window (pid ${pid}).`;
   }
 
-  if (snapshot.controlPlane?.role === "worker") {
-    return `Could not focus Port Manager owner window: ${ownerTitle} (pid ${ownerPid}).`;
-  }
-
-  if (snapshot.controlPlane?.role === "unowned") {
-    return "No Port Manager owner window is elected yet. Refresh after one window claims the owner lease.";
-  }
-
-  return "Owner-only routing actions are available in the elected Port Manager owner window.";
+  return "Port Manager: could not switch control ownership to this window. Refresh and try again.";
 }
 
 function formatOwnerWindowTitle(snapshot: NetworkSnapshot): string {
