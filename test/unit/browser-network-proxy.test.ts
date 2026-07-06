@@ -9,6 +9,8 @@ import {
   BrowserNetworkProxyManager,
   browserNetworkProxyEndpointId,
   formatBrowserNetworkProxyUrl,
+  rewriteBrowserProxyResponseTextForTest,
+  type ActiveBrowserNetworkProxyEndpoint,
   type BrowserNetworkProxyEndpoint,
 } from "../../src/platform/ports/browser-network-proxy";
 
@@ -138,6 +140,36 @@ test("keeps Vite-facing requests on localhost while rewriting localhost response
     await proxy.dispose();
     await closeServer(upstream);
   }
+});
+
+test("rewrites the network loopback IP the dev server binds to into the public alias", () => {
+  // The hook rewrites the server's bind to the network loopback (127.96.x), so
+  // apps that self-reference their bound socket (Vite HMR, server.address())
+  // emit that IP. The localhost-only patterns miss it; it must map to the alias.
+  const endpoint: ActiveBrowserNetworkProxyEndpoint = {
+    id: browserNetworkProxyEndpointId("network-a5c1b2c6", 3004),
+    networkId: "network-a5c1b2c6",
+    logicalPort: 3004,
+    listenHost: "127.96.185.16",
+    listenPorts: [3004],
+    listenPort: 3004,
+    publicHost: "production1",
+    publicProtocol: "https",
+  };
+  const body = [
+    '<a href="http://127.96.185.16:3004/dashboard">dashboard</a>',
+    '  const socket = "ws://127.96.185.16:3004/@vite/client";',
+    '  const asset = "//127.96.185.16:3004/src/main.ts";',
+    '<a href="http://localhost:3004/login">login</a>', // localhost still rewritten (regression)
+  ].join("\n");
+
+  const rewritten = rewriteBrowserProxyResponseTextForTest(body, endpoint);
+
+  assert.match(rewritten, /https:\/\/production1:3004\/dashboard/);
+  assert.match(rewritten, /wss:\/\/production1:3004\/@vite\/client/);
+  assert.match(rewritten, /\/\/production1:3004\/src\/main\.ts/);
+  assert.match(rewritten, /https:\/\/production1:3004\/login/);
+  assert.doesNotMatch(rewritten, /127\.96\.185\.16/);
 });
 
 test("uses a fallback browser port when the logical port is already occupied", async () => {

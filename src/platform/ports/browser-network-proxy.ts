@@ -135,6 +135,14 @@ interface BrowserNetworkProxyEndpointMetadata {
   readonly upstreamHostHeader: string;
   /** Localhost variants that may appear in redirect/CORS headers. */
   readonly upstreamOrigins: readonly string[];
+  /**
+   * Network-specific loopback address the hooked dev server actually binds to
+   * (e.g. 127.96.x). Apps that build self-URLs from their bound socket address
+   * (Vite's HMR/"Network:" URL, `server.address()`) emit this IP, which the
+   * localhost-only rewrite patterns miss — so it is rewritten to the public
+   * alias too. Undefined when it is just a localhost variant already covered.
+   */
+  readonly upstreamLoopbackHost?: string;
 }
 
 const DEFAULT_RETRY_DELAY_MS = 30_000;
@@ -783,6 +791,7 @@ function stringIncludesAny(value: string, needles: readonly string[]): boolean {
 function shouldRewriteLocalhostOrigins(value: string, metadata: BrowserNetworkProxyEndpointMetadata): boolean {
   return (
     metadata.upstreamOrigins.some((origin) => value.includes(origin)) ||
+    (metadata.upstreamLoopbackHost !== undefined && value.includes(metadata.upstreamLoopbackHost)) ||
     regexMatches(ABSOLUTE_LOCALHOST_ORIGIN_PATTERN, value) ||
     regexMatches(PROTOCOL_RELATIVE_LOCALHOST_ORIGIN_PATTERN, value)
   );
@@ -805,13 +814,48 @@ function rewriteLocalhostOrigins(value: string, metadata: BrowserNetworkProxyEnd
       `${publicProtocolForLocalhostRewrite(protocol, metadata)}://${metadata.publicHost}:${publicPortForLocalhostRewrite(portText, metadata)}`,
   );
 
-  return absoluteRewritten.replace(
+  const protocolRewritten = absoluteRewritten.replace(
     PROTOCOL_RELATIVE_LOCALHOST_ORIGIN_PATTERN,
     (match, prefix: string, _host: string, portText: string) => {
       const separator = match.startsWith("//") ? "" : prefix;
       return `${separator}//${metadata.publicHost}:${publicPortForLocalhostRewrite(portText, metadata)}`;
     },
   );
+
+  return rewriteUpstreamLoopbackOrigins(protocolRewritten, metadata);
+}
+
+/**
+ * Rewrites the network loopback address the dev server binds to (127.96.x),
+ * which the hard-coded localhost patterns do not cover. The hook rewrites the
+ * server's bind to this address, so apps that self-reference their bound socket
+ * (Vite HMR, `server.address()`) leak it into links; map it to the public alias.
+ */
+function rewriteUpstreamLoopbackOrigins(value: string, metadata: BrowserNetworkProxyEndpointMetadata): string {
+  const host = metadata.upstreamLoopbackHost;
+  if (host === undefined || !value.includes(host)) {
+    return value;
+  }
+
+  const escaped = escapeRegExpLiteral(host);
+  const boundary = `(?=/|[?#"'\`\\s<);]|$)`;
+  const absolute = new RegExp(`\\b(https?|wss?):\\/\\/${escaped}:(\\d{1,5})${boundary}`, "gi");
+  const protocolRelative = new RegExp(`(^|[^:])\\/\\/${escaped}:(\\d{1,5})${boundary}`, "gi");
+
+  const absoluteRewritten = value.replace(
+    absolute,
+    (_match, protocol: string, portText: string) =>
+      `${publicProtocolForLocalhostRewrite(protocol, metadata)}://${metadata.publicHost}:${publicPortForLocalhostRewrite(portText, metadata)}`,
+  );
+
+  return absoluteRewritten.replace(protocolRelative, (match, prefix: string, portText: string) => {
+    const separator = match.startsWith("//") ? "" : prefix;
+    return `${separator}//${metadata.publicHost}:${publicPortForLocalhostRewrite(portText, metadata)}`;
+  });
+}
+
+function escapeRegExpLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function publicProtocolForLocalhostRewrite(
@@ -879,6 +923,7 @@ function buildEndpointMetadata(endpoint: ActiveBrowserNetworkProxyEndpoint): Bro
   const publicOrigin = `${publicProtocol}://${publicHost}:${endpoint.listenPort}`;
   const upstreamHostHeader = `${LOCALHOST_UPSTREAM_HOST}:${endpoint.logicalPort}`;
   const upstreamOrigin = `http://${upstreamHostHeader}`;
+  const upstreamLoopbackHost = normalizeUpstreamLoopbackHost(endpoint.listenHost);
 
   return {
     publicOrigin,
@@ -888,8 +933,21 @@ function buildEndpointMetadata(endpoint: ActiveBrowserNetworkProxyEndpoint): Bro
     logicalPort: endpoint.logicalPort,
     upstreamOrigin,
     upstreamHostHeader,
-    upstreamOrigins: buildUpstreamOrigins(endpoint.logicalPort),
+    upstreamOrigins: buildUpstreamOrigins(endpoint.logicalPort, upstreamLoopbackHost),
+    upstreamLoopbackHost,
   };
+}
+
+/**
+ * Test seam: applies the response origin rewrite (headers/body share the same
+ * logic) for one endpoint, so the localhost + network-loopback rewrites can be
+ * verified without binding a real network loopback alias.
+ */
+export function rewriteBrowserProxyResponseTextForTest(
+  text: string,
+  endpoint: ActiveBrowserNetworkProxyEndpoint,
+): string {
+  return rewriteLocalhostOrigins(text, buildEndpointMetadata(endpoint));
 }
 
 /** Browser-facing TLS and upstream application TLS are independent routing decisions. */
@@ -901,16 +959,35 @@ function buildUpstreamMetadata(
   return {
     ...metadata,
     upstreamOrigin: `${protocol}://${metadata.upstreamHostHeader}`,
-    upstreamOrigins: buildUpstreamOrigins(endpoint.logicalPort),
+    upstreamOrigins: buildUpstreamOrigins(endpoint.logicalPort, metadata.upstreamLoopbackHost),
   };
 }
 
-function buildUpstreamOrigins(logicalPort: number): readonly string[] {
-  return ["http", "https"].flatMap((protocol) => [
-    `${protocol}://${LOCALHOST_UPSTREAM_HOST}:${logicalPort}`,
-    `${protocol}://127.0.0.1:${logicalPort}`,
-    `${protocol}://[::1]:${logicalPort}`,
-  ]);
+function buildUpstreamOrigins(logicalPort: number, loopbackHost?: string): readonly string[] {
+  return ["http", "https"].flatMap((protocol) => {
+    const origins = [
+      `${protocol}://${LOCALHOST_UPSTREAM_HOST}:${logicalPort}`,
+      `${protocol}://127.0.0.1:${logicalPort}`,
+      `${protocol}://[::1]:${logicalPort}`,
+    ];
+    if (loopbackHost !== undefined) {
+      origins.push(`${protocol}://${loopbackHost}:${logicalPort}`);
+    }
+    return origins;
+  });
+}
+
+/**
+ * The network loopback address the dev server binds to (127.96.x) when it is a
+ * distinct address, not a plain localhost variant already handled by the
+ * localhost rewrite patterns. Returned undefined for localhost/127.0.0.1/::1.
+ */
+function normalizeUpstreamLoopbackHost(listenHost: string | undefined): string | undefined {
+  const host = (listenHost ?? "").trim();
+  if (host === "" || host === LOCALHOST_UPSTREAM_HOST || host === "127.0.0.1" || host === "::1" || host === "[::1]") {
+    return undefined;
+  }
+  return host;
 }
 
 function normalizeTargetProtocol(protocol: BrowserNetworkProxyTarget["protocol"]): "http" | "https" {
