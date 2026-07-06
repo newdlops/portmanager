@@ -25,6 +25,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fnmatch.h>
 
 #include "../shared/pm_dev_log.h"
 
@@ -4803,6 +4804,380 @@ static int pm_kill_hook(pid_t pid, int sig) {
   return pm_real_kill(pid, sig);
 }
 
+/*
+ * ============================================================================
+ * Per-network local-state path redirection
+ * ============================================================================
+ * When the same working directory is attached to more than one logical network
+ * (e.g. the same repo run under alphac and captainprod), each instance's local
+ * state files — celery pidfiles/logfiles, unix sockets, sqlite, etc. — collide
+ * because they are literally the same paths on one disk. Network isolation is
+ * an L4 concern; this covers the filesystem axis.
+ *
+ * For a hooked process that carries a network id, any path-taking libc call
+ * whose argument falls under a configured state root is transparently rewritten
+ * to insert a per-network segment `<root>/__pmnet__/<network>/…`, so each
+ * network keeps its own copy. Every non-matching path passes through
+ * byte-identical. Opt-in (no config => total no-op), fail-safe (any error or
+ * overflow => original path). Config comes from the repo's
+ * `.portmanager/state-paths`, delivered by terminal-hook-environment.ts via:
+ *   PORT_MANAGER_PER_NETWORK_STATE_ROOTS  ':'-joined absolute dir/file prefixes
+ *   PORT_MANAGER_PER_NETWORK_STATE_GLOBS  ':'-joined basename globs (fnmatch)
+ *   PORT_MANAGER_STATE_REPO_ROOT          repo root that bounds glob matches
+ * The per-network segment uses PORT_MANAGER_NETWORK_NAME (else NETWORK_ID).
+ * See docs/per-network-state.md and AGENTS.md.
+ * ============================================================================
+ */
+#define PM_STATE_MARKER "__pmnet__"
+#define PM_STATE_MAX_ROOTS 64
+#define PM_STATE_MAX_GLOBS 64
+
+typedef int (*pm_open_fn)(const char *, int, ...);
+typedef int (*pm_openat_fn)(int, const char *, int, ...);
+typedef int (*pm_stat_fn)(const char *, struct stat *);
+typedef int (*pm_lstat_fn)(const char *, struct stat *);
+typedef int (*pm_access_fn)(const char *, int);
+typedef int (*pm_unlink_fn)(const char *);
+typedef int (*pm_rename_fn)(const char *, const char *);
+typedef int (*pm_mkdir_fn)(const char *, mode_t);
+
+#if defined(__APPLE__)
+static pm_open_fn pm_real_open = open;
+static pm_openat_fn pm_real_openat = openat;
+static pm_stat_fn pm_real_stat = stat;
+static pm_lstat_fn pm_real_lstat = lstat;
+static pm_access_fn pm_real_access = access;
+static pm_unlink_fn pm_real_unlink = unlink;
+static pm_rename_fn pm_real_rename = rename;
+static pm_mkdir_fn pm_real_mkdir = mkdir;
+#else
+static pm_open_fn pm_real_open = NULL;
+static pm_openat_fn pm_real_openat = NULL;
+static pm_stat_fn pm_real_stat = NULL;
+static pm_lstat_fn pm_real_lstat = NULL;
+static pm_access_fn pm_real_access = NULL;
+static pm_unlink_fn pm_real_unlink = NULL;
+static pm_rename_fn pm_real_rename = NULL;
+static pm_mkdir_fn pm_real_mkdir = NULL;
+#endif
+
+static int pm_state_active = 0;                 /* 1 once config resolves to something usable */
+static char pm_state_segment[160];              /* "__pmnet__/<network>" */
+static char pm_state_repo_root[PATH_MAX];
+static size_t pm_state_repo_root_len = 0;
+static char *pm_state_roots[PM_STATE_MAX_ROOTS];
+static size_t pm_state_root_lens[PM_STATE_MAX_ROOTS];
+static size_t pm_state_root_count = 0;
+static char *pm_state_globs[PM_STATE_MAX_GLOBS];
+static size_t pm_state_glob_count = 0;
+static pthread_once_t pm_state_once = PTHREAD_ONCE_INIT;
+
+/* Splits a ':'-delimited env value, strdup'ing each non-empty token into out[]. */
+static size_t pm_state_split(const char *value, char **out, size_t *lens, size_t max) {
+  size_t count = 0;
+  const char *cursor = value;
+  while (cursor != NULL && *cursor != '\0' && count < max) {
+    const char *sep = strchr(cursor, ':');
+    size_t len = (sep != NULL) ? (size_t)(sep - cursor) : strlen(cursor);
+    if (len > 0) {
+      char *token = (char *)malloc(len + 1);
+      if (token != NULL) {
+        memcpy(token, cursor, len);
+        token[len] = '\0';
+        if (lens != NULL) {
+          lens[count] = len;
+        }
+        out[count++] = token;
+      }
+    }
+    if (sep == NULL) {
+      break;
+    }
+    cursor = sep + 1;
+  }
+  return count;
+}
+
+static void pm_state_init(void) {
+  const char *roots = getenv("PORT_MANAGER_PER_NETWORK_STATE_ROOTS");
+  const char *globs = getenv("PORT_MANAGER_PER_NETWORK_STATE_GLOBS");
+  const char *repo_root = getenv("PORT_MANAGER_STATE_REPO_ROOT");
+  const char *network = getenv("PORT_MANAGER_NETWORK_NAME");
+  char sanitized[128];
+  size_t out_index = 0;
+
+  if (network == NULL || network[0] == '\0') {
+    network = getenv("PORT_MANAGER_NETWORK_ID");
+  }
+  if (network == NULL || network[0] == '\0') {
+    return; /* no network identity => never redirect */
+  }
+  if ((roots == NULL || roots[0] == '\0') && (globs == NULL || globs[0] == '\0')) {
+    return; /* feature not configured => total no-op */
+  }
+
+  /* Sanitize the network segment to a filesystem-safe token. */
+  for (const char *cursor = network; *cursor != '\0' && out_index + 1 < sizeof(sanitized); cursor++) {
+    unsigned char ch = (unsigned char)*cursor;
+    sanitized[out_index++] =
+        (isalnum(ch) || ch == '-' || ch == '_' || ch == '.') ? (char)ch : '_';
+  }
+  sanitized[out_index] = '\0';
+  if (sanitized[0] == '\0') {
+    return;
+  }
+  snprintf(pm_state_segment, sizeof(pm_state_segment), "%s/%s", PM_STATE_MARKER, sanitized);
+
+  if (repo_root != NULL && repo_root[0] == '/') {
+    snprintf(pm_state_repo_root, sizeof(pm_state_repo_root), "%s", repo_root);
+    pm_state_repo_root_len = strlen(pm_state_repo_root);
+    /* Drop any trailing slash so prefix comparisons are uniform. */
+    while (pm_state_repo_root_len > 1 && pm_state_repo_root[pm_state_repo_root_len - 1] == '/') {
+      pm_state_repo_root[--pm_state_repo_root_len] = '\0';
+    }
+  }
+
+  if (roots != NULL) {
+    pm_state_root_count = pm_state_split(roots, pm_state_roots, pm_state_root_lens, PM_STATE_MAX_ROOTS);
+    /* Normalize away trailing slashes so "<root>/" and "<root>" match alike. */
+    for (size_t i = 0; i < pm_state_root_count; i++) {
+      while (pm_state_root_lens[i] > 1 && pm_state_roots[i][pm_state_root_lens[i] - 1] == '/') {
+        pm_state_roots[i][--pm_state_root_lens[i]] = '\0';
+      }
+    }
+  }
+  if (globs != NULL) {
+    pm_state_glob_count = pm_state_split(globs, pm_state_globs, NULL, PM_STATE_MAX_GLOBS);
+  }
+
+  pm_state_active = (pm_state_root_count > 0 || pm_state_glob_count > 0);
+}
+
+/* Absolutizes a path (prepending cwd for relative inputs) without resolving
+ * symlinks or `..`, which would change the caller's intended semantics. */
+static int pm_state_absolutize(const char *in, char *abs, size_t abs_size) {
+  if (in == NULL || in[0] == '\0') {
+    return -1;
+  }
+  if (in[0] == '/') {
+    if (strlen(in) >= abs_size) {
+      return -1;
+    }
+    snprintf(abs, abs_size, "%s", in);
+    return 0;
+  }
+  char cwd[PATH_MAX];
+  if (getcwd(cwd, sizeof(cwd)) == NULL) {
+    return -1;
+  }
+  const char *rel = in;
+  while (rel[0] == '.' && rel[1] == '/') {
+    rel += 2; /* strip leading "./" noise */
+  }
+  if ((size_t)snprintf(abs, abs_size, "%s/%s", cwd, rel) >= abs_size) {
+    return -1;
+  }
+  return 0;
+}
+
+/*
+ * Rewrites `in` into `out` with the per-network segment inserted when it falls
+ * under a configured root (segment after the root) or matches a glob (segment
+ * before the basename). Returns 1 when rewritten, 0 otherwise.
+ */
+static int pm_state_redirect_path(const char *in, char *out, size_t out_size) {
+  char abs[PATH_MAX];
+
+  pthread_once(&pm_state_once, pm_state_init);
+  if (!pm_state_active || in == NULL || in[0] == '\0') {
+    return 0;
+  }
+  /* Our own segment must never be re-redirected (idempotency / no nesting). */
+  if (strstr(in, "/" PM_STATE_MARKER "/") != NULL) {
+    return 0;
+  }
+  if (pm_state_absolutize(in, abs, sizeof(abs)) != 0) {
+    return 0;
+  }
+
+  for (size_t i = 0; i < pm_state_root_count; i++) {
+    size_t len = pm_state_root_lens[i];
+    if (strncmp(abs, pm_state_roots[i], len) == 0 && (abs[len] == '\0' || abs[len] == '/')) {
+      if ((size_t)snprintf(out, out_size, "%.*s/%s%s", (int)len, pm_state_roots[i],
+                           pm_state_segment, abs + len) >= out_size) {
+        return 0;
+      }
+      return 1;
+    }
+  }
+
+  if (pm_state_glob_count > 0 && pm_state_repo_root_len > 0 &&
+      strncmp(abs, pm_state_repo_root, pm_state_repo_root_len) == 0 &&
+      abs[pm_state_repo_root_len] == '/') {
+    const char *slash = strrchr(abs, '/');
+    const char *base = (slash != NULL) ? slash + 1 : abs;
+    for (size_t i = 0; i < pm_state_glob_count; i++) {
+      if (fnmatch(pm_state_globs[i], base, 0) == 0) {
+        size_t dir_len = (size_t)(base - abs); /* includes trailing slash */
+        if ((size_t)snprintf(out, out_size, "%.*s%s/%s", (int)dir_len, abs,
+                             pm_state_segment, base) >= out_size) {
+          return 0;
+        }
+        return 1;
+      }
+    }
+  }
+
+  return 0;
+}
+
+/* Creates the parent directories of `path` (best effort) using the real mkdir
+ * so redirected create operations don't fail on a missing per-network dir. */
+static void pm_state_make_parents(const char *path) {
+  char buffer[PATH_MAX];
+  if (strlen(path) >= sizeof(buffer)) {
+    return;
+  }
+  snprintf(buffer, sizeof(buffer), "%s", path);
+  for (char *cursor = buffer + 1; *cursor != '\0'; cursor++) {
+    if (*cursor == '/') {
+      *cursor = '\0';
+      pm_real_mkdir(buffer, 0777);
+      *cursor = '/';
+    }
+  }
+}
+
+#if !defined(__APPLE__)
+/* Linux resolves the real symbols lazily (macOS pre-binds them above). */
+static void pm_state_resolve_real(void) {
+  if (pm_real_open == NULL) pm_real_open = (pm_open_fn)dlsym(RTLD_NEXT, "open");
+  if (pm_real_openat == NULL) pm_real_openat = (pm_openat_fn)dlsym(RTLD_NEXT, "openat");
+  if (pm_real_stat == NULL) pm_real_stat = (pm_stat_fn)dlsym(RTLD_NEXT, "stat");
+  if (pm_real_lstat == NULL) pm_real_lstat = (pm_lstat_fn)dlsym(RTLD_NEXT, "lstat");
+  if (pm_real_access == NULL) pm_real_access = (pm_access_fn)dlsym(RTLD_NEXT, "access");
+  if (pm_real_unlink == NULL) pm_real_unlink = (pm_unlink_fn)dlsym(RTLD_NEXT, "unlink");
+  if (pm_real_rename == NULL) pm_real_rename = (pm_rename_fn)dlsym(RTLD_NEXT, "rename");
+  if (pm_real_mkdir == NULL) pm_real_mkdir = (pm_mkdir_fn)dlsym(RTLD_NEXT, "mkdir");
+}
+#else
+static void pm_state_resolve_real(void) {}
+#endif
+
+/* True when this call should attempt redirection: the master hook switch is on
+ * and we are not inside a hook-internal file operation (reentrancy guard). */
+static int pm_state_should_redirect(void) {
+  return pm_hook_depth == 0 && pm_hook_enabled();
+}
+
+static int pm_open_hook(const char *path, int flags, ...) {
+  mode_t mode = 0;
+  va_list args;
+  char redirected[PATH_MAX];
+
+  va_start(args, flags);
+  mode = (mode_t)va_arg(args, int);
+  va_end(args);
+
+  pm_state_resolve_real();
+  if (pm_state_should_redirect() && pm_state_redirect_path(path, redirected, sizeof(redirected))) {
+    if ((flags & O_CREAT) != 0) {
+      pm_state_make_parents(redirected);
+    }
+    pm_debug("state redirect open %s -> %s", path, redirected);
+    return pm_real_open(redirected, flags, mode);
+  }
+  return pm_real_open(path, flags, mode);
+}
+
+static int pm_openat_hook(int dirfd, const char *path, int flags, ...) {
+  mode_t mode = 0;
+  va_list args;
+  char redirected[PATH_MAX];
+
+  va_start(args, flags);
+  mode = (mode_t)va_arg(args, int);
+  va_end(args);
+
+  pm_state_resolve_real();
+  /* Only redirect when the path is unambiguous relative to cwd (AT_FDCWD) or
+   * absolute; a path relative to an arbitrary dirfd can't be resolved cheaply. */
+  if (pm_state_should_redirect() && (dirfd == AT_FDCWD || (path != NULL && path[0] == '/')) &&
+      pm_state_redirect_path(path, redirected, sizeof(redirected))) {
+    if ((flags & O_CREAT) != 0) {
+      pm_state_make_parents(redirected);
+    }
+    pm_debug("state redirect openat %s -> %s", path, redirected);
+    return pm_real_openat(dirfd, redirected, flags, mode);
+  }
+  return pm_real_openat(dirfd, path, flags, mode);
+}
+
+static int pm_stat_hook(const char *path, struct stat *buf) {
+  char redirected[PATH_MAX];
+  pm_state_resolve_real();
+  if (pm_state_should_redirect() && pm_state_redirect_path(path, redirected, sizeof(redirected))) {
+    return pm_real_stat(redirected, buf);
+  }
+  return pm_real_stat(path, buf);
+}
+
+static int pm_lstat_hook(const char *path, struct stat *buf) {
+  char redirected[PATH_MAX];
+  pm_state_resolve_real();
+  if (pm_state_should_redirect() && pm_state_redirect_path(path, redirected, sizeof(redirected))) {
+    return pm_real_lstat(redirected, buf);
+  }
+  return pm_real_lstat(path, buf);
+}
+
+static int pm_access_hook(const char *path, int amode) {
+  char redirected[PATH_MAX];
+  pm_state_resolve_real();
+  if (pm_state_should_redirect() && pm_state_redirect_path(path, redirected, sizeof(redirected))) {
+    return pm_real_access(redirected, amode);
+  }
+  return pm_real_access(path, amode);
+}
+
+static int pm_unlink_hook(const char *path) {
+  char redirected[PATH_MAX];
+  pm_state_resolve_real();
+  if (pm_state_should_redirect() && pm_state_redirect_path(path, redirected, sizeof(redirected))) {
+    return pm_real_unlink(redirected);
+  }
+  return pm_real_unlink(path);
+}
+
+static int pm_rename_hook(const char *from, const char *to) {
+  char redirected_from[PATH_MAX];
+  char redirected_to[PATH_MAX];
+  const char *use_from = from;
+  const char *use_to = to;
+
+  pm_state_resolve_real();
+  if (pm_state_should_redirect()) {
+    if (pm_state_redirect_path(from, redirected_from, sizeof(redirected_from))) {
+      use_from = redirected_from;
+    }
+    if (pm_state_redirect_path(to, redirected_to, sizeof(redirected_to))) {
+      pm_state_make_parents(redirected_to);
+      use_to = redirected_to;
+    }
+  }
+  return pm_real_rename(use_from, use_to);
+}
+
+static int pm_mkdir_hook(const char *path, mode_t mode) {
+  char redirected[PATH_MAX];
+  pm_state_resolve_real();
+  if (pm_state_should_redirect() && pm_state_redirect_path(path, redirected, sizeof(redirected))) {
+    pm_state_make_parents(redirected);
+    return pm_real_mkdir(redirected, mode);
+  }
+  return pm_real_mkdir(path, mode);
+}
+
 #if defined(__APPLE__)
 #define PM_DYLD_INTERPOSE(_replacement, _replacee) \
   __attribute__((used)) static struct { const void *replacement; const void *replacee; } \
@@ -4823,6 +5198,14 @@ PM_DYLD_INTERPOSE(pm_wait4_hook, wait4);
 PM_DYLD_INTERPOSE(pm_waitpid_hook, waitpid);
 PM_DYLD_INTERPOSE(pm_wait3_hook, wait3);
 PM_DYLD_INTERPOSE(pm_kill_hook, kill);
+PM_DYLD_INTERPOSE(pm_open_hook, open);
+PM_DYLD_INTERPOSE(pm_openat_hook, openat);
+PM_DYLD_INTERPOSE(pm_stat_hook, stat);
+PM_DYLD_INTERPOSE(pm_lstat_hook, lstat);
+PM_DYLD_INTERPOSE(pm_access_hook, access);
+PM_DYLD_INTERPOSE(pm_unlink_hook, unlink);
+PM_DYLD_INTERPOSE(pm_rename_hook, rename);
+PM_DYLD_INTERPOSE(pm_mkdir_hook, mkdir);
 #else
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   return pm_bind_hook(sockfd, addr, addrlen);
@@ -4886,5 +5269,45 @@ pid_t wait3(int *status, int options, struct rusage *rusage) {
 
 int kill(pid_t pid, int sig) {
   return pm_kill_hook(pid, sig);
+}
+
+/*
+ * Per-network state redirection on Linux. stat/lstat are intentionally omitted:
+ * glibc exposes them as inline wrappers over __xstat, so redefining the plain
+ * symbols conflicts. macOS (the primary target) covers stat/lstat via the
+ * interpose table above.
+ */
+int open(const char *path, int flags, ...) {
+  va_list args;
+  mode_t mode;
+  va_start(args, flags);
+  mode = (mode_t)va_arg(args, int);
+  va_end(args);
+  return pm_open_hook(path, flags, mode);
+}
+
+int openat(int dirfd, const char *path, int flags, ...) {
+  va_list args;
+  mode_t mode;
+  va_start(args, flags);
+  mode = (mode_t)va_arg(args, int);
+  va_end(args);
+  return pm_openat_hook(dirfd, path, flags, mode);
+}
+
+int access(const char *path, int amode) {
+  return pm_access_hook(path, amode);
+}
+
+int unlink(const char *path) {
+  return pm_unlink_hook(path);
+}
+
+int rename(const char *from, const char *to) {
+  return pm_rename_hook(from, to);
+}
+
+int mkdir(const char *path, mode_t mode) {
+  return pm_mkdir_hook(path, mode);
 }
 #endif

@@ -171,6 +171,16 @@ routing/attribution decisions to that one file; `tail -f` it. Empty disables it
 (zero overhead). Full reference, line format, and how to extend it:
 [docs/dev-logging.md](docs/dev-logging.md).
 
+### Per-network local state
+
+Running the **same repo directory** in two logical networks makes the app's
+local state collide (e.g. celery's `.celery/celery1.pid`, unix sockets, sqlite),
+because it is literally the same path on one disk — network isolation can't fix
+a filesystem collision. Declare the colliding paths in a committed
+`.portmanager/state-paths` file and the native hook namespaces them per network
+(`.celery/__pmnet__/<network>/…`) with **no app changes**. See
+[docs/per-network-state.md](docs/per-network-state.md).
+
 For Marketplace release steps, publisher identity, VSIX verification, and native hook packaging checks, see [PUBLISHING.MD](PUBLISHING.MD). The Marketplace publisher ID is `newdlops`.
 
 ## Architecture

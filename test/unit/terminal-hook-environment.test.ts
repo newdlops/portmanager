@@ -1933,3 +1933,38 @@ test("compose mutation publishes hidden ports on the network loopback host", () 
   assert.equal(attachBody.includes("resolveTerminalLoopbackAddressRoutingMode(portSettings)"), true);
   assert.equal(attachBody.includes("hiddenHostAddress,"), true);
 });
+
+test("per-network state redirection is delivered from .portmanager/state-paths to the hook env", () => {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts"),
+    "utf8",
+  );
+  // Reads the committed repo config and classifies prefixes vs basename globs.
+  assert.equal(source.includes('path.join(repoRoot, ".portmanager", "state-paths")'), true);
+  assert.equal(source.includes("/[*?[]/.test(line)"), true);
+  assert.equal(source.includes("path.resolve(repoRoot, line)"), true);
+  // Delivered only from the scoped path (needs a network name to be meaningful).
+  assert.equal(source.includes("applyPerNetworkStateEnvironment(collection);"), true);
+  assert.equal(source.includes('collection.replace("PORT_MANAGER_PER_NETWORK_STATE_ROOTS"'), true);
+  assert.equal(source.includes('collection.replace("PORT_MANAGER_PER_NETWORK_STATE_GLOBS"'), true);
+  assert.equal(source.includes('collection.replace("PORT_MANAGER_STATE_REPO_ROOT"'), true);
+});
+
+test("native hook interposes path calls and rewrites configured state paths per network", () => {
+  const hook = fs.readFileSync(
+    path.resolve(__dirname, "../../../native/hook/portmanager_hook.c"),
+    "utf8",
+  );
+  // The full path-taking set is interposed so an app's existence check (stat)
+  // and its write (open) see the same per-network file.
+  for (const fn of ["open", "openat", "stat", "lstat", "access", "unlink", "rename", "mkdir"]) {
+    assert.equal(hook.includes(`PM_DYLD_INTERPOSE(pm_${fn}_hook, ${fn});`), true, `interpose ${fn}`);
+  }
+  // Env contract with terminal-hook-environment.ts and the segment layout.
+  assert.equal(hook.includes('getenv("PORT_MANAGER_PER_NETWORK_STATE_ROOTS")'), true);
+  assert.equal(hook.includes('getenv("PORT_MANAGER_PER_NETWORK_STATE_GLOBS")'), true);
+  assert.equal(hook.includes('getenv("PORT_MANAGER_STATE_REPO_ROOT")'), true);
+  assert.equal(hook.includes('#define PM_STATE_MARKER "__pmnet__"'), true);
+  // Redirection is opt-in and bound to the master hook switch (fail-safe).
+  assert.equal(hook.includes("pm_hook_depth == 0 && pm_hook_enabled()"), true);
+});
