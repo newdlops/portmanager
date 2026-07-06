@@ -91,6 +91,7 @@ import {
 } from "../platform/ports/logical-port-router";
 import { NodeTcpConnectionProcessResolver } from "../platform/ports/tcp-connection-process-resolver";
 import { ProcessTrackerManager } from "../platform/process/process-tracker-manager";
+import { devLog, devLogEnabled } from "../platform/dev-log";
 import {
   buildProcessTreeContext,
   NodeProcessTableProvider,
@@ -4743,6 +4744,23 @@ export class PortManagerNetworkService implements DisposableLike {
     connection: LogicalPortRouterConnection,
   ): Promise<LogicalPortRouterTarget> {
     const verdict = await this.resolveRouterClientVerdict(connection);
+
+    if (devLogEnabled()) {
+      const composeForNet =
+        verdict.networkId !== undefined
+          ? this.isComposeLogicalPortForNetwork(verdict.networkId, connection.logicalPort)
+          : "-";
+      const composePorts =
+        verdict.networkId !== undefined
+          ? this.getComposeLogicalPortsForNetwork(verdict.networkId).join("|")
+          : "-";
+      devLog(
+        "ts-router",
+        `resolve logical_port=${connection.logicalPort} clientPid=${connection.clientPid ?? "?"} ` +
+          `clientNet=${connection.clientNetworkId ?? "-"} verdictNet=${verdict.networkId ?? "NONE"} ` +
+          `composeForNet=${composeForNet} composePorts=${composePorts}`,
+      );
+    }
 
     if (verdict.networkId !== undefined) {
       return this.resolveNetworkClientTarget(verdict.networkId, connection.logicalPort, verdict.processRows);

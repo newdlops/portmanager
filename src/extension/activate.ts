@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "node:path";
+import * as os from "node:os";
 import { configureRouteTableStorageDirectory } from "../agent/route-table";
 import { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import { LocalAgentClient } from "./local-agent-client";
@@ -18,6 +19,25 @@ export interface PortManagerExtensionApi {
 }
 
 /**
+ * Copies the `portManager.developmentLogPath` setting into the
+ * PORT_MANAGER_DEV_LOG environment variable so `buildNodeRuntimeEnvironment`
+ * propagates it to every native child and `devLog` (src/platform/dev-log.ts)
+ * writes to it. Empty setting leaves any pre-existing env var untouched, so
+ * launching with the raw env var still works. A leading `~/` expands to $HOME.
+ */
+function applyDevelopmentLogSetting(): void {
+  const configured = vscode.workspace.getConfiguration("portManager").get<string>("developmentLogPath");
+  if (typeof configured !== "string" || configured.trim().length === 0) {
+    return;
+  }
+  let resolved = configured.trim();
+  if (resolved === "~" || resolved.startsWith("~/")) {
+    resolved = path.join(os.homedir(), resolved.slice(1));
+  }
+  process.env.PORT_MANAGER_DEV_LOG = resolved;
+}
+
+/**
  * VS Code activation entry point for Port Manager.
  *
  * Activation composes the layers defined in AGENTS.md: core services receive
@@ -25,6 +45,12 @@ export interface PortManagerExtensionApi {
  * handlers orchestrate user workflows.
  */
 export function activate(context: vscode.ExtensionContext): PortManagerExtensionApi {
+  // Development log endpoint: mirror the `portManager.developmentLogPath` setting
+  // into PORT_MANAGER_DEV_LOG before any native child is spawned, so the whole
+  // system (hook/router/agent + this host) writes one shared trace file. Reload
+  // the window after changing the setting so running daemons pick it up. See
+  // docs/dev-logging.md.
+  applyDevelopmentLogSetting();
   configureRouteTableStorageDirectory(path.join(context.globalStorageUri.fsPath, "route-tables"));
   const processService = new LocalAgentClient(context);
   const networkService = new PortManagerNetworkService(context, processService);

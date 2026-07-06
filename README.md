@@ -161,6 +161,16 @@ npm run build:hook
 
 Packaging and publishing run this hook build again through `vscode:prepublish`. On macOS the generated hook library and asdf shim are ad-hoc signed when `codesign` is available.
 
+### Development log endpoint
+
+To trace how a connection is attributed and routed **without rebuilding native
+binaries**, set the `portManager.developmentLogPath` setting (or the
+`PORT_MANAGER_DEV_LOG` env var) to an absolute path and reload the window. The
+native hook, TCP router, and agent — plus the extension host — append their
+routing/attribution decisions to that one file; `tail -f` it. Empty disables it
+(zero overhead). Full reference, line format, and how to extend it:
+[docs/dev-logging.md](docs/dev-logging.md).
+
 For Marketplace release steps, publisher identity, VSIX verification, and native hook packaging checks, see [PUBLISHING.MD](PUBLISHING.MD). The Marketplace publisher ID is `newdlops`.
 
 ## Architecture

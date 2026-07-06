@@ -194,3 +194,19 @@ config -> shared
 - 새 모듈 폴더에 `README.MD`가 있는가
 - 파일 길이 기준을 지키거나 예외 사유가 명확한가
 - 테스트가 로직, 플랫폼 어댑터, UI 동작의 위험도에 맞게 추가되었는가
+
+## 12. 개발용 로그 엔드포인트 (디버깅)
+
+라우팅/attribution 동작을 추적할 때는 **리빌드 없이** 켤 수 있는 공유 dev-log
+엔드포인트를 사용한다. `portManager.developmentLogPath` 설정(또는
+`PORT_MANAGER_DEV_LOG` 환경변수)에 절대경로를 지정하고 창을 리로드하면, 네이티브
+hook/router/agent와 확장 호스트가 **하나의 파일**에 attribution·라우팅 결정을
+추가한다. 비워두면 무비용 no-op이다.
+
+- 사용법·형식·구성요소별 로그·확장 방법: **`docs/dev-logging.md`**
+- 네이티브 로거: `native/shared/pm_dev_log.{h,c}` / TS 로거: `src/platform/dev-log.ts`
+- 새 native 바이너리에 로그를 추가하려면 헤더를 include하고 `pm_dev_log(...)`를
+  호출한 뒤 `scripts/build-native-hook.sh`의 컴파일 라인에 `pm_dev_log.c`를 추가한다.
+
+새 로우레벨 진단 코드를 임시 `fprintf`/`appendFileSync`로 심지 말고 이 엔드포인트를
+쓴다 (다음 세션에서도 동일하게 켜고 끌 수 있도록).

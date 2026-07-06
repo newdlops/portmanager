@@ -26,6 +26,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "../shared/pm_dev_log.h"
+
 /*
  * Port Manager native socket hook.
  *
@@ -190,17 +192,30 @@ static int pm_debug_enabled(void) {
 }
 
 static void pm_debug(const char *format, ...) {
+  int to_stderr = pm_debug_enabled();
+  /*
+   * PORT_MANAGER_HOOK_DEBUG=1 keeps the legacy stderr trace; PORT_MANAGER_DEV_LOG
+   * additionally tees every hook debug line into the shared dev-log file so hook
+   * activity lands on the same timeline as the router/agent (see docs/dev-logging.md).
+   */
+  int to_devlog = pm_dev_log_enabled();
+  char message[1024];
   va_list args;
 
-  if (!pm_debug_enabled()) {
+  if (!to_stderr && !to_devlog) {
     return;
   }
 
-  fprintf(stderr, "[portmanager-hook pid=%ld] ", (long)getpid());
   va_start(args, format);
-  vfprintf(stderr, format, args);
+  vsnprintf(message, sizeof(message), format, args);
   va_end(args);
-  fprintf(stderr, "\n");
+
+  if (to_stderr) {
+    fprintf(stderr, "[portmanager-hook pid=%ld] %s\n", (long)getpid(), message);
+  }
+  if (to_devlog) {
+    pm_dev_log("hook", "%s", message);
+  }
 }
 
 static const char *pm_path_basename(const char *path) {

@@ -13,6 +13,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../shared/pm_dev_log.h"
+
 #define PM_CLIENT_BUFFER_INITIAL 2048
 /* Large enough for a respawnChild request carrying an escaped child's full
  * argv+env (base64), which reaches tens of KB in deep shell/yarn chains. */
@@ -428,6 +430,17 @@ static int pm_reserve_client_buffer(pm_client *client, size_t required) {
 static int pm_dispatch(pm_agent_state *state, const pm_request *request, pm_buffer *payload, int *state_changed, int *shutdown_requested, char *error, size_t error_size) {
   *state_changed = 0;
   *shutdown_requested = 0;
+
+  /*
+   * Dev-log every request except the high-frequency read-only polls, so the
+   * shared timeline (docs/dev-logging.md) shows route allocations/releases and
+   * other mutations without being flooded by snapshot polling.
+   */
+  if (pm_dev_log_enabled() && strcmp(request->method, "listSnapshot") != 0 &&
+      strcmp(request->method, "daemonStatus") != 0 &&
+      strcmp(request->method, "refreshSnapshot") != 0) {
+    pm_dev_log("agent", "dispatch method=%s", request->method);
+  }
 
   if (strcmp(request->method, "listSnapshot") == 0) {
     return pm_state_snapshot(state, payload);

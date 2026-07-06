@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "../shared/pm_peer_process.h"
+#include "../shared/pm_dev_log.h"
 
 #define PM_ROUTER_BACKLOG 1024
 #define PM_ROUTER_BUFFER_SIZE 65536
@@ -647,6 +648,8 @@ static void pm_attribute_connection(accepted_connection_t *connection) {
   char network_id[PM_ROUTER_HOST_SIZE];
 
   if (pid <= 0) {
+    pm_dev_log("router", "attribute logical_port=%d peer=%s:%d -> UNRESOLVED (no owner pid)",
+               connection->local_port, connection->remote_address, connection->remote_port);
     return;
   }
 
@@ -672,6 +675,10 @@ static void pm_attribute_connection(accepted_connection_t *connection) {
       snprintf(connection->client_network_id, sizeof(connection->client_network_id), "%s", network_id);
     }
   }
+
+  pm_dev_log("router", "attribute logical_port=%d pid=%d net=%s",
+             connection->local_port, pid,
+             connection->client_network_id[0] != '\0' ? connection->client_network_id : "-");
 }
 
 static void *pm_connection_thread(void *raw_connection) {
@@ -683,6 +690,9 @@ static void *pm_connection_thread(void *raw_connection) {
   pm_attribute_connection(connection);
 
   if (pm_resolve_route(connection, host, sizeof(host), &port) != 0) {
+    pm_dev_log("router", "resolve logical_port=%d pid=%s net=%s -> REFUSE (no route)",
+               connection->local_port, pm_field_or_dash(connection->client_pid),
+               pm_field_or_dash(connection->client_network_id));
     close(connection->client_fd);
     free(connection);
     return NULL;
@@ -690,11 +700,16 @@ static void *pm_connection_thread(void *raw_connection) {
 
   target_fd = pm_connect_target(host, port);
   if (target_fd < 0) {
+    pm_dev_log("router", "resolve logical_port=%d net=%s -> target %s:%d but CONNECT FAILED",
+               connection->local_port, pm_field_or_dash(connection->client_network_id), host, port);
     close(connection->client_fd);
     free(connection);
     return NULL;
   }
 
+  pm_dev_log("router", "route logical_port=%d pid=%s net=%s -> %s:%d (forwarding)",
+             connection->local_port, pm_field_or_dash(connection->client_pid),
+             pm_field_or_dash(connection->client_network_id), host, port);
   pm_proxy_connection(connection->client_fd, target_fd);
   close(target_fd);
   close(connection->client_fd);

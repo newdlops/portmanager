@@ -179,6 +179,11 @@ export function applyTerminalHookEnvironment(
   const preloadHintVariable = process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD";
 
   collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_MUTATOR_OPTIONS);
+  // Dev-log endpoint (docs/dev-logging.md): hooked servers/clients write to the
+  // shared trace file when PORT_MANAGER_DEV_LOG is set in the host env.
+  if (process.env.PORT_MANAGER_DEV_LOG !== undefined && process.env.PORT_MANAGER_DEV_LOG.length > 0) {
+    collection.replace("PORT_MANAGER_DEV_LOG", process.env.PORT_MANAGER_DEV_LOG, TERMINAL_MUTATOR_OPTIONS);
+  }
   collection.replace("PORT_MANAGER_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
   if (scope.networkName !== undefined) {
     collection.replace("PORT_MANAGER_NETWORK_NAME", scope.networkName, TERMINAL_MUTATOR_OPTIONS);
@@ -243,6 +248,10 @@ function applyScopelessGatewayEnvironment(
   const preloadHintVariable = process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD";
 
   collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_MUTATOR_OPTIONS);
+  // Dev-log endpoint (docs/dev-logging.md): even scopeless gateway terminals log.
+  if (process.env.PORT_MANAGER_DEV_LOG !== undefined && process.env.PORT_MANAGER_DEV_LOG.length > 0) {
+    collection.replace("PORT_MANAGER_DEV_LOG", process.env.PORT_MANAGER_DEV_LOG, TERMINAL_MUTATOR_OPTIONS);
+  }
   collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_PRELOAD_REPAIR", "1", TERMINAL_MUTATOR_OPTIONS);
