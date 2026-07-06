@@ -1327,9 +1327,9 @@ export class PortManagerCommandController implements DisposableLike {
             ]
           : [
               {
-                label: "$(window) Open Owner UI",
+                label: "$(window) Make This Window Owner",
                 description: formatStatusMenuOwnerDescription(snapshot),
-                detail: "Owner-only routing actions run from the elected Port Manager window.",
+                detail: "Switch the control-plane owner to this window so owner-only routing actions run here.",
                 action: "ownerUi" as const,
               },
               {

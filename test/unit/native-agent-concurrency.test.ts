@@ -47,7 +47,7 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(agentSource.includes("Only unlink after"), true);
   assert.equal(agentSource.includes("bind_errno != EADDRINUSE || pm_socket_has_live_server"), true);
   assert.equal(agentSource.includes("PM_CLIENT_BUFFER_INITIAL 2048"), true);
-  assert.equal(agentSource.includes("PM_CLIENT_BUFFER_MAX 32768"), true);
+  assert.equal(agentSource.includes("PM_CLIENT_BUFFER_MAX 262144"), true);
   assert.equal(agentSource.includes("#include <poll.h>"), true);
   assert.equal(agentSource.includes("ready = poll("), true);
   assert.equal(agentSource.includes("state->route_tables_dirty = 1;"), true);

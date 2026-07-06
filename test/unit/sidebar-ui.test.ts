@@ -136,15 +136,18 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(source.includes('new VscodeWindowTerminalBindingTreeItem(windowTerminalBinding, element.network, ownerAction)'), false);
   assert.equal(source.includes('"Use for VS Code Terminals"'), true);
   assert.equal(source.includes('"Make this window default"'), true);
-  assert.equal(source.includes('"Open Owner UI"'), true);
+  // The owner button transfers control-plane ownership to the current window
+  // (takeControlPlaneOwnership) rather than navigating to the elected owner.
+  assert.equal(source.includes('"Make This Window Owner"'), true);
   assert.equal(commandsSource.includes('label: "$(lock) Owner actions disabled"'), true);
-  assert.equal(commandsSource.includes('label: "$(window) Open Owner UI"'), true);
+  assert.equal(commandsSource.includes('label: "$(window) Make This Window Owner"'), true);
   assert.equal(commandsSource.includes('action: "ownerUi" as const'), true);
   assert.equal(commandsSource.includes('"portManager.openOwnerUi"'), true);
-  assert.equal(commandsSource.includes("focusControlPlaneOwnerWindow()"), true);
-  assert.equal(commandsSource.includes("Port Manager owner window:"), true);
-  assert.equal(commandsSource.includes("Opened or focused Port Manager owner window:"), true);
-  assert.equal(commandsSource.includes("formatOwnerWindowTitle(snapshot)"), true);
+  assert.equal(commandsSource.includes("this.dependencies.networkService.takeControlPlaneOwnership()"), true);
+  assert.equal(commandsSource.includes("switchControlOwnerToThisWindow"), true);
+  assert.equal(commandsSource.includes("is now the control owner"), true);
+  assert.equal(commandsSource.includes("switched control ownership to this window"), true);
+  assert.equal(networkServiceSource.includes("async takeControlPlaneOwnership(): Promise<boolean>"), true);
   assert.equal(commandsSource.includes("requestControlPlaneOwnerUiFocus()"), false);
   assert.equal(commandsSource.includes('action: "ownerOnly" as const'), true);
   assert.equal(manifest.activationEvents?.includes("onCommand:portManager.openOwnerUi"), true);

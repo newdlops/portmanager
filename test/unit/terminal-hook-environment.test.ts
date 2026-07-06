@@ -1801,6 +1801,17 @@ test("logical routers expose host-client networks without taking unrelated netwo
     true,
     "unscoped host routes can still use a localhost TCP router fallback",
   );
+
+  // Compose service containers publish on the per-network loopback and are not
+  // hook-tracked, so the gateway also claims their logical ports (gated by the
+  // gateway flag, and skipped when the localhost port is externally owned) so
+  // hookless/host clients dialing localhost reach their network's container.
+  assert.equal(collectLogicalRouterPorts.includes("options.composeLogicalPorts ?? []"), true);
+  assert.equal(collectLogicalRouterPorts.includes("Compose service containers publish on the per-network loopback"), true);
+  assert.equal(collectLogicalRouterPorts.includes("!externallyOwnedPorts.has(composePort)"), true);
+  assert.equal(syncBody.includes("composeLogicalPorts: this.collectAllComposeLogicalPorts()"), true);
+  assert.equal(source.includes("private collectAllComposeLogicalPorts(): readonly number[]"), true);
+  assert.equal(source.includes("private isComposeLogicalPortForNetwork(networkId: string, logicalPort: number): boolean"), true);
 });
 
 test("logical router classifies clients by process tree label before hook environment fallback", () => {
@@ -1831,11 +1842,18 @@ test("logical router classifies clients by process tree label before hook enviro
   assert.equal(resolveRouterClientVerdict.includes("this.routerVerdictCache.store("), true);
   assert.equal(resolveRouterClientVerdict.includes("ROUTER_NON_NETWORK_VERDICT"), true);
 
-  // Attributed network clients fail closed on fixed-protocol ports and otherwise
-  // synthesize the per-network loopback backend; they never inherit another
-  // network's sole route.
+  // Attributed network clients fail closed on fixed-protocol ports EXCEPT
+  // compose service ports (a known container on the per-network loopback), and
+  // otherwise synthesize the per-network loopback backend; they never inherit
+  // another network's sole route.
   assert.equal(resolveNetworkClientTarget.includes("this.isFixedProtocolPort(logicalPort)"), true);
   assert.equal(resolveNetworkClientTarget.includes("loopbackAddressForNetwork(networkId)"), true);
+  assert.equal(
+    resolveNetworkClientTarget.includes("this.isComposeLogicalPortForNetwork(networkId, logicalPort)"),
+    true,
+    "compose service ports route to the per-network loopback container instead of failing closed",
+  );
+  assert.equal(resolveNetworkClientTarget.includes("this.isFixedProtocolPort(logicalPort) && !isComposePort"), true);
 
   // The older cwd/unique-route guessing fallbacks are removed; the non-network
   // path forwards only to an explicit relocated owner.

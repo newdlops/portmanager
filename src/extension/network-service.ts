@@ -4816,15 +4816,23 @@ export class PortManagerNetworkService implements DisposableLike {
       return { host: route.host, port: route.actualPort };
     }
 
-    // Fixed-protocol ports must fail closed rather than dial a possibly wrong
-    // host, matching the in-process hook's connect behavior for these ports.
-    if (this.isFixedProtocolPort(logicalPort)) {
+    // Compose service containers publish on the per-network loopback with the
+    // logical port preserved, and are not hook-tracked so no route row exists.
+    // Synthesize that backend rather than failing closed: it is a known network
+    // service on a deterministic coordinate, matching the in-process hook's
+    // address-only connect rewrite for hooked clients.
+    const isComposePort = this.isComposeLogicalPortForNetwork(networkId, logicalPort);
+
+    // Other fixed-protocol ports must fail closed rather than dial a possibly
+    // wrong host, matching the in-process hook's connect behavior for them.
+    if (this.isFixedProtocolPort(logicalPort) && !isComposePort) {
       throw new Error(`No route for fixed-protocol port ${logicalPort} in ${networkId}; refusing.`);
     }
 
-    // Same-port (loopback-address-only) networks may have no route row yet, or
-    // the server may still be starting. Synthesize the per-network loopback
-    // backend and give a starting server a brief grace window before answering.
+    // Same-port (loopback-address-only) networks and compose services may have
+    // no route row yet, or the server may still be starting. Synthesize the
+    // per-network loopback backend and give it a brief grace window before
+    // answering.
     const host = loopbackAddressForNetwork(networkId);
     await this.waitForBackendReachable(host, logicalPort);
     return { host, port: logicalPort };
@@ -5108,7 +5116,10 @@ export class PortManagerNetworkService implements DisposableLike {
       snapshot?.routes ?? [],
       snapshot?.listeners ?? [],
       this.registry.getSnapshot().attachments,
-      { gatewayEnabled: readPortManagerSettings().logicalPortGateway },
+      {
+        gatewayEnabled: readPortManagerSettings().logicalPortGateway,
+        composeLogicalPorts: this.collectAllComposeLogicalPorts(),
+      },
     );
 
     if (!tryAcquireLogicalRouterOwnerLease()) {
@@ -5999,6 +6010,35 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     return [...ports].sort((left, right) => left - right);
+  }
+
+  /**
+   * Union of compose service logical ports across every network with a
+   * restorable compose attachment. The logical port gateway claims these on
+   * localhost so hookless/host clients reach their network's container; which
+   * network a claimed port routes to is decided per-client by attribution.
+   */
+  private collectAllComposeLogicalPorts(): readonly number[] {
+    const ports = new Set<number>();
+
+    for (const attachment of this.registry.getSnapshot().composeAttachments) {
+      if (!isRestorableComposeAttachment(attachment)) {
+        continue;
+      }
+
+      for (const port of attachment.ports) {
+        if (isTcpPort(port.logicalPort)) {
+          ports.add(port.logicalPort);
+        }
+      }
+    }
+
+    return [...ports].sort((left, right) => left - right);
+  }
+
+  /** True when a logical port is served by a compose attachment on the given network. */
+  private isComposeLogicalPortForNetwork(networkId: string, logicalPort: number): boolean {
+    return this.getComposeLogicalPortsForNetwork(networkId).includes(logicalPort);
   }
 
   /** Cross-window lock path for publishing one network-scoped compose routing generation. */
@@ -8391,7 +8431,7 @@ function collectLogicalRouterPorts(
   routes: readonly LogicalPortRoute[],
   listeners: readonly ListeningPort[] = [],
   attachments: readonly TerminalAttachment[] = [],
-  options: { readonly gatewayEnabled?: boolean } = {},
+  options: { readonly gatewayEnabled?: boolean; readonly composeLogicalPorts?: readonly number[] } = {},
 ): readonly number[] {
   const ports = new Set<number>();
   const hostClientNetworkIds = collectHostClientAttachmentNetworkIds(attachments);
@@ -8422,6 +8462,23 @@ function collectLogicalRouterPorts(
       !externallyOwnedPorts.has(route.logicalPort)
     ) {
       ports.add(route.logicalPort);
+    }
+  }
+
+  /*
+   * Compose service containers publish on the per-network loopback (not the
+   * localhost the client dials) and are not hook-tracked, so no live listen
+   * route exists to key off. With the gateway on, still own the localhost
+   * logical port so hookless/host clients reach their network's container by
+   * source attribution — the same localhost -> per-network-loopback bridge that
+   * hook-tracked servers get. Per-network resolution still fails closed for a
+   * network that has no such compose service on the port.
+   */
+  if (options.gatewayEnabled === true) {
+    for (const composePort of options.composeLogicalPorts ?? []) {
+      if (isTcpPort(composePort) && !externallyOwnedPorts.has(composePort)) {
+        ports.add(composePort);
+      }
     }
   }
 
