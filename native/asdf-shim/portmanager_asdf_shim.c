@@ -471,9 +471,15 @@ static int pm_candidate_is_shell_wrapper(const char *path) {
   if (strcmp(base_name, "env") == 0) {
     return 0;
   }
-  return strcmp(base_name, "sh") == 0 || strcmp(base_name, "bash") == 0 ||
-         strcmp(base_name, "zsh") == 0 || strcmp(base_name, "dash") == 0 ||
-         strcmp(base_name, "ksh") == 0;
+  /*
+   * Only a shell that reads NO startup file for a non-interactive script is a
+   * true dead end (the stripped preload can never come back): sh/dash (POSIX).
+   * Keep bash — it sources BASH_ENV, which is our restore script, so a
+   * `#!/bin/bash` wrapper (e.g. Homebrew's `yarn`) recovers the preload — and
+   * keep zsh (.zshenv) for the same reason. Keeping them also avoids resolving
+   * PAST the only real tool when it happens to be a bash/zsh wrapper.
+   */
+  return strcmp(base_name, "sh") == 0 || strcmp(base_name, "dash") == 0;
 }
 
 /*

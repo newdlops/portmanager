@@ -922,9 +922,23 @@ __pm_is_package_command_shim() {
   [ "\${__pm_candidate_second_line}" = "\${__pm_marker}" ]
 }
 
+# A #!/bin/sh-class wrapper (e.g. yarn's temp node/yarn shims) strips
+# DYLD_INSERT_LIBRARIES when exec'd (SIP shell) and re-execs a real binary by
+# absolute path, bypassing every shim -- an unrecoverable preload dead end.
+# Resolve PAST it to a native binary or a #!/usr/bin/env script (re-routes
+# through PATH back into a shim). Shebang-only; no runtime-manager specifics.
+__pm_candidate_is_shell_wrapper() {
+  __pm_w_first="$(IFS= read -r __pm_w_line < "$1" 2>/dev/null && printf '%s' "\${__pm_w_line}")"
+  case "\${__pm_w_first}" in
+    '#!/bin/sh'|'#!/bin/sh '*|'#!/usr/bin/sh'|'#!/usr/bin/sh '*|'#!/bin/dash'|'#!/bin/dash '*|'#!/usr/bin/dash'|'#!/usr/bin/dash '*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 __pm_find_next_command() {
   __pm_old_ifs="\${IFS}"
   IFS=:
+  __pm_fallback=""
   for __pm_dir in \${PATH:-}; do
     [ -n "\${__pm_dir}" ] || __pm_dir="."
     __pm_dir_physical="$(CDPATH= cd "\${__pm_dir}" 2>/dev/null && pwd -P)"
@@ -937,12 +951,20 @@ __pm_find_next_command() {
       if __pm_is_package_command_shim "\${__pm_candidate}"; then
         continue
       fi
+      if __pm_candidate_is_shell_wrapper "\${__pm_candidate}"; then
+        [ -n "\${__pm_fallback}" ] || __pm_fallback="\${__pm_candidate}"
+        continue
+      fi
       IFS="\${__pm_old_ifs}"
       printf '%s\\n' "\${__pm_candidate}"
       return 0
     fi
   done
   IFS="\${__pm_old_ifs}"
+  if [ -n "\${__pm_fallback}" ]; then
+    printf '%s\\n' "\${__pm_fallback}"
+    return 0
+  fi
   return 1
 }
 
@@ -976,9 +998,22 @@ __pm_is_package_manager_shim() {
   [ "\${__pm_candidate_second_line}" = "\${__pm_marker}" ]
 }
 
+# See __pm_candidate_is_shell_wrapper in the package-command shim: a
+# #!/bin/sh-class wrapper (yarn's temp node/yarn shims) strips DYLD and
+# absolute-execs past every shim, so resolve past it to a native binary or a
+# #!/usr/bin/env script (which re-routes through PATH back into a shim).
+__pm_candidate_is_shell_wrapper() {
+  __pm_w_first="$(IFS= read -r __pm_w_line < "$1" 2>/dev/null && printf '%s' "\${__pm_w_line}")"
+  case "\${__pm_w_first}" in
+    '#!/bin/sh'|'#!/bin/sh '*|'#!/usr/bin/sh'|'#!/usr/bin/sh '*|'#!/bin/dash'|'#!/bin/dash '*|'#!/usr/bin/dash'|'#!/usr/bin/dash '*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 __pm_find_next_command() {
   __pm_old_ifs="\${IFS}"
   IFS=:
+  __pm_fallback=""
   for __pm_dir in \${PATH:-}; do
     [ -n "\${__pm_dir}" ] || __pm_dir="."
     __pm_dir_physical="$(CDPATH= cd "\${__pm_dir}" 2>/dev/null && pwd -P)"
@@ -991,12 +1026,20 @@ __pm_find_next_command() {
       if __pm_is_package_manager_shim "\${__pm_candidate}"; then
         continue
       fi
+      if __pm_candidate_is_shell_wrapper "\${__pm_candidate}"; then
+        [ -n "\${__pm_fallback}" ] || __pm_fallback="\${__pm_candidate}"
+        continue
+      fi
       IFS="\${__pm_old_ifs}"
       printf '%s\\n' "\${__pm_candidate}"
       return 0
     fi
   done
   IFS="\${__pm_old_ifs}"
+  if [ -n "\${__pm_fallback}" ]; then
+    printf '%s\\n' "\${__pm_fallback}"
+    return 0
+  fi
   return 1
 }
 
