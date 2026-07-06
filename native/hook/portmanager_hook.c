@@ -1212,8 +1212,7 @@ static int pm_route_host_is_wildcard_text(const char *host) {
      strcmp(host, "*") == 0);
 }
 
-static const char *pm_non_default_loopback_host_env(const char *name) {
-  const char *host = getenv(name);
+static const char *pm_validated_non_default_loopback_host(const char *host) {
   struct in_addr address;
   uint32_t ip;
 
@@ -1231,6 +1230,10 @@ static const char *pm_non_default_loopback_host_env(const char *name) {
   }
 
   return host;
+}
+
+static const char *pm_non_default_loopback_host_env(const char *name) {
+  return pm_validated_non_default_loopback_host(getenv(name));
 }
 
 static const char *pm_actual_loopback_host(void) {
@@ -4494,6 +4497,159 @@ static void pm_free_rewritten_argv(char **rewritten, char *const original[]) {
   free(rewritten);
 }
 
+/*
+ * ============================================================================
+ * Per-network argv "localhost" rewrite (exec boundary)
+ * ============================================================================
+ * Hostname virtualization covers identity DERIVED from gethostname()/uname(),
+ * but a launcher that bakes the literal text "localhost" into a child's argv
+ * (e.g. celery multi's `-n celery1@localhost`, `--hostname=localhost`) never
+ * asks for the hostname, so every network's worker announces the same name.
+ * Inside a logical network the hook already defines what "localhost" MEANS at
+ * the socket layer (connect() → the network's loopback); this applies the same
+ * meaning to the textual layer at the exec boundary, with zero app knowledge.
+ *
+ * Only HOST-POSITIONED occurrences are rewritten — "@localhost", "=localhost",
+ * "://localhost", "localhost:<digit>" — never a standalone "localhost" token,
+ * so text arguments like `grep localhost` keep their meaning. (Standalone dial
+ * targets don't need rewriting anyway: the connect() rewrite routes them.)
+ * Occurrences that continue as a hostname label ("localhost.localdomain",
+ * "mylocalhost") never match. Opt-out: PORT_MANAGER_ARGV_LOCALHOST_REWRITE=0.
+ * Known tradeoff: every user@localhost-shaped identity is rewritten (that is
+ * the point), including e.g. `ssh user@localhost` — dial 127.0.0.1 explicitly
+ * to reach the machine-global service. See docs/per-network-hostname.md.
+ */
+#define PM_ARGV_LOCALHOST_REWRITE_ENV "PORT_MANAGER_ARGV_LOCALHOST_REWRITE"
+
+static int pm_is_hostname_label_char(unsigned char ch) {
+  return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+    ch == '-' || ch == '_';
+}
+
+/* True when the "localhost" at `occurrence` (inside `arg`) is host-positioned. */
+static int pm_localhost_occurrence_qualifies(const char *arg, const char *occurrence) {
+  unsigned char prev = occurrence == arg ? (unsigned char)'\0' : (unsigned char)occurrence[-1];
+  unsigned char next = (unsigned char)occurrence[9];
+  int word_boundary =
+    !pm_is_hostname_label_char(prev) && prev != '.' &&
+    !pm_is_hostname_label_char(next) && next != '.';
+  int host_position =
+    prev == '@' ||
+    prev == '=' ||
+    (prev == '/' && (occurrence - arg) >= 2 && occurrence[-2] == '/') ||
+    (next == ':' && occurrence[10] >= '0' && occurrence[10] <= '9');
+  return word_boundary && host_position;
+}
+
+/* malloc'd rewrite of one argument, or NULL when no occurrence qualifies. */
+static char *pm_rewrite_localhost_occurrences(const char *arg, const char *replacement) {
+  static const char needle[] = "localhost";
+  const size_t needle_length = sizeof(needle) - 1;
+  size_t replacement_length = strlen(replacement);
+  size_t qualifying = 0;
+  const char *cursor;
+  char *rewritten;
+  char *output;
+
+  for (cursor = strstr(arg, needle); cursor != NULL; cursor = strstr(cursor + needle_length, needle)) {
+    if (pm_localhost_occurrence_qualifies(arg, cursor)) {
+      qualifying++;
+    }
+  }
+  if (qualifying == 0) {
+    return NULL;
+  }
+
+  rewritten = malloc(strlen(arg) + qualifying * replacement_length + 1);
+  if (rewritten == NULL) {
+    return NULL;
+  }
+  output = rewritten;
+  cursor = arg;
+  while (*cursor != '\0') {
+    if (strncmp(cursor, needle, needle_length) == 0 && pm_localhost_occurrence_qualifies(arg, cursor)) {
+      memcpy(output, replacement, replacement_length);
+      output += replacement_length;
+      cursor += needle_length;
+    } else {
+      *output++ = *cursor++;
+    }
+  }
+  *output = '\0';
+  return rewritten;
+}
+
+/* The loopback the CHILD will live on, read from the environment it execs with. */
+static const char *pm_envp_network_loopback_host(char *const envp[]) {
+  const char *host = pm_validated_non_default_loopback_host(pm_envp_value(envp, PM_NETWORK_LOOPBACK_HOST_ENV));
+
+  if (host == NULL) {
+    host = pm_validated_non_default_loopback_host(pm_envp_value(envp, PM_ACTUAL_LOOPBACK_HOST_ENV));
+  }
+  return host;
+}
+
+/*
+ * Returns a rewritten argv with host-positioned "localhost" replaced by the
+ * child's network loopback, or NULL when nothing qualifies. Same contract as
+ * pm_rewrite_shell_c_argv: changed entries are malloc'd, unchanged entries
+ * alias the input array; release with pm_free_rewritten_argv.
+ */
+static char **pm_rewrite_localhost_argv(char *const argv[], char *const envp[]) {
+  const char *network;
+  const char *loopback;
+  size_t argc = 0;
+  size_t changed = 0;
+  char **rewritten;
+
+  if (!pm_hook_enabled() || pm_hook_depth > 0 || argv == NULL || envp == NULL ||
+      pm_envp_value_is(envp, "PORT_MANAGER_HOOK_DISABLED", "1") ||
+      pm_envp_value_is(envp, "PORT_MANAGER_HOOK", "0") ||
+      pm_envp_value_is(envp, PM_ARGV_LOCALHOST_REWRITE_ENV, "0")) {
+    return NULL;
+  }
+
+  network = pm_envp_value(envp, "PORT_MANAGER_NETWORK_NAME");
+  if (network == NULL || network[0] == '\0') {
+    network = pm_envp_value(envp, "PORT_MANAGER_NETWORK_ID");
+  }
+  if (network == NULL || network[0] == '\0') {
+    return NULL;
+  }
+
+  loopback = pm_envp_network_loopback_host(envp);
+  if (loopback == NULL) {
+    return NULL;
+  }
+
+  while (argv[argc] != NULL) {
+    argc++;
+  }
+  if (argc == 0) {
+    return NULL;
+  }
+
+  rewritten = (char **)malloc((argc + 1) * sizeof(char *));
+  if (rewritten == NULL) {
+    return NULL;
+  }
+  for (size_t index = 0; index < argc; index++) {
+    char *replaced = pm_rewrite_localhost_occurrences(argv[index], loopback);
+
+    if (replaced != NULL) {
+      changed++;
+      pm_debug("child argv localhost rewrite %s -> %s", argv[index], replaced);
+    }
+    rewritten[index] = replaced != NULL ? replaced : argv[index];
+  }
+  rewritten[argc] = NULL;
+  if (changed == 0) {
+    free(rewritten);
+    return NULL;
+  }
+  return rewritten;
+}
+
 static int pm_exec_with_prepared_child(
   const char *path,
   char *const argv[],
@@ -4538,8 +4694,12 @@ static int pm_exec_with_prepared_child(
 
   {
     char **rewritten_argv = pm_rewrite_shell_c_argv(exec_target, argv, child_environment.envp);
-    result = pm_real_execve(exec_target, rewritten_argv != NULL ? rewritten_argv : argv, child_environment.envp);
+    char *const *base_argv = rewritten_argv != NULL ? rewritten_argv : argv;
+    char **localhost_argv = pm_rewrite_localhost_argv(base_argv, child_environment.envp);
+    result = pm_real_execve(
+      exec_target, localhost_argv != NULL ? localhost_argv : base_argv, child_environment.envp);
     saved_errno = errno;
+    pm_free_rewritten_argv(localhost_argv, base_argv);
     pm_free_rewritten_argv(rewritten_argv, argv);
   }
   pm_release_child_environment(&child_environment);
@@ -4587,8 +4747,12 @@ static int pm_posix_spawn_hook(
   child_environment = pm_prepare_child_environment(envp);
   {
     char **rewritten_argv = pm_rewrite_shell_c_argv(target, argv, child_environment.envp);
+    char *const *base_argv = rewritten_argv != NULL ? rewritten_argv : argv;
+    char **localhost_argv = pm_rewrite_localhost_argv(base_argv, child_environment.envp);
     result = pm_real_posix_spawn(
-      pid, target, file_actions, attrp, rewritten_argv != NULL ? rewritten_argv : argv, child_environment.envp);
+      pid, target, file_actions, attrp, localhost_argv != NULL ? localhost_argv : base_argv,
+      child_environment.envp);
+    pm_free_rewritten_argv(localhost_argv, base_argv);
     pm_free_rewritten_argv(rewritten_argv, argv);
   }
   pm_release_child_environment(&child_environment);
@@ -4620,7 +4784,9 @@ static int pm_posix_spawnp_hook(
 
   {
     char **rewritten_argv = pm_rewrite_shell_c_argv(target != file ? target : file, argv, child_environment.envp);
-    char *const *effective_argv = rewritten_argv != NULL ? rewritten_argv : argv;
+    char *const *base_argv = rewritten_argv != NULL ? rewritten_argv : argv;
+    char **localhost_argv = pm_rewrite_localhost_argv(base_argv, child_environment.envp);
+    char *const *effective_argv = localhost_argv != NULL ? localhost_argv : base_argv;
     if (target != file) {
       /*
        * The runtime target was rewritten to an absolute shim path, so spawn it
@@ -4631,6 +4797,7 @@ static int pm_posix_spawnp_hook(
     } else {
       result = pm_real_posix_spawnp(pid, file, file_actions, attrp, effective_argv, child_environment.envp);
     }
+    pm_free_rewritten_argv(localhost_argv, base_argv);
     pm_free_rewritten_argv(rewritten_argv, argv);
   }
 
@@ -4814,13 +4981,17 @@ static int pm_kill_hook(pid_t pid, int sig) {
  * hostname — celery's default node name `celery@%h`, pidfiles, logs, locks,
  * metrics — collides across networks. To give each network a distinct identity
  * GENERICALLY, with zero application-specific knowledge, a hooked process that
- * carries a network id reports the NETWORK NAME as its hostname.
+ * carries a network id reports the NETWORK'S LOOPBACK ADDRESS as its hostname.
  *
- * gethostname()/uname().nodename then return e.g. "alphac"/"captainprod", so the
- * shell (bash/sh/zsh) and every child it spawns inherit a per-network identity.
- * Apps that derive identity from their hostname distinguish automatically (e.g.
- * celery's default `celery@%h` becomes `celery@alphac`). Opt-in and fail-safe:
- * no network id (or hook disabled) => the real hostname passes through. This is
+ * gethostname()/uname().nodename then return e.g. "127.93.164.7" — the address
+ * this network's servers actually live on. Unlike the user-chosen network name
+ * it is unique by construction, hostname-safe (names can be non-ASCII/spacey
+ * and degenerate when sanitized), and it resolves/connects as-is. The shell
+ * (bash/sh/zsh) and every child it spawns inherit it, so apps that derive
+ * identity from their hostname distinguish automatically (celery's default
+ * `celery@%h` becomes `celery@127.93.164.7`). Falls back to the sanitized
+ * network name when no loopback env is delivered. Opt-in and fail-safe: no
+ * network id (or hook disabled) => the real hostname passes through. This is
  * the generic analogue of what zz-multi does by hand with `--hostname=<cluster>`.
  * See docs/per-network-hostname.md.
  * ============================================================================
@@ -4837,14 +5008,17 @@ static pm_uname_fn pm_real_uname = NULL;
 #endif
 
 /*
- * Returns the per-network hostname (the network name, sanitized to hostname-safe
- * characters) for this process, or NULL when it is not attached to a network or
- * the hook is disabled. Uses only getenv + string ops, so it is safe to call
- * from any thread and arbitrarily early (no file I/O, no interposed calls).
+ * Returns the per-network hostname for this process, or NULL when it is not
+ * attached to a network or the hook is disabled. Prefers the network's loopback
+ * address (the host this network's servers bind on); falls back to the network
+ * name sanitized to hostname-safe characters when no loopback env is delivered.
+ * Uses only getenv + string ops, so it is safe to call from any thread and
+ * arbitrarily early (no file I/O, no interposed calls).
  */
 static const char *pm_network_hostname(void) {
   static __thread char sanitized[256];
   const char *network;
+  const char *loopback;
   size_t out = 0;
 
   if (!pm_hook_enabled()) {
@@ -4857,9 +5031,20 @@ static const char *pm_network_hostname(void) {
   if (network == NULL || network[0] == '\0') {
     return NULL;
   }
+  loopback = pm_network_loopback_host();
+  if (loopback == NULL) {
+    loopback = pm_actual_loopback_host();
+  }
+  if (loopback != NULL) {
+    return loopback;
+  }
   for (const char *cursor = network; *cursor != '\0' && out + 1 < sizeof(sanitized); cursor++) {
     unsigned char ch = (unsigned char)*cursor;
-    sanitized[out++] = (isalnum(ch) || ch == '-' || ch == '.') ? (char)ch : '-';
+    /* explicit ASCII ranges, not isalnum(): locale-aware ctype in UTF-8 hosts
+     * passes stray multibyte fragments through and yields invalid hostnames. */
+    int safe = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+      (ch >= '0' && ch <= '9') || ch == '-' || ch == '.';
+    sanitized[out++] = safe ? (char)ch : '-';
   }
   sanitized[out] = '\0';
   return sanitized[0] != '\0' ? sanitized : NULL;

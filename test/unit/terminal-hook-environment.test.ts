@@ -1934,7 +1934,7 @@ test("compose mutation publishes hidden ports on the network loopback host", () 
   assert.equal(attachBody.includes("hiddenHostAddress,"), true);
 });
 
-test("native hook virtualizes gethostname/uname to the per-network name", () => {
+test("native hook virtualizes gethostname/uname to the per-network loopback address", () => {
   const hook = fs.readFileSync(
     path.resolve(__dirname, "../../../native/hook/portmanager_hook.c"),
     "utf8",
@@ -1944,10 +1944,35 @@ test("native hook virtualizes gethostname/uname to the per-network name", () => 
   // distinguishes automatically — the extension holds no app-specific logic.
   assert.equal(hook.includes("PM_DYLD_INTERPOSE(pm_gethostname_hook, gethostname);"), true);
   assert.equal(hook.includes("PM_DYLD_INTERPOSE(pm_uname_hook, uname);"), true);
-  // Value is the network name; opt-in + fail-safe (no network id / hook off => real hostname).
+  // Value is the network's loopback address (unique, hostname-safe, connectable
+  // as-is); the sanitized network name is only the no-loopback-env fallback.
+  // Opt-in + fail-safe (no network id / hook off => real hostname).
   assert.equal(hook.includes('getenv("PORT_MANAGER_NETWORK_NAME")'), true);
+  assert.equal(hook.includes("loopback = pm_network_loopback_host();"), true);
+  assert.equal(hook.includes("loopback = pm_actual_loopback_host();"), true);
   assert.equal(hook.includes("if (!pm_hook_enabled()) {"), true);
   assert.equal(hook.includes("snprintf(buf->nodename, sizeof(buf->nodename)"), true);
+});
+
+test("native hook rewrites host-positioned localhost argv at the exec boundary", () => {
+  const hook = fs.readFileSync(
+    path.resolve(__dirname, "../../../native/hook/portmanager_hook.c"),
+    "utf8",
+  );
+  // A launcher-baked literal (`--hostname=localhost`, `-n x@localhost`) never
+  // consults gethostname, so the exec boundary applies the same "localhost =
+  // this network's loopback" meaning textually — host-positioned occurrences
+  // only, with a standalone token untouched so text args (grep patterns) keep
+  // their meaning.
+  assert.equal(hook.includes("static char **pm_rewrite_localhost_argv("), true);
+  assert.equal(hook.includes("static int pm_localhost_occurrence_qualifies("), true);
+  assert.equal(
+    hook.includes('#define PM_ARGV_LOCALHOST_REWRITE_ENV "PORT_MANAGER_ARGV_LOCALHOST_REWRITE"'),
+    true,
+  );
+  // Wired into all three exec boundaries (execve family, posix_spawn, posix_spawnp).
+  const wired = hook.split("pm_rewrite_localhost_argv(base_argv, child_environment.envp)").length - 1;
+  assert.equal(wired, 3);
 });
 
 test("native hook no longer redirects filesystem paths (reverted for the hostname approach)", () => {

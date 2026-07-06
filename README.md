@@ -176,10 +176,15 @@ routing/attribution decisions to that one file; `tail -f` it. Empty disables it
 Running the **same repo directory** in two logical networks makes hostname-keyed
 app identity collide (celery node name `@%h`, pidfiles/logs, locks, metrics),
 because every process still thinks it is on the one machine hostname. The native
-hook virtualizes `gethostname()`/`uname()` to the **network name** for a hooked
-process and all its children, so any app that keys off its hostname distinguishes
-itself per network automatically — no app-specific logic in the extension. Apps
-use it by keeping standard hostname templates (celery `%h`/`%n`). See
+hook virtualizes `gethostname()`/`uname()` to the **network's loopback address**
+(e.g. `127.93.164.7` — unique per network, hostname-safe, connectable as-is; the
+sanitized network name is only a fallback) for a hooked process and all its
+children, so any app that keys off its hostname distinguishes itself per network
+automatically — no app-specific logic in the extension. Apps
+use it by keeping standard hostname templates (celery `%h`/`%n`); argv literals
+like `--hostname=localhost` are additionally rewritten to the network loopback
+at the exec boundary (host-positioned occurrences only — a standalone
+`localhost` token, e.g. a grep pattern, is never touched). See
 [docs/per-network-hostname.md](docs/per-network-hostname.md).
 
 For Marketplace release steps, publisher identity, VSIX verification, and native hook packaging checks, see [PUBLISHING.MD](PUBLISHING.MD). The Marketplace publisher ID is `newdlops`.
