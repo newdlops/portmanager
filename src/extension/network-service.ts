@@ -4924,9 +4924,16 @@ export class PortManagerNetworkService implements DisposableLike {
   ): Promise<LogicalPortRouterTarget> {
     const settings = readPortManagerSettings();
     // In the address-only model, an unattributable client belongs to the
-    // reserved global network. It must not fall through to a network-less
-    // localhost owner, because 127.0.0.1/0.0.0.0 are daemon-owned ingress.
+    // reserved global network. Fixed-protocol host clients first reuse the
+    // host-default gateway policy so IPv6 ::1 clients behave like the pf IPv4
+    // redirect path instead of probing the empty global network for compose DBs.
     if (settings.globalNetwork && usesLoopbackAddressOnlyRouting(settings)) {
+      const hostDefaultGatewayTarget = this.resolveHostDefaultGatewayClientTarget(logicalPort);
+      if (hostDefaultGatewayTarget !== undefined) {
+        await this.waitForBackendReachable(hostDefaultGatewayTarget.host, hostDefaultGatewayTarget.port);
+        return hostDefaultGatewayTarget;
+      }
+
       return this.resolveNetworkClientTarget(GLOBAL_LOGICAL_NETWORK_ID, logicalPort, []);
     }
 
@@ -4936,6 +4943,48 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     return { host: ownerRoute.host, port: ownerRoute.actualPort };
+  }
+
+  /**
+   * Selects the raw TCP target used by hookless host clients on fixed-protocol
+   * ports. This mirrors the host-local pf redirect policy but runs inside the
+   * logical router too, which covers IPv6 localhost and systems without pf rules.
+   */
+  private resolveHostDefaultGatewayClientTarget(logicalPort: number): LogicalPortRouterTarget | undefined {
+    if (!this.isFixedProtocolPort(logicalPort)) {
+      return undefined;
+    }
+
+    const registrySnapshot = this.registry.getSnapshot();
+    const processSnapshot = this.processService?.getSnapshot();
+    const exposures = collectHostGatewayExposures(
+      processSnapshot?.routes ?? [],
+      registrySnapshot.networks,
+      [],
+      registrySnapshot.composeAttachments,
+    ).filter((exposure) => exposure.hostPort === logicalPort);
+    const exposure = selectHostDefaultGatewayExposure(exposures, {
+      networks: registrySnapshot.networks,
+      preferredNetworkId:
+        this.vscodeWindowTerminalBinding?.status === "attached" ? this.vscodeWindowTerminalBinding.networkId : undefined,
+    });
+
+    if (exposure === undefined) {
+      if (devLogEnabled()) {
+        devLog("ts-router", `host-default logical_port=${logicalPort} -> MISS`);
+      }
+      return undefined;
+    }
+
+    const host = exposure.targetAddress.trim().length === 0 ? "127.0.0.1" : exposure.targetAddress;
+    if (devLogEnabled()) {
+      devLog(
+        "ts-router",
+        `host-default logical_port=${logicalPort} network=${exposure.networkId} -> ${host}:${exposure.targetPort}`,
+      );
+    }
+
+    return { host, port: exposure.targetPort };
   }
 
   /** Finds the network-less relocated listen route that owns a logical port. */

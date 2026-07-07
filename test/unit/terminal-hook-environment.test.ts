@@ -2010,10 +2010,20 @@ test("logical router classifies clients by process tree label before hook enviro
   );
   assert.equal(resolveNetworkClientTarget.includes("this.isFixedProtocolPort(logicalPort) && !isComposePort"), true);
 
-  // In address-only mode, unattributable clients join the reserved global
-  // network instead of falling through to legacy network-less localhost owners.
+  // In address-only mode, unattributable fixed-protocol host clients first reuse
+  // the host-default gateway policy, then join the reserved global network
+  // instead of falling through to legacy network-less localhost owners.
   assert.equal(
     resolveNonNetworkClientTarget.includes("settings.globalNetwork && usesLoopbackAddressOnlyRouting(settings)"),
+    true,
+  );
+  assert.equal(
+    resolveNonNetworkClientTarget.includes("this.resolveHostDefaultGatewayClientTarget(logicalPort)"),
+    true,
+  );
+  assert.equal(
+    resolveNonNetworkClientTarget.indexOf("this.resolveHostDefaultGatewayClientTarget(logicalPort)") <
+      resolveNonNetworkClientTarget.indexOf("this.resolveNetworkClientTarget(GLOBAL_LOGICAL_NETWORK_ID"),
     true,
   );
   assert.equal(
@@ -2027,6 +2037,10 @@ test("logical router classifies clients by process tree label before hook enviro
       resolveNonNetworkClientTarget.indexOf("this.findNonNetworkOwnerRoute(logicalPort, clientCwd)"),
     true,
   );
+  assert.equal(source.includes("private resolveHostDefaultGatewayClientTarget(logicalPort: number)"), true);
+  assert.equal(source.includes("collectHostGatewayExposures("), true);
+  assert.equal(source.includes("selectHostDefaultGatewayExposure(exposures"), true);
+  assert.equal(source.includes("this.vscodeWindowTerminalBinding?.status === \"attached\""), true);
 
   // The older cwd/unique-route guessing fallbacks are removed; the legacy
   // non-network path forwards only to an explicit relocated owner.
