@@ -2143,6 +2143,8 @@ test("native hook virtualizes gethostname/uname to the per-network loopback addr
   assert.equal(hook.includes('getenv("PORT_MANAGER_NETWORK_NAME")'), true);
   assert.equal(hook.includes("loopback = pm_network_loopback_host();"), true);
   assert.equal(hook.includes("loopback = pm_actual_loopback_host();"), true);
+  assert.equal(hook.includes("static uint32_t pm_fnv1a32"), true);
+  assert.equal(hook.includes("pm_loopback_host_for_network_id(network_id)"), true);
   assert.equal(hook.includes("if (!pm_hook_enabled()) {"), true);
   assert.equal(hook.includes("snprintf(buf->nodename, sizeof(buf->nodename)"), true);
 });
@@ -2260,6 +2262,24 @@ test("native hook substitutes per-network files exclusively at open", () => {
   // Only real files substitute, and .portmanager itself is never remapped.
   assert.equal(hook.includes("S_ISREG(substitute_stat.st_mode)"), true);
   assert.equal(hook.includes('strstr(absolute, "/.portmanager/")'), true);
+});
+
+test("native hook rewrites state argv paths using the child network environment", () => {
+  const hook = fs.readFileSync(
+    path.resolve(__dirname, "../../../native/hook/portmanager_hook.c"),
+    "utf8",
+  );
+  const rewriteStart = hook.indexOf("static char **pm_rewrite_state_path_argv");
+  const rewriteEnd = hook.indexOf("static int pm_exec_with_prepared_child", rewriteStart);
+  const rewriteBody = hook.slice(rewriteStart, rewriteEnd);
+
+  assert.notEqual(rewriteStart, -1);
+  assert.notEqual(rewriteEnd, -1);
+  assert.equal(hook.includes("pm_file_substitution_context_for_envp"), true);
+  assert.equal(rewriteBody.includes("pm_file_substitution_context context;"), true);
+  assert.equal(rewriteBody.includes("pm_file_substitution_context_for_envp(envp, &context)"), true);
+  assert.equal(rewriteBody.includes("pm_rewrite_state_path_token(argv[index], &context)"), true);
+  assert.equal(rewriteBody.includes("pm_file_substitution_ready"), false);
 });
 
 test("native hook no longer redirects filesystem paths (reverted for the hostname approach)", () => {

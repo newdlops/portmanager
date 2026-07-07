@@ -945,6 +945,13 @@ static size_t pm_file_substitution_root_length = 0;
 static char pm_file_substitution_prefix[PM_MAX_PATH];
 static int pm_file_substitution_ready = 0;
 
+typedef struct {
+  char root[PM_MAX_PATH];
+  size_t root_length;
+  char prefix[PM_MAX_PATH];
+  int ready;
+} pm_file_substitution_context;
+
 typedef int (*pm_open_fn)(const char *, int, ...);
 typedef int (*pm_openat_fn)(int, const char *, int, ...);
 typedef int (*pm_unlink_fn)(const char *);
@@ -956,14 +963,69 @@ static pm_unlink_fn pm_real_unlink = NULL;
 static pm_unlinkat_fn pm_real_unlinkat = NULL;
 #endif
 
-/* Resolved once, before main: nearest ancestor of cwd with `.portmanager/`. */
-static void pm_file_substitution_init(void) {
-  const char *network;
-  const char *flag;
+static int pm_file_substitution_build_context(const char *network, pm_file_substitution_context *context) {
   char directory[PM_MAX_PATH];
   char probe[PM_MAX_PATH];
   char network_key[256];
   size_t out = 0;
+
+  memset(context, 0, sizeof(*context));
+  if (network == NULL || network[0] == '\0') {
+    return -1;
+  }
+  for (const char *cursor = network; *cursor != '\0' && out + 1 < sizeof(network_key); cursor++) {
+    network_key[out++] = (*cursor == '/') ? '-' : *cursor;
+  }
+  network_key[out] = '\0';
+  if (out == 0) {
+    return -1;
+  }
+  if (getcwd(directory, sizeof(directory)) == NULL) {
+    return -1;
+  }
+
+  for (int depth = 0; depth < 64; depth++) {
+    struct stat probe_stat;
+    char *slash;
+
+    snprintf(probe, sizeof(probe), "%s/.portmanager", directory);
+    if (stat(probe, &probe_stat) == 0 && S_ISDIR(probe_stat.st_mode)) {
+      int written = snprintf(
+        context->prefix,
+        sizeof(context->prefix),
+        "%s/.portmanager/%s/%s",
+        directory,
+        PM_FILE_SUBSTITUTION_DIR,
+        network_key);
+      if (written <= 0 || (size_t)written >= sizeof(context->prefix)) {
+        return -1;
+      }
+      snprintf(context->root, sizeof(context->root), "%s", directory);
+      context->root_length = strlen(context->root);
+      context->ready = 1;
+      return 0;
+    }
+    slash = strrchr(directory, '/');
+    if (slash == NULL) {
+      return -1;
+    }
+    if (slash == directory) {
+      if (directory[1] == '\0') {
+        return -1;
+      }
+      directory[1] = '\0';
+      continue;
+    }
+    *slash = '\0';
+  }
+  return -1;
+}
+
+/* Resolved once, before main: nearest ancestor of cwd with `.portmanager/`. */
+static void pm_file_substitution_init(void) {
+  const char *network;
+  const char *flag;
+  pm_file_substitution_context context;
 
   if (!pm_hook_enabled() || pm_network_scope_is_global()) {
     return;
@@ -976,62 +1038,30 @@ static void pm_file_substitution_init(void) {
   if (network == NULL || network[0] == '\0') {
     network = getenv("PORT_MANAGER_NETWORK_ID");
   }
-  if (network == NULL || network[0] == '\0') {
+  if (pm_file_substitution_build_context(network, &context) != 0) {
     return;
   }
-  for (const char *cursor = network; *cursor != '\0' && out + 1 < sizeof(network_key); cursor++) {
-    network_key[out++] = (*cursor == '/') ? '-' : *cursor;
-  }
-  network_key[out] = '\0';
-  if (out == 0) {
-    return;
-  }
-  if (getcwd(directory, sizeof(directory)) == NULL) {
-    return;
-  }
-
-  for (int depth = 0; depth < 64; depth++) {
-    struct stat probe_stat;
-    char *slash;
-
-    snprintf(probe, sizeof(probe), "%s/.portmanager", directory);
-    if (stat(probe, &probe_stat) == 0 && S_ISDIR(probe_stat.st_mode)) {
-      int written = snprintf(
-        pm_file_substitution_prefix,
-        sizeof(pm_file_substitution_prefix),
-        "%s/.portmanager/%s/%s",
-        directory,
-        PM_FILE_SUBSTITUTION_DIR,
-        network_key);
-      if (written <= 0 || (size_t)written >= sizeof(pm_file_substitution_prefix)) {
-        return;
-      }
-      snprintf(pm_file_substitution_root, sizeof(pm_file_substitution_root), "%s", directory);
-      pm_file_substitution_root_length = strlen(pm_file_substitution_root);
-      pm_file_substitution_ready = 1;
-      return;
-    }
-    slash = strrchr(directory, '/');
-    if (slash == NULL) {
-      return;
-    }
-    if (slash == directory) {
-      if (directory[1] == '\0') {
-        return;
-      }
-      directory[1] = '\0';
-      continue;
-    }
-    *slash = '\0';
-  }
+  snprintf(pm_file_substitution_root, sizeof(pm_file_substitution_root), "%s", context.root);
+  pm_file_substitution_root_length = context.root_length;
+  snprintf(pm_file_substitution_prefix, sizeof(pm_file_substitution_prefix), "%s", context.prefix);
+  pm_file_substitution_ready = 1;
 }
 
 /* Builds the substitute candidate for a path; 0 when inside the root. */
-static int pm_file_substitution_candidate(const char *path, char *absolute, size_t absolute_size, char *buffer, size_t size) {
+static int pm_file_substitution_candidate_for_context(
+  const char *path,
+  char *absolute,
+  size_t absolute_size,
+  char *buffer,
+  size_t size,
+  const char *root,
+  size_t root_length,
+  const char *prefix) {
   const char *relative;
   int written;
 
-  if (!pm_file_substitution_ready || path == NULL || path[0] == '\0') {
+  if (root == NULL || root[0] == '\0' || prefix == NULL || prefix[0] == '\0' ||
+      path == NULL || path[0] == '\0') {
     return -1;
   }
   if (path[0] == '/') {
@@ -1053,19 +1083,33 @@ static int pm_file_substitution_candidate(const char *path, char *absolute, size
   if (strstr(absolute, "/.portmanager/") != NULL || strstr(absolute, "/../") != NULL) {
     return -1;
   }
-  if (strncmp(absolute, pm_file_substitution_root, pm_file_substitution_root_length) != 0 ||
-      absolute[pm_file_substitution_root_length] != '/') {
+  if (strncmp(absolute, root, root_length) != 0 || absolute[root_length] != '/') {
     return -1;
   }
-  relative = absolute + pm_file_substitution_root_length + 1;
+  relative = absolute + root_length + 1;
   if (relative[0] == '\0') {
     return -1;
   }
-  written = snprintf(buffer, size, "%s/%s", pm_file_substitution_prefix, relative);
+  written = snprintf(buffer, size, "%s/%s", prefix, relative);
   if (written <= 0 || (size_t)written >= size) {
     return -1;
   }
   return 0;
+}
+
+static int pm_file_substitution_candidate(const char *path, char *absolute, size_t absolute_size, char *buffer, size_t size) {
+  if (!pm_file_substitution_ready) {
+    return -1;
+  }
+  return pm_file_substitution_candidate_for_context(
+    path,
+    absolute,
+    absolute_size,
+    buffer,
+    size,
+    pm_file_substitution_root,
+    pm_file_substitution_root_length,
+    pm_file_substitution_prefix);
 }
 
 /*
@@ -2032,6 +2076,34 @@ static const char *pm_actual_loopback_host(void) {
 
 static const char *pm_network_loopback_host(void) {
   return pm_non_default_loopback_host_env(PM_NETWORK_LOOPBACK_HOST_ENV);
+}
+
+static uint32_t pm_fnv1a32(const char *value) {
+  uint32_t hash = 0x811c9dc5u;
+
+  for (const unsigned char *cursor = (const unsigned char *)value; cursor != NULL && *cursor != '\0'; cursor++) {
+    hash ^= (uint32_t)*cursor;
+    hash *= 0x01000193u;
+  }
+  return hash;
+}
+
+static const char *pm_loopback_host_for_network_id(const char *network_id) {
+  static __thread char host[32];
+  uint32_t hash;
+  unsigned int second_octet;
+  unsigned int third_octet;
+  unsigned int fourth_octet;
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    return NULL;
+  }
+  hash = pm_fnv1a32(network_id);
+  second_octet = 80u + (hash & 0x1fu);
+  third_octet = (hash >> 8) & 0xffu;
+  fourth_octet = 1u + ((hash >> 16) % 254u);
+  snprintf(host, sizeof(host), "127.%u.%u.%u", second_octet, third_octet, fourth_octet);
+  return host;
 }
 
 static void pm_sockaddr_host(const struct sockaddr *addr, char *buffer, size_t size) {
@@ -5580,6 +5652,26 @@ static char **pm_rewrite_localhost_argv(char *const argv[], char *const envp[]) 
   return rewritten;
 }
 
+static int pm_file_substitution_context_for_envp(char *const envp[], pm_file_substitution_context *context) {
+  const char *network;
+  const char *flag;
+
+  if (envp == NULL || pm_envp_value_is(envp, "PORT_MANAGER_HOOK_DISABLED", "1") ||
+      pm_envp_value_is(envp, "PORT_MANAGER_HOOK", "0") ||
+      pm_envp_network_scope_is_global(envp)) {
+    return -1;
+  }
+  flag = pm_envp_value(envp, PM_FILE_SUBSTITUTION_ENV);
+  if (flag != NULL && strcmp(flag, "0") == 0) {
+    return -1;
+  }
+  network = pm_envp_value(envp, "PORT_MANAGER_NETWORK_NAME");
+  if (network == NULL || network[0] == '\0') {
+    network = pm_envp_network_id(envp);
+  }
+  return pm_file_substitution_build_context(network, context);
+}
+
 /*
  * Maps one argv token (or the value part of a `--flag=`/`KEY=` token) to this
  * process's network mirror when the mirror file exists. This is what lets an
@@ -5587,20 +5679,31 @@ static char **pm_rewrite_localhost_argv(char *const argv[], char *const envp[]) 
  * network's state file: the hooked exec boundary hands it the mirror path as
  * plain argv, so each terminal observes its own namespace.
  */
-static char *pm_rewrite_state_path_token(const char *token) {
+static char *pm_rewrite_state_path_token(const char *token, const pm_file_substitution_context *context) {
   char absolute[PM_MAX_PATH];
   char candidate[PM_MAX_PATH];
   struct stat candidate_stat;
   const char *value = token;
   const char *equals = strchr(token, '=');
 
+  if (context == NULL || !context->ready) {
+    return NULL;
+  }
   if (equals != NULL && equals[1] != '\0') {
     value = equals + 1;
   }
   if (value[0] == '\0' || value[0] == '-') {
     return NULL;
   }
-  if (pm_file_substitution_candidate(value, absolute, sizeof(absolute), candidate, sizeof(candidate)) != 0) {
+  if (pm_file_substitution_candidate_for_context(
+        value,
+        absolute,
+        sizeof(absolute),
+        candidate,
+        sizeof(candidate),
+        context->root,
+        context->root_length,
+        context->prefix) != 0) {
     return NULL;
   }
   if (stat(candidate, &candidate_stat) != 0 || !S_ISREG(candidate_stat.st_mode)) {
@@ -5631,10 +5734,9 @@ static char **pm_rewrite_state_path_argv(char *const argv[], char *const envp[])
   size_t argc = 0;
   size_t changed = 0;
   char **rewritten;
+  pm_file_substitution_context context;
 
-  if (!pm_file_substitution_ready || pm_hook_depth > 0 || argv == NULL || envp == NULL ||
-      pm_envp_value_is(envp, "PORT_MANAGER_HOOK_DISABLED", "1") ||
-      pm_envp_value_is(envp, "PORT_MANAGER_HOOK", "0")) {
+  if (pm_hook_depth > 0 || argv == NULL || pm_file_substitution_context_for_envp(envp, &context) != 0) {
     return NULL;
   }
   while (argv[argc] != NULL) {
@@ -5648,7 +5750,7 @@ static char **pm_rewrite_state_path_argv(char *const argv[], char *const envp[])
     return NULL;
   }
   for (size_t index = 0; index < argc; index++) {
-    char *replaced = pm_rewrite_state_path_token(argv[index]);
+    char *replaced = pm_rewrite_state_path_token(argv[index], &context);
 
     if (replaced != NULL) {
       changed++;
@@ -6043,6 +6145,7 @@ static pm_uname_fn pm_real_uname = NULL;
 static const char *pm_network_hostname(void) {
   static __thread char sanitized[256];
   const char *network;
+  const char *network_id;
   const char *loopback;
   size_t out = 0;
 
@@ -6063,6 +6166,10 @@ static const char *pm_network_hostname(void) {
   loopback = pm_network_loopback_host();
   if (loopback == NULL) {
     loopback = pm_actual_loopback_host();
+  }
+  network_id = pm_current_network_id();
+  if (loopback != NULL && network_id != NULL && network_id[0] != '\0') {
+    return pm_loopback_host_for_network_id(network_id);
   }
   if (loopback != NULL) {
     return loopback;
