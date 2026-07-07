@@ -187,6 +187,15 @@ at the exec boundary (host-positioned occurrences only — a standalone
 `localhost` token, e.g. a grep pattern, is never touched). See
 [docs/per-network-hostname.md](docs/per-network-hostname.md).
 
+Per-network **values** (credential paths, bucket names, flags) come from an
+optional `.portmanager/env/<network>.env` found upward from the process working
+directory: the hook applies it before `main()` in every attached process —
+ahead of any runtime's env snapshot and with precedence over the app's own
+`.env`. See [docs/per-network-env.md](docs/per-network-env.md). For whole-file
+replacement, a file at `.portmanager/files/<network>/<relative-path>` is opened
+**instead of** the original (reads and writes; existence is the opt-in). See
+[docs/per-network-files.md](docs/per-network-files.md).
+
 For Marketplace release steps, publisher identity, VSIX verification, and native hook packaging checks, see [PUBLISHING.MD](PUBLISHING.MD). The Marketplace publisher ID is `newdlops`.
 
 ## Architecture

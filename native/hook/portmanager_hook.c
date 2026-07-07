@@ -656,8 +656,724 @@ static void pm_normalize_process_preload_env(void) {
   free(assignment);
 }
 
+/*
+ * ============================================================================
+ * Per-network environment file injection
+ * ============================================================================
+ * Routing lets one .env serve every network (localhost URLs route per network)
+ * and hostname virtualization splits hostname-derived identity, but neither can
+ * express per-network VALUES — a credential path, a bucket name — without
+ * app-specific configuration. The generic supply point is process startup:
+ * this dylib's constructor runs before main() and before every runtime's
+ * environment snapshot (CPython os.environ, JVM, Go), so values set here are
+ * visible to ANY runtime with zero app knowledge.
+ *
+ * A process attached to network <name> looks for `.portmanager/env/<name>.env`
+ * from its cwd upward (nearest wins; <name> falls back to the network id) and
+ * applies KEY=VALUE lines with OVERWRITE semantics — the per-network file beats
+ * both inherited terminal env and the app's own .env (dotenv defaults never
+ * overwrite existing vars). Reserved names (PORT_MANAGER_*, NEWDLOPS_PM_*,
+ * PATH, BASH_ENV, preload vars) are never applied. The tree marker
+ * (PORT_MANAGER_NETWORK_ENV_APPLIED=<network>) makes injection once per process
+ * tree, so values an app deliberately changes mid-tree are not stomped in its
+ * children; the shell itself is unhooked and marker-free, so every fresh
+ * command re-reads the file and picks up edits. Format: KEY=VALUE lines,
+ * optional `export ` prefix, #-comments, one matching quote pair stripped; no
+ * interpolation, no multiline. See docs/per-network-env.md.
+ * ============================================================================
+ */
+#define PM_NETWORK_ENV_DIR_RELATIVE ".portmanager/env"
+#define PM_NETWORK_ENV_APPLIED_ENV "PORT_MANAGER_NETWORK_ENV_APPLIED"
+
+static int pm_network_env_key_is_reserved(const char *key) {
+  static const char *const reserved[] = {"PATH", "BASH_ENV", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD", NULL};
+
+  if (strncmp(key, "PORT_MANAGER_", 13) == 0 || strncmp(key, "NEWDLOPS_PM_", 12) == 0) {
+    return 1;
+  }
+  for (size_t index = 0; reserved[index] != NULL; index++) {
+    if (strcmp(key, reserved[index]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int pm_network_env_key_is_valid(const char *key) {
+  if (!((key[0] >= 'A' && key[0] <= 'Z') || (key[0] >= 'a' && key[0] <= 'z') || key[0] == '_')) {
+    return 0;
+  }
+  for (const char *cursor = key + 1; *cursor != '\0'; cursor++) {
+    if (!((*cursor >= 'A' && *cursor <= 'Z') || (*cursor >= 'a' && *cursor <= 'z') ||
+          (*cursor >= '0' && *cursor <= '9') || *cursor == '_')) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* Applies one env-file line in place; returns 1 when a variable was set. */
+static int pm_network_env_apply_line(char *line) {
+  char *cursor = line;
+  char *equals;
+  char *key;
+  char *key_end;
+  char *value;
+  size_t value_length;
+
+  while (*cursor == ' ' || *cursor == '\t') {
+    cursor++;
+  }
+  if (*cursor == '\0' || *cursor == '#') {
+    return 0;
+  }
+  if (strncmp(cursor, "export ", 7) == 0) {
+    cursor += 7;
+    while (*cursor == ' ' || *cursor == '\t') {
+      cursor++;
+    }
+  }
+  equals = strchr(cursor, '=');
+  if (equals == NULL || equals == cursor) {
+    return 0;
+  }
+  key = cursor;
+  key_end = equals;
+  while (key_end > key && (key_end[-1] == ' ' || key_end[-1] == '\t')) {
+    key_end--;
+  }
+  value = equals + 1;
+  *key_end = '\0';
+  while (*value == ' ' || *value == '\t') {
+    value++;
+  }
+  value_length = strlen(value);
+  while (value_length > 0 &&
+         (value[value_length - 1] == ' ' || value[value_length - 1] == '\t' || value[value_length - 1] == '\r')) {
+    value[--value_length] = '\0';
+  }
+  if (value_length >= 2 && (value[0] == '"' || value[0] == '\'') && value[value_length - 1] == value[0]) {
+    value[value_length - 1] = '\0';
+    value++;
+  }
+  if (!pm_network_env_key_is_valid(key) || pm_network_env_key_is_reserved(key)) {
+    return 0;
+  }
+  return setenv(key, value, 1) == 0 ? 1 : 0;
+}
+
+/* Finds `.portmanager/env/<network>.env` from cwd upward; 0 on success. */
+static int pm_find_network_env_file(const char *network, char *path, size_t size) {
+  char directory[PM_MAX_PATH];
+  char file_name[256];
+  size_t out = 0;
+
+  /* The network name doubles as a file name: bytes verbatim, path separators mapped. */
+  for (const char *cursor = network; *cursor != '\0' && out + 5 < sizeof(file_name); cursor++) {
+    file_name[out++] = (*cursor == '/') ? '-' : *cursor;
+  }
+  if (out == 0) {
+    return -1;
+  }
+  memcpy(file_name + out, ".env", 5);
+
+  if (getcwd(directory, sizeof(directory)) == NULL) {
+    return -1;
+  }
+
+  for (int depth = 0; depth < 64; depth++) {
+    struct stat file_stat;
+    char *slash;
+
+    snprintf(path, size, "%s/%s/%s", directory, PM_NETWORK_ENV_DIR_RELATIVE, file_name);
+    if (stat(path, &file_stat) == 0 && S_ISREG(file_stat.st_mode)) {
+      return 0;
+    }
+    slash = strrchr(directory, '/');
+    if (slash == NULL) {
+      return -1;
+    }
+    if (slash == directory) {
+      if (directory[1] == '\0') {
+        return -1;
+      }
+      directory[1] = '\0';
+      continue;
+    }
+    *slash = '\0';
+  }
+  return -1;
+}
+
+static void pm_apply_network_env_file(void) {
+  const char *network;
+  const char *already_applied;
+  char path[PM_MAX_PATH];
+  FILE *file;
+  char line[4096];
+  int applied_count = 0;
+
+  if (!pm_hook_enabled()) {
+    return;
+  }
+  network = getenv("PORT_MANAGER_NETWORK_NAME");
+  if (network == NULL || network[0] == '\0') {
+    network = getenv("PORT_MANAGER_NETWORK_ID");
+  }
+  if (network == NULL || network[0] == '\0') {
+    return;
+  }
+
+  /* Once per process tree: children inherit both the values and this marker. */
+  already_applied = getenv(PM_NETWORK_ENV_APPLIED_ENV);
+  if (already_applied != NULL && strcmp(already_applied, network) == 0) {
+    return;
+  }
+  setenv(PM_NETWORK_ENV_APPLIED_ENV, network, 1);
+
+  if (pm_find_network_env_file(network, path, sizeof(path)) != 0) {
+    return;
+  }
+  file = fopen(path, "r");
+  if (file == NULL) {
+    return;
+  }
+  while (fgets(line, sizeof(line), file) != NULL) {
+    size_t length = strlen(line);
+
+    if (length > 0 && line[length - 1] == '\n') {
+      line[length - 1] = '\0';
+    }
+    applied_count += pm_network_env_apply_line(line);
+  }
+  fclose(file);
+  if (applied_count > 0) {
+    pm_debug("network env applied file=%s keys=%d", path, applied_count);
+    pm_dev_log("hook", "network-env applied file=%s keys=%d pid=%d", path, applied_count, (int)getpid());
+  }
+}
+
+/*
+ * ============================================================================
+ * Per-network file substitution (existence-based, exclusive)
+ * ============================================================================
+ * The rule, as specified: when a per-network counterpart of a file exists under
+ * `.portmanager`, the process talks ONLY to that counterpart — the original is
+ * never read (or written). Layout mirrors the original path:
+ *
+ *   <root>/.portmanager/files/<network>/<path relative to root>
+ *
+ * e.g. inside network "alphac", open("<root>/.env") opens
+ * `<root>/.portmanager/files/alphac/.env` when that file exists; open modes are
+ * not special-cased, so writes land in the substitute too. <root> is the
+ * nearest ancestor of the process cwd containing a `.portmanager` directory,
+ * resolved ONCE in the constructor; per-open cost is a prefix compare plus one
+ * stat, and paths outside the root (or already under `.portmanager/`) are
+ * untouched. Existence of the substitute IS the opt-in: no substitute file, no
+ * behavior change — which also keeps this compatible with tools that are not
+ * hooked (they see real files either way; the substitute is a real file the
+ * user created and edits). Opt-out: PORT_MANAGER_FILE_SUBSTITUTION=0.
+ *
+ * Limits: only open/openat are interposed (openat only for AT_FDCWD or
+ * absolute paths); stat/exists checks still see the original, so apps that
+ * probe before opening need the ORIGINAL to exist (substitute replaces its
+ * content, not its existence); paths with ".." segments are left alone. This
+ * is NOT the reverted state-path redirection: nothing is invented or moved —
+ * a user-created file is chosen over the original, per network.
+ * ============================================================================
+ */
+#define PM_FILE_SUBSTITUTION_ENV "PORT_MANAGER_FILE_SUBSTITUTION"
+#define PM_FILE_SUBSTITUTION_DIR "files"
+
+static char pm_file_substitution_root[PM_MAX_PATH];
+static size_t pm_file_substitution_root_length = 0;
+static char pm_file_substitution_prefix[PM_MAX_PATH];
+static int pm_file_substitution_ready = 0;
+
+typedef int (*pm_open_fn)(const char *, int, ...);
+typedef int (*pm_openat_fn)(int, const char *, int, ...);
+typedef int (*pm_unlink_fn)(const char *);
+typedef int (*pm_unlinkat_fn)(int, const char *, int);
+#if !defined(__APPLE__)
+static pm_open_fn pm_real_open = NULL;
+static pm_openat_fn pm_real_openat = NULL;
+static pm_unlink_fn pm_real_unlink = NULL;
+static pm_unlinkat_fn pm_real_unlinkat = NULL;
+#endif
+
+/* Resolved once, before main: nearest ancestor of cwd with `.portmanager/`. */
+static void pm_file_substitution_init(void) {
+  const char *network;
+  const char *flag;
+  char directory[PM_MAX_PATH];
+  char probe[PM_MAX_PATH];
+  char network_key[256];
+  size_t out = 0;
+
+  if (!pm_hook_enabled()) {
+    return;
+  }
+  flag = getenv(PM_FILE_SUBSTITUTION_ENV);
+  if (flag != NULL && strcmp(flag, "0") == 0) {
+    return;
+  }
+  network = getenv("PORT_MANAGER_NETWORK_NAME");
+  if (network == NULL || network[0] == '\0') {
+    network = getenv("PORT_MANAGER_NETWORK_ID");
+  }
+  if (network == NULL || network[0] == '\0') {
+    return;
+  }
+  for (const char *cursor = network; *cursor != '\0' && out + 1 < sizeof(network_key); cursor++) {
+    network_key[out++] = (*cursor == '/') ? '-' : *cursor;
+  }
+  network_key[out] = '\0';
+  if (out == 0) {
+    return;
+  }
+  if (getcwd(directory, sizeof(directory)) == NULL) {
+    return;
+  }
+
+  for (int depth = 0; depth < 64; depth++) {
+    struct stat probe_stat;
+    char *slash;
+
+    snprintf(probe, sizeof(probe), "%s/.portmanager", directory);
+    if (stat(probe, &probe_stat) == 0 && S_ISDIR(probe_stat.st_mode)) {
+      int written = snprintf(
+        pm_file_substitution_prefix,
+        sizeof(pm_file_substitution_prefix),
+        "%s/.portmanager/%s/%s",
+        directory,
+        PM_FILE_SUBSTITUTION_DIR,
+        network_key);
+      if (written <= 0 || (size_t)written >= sizeof(pm_file_substitution_prefix)) {
+        return;
+      }
+      snprintf(pm_file_substitution_root, sizeof(pm_file_substitution_root), "%s", directory);
+      pm_file_substitution_root_length = strlen(pm_file_substitution_root);
+      pm_file_substitution_ready = 1;
+      return;
+    }
+    slash = strrchr(directory, '/');
+    if (slash == NULL) {
+      return;
+    }
+    if (slash == directory) {
+      if (directory[1] == '\0') {
+        return;
+      }
+      directory[1] = '\0';
+      continue;
+    }
+    *slash = '\0';
+  }
+}
+
+/* Builds the substitute candidate for a path; 0 when inside the root. */
+static int pm_file_substitution_candidate(const char *path, char *absolute, size_t absolute_size, char *buffer, size_t size) {
+  const char *relative;
+  int written;
+
+  if (!pm_file_substitution_ready || path == NULL || path[0] == '\0') {
+    return -1;
+  }
+  if (path[0] == '/') {
+    if (strlen(path) >= absolute_size) {
+      return -1;
+    }
+    snprintf(absolute, absolute_size, "%s", path);
+  } else {
+    char cwd[PM_MAX_PATH];
+
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+      return -1;
+    }
+    written = snprintf(absolute, absolute_size, "%s/%s", cwd, path);
+    if (written <= 0 || (size_t)written >= absolute_size) {
+      return -1;
+    }
+  }
+  if (strstr(absolute, "/.portmanager/") != NULL || strstr(absolute, "/../") != NULL) {
+    return -1;
+  }
+  if (strncmp(absolute, pm_file_substitution_root, pm_file_substitution_root_length) != 0 ||
+      absolute[pm_file_substitution_root_length] != '/') {
+    return -1;
+  }
+  relative = absolute + pm_file_substitution_root_length + 1;
+  if (relative[0] == '\0') {
+    return -1;
+  }
+  written = snprintf(buffer, size, "%s/%s", pm_file_substitution_prefix, relative);
+  if (written <= 0 || (size_t)written >= size) {
+    return -1;
+  }
+  return 0;
+}
+
+/*
+ * Best-effort window for unhooked observers (tail, exists-probes): when a file
+ * is CREATED in the mirror, leave a symlink at the original path pointing to
+ * it. A real file at the original is never touched; an existing symlink is
+ * repointed, so the original tracks the most recently started network while
+ * hooked processes always resolve their own network's mirror regardless.
+ */
+static void pm_file_substitution_symlink_back(const char *original, const char *substitute) {
+  struct stat original_stat;
+
+  if (lstat(original, &original_stat) == 0) {
+    char current[PM_MAX_PATH];
+    ssize_t length;
+
+    if (!S_ISLNK(original_stat.st_mode)) {
+      return;
+    }
+    length = readlink(original, current, sizeof(current) - 1);
+    if (length > 0) {
+      current[length] = '\0';
+      if (strcmp(current, substitute) == 0) {
+        return;
+      }
+    }
+    unlink(original);
+  }
+  (void)symlink(substitute, original);
+}
+
+/* Background infrastructure is never mirrored (the user's "배경파일"). */
+static int pm_file_substitution_relative_is_excluded(const char *relative) {
+  static const char *const excluded[] = {".git", "node_modules", ".venv", "venv", "__pycache__", NULL};
+  const char *segment = relative;
+
+  while (*segment != '\0') {
+    const char *end = strchr(segment, '/');
+    size_t length = end == NULL ? strlen(segment) : (size_t)(end - segment);
+
+    for (size_t index = 0; excluded[index] != NULL; index++) {
+      if (strlen(excluded[index]) == length && strncmp(segment, excluded[index], length) == 0) {
+        return 1;
+      }
+    }
+    if (end == NULL) {
+      break;
+    }
+    segment = end + 1;
+  }
+  return 0;
+}
+
+/*
+ * Process-private state, by ecosystem convention: anything inside a
+ * dot-directory (.celery/, .cache/), any dotfile, an extension-less file
+ * (celerybeat-schedule), or a state-suffixed file (.pid/.lock/.log/.sock/
+ * .tmp/.state/.db/.sqlite*). Only generated files with a SOURCE-style
+ * extension stay at the original path — a hooked `git checkout`/codegen
+ * writing .py/.ts must keep producing real worktree files, not mirror links.
+ */
+static int pm_file_substitution_relative_is_state(const char *relative) {
+  static const char *const suffixes[] = {
+    ".pid", ".lock", ".log", ".sock", ".tmp", ".state", ".db", ".sqlite", ".sqlite3", NULL,
+  };
+  const char *basename = strrchr(relative, '/');
+  size_t length;
+
+  /* dot-directory anywhere in the relative path (basename handled below) */
+  for (const char *cursor = relative; *cursor != '\0'; cursor++) {
+    if (cursor[0] == '.' && (cursor == relative || cursor[-1] == '/') && strchr(cursor, '/') != NULL) {
+      return 1;
+    }
+  }
+  basename = basename == NULL ? relative : basename + 1;
+  if (basename[0] == '.') {
+    return 1;
+  }
+  if (strchr(basename, '.') == NULL) {
+    return 1;
+  }
+  length = strlen(basename);
+  for (size_t index = 0; suffixes[index] != NULL; index++) {
+    size_t suffix_length = strlen(suffixes[index]);
+
+    if (length > suffix_length && strcmp(basename + length - suffix_length, suffixes[index]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* dotenv-convention files: .env and .env.* anywhere under the root. */
+static int pm_file_substitution_relative_is_dotenv(const char *relative) {
+  const char *basename = strrchr(relative, '/');
+
+  basename = basename == NULL ? relative : basename + 1;
+  return strcmp(basename, ".env") == 0 || strncmp(basename, ".env.", 5) == 0;
+}
+
+/* Byte copy used to materialize a network's own .env from the shared original. */
+static int pm_file_substitution_copy_file(const char *source, const char *destination) {
+  char buffer[65536];
+  ssize_t got;
+  int in;
+  int out;
+  int ok = 1;
+
+  in = open(source, O_RDONLY);
+  if (in < 0) {
+    return -1;
+  }
+  out = open(destination, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (out < 0) {
+    close(in);
+    return -1;
+  }
+  while ((got = read(in, buffer, sizeof(buffer))) > 0) {
+    if (write(out, buffer, (size_t)got) != got) {
+      ok = 0;
+      break;
+    }
+  }
+  if (got < 0) {
+    ok = 0;
+  }
+  close(in);
+  close(out);
+  if (!ok) {
+    unlink(destination);
+    return -1;
+  }
+  return 0;
+}
+
+/* True when the original is absent or already one of our mirror windows. */
+static int pm_file_substitution_original_is_virtual(const char *absolute) {
+  struct stat original_stat;
+  char current[PM_MAX_PATH];
+  ssize_t length;
+
+  if (lstat(absolute, &original_stat) != 0) {
+    return 1;
+  }
+  if (!S_ISLNK(original_stat.st_mode)) {
+    return 0;
+  }
+  length = readlink(absolute, current, sizeof(current) - 1);
+  if (length <= 0) {
+    return 0;
+  }
+  current[length] = '\0';
+  return strstr(current, "/.portmanager/" PM_FILE_SUBSTITUTION_DIR "/") != NULL;
+}
+
+/*
+ * mkdir -p for every mirror-side parent of a candidate path, starting right
+ * after the root (which exists by definition) so the hook never depends on the
+ * extension having scaffolded `files/<network>/` first.
+ */
+static void pm_file_substitution_make_parents(char *candidate) {
+  for (char *cursor = candidate + pm_file_substitution_root_length + 1; *cursor != '\0'; cursor++) {
+    if (*cursor == '/') {
+      *cursor = '\0';
+      (void)mkdir(candidate, 0755);
+      *cursor = '/';
+    }
+  }
+}
+
+/*
+ * Maps an opened path to its per-network substitute. Two rules, zero
+ * configuration:
+ * 1. The substitute FILE exists -> open it (any mode).
+ * 2. O_CREAT of a genuinely new state file (original absent or already a
+ *    mirror window; state by convention; background dirs excluded) -> create
+ *    in the mirror (parents auto-created) and leave a symlink window at the
+ *    original so unhooked observers (tail, exists probes) still see content.
+ * Returns NULL to open the original.
+ */
+static const char *pm_file_substitution_target(const char *path, int oflag, char *buffer, size_t size) {
+  char absolute[PM_MAX_PATH];
+  struct stat substitute_stat;
+  const char *relative;
+
+  if (pm_file_substitution_candidate(path, absolute, sizeof(absolute), buffer, size) != 0) {
+    return NULL;
+  }
+  if (stat(buffer, &substitute_stat) == 0 && S_ISREG(substitute_stat.st_mode)) {
+    pm_debug("file substitute %s -> %s", absolute, buffer);
+    pm_dev_log("hook", "file-substitute %s -> %s pid=%d", absolute, buffer, (int)getpid());
+    return buffer;
+  }
+  relative = absolute + pm_file_substitution_root_length + 1;
+  if (pm_file_substitution_relative_is_excluded(relative)) {
+    return NULL;
+  }
+  /*
+   * dotenv family always resolves to this network's own copy: on first touch
+   * the shared original is materialized into the mirror, and every read and
+   * write from then on lands in .portmanager — the original stays untouched.
+   */
+  if (pm_file_substitution_relative_is_dotenv(relative)) {
+    struct stat original_stat;
+
+    if (lstat(absolute, &original_stat) == 0 && S_ISREG(original_stat.st_mode)) {
+      pm_file_substitution_make_parents(buffer);
+      if (pm_file_substitution_copy_file(absolute, buffer) == 0) {
+        pm_debug("file substitute env copy-up %s -> %s", absolute, buffer);
+        pm_dev_log("hook", "file-substitute-env-copy %s -> %s pid=%d", absolute, buffer, (int)getpid());
+        return buffer;
+      }
+      return NULL;
+    }
+  }
+  if (!pm_file_substitution_relative_is_state(relative) ||
+      !pm_file_substitution_original_is_virtual(absolute)) {
+    return NULL;
+  }
+  if ((oflag & O_CREAT) != 0) {
+    pm_file_substitution_make_parents(buffer);
+    pm_file_substitution_symlink_back(absolute, buffer);
+    pm_debug("file substitute create %s -> %s", absolute, buffer);
+    pm_dev_log("hook", "file-substitute-create %s -> %s pid=%d", absolute, buffer, (int)getpid());
+    return buffer;
+  }
+  /*
+   * Read-side scoping: a state path resolves in THIS network's mirror even
+   * when nothing exists there yet, so another network's window at the
+   * original can never leak through a read — the open reports a clean ENOENT
+   * inside this network's namespace instead.
+   */
+  pm_debug("file substitute scope %s -> %s", absolute, buffer);
+  return buffer;
+}
+
+/*
+ * unlink follows the same mapping so state cleanup (pidfiles) hits the mirror.
+ * The original is only touched when it is a symlink into THIS network's
+ * mirror; another network's window is left alone.
+ */
+static int pm_file_substitution_unlink_target(const char *path, char *buffer, size_t size) {
+  char absolute[PM_MAX_PATH];
+  struct stat substitute_stat;
+  struct stat original_stat;
+
+  if (pm_file_substitution_candidate(path, absolute, sizeof(absolute), buffer, size) != 0) {
+    return -1;
+  }
+  if (lstat(buffer, &substitute_stat) != 0 || !S_ISREG(substitute_stat.st_mode)) {
+    const char *relative = absolute + pm_file_substitution_root_length + 1;
+
+    if (pm_file_substitution_relative_is_excluded(relative) ||
+        !pm_file_substitution_relative_is_state(relative) ||
+        !pm_file_substitution_original_is_virtual(absolute)) {
+      return -1;
+    }
+    /* Scoped: ENOENT in this network's namespace; another network's window stays. */
+    return 0;
+  }
+  if (lstat(absolute, &original_stat) == 0 && S_ISLNK(original_stat.st_mode)) {
+    char current[PM_MAX_PATH];
+    ssize_t length = readlink(absolute, current, sizeof(current) - 1);
+
+    if (length > 0) {
+      current[length] = '\0';
+      if (strcmp(current, buffer) == 0) {
+        unlink(absolute);
+      }
+    }
+  }
+  pm_dev_log("hook", "file-substitute-unlink %s -> %s pid=%d", absolute, buffer, (int)getpid());
+  return 0;
+}
+
+static int pm_substitute_open_hook(const char *path, int oflag, ...) {
+  char substitute[PM_MAX_PATH];
+  const char *target;
+  mode_t mode = 0;
+
+  if ((oflag & O_CREAT) != 0) {
+    va_list arguments;
+
+    va_start(arguments, oflag);
+    mode = (mode_t)va_arg(arguments, int);
+    va_end(arguments);
+  }
+  target = pm_file_substitution_target(path, oflag, substitute, sizeof(substitute));
+#if defined(__APPLE__)
+  return open(target != NULL ? target : path, oflag, mode);
+#else
+  if (pm_real_open == NULL) {
+    pm_real_open = (pm_open_fn)pm_resolve_symbol("open");
+  }
+  return pm_real_open(target != NULL ? target : path, oflag, mode);
+#endif
+}
+
+static int pm_substitute_openat_hook(int dirfd, const char *path, int oflag, ...) {
+  char substitute[PM_MAX_PATH];
+  const char *target = NULL;
+  mode_t mode = 0;
+
+  if ((oflag & O_CREAT) != 0) {
+    va_list arguments;
+
+    va_start(arguments, oflag);
+    mode = (mode_t)va_arg(arguments, int);
+    va_end(arguments);
+  }
+  /* Only cwd-relative or absolute paths are mapped; real dirfd bases pass through. */
+  if (dirfd == AT_FDCWD || (path != NULL && path[0] == '/')) {
+    target = pm_file_substitution_target(path, oflag, substitute, sizeof(substitute));
+  }
+#if defined(__APPLE__)
+  return openat(dirfd, target != NULL ? target : path, oflag, mode);
+#else
+  if (pm_real_openat == NULL) {
+    pm_real_openat = (pm_openat_fn)pm_resolve_symbol("openat");
+  }
+  return pm_real_openat(dirfd, target != NULL ? target : path, oflag, mode);
+#endif
+}
+
+static int pm_substitute_unlink_hook(const char *path) {
+  char substitute[PM_MAX_PATH];
+  const char *target = path;
+
+  if (pm_file_substitution_unlink_target(path, substitute, sizeof(substitute)) == 0) {
+    target = substitute;
+  }
+#if defined(__APPLE__)
+  return unlink(target);
+#else
+  if (pm_real_unlink == NULL) {
+    pm_real_unlink = (pm_unlink_fn)pm_resolve_symbol("unlink");
+  }
+  return pm_real_unlink(target);
+#endif
+}
+
+static int pm_substitute_unlinkat_hook(int dirfd, const char *path, int flags) {
+  char substitute[PM_MAX_PATH];
+  const char *target = path;
+
+  if ((flags & AT_REMOVEDIR) == 0 && (dirfd == AT_FDCWD || (path != NULL && path[0] == '/')) &&
+      pm_file_substitution_unlink_target(path, substitute, sizeof(substitute)) == 0) {
+    target = substitute;
+  }
+#if defined(__APPLE__)
+  return unlinkat(dirfd, target, flags);
+#else
+  if (pm_real_unlinkat == NULL) {
+    pm_real_unlinkat = (pm_unlinkat_fn)pm_resolve_symbol("unlinkat");
+  }
+  return pm_real_unlinkat(dirfd, target, flags);
+#endif
+}
+
 __attribute__((constructor)) static void pm_hook_loaded(void) {
   pm_normalize_process_preload_env();
+  pm_apply_network_env_file();
+  pm_file_substitution_init();
   pm_debug("loaded");
 }
 
@@ -4650,6 +5366,91 @@ static char **pm_rewrite_localhost_argv(char *const argv[], char *const envp[]) 
   return rewritten;
 }
 
+/*
+ * Maps one argv token (or the value part of a `--flag=`/`KEY=` token) to this
+ * process's network mirror when the mirror file exists. This is what lets an
+ * unhooked SIP observer (tail/cat via the PATH trampoline) follow its own
+ * network's state file: the hooked exec boundary hands it the mirror path as
+ * plain argv, so each terminal observes its own namespace.
+ */
+static char *pm_rewrite_state_path_token(const char *token) {
+  char absolute[PM_MAX_PATH];
+  char candidate[PM_MAX_PATH];
+  struct stat candidate_stat;
+  const char *value = token;
+  const char *equals = strchr(token, '=');
+
+  if (equals != NULL && equals[1] != '\0') {
+    value = equals + 1;
+  }
+  if (value[0] == '\0' || value[0] == '-') {
+    return NULL;
+  }
+  if (pm_file_substitution_candidate(value, absolute, sizeof(absolute), candidate, sizeof(candidate)) != 0) {
+    return NULL;
+  }
+  if (stat(candidate, &candidate_stat) != 0 || !S_ISREG(candidate_stat.st_mode)) {
+    return NULL;
+  }
+  if (equals != NULL) {
+    size_t prefix_length = (size_t)(equals - token) + 1;
+    size_t candidate_length = strlen(candidate);
+    char *rewritten = malloc(prefix_length + candidate_length + 1);
+
+    if (rewritten == NULL) {
+      return NULL;
+    }
+    memcpy(rewritten, token, prefix_length);
+    memcpy(rewritten + prefix_length, candidate, candidate_length + 1);
+    return rewritten;
+  }
+  return strdup(candidate);
+}
+
+/*
+ * Third argv pass at the exec boundary (after the localhost rewrite): argv
+ * tokens naming a file whose per-network mirror EXISTS are rewritten to the
+ * mirror path. Same malloc contract as pm_rewrite_shell_c_argv; release with
+ * pm_free_rewritten_argv.
+ */
+static char **pm_rewrite_state_path_argv(char *const argv[], char *const envp[]) {
+  size_t argc = 0;
+  size_t changed = 0;
+  char **rewritten;
+
+  if (!pm_file_substitution_ready || pm_hook_depth > 0 || argv == NULL || envp == NULL ||
+      pm_envp_value_is(envp, "PORT_MANAGER_HOOK_DISABLED", "1") ||
+      pm_envp_value_is(envp, "PORT_MANAGER_HOOK", "0")) {
+    return NULL;
+  }
+  while (argv[argc] != NULL) {
+    argc++;
+  }
+  if (argc == 0) {
+    return NULL;
+  }
+  rewritten = (char **)malloc((argc + 1) * sizeof(char *));
+  if (rewritten == NULL) {
+    return NULL;
+  }
+  for (size_t index = 0; index < argc; index++) {
+    char *replaced = pm_rewrite_state_path_token(argv[index]);
+
+    if (replaced != NULL) {
+      changed++;
+      pm_debug("child argv state path rewrite %s -> %s", argv[index], replaced);
+      pm_dev_log("hook", "argv-state-path %s -> %s pid=%d", argv[index], replaced, (int)getpid());
+    }
+    rewritten[index] = replaced != NULL ? replaced : argv[index];
+  }
+  rewritten[argc] = NULL;
+  if (changed == 0) {
+    free(rewritten);
+    return NULL;
+  }
+  return rewritten;
+}
+
 static int pm_exec_with_prepared_child(
   const char *path,
   char *const argv[],
@@ -4696,9 +5497,12 @@ static int pm_exec_with_prepared_child(
     char **rewritten_argv = pm_rewrite_shell_c_argv(exec_target, argv, child_environment.envp);
     char *const *base_argv = rewritten_argv != NULL ? rewritten_argv : argv;
     char **localhost_argv = pm_rewrite_localhost_argv(base_argv, child_environment.envp);
+    char *const *scoped_base = localhost_argv != NULL ? localhost_argv : base_argv;
+    char **state_argv = pm_rewrite_state_path_argv(scoped_base, child_environment.envp);
     result = pm_real_execve(
-      exec_target, localhost_argv != NULL ? localhost_argv : base_argv, child_environment.envp);
+      exec_target, state_argv != NULL ? state_argv : scoped_base, child_environment.envp);
     saved_errno = errno;
+    pm_free_rewritten_argv(state_argv, scoped_base);
     pm_free_rewritten_argv(localhost_argv, base_argv);
     pm_free_rewritten_argv(rewritten_argv, argv);
   }
@@ -4749,9 +5553,12 @@ static int pm_posix_spawn_hook(
     char **rewritten_argv = pm_rewrite_shell_c_argv(target, argv, child_environment.envp);
     char *const *base_argv = rewritten_argv != NULL ? rewritten_argv : argv;
     char **localhost_argv = pm_rewrite_localhost_argv(base_argv, child_environment.envp);
+    char *const *scoped_base = localhost_argv != NULL ? localhost_argv : base_argv;
+    char **state_argv = pm_rewrite_state_path_argv(scoped_base, child_environment.envp);
     result = pm_real_posix_spawn(
-      pid, target, file_actions, attrp, localhost_argv != NULL ? localhost_argv : base_argv,
+      pid, target, file_actions, attrp, state_argv != NULL ? state_argv : scoped_base,
       child_environment.envp);
+    pm_free_rewritten_argv(state_argv, scoped_base);
     pm_free_rewritten_argv(localhost_argv, base_argv);
     pm_free_rewritten_argv(rewritten_argv, argv);
   }
@@ -4786,7 +5593,9 @@ static int pm_posix_spawnp_hook(
     char **rewritten_argv = pm_rewrite_shell_c_argv(target != file ? target : file, argv, child_environment.envp);
     char *const *base_argv = rewritten_argv != NULL ? rewritten_argv : argv;
     char **localhost_argv = pm_rewrite_localhost_argv(base_argv, child_environment.envp);
-    char *const *effective_argv = localhost_argv != NULL ? localhost_argv : base_argv;
+    char *const *scoped_base = localhost_argv != NULL ? localhost_argv : base_argv;
+    char **state_argv = pm_rewrite_state_path_argv(scoped_base, child_environment.envp);
+    char *const *effective_argv = state_argv != NULL ? state_argv : scoped_base;
     if (target != file) {
       /*
        * The runtime target was rewritten to an absolute shim path, so spawn it
@@ -4797,6 +5606,7 @@ static int pm_posix_spawnp_hook(
     } else {
       result = pm_real_posix_spawnp(pid, file, file_actions, attrp, effective_argv, child_environment.envp);
     }
+    pm_free_rewritten_argv(state_argv, scoped_base);
     pm_free_rewritten_argv(localhost_argv, base_argv);
     pm_free_rewritten_argv(rewritten_argv, argv);
   }
@@ -5105,6 +5915,10 @@ PM_DYLD_INTERPOSE(pm_wait3_hook, wait3);
 PM_DYLD_INTERPOSE(pm_kill_hook, kill);
 PM_DYLD_INTERPOSE(pm_gethostname_hook, gethostname);
 PM_DYLD_INTERPOSE(pm_uname_hook, uname);
+PM_DYLD_INTERPOSE(pm_substitute_open_hook, open);
+PM_DYLD_INTERPOSE(pm_substitute_openat_hook, openat);
+PM_DYLD_INTERPOSE(pm_substitute_unlink_hook, unlink);
+PM_DYLD_INTERPOSE(pm_substitute_unlinkat_hook, unlinkat);
 #else
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   return pm_bind_hook(sockfd, addr, addrlen);
@@ -5176,5 +5990,39 @@ int gethostname(char *name, size_t namelen) {
 
 int uname(struct utsname *buf) {
   return pm_uname_hook(buf);
+}
+
+int open(const char *path, int oflag, ...) {
+  mode_t mode = 0;
+
+  if ((oflag & O_CREAT) != 0) {
+    va_list arguments;
+
+    va_start(arguments, oflag);
+    mode = (mode_t)va_arg(arguments, int);
+    va_end(arguments);
+  }
+  return pm_substitute_open_hook(path, oflag, mode);
+}
+
+int openat(int dirfd, const char *path, int oflag, ...) {
+  mode_t mode = 0;
+
+  if ((oflag & O_CREAT) != 0) {
+    va_list arguments;
+
+    va_start(arguments, oflag);
+    mode = (mode_t)va_arg(arguments, int);
+    va_end(arguments);
+  }
+  return pm_substitute_openat_hook(dirfd, path, oflag, mode);
+}
+
+int unlink(const char *path) {
+  return pm_substitute_unlink_hook(path);
+}
+
+int unlinkat(int dirfd, const char *path, int flags) {
+  return pm_substitute_unlinkat_hook(dirfd, path, flags);
 }
 #endif

@@ -83,7 +83,8 @@ routed by the connect() rewrite), nor is a longer hostname label
 (`localhost.localdomain`, `mylocalhost`). Opt out with
 `PORT_MANAGER_ARGV_LOCALHOST_REWRITE=0`. Literals baked into config **files**
 remain the app's own choice — prefer `%h`/`%n` (celery's built-in templates) so
-identity tracks the hostname.
+identity tracks the hostname. Per-network **values** (as opposed to identity)
+are delivered by the [per-network env file](per-network-env.md).
 
 ## Verifying
 

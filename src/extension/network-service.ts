@@ -136,6 +136,7 @@ import {
   DOCKER_SHIM_PATH_ENV,
   EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV,
   getAsdfShimLauncherRelativePath,
+  ensureNetworkEnvFileScaffold,
   getHookLibraryRelativePath,
   getRuntimeCommandShimRelativePath,
   NETWORK_DNS_ALIAS_ENV,
@@ -6622,6 +6623,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Builds the full attach bootstrap stored in globalStorage and sourced by the shell. */
   private buildTerminalRoutingScriptBody(networkId: string, networkName: string, settings: PortManagerSettings): string {
+    // Per-terminal attach must scaffold too — the window-binding path alone
+    // never fires for terminals attached individually (docs/per-network-env.md).
+    ensureNetworkEnvFileScaffold(networkId, networkName);
     const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
     const agentMainPath = this.context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
     const nativeAgentPath = this.context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));

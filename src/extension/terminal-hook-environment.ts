@@ -63,6 +63,10 @@ const PRELOAD_RUNTIME_LAUNCHER_NAMES = [
   "php",
   "perl",
 ];
+// Observation commands get a hooked exec boundary via the same trampoline so
+// state-path arguments (.celery/celery.log) are remapped to the caller's own
+// network mirror — each terminal tails ITS network (docs/per-network-files.md).
+const OBSERVATION_COMMAND_SHIM_NAMES: readonly string[] = ["tail", "cat"];
 // These names are project-bin commands that commonly bind or probe dev ports.
 // Package managers are intentionally excluded so install/link lifecycle work
 // does not inherit socket routing unless the invoked tool crosses a runtime
@@ -152,6 +156,8 @@ export function applyTerminalHookEnvironment(
   if (!shouldInjectTerminalHook(settings)) {
     return;
   }
+
+  ensureNetworkEnvFileScaffold(scope.networkId, scope.networkName);
 
   const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
   const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
@@ -283,6 +289,105 @@ function applyLoopbackRoutingHosts(
   }
 }
 
+/**
+ * Scaffolds `<workspaceFolder>/.portmanager/` so both per-network mechanisms
+ * are ready the moment anything attaches to the network — window bindings AND
+ * per-terminal attach scripts: `env/<network>.env` (injected before main(),
+ * docs/per-network-env.md) and `files/<network>/` (existence-based exclusive
+ * file substitution, docs/per-network-files.md). The app `.env` is auto-split:
+ * a copy is seeded as `files/<network>/.env` so every network starts on an
+ * independent (initially identical) file that the hook substitutes exclusively
+ * from then on. The native hook only READS these paths. `.portmanager/` is
+ * machine-local state, so it is ignored via the repo-LOCAL `.git/info/exclude`
+ * — never the shared .gitignore. Idempotent and silent — never overwrites
+ * existing content, ignores filesystem errors.
+ */
+export function ensureNetworkEnvFileScaffold(networkId: string, networkName: string | undefined): void {
+  const networkKey = networkName !== undefined && networkName.length > 0 ? networkName : networkId;
+  const safeKey = networkKey.replace(/\//g, "-");
+
+  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    if (folder.uri.scheme !== "file") {
+      continue;
+    }
+    try {
+      const root = folder.uri.fsPath;
+      const envDirectory = path.join(root, ".portmanager", "env");
+      const filesDirectory = path.join(root, ".portmanager", "files", safeKey);
+      fs.mkdirSync(envDirectory, { recursive: true });
+      fs.mkdirSync(filesDirectory, { recursive: true });
+      ensureLocalGitExclude(root);
+      const envFilePath = path.join(envDirectory, `${safeKey}.env`);
+      if (!fs.existsSync(envFilePath)) {
+        fs.writeFileSync(
+          envFilePath,
+          [
+            `# Port Manager per-network environment for "${networkKey}".`,
+            "# KEY=VALUE lines are injected into every process of this network before",
+            "# main() — they win over inherited terminal env and the app's own .env.",
+            "# PORT_MANAGER_*/NEWDLOPS_PM_*/PATH/BASH_ENV/preload keys are ignored.",
+            "# See docs/per-network-env.md. Examples:",
+            "#",
+            "# GOOGLE_APPLICATION_CREDENTIALS=/path/credential.this-network.json",
+            "# S3_BUCKET=this-network-dev-bucket",
+            "",
+          ].join("\n"),
+        );
+      }
+      // Auto-split the app .env: seed this network's own copy once. Content is
+      // identical at copy time (behavior-neutral); afterwards the network talks
+      // only to its copy (docs/per-network-files.md), so edits are independent.
+      const originalDotenvPath = path.join(root, ".env");
+      const substituteDotenvPath = path.join(filesDirectory, ".env");
+      if (fs.existsSync(originalDotenvPath) && !fs.existsSync(substituteDotenvPath)) {
+        fs.copyFileSync(originalDotenvPath, substituteDotenvPath);
+      }
+    } catch {
+      // Best-effort scaffold: a read-only or vanished folder must not break attach.
+    }
+  }
+}
+
+/**
+ * Adds `.portmanager/` to the repo-LOCAL git exclude file
+ * (`<gitdir>/info/exclude`). Per-network files are machine-local, so the
+ * shared .gitignore must stay untouched. Follows `gitdir:` indirection for
+ * worktrees (exclude lives in the common dir) and submodules.
+ */
+function ensureLocalGitExclude(root: string): void {
+  const gitPath = path.join(root, ".git");
+  let gitDirectory: string | undefined;
+  const gitStats = fs.statSync(gitPath, { throwIfNoEntry: false });
+
+  if (gitStats !== undefined && gitStats.isDirectory()) {
+    gitDirectory = gitPath;
+  } else if (gitStats !== undefined && gitStats.isFile()) {
+    const match = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(gitPath, "utf8"));
+    if (match !== null) {
+      const resolved = path.resolve(root, match[1]);
+      const worktreeMarker = `${path.sep}worktrees${path.sep}`;
+      const markerIndex = resolved.lastIndexOf(worktreeMarker);
+      gitDirectory = markerIndex >= 0 ? resolved.slice(0, markerIndex) : resolved;
+    }
+  }
+  if (gitDirectory === undefined) {
+    return;
+  }
+
+  const infoDirectory = path.join(gitDirectory, "info");
+  const excludePath = path.join(infoDirectory, "exclude");
+  const excludeEntry = ".portmanager/";
+  const existing = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, "utf8") : "";
+  // Accept hand-written variants (/.portmanager/, .portmanager) as satisfying.
+  const normalize = (line: string) => line.trim().replace(/^\//, "").replace(/\/$/, "");
+  if (existing.split("\n").some((line) => normalize(line) === ".portmanager")) {
+    return;
+  }
+  fs.mkdirSync(infoDirectory, { recursive: true });
+  const separator = existing.length === 0 || existing.endsWith("\n") ? "" : "\n";
+  fs.writeFileSync(excludePath, `${existing}${separator}${excludeEntry}\n`);
+}
+
 /** Mirrors user routing policy into the native hook's simple env contract. */
 function applyRoutingSettings(
   collection: vscode.EnvironmentVariableCollection,
@@ -391,6 +496,10 @@ export function prepareRuntimeShimLauncherDirectory(
     ensureExecutableAlias(path.join(targetDirectory, runtimeName), launcherPath);
   }
 
+  for (const observationName of OBSERVATION_COMMAND_SHIM_NAMES) {
+    ensureExecutableAlias(path.join(targetDirectory, observationName), launcherPath);
+  }
+
   if (sourceShimDirectory !== undefined) {
     for (const entry of fs.readdirSync(sourceShimDirectory, { withFileTypes: true })) {
       if (
@@ -442,6 +551,7 @@ function buildRuntimeShimDirectorySignature(
         runtimeCommandShimPath ?? "",
         sourceShimDirectory ?? "",
         sourceShimDirectoryMtimeMs,
+        OBSERVATION_COMMAND_SHIM_NAMES.join(","),
       ]),
     )
     .digest("hex");

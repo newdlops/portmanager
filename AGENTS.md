@@ -242,3 +242,85 @@ per-network 분리된다(예: celery `celery@%h`→`celery@127.93.164.7`). opt-i
 
 (폐기: 예전 파일시스템 경로 리다이렉션(`.portmanager/state-paths`, `pm_state_*`)은
 celery-특화적이고 층이 틀려 되돌렸다. 정체성은 호스트명 층에서 제네릭하게 푼다.)
+
+## 14. per-network env 값 = 생성자 주입 (`.portmanager/env/<네트워크이름>.env`)
+
+라우팅은 하나의 .env로 모든 네트워크를 커버하고(로컬호스트 URL은 connect()에서
+네트워크별 라우팅), 호스트명 가상화는 호스트명-파생 정체성을 가른다. 그러나
+네트워크별로 **값 자체**가 달라야 하는 것(자격증명 경로, 버킷명 등)은 앱-특화 설정
+없이 표현할 수 없었다. 제네릭한 공급 지점은 프로세스 시작 — hook dylib 생성자
+(`pm_hook_loaded`)는 main()과 모든 런타임의 env 스냅샷(CPython os.environ/JVM/Go)보다
+먼저 실행되므로, 여기서 setenv한 값은 어떤 런타임에도 보인다.
+
+- 파일: cwd 상향 탐색(가까운 것 우선, 최대 64단계)으로
+  `.portmanager/env/<네트워크이름>.env` (이름 없으면 network id 폴백; 이름은
+  바이트 그대로 파일명, `/`→`-`).
+- 우선순위: **네트워크 파일 > 터미널 상속 env > 앱의 .env** (dotenv 기본값이 기존
+  변수를 안 덮으므로 자연 성립). overwrite 주입.
+- 트리당 1회: `PORT_MANAGER_NETWORK_ENV_APPLIED=<network>` 마커로 자식은 상속만 —
+  앱이 중간에 바꾼 값을 자식에서 되밟지 않는다. 셸은 unhooked라 마커가 없어 새
+  명령마다 파일을 다시 읽는다(수정은 다음 실행부터 반영).
+- 가드: `PORT_MANAGER_*`/`NEWDLOPS_PM_*`/`PATH`/`BASH_ENV`/preload 키는 파일에서
+  절대 적용 안 됨. 네트워크 없음/훅 off → no-op.
+- credential.json류(경로가 env로 전달되는 설정 파일)는 이 파일에서 경로 변수만
+  네트워크별 값으로 주면 앱이 스스로 네트워크별 파일을 연다 — FS 가상화 불필요.
+- 스캐폴드: 네트워크에 뭔가 붙을 때마다 — **윈도우 바인딩뿐 아니라 터미널 단위
+  attach 스크립트 생성(`buildTerminalRoutingScriptBody`)에서도** — extension이
+  워크스페이스 루트에 `env/<이름>.env`와 `files/<이름>/`를 자동 생성한다
+  (`ensureNetworkEnvFileScaffold`, terminal-hook-environment.ts). 윈도우 바인딩
+  경로 하나만 걸면 터미널-단위 attach 사용자는 영영 스캐폴드를 못 받는다(실제로
+  겪은 버그). repo 루트의 `.env`가 있으면 `files/<이름>/.env`로 **자동 분할**
+  (복사 시점엔 내용 동일 → 무해, 이후 네트워크별 독립). `.portmanager/`는
+  머신-로컬이므로 **repo-local `.git/info/exclude`**에 넣는다(공유 .gitignore는
+  건드리지 않음; 워크트리 `gitdir:` 추적, 손으로 쓴 `/.portmanager/` 변형도 중복
+  없이 인식 — `ensureLocalGitExclude`). 기존 파일은 절대 덮지 않음. 훅은 이
+  파일들을 **읽기만** 한다.
+- 문서: **`docs/per-network-env.md`** / hook: `pm_apply_network_env_file` /
+  `pm_network_env_apply_line` / `pm_find_network_env_file` (`portmanager_hook.c`).
+
+## 15. per-network 파일 치환 (`.portmanager/files/<이름>/…`) — 대체 + 자동 상태 분할
+
+규칙(사용자 명세): **`.portmanager`에 대응 파일이 존재하면 프로세스는 그 파일과만
+소통하고 원본은 읽지 않는다** — 완전 대체, 쓰기 포함. 그리고 **`.pid`/`.lock`/log류
+프로세스 상태 파일은 개입 없이 자동 분할**된다. root는 생성자에서 cwd 상향 탐색으로
+1회 결정(`.portmanager` 디렉터리를 가진 가장 가까운 조상), per-open 비용 prefix 비교
++ stat 1회.
+
+- 규칙 1(대체): 미러에 실존 파일이 있으면 `open/openat`이 그쪽을 연다(모든 모드).
+- 규칙 2(자동 상태 분할): **진짜 신규**(원본 없음 또는 이미 우리 심링크 윈도우)
+  O_CREAT가 **상태 관례**(닷-디렉터리 내부 / 닷파일 / `.pid .lock .log .sock .tmp
+  .state` 접미)에 맞으면 미러에 생성(부모 자동 mkdir — 스캐폴드에 의존하지 않음,
+  실제로 의존했다가 ENOENT 버그) + **원본 자리에 심링크 윈도우**를 남긴다 → unhooked
+  관찰자(zz의 `tail -f`, exists 체크)도 내용을 본다. N개 네트워크면 윈도우는 마지막
+  시작 네트워크를 가리키고, 각 네트워크의 훅 프로세스는 항상 자기 미러를 본다.
+- 규칙 2b(읽기 스코핑): 상태 경로는 미러에 파일이 **없어도** 자기 미러로 해석한다
+  (원본이 부재/윈도우일 때) — 읽기가 다른 네트워크의 윈도우를 타고 새지 않고 자기
+  네임스페이스의 깨끗한 ENOENT를 받는다. unlink도 동일(남의 윈도우를 지우지 않음).
+  이게 없으면 B가 A의 pidfile을 읽고 "이미 실행 중"으로 오판한다(실측한 누수).
+- 규칙 1.5(dotenv copy-up): `.env`/`.env.*`는 **첫 접근 때 원본 바이트를 미러로
+  복사(물질화)하고 그 뒤 모든 읽기·쓰기가 .portmanager 사본으로만** 간다 — 원본은
+  다시는 읽히지도 쓰이지도 않는다. 네트워크마다 원본에서 독립적으로 copy-up.
+- 규칙 3(관찰은 호출자의 네트워크): exec 경계 3지점의 세 번째 argv 패스
+  (`pm_rewrite_state_path_argv`)가 **미러가 실존하는 파일을 가리키는 argv 토큰**
+  (`--flag=경로` 형태 포함)을 미러 경로로 재작성한다. `tail`/`cat`은 PATH 심
+  디렉터리의 트램펄린 별칭(`OBSERVATION_COMMAND_SHIM_NAMES`,
+  terminal-hook-environment.ts)으로 hooked exec 경계를 얻으므로, unhooked SIP
+  바이너리인데도 `tail -f .celery/celery.log`가 **그 터미널 네트워크의 미러**를
+  팔로우한다 — 윈도우(마지막 시작 네트워크)가 아니라 각자 자기 것.
+- 상태 관례 확장: 무확장자 파일(celerybeat-schedule류)과 `.db/.sqlite/.sqlite3`도
+  자동 분할 대상. 반대로 **소스 확장자 신규 파일(.py/.ts 등)은 원본 위치 유지** —
+  hooked `git checkout`/codegen이 미러 심링크가 아닌 실제 워크트리 파일을 만들어야
+  해서(전면 리다이렉트 시 checkout이 깨진다).
+- 절대 안 건드리는 것: 배경 인프라(`.git`/`node_modules`/`.venv`/`venv`/`__pycache__`),
+  **기존 실파일**(yarn.lock 같은 커밋 파일은 제자리 갱신 유지; 기존 공유 `.celery/*`는
+  한 번 지워야 윈도우가 형성됨), 일반 신규 파일(codegen 소스는 원본 위치).
+- `unlink/unlinkat`도 같은 매핑(각 네트워크가 자기 pidfile만 정리; 다른 네트워크의
+  윈도우는 보존). rename 미인터포즈 — 심링크 윈도우 덕에 대체로 무해(문서 참고).
+- env 파일(§14)은 **오버레이**(값 주입), files는 **대체/분할** — 상보적.
+  opt-out: `PORT_MANAGER_FILE_SUBSTITUTION=0`. intra-libc fopen(순수 C 앱) 우회
+  가능(python/node/ruby 커버).
+- 폐기했던 state-path 리다이렉션과의 차이: 설정 파일로 경로를 열거하지 않고(관례 +
+  존재 기반), 심링크 윈도우로 unhooked 뷰 분열 문제를 풀었다(그때의 revert 사유).
+- 문서: **`docs/per-network-files.md`** / hook: `pm_file_substitution_target` /
+  `pm_file_substitution_relative_is_state` / `pm_file_substitution_symlink_back` /
+  `pm_substitute_open(at)_hook` / `pm_substitute_unlink(at)_hook` (`portmanager_hook.c`).

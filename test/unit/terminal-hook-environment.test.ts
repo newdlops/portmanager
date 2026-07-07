@@ -1975,12 +1975,109 @@ test("native hook rewrites host-positioned localhost argv at the exec boundary",
   assert.equal(wired, 3);
 });
 
+test("native hook applies the per-network env file before main", () => {
+  const hook = fs.readFileSync(
+    path.resolve(__dirname, "../../../native/hook/portmanager_hook.c"),
+    "utf8",
+  );
+  // Constructor-time injection lands ahead of every runtime's env snapshot
+  // (CPython os.environ, JVM, Go), so per-network values reach any runtime
+  // with zero app knowledge; the per-network file wins over the app's .env.
+  assert.equal(hook.includes('#define PM_NETWORK_ENV_DIR_RELATIVE ".portmanager/env"'), true);
+  assert.equal(hook.includes('#define PM_NETWORK_ENV_APPLIED_ENV "PORT_MANAGER_NETWORK_ENV_APPLIED"'), true);
+  assert.equal(hook.includes("pm_apply_network_env_file();"), true);
+  // The repo file can never take over Port Manager's own contract or preload delivery.
+  assert.equal(hook.includes('strncmp(key, "PORT_MANAGER_", 13)'), true);
+  assert.equal(hook.includes('"DYLD_INSERT_LIBRARIES", "LD_PRELOAD"'), true);
+});
+
+test("attaching a window scaffolds the per-network env file", () => {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts"),
+    "utf8",
+  );
+  // The hook only reads these paths; the extension creates the editable targets
+  // so the features are discoverable. Never overwrites. `.portmanager/` is
+  // machine-local, so it is ignored via the repo-LOCAL .git/info/exclude —
+  // the shared .gitignore stays untouched.
+  assert.equal(source.includes("ensureNetworkEnvFileScaffold(scope.networkId, scope.networkName);"), true);
+  assert.equal(source.includes('path.join(root, ".portmanager", "env")'), true);
+  assert.equal(source.includes('path.join(root, ".portmanager", "files", safeKey)'), true);
+  assert.equal(source.includes("ensureLocalGitExclude(root);"), true);
+  assert.equal(source.includes('const excludePath = path.join(infoDirectory, "exclude");'), true);
+  assert.equal(source.includes('const excludeEntry = ".portmanager/";'), true);
+  assert.equal(source.includes("if (!fs.existsSync(envFilePath)) {"), true);
+  // Auto-split: the app .env is seeded once as the network's own copy.
+  assert.equal(source.includes("fs.copyFileSync(originalDotenvPath, substituteDotenvPath);"), true);
+
+  // The window-binding path alone never fires for individually attached
+  // terminals, so the per-terminal attach script builder must scaffold too.
+  const networkService = fs.readFileSync(
+    path.resolve(__dirname, "../../../src/extension/network-service.ts"),
+    "utf8",
+  );
+  assert.equal(networkService.includes("ensureNetworkEnvFileScaffold(networkId, networkName);"), true);
+});
+
+test("native hook substitutes per-network files exclusively at open", () => {
+  const hook = fs.readFileSync(
+    path.resolve(__dirname, "../../../native/hook/portmanager_hook.c"),
+    "utf8",
+  );
+  // Exclusive substitution: when `.portmanager/files/<network>/<rel>` exists,
+  // the process talks only to it (reads AND writes) and never touches the
+  // original. State files (.pid/.lock/.log, dot-dirs) are auto-created in the
+  // mirror with a symlink window at the original for unhooked observers;
+  // background dirs (.git, node_modules, …) and pre-existing real files are
+  // never remapped, so committed files and generated source stay put.
+  assert.equal(hook.includes('#define PM_FILE_SUBSTITUTION_ENV "PORT_MANAGER_FILE_SUBSTITUTION"'), true);
+  assert.equal(hook.includes("PM_DYLD_INTERPOSE(pm_substitute_open_hook, open);"), true);
+  assert.equal(hook.includes("PM_DYLD_INTERPOSE(pm_substitute_openat_hook, openat);"), true);
+  assert.equal(hook.includes("PM_DYLD_INTERPOSE(pm_substitute_unlink_hook, unlink);"), true);
+  assert.equal(hook.includes("PM_DYLD_INTERPOSE(pm_substitute_unlinkat_hook, unlinkat);"), true);
+  assert.equal(hook.includes("pm_file_substitution_relative_is_state"), true);
+  assert.equal(hook.includes("pm_file_substitution_relative_is_excluded"), true);
+  assert.equal(hook.includes("pm_file_substitution_symlink_back"), true);
+  assert.equal(hook.includes("pm_file_substitution_make_parents"), true);
+  // dotenv family is materialized per network on first touch (copy-up), so
+  // env reads land in .portmanager while the shared original stays untouched.
+  assert.equal(hook.includes("pm_file_substitution_relative_is_dotenv"), true);
+  assert.equal(hook.includes("pm_file_substitution_copy_file"), true);
+  // Observation: argv tokens naming a file whose mirror exists are rewritten to
+  // the mirror path at every exec boundary, so a SIP tail/cat launched through
+  // the PATH trampoline follows the CALLER's network — each terminal sees its
+  // own namespace instead of the shared original/window.
+  assert.equal(hook.includes("static char **pm_rewrite_state_path_argv("), true);
+  assert.equal(hook.includes("static char *pm_rewrite_state_path_token("), true);
+  const stateArgvWired = hook.split("pm_rewrite_state_path_argv(scoped_base, child_environment.envp)").length - 1;
+  assert.equal(stateArgvWired, 3);
+
+  const hookEnvironmentSource = fs.readFileSync(
+    path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts"),
+    "utf8",
+  );
+  assert.equal(
+    hookEnvironmentSource.includes('const OBSERVATION_COMMAND_SHIM_NAMES: readonly string[] = ["tail", "cat"];'),
+    true,
+  );
+  assert.equal(hookEnvironmentSource.includes("for (const observationName of OBSERVATION_COMMAND_SHIM_NAMES)"), true);
+  // Read-side scoping: state reads resolve in the network's own mirror even
+  // when absent, so another network's window never leaks through a read.
+  assert.equal(hook.includes("Read-side scoping"), true);
+  // Only real files substitute, and .portmanager itself is never remapped.
+  assert.equal(hook.includes("S_ISREG(substitute_stat.st_mode)"), true);
+  assert.equal(hook.includes('strstr(absolute, "/.portmanager/")'), true);
+});
+
 test("native hook no longer redirects filesystem paths (reverted for the hostname approach)", () => {
   const hook = fs.readFileSync(
     path.resolve(__dirname, "../../../native/hook/portmanager_hook.c"),
     "utf8",
   );
-  // The per-network filesystem redirection was replaced by hostname virtualization.
+  // The old config-driven state-path redirection stays gone (replaced by
+  // hostname virtualization). The existence-based per-network file
+  // substitution (pm_substitute_open_hook) is a different mechanism: it never
+  // invents or moves paths — it only picks a user-created substitute file.
   for (const dead of ["PM_STATE_MARKER", "pm_state_redirect_path", "PM_DYLD_INTERPOSE(pm_open_hook", "state-paths"]) {
     assert.equal(hook.includes(dead), false, `remnant ${dead}`);
   }
