@@ -84,6 +84,14 @@ test("unattached terminals join the global network by default in address-only mo
   assert.equal(DEFAULT_PORT_MANAGER_SETTINGS.globalNetwork, true);
 });
 
+test("terminal environment overwrites stale network loopback host when hidden", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+
+  assert.equal(source.includes('collection.replace(NETWORK_LOOPBACK_HOST_ENV, "", TERMINAL_MUTATOR_OPTIONS);'), true);
+  assert.equal(source.includes("older terminal attachment"), true);
+});
+
 test("terminal hook preload entries are normalized across multiple VS Code windows", () => {
   const terminalHookEnvironmentPath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
   const networkServicePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
@@ -442,6 +450,7 @@ test("external pm shell function selects a network and sources its attach script
   assert.equal(networkServiceSource.includes("NETWORK_DNS_ALIAS_ENV"), true);
   assert.equal(networkServiceSource.includes("normalizeBrowserDnsHostname(networkName)"), true);
   assert.equal(networkServiceSource.includes("buildTerminalTitleShell(buildPortManagerTerminalTitle(networkName))"), true);
+  assert.equal(networkServiceSource.includes("networkName,"), true);
   assert.equal(daemonReadyGuardIndex >= 0, true);
   assert.equal(shimReadyCheckIndex > daemonReadyGuardIndex, true);
   assert.equal(shimReadyGuardIndex > shimReadyCheckIndex, true);
@@ -453,8 +462,12 @@ test("external pm shell function selects a network and sources its attach script
   assert.equal(networkServiceSource.includes("Port Manager routing unavailable: runtime shim check failed."), true);
   assert.equal(networkServiceSource.includes('buildTerminalTitleShell("Port Manager: detached")'), true);
   assert.equal(terminalHookEnvironmentSource.includes("readonly networkName?: string;"), true);
+  assert.equal(terminalHookEnvironmentSource.includes("const networkName = scope.networkName ?? scope.networkId;"), true);
+  assert.equal(terminalHookEnvironmentSource.includes('const networkName = scope.networkName ?? scope.networkId ?? "";'), true);
+  assert.equal(terminalHookEnvironmentSource.includes("networkId: scope.networkId,\n    networkName,"), true);
+  assert.equal(terminalHookEnvironmentSource.includes("export PORT_MANAGER_NETWORK_NAME=${shellQuote(networkName)}"), true);
   assert.equal(terminalHookEnvironmentSource.includes("readonly networkDnsAlias?: string;"), true);
-  assert.equal(terminalHookEnvironmentSource.includes('collection.replace("PORT_MANAGER_NETWORK_NAME", scope.networkName'), true);
+  assert.equal(terminalHookEnvironmentSource.includes('collection.replace("PORT_MANAGER_NETWORK_NAME", networkName'), true);
   assert.equal(terminalHookEnvironmentSource.includes("collection.replace(NETWORK_DNS_ALIAS_ENV, networkDnsAlias"), true);
   assert.equal(commandSource.includes("readonly terminalNetworkSelectionFilePath: string;"), true);
   assert.equal(commandSource.includes('export PORT_MANAGER_NETWORKS_FILE="'), true);
@@ -1693,6 +1706,44 @@ test("terminal attach script prepares actual loopback routing only after alias r
   assert.equal(refreshBody.includes("shouldUseGlobalNetworkTerminalEnvironment(settings)"), true);
   assert.equal(refreshBody.includes("loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID)"), true);
   assert.equal(refreshBody.includes("do not fall back to a plain localhost identity"), true);
+});
+
+test("terminal attach switches loopback identity before long shell bootstrap work", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const scriptStart = source.indexOf("private buildTerminalRoutingScriptBody");
+  const scriptEnd = source.indexOf("private buildTerminalDetachScript", scriptStart);
+  const scriptBody = source.slice(scriptStart, scriptEnd);
+  const networkExportIndex = scriptBody.indexOf('shellExport("PORT_MANAGER_NETWORK_ID", networkId)');
+  const identityExportIndex = scriptBody.indexOf("buildLoopbackIdentityExportShell(loopbackHost, terminalLoopbackMode)");
+  const composeShellIndex = scriptBody.indexOf("buildComposeProjectRoutingShell");
+  const aliasCheckIndex = scriptBody.indexOf("buildLoopbackAddressRoutingShell(loopbackHost, terminalLoopbackMode)");
+
+  assert.notEqual(scriptStart, -1);
+  assert.notEqual(scriptEnd, -1);
+  assert.notEqual(networkExportIndex, -1);
+  assert.notEqual(identityExportIndex, -1);
+  assert.notEqual(composeShellIndex, -1);
+  assert.notEqual(aliasCheckIndex, -1);
+  assert.equal(networkExportIndex < identityExportIndex, true);
+  assert.equal(identityExportIndex < composeShellIndex, true);
+  assert.equal(identityExportIndex < aliasCheckIndex, true);
+  assert.equal(source.includes("leaving the new network id paired with a stale loopback"), true);
+});
+
+test("terminal attach unwraps previous Port Manager BASH_ENV when switching networks", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const scriptStart = source.indexOf("private buildTerminalRoutingScriptBody");
+  const scriptEnd = source.indexOf("private buildTerminalDetachScript", scriptStart);
+  const scriptBody = source.slice(scriptStart, scriptEnd);
+
+  assert.equal(scriptBody.includes('export PORT_MANAGER_PREV_BASH_ENV="\\${BASH_ENV:-}"'), false);
+  assert.equal(scriptBody.includes("buildShellEnvRestoreSelectionShell"), true);
+  assert.equal(source.includes('path.join(globalStoragePath, "portmanager-bash-env-")'), true);
+  assert.equal(source.includes("Network restore scripts are generated state"), true);
+  assert.equal(source.includes('__pm_previous_bash_env="${PORT_MANAGER_PREV_BASH_ENV:-}"'), true);
+  assert.equal(source.includes('__pm_previous_bash_env=""'), true);
 });
 
 test("terminal attach does not require durable compose routes before reporting active", () => {

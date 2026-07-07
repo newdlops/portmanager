@@ -10,7 +10,8 @@ import type {
   ComposeVolumeMutationMapping,
   ContainerServiceCandidate,
 } from "../../shared/types";
-import type { ContainerCommandRunner } from "./container-runtime";
+import { devLog, devLogEnabled } from "../dev-log";
+import type { ContainerCommandResult, ContainerCommandRunner } from "./container-runtime";
 import { mergeComposeContainerMappingLineage } from "./compose-container-mappings";
 import {
   mergeRuntimeContainerRowsWithInspectNames,
@@ -67,6 +68,8 @@ export interface ComposePublishMutationInput {
   readonly composeFiles?: readonly string[];
   /** Previous clone mapping lineage that must continue to route into this new clone. */
   readonly sourceContainerMappings?: readonly ComposeContainerMutationMapping[];
+  /** Existing clone volumes that should be treated as the data source when copying a hidden project. */
+  readonly sourceClonedVolumes?: readonly ComposeVolumeMutationMapping[];
   /** Copy every defined service into the hidden project, including stopped/no-port services. */
   readonly copyStoppedServices?: boolean;
   /** Published endpoints selected for attach. */
@@ -142,6 +145,7 @@ interface RuntimeContainerInspectRow {
   readonly Name?: string;
   readonly Config?: {
     readonly Labels?: Record<string, string>;
+    readonly ExposedPorts?: Record<string, unknown>;
   };
   readonly Mounts?: readonly RuntimeContainerMount[];
 }
@@ -198,6 +202,7 @@ interface ComposeVolumeMount {
   readonly originalVolumeName: string;
   readonly target: string;
   readonly readOnly: boolean;
+  readonly sourceContainerId?: string;
 }
 
 interface ComposeBindMount {
@@ -205,6 +210,7 @@ interface ComposeBindMount {
   readonly source: string;
   readonly target: string;
   readonly readOnly: boolean;
+  readonly sourceContainerId?: string;
 }
 
 interface ComposeTmpfsMount {
@@ -217,6 +223,8 @@ interface VolumeClonePlan {
   readonly sourceKind: "volume" | "bind";
   readonly sourceName: string;
   readonly targetVolumeName: string;
+  readonly containerPath: string;
+  readonly sourceContainerId?: string;
 }
 
 interface VolumeCloneMapping {
@@ -226,6 +234,50 @@ interface VolumeCloneMapping {
   readonly targetVolumeName: string;
   readonly containerPath: string;
   readonly readOnly: boolean;
+}
+
+interface ComposeMutationLogPlan {
+  readonly mode: ComposePortMutationMode;
+  readonly runtime: "docker" | "podman";
+  readonly originalProjectName: string;
+  readonly attachedProjectName: string;
+  readonly workingDirectory?: string;
+  readonly composeFiles: readonly string[];
+  readonly overrideFile: string;
+  readonly requestedServices: readonly string[];
+  readonly availableServices: readonly string[];
+  readonly routeServices: readonly string[];
+  readonly activeHiddenServices: readonly string[];
+  readonly lifecycleServices: readonly string[];
+  readonly disabledOverrideServices: readonly string[];
+  readonly ports: readonly ComposePublishedPort[];
+  readonly originalContainers: readonly ComposeServiceContainer[];
+  readonly volumeClones: readonly VolumeClonePlan[];
+  readonly volumeMappings: readonly VolumeCloneMapping[];
+}
+
+interface RuntimePublishedPortConflict {
+  readonly requested: ComposePublishedPort;
+  readonly hostAddress: string;
+  readonly hostPort: number;
+  readonly containerName?: string;
+  readonly composeProject?: string;
+  readonly composeService?: string;
+  readonly portsText: string;
+}
+
+interface RuntimePublishedPortConflictOptions {
+  readonly attachedProjectName: string;
+  readonly hiddenHostAddress: string;
+  readonly originalProjectName: string;
+  readonly ignoredOriginalServices: ReadonlySet<string>;
+}
+
+interface RuntimePublishedPort {
+  readonly hostAddress: string;
+  readonly hostPort: number;
+  readonly containerPort: number;
+  readonly protocol: string;
 }
 
 /**
@@ -241,9 +293,55 @@ export class ComposePublishMutator {
   /** Low-level container runtime command runner. */
   private readonly runCommand: ContainerCommandRunner;
 
+  /** Monotonic id that ties dev-log start/end/fail rows for one runtime command. */
+  private commandSequence = 0;
+
   constructor(options: ComposePublishMutatorOptions) {
     this.storageDirectory = options.storageDirectory;
-    this.runCommand = options.runCommand;
+    this.runCommand = async (executable, args, commandOptions) =>
+      this.runLoggedCommand(options.runCommand, executable, args, commandOptions);
+  }
+
+  /**
+   * Wraps the runtime adapter with opt-in dev logging.
+   *
+   * Compose failures often collapse several container/volume steps into one CLI
+   * error. Logging every runtime command with a stable id gives the shared
+   * dev-log enough context to reconstruct the exact failure sequence without
+   * changing normal behavior when PORT_MANAGER_DEV_LOG is unset.
+   */
+  private async runLoggedCommand(
+    runner: ContainerCommandRunner,
+    executable: string,
+    args: readonly string[],
+    commandOptions?: { readonly timeoutMs?: number; readonly cwd?: string },
+  ): Promise<ContainerCommandResult> {
+    if (!devLogEnabled()) {
+      return commandOptions === undefined ? runner(executable, args) : runner(executable, args, commandOptions);
+    }
+
+    const options = commandOptions ?? {};
+    const commandId = ++this.commandSequence;
+    const startedAt = Date.now();
+    devLog(
+      "ts-compose",
+      `cmd#${commandId} start ${formatCommandOptionsForLog(options)} argv=${formatCommandForLog(executable, args)}`,
+    );
+
+    try {
+      const result = commandOptions === undefined ? await runner(executable, args) : await runner(executable, args, commandOptions);
+      devLog(
+        "ts-compose",
+        `cmd#${commandId} ok durationMs=${Date.now() - startedAt} ${formatCommandResultForLog(result)}`,
+      );
+      return result;
+    } catch (error) {
+      devLog(
+        "ts-compose",
+        `cmd#${commandId} fail durationMs=${Date.now() - startedAt} error=${sanitizeLogText(formatUnknownError(error), 16_000)}`,
+      );
+      throw error;
+    }
   }
 
   /** Starts a hidden attached clone and stops the original published services. */
@@ -333,7 +431,18 @@ export class ComposePublishMutator {
       mode === "copy" && copyStoppedServices
         ? requestedRouteServices.filter((service) => runningOriginalServices.has(service))
         : requestedRouteServices;
-    const ports = input.ports.filter((port) => routeServices.includes(port.serviceName));
+    const selectedPorts = input.ports.filter((port) => routeServices.includes(port.serviceName));
+    const ports = createsHiddenProject
+      ? mergeComposePublishedPorts([
+          ...selectedPorts,
+          ...buildSupplementalInternalServicePorts(
+            activeHiddenServices,
+            selectedPorts,
+            originalContainers,
+            originalContainerList.inspectedRows,
+          ),
+        ])
+      : selectedPorts;
     const disabledOverrideServices =
       mode === "clone" && !copyStoppedServices
         ? overrideServices.filter((service) => !activeHiddenServices.includes(service))
@@ -343,6 +452,9 @@ export class ComposePublishMutator {
       originalContainers,
       originalContainerList.inspectedRows,
       lifecycleServices,
+      {
+        sourceClonedVolumes: input.sourceClonedVolumes,
+      },
     );
     const statefulCloneServices = findStatefulCloneServices(lifecycleServices, ports, originalServiceMounts);
     if (createsHiddenProject && statefulCloneServices.length > 0 && input.allowStatefulClone !== true) {
@@ -412,6 +524,25 @@ export class ComposePublishMutator {
       workingDirectory: input.workingDirectory,
       composeFiles: appendUniqueComposeFile(composeFiles, overrideFile),
     };
+    this.logComposeMutationPlan({
+      mode,
+      runtime: input.runtime,
+      originalProjectName,
+      attachedProjectName,
+      workingDirectory: input.workingDirectory,
+      composeFiles,
+      overrideFile,
+      requestedServices,
+      availableServices,
+      routeServices,
+      activeHiddenServices,
+      lifecycleServices,
+      disabledOverrideServices,
+      ports,
+      originalContainers,
+      volumeClones: volumeClonePlan.volumeClones,
+      volumeMappings: volumeClonePlan.volumeMappings,
+    });
     let originalStopped = false;
     let hiddenStarted = false;
     let hiddenProjectTouched = false;
@@ -419,6 +550,18 @@ export class ComposePublishMutator {
     let clonedVolumesCreated = false;
 
     try {
+      if (createsHiddenProject && input.preservePublishedHostPorts === true) {
+        await this.assertHiddenPublishPortsAvailable(
+          input.runtime,
+          {
+            attachedProjectName,
+            hiddenHostAddress: input.hiddenHostAddress,
+            originalProjectName,
+            ignoredOriginalServices: new Set(routeServices),
+          },
+          ports,
+        );
+      }
       if (mode === "clone" && routeServices.length > 0) {
         await this.runCompose(originalContext, ["stop", ...routeServices]);
         originalStopped = true;
@@ -477,6 +620,7 @@ export class ComposePublishMutator {
         },
       };
     } catch (error) {
+      await this.logComposeMutationFailureDiagnostics(hiddenContext, activeHiddenServices, overrideFile, error);
       if ((hiddenProjectTouched || hiddenStarted || hiddenCreated) && createsHiddenProject) {
         await this.runCompose(hiddenContext, ["down", "--remove-orphans"]).catch(() => undefined);
       }
@@ -1108,12 +1252,17 @@ export class ComposePublishMutator {
     containers: readonly ComposeServiceContainer[],
     inspectedRows: readonly RuntimeContainerInspectRow[],
     services: readonly string[],
+    options: {
+      readonly sourceClonedVolumes?: readonly ComposeVolumeMutationMapping[];
+    } = {},
   ): Promise<ReadonlyMap<string, readonly ComposeServiceMount[]>> {
     if (containers.length > 0) {
       return this.inspectServiceMounts(context.runtime, containers, inspectedRows);
     }
 
-    return this.readComposeConfigServiceMounts(context, services);
+    const configMounts = await this.readComposeConfigServiceMounts(context, services);
+    const sourceCloneMounts = buildServiceMountsFromCopySourceVolumes(options.sourceClonedVolumes, services);
+    return mergeRestoredServiceMounts(configMounts, sourceCloneMounts);
   }
 
   /** Reads service mount declarations from Docker/Podman's normalized Compose config JSON. */
@@ -1166,7 +1315,7 @@ export class ComposePublishMutator {
         continue;
       }
 
-      const mounts = parseContainerMounts(serviceName, row.Mounts ?? []);
+      const mounts = parseContainerMounts(serviceName, row.Mounts ?? [], selectedContainer.id);
       const existingMounts = grouped.get(serviceName);
       if (existingMounts !== undefined && (existingMounts.length > 0 || mounts.length > 0)) {
         throw new Error(`Scaled compose service ${serviceName} has volume mounts and cannot be safely attached.`);
@@ -1245,30 +1394,246 @@ export class ComposePublishMutator {
     return matchedServices;
   }
 
+  /** Records the composed attach plan so a later Docker failure has domain context. */
+  private logComposeMutationPlan(plan: ComposeMutationLogPlan): void {
+    if (!devLogEnabled()) {
+      return;
+    }
+
+    devLog(
+      "ts-compose",
+      [
+        "mutation plan",
+        `mode=${plan.mode}`,
+        `runtime=${plan.runtime}`,
+        `original=${plan.originalProjectName}`,
+        `attached=${plan.attachedProjectName}`,
+        `cwd=${quoteLogScalar(plan.workingDirectory ?? "-")}`,
+        `composeFiles=${formatStringListForLog(plan.composeFiles)}`,
+        `override=${quoteLogScalar(plan.overrideFile)}`,
+        `requestedServices=${formatStringListForLog(plan.requestedServices)}`,
+        `availableServices=${formatStringListForLog(plan.availableServices)}`,
+        `routeServices=${formatStringListForLog(plan.routeServices)}`,
+        `activeHiddenServices=${formatStringListForLog(plan.activeHiddenServices)}`,
+        `lifecycleServices=${formatStringListForLog(plan.lifecycleServices)}`,
+        `disabledServices=${formatStringListForLog(plan.disabledOverrideServices)}`,
+        `ports=${formatComposePortsForLog(plan.ports)}`,
+        `sourceContainers=${formatComposeContainersForLog(plan.originalContainers)}`,
+        `volumeClones=${formatVolumeClonesForLog(plan.volumeClones)}`,
+        `volumeMappings=${formatVolumeMappingsForLog(plan.volumeMappings)}`,
+      ].join(" "),
+    );
+  }
+
+  /**
+   * Captures post-failure runtime state before rollback removes the evidence.
+   *
+   * These commands are diagnostic only. Every failure is swallowed so cleanup and
+   * the original error path remain unchanged when Docker is already unhealthy.
+   */
+  private async logComposeMutationFailureDiagnostics(
+    context: ComposeCommandContext,
+    activeHiddenServices: readonly string[],
+    overrideFile: string,
+    error: unknown,
+  ): Promise<void> {
+    if (!devLogEnabled()) {
+      return;
+    }
+
+    devLog(
+      "ts-compose",
+      `mutation failure project=${context.projectName} services=${formatStringListForLog(activeHiddenServices)} error=${sanitizeLogText(formatUnknownError(error), 16_000)}`,
+    );
+
+    const overrideText = await fs.readFile(overrideFile, "utf8").catch(() => undefined);
+    if (overrideText !== undefined) {
+      devLog(
+        "ts-compose",
+        `failure override file=${quoteLogScalar(overrideFile)} bytes=${Buffer.byteLength(overrideText, "utf8")} text=${sanitizeLogText(overrideText, 16_000)}`,
+      );
+    } else {
+      devLog("ts-compose", `failure override file=${quoteLogScalar(overrideFile)} unreadable`);
+    }
+
+    await this.runDiagnosticComposeCommand(context, ["ps", "--all"], "failure compose ps");
+    if (activeHiddenServices.length > 0) {
+      await this.runDiagnosticComposeCommand(
+        context,
+        ["logs", "--no-color", "--tail", "120", ...activeHiddenServices],
+        "failure compose logs",
+      );
+    }
+    await this.logRuntimeProjectContainers(context.runtime, context.projectName);
+  }
+
+  private async runDiagnosticComposeCommand(
+    context: ComposeCommandContext,
+    args: readonly string[],
+    label: string,
+  ): Promise<void> {
+    try {
+      const result = await this.runCommand(context.runtime, this.buildComposeArgs(context, args), {
+        timeoutMs: COMPOSE_TIMEOUT_MS,
+        ...(context.workingDirectory !== undefined ? { cwd: context.workingDirectory } : {}),
+      });
+      devLog("ts-compose", `${label} ${formatCommandResultForLog(result, 16_000)}`);
+    } catch (error) {
+      devLog("ts-compose", `${label} failed error=${sanitizeLogText(formatUnknownError(error), 16_000)}`);
+    }
+  }
+
+  private async logRuntimeProjectContainers(runtime: "docker" | "podman", projectName: string): Promise<void> {
+    try {
+      const listResult = await this.runCommand(
+        runtime,
+        buildRuntimeContainerListArgs(runtime, {
+          includeStopped: true,
+          composeProjectName: projectName,
+        }),
+        { timeoutMs: LIST_TIMEOUT_MS },
+      );
+      devLog("ts-compose", `failure runtime containers project=${projectName} ${formatCommandResultForLog(listResult, 16_000)}`);
+
+      const containerIds = uniqueStrings(
+        listResult.stdout
+          .split(/\r?\n/)
+          .map((line) => parseRuntimeContainerRow(line.trim()))
+          .filter((row): row is RuntimeContainerRow => row !== undefined)
+          .map(readRuntimeContainerId)
+          .filter((id): id is string => id !== undefined),
+      );
+      if (containerIds.length === 0) {
+        return;
+      }
+
+      const inspectResult = await this.runCommand(runtime, ["container", "inspect", ...containerIds], {
+        timeoutMs: INSPECT_TIMEOUT_MS,
+      });
+      devLog("ts-compose", `failure runtime inspect project=${projectName} ${formatCommandResultForLog(inspectResult, 16_000)}`);
+    } catch (error) {
+      devLog("ts-compose", `failure runtime container diagnostics project=${projectName} failed error=${sanitizeLogText(formatUnknownError(error), 16_000)}`);
+    }
+  }
+
+  /**
+   * Fails before stopping the original project when another running container
+   * already owns the exact host publish required by the hidden clone.
+   *
+   * Source services that this mutation will stop are ignored here: their current
+   * wildcard publishes are expected to disappear before the clone starts, while
+   * unrelated projects and stale clones must fail fast before any lifecycle work.
+   */
+  private async assertHiddenPublishPortsAvailable(
+    runtime: "docker" | "podman",
+    options: {
+      readonly attachedProjectName: string;
+      readonly hiddenHostAddress: string | undefined;
+      readonly originalProjectName: string;
+      readonly ignoredOriginalServices: ReadonlySet<string>;
+    },
+    ports: readonly ComposePublishedPort[],
+  ): Promise<void> {
+    const hiddenHost = normalizeHiddenPublishHost(options.hiddenHostAddress);
+    const rows = await this.listRuntimeRows(runtime);
+    const conflicts = findRuntimePublishedPortConflicts(
+      rows,
+      {
+        attachedProjectName: options.attachedProjectName,
+        hiddenHostAddress: hiddenHost,
+        originalProjectName: options.originalProjectName,
+        ignoredOriginalServices: options.ignoredOriginalServices,
+      },
+      ports,
+    );
+    if (conflicts.length === 0) {
+      return;
+    }
+
+    const formatted = conflicts.map(formatRuntimePublishedPortConflict).join(", ");
+    throw new Error(
+      `Compose hidden project ${options.attachedProjectName} cannot publish logical port${conflicts.length === 1 ? "" : "s"} because another running container already owns the target host port: ${formatted}. Detach or remove the existing compose clone, or attach this project to a different logical network.`,
+    );
+  }
+
   /** Copies Docker volumes before the hidden service starts so clone traffic has isolated state. */
   private async copyVolumes(runtime: "docker" | "podman", volumeClones: readonly VolumeClonePlan[]): Promise<void> {
     for (const volume of volumeClones) {
-      const sourceMount = volume.sourceKind === "volume" ? `${volume.sourceName}:/from:ro` : `${volume.sourceName}:/from:ro`;
+      if (devLogEnabled()) {
+        devLog(
+          "ts-compose",
+          `volume copy start kind=${volume.sourceKind} source=${quoteLogScalar(volume.sourceName)} target=${quoteLogScalar(volume.targetVolumeName)} path=${quoteLogScalar(volume.containerPath)} sourceContainer=${quoteLogScalar(volume.sourceContainerId ?? "-")}`,
+        );
+      }
       await this.runCommand(runtime, ["volume", "create", volume.targetVolumeName], {
         timeoutMs: LIST_TIMEOUT_MS,
       });
-      await this.runCommand(
-        runtime,
-        [
-          "run",
-          "--rm",
-          "-v",
-          sourceMount,
-          "-v",
-          `${volume.targetVolumeName}:/to`,
-          VOLUME_COPY_IMAGE,
-          "sh",
-          "-lc",
-          "cd /from && cp -a . /to",
-        ],
-        { timeoutMs: VOLUME_COPY_TIMEOUT_MS },
-      );
+      if (volume.sourceContainerId !== undefined) {
+        await this.copyVolumeFromContainerMount(runtime, volume);
+        if (devLogEnabled()) {
+          devLog("ts-compose", `volume copy ok target=${volume.targetVolumeName}`);
+        }
+        continue;
+      }
+
+      await this.copyVolumeFromRuntimeMount(runtime, volume);
+      if (devLogEnabled()) {
+        devLog("ts-compose", `volume copy ok target=${volume.targetVolumeName}`);
+      }
     }
+  }
+
+  /** Copies the mounted data exactly as the source container sees it. */
+  private async copyVolumeFromContainerMount(runtime: "docker" | "podman", volume: VolumeClonePlan): Promise<void> {
+    await this.runCommand(
+      runtime,
+      [
+        "run",
+        "--rm",
+        "--volumes-from",
+        volume.sourceContainerId!,
+        "-v",
+        `${volume.targetVolumeName}:/to`,
+        VOLUME_COPY_IMAGE,
+        "sh",
+        "-lc",
+        [
+          "set -eu",
+          "src=$1",
+          "if [ -d \"$src\" ]; then",
+          "  cd \"$src\" && cp -a . /to",
+          "elif [ -f \"$src\" ]; then",
+          "  cp -a \"$src\" /to/",
+          "else",
+          "  exit 0",
+          "fi",
+        ].join("\n"),
+        "sh",
+        volume.containerPath,
+      ],
+      { timeoutMs: VOLUME_COPY_TIMEOUT_MS },
+    );
+  }
+
+  /** Fallback for recovered clone metadata when no source container exists anymore. */
+  private async copyVolumeFromRuntimeMount(runtime: "docker" | "podman", volume: VolumeClonePlan): Promise<void> {
+    const sourceMount = `${volume.sourceName}:/from:ro`;
+    await this.runCommand(
+      runtime,
+      [
+        "run",
+        "--rm",
+        "-v",
+        sourceMount,
+        "-v",
+        `${volume.targetVolumeName}:/to`,
+        VOLUME_COPY_IMAGE,
+        "sh",
+        "-lc",
+        "cd /from && cp -a . /to",
+      ],
+      { timeoutMs: VOLUME_COPY_TIMEOUT_MS },
+    );
   }
 
   /** Best-effort rollback for cloned volumes created before a failed attach. */
@@ -1515,6 +1880,243 @@ export class ComposePublishMutator {
 
 }
 
+function formatCommandOptionsForLog(options: { readonly timeoutMs?: number; readonly cwd?: string }): string {
+  return `cwd=${quoteLogScalar(options.cwd ?? "-")} timeoutMs=${options.timeoutMs ?? "-"}`;
+}
+
+function formatCommandForLog(executable: string, args: readonly string[]): string {
+  return sanitizeLogText([executable, ...args].map(quoteCommandPartForLog).join(" "), 8_000);
+}
+
+function quoteCommandPartForLog(value: string): string {
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) {
+    return value;
+  }
+
+  return JSON.stringify(value);
+}
+
+function formatCommandResultForLog(result: ContainerCommandResult, previewLimit = 8_000): string {
+  return [
+    `stdoutBytes=${Buffer.byteLength(result.stdout, "utf8")}`,
+    `stderrBytes=${Buffer.byteLength(result.stderr, "utf8")}`,
+    `stdout=${JSON.stringify(sanitizeLogText(result.stdout, previewLimit))}`,
+    `stderr=${JSON.stringify(sanitizeLogText(result.stderr, previewLimit))}`,
+  ].join(" ");
+}
+
+function formatStringListForLog(values: readonly string[]): string {
+  return JSON.stringify(values.map((value) => sanitizeLogText(value, 1_000)));
+}
+
+function quoteLogScalar(value: string): string {
+  return JSON.stringify(sanitizeLogText(value, 4_000));
+}
+
+function formatComposePortsForLog(ports: readonly ComposePublishedPort[]): string {
+  return sanitizeJsonForLog(
+    ports.map((port) => ({
+      service: port.serviceName,
+      logical: port.logicalPort,
+      actualHost: `${port.actualHostAddress}:${port.actualHostPort}`,
+      container: port.containerPort,
+      protocol: port.protocol,
+      protocolName: port.protocolName,
+    })),
+    8_000,
+  );
+}
+
+function formatComposeContainersForLog(containers: readonly ComposeServiceContainer[]): string {
+  return sanitizeJsonForLog(
+    containers.map((container) => ({
+      service: container.serviceName,
+      id: container.id,
+      name: container.name,
+      status: container.status,
+      running: container.isRunning,
+      published: container.hasPublishedPorts,
+    })),
+    8_000,
+  );
+}
+
+function formatVolumeClonesForLog(volumes: readonly VolumeClonePlan[]): string {
+  return sanitizeJsonForLog(
+    volumes.map((volume) => ({
+      kind: volume.sourceKind,
+      source: volume.sourceName,
+      target: volume.targetVolumeName,
+      containerPath: volume.containerPath,
+      sourceContainer: volume.sourceContainerId,
+    })),
+    8_000,
+  );
+}
+
+function formatVolumeMappingsForLog(volumes: readonly VolumeCloneMapping[]): string {
+  return sanitizeJsonForLog(
+    volumes.map((volume) => ({
+      service: volume.serviceName,
+      kind: volume.sourceKind,
+      source: volume.sourceName,
+      target: volume.targetVolumeName,
+      containerPath: volume.containerPath,
+      readOnly: volume.readOnly,
+    })),
+    8_000,
+  );
+}
+
+function sanitizeJsonForLog(value: unknown, limit: number): string {
+  return sanitizeLogText(JSON.stringify(value), limit);
+}
+
+function sanitizeLogText(value: string, limit = 4_000): string {
+  const escaped = value.replace(/\r/g, "\\r").replace(/\n/g, "\\n");
+  if (escaped.length <= limit) {
+    return escaped;
+  }
+
+  return `${escaped.slice(0, limit)}...<truncated ${escaped.length - limit} chars>`;
+}
+
+function findRuntimePublishedPortConflicts(
+  rows: readonly RuntimeContainerRow[],
+  options: RuntimePublishedPortConflictOptions,
+  requestedPorts: readonly ComposePublishedPort[],
+): readonly RuntimePublishedPortConflict[] {
+  const conflicts: RuntimePublishedPortConflict[] = [];
+
+  for (const row of rows) {
+    const portsText = row.Ports?.trim();
+    if (portsText === undefined || portsText.length === 0) {
+      continue;
+    }
+
+    const labels = parseRuntimeLabels(row.Labels);
+    const composeProject = readRuntimeLabel(labels, "com.docker.compose.project", "io.podman.compose.project");
+    const composeService = readRuntimeLabel(labels, "com.docker.compose.service", "io.podman.compose.service");
+    if (
+      composeProject === options.attachedProjectName ||
+      (composeProject === options.originalProjectName &&
+        composeService !== undefined &&
+        options.ignoredOriginalServices.has(composeService))
+    ) {
+      continue;
+    }
+
+    const publishedPorts = parseRuntimePublishedPorts(portsText);
+    if (publishedPorts.length === 0) {
+      continue;
+    }
+
+    for (const requested of requestedPorts) {
+      const requestedHostPort = requested.logicalPort;
+      const conflict = publishedPorts.find(
+        (published) =>
+          published.protocol === requested.protocol &&
+          published.hostPort === requestedHostPort &&
+          publishHostsConflict(options.hiddenHostAddress, published.hostAddress),
+      );
+      if (conflict === undefined) {
+        continue;
+      }
+
+      conflicts.push({
+        requested,
+        hostAddress: conflict.hostAddress,
+        hostPort: conflict.hostPort,
+        ...(readRuntimeContainerName(row) !== undefined ? { containerName: readRuntimeContainerName(row) } : {}),
+        ...(composeProject !== undefined ? { composeProject } : {}),
+        ...(composeService !== undefined ? { composeService } : {}),
+        portsText,
+      });
+    }
+  }
+
+  return conflicts;
+}
+
+function parseRuntimePublishedPorts(portsText: string): readonly RuntimePublishedPort[] {
+  return portsText
+    .split(",")
+    .map((part) => part.trim())
+    .map(parseRuntimePublishedPort)
+    .filter((port): port is RuntimePublishedPort => port !== undefined);
+}
+
+function parseRuntimePublishedPort(value: string): RuntimePublishedPort | undefined {
+  const arrowIndex = value.indexOf("->");
+  if (arrowIndex <= 0) {
+    return undefined;
+  }
+
+  const hostPort = parseRuntimeHostPort(value.slice(0, arrowIndex));
+  const containerPort = parseRuntimeContainerPort(value.slice(arrowIndex + 2));
+  if (hostPort === undefined || containerPort === undefined) {
+    return undefined;
+  }
+
+  return {
+    hostAddress: hostPort.hostAddress,
+    hostPort: hostPort.hostPort,
+    containerPort: containerPort.containerPort,
+    protocol: containerPort.protocol,
+  };
+}
+
+function parseRuntimeHostPort(value: string): { readonly hostAddress: string; readonly hostPort: number } | undefined {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("[")) {
+    const endBracketIndex = trimmed.indexOf("]");
+    if (endBracketIndex <= 0 || trimmed[endBracketIndex + 1] !== ":") {
+      return undefined;
+    }
+
+    const hostPort = Number.parseInt(trimmed.slice(endBracketIndex + 2), 10);
+    return isTcpPort(hostPort) ? { hostAddress: trimmed.slice(1, endBracketIndex), hostPort } : undefined;
+  }
+
+  const separatorIndex = trimmed.lastIndexOf(":");
+  if (separatorIndex < 0) {
+    const hostPort = Number.parseInt(trimmed, 10);
+    return isTcpPort(hostPort) ? { hostAddress: "", hostPort } : undefined;
+  }
+
+  const hostPort = Number.parseInt(trimmed.slice(separatorIndex + 1), 10);
+  return isTcpPort(hostPort)
+    ? { hostAddress: trimmed.slice(0, separatorIndex), hostPort }
+    : undefined;
+}
+
+function parseRuntimeContainerPort(value: string): { readonly containerPort: number; readonly protocol: string } | undefined {
+  const [portText, rawProtocol] = value.trim().split("/");
+  const containerPort = Number.parseInt(portText ?? "", 10);
+  const protocol = rawProtocol?.toLowerCase() ?? "tcp";
+  return isTcpPort(containerPort) && protocol.length > 0 ? { containerPort, protocol } : undefined;
+}
+
+function publishHostsConflict(requestedHost: string, existingHost: string): boolean {
+  const requested = normalizeRuntimePublishHost(requestedHost);
+  const existing = normalizeRuntimePublishHost(existingHost);
+  return requested === existing || requested === "*" || existing === "*";
+}
+
+function normalizeRuntimePublishHost(host: string): string {
+  const normalized = host.trim().toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+  return normalized.length === 0 || normalized === "0.0.0.0" || normalized === "::" ? "*" : normalized;
+}
+
+function formatRuntimePublishedPortConflict(conflict: RuntimePublishedPortConflict): string {
+  const owner = [
+    conflict.containerName ?? "unknown-container",
+    conflict.composeProject !== undefined ? `project=${conflict.composeProject}` : undefined,
+    conflict.composeService !== undefined ? `service=${conflict.composeService}` : undefined,
+  ].filter((part): part is string => part !== undefined).join(" ");
+  return `${conflict.requested.serviceName}:${conflict.requested.logicalPort}->${conflict.hostAddress || "*"}:${conflict.hostPort} owned by ${owner} (${conflict.portsText})`;
+}
+
 function groupPortsByService(
   ports: readonly ComposePublishedPort[],
 ): ReadonlyMap<string, readonly ComposePublishedPort[]> {
@@ -1533,6 +2135,19 @@ function groupPortsByService(
   }
 
   return grouped;
+}
+
+function mergeComposePublishedPorts(ports: readonly ComposePublishedPort[]): readonly ComposePublishedPort[] {
+  const merged = new Map<string, ComposePublishedPort>();
+
+  for (const port of ports) {
+    const key = buildPortKey(port);
+    if (!merged.has(key)) {
+      merged.set(key, port);
+    }
+  }
+
+  return [...merged.values()];
 }
 
 function sleep(delayMs: number): Promise<void> {
@@ -1606,6 +2221,165 @@ function buildContainerCloneMappings(
   }
 
   return mappings;
+}
+
+function buildSupplementalInternalServicePorts(
+  activeHiddenServices: readonly string[],
+  selectedPorts: readonly ComposePublishedPort[],
+  originalContainers: readonly ComposeServiceContainer[],
+  inspectedRows: readonly RuntimeContainerInspectRow[],
+): readonly ComposePublishedPort[] {
+  const selectedServices = new Set(selectedPorts.map((port) => port.serviceName));
+  const existingPortKeys = new Set(selectedPorts.map((port) => buildPortKey(port)));
+  const inspectedRowsByService = groupInspectRowsByService(originalContainers, inspectedRows);
+  const supplementalPorts: ComposePublishedPort[] = [];
+
+  for (const serviceName of activeHiddenServices) {
+    if (selectedServices.has(serviceName)) {
+      continue;
+    }
+
+    const exposedPorts = uniqueNumbers(
+      (inspectedRowsByService.get(serviceName) ?? []).flatMap((row) =>
+        parseInfrastructureExposedTcpPorts(serviceName, row.Config?.ExposedPorts),
+      ),
+    );
+    const internalPorts = exposedPorts.length > 0 ? exposedPorts : inferDefaultInfrastructurePorts(serviceName);
+    for (const port of internalPorts) {
+      const supplementalPort: ComposePublishedPort = {
+        serviceName,
+        logicalPort: port,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: port,
+        containerPort: port,
+        protocol: "tcp",
+        protocolName: inferInfrastructureProtocolName(port),
+      };
+      const key = buildPortKey(supplementalPort);
+      if (existingPortKeys.has(key)) {
+        continue;
+      }
+
+      existingPortKeys.add(key);
+      supplementalPorts.push(supplementalPort);
+    }
+  }
+
+  return supplementalPorts;
+}
+
+function groupInspectRowsByService(
+  containers: readonly ComposeServiceContainer[],
+  inspectedRows: readonly RuntimeContainerInspectRow[],
+): ReadonlyMap<string, readonly RuntimeContainerInspectRow[]> {
+  const grouped = new Map<string, RuntimeContainerInspectRow[]>();
+
+  for (const row of inspectedRows) {
+    const selectedContainer = findInspectedServiceContainer(row, containers);
+    const serviceName = findInspectServiceName(row) ?? selectedContainer?.serviceName;
+    if (serviceName === undefined) {
+      continue;
+    }
+
+    grouped.set(serviceName, [...(grouped.get(serviceName) ?? []), row]);
+  }
+
+  return grouped;
+}
+
+function parseInfrastructureExposedTcpPorts(
+  serviceName: string,
+  exposedPorts: Record<string, unknown> | undefined,
+): readonly number[] {
+  if (exposedPorts === undefined) {
+    return [];
+  }
+
+  return Object.keys(exposedPorts)
+    .map(parseExposedTcpPortKey)
+    .filter((port): port is number => port !== undefined && isInfrastructurePortForService(serviceName, port));
+}
+
+function parseExposedTcpPortKey(key: string): number | undefined {
+  const [portText, protocol] = key.split("/");
+  const port = Number.parseInt(portText ?? "", 10);
+  return protocol === "tcp" && isTcpPort(port) ? port : undefined;
+}
+
+function inferDefaultInfrastructurePorts(serviceName: string): readonly number[] {
+  const normalized = serviceName.toLowerCase().replace(/[-_]+/g, " ");
+  if (/\b(postgres|postgresql|db|database)\b/.test(normalized)) {
+    return [5432];
+  }
+  if (/\b(mysql|mariadb)\b/.test(normalized)) {
+    return [3306];
+  }
+  if (/\b(redis)\b/.test(normalized)) {
+    return [6379];
+  }
+  if (/\b(rabbitmq|amqp)\b/.test(normalized)) {
+    return [5671, 5672, 15672];
+  }
+  if (/\b(mqtt)\b/.test(normalized)) {
+    return [1883, 8883];
+  }
+  if (/\b(kafka)\b/.test(normalized)) {
+    return [9092];
+  }
+  if (/\b(nats)\b/.test(normalized)) {
+    return [4222];
+  }
+  if (/\b(mongo|mongodb)\b/.test(normalized)) {
+    return [27017];
+  }
+  if (/\b(elastic|elasticsearch|opensearch)\b/.test(normalized)) {
+    return [9200, 9300];
+  }
+
+  return [];
+}
+
+function isInfrastructurePortForService(serviceName: string, port: number): boolean {
+  if (inferInfrastructureProtocolName(port) === undefined) {
+    return false;
+  }
+
+  const defaultPorts = inferDefaultInfrastructurePorts(serviceName);
+  return defaultPorts.length === 0 || defaultPorts.includes(port);
+}
+
+function inferInfrastructureProtocolName(port: number): string | undefined {
+  switch (port) {
+    case 5432:
+      return "postgresql";
+    case 3306:
+      return "mysql";
+    case 6379:
+      return "redis";
+    case 5671:
+      return "amqps";
+    case 5672:
+      return "amqp";
+    case 15672:
+      return "rabbitmq-management";
+    case 1883:
+      return "mqtt";
+    case 4222:
+      return "nats";
+    case 8883:
+      return "mqtts";
+    case 9092:
+      return "kafka";
+    case 27017:
+      return "mongodb";
+    case 9200:
+    case 9300:
+      return "elasticsearch";
+    case 50051:
+      return "grpc";
+    default:
+      return undefined;
+  }
 }
 
 function isRunningComposeServiceContainer(container: ComposeServiceContainer): boolean {
@@ -1886,6 +2660,41 @@ function buildServiceMountsFromPersistedCloneVolumes(
       sourceKey: buildVolumeSourceKey(mapping.targetVolumeName),
       volumeName: mapping.targetVolumeName,
       originalVolumeName: mapping.sourceName,
+      target: mapping.containerPath,
+      readOnly: mapping.readOnly,
+    });
+    serviceMounts.set(mapping.serviceName, mounts);
+  }
+
+  return serviceMounts;
+}
+
+/**
+ * Treats a copied attachment's clone volumes as the next copy source.
+ *
+ * When the source hidden project has no containers left to inspect, the durable
+ * mutation state is the only place that still identifies the volume holding the
+ * user's data. The next clone must copy from that target volume, not from the
+ * original host-project volume name recorded for restore diagnostics.
+ */
+function buildServiceMountsFromCopySourceVolumes(
+  clonedVolumes: readonly ComposeVolumeMutationMapping[] | undefined,
+  serviceNames: readonly string[],
+): ReadonlyMap<string, readonly ComposeServiceMount[]> {
+  const serviceNameSet = new Set(serviceNames);
+  const serviceMounts = new Map<string, ComposeServiceMount[]>();
+
+  for (const mapping of clonedVolumes ?? []) {
+    if (!serviceNameSet.has(mapping.serviceName)) {
+      continue;
+    }
+
+    const mounts = serviceMounts.get(mapping.serviceName) ?? [];
+    mounts.push({
+      type: "volume",
+      sourceKey: buildVolumeSourceKey(mapping.targetVolumeName),
+      volumeName: mapping.targetVolumeName,
+      originalVolumeName: mapping.targetVolumeName,
       target: mapping.containerPath,
       readOnly: mapping.readOnly,
     });
@@ -2352,7 +3161,7 @@ async function buildVolumeClonePlan(
   const clonedServiceMounts = new Map<string, readonly ComposeServiceMount[]>();
 
   for (const [serviceName, mounts] of serviceMounts) {
-    const shouldCloneBindMounts = statefulServiceNames.has(serviceName);
+    const shouldRejectUncloneableBindMounts = statefulServiceNames.has(serviceName);
     clonedServiceMounts.set(
       serviceName,
       await Promise.all(
@@ -2373,8 +3182,14 @@ async function buildVolumeClonePlan(
             return clonedMount;
           }
 
-          if (mount.type === "bind" && shouldCloneBindMounts) {
-            await assertCloneableBindMount(serviceName, mount);
+          if (mount.type === "bind") {
+            const cloneableBindMount = await resolveCloneableBindMount(serviceName, mount, {
+              failWhenUncloneable: shouldRejectUncloneableBindMounts,
+            });
+            if (cloneableBindMount === undefined) {
+              return mount;
+            }
+
             return cloneVolumeBackedMount(
               attachedProjectName,
               cloneRunId,
@@ -2385,6 +3200,7 @@ async function buildVolumeClonePlan(
                 originalVolumeName: mount.source,
                 target: mount.target,
                 readOnly: mount.readOnly,
+                ...(mount.sourceContainerId !== undefined ? { sourceContainerId: mount.sourceContainerId } : {}),
               },
               serviceName,
               "bind",
@@ -2428,6 +3244,8 @@ function cloneVolumeBackedMount(
       sourceKind,
       sourceName,
       targetVolumeName,
+      containerPath: mount.target,
+      ...(mount.sourceContainerId !== undefined ? { sourceContainerId: mount.sourceContainerId } : {}),
     });
   }
 
@@ -2447,16 +3265,28 @@ function cloneVolumeBackedMount(
   };
 }
 
-async function assertCloneableBindMount(serviceName: string, mount: ComposeBindMount): Promise<void> {
+async function resolveCloneableBindMount(
+  serviceName: string,
+  mount: ComposeBindMount,
+  options: { readonly failWhenUncloneable: boolean },
+): Promise<ComposeBindMount | undefined> {
   const stat = await fs.stat(mount.source).catch(() => undefined);
   if (stat === undefined) {
-    throw new Error(`Compose service ${serviceName} bind mount ${mount.source} does not exist and cannot be safely cloned.`);
+    if (options.failWhenUncloneable) {
+      throw new Error(`Compose service ${serviceName} bind mount ${mount.source} does not exist and cannot be safely cloned.`);
+    }
+    return undefined;
   }
   if (!stat.isDirectory()) {
-    throw new Error(
-      `Compose service ${serviceName} bind mount ${mount.source} targets ${mount.target}, but file bind mounts cannot be safely cloned into an isolated volume.`,
-    );
+    if (options.failWhenUncloneable) {
+      throw new Error(
+        `Compose service ${serviceName} bind mount ${mount.source} targets ${mount.target}, but file bind mounts cannot be safely cloned into an isolated volume.`,
+      );
+    }
+    return undefined;
   }
+
+  return mount;
 }
 
 function buildVolumeMutationMappings(volumeMappings: readonly VolumeCloneMapping[]): readonly ComposeVolumeMutationMapping[] {
@@ -2877,11 +3707,16 @@ function findInspectedServiceContainer(
 function parseContainerMounts(
   serviceName: string,
   mounts: readonly RuntimeContainerMount[],
+  sourceContainerId?: string,
 ): readonly ComposeServiceMount[] {
-  return mounts.map((mount) => parseContainerMount(serviceName, mount));
+  return mounts.map((mount) => parseContainerMount(serviceName, mount, sourceContainerId));
 }
 
-function parseContainerMount(serviceName: string, mount: RuntimeContainerMount): ComposeServiceMount {
+function parseContainerMount(
+  serviceName: string,
+  mount: RuntimeContainerMount,
+  sourceContainerId: string | undefined,
+): ComposeServiceMount {
   const type = assertNonEmptyString(mount.Type ?? "", `Mount type for ${serviceName}`);
   const target = assertNonEmptyString(mount.Destination ?? "", `Mount target for ${serviceName}`);
   const readOnly = mount.RW === false;
@@ -2896,6 +3731,7 @@ function parseContainerMount(serviceName: string, mount: RuntimeContainerMount):
         originalVolumeName: volumeName,
         target,
         readOnly,
+        ...(sourceContainerId !== undefined ? { sourceContainerId } : {}),
       };
     }
     case "bind":
@@ -2904,6 +3740,7 @@ function parseContainerMount(serviceName: string, mount: RuntimeContainerMount):
         source: assertNonEmptyString(mount.Source ?? "", `Bind source for ${serviceName}:${target}`),
         target,
         readOnly,
+        ...(sourceContainerId !== undefined ? { sourceContainerId } : {}),
       };
     case "tmpfs":
       return {
@@ -3152,6 +3989,14 @@ function sameContainerId(left: string, right: string): boolean {
 
 function uniqueStrings(values: readonly string[]): readonly string[] {
   return [...new Set(values.filter((value) => value.length > 0))];
+}
+
+function uniqueNumbers(values: readonly number[]): readonly number[] {
+  return [...new Set(values.filter(isTcpPort))];
+}
+
+function isTcpPort(port: number): boolean {
+  return Number.isInteger(port) && port > 0 && port <= 65_535;
 }
 
 function appendUniqueComposeFile(composeFiles: readonly string[], overrideFile: string): readonly string[] {

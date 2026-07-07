@@ -183,9 +183,14 @@ export function applyTerminalHookEnvironment(
   const nativeContainerMapPath = context.asAbsolutePath(path.join("media", "native", "portmanager_container_map"));
   const asdfShimLauncherPath = context.asAbsolutePath(getAsdfShimLauncherRelativePath());
   const runtimeCommandShimPath = context.asAbsolutePath(getRuntimeCommandShimRelativePath());
-  const networkDnsAlias = scope.networkDnsAlias ?? normalizeBrowserDnsHostname(scope.networkName ?? "");
+  // User network identity must stay non-empty across protected shebang/BASH_ENV
+  // boundaries; the native hook treats an empty name with the global flag as
+  // host-real and disables per-network env/file substitution.
+  const networkName = scope.networkName ?? scope.networkId;
+  const networkDnsAlias = scope.networkDnsAlias ?? normalizeBrowserDnsHostname(networkName);
   const shellEnvRestorePath = prepareShellEnvRestoreScript(context.globalStorageUri.fsPath, hookLibraryPath, {
     networkId: scope.networkId,
+    networkName,
     networkDnsAlias,
     agentSocketPath: getAgentSocketPath(),
     agentMainPath,
@@ -210,12 +215,10 @@ export function applyTerminalHookEnvironment(
     collection.replace("PORT_MANAGER_DEV_LOG", process.env.PORT_MANAGER_DEV_LOG, TERMINAL_MUTATOR_OPTIONS);
   }
   collection.replace("PORT_MANAGER_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
-  if (scope.networkName !== undefined) {
-    collection.replace("PORT_MANAGER_NETWORK_NAME", scope.networkName, TERMINAL_MUTATOR_OPTIONS);
-  }
-  // Per-network identity needs no extra env here: the hook virtualizes
-  // gethostname()/uname() to PORT_MANAGER_NETWORK_NAME for this shell and its
-  // children, so hostname-derived identity (celery `@%h`, etc.) is per-network.
+  collection.replace("PORT_MANAGER_NETWORK_NAME", networkName, TERMINAL_MUTATOR_OPTIONS);
+  // Per-network identity uses the hook's hostname virtualization: loopback
+  // address first, network name as fallback. A non-empty name also prevents a
+  // stale global-scope flag from making this user network host-real.
   // See docs/per-network-hostname.md.
   if (networkDnsAlias !== undefined) {
     collection.replace(NETWORK_DNS_ALIAS_ENV, networkDnsAlias, TERMINAL_MUTATOR_OPTIONS);
@@ -358,6 +361,10 @@ function applyLoopbackRoutingHosts(
 
   if (shouldExposeNetworkLoopbackHost(settings)) {
     collection.replace(NETWORK_LOOPBACK_HOST_ENV, loopbackHost, TERMINAL_MUTATOR_OPTIONS);
+  } else {
+    // Replace with empty rather than deleting the mutator so an inherited value
+    // from an older terminal attachment cannot survive into a new process tree.
+    collection.replace(NETWORK_LOOPBACK_HOST_ENV, "", TERMINAL_MUTATOR_OPTIONS);
   }
 }
 
@@ -426,7 +433,7 @@ export function ensureNetworkEnvFileScaffold(networkId: string, networkName: str
  * shared .gitignore must stay untouched. Follows `gitdir:` indirection for
  * worktrees (exclude lives in the common dir) and submodules.
  */
-function ensureLocalGitExclude(root: string): void {
+export function ensureLocalGitExclude(root: string): void {
   const gitPath = path.join(root, ".git");
   let gitDirectory: string | undefined;
   const gitStats = fs.statSync(gitPath, { throwIfNoEntry: false });
@@ -751,6 +758,8 @@ function isStaleGeneratedRuntimeShim(filePath: string): boolean {
 export interface ShellEnvRestoreScope {
   /** Logical network scope that must survive protected shebang and bash boundaries. */
   readonly networkId?: string;
+  /** Human-visible network name; non-empty value marks user networks as not the reserved global scope. */
+  readonly networkName?: string;
   /** Single-label network alias used to fold dev-server --host aliases back to localhost. */
   readonly networkDnsAlias?: string;
   /** Singleton daemon socket path; losing this can point native hooks at a different temp directory. */
@@ -1406,6 +1415,7 @@ function sanitizeFileNamePart(value: string): string {
 function buildShellEnvRestoreScript(scope: ShellEnvRestoreScope, scriptPath: string): string {
   const globalRouteTablePath = scope.globalRouteTablePath ?? getDefaultRouteTablePath();
   const hostAccessFilePath = scope.hostAccessFilePath ?? getDefaultHostAccessBindingsPath();
+  const networkName = scope.networkName ?? scope.networkId ?? "";
   const routeTableExports =
     scope.networkId === undefined
       ? `if [ -z "\${PORT_MANAGER_ROUTES_FILE:-}" ]; then
@@ -1436,6 +1446,7 @@ fi`
       : `export PORT_MANAGER_HOOK=1
 unset ${NETWORK_IS_GLOBAL_ENV}
 export PORT_MANAGER_NETWORK_ID=${shellQuote(scope.networkId)}
+export PORT_MANAGER_NETWORK_NAME=${shellQuote(networkName)}
 export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID=${shellQuote(scope.networkId)}
 	export PORT_MANAGER_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}
 	export NEWDLOPS_PM_NETWORK_ID=${shellQuote(scope.networkId)}

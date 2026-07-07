@@ -1,11 +1,12 @@
 # Port Manager development log endpoint
 
-> **TL;DR** — Set the `portManager.developmentLogPath` VS Code setting (or the
-> `PORT_MANAGER_DEV_LOG` env var) to an absolute file path, reload the window,
-> then `tail -f` that file. The native hook, TCP router, and agent — plus the
-> extension host — all append their routing/attribution decisions to that one
-> file. Leave it empty to disable (zero overhead). **No rebuild needed to turn
-> logging on or off.**
+> **TL;DR** — Port Manager writes the shared dev-log to
+> `.portmanager/portmanager-dev.log` by default. Override
+> `portManager.developmentLogPath` (or the `PORT_MANAGER_DEV_LOG` env var),
+> reload the window, then `tail -f` that file. The native hook, TCP router, and
+> agent — plus the extension host — all append their routing/attribution
+> decisions to that one file. Set the VS Code setting to empty to disable.
+> **No rebuild needed to turn logging on or off.**
 
 This endpoint exists so we can trace how a connection is attributed and routed
 **without** editing C, rebuilding native binaries, and reloading for every probe
@@ -18,7 +19,10 @@ shared by every component.
 There are two switches; either one turns the endpoint on:
 
 1. **VS Code setting (recommended):** `portManager.developmentLogPath`
-   - Absolute path; a leading `~/` expands to `$HOME`.
+   - Default: `.portmanager/portmanager-dev.log` in the first workspace folder.
+   - Relative paths are kept under the workspace-local `.portmanager/`
+     directory; a leading `.portmanager/` is accepted as already scoped.
+   - Absolute paths and a leading `~/` are respected.
    - `activate()` copies it into `process.env.PORT_MANAGER_DEV_LOG` **before any
      native child is spawned**, so it propagates to the router/agent/tracker via
      `buildNodeRuntimeEnvironment` (which spreads `process.env`) and to hooked
@@ -26,15 +30,17 @@ There are two switches; either one turns the endpoint on:
    - **Reload the window after changing it** — long-lived daemons (the gateway
      router, the agent) only read the env at spawn, so they pick up a change on
      the next reload/respawn.
-   - Empty (default) → disabled; any pre-existing `PORT_MANAGER_DEV_LOG` env var
-     is left untouched.
+   - Empty → disabled and clears `PORT_MANAGER_DEV_LOG` for children spawned by
+     the extension.
 
 2. **Raw env var:** launch VS Code (or any native binary directly) with
-   `PORT_MANAGER_DEV_LOG=/abs/path`. Useful for standalone runs of
+   `PORT_MANAGER_DEV_LOG=/abs/path`. If VS Code normalizes a relative env value,
+   it is scoped under workspace `.portmanager/`; standalone native binaries use
+   the env value as provided. Useful for standalone runs of
    `portmanager_tcp_router`, `portmanager_agent`, or a hooked shell in tests.
 
-When unset/empty the logger is a no-op in every component (a single `getenv`
-check), so it is safe to ship enabled-by-code / disabled-by-default.
+When disabled the logger is a no-op in every component (a single `getenv`
+check).
 
 ## Line format
 

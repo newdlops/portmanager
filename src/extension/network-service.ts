@@ -112,6 +112,7 @@ import type {
   ComposePortMutationMode,
   ComposePortMutationState,
   ComposePublishedPort,
+  ComposeVolumeMutationMapping,
   ControlPlaneStatus,
   ContainerServiceCandidate,
   DisposableLike,
@@ -2630,6 +2631,9 @@ export class PortManagerNetworkService implements DisposableLike {
           copyStoppedServices: true,
           ...(source.mutation?.containerMappings !== undefined
             ? { sourceContainerMappings: source.mutation.containerMappings }
+            : {}),
+          ...(source.mutation?.clonedVolumes !== undefined
+            ? { sourceClonedVolumes: source.mutation.clonedVolumes }
             : {}),
         },
         ports: source.ports.map(dropComposeProcessId),
@@ -6703,8 +6707,11 @@ export class PortManagerNetworkService implements DisposableLike {
     // Address-only routing keeps isolation in the loopback IP itself, so the
     // singleton agent socket is not part of the terminal attach invariant.
     const agentRequired = !usesLoopbackAddressOnlyRouting(settings);
+    const loopbackHost = loopbackAddressForNetwork(networkId);
+    const terminalLoopbackMode = resolveTerminalLoopbackAddressRoutingMode(settings);
     const shellEnvRestorePath = prepareShellEnvRestoreScript(this.context.globalStorageUri.fsPath, hookLibraryPath, {
       networkId,
+      networkName,
       networkDnsAlias,
       agentSocketPath: getAgentSocketPath(),
       agentMainPath,
@@ -6737,6 +6744,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_BORROWED_NETWORK_ID", networkId),
       shellExport("NEWDLOPS_PM_NETWORK_ID", networkId),
       shellExport("NEWDLOPS_PM_BORROWED_NETWORK_ID", networkId),
+      buildLoopbackIdentityExportShell(loopbackHost, terminalLoopbackMode),
       shellExport("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath()),
       shellExport("PORT_MANAGER_AGENT_MAIN", agentMainPath),
       shellExport("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath),
@@ -6764,7 +6772,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport(ROUTE_TABLE_TTL_SECONDS_ENV, String(settings.routeTableTtlSeconds)),
       shellPrependLibrary(preloadVariable, hookLibraryPath),
     ];
-    commands.push(buildLoopbackAddressRoutingShell(loopbackAddressForNetwork(networkId), resolveTerminalLoopbackAddressRoutingMode(settings)));
+    commands.push(buildLoopbackAddressRoutingShell(loopbackHost, terminalLoopbackMode));
     if (agentRequired) {
       commands.push(buildAgentDaemonEnsureShell(process.execPath));
       commands.push(`if [ "\${PORT_MANAGER_HOOK_DAEMON_STARTED:-0}" != "1" ]; then return 1 2>/dev/null || exit 1; fi`);
@@ -6774,10 +6782,7 @@ export class PortManagerNetworkService implements DisposableLike {
     commands.push(buildTerminalSessionIsolationShell());
 
     if (process.platform === "darwin" && shellEnvRestorePath !== undefined) {
-      commands.push(
-        `export PORT_MANAGER_PREV_BASH_ENV="\${BASH_ENV:-}"`,
-        shellExport("BASH_ENV", shellEnvRestorePath),
-      );
+      commands.push(buildShellEnvRestoreSelectionShell(this.context.globalStorageUri.fsPath, shellEnvRestorePath));
     }
 
     if (runtimeShimDirectory !== undefined) {
@@ -6963,6 +6968,8 @@ export interface ComposePublishMutationInput {
   readonly composeFiles?: readonly string[];
   /** Existing clone id/name lineage to preserve when copying a Port Manager clone. */
   readonly sourceContainerMappings?: readonly ComposeContainerMutationMapping[];
+  /** Existing clone volumes that should seed a copied hidden Compose project. */
+  readonly sourceClonedVolumes?: readonly ComposeVolumeMutationMapping[];
   /** Copy defined services that currently have no running published endpoint. */
   readonly copyStoppedServices?: boolean;
 }
@@ -11105,6 +11112,20 @@ function shellRemovePathListEntry(name: string, entry: string): string {
 }
 
 /**
+ * Keeps network identity variables internally consistent as soon as the attach
+ * script switches networks. Alias readiness is still verified by
+ * buildLoopbackAddressRoutingShell; this early export prevents a partially
+ * sourced script from leaving the new network id paired with a stale loopback
+ * host inherited from the previous terminal attachment.
+ */
+function buildLoopbackIdentityExportShell(host: string, mode: "auto" | "loopback" | "high-port"): string {
+  return [
+    shellExport(ACTUAL_LOOPBACK_HOST_ENV, host),
+    mode === "high-port" ? `unset ${NETWORK_LOOPBACK_HOST_ENV}` : shellExport(NETWORK_LOOPBACK_HOST_ENV, host),
+  ].join("\n");
+}
+
+/**
  * Enables loopback-address routing only after the OS can bind the generated
  * address. High-port and same-port modes both depend on this host; auto mode
  * keeps startup non-interactive, while explicit modes may prompt for sudo.
@@ -11158,6 +11179,40 @@ function buildLoopbackAddressRoutingShell(host: string, mode: "auto" | "loopback
     ...failureCommands,
     `fi`,
     `unset __pm_loopback_host`,
+  ].join("\n");
+}
+
+/**
+ * Carries a user-provided BASH_ENV through attach without nesting an older Port
+ * Manager network restore script. Network restore scripts are generated state;
+ * chaining the previous one replays stale network identity before every
+ * non-interactive bash child during network switches.
+ */
+function buildShellEnvRestoreSelectionShell(globalStoragePath: string, shellEnvRestorePath: string): string {
+  const generatedGlobalRestorePath = path.join(globalStoragePath, "portmanager-bash-env.sh");
+  const generatedNetworkRestorePattern = `${shellQuote(path.join(globalStoragePath, "portmanager-bash-env-"))}*.sh`;
+  const nextRestorePath = shellQuote(shellEnvRestorePath);
+
+  return [
+    `__pm_next_bash_env=${nextRestorePath}`,
+    '__pm_previous_bash_env="${BASH_ENV:-}"',
+    'case "$__pm_previous_bash_env" in',
+    `  ${shellQuote(generatedGlobalRestorePath)}|${generatedNetworkRestorePattern})`,
+    '    __pm_previous_bash_env="${PORT_MANAGER_PREV_BASH_ENV:-}"',
+    "    ;;",
+    "esac",
+    'case "$__pm_previous_bash_env" in',
+    `  ${shellQuote(generatedGlobalRestorePath)}|${generatedNetworkRestorePattern})`,
+    '    __pm_previous_bash_env=""',
+    "    ;;",
+    "esac",
+    'if [ -n "$__pm_previous_bash_env" ] && [ "$__pm_previous_bash_env" != "$__pm_next_bash_env" ]; then',
+    '  export PORT_MANAGER_PREV_BASH_ENV="$__pm_previous_bash_env"',
+    "else",
+    "  unset PORT_MANAGER_PREV_BASH_ENV",
+    "fi",
+    'export BASH_ENV="$__pm_next_bash_env"',
+    "unset __pm_next_bash_env __pm_previous_bash_env",
   ].join("\n");
 }
 

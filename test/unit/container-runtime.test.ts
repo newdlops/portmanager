@@ -9,6 +9,7 @@ import {
   type ContainerCommandRunner,
 } from "../../src/platform/network/container-runtime";
 import { ComposePublishMutator } from "../../src/platform/network/compose-publish-mutator";
+import { DEV_LOG_ENV } from "../../src/platform/dev-log";
 import {
   buildExistingCloneMutationFromCandidate,
   ContainerServiceDiscoveryAdapter,
@@ -1257,8 +1258,12 @@ test("mutates compose services into a hidden network-scoped project", async (con
     result.state.overrideFile,
     "up",
   ]);
-  assert.equal(calls[6]?.args.includes("workspace_pgdata:/from:ro"), true);
-  assert.equal(calls[8]?.args.includes(`${initdbDir}:/from:ro`), true);
+  assert.equal(calls[6]?.args.includes("--volumes-from"), true);
+  assert.equal(calls[6]?.args.includes("original123"), true);
+  assert.equal(calls[6]?.args.includes("/var/lib/postgresql/data"), true);
+  assert.equal(calls[8]?.args.includes("--volumes-from"), true);
+  assert.equal(calls[8]?.args.includes("original123"), true);
+  assert.equal(calls[8]?.args.includes("/docker-entrypoint-initdb.d"), true);
   assert.equal(calls[0]?.cwd, tempDir);
   assert.equal(calls[4]?.cwd, tempDir);
   assert.deepEqual(
@@ -1266,6 +1271,584 @@ test("mutates compose services into a hidden network-scoped project", async (con
       .filter((call) => call.args[0] === "container" && call.args[1] === "inspect")
       .map((call) => call.timeoutMs),
     [30_000, 30_000, 30_000],
+  );
+});
+
+test("copy mode seeds missing source containers from persisted clone volumes", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-copy-source-volumes-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: workspace",
+      "services:",
+      "  db:",
+      "    image: postgres:16",
+      "    volumes:",
+      "      - pgdata:/var/lib/postgresql/data",
+      "volumes:",
+      "  pgdata:",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
+  const sourceCloneVolumeName = "pm-alpha-workspace-oldvolume";
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (executable, args) => {
+      calls.push({ executable, args });
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (args[0] === "compose" && args.includes("ps") && args.includes("--services")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (args[0] === "compose" && args.includes("config") && args.includes("--format")) {
+        return {
+          stdout: JSON.stringify({
+            services: {
+              db: {
+                volumes: [
+                  {
+                    type: "volume",
+                    source: "pgdata",
+                    target: "/var/lib/postgresql/data",
+                  },
+                ],
+              },
+            },
+            volumes: {
+              pgdata: {},
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && (args[1] === "ls" || args[1] === "ps")) {
+        return { stdout: "", stderr: "" };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    mode: "copy",
+    allowStatefulClone: true,
+    runtime: "docker",
+    networkName: "Beta",
+    originalProjectName: "alpha-workspace-11111111",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    copyStoppedServices: true,
+    sourceClonedVolumes: [
+      {
+        serviceName: "db",
+        sourceKind: "volume",
+        sourceName: "workspace_pgdata",
+        targetVolumeName: sourceCloneVolumeName,
+        containerPath: "/var/lib/postgresql/data",
+        readOnly: false,
+      },
+    ],
+    ports: [
+      {
+        serviceName: "db",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 15432,
+        containerPort: 5432,
+        protocol: "tcp",
+        protocolName: "postgresql",
+      },
+    ],
+  });
+
+  const copyArgs = calls.filter((call) => call.args[0] === "run").map((call) => call.args);
+  assert.equal(copyArgs.some((args) => args.includes(`${sourceCloneVolumeName}:/from:ro`)), true);
+  assert.equal(copyArgs.some((args) => args.includes("alpha-workspace-11111111_pgdata:/from:ro")), false);
+  assert.equal(result.state.clonedVolumes?.[0]?.sourceName, sourceCloneVolumeName);
+
+  const overrideText = fs.readFileSync(result.state.overrideFile, "utf8");
+  assert.match(overrideText, /target: '\/var\/lib\/postgresql\/data'/);
+  assert.doesNotMatch(overrideText, new RegExp(`name: '${sourceCloneVolumeName}'`));
+  assert.match(overrideText, /name: 'pm-beta-workspace-[a-f0-9]{8}-[a-f0-9]{12}-[a-f0-9]{8}'/);
+});
+
+test("clone attach copies arbitrary directory bind mounts into isolated volumes", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-arbitrary-bind-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const uploadsDir = path.join(tempDir, "uploads");
+  fs.mkdirSync(uploadsDir, { recursive: true });
+  fs.writeFileSync(path.join(uploadsDir, "seed.txt"), "uploaded data\n", "utf8");
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: workspace",
+      "services:",
+      "  web:",
+      "    image: app:latest",
+      "    ports:",
+      "      - 18081:8081",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
+  let containerListCount = 0;
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (executable, args) => {
+      calls.push({ executable, args });
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "web\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        containerListCount += 1;
+        return {
+          stdout: JSON.stringify(
+            containerListCount === 1
+              ? {
+                  ID: "web-source",
+                  Names: "workspace-web-1",
+                  Ports: "127.0.0.1:18081->8081/tcp",
+                  Labels: "com.docker.compose.project=workspace,com.docker.compose.service=web",
+                }
+              : {
+                  ID: "web-hidden",
+                  Names: "alpha-workspace-12345678-web-1",
+                  Ports: "127.81.154.127:57081->8081/tcp",
+                  Labels: "com.docker.compose.project=alpha-workspace-12345678,com.docker.compose.service=web",
+                },
+          ),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({
+              Id: id,
+              Config: { Labels: { "com.docker.compose.service": "web" } },
+              Mounts:
+                id === "web-source"
+                  ? [
+                      {
+                        Type: "bind",
+                        Source: uploadsDir,
+                        Destination: "/srv/uploads",
+                        RW: true,
+                      },
+                    ]
+                  : [],
+            })),
+          ),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    runtime: "docker",
+    networkName: "Alpha",
+    attachedProjectName: "alpha-workspace-12345678",
+    hiddenHostAddress: "127.81.154.127",
+    originalProjectName: "workspace",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    ports: [
+      {
+        serviceName: "web",
+        logicalPort: 18081,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 18081,
+        containerPort: 8081,
+        protocol: "tcp",
+      },
+    ],
+  });
+
+  const copyArgs = calls.filter((call) => call.args[0] === "run").map((call) => call.args);
+  assert.equal(copyArgs.some((args) => args.includes("--volumes-from") && args.includes("web-source")), true);
+  assert.equal(copyArgs.some((args) => args.includes("/srv/uploads")), true);
+  assert.equal(result.state.clonedVolumes?.[0]?.sourceKind, "bind");
+  assert.equal(result.state.clonedVolumes?.[0]?.sourceName, uploadsDir);
+  assert.equal(result.state.clonedVolumes?.[0]?.containerPath, "/srv/uploads");
+
+  const overrideText = fs.readFileSync(result.state.overrideFile, "utf8");
+  assert.match(overrideText, /target: '\/srv\/uploads'/);
+  assert.doesNotMatch(overrideText, /type: bind/);
+  assert.match(overrideText, /name: 'pm-alpha-workspace-12345678-[a-f0-9]{12}-[a-f0-9]{8}'/);
+});
+
+test("compose mutation writes dev-log diagnostics when hidden compose up fails", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-dev-log-"));
+  const previousDevLogPath = process.env[DEV_LOG_ENV];
+  const devLogPath = path.join(tempDir, "portmanager-dev.log");
+  process.env[DEV_LOG_ENV] = devLogPath;
+  context.after(() => {
+    if (previousDevLogPath === undefined) {
+      delete process.env[DEV_LOG_ENV];
+    } else {
+      process.env[DEV_LOG_ENV] = previousDevLogPath;
+    }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const composeFile = path.join(tempDir, "compose.yaml");
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: workspace",
+      "services:",
+      "  web:",
+      "    image: app:latest",
+      "    ports:",
+      "      - 18081:8081",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "web\n", stderr: "" };
+      }
+      if (args[0] === "compose" && args.includes("up") && args.includes("alpha-workspace-12345678")) {
+        throw new Error("compose up exploded: port is already allocated");
+      }
+      if (args[0] === "compose" && args.includes("ps")) {
+        return { stdout: "hidden-web-1 exited 1\n", stderr: "" };
+      }
+      if (args[0] === "compose" && args.includes("logs")) {
+        return { stdout: "web boot failed\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        const isHiddenProject = args.includes("label=com.docker.compose.project=alpha-workspace-12345678");
+        return {
+          stdout: JSON.stringify(
+            isHiddenProject
+              ? {
+                  ID: "hidden-web",
+                  Names: "alpha-workspace-12345678-web-1",
+                  Ports: "",
+                  Status: "Exited (1) 2 seconds ago",
+                  Labels: "com.docker.compose.project=alpha-workspace-12345678,com.docker.compose.service=web",
+                }
+              : {
+                  ID: "source-web",
+                  Names: "workspace-web-1",
+                  Ports: "127.0.0.1:18081->8081/tcp",
+                  Status: "Up 1 minute",
+                  Labels: "com.docker.compose.project=workspace,com.docker.compose.service=web",
+                },
+          ),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "ps") {
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({
+              Id: id,
+              Name: id === "hidden-web" ? "/alpha-workspace-12345678-web-1" : "/workspace-web-1",
+              Config: { Labels: { "com.docker.compose.service": "web" } },
+              Mounts: [],
+            })),
+          ),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await assert.rejects(
+    () =>
+      mutator.hidePublishedPorts({
+        runtime: "docker",
+        networkName: "Alpha",
+        attachedProjectName: "alpha-workspace-12345678",
+        hiddenHostAddress: "127.81.154.127",
+        originalProjectName: "workspace",
+        workingDirectory: tempDir,
+        composeFiles: [composeFile],
+        ports: [
+          {
+            serviceName: "web",
+            logicalPort: 18081,
+            actualHostAddress: "127.0.0.1",
+            actualHostPort: 18081,
+            containerPort: 8081,
+            protocol: "tcp",
+          },
+        ],
+      }),
+    /compose up exploded/,
+  );
+
+  const logText = fs.readFileSync(devLogPath, "utf8");
+  assert.match(logText, /mutation plan .*attached=alpha-workspace-12345678/);
+  assert.match(logText, /cmd#\d+ fail .*compose up exploded/);
+  assert.match(logText, /mutation failure project=alpha-workspace-12345678/);
+  assert.match(logText, /failure override file=.*\.ports\.override\.yaml/);
+  assert.match(logText, /failure compose ps .*hidden-web-1 exited 1/);
+  assert.match(logText, /failure compose logs .*web boot failed/);
+  assert.match(logText, /failure runtime inspect project=alpha-workspace-12345678/);
+});
+
+test("clone attach fails before compose up when another clone owns the preserved host port", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-port-conflict-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: workspace",
+      "services:",
+      "  db:",
+      "    image: postgres:17-alpine",
+      "    ports:",
+      "      - 15432:5432",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const calls: Array<{ readonly args: readonly string[] }> = [];
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      calls.push({ args });
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls" && args.includes("label=com.docker.compose.project=workspace")) {
+        return {
+          stdout: JSON.stringify({
+            ID: "source-db",
+            Names: "workspace-db-1",
+            Ports: "127.0.0.1:15432->5432/tcp",
+            Status: "Up 1 minute",
+            Labels: "com.docker.compose.project=workspace,com.docker.compose.service=db",
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "ls" && args.includes("label=com.docker.compose.project=alpha-workspace-next")) {
+        return {
+          stdout: JSON.stringify({
+            ID: "hidden-db",
+            Names: "workspace-db-alpha-workspace-next",
+            Ports: "127.81.154.127:15432->5432/tcp",
+            Status: "Up 1 second",
+            Labels: "newdlops.portmanager.compose-clone-service=1,com.docker.compose.project=alpha-workspace-next,com.docker.compose.service=db,newdlops.portmanager.logical-port.5432.tcp=15432",
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({
+              Id: id,
+              Config: { Labels: { "com.docker.compose.service": "db" } },
+              Mounts: [],
+            })),
+          ),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "ps" && args.includes("--all")) {
+        return {
+          stdout: JSON.stringify({
+            ID: "existing-db",
+            Names: "captain_db-alpha-workspace-existing",
+            Ports: "127.81.154.127:15432->5432/tcp",
+            Status: "Up 10 minutes",
+            Labels: "newdlops.portmanager.compose-clone-service=1,com.docker.compose.project=alpha-workspace-existing,com.docker.compose.service=db",
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        return {
+          stdout: JSON.stringify({
+            ID: "existing-db",
+            Names: "captain_db-alpha-workspace-existing",
+            Ports: "127.81.154.127:15432->5432/tcp",
+            Status: "Up 10 minutes",
+            Labels: "newdlops.portmanager.compose-clone-service=1,com.docker.compose.project=alpha-workspace-existing,com.docker.compose.service=db",
+          }),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await assert.rejects(
+    () =>
+      mutator.hidePublishedPorts({
+        allowStatefulClone: true,
+        runtime: "docker",
+        networkName: "Alpha",
+        attachedProjectName: "alpha-workspace-next",
+        hiddenHostAddress: "127.81.154.127",
+        preservePublishedHostPorts: true,
+        originalProjectName: "workspace",
+        workingDirectory: tempDir,
+        composeFiles: [composeFile],
+        ports: [
+          {
+            serviceName: "db",
+            logicalPort: 15432,
+            actualHostAddress: "127.0.0.1",
+            actualHostPort: 15432,
+            containerPort: 5432,
+            protocol: "tcp",
+            protocolName: "postgresql",
+          },
+        ],
+      }),
+    /already owns the target host port.*alpha-workspace-existing/,
+  );
+
+  assert.equal(calls.some((call) => call.args[0] === "volume"), false);
+  assert.equal(
+    calls.some((call) => call.args[0] === "compose" && call.args.includes("-p") && call.args.includes("alpha-workspace-next") && call.args.includes("up")),
+    false,
+  );
+  assert.equal(calls.some((call) => call.args[0] === "compose" && call.args.includes("stop")), false);
+});
+
+test("clone publish preflight ignores source services that will be stopped", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-source-port-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: workspace",
+      "services:",
+      "  db:",
+      "    image: postgres:17-alpine",
+      "    ports:",
+      "      - 15432:5432",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const calls: Array<{ readonly args: readonly string[] }> = [];
+  let globalListCount = 0;
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      calls.push({ args });
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls" && args.includes("label=com.docker.compose.project=workspace")) {
+        return {
+          stdout: JSON.stringify({
+            ID: "source-db",
+            Names: "workspace-db-1",
+            Ports: "0.0.0.0:15432->5432/tcp",
+            Status: "Up 1 minute",
+            Labels: `com.docker.compose.project=workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=${composeFile}`,
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "ls" && args.includes("label=com.docker.compose.project=alpha-workspace-next")) {
+        return {
+          stdout: JSON.stringify({
+            ID: "hidden-db",
+            Names: "workspace-db-alpha-workspace-next",
+            Ports: "127.81.154.127:15432->5432/tcp",
+            Status: "Up 1 second",
+            Labels: `newdlops.portmanager.compose-clone-service=1,com.docker.compose.project=alpha-workspace-next,com.docker.compose.service=db,com.docker.compose.project.config_files=${composeFile},${path.join(tempDir, "alpha-workspace-next.ports.override.yaml")},newdlops.portmanager.logical-port.5432.tcp=15432`,
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({
+              Id: id,
+              Config: { Labels: { "com.docker.compose.service": "db" } },
+              Mounts: [],
+            })),
+          ),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "ps" && args.includes("--all")) {
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        globalListCount += 1;
+        return {
+          stdout: JSON.stringify({
+            ID: "source-db",
+            Names: "workspace-db-1",
+            Ports: "0.0.0.0:15432->5432/tcp",
+            Status: "Up 1 minute",
+            Labels: `com.docker.compose.project=workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=${composeFile}`,
+          }),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await mutator.hidePublishedPorts({
+    allowStatefulClone: true,
+    runtime: "docker",
+    networkName: "Alpha",
+    attachedProjectName: "alpha-workspace-next",
+    hiddenHostAddress: "127.81.154.127",
+    preservePublishedHostPorts: true,
+    originalProjectName: "workspace",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    ports: [
+      {
+        serviceName: "db",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 15432,
+        containerPort: 5432,
+        protocol: "tcp",
+        protocolName: "postgresql",
+      },
+    ],
+  });
+
+  assert.equal(globalListCount > 0, true);
+  assert.equal(calls.some((call) => call.args[0] === "compose" && call.args.includes("stop")), true);
+  assert.equal(
+    calls.some((call) => call.args[0] === "compose" && call.args.includes("-p") && call.args.includes("alpha-workspace-next") && call.args.includes("up")),
+    true,
   );
 });
 
@@ -1431,7 +2014,7 @@ test("clone attach carries running internal compose services without stopping th
                   ID: "hidden-rabbit",
                   Names: "alpha-captain-rabbitmq-1",
                   Status: "Up 1 second",
-                  Ports: "",
+                  Ports: "127.81.154.127:57072->5672/tcp",
                   Labels: "com.docker.compose.project=alpha-captain,com.docker.compose.service=rabbitmq",
                 },
               ]
@@ -1461,6 +2044,12 @@ test("clone attach carries running internal compose services without stopping th
                 Labels: {
                   "com.docker.compose.service": services.get(id) ?? "",
                 },
+                ExposedPorts:
+                  id === "source-rabbit"
+                    ? {
+                        "5672/tcp": {},
+                      }
+                    : {},
               },
               Mounts:
                 id === "source-rabbit"
@@ -1517,13 +2106,19 @@ test("clone attach carries running internal compose services without stopping th
     result.state.containerMappings?.map((mapping) => mapping.serviceName),
     ["app", "rabbitmq"],
   );
-  assert.equal(result.ports.length, 1);
+  assert.equal(result.ports.length, 2);
   assert.equal(result.ports[0]?.serviceName, "app");
+  assert.equal(result.ports[1]?.serviceName, "rabbitmq");
+  assert.equal(result.ports[1]?.logicalPort, 5672);
+  assert.equal(result.ports[1]?.actualHostAddress, "127.81.154.127");
+  assert.equal(result.ports[1]?.actualHostPort, 57072);
   assert.equal(result.state.clonedVolumes?.[0]?.serviceName, "rabbitmq");
 
   const overrideText = fs.readFileSync(result.state.overrideFile, "utf8");
   assert.match(overrideText, /'rabbitmq':/);
   assert.doesNotMatch(overrideText, /'rabbitmq':\n    container_name: !reset null\n    network_mode: !reset null\n    links: !reset \[\]\n    external_links: !reset \[\]\n    profiles: !override/);
+  assert.match(overrideText, /'?newdlops\.portmanager\.logical-port\.5672\.tcp'?: '5672'/);
+  assert.match(overrideText, /127\.81\.154\.127::5672\/tcp/);
   assert.match(overrideText, /target: '\/var\/lib\/rabbitmq'/);
   assert.match(overrideText, /name: 'pm-alpha-captain-[a-f0-9]{12}-[a-f0-9]{8}'/);
 });

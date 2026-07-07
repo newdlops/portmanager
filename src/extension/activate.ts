@@ -1,13 +1,18 @@
 import * as vscode from "vscode";
-import * as path from "node:path";
+import * as fs from "node:fs";
 import * as os from "node:os";
+import * as path from "node:path";
 import { configureRouteTableStorageDirectory } from "../agent/route-table";
 import { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import { LocalAgentClient } from "./local-agent-client";
 import { PortManagerCommandController } from "./commands";
 import { PortManagerNetworkService } from "./network-service";
 import { PortManagerTerminalSecureBrowserLinkProvider } from "./terminal-secure-browser-link-provider";
+import { ensureLocalGitExclude } from "./terminal-hook-environment";
 import type { DisposableLike, LogicalNetwork, NetworkSnapshot } from "../shared/types";
+
+const DEVELOPMENT_LOG_DIRECTORY = ".portmanager";
+const DEFAULT_DEVELOPMENT_LOG_FILE = "portmanager-dev.log";
 
 export interface PortManagerExtensionApi {
   /** Lists logical networks so terminal-owning extensions can choose one without importing UI code. */
@@ -22,19 +27,89 @@ export interface PortManagerExtensionApi {
  * Copies the `portManager.developmentLogPath` setting into the
  * PORT_MANAGER_DEV_LOG environment variable so `buildNodeRuntimeEnvironment`
  * propagates it to every native child and `devLog` (src/platform/dev-log.ts)
- * writes to it. Empty setting leaves any pre-existing env var untouched, so
- * launching with the raw env var still works. A leading `~/` expands to $HOME.
+ * writes to it. Explicit setting wins over the raw env var; without an explicit
+ * setting, a raw env var wins over the package default. Relative paths are kept
+ * under the workspace-local `.portmanager/` directory instead of the repo root.
  */
-function applyDevelopmentLogSetting(): void {
-  const configured = vscode.workspace.getConfiguration("portManager").get<string>("developmentLogPath");
-  if (typeof configured !== "string" || configured.trim().length === 0) {
+function applyDevelopmentLogSetting(context: vscode.ExtensionContext): void {
+  const configured = readDevelopmentLogPathSetting();
+  if (configured.trim().length === 0) {
+    delete process.env.PORT_MANAGER_DEV_LOG;
     return;
   }
-  let resolved = configured.trim();
-  if (resolved === "~" || resolved.startsWith("~/")) {
-    resolved = path.join(os.homedir(), resolved.slice(1));
+
+  const workspaceRoot = findPrimaryWorkspaceRoot();
+  const resolved = resolveDevelopmentLogPath(configured, workspaceRoot ?? context.globalStorageUri.fsPath);
+  try {
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    if (workspaceRoot !== undefined && isInsidePath(resolved, path.join(workspaceRoot, DEVELOPMENT_LOG_DIRECTORY))) {
+      ensureLocalGitExclude(workspaceRoot);
+    }
+  } catch {
+    // Dev logging is diagnostic-only; a read-only workspace must not block activation.
   }
   process.env.PORT_MANAGER_DEV_LOG = resolved;
+}
+
+function readDevelopmentLogPathSetting(): string {
+  const configuration = vscode.workspace.getConfiguration("portManager");
+  const inspected = configuration.inspect<string>("developmentLogPath");
+  const explicit = firstDefinedString([
+    inspected?.workspaceFolderLanguageValue,
+    inspected?.workspaceFolderValue,
+    inspected?.workspaceLanguageValue,
+    inspected?.workspaceValue,
+    inspected?.globalLanguageValue,
+    inspected?.globalValue,
+  ]);
+  if (explicit !== undefined) {
+    return explicit;
+  }
+
+  const rawEnv = process.env.PORT_MANAGER_DEV_LOG;
+  if (rawEnv !== undefined && rawEnv.trim().length > 0) {
+    return rawEnv;
+  }
+
+  return inspected?.defaultValue ?? configuration.get<string>("developmentLogPath") ?? "";
+}
+
+function resolveDevelopmentLogPath(configured: string, baseRoot: string): string {
+  const trimmed = configured.trim();
+  if (trimmed === "~" || trimmed.startsWith("~/")) {
+    return path.join(os.homedir(), trimmed.slice(1));
+  }
+  if (path.isAbsolute(trimmed)) {
+    return trimmed;
+  }
+
+  const relativePath = normalizeDevelopmentLogRelativePath(trimmed);
+  return path.join(baseRoot, relativePath);
+}
+
+function normalizeDevelopmentLogRelativePath(configured: string): string {
+  const withoutCurrentDirectory = configured.replace(/^\.([/\\]|$)/, "");
+  const normalized = path.normalize(withoutCurrentDirectory).replace(/^(\.\.(?:[/\\]|$))+/, "");
+  const relativePath = normalized.length === 0 || normalized === "." ? DEFAULT_DEVELOPMENT_LOG_FILE : normalized;
+  const firstSegment = relativePath.split(/[\\/]/)[0];
+  if (firstSegment === DEVELOPMENT_LOG_DIRECTORY) {
+    return relativePath;
+  }
+
+  return path.join(DEVELOPMENT_LOG_DIRECTORY, relativePath);
+}
+
+function findPrimaryWorkspaceRoot(): string | undefined {
+  return (vscode.workspace.workspaceFolders ?? []).find((folder) => folder.uri.scheme === "file")?.uri.fsPath;
+}
+
+function firstDefinedString(values: readonly (string | undefined)[]): string | undefined {
+  return values.find((value): value is string => value !== undefined);
+}
+
+function isInsidePath(candidate: string, parent: string): boolean {
+  const relative = path.relative(parent, candidate);
+  return relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 /**
@@ -50,7 +125,7 @@ export function activate(context: vscode.ExtensionContext): PortManagerExtension
   // system (hook/router/agent + this host) writes one shared trace file. Reload
   // the window after changing the setting so running daemons pick it up. See
   // docs/dev-logging.md.
-  applyDevelopmentLogSetting();
+  applyDevelopmentLogSetting(context);
   configureRouteTableStorageDirectory(path.join(context.globalStorageUri.fsPath, "route-tables"));
   const processService = new LocalAgentClient(context);
   const networkService = new PortManagerNetworkService(context, processService);
