@@ -35,6 +35,7 @@ import {
   GLOBAL_LOGICAL_NETWORK_ID,
   hostLocalGatewayLoopbackAddressForNetwork,
   loopbackAddressForNetwork,
+  NETWORK_IS_GLOBAL_ENV,
   NETWORK_LOOPBACK_HOST_ENV,
   resolveTerminalLoopbackAddressRoutingMode,
   usesLoopbackAddressOnlyRouting,
@@ -2423,6 +2424,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
         mutation = mutationResult.state;
         mutationToRestoreOnError = mutation;
+        await this.ensureComposeHiddenPublishHostsReady(mutation);
         registeredAttachment = {
           ...attachment,
           runtime: mutation.runtime,
@@ -2433,6 +2435,7 @@ export class PortManagerNetworkService implements DisposableLike {
         };
       }
       if (input.existingMutation !== undefined) {
+        await this.ensureComposeHiddenPublishHostsReady(input.existingMutation);
         const overrideFile = await this.composePublishMutator.restoreHiddenPortsOverride(input.existingMutation, {
           force: true,
           recoverToStorageDirectory: true,
@@ -2544,6 +2547,7 @@ export class PortManagerNetworkService implements DisposableLike {
     let attachmentToRemove = attachment;
     if (attachment.mutation !== undefined) {
       try {
+        await this.ensureComposeHiddenPublishHostsReady(attachment.mutation);
         const overrideFile = await this.composePublishMutator.restoreHiddenPortsOverride(attachment.mutation, {
           force: true,
           recoverToStorageDirectory: true,
@@ -2666,6 +2670,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     try {
+      await this.ensureComposeHiddenPublishHostsReady(mutation);
       const mutationResult = await this.composePublishMutator.renameAttachedProject(
         mutation,
         attachedProjectName,
@@ -3137,9 +3142,9 @@ export class PortManagerNetworkService implements DisposableLike {
    */
   private async refreshVscodeWindowTerminalEnvironment(options: { readonly interactive: boolean }): Promise<void> {
     const binding = this.vscodeWindowTerminalBinding;
+    const settings = readPortManagerSettings();
 
     if (binding !== undefined) {
-      const settings = readPortManagerSettings();
       let nextBinding = binding;
 
       if (settings.enabled && shouldInjectTerminalHook(settings)) {
@@ -3161,6 +3166,14 @@ export class PortManagerNetworkService implements DisposableLike {
         this.saveVscodeWindowTerminalBinding();
         this.localChangeEvents.emit();
       }
+    } else if (shouldUseGlobalNetworkTerminalEnvironment(settings)) {
+      // No persisted window binding means new terminals inherit the reserved
+      // global network. Prepare its fixed loopback alias opportunistically, but
+      // do not fall back to a plain localhost identity on setup failure.
+      await ensureLoopbackAddressRoutingHostReady(
+        loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID),
+        resolveTerminalLoopbackAddressRoutingMode(settings),
+      ).catch(() => undefined);
     }
 
     this.applyVscodeWindowTerminalEnvironment();
@@ -3643,6 +3656,31 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Applies the same loopback model to regenerated Compose overrides as new attaches use. */
   private shouldPreserveComposeHiddenPublishedHostPorts(): boolean {
     return resolveTerminalLoopbackAddressRoutingMode(readPortManagerSettings()) !== "high-port";
+  }
+
+  /** Ensures persisted clone host-publish addresses exist before Docker tries to bind them. */
+  private async ensureComposeHiddenPublishHostsReady(state: ComposePortMutationState): Promise<void> {
+    const addresses = [
+      ...new Set(
+        state.hiddenPorts
+          .map((port) => port.actualHostAddress.trim())
+          .filter(isNonDefaultLoopbackIpv4Address),
+      ),
+    ];
+    if (addresses.length === 0) {
+      return;
+    }
+
+    const mode = resolveTerminalLoopbackAddressRoutingMode(readPortManagerSettings());
+    for (const address of addresses) {
+      try {
+        await ensureLoopbackAddressRoutingHostReady(address, mode);
+      } catch (error) {
+        throw new Error(`Cannot prepare Docker Compose hidden loopback host ${address}.`, {
+          cause: error,
+        });
+      }
+    }
   }
 
   /** Rebuilds generated Compose files/routes before a terminal receives routing env. */
@@ -4749,9 +4787,9 @@ export class PortManagerNetworkService implements DisposableLike {
    * The decision is source-first and application-agnostic: attribute the client
    * process to a logical network (native attribution when available, else the
    * process table ancestry and environment), then forward to that network's
-   * backend. Clients with no network identity are passed through to a
-   * non-network owner on 127.0.0.1 and refused when none exists, replacing the
-   * older cwd/unique-route guessing that could silently misroute.
+   * backend. Clients with no network identity join the reserved global network
+   * in the address-only model; legacy network-less owners are used only when the
+   * global model is disabled or unavailable.
    */
   private async resolveLogicalPortRouterTarget(
     connection: LogicalPortRouterConnection,
@@ -4870,24 +4908,22 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * Resolves the passthrough target for a client with no network identity.
+   * Resolves the target for a client with no network identity.
    *
-   * A non-network server that wanted this logical port was relocated to a high
-   * port and registered as a network-less listen route; that row is the real
-   * 127.0.0.1 coordinate. With no such owner the connection is refused so a
-   * network's port is never leaked to an unrelated client.
+   * Address-only routing treats that client as part of the reserved global
+   * network. The legacy network-less owner route remains only for non-global
+   * modes where terminals still run without a network id.
    */
   private async resolveNonNetworkClientTarget(
     logicalPort: number,
     clientCwd: string | undefined,
   ): Promise<LogicalPortRouterTarget> {
-    // An unattributable client is a global-network client once the global
-    // network exists: its live route wins over the legacy relocated owner.
-    if (readPortManagerSettings().globalNetwork) {
-      const globalRoute = await this.findNetworkRouteForRouter(GLOBAL_LOGICAL_NETWORK_ID, logicalPort, []);
-      if (globalRoute !== undefined) {
-        return { host: globalRoute.host, port: globalRoute.actualPort };
-      }
+    const settings = readPortManagerSettings();
+    // In the address-only model, an unattributable client belongs to the
+    // reserved global network. It must not fall through to a network-less
+    // localhost owner, because 127.0.0.1/0.0.0.0 are daemon-owned ingress.
+    if (settings.globalNetwork && usesLoopbackAddressOnlyRouting(settings)) {
+      return this.resolveNetworkClientTarget(GLOBAL_LOGICAL_NETWORK_ID, logicalPort, []);
     }
 
     const ownerRoute = this.findNonNetworkOwnerRoute(logicalPort, clientCwd);
@@ -5899,6 +5935,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     try {
+      await this.ensureComposeHiddenPublishHostsReady(mutation);
       const overrideFile = await this.composePublishMutator.restoreHiddenPortsOverride(mutation, {
         ...options,
         recoverToStorageDirectory: true,
@@ -5980,6 +6017,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const recoveryMutation = buildMutationlessComposeOverrideRecoveryState(attachment);
     if (recoveryMutation !== undefined) {
       try {
+        await this.ensureComposeHiddenPublishHostsReady(recoveryMutation);
         const overrideFile = await this.composePublishMutator.restoreHiddenPortsOverride(recoveryMutation, {
           force: true,
           recoverToStorageDirectory: true,
@@ -6686,7 +6724,7 @@ export class PortManagerNetworkService implements DisposableLike {
       buildTerminalAttachmentMarkerRemoveShell(),
       shellRemovePathListEntry(preloadVariable, hookLibraryPath),
       ...(runtimeShimDirectory === undefined ? [] : [shellRemovePathListEntry("PATH", runtimeShimDirectory)]),
-      `unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV} ${AGENT_REQUIRED_ENV}`,
+      `unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV} ${AGENT_REQUIRED_ENV} ${NETWORK_IS_GLOBAL_ENV}`,
       "unset PORT_MANAGER_HOOK_DISABLED",
       shellExport("PORT_MANAGER_HOOK", "1"),
       shellExport("PORT_MANAGER_RUNTIME_SHIM_READY", "0"),
@@ -7225,9 +7263,12 @@ function buildComposeProjectRoutingRows(
         composeFiles: attachment.composeFiles,
         serviceNames: attachment.ports.map((port) => port.serviceName),
       });
+      // As-is compose rows have no generated override, so the runtime project is
+      // both the original and attached name. Leaving it empty would make shims
+      // guess from the workdir basename, which breaks named compose projects.
       const originalProjectName =
         routingFiles.overrideFile === undefined
-          ? undefined
+          ? attachment.projectName
           : inferOriginalComposeProjectNameForRouting(workingDirectory, routingFiles.composeFiles, attachment.projectName);
 
       return composeAttachmentRuntimes(attachment).map((runtime) => ({
@@ -9450,6 +9491,21 @@ function isLoopbackAddressAliasConfigured(address: string): boolean {
   return readLoopbackAliasAddressesSync().has(address);
 }
 
+function isNonDefaultLoopbackIpv4Address(host: string): boolean {
+  const parts = host.trim().split(".");
+  if (parts.length !== 4 || parts[0] !== "127" || host === "127.0.0.1") {
+    return false;
+  }
+
+  return parts.every((part) => {
+    if (!/^\d+$/.test(part)) {
+      return false;
+    }
+    const value = Number.parseInt(part, 10);
+    return value >= 0 && value <= 255;
+  });
+}
+
 /** Awaitable alias check used by paths that run during activation or background syncs. */
 async function isLoopbackAddressAliasConfiguredAsync(address: string): Promise<boolean> {
   if (process.platform !== "darwin") {
@@ -9481,6 +9537,19 @@ async function runNonInteractiveLoopbackAliasSetup(address: string): Promise<voi
   } finally {
     invalidateLoopbackAliasCache();
   }
+}
+
+/**
+ * True when a window without an explicit terminal binding should still inherit
+ * the reserved global network instead of a network-less localhost identity.
+ */
+function shouldUseGlobalNetworkTerminalEnvironment(settings: PortManagerSettings): boolean {
+  return (
+    settings.logicalPortGateway &&
+    settings.globalNetwork &&
+    shouldInjectTerminalHook(settings) &&
+    usesLoopbackAddressOnlyRouting(settings)
+  );
 }
 
 /**

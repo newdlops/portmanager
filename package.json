@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8184",
+  "version": "0.0.8194",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -436,12 +436,12 @@
       "view/title": [
         {
           "command": "portManager.createLogicalNetwork",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner",
+          "when": "view == portManager.processes",
           "group": "navigation@1"
         },
         {
           "command": "portManager.refresh",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner",
+          "when": "view == portManager.processes",
           "group": "navigation@2"
         },
         {
@@ -520,7 +520,7 @@
       "view/item/context": [
         {
           "command": "portManager.createLogicalNetwork",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == section.networks",
+          "when": "view == portManager.processes && viewItem == section.networks",
           "group": "network@1"
         },
         {
@@ -540,7 +540,7 @@
         },
         {
           "command": "portManager.attachContainerToNetwork",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@5"
         },
         {
@@ -580,32 +580,32 @@
         },
         {
           "command": "portManager.removeLogicalNetwork",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "network@13"
         },
         {
           "command": "portManager.refreshContainerServices",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == section.containers",
+          "when": "view == portManager.processes && viewItem == section.containers",
           "group": "container@1"
         },
         {
           "command": "portManager.attachContainerToNetwork",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == section.containers",
+          "when": "view == portManager.processes && viewItem == section.containers",
           "group": "container@2"
         },
         {
           "command": "portManager.attachContainerToNetwork",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == containerServiceCandidate",
+          "when": "view == portManager.processes && viewItem == containerServiceCandidate",
           "group": "container@3"
         },
         {
           "command": "portManager.attachContainerToNetwork",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == composeProjectCandidate",
+          "when": "view == portManager.processes && viewItem == composeProjectCandidate",
           "group": "container@3"
         },
         {
           "command": "portManager.refreshTerminals",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == section.daemon",
+          "when": "view == portManager.processes && viewItem == section.daemon",
           "group": "terminal@1"
         },
         {
@@ -670,7 +670,7 @@
         },
         {
           "command": "portManager.detachComposeAttachment",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == composeAttachment",
+          "when": "view == portManager.processes && viewItem == composeAttachment",
           "group": "exposure@5"
         },
         {
@@ -963,8 +963,8 @@
         },
         "portManager.globalNetwork": {
           "type": "boolean",
-          "default": false,
-          "description": "Treat unattached terminals as members of the reserved global logical network (fixed loopback 127.1.0.1) so no process lives outside a network. Requires loopback-address-only route ownership and the logical port gateway; unattached terminals keep the plain environment when those are off or the global alias is missing."
+          "default": true,
+          "description": "Treat unattached terminals as members of the reserved global logical network (fixed loopback 127.1.0.1) so no process lives outside a network and 127.0.0.1/0.0.0.0 stay Port Manager-owned ingress coordinates. Requires loopback-address-only route ownership and the logical port gateway; unattached terminals use the minimal gateway environment when those are off."
         },
         "portManager.developmentLogPath": {
           "type": "string",

@@ -271,6 +271,35 @@ static int pm_envp_value_is(char *const envp[], const char *name, const char *ex
   return value != NULL && strcmp(value, expected) == 0;
 }
 
+static const char *pm_envp_network_id(char *const envp[]) {
+  const char *network_id = pm_envp_value(envp, "PORT_MANAGER_NETWORK_ID");
+
+  if (network_id == NULL || network_id[0] == '\0') {
+    network_id = pm_envp_value(envp, "PORT_MANAGER_ROUTE_TABLE_NETWORK_ID");
+  }
+  if (network_id == NULL || network_id[0] == '\0') {
+    network_id = pm_envp_value(envp, "NEWDLOPS_PM_NETWORK_ID");
+  }
+  if (network_id == NULL || network_id[0] == '\0') {
+    network_id = pm_envp_value(envp, "PORT_MANAGER_BORROWED_NETWORK_ID");
+  }
+  if (network_id == NULL || network_id[0] == '\0') {
+    network_id = pm_envp_value(envp, "NEWDLOPS_PM_BORROWED_NETWORK_ID");
+  }
+
+  return network_id;
+}
+
+static int pm_envp_network_scope_is_global(char *const envp[]) {
+  const char *flag = pm_envp_value(envp, "PORT_MANAGER_NETWORK_IS_GLOBAL");
+  const char *network_id = pm_envp_network_id(envp);
+  const char *network_name = pm_envp_value(envp, "PORT_MANAGER_NETWORK_NAME");
+
+  return flag != NULL && strcmp(flag, "1") == 0 &&
+         network_id != NULL && network_id[0] != '\0' &&
+         (network_name == NULL || network_name[0] == '\0');
+}
+
 static int pm_preload_value_is_normalized(const char *value, const char *hook_path) {
   size_t hook_length;
   const char *cursor;
@@ -647,12 +676,17 @@ static int pm_has_current_network_scope(void) {
  * (hostname), per-network env/file features, the Docker-socket guard, and
  * argv rewriting stay host-real, so an unattached terminal keeps behaving
  * like a plain host shell. Delivered as a flag env rather than a magic id so
- * the dylib never hard-codes the TS-side network id constant.
+ * the dylib never hard-codes the TS-side network id constant. A user network
+ * always carries PORT_MANAGER_NETWORK_NAME, so a stale global flag left behind
+ * by shell reattachment must not keep the process host-real.
  */
 static int pm_network_scope_is_global(void) {
   const char *flag = getenv("PORT_MANAGER_NETWORK_IS_GLOBAL");
+  const char *network_name = getenv("PORT_MANAGER_NETWORK_NAME");
 
-  return flag != NULL && strcmp(flag, "1") == 0 && pm_has_current_network_scope();
+  return flag != NULL && strcmp(flag, "1") == 0 &&
+         pm_has_current_network_scope() &&
+         (network_name == NULL || network_name[0] == '\0');
 }
 
 static void pm_normalize_process_preload_env(void) {
@@ -4166,12 +4200,6 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
 
     loopback_host = pm_network_loopback_host();
     if (loopback_host == NULL || !pm_sockaddr_is_local(addr)) {
-      if (pm_network_scope_is_global()) {
-        /* A missing global alias must degrade to the host view, never fail
-           the server: unattached terminals cannot require a sudo alias. */
-        pm_debug("bind global raw fallback (no alias) logical=%d", logical_port);
-        return pm_real_bind(sockfd, addr, addrlen);
-      }
       pm_debug("bind address-only unavailable logical=%d", logical_port);
       errno = EADDRNOTAVAIL;
       return -1;
@@ -4182,19 +4210,6 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
     pm_set_sockaddr_port((struct sockaddr *)&rewritten, logical_port);
 
     result = pm_real_bind(sockfd, (struct sockaddr *)&rewritten, addrlen);
-    if (result != 0 && pm_network_scope_is_global() &&
-        (errno == EADDRNOTAVAIL || errno == EAFNOSUPPORT || errno == EACCES)) {
-      int alias_bind_errno = errno;
-
-      pm_debug(
-        "bind global raw fallback logical=%d alias=%s error=%s",
-        logical_port,
-        loopback_host,
-        strerror(alias_bind_errno));
-      pm_sockaddr_host(addr, host, sizeof(host));
-      loopback_host = host;
-      result = pm_real_bind(sockfd, addr, addrlen);
-    }
     if (result == 0) {
       char logical_text[16];
 
@@ -4429,20 +4444,30 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
           return -1;
         }
         /*
-         * Unmanaged port: the global network is the host view. Services Port
-         * Manager does not manage (launchd daemons, Homebrew DBs, unhooked
-         * servers) stay reachable at their raw coordinates — unlike a user
-         * network, passing through cannot cross an isolation boundary.
+         * Unmanaged or not-yet-published port: the global network still owns a
+         * concrete loopback identity. Dial the global alias directly instead of
+         * falling back to ::1/127.0.0.1, which are daemon-owned ingress
+         * coordinates and may be the logical router itself.
          */
-        pm_debug("connect global raw passthrough logical=%d", logical_port);
-        return pm_real_connect(sockfd, addr, addrlen);
+        loopback_host = pm_network_loopback_host();
+        if (loopback_host == NULL) {
+          pm_debug("connect global unavailable logical=%d", logical_port);
+          errno = ECONNREFUSED;
+          return -1;
+        }
+        memcpy(&rewritten, addr, addrlen);
+        pm_set_sockaddr_port((struct sockaddr *)&rewritten, logical_port);
+        pm_set_sockaddr_host((struct sockaddr *)&rewritten, loopback_host);
+        pm_debug("connect global address-only logical=%d host=%s", logical_port, loopback_host);
+        return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
       }
 
       if (global_host[0] == '\0' || pm_route_host_is_wildcard_text(global_host)) {
         loopback_host = pm_network_loopback_host();
         if (loopback_host == NULL) {
-          pm_debug("connect global raw passthrough (no alias) logical=%d", logical_port);
-          return pm_real_connect(sockfd, addr, addrlen);
+          pm_debug("connect global unavailable (no alias) logical=%d", logical_port);
+          errno = ECONNREFUSED;
+          return -1;
         }
         snprintf(global_host, sizeof(global_host), "%s", loopback_host);
       }
@@ -4466,18 +4491,13 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
         errno = alias_errno;
         return alias_result;
       }
-      /*
-       * Stale row — the managed server is gone; fall back to the host view.
-       * Only blocking connects get here: a non-blocking dial already returned
-       * EINPROGRESS above and surfaces the refusal to the app, exactly like a
-       * server dying today. Unmanaged ports never dial the alias at all.
-       */
       pm_debug(
-        "connect global raw fallback logical=%d host=%s error=%s",
+        "connect global managed failed logical=%d host=%s error=%s",
         logical_port,
         global_host,
         strerror(alias_errno));
-      return pm_real_connect(sockfd, addr, addrlen);
+      errno = alias_errno;
+      return alias_result;
     }
 
     loopback_host = pm_network_loopback_host();
@@ -5514,7 +5534,7 @@ static char **pm_rewrite_localhost_argv(char *const argv[], char *const envp[]) 
   if (!pm_hook_enabled() || pm_hook_depth > 0 || argv == NULL || envp == NULL ||
       pm_envp_value_is(envp, "PORT_MANAGER_HOOK_DISABLED", "1") ||
       pm_envp_value_is(envp, "PORT_MANAGER_HOOK", "0") ||
-      pm_envp_value_is(envp, "PORT_MANAGER_NETWORK_IS_GLOBAL", "1") ||
+      pm_envp_network_scope_is_global(envp) ||
       pm_envp_value_is(envp, PM_ARGV_LOCALHOST_REWRITE_ENV, "0")) {
     return NULL;
   }

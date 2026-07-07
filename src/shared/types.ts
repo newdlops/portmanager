@@ -527,9 +527,9 @@ export interface PortManagerSettings {
   readonly logicalPortGateway: boolean;
   /**
    * Whether unattached terminals join the reserved global logical network
-   * (fixed loopback 127.1.0.1) instead of living outside every network.
-   * Requires loopback-address-only route ownership and the logical port
-   * gateway; degrades to the plain scopeless environment otherwise.
+   * (fixed loopback 127.1.0.1) instead of living outside every network, leaving
+   * 127.0.0.1/0.0.0.0 as daemon-owned ingress coordinates. Requires
+   * loopback-address-only route ownership and the logical port gateway.
    */
   readonly globalNetwork: boolean;
   /**

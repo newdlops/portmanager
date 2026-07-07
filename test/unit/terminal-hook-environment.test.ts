@@ -37,24 +37,25 @@ test("BASH_ENV restore script promotes runtime shims ahead of inherited PATH ent
   assert.equal(source.includes('export PATH="\\${__pm_path_rest}"'), true);
 });
 
-test("unattached terminals join the global network only when mode and alias allow", () => {
+test("unattached terminals join the global network by default in address-only mode", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
   const scopelessStart = source.indexOf("if (scope === undefined) {");
   const scopelessEnd = source.indexOf("if (!shouldInjectTerminalHook(settings))", scopelessStart);
   const scopelessBody = source.slice(scopelessStart, scopelessEnd);
   const globalStart = source.indexOf("function applyGlobalNetworkEnvironment");
-  const globalEnd = source.indexOf("function isGlobalLoopbackAliasConfigured", globalStart);
+  const globalEnd = source.indexOf("function applyScopelessGatewayEnvironment", globalStart);
   const globalBody = source.slice(globalStart, globalEnd);
 
   assert.notEqual(scopelessStart, -1);
   assert.notEqual(globalStart, -1);
 
-  // Gate: setting + loopback-address-only mode + verified lo0 alias. On any
-  // miss the terminal keeps the plain scopeless env — creation never fails.
+  // Gate: setting + loopback-address-only mode. Alias preparation is async in
+  // the network service; env generation must not fall back to unmanaged
+  // localhost because a synchronous lo0 probe failed or has not run yet.
   assert.equal(scopelessBody.includes("settings.globalNetwork &&"), true);
-  assert.equal(scopelessBody.includes("usesLoopbackAddressOnlyRouting(settings) &&"), true);
-  assert.equal(scopelessBody.includes("isGlobalLoopbackAliasConfigured()"), true);
+  assert.equal(scopelessBody.includes("usesLoopbackAddressOnlyRouting(settings)"), true);
+  assert.equal(source.includes("isGlobalLoopbackAliasConfigured"), false);
   assert.equal(scopelessBody.includes("applyScopelessGatewayEnvironment(context, collection, settings);"), true);
 
   // The global scope carries the reserved id on all five id vars plus the
@@ -79,8 +80,8 @@ test("unattached terminals join the global network only when mode and alias allo
   assert.equal(globalBody.includes("PORT_MANAGER_COMPOSE_LOGICAL_PORTS"), false);
   assert.equal(globalBody.includes("applyLoopbackRoutingHosts(collection, GLOBAL_LOGICAL_NETWORK_ID, settings);"), true);
 
-  // Stage rollout: the setting ships off until the edge normalization lands.
-  assert.equal(DEFAULT_PORT_MANAGER_SETTINGS.globalNetwork, false);
+  // The reserved global network is the default non-network terminal identity.
+  assert.equal(DEFAULT_PORT_MANAGER_SETTINGS.globalNetwork, true);
 });
 
 test("terminal hook preload entries are normalized across multiple VS Code windows", () => {
@@ -101,6 +102,7 @@ test("terminal hook preload entries are normalized across multiple VS Code windo
   const detachBody = networkServiceSource.slice(detachStart, networkServiceSource.indexOf("export interface", detachStart));
 
   assert.equal(applyBody.includes("collection.prepend(preloadVariable"), false);
+  assert.equal(applyBody.includes('collection.replace(NETWORK_IS_GLOBAL_ENV, "", TERMINAL_MUTATOR_OPTIONS);'), true);
   assert.equal(applyBody.includes("prependUniquePathListEntry(hookLibraryPath, process.env[preloadVariable])"), true);
   assert.equal(applyBody.includes("collection.replace(preloadHintVariable, hookLibraryPath"), true);
   assert.equal(terminalHookEnvironmentSource.includes('collection.replace(\n      "PATH"'), false);
@@ -112,6 +114,8 @@ test("terminal hook preload entries are normalized across multiple VS Code windo
   assert.equal(terminalHookEnvironmentSource.includes("function prependUniquePathListEntry"), true);
   assert.equal(terminalHookEnvironmentSource.includes("function buildShellPrependVariablePathListEntry"), true);
   assert.equal(attachBody.includes("shellPrependLibrary(preloadVariable, hookLibraryPath)"), true);
+  assert.equal(attachBody.includes("${NETWORK_IS_GLOBAL_ENV}"), true);
+  assert.equal(attachBody.includes("shellExport(\"PORT_MANAGER_NETWORK_NAME\", networkName)"), true);
   assert.equal(attachBody.includes("shellPrependPathListEntry(\"PATH\", runtimeShimDirectory)"), true);
   assert.equal(detachBody.includes("shellRemovePathListEntry(preloadVariable, hookLibraryPath)"), true);
   assert.equal(detachBody.includes("shellRemovePathListEntry(\"PATH\", runtimeShimDirectory)"), true);
@@ -140,6 +144,7 @@ test("experimental route ownership env is opt-in and cleaned from legacy paths",
   assert.equal(terminalHookEnvironmentSource.includes("PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE"), true);
   assert.equal(terminalHookEnvironmentSource.includes('settings.experimentalRouteOwnershipMode !== "process"'), true);
   assert.equal(terminalHookEnvironmentSource.includes("shouldExposeNetworkLoopbackHost(settings)"), true);
+  assert.equal(terminalHookEnvironmentSource.includes("unset ${NETWORK_IS_GLOBAL_ENV}"), true);
   assert.equal(terminalHookEnvironmentSource.includes("unset ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}"), true);
   assert.equal(networkServiceSource.includes("EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV"), true);
   assert.equal(commandsSource.includes("EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV"), true);
@@ -269,7 +274,7 @@ test("global storage cleanup preserves live terminal hook assets", () => {
   assert.equal(source.includes("if (isLiveTerminalHookStorageEntry(entry.name))"), true);
 });
 
-test("global shell hook keeps no-network shells out of native preload routing", () => {
+test("global shell hook routes no-network shells through the global scope", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/commands.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
   const hookStart = source.indexOf("return `# Port Manager shell hook");
@@ -278,6 +283,21 @@ test("global shell hook keeps no-network shells out of native preload routing", 
 
   assert.equal(hookTemplate.includes('if [ -n "\\${PORT_MANAGER_NETWORK_ID:-}" ]'), true);
   assert.equal(hookTemplate.includes("unset PORT_MANAGER_HOOK_DISABLED\n  export PORT_MANAGER_HOOK=1"), true);
+  assert.equal(hookTemplate.includes('elif [ "${defaultGlobalScopeEnabled ? "1" : "0"}" = "1" ]; then'), true);
+  assert.equal(hookTemplate.includes('export PORT_MANAGER_NETWORK_ID="${escapedGlobalNetworkId}"'), true);
+  assert.equal(hookTemplate.includes('export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID="${escapedGlobalNetworkId}"'), true);
+  assert.equal(hookTemplate.includes('export ${NETWORK_IS_GLOBAL_ENV}=1'), true);
+  assert.equal(hookTemplate.includes("unset ${NETWORK_IS_GLOBAL_ENV}"), true);
+  assert.equal(hookTemplate.includes('export ${ACTUAL_LOOPBACK_HOST_ENV}="${escapedGlobalLoopbackHost}"'), true);
+  assert.equal(hookTemplate.includes('export ${NETWORK_LOOPBACK_HOST_ENV}="${escapedGlobalLoopbackHost}"'), true);
+  assert.equal(hookTemplate.includes("buildExistingShellScopeRouteSelectionScript"), true);
+  assert.equal(
+    hookTemplate.includes(
+      'if [ "$__pm_existing_network_id" = "${options.escapedGlobalNetworkId}" ] && [ "$PORT_MANAGER_ROUTES_FILE" = "${options.escapedRouteTablePath}" ]; then',
+    ),
+    true,
+  );
+  assert.equal(hookTemplate.includes('export PORT_MANAGER_ROUTES_FILE="$__pm_routes_file"'), true);
   assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK=0"), true);
   assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK_DISABLED=1"), true);
   assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK_DAEMON_STARTED=0"), true);
@@ -302,7 +322,8 @@ test("global shell hook keeps no-network shells out of native preload routing", 
   assert.equal(hookTemplate.includes("removeNativeHookPreloadScript"), true);
   assert.equal(source.includes('shellRemovePathListEntry("DYLD_INSERT_LIBRARIES", options.hookLibraryPath)'), true);
   assert.equal(source.includes('shellRemovePathListEntry("LD_PRELOAD", options.hookLibraryPath)'), true);
-  assert.equal(hookTemplate.includes("export PORT_MANAGER_HOOK=1\nexport PORT_MANAGER_AGENT_SOCKET"), false);
+  assert.equal(source.includes("getRouteTablePathForNetwork(GLOBAL_LOGICAL_NETWORK_ID, options.routeTablePath)"), true);
+  assert.equal(source.includes("loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID)"), true);
   assert.equal(hookTemplate.includes("__pm_agent_required()"), true);
   assert.equal(hookTemplate.includes('export ${AGENT_REQUIRED_ENV}="${agentRequired ? "1" : "0"}"'), true);
   assert.equal(hookTemplate.includes('if __pm_agent_required; then\n    __pm_agent_ensure'), true);
@@ -1650,6 +1671,9 @@ test("route tables are stored in extension global storage and legacy temp files 
 test("terminal attach script prepares actual loopback routing only after alias readiness", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
+  const refreshStart = source.indexOf("private async refreshVscodeWindowTerminalEnvironment");
+  const refreshEnd = source.indexOf("private async injectRoutingIntoOpenVscodeTerminals", refreshStart);
+  const refreshBody = source.slice(refreshStart, refreshEnd);
 
   assert.equal(source.includes("buildLoopbackAddressRoutingShell"), true);
   assert.equal(source.includes("sudo -n ifconfig lo0 alias"), true);
@@ -1665,6 +1689,10 @@ test("terminal attach script prepares actual loopback routing only after alias r
   assert.equal(source.includes("refreshVscodeWindowTerminalEnvironment"), true);
   assert.equal(source.includes('binding?.status === "attached"'), true);
   assert.equal(source.includes("VS Code terminal default not applied."), true);
+  assert.equal(source.includes("function shouldUseGlobalNetworkTerminalEnvironment"), true);
+  assert.equal(refreshBody.includes("shouldUseGlobalNetworkTerminalEnvironment(settings)"), true);
+  assert.equal(refreshBody.includes("loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID)"), true);
+  assert.equal(refreshBody.includes("do not fall back to a plain localhost identity"), true);
 });
 
 test("terminal attach does not require durable compose routes before reporting active", () => {
@@ -1790,6 +1818,10 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   assert.equal(ephemeralHelperBody.includes("pm_remember_route(actual_port, actual_port, loopback_host, \"\", 0);"), true);
   assert.equal(ephemeralHelperBody.includes("pm_register_process(actual_port, actual_port, loopback_host, \"\");"), true);
   assert.equal(source.includes("errno = EADDRNOTAVAIL;\n      return -1;"), true);
+  assert.equal(source.includes("bind global raw fallback"), false);
+  assert.equal(source.includes("connect global raw fallback"), false);
+  assert.equal(source.includes("connect global raw passthrough"), false);
+  assert.equal(source.includes("connect global address-only logical=%d host=%s"), true);
   assert.equal(ephemeralBindStart < addressOnlyBindStart, true);
   assert.equal(source.includes("bind address-only logical=%d host=%s"), true);
   assert.equal(addressOnlyBindStart < allocationStart, true);
@@ -1893,8 +1925,11 @@ test("logical router classifies clients by process tree label before hook enviro
   const verdictEnd = source.indexOf("private async resolveNetworkClientTarget", verdictStart);
   const resolveRouterClientVerdict = source.slice(verdictStart, verdictEnd);
   const networkTargetStart = source.indexOf("private async resolveNetworkClientTarget");
-  const networkTargetEnd = source.indexOf("private resolveNonNetworkClientTarget", networkTargetStart);
+  const networkTargetEnd = source.indexOf("private async resolveNonNetworkClientTarget", networkTargetStart);
   const resolveNetworkClientTarget = source.slice(networkTargetStart, networkTargetEnd);
+  const nonNetworkTargetStart = source.indexOf("private async resolveNonNetworkClientTarget");
+  const nonNetworkTargetEnd = source.indexOf("private findNonNetworkOwnerRoute", nonNetworkTargetStart);
+  const resolveNonNetworkClientTarget = source.slice(nonNetworkTargetStart, nonNetworkTargetEnd);
 
   assert.equal(source.includes('from "../core/process-network-labels"'), true);
   assert.equal(
@@ -1924,8 +1959,26 @@ test("logical router classifies clients by process tree label before hook enviro
   );
   assert.equal(resolveNetworkClientTarget.includes("this.isFixedProtocolPort(logicalPort) && !isComposePort"), true);
 
-  // The older cwd/unique-route guessing fallbacks are removed; the non-network
-  // path forwards only to an explicit relocated owner.
+  // In address-only mode, unattributable clients join the reserved global
+  // network instead of falling through to legacy network-less localhost owners.
+  assert.equal(
+    resolveNonNetworkClientTarget.includes("settings.globalNetwork && usesLoopbackAddressOnlyRouting(settings)"),
+    true,
+  );
+  assert.equal(
+    resolveNonNetworkClientTarget.includes(
+      "return this.resolveNetworkClientTarget(GLOBAL_LOGICAL_NETWORK_ID, logicalPort, []);",
+    ),
+    true,
+  );
+  assert.equal(
+    resolveNonNetworkClientTarget.indexOf("this.resolveNetworkClientTarget(GLOBAL_LOGICAL_NETWORK_ID") <
+      resolveNonNetworkClientTarget.indexOf("this.findNonNetworkOwnerRoute(logicalPort, clientCwd)"),
+    true,
+  );
+
+  // The older cwd/unique-route guessing fallbacks are removed; the legacy
+  // non-network path forwards only to an explicit relocated owner.
   assert.equal(source.includes("private async findUniqueRouteForRouter"), false);
   assert.equal(source.includes("private findClientCwdRouteForRouter"), false);
   assert.equal(source.includes("selectNonNetworkOwnerRoute"), true);
@@ -1999,8 +2052,28 @@ test("compose mutation publishes hidden ports on the network loopback host", () 
   // Interactive attach goes through the consolidated setup so one admin
   // approval prepares aliases for every network, not just the attached one.
   assert.equal(attachBody.includes("await this.ensureTerminalRoutingHostReadyForNetwork(network, loopbackMode);"), true);
+  assert.equal(attachBody.includes("await this.ensureComposeHiddenPublishHostsReady(mutation);"), true);
   assert.equal(attachBody.includes("resolveTerminalLoopbackAddressRoutingMode(portSettings)"), true);
   assert.equal(attachBody.includes("hiddenHostAddress,"), true);
+});
+
+test("compose override recovery prepares persisted hidden loopback hosts", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const helperStart = source.indexOf("private async ensureComposeHiddenPublishHostsReady");
+  const helperEnd = source.indexOf("  /** Rebuilds generated Compose files/routes", helperStart);
+  const helperBody = source.slice(helperStart, helperEnd);
+  const renameStart = source.indexOf("async renameComposeAttachment");
+  const renameEnd = source.indexOf("  /** Captures the selected network", renameStart);
+  const renameBody = source.slice(renameStart, renameEnd);
+
+  assert.notEqual(helperStart, -1);
+  assert.equal(helperBody.includes(".filter(isNonDefaultLoopbackIpv4Address)"), true);
+  assert.equal(helperBody.includes("await ensureLoopbackAddressRoutingHostReady(address, mode);"), true);
+  assert.equal(source.includes("await this.ensureComposeHiddenPublishHostsReady(input.existingMutation);"), true);
+  assert.equal(source.includes("await this.ensureComposeHiddenPublishHostsReady(attachment.mutation);"), true);
+  assert.equal(source.includes("await this.ensureComposeHiddenPublishHostsReady(recoveryMutation);"), true);
+  assert.equal(renameBody.includes("await this.ensureComposeHiddenPublishHostsReady(mutation);"), true);
 });
 
 test("native hook virtualizes gethostname/uname to the per-network loopback address", () => {

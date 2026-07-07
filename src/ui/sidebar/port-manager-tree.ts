@@ -95,7 +95,7 @@ interface RoutingTimelineEntry {
 }
 
 interface ActionAvailability {
-  /** False removes the command from the tree row so non-owner windows cannot invoke owner work. */
+  /** False renders the row as owner-scoped while the command wrapper acquires ownership. */
   readonly enabled: boolean;
   /** Short reason appended to disabled action rows. */
   readonly disabledReason?: string;
@@ -561,13 +561,11 @@ class ActionTreeItem extends vscode.TreeItem {
       availability.enabled ? undefined : new vscode.ThemeColor("disabledForeground"),
     );
 
-    if (availability.enabled) {
-      this.command = {
-        command,
-        title: label,
-        arguments: argument === undefined ? [] : [argument],
-      };
-    }
+    this.command = {
+      command,
+      title: label,
+      arguments: argument === undefined ? [] : [argument],
+    };
   }
 }
 
@@ -799,13 +797,11 @@ export class ComposeProjectCandidateTreeItem extends vscode.TreeItem {
       availability.enabled ? "server-environment" : "circle-slash",
       availability.enabled ? undefined : new vscode.ThemeColor("disabledForeground"),
     );
-    if (availability.enabled) {
-      this.command = {
-        command: "portManager.attachContainerToNetwork",
-        title: "Attach Compose Project to Network",
-        arguments: [{ containerService: this.aggregateCandidate }],
-      };
-    }
+    this.command = {
+      command: "portManager.attachContainerToNetwork",
+      title: "Attach Compose Project to Network",
+      arguments: [{ containerService: this.aggregateCandidate }],
+    };
   }
 }
 
@@ -825,13 +821,11 @@ export class ContainerServiceCandidateTreeItem extends vscode.TreeItem {
       availability.enabled ? (candidate.composeProject ? "server-environment" : "server-process") : "circle-slash",
       availability.enabled ? undefined : new vscode.ThemeColor("disabledForeground"),
     );
-    if (availability.enabled) {
-      this.command = {
-        command: "portManager.attachContainerToNetwork",
-        title: "Attach Service to Network",
-        arguments: [{ containerService: candidate }],
-      };
-    }
+    this.command = {
+      command: "portManager.attachContainerToNetwork",
+      title: "Attach Service to Network",
+      arguments: [{ containerService: candidate }],
+    };
   }
 }
 
@@ -1788,7 +1782,21 @@ export function getLogicalNetworkFromCommandArgument(argument: unknown): Logical
     return argument;
   }
 
+  const wrappedNetwork = getWrappedLogicalNetwork(argument);
+  if (wrappedNetwork !== undefined) {
+    return wrappedNetwork;
+  }
+
   return undefined;
+}
+
+function getWrappedLogicalNetwork(argument: unknown): LogicalNetwork | undefined {
+  if (typeof argument !== "object" || argument === null || !("network" in argument)) {
+    return undefined;
+  }
+
+  const candidate = argument as { readonly network?: unknown };
+  return isLogicalNetwork(candidate.network) ? candidate.network : undefined;
 }
 
 /** Extracts a terminal window from a tree command argument. */

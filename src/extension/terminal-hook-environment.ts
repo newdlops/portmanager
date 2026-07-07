@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -155,15 +154,12 @@ export function applyTerminalHookEnvironment(
     if (!settings.logicalPortGateway || !shouldInjectTerminalHook(settings)) {
       return;
     }
-    // Unattached terminals join the reserved global network when the routing
-    // mode supports it and the fixed global alias exists on lo0; otherwise
-    // they keep the minimal scopeless-gateway environment. A terminal must
-    // never fail to open because the global alias is missing.
-    if (
-      settings.globalNetwork &&
-      usesLoopbackAddressOnlyRouting(settings) &&
-      isGlobalLoopbackAliasConfigured()
-    ) {
+    // Unattached terminals join the reserved global network in address-only
+    // mode so 127.0.0.1/0.0.0.0 remain daemon-owned ingress coordinates. The
+    // service prepares the fixed lo0 alias asynchronously; env generation never
+    // falls back to an unmanaged localhost identity just because the alias probe
+    // is pending or failed.
+    if (settings.globalNetwork && usesLoopbackAddressOnlyRouting(settings)) {
       applyGlobalNetworkEnvironment(context, collection, settings);
       return;
     }
@@ -207,6 +203,7 @@ export function applyTerminalHookEnvironment(
   const preloadHintVariable = process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD";
 
   collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_MUTATOR_OPTIONS);
+  collection.replace(NETWORK_IS_GLOBAL_ENV, "", TERMINAL_MUTATOR_OPTIONS);
   // Dev-log endpoint (docs/dev-logging.md): hooked servers/clients write to the
   // shared trace file when PORT_MANAGER_DEV_LOG is set in the host env.
   if (process.env.PORT_MANAGER_DEV_LOG !== undefined && process.env.PORT_MANAGER_DEV_LOG.length > 0) {
@@ -315,33 +312,6 @@ function applyGlobalNetworkEnvironment(
   );
   collection.replace(preloadHintVariable, hookLibraryPath, TERMINAL_MUTATOR_OPTIONS);
   applyRuntimeShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath, runtimeCommandShimPath);
-}
-
-/** Cached `ifconfig lo0` probe for the fixed global alias (created by the consolidated admin setup). */
-let globalLoopbackAliasProbe: { readonly atMs: number; readonly configured: boolean } | undefined;
-const GLOBAL_LOOPBACK_ALIAS_PROBE_TTL_MS = 30_000;
-
-function isGlobalLoopbackAliasConfigured(): boolean {
-  if (process.platform !== "darwin") {
-    return true;
-  }
-
-  const now = Date.now();
-  if (globalLoopbackAliasProbe !== undefined && now - globalLoopbackAliasProbe.atMs < GLOBAL_LOOPBACK_ALIAS_PROBE_TTL_MS) {
-    return globalLoopbackAliasProbe.configured;
-  }
-
-  let configured = false;
-  try {
-    const output = execFileSync("/sbin/ifconfig", ["lo0"], { encoding: "utf8", timeout: 2_000 });
-    const address = loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID).replace(/\./g, "\\.");
-    configured = new RegExp(`inet[\\t ]+${address}([\\t ]|$)`, "m").test(output);
-  } catch {
-    configured = false;
-  }
-
-  globalLoopbackAliasProbe = { atMs: now, configured };
-  return configured;
 }
 
 /**
@@ -1464,6 +1434,7 @@ if [ -z "\${PORT_MANAGER_NETWORK_ID:-}" ] && [ -n "\${NEWDLOPS_PM_BORROWED_NETWO
   export PORT_MANAGER_NETWORK_ID="\${NEWDLOPS_PM_BORROWED_NETWORK_ID}"
 fi`
       : `export PORT_MANAGER_HOOK=1
+unset ${NETWORK_IS_GLOBAL_ENV}
 export PORT_MANAGER_NETWORK_ID=${shellQuote(scope.networkId)}
 export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID=${shellQuote(scope.networkId)}
 	export PORT_MANAGER_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}

@@ -1015,6 +1015,43 @@ __port_manager_wait_for_compose_route_refresh() {
   return 0
 }
 
+__port_manager_prepare_compose_hidden_publish_hosts() {
+  __pm_publish_file="$1"
+  [ "$(uname -s 2>/dev/null || true)" = "Darwin" ] || { unset __pm_publish_file; return 0; }
+  [ -r "\${__pm_publish_file}" ] || { unset __pm_publish_file; return 0; }
+
+  while IFS= read -r __pm_publish_line || [ -n "\${__pm_publish_line}" ]; do
+    __pm_publish_host="$(printf '%s\\n' "\${__pm_publish_line}" | sed -n "s/^[[:space:]]*-[[:space:]]*['\\"]\\{0,1\\}\\(127\\.[0-9][0-9]*\\.[0-9][0-9]*\\.[0-9][0-9]*\\):[0-9][0-9]*:.*/\\1/p")"
+    case "\${__pm_publish_host}" in
+      ""|127.0.0.1)
+        continue
+        ;;
+      127.*.*.*)
+        ;;
+      *)
+        continue
+        ;;
+    esac
+
+    if ifconfig lo0 2>/dev/null | grep -E "inet[[:space:]]+\${__pm_publish_host}([[:space:]]|$)" >/dev/null 2>&1; then
+      continue
+    fi
+
+    if ifconfig lo0 alias "\${__pm_publish_host}" 255.255.255.255 >/dev/null 2>&1 ||
+      sudo -n ifconfig lo0 alias "\${__pm_publish_host}" 255.255.255.255 >/dev/null 2>&1; then
+      continue
+    fi
+
+    printf 'Port Manager compose routing unavailable: Docker needs loopback host %s from %s, but it is not configured on lo0 and could not be added non-interactively.\\n' "\${__pm_publish_host}" "\${__pm_publish_file}" >&2
+    printf '%s\\n' 'Run Port Manager: Fix Stale Routing, reattach the Compose project, or add the alias with sudo ifconfig lo0 alias <host> 255.255.255.255.' >&2
+    unset __pm_publish_file __pm_publish_line __pm_publish_host
+    return 1
+  done < "\${__pm_publish_file}"
+
+  unset __pm_publish_file __pm_publish_line __pm_publish_host
+  return 0
+}
+
 __port_manager_compose_command_may_change_endpoints() {
   __pm_standalone="$1"
   shift
@@ -1318,6 +1355,7 @@ __port_manager_run_compose_command_with_routing() {
     if ! __port_manager_compose_args_reference_file "\${__pm_override_file}" "$@"; then
       __pm_override_enabled=1
     fi
+    __port_manager_prepare_compose_hidden_publish_hosts "\${__pm_override_file}" || return $?
   fi
   if __port_manager_compose_should_detach_up "\${__pm_standalone_compose}" "$@"; then
     __pm_detach_up=1

@@ -58,7 +58,7 @@ export const DEFAULT_PORT_MANAGER_SETTINGS: PortManagerSettings = {
   notifyOnDetectedConflict: true,
   monitorAllListeningPorts: true,
   logicalPortGateway: true,
-  globalNetwork: false,
+  globalNetwork: true,
   escapedServerRespawn: false,
   detectTerminalListenFailures: false,
   routeTerminalCommandsOnStart: false,

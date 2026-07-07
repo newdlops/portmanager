@@ -3,10 +3,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { getAgentSocketPath } from "../agent/agent-socket";
-import { getDefaultHostAccessBindingsPath, getDefaultRouteTablePath, ROUTE_TABLE_TTL_SECONDS_ENV } from "../agent/route-table";
+import {
+  getDefaultHostAccessBindingsPath,
+  getDefaultRouteTablePath,
+  getRouteTablePathForNetwork,
+  ROUTE_TABLE_TTL_SECONDS_ENV,
+} from "../agent/route-table";
 import { readPortManagerSettings, openPortManagerSettings } from "../config/vscode-settings";
 import {
   ACTUAL_LOOPBACK_HOST_ENV,
+  GLOBAL_LOGICAL_NETWORK_ID,
+  loopbackAddressForNetwork,
+  NETWORK_IS_GLOBAL_ENV,
   NETWORK_LOOPBACK_HOST_ENV,
   usesLoopbackAddressOnlyRouting,
 } from "../core/networks/loopback-address";
@@ -78,6 +86,11 @@ export interface PortManagerCommandDependencies {
   readonly treeProvider: PortManagerTreeProvider;
 }
 
+interface CommandRegistrationOptions {
+  /** Acquire the cross-window control-plane lease in this window before running the command. */
+  readonly requiresControlPlaneOwner?: boolean;
+}
+
 /**
  * Command controller keeps VS Code prompt flow separate from the agent-backed
  * process service so the same agent can serve multiple VS Code windows.
@@ -94,24 +107,26 @@ export class PortManagerCommandController implements DisposableLike {
    * error notifications instead of unhandled promise rejections.
    */
   register(context: vscode.ExtensionContext): void {
-    this.registerCommand(context, "portManager.createLogicalNetwork", () => this.createLogicalNetwork());
+    const ownerCommand: CommandRegistrationOptions = { requiresControlPlaneOwner: true };
+
+    this.registerCommand(context, "portManager.createLogicalNetwork", () => this.createLogicalNetwork(), ownerCommand);
     this.registerCommand(context, "portManager.removeLogicalNetwork", (argument) =>
       this.removeLogicalNetwork(argument),
-    );
-    this.registerCommand(context, "portManager.refreshTerminals", () => this.refreshTerminals());
-    this.registerCommand(context, "portManager.refreshContainerServices", () => this.refreshContainerServices());
+    ownerCommand);
+    this.registerCommand(context, "portManager.refreshTerminals", () => this.refreshTerminals(), ownerCommand);
+    this.registerCommand(context, "portManager.refreshContainerServices", () => this.refreshContainerServices(), ownerCommand);
     this.registerCommand(context, "portManager.attachTerminalToNetwork", (argument) =>
       this.attachTerminalToNetwork(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.attachActiveTerminalToNetwork", (argument) =>
       this.attachActiveTerminalToNetwork(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.revealTerminalWindow", (argument) =>
       this.revealTerminalWindow(argument),
     );
     this.registerCommand(context, "portManager.attachProcessToNetwork", (argument) =>
       this.attachProcessToNetwork(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.attachVscodeWindowTerminalsToNetwork", (argument) =>
       this.attachVscodeWindowTerminalsToNetwork(argument),
     );
@@ -120,7 +135,7 @@ export class PortManagerCommandController implements DisposableLike {
     );
     this.registerCommand(context, "portManager.copyTerminalRoutingScript", (argument) =>
       this.copyTerminalRoutingScript(argument),
-    );
+    ownerCommand);
     this.registerApiCommand(context, "portManager.listLogicalNetworks", () => this.listLogicalNetworks());
     this.registerApiCommand(context, "portManager.getTerminalRoutingScript", (argument) =>
       this.getTerminalRoutingScript(argument),
@@ -130,84 +145,84 @@ export class PortManagerCommandController implements DisposableLike {
     );
     this.registerCommand(context, "portManager.attachContainerToNetwork", (argument) =>
       this.attachContainerToNetwork(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.detachTerminalFromNetwork", (argument) =>
       this.detachTerminalFromNetwork(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.resetTerminalNetworkSettings", (argument) =>
       this.resetTerminalNetworkSettings(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.addHostPortExposure", (argument) =>
       this.addHostPortExposure(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.addHostAccessBinding", (argument) =>
       this.addHostAccessBinding(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.addComposePublishedPort", (argument) =>
       this.addComposePublishedPort(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.copyComposeAttachment", (argument) =>
       this.copyComposeAttachment(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.detachComposeAttachment", (argument) =>
       this.detachComposeAttachment(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.renameComposeAttachment", (argument) =>
       this.renameComposeAttachment(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.removeComposeAttachment", (argument) =>
       this.removeComposeAttachment(argument),
-    );
-    this.registerCommand(context, "portManager.saveBindingPreset", (argument) => this.saveBindingPreset(argument));
-    this.registerCommand(context, "portManager.applyBindingPreset", (argument) => this.applyBindingPreset(argument));
+    ownerCommand);
+    this.registerCommand(context, "portManager.saveBindingPreset", (argument) => this.saveBindingPreset(argument), ownerCommand);
+    this.registerCommand(context, "portManager.applyBindingPreset", (argument) => this.applyBindingPreset(argument), ownerCommand);
     this.registerCommand(context, "portManager.removeHostAccessBinding", (argument) =>
       this.removeHostAccessBinding(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.removeHostPortExposure", (argument) =>
       this.removeHostPortExposure(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.copyHostPortExposureUrl", (argument) =>
       this.copyHostPortExposureUrl(argument),
     );
     this.registerCommand(context, "portManager.openHostPortExposureUrl", (argument) =>
       this.openHostPortExposureUrl(argument),
     );
-    this.registerCommand(context, "portManager.startDaemon", () => this.startDaemon());
-    this.registerCommand(context, "portManager.restartDaemon", () => this.restartDaemon());
-    this.registerCommand(context, "portManager.stopDaemon", () => this.stopDaemon());
+    this.registerCommand(context, "portManager.startDaemon", () => this.startDaemon(), ownerCommand);
+    this.registerCommand(context, "portManager.restartDaemon", () => this.restartDaemon(), ownerCommand);
+    this.registerCommand(context, "portManager.stopDaemon", () => this.stopDaemon(), ownerCommand);
     this.registerCommand(context, "portManager.showDaemonStatus", () => this.showDaemonStatus());
-    this.registerCommand(context, "portManager.fixStaleRouting", () => this.fixStaleRouting());
-    this.registerCommand(context, "portManager.clearRoutingFiles", () => this.clearRoutingFiles());
-    this.registerCommand(context, "portManager.clearGlobalStorageFiles", () => this.clearGlobalStorageFiles());
-    this.registerCommand(context, "portManager.resetRouting", () => this.clearRoutingFiles());
+    this.registerCommand(context, "portManager.fixStaleRouting", () => this.fixStaleRouting(), ownerCommand);
+    this.registerCommand(context, "portManager.clearRoutingFiles", () => this.clearRoutingFiles(), ownerCommand);
+    this.registerCommand(context, "portManager.clearGlobalStorageFiles", () => this.clearGlobalStorageFiles(), ownerCommand);
+    this.registerCommand(context, "portManager.resetRouting", () => this.clearRoutingFiles(), ownerCommand);
     this.registerCommand(context, "portManager.clearNetworkCache", (argument) =>
       this.clearNetworkCache(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.clearNetworkRoutingFiles", (argument) =>
       this.clearNetworkCache(argument),
-    );
-    this.registerCommand(context, "portManager.startManagedProcess", () => this.startManagedProcess());
-    this.registerCommand(context, "portManager.addExistingProcess", () => this.addExistingProcess());
-    this.registerCommand(context, "portManager.refresh", () => this.refresh());
+    ownerCommand);
+    this.registerCommand(context, "portManager.startManagedProcess", () => this.startManagedProcess(), ownerCommand);
+    this.registerCommand(context, "portManager.addExistingProcess", () => this.addExistingProcess(), ownerCommand);
+    this.registerCommand(context, "portManager.refresh", () => this.refresh(), ownerCommand);
     this.registerCommand(context, "portManager.showStatusMenu", () => this.showStatusMenu());
-    this.registerCommand(context, "portManager.stopProcess", (argument) => this.stopProcess(argument));
-    this.registerCommand(context, "portManager.restartProcess", (argument) => this.restartProcess(argument));
-    this.registerCommand(context, "portManager.stopAllProcesses", () => this.stopAllProcesses());
+    this.registerCommand(context, "portManager.stopProcess", (argument) => this.stopProcess(argument), ownerCommand);
+    this.registerCommand(context, "portManager.restartProcess", (argument) => this.restartProcess(argument), ownerCommand);
+    this.registerCommand(context, "portManager.stopAllProcesses", () => this.stopAllProcesses(), ownerCommand);
     this.registerCommand(context, "portManager.copyRoutedUrl", (argument) => this.copyRoutedUrl(argument));
     this.registerCommand(context, "portManager.openRoutedUrl", (argument) => this.openRoutedUrl(argument));
-    this.registerCommand(context, "portManager.removeProcess", (argument) => this.removeProcess(argument));
+    this.registerCommand(context, "portManager.removeProcess", (argument) => this.removeProcess(argument), ownerCommand);
     this.registerCommand(context, "portManager.installBrowserDnsResolvers", () =>
       this.installBrowserDnsResolvers(),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.cleanupBrowserDnsResolvers", () =>
       this.cleanupBrowserDnsResolvers(),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.renewBrowserTlsCertificate", () =>
       this.renewBrowserTlsCertificate(),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.repairBrowserDnsRecord", (argument) =>
       this.repairBrowserDnsRecord(argument),
-    );
+    ownerCommand);
     this.registerCommand(context, "portManager.installShellHook", () => this.installShellHook(context));
     this.registerCommand(context, "portManager.installExternalCli", () => this.installExternalCli(context));
     this.registerCommand(context, "portManager.openOwnerUi", () => this.switchControlOwnerToThisWindow());
@@ -1317,15 +1332,13 @@ export class PortManagerCommandController implements DisposableLike {
               },
             ]
           : []),
-        ...(ownsControlPlane
+        {
+          label: "$(refresh) Refresh",
+          description: "Rescan terminals and services",
+          action: "refresh" as const,
+        },
+        ...(!ownsControlPlane
           ? [
-              {
-                label: "$(refresh) Refresh",
-                description: "Rescan terminals and services",
-                action: "refresh" as const,
-              },
-            ]
-          : [
               {
                 label: "$(window) Make This Window Owner",
                 description: formatStatusMenuOwnerDescription(snapshot),
@@ -1337,7 +1350,8 @@ export class PortManagerCommandController implements DisposableLike {
                 description: formatStatusMenuOwnerDescription(snapshot),
                 action: "ownerOnly" as const,
               },
-            ]),
+            ]
+          : []),
       ],
       { title: "Port Manager", placeHolder: statusSummary.label },
     );
@@ -1400,6 +1414,28 @@ export class PortManagerCommandController implements DisposableLike {
     await vscode.window.showInformationMessage(
       formatControlOwnerSwitchMessage(this.dependencies.networkService.getSnapshot(), became),
     );
+  }
+
+  /**
+   * User-initiated owner-only commands should not dead-end in worker windows.
+   * The command becomes the control-plane owner first, then continues with the
+   * original action so tree buttons and context menus stay directly actionable.
+   */
+  private async ensureControlPlaneOwnerForCommand(): Promise<boolean> {
+    const snapshot = this.dependencies.networkService.getSnapshot();
+    if (snapshot.controlPlane?.role === "owner") {
+      return true;
+    }
+
+    const acquired = await this.dependencies.networkService.takeControlPlaneOwnership();
+    if (!acquired) {
+      await vscode.window.showWarningMessage("Could not make this window the Port Manager control owner.");
+      return false;
+    }
+
+    await vscode.commands.executeCommand("setContext", "portManager.isControlPlaneOwner", true);
+    this.dependencies.treeProvider.refresh();
+    return true;
   }
 
   /**
@@ -2251,9 +2287,14 @@ export class PortManagerCommandController implements DisposableLike {
     context: vscode.ExtensionContext,
     command: string,
     handler: (...args: unknown[]) => Promise<void> | void,
+    options: CommandRegistrationOptions = {},
   ): void {
     const disposable = vscode.commands.registerCommand(command, async (...args: unknown[]) => {
       try {
+        if (options.requiresControlPlaneOwner === true && !(await this.ensureControlPlaneOwnerForCommand())) {
+          return;
+        }
+
         await handler(...args);
       } catch (error) {
         await showCommandError(error);
@@ -2556,6 +2597,10 @@ async function promptForComposeAttachMode(
 
 function isComposeCloneAttachMode(mode: ComposeAttachMode): boolean {
   return mode === "clone" || mode === "clone-custom";
+}
+
+function isComposeAttachModeValue(value: unknown): value is ComposeAttachMode {
+  return value === "clone" || value === "clone-custom" || value === "as-is";
 }
 
 async function promptForComposeProjectName(
@@ -2981,15 +3026,23 @@ function getAttachContainerInput(argument: unknown): AttachContainerCommandInput
   }
 
   const candidate = argument as Partial<AttachContainerCommandInput>;
-  if (candidate.containerService === undefined && candidate.network === undefined) {
+  const containerService = getContainerServiceCandidateFromCommandArgument(candidate.containerService);
+  const network = getLogicalNetworkFromCommandArgument(candidate.network);
+  const composeAttachMode = isComposeAttachModeValue(candidate.composeAttachMode)
+    ? candidate.composeAttachMode
+    : undefined;
+  const attachedProjectName =
+    typeof candidate.attachedProjectName === "string" ? candidate.attachedProjectName : undefined;
+
+  if (containerService === undefined && network === undefined) {
     return undefined;
   }
 
   return {
-    containerService: candidate.containerService,
-    network: candidate.network,
-    composeAttachMode: candidate.composeAttachMode,
-    attachedProjectName: candidate.attachedProjectName,
+    ...(containerService !== undefined ? { containerService } : {}),
+    ...(network !== undefined ? { network } : {}),
+    ...(composeAttachMode !== undefined ? { composeAttachMode } : {}),
+    ...(attachedProjectName !== undefined ? { attachedProjectName } : {}),
   };
 }
 
@@ -3257,6 +3310,9 @@ function buildShellHookStartupScript(options: ShellHookStartupScriptOptions): st
   const escapedDockerShimPath = shellDoubleQuote(options.dockerShimPath);
   const escapedSocketPath = shellDoubleQuote(options.socketPath);
   const escapedRouteTablePath = shellDoubleQuote(options.routeTablePath);
+  const escapedGlobalNetworkRouteTablePath = shellDoubleQuote(
+    getRouteTablePathForNetwork(GLOBAL_LOGICAL_NETWORK_ID, options.routeTablePath),
+  );
   const escapedHostAccessFilePath = shellDoubleQuote(options.hostAccessFilePath);
   const escapedTerminalNetworkSelectionFilePath = shellDoubleQuote(options.terminalNetworkSelectionFilePath);
   const escapedPackageVersion = shellDoubleQuote(options.packageVersion);
@@ -3265,6 +3321,14 @@ function buildShellHookStartupScript(options: ShellHookStartupScriptOptions): st
   const escapedShellEnvRestorePath =
     options.shellEnvRestorePath !== undefined ? shellDoubleQuote(options.shellEnvRestorePath) : undefined;
   const agentRequired = !usesLoopbackAddressOnlyRouting(options.settings);
+  const defaultGlobalScopeEnabled = options.settings.globalNetwork && usesLoopbackAddressOnlyRouting(options.settings);
+  const escapedGlobalNetworkId = shellDoubleQuote(GLOBAL_LOGICAL_NETWORK_ID);
+  const escapedGlobalLoopbackHost = shellDoubleQuote(loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID));
+  const existingScopeRouteSelectionScript = buildExistingShellScopeRouteSelectionScript({
+    escapedGlobalNetworkId,
+    escapedRouteTablePath,
+    escapedGlobalNetworkRouteTablePath,
+  });
   const removeNativeHookPreloadScript = [
     shellRemovePathListEntry("DYLD_INSERT_LIBRARIES", options.hookLibraryPath),
     shellRemovePathListEntry("LD_PRELOAD", options.hookLibraryPath),
@@ -3287,9 +3351,23 @@ function buildShellHookStartupScript(options: ShellHookStartupScriptOptions): st
 
   return `# Port Manager shell startup
 # This file is generated by the VS Code Port Manager extension.
+__pm_routes_file="${escapedRouteTablePath}"
 if [ -n "\${PORT_MANAGER_NETWORK_ID:-}" ] || [ -n "\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-}" ] || [ -n "\${PORT_MANAGER_BORROWED_NETWORK_ID:-}" ] || [ -n "\${NEWDLOPS_PM_NETWORK_ID:-}" ] || [ -n "\${NEWDLOPS_PM_BORROWED_NETWORK_ID:-}" ]; then
   unset PORT_MANAGER_HOOK_DISABLED
   export PORT_MANAGER_HOOK=1
+${existingScopeRouteSelectionScript}
+elif [ "${defaultGlobalScopeEnabled ? "1" : "0"}" = "1" ]; then
+  unset PORT_MANAGER_HOOK_DISABLED
+  export PORT_MANAGER_HOOK=1
+  export PORT_MANAGER_NETWORK_ID="${escapedGlobalNetworkId}"
+  export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID="${escapedGlobalNetworkId}"
+  export PORT_MANAGER_BORROWED_NETWORK_ID="${escapedGlobalNetworkId}"
+  export NEWDLOPS_PM_NETWORK_ID="${escapedGlobalNetworkId}"
+  export NEWDLOPS_PM_BORROWED_NETWORK_ID="${escapedGlobalNetworkId}"
+  export ${NETWORK_IS_GLOBAL_ENV}=1
+  export ${ACTUAL_LOOPBACK_HOST_ENV}="${escapedGlobalLoopbackHost}"
+  export ${NETWORK_LOOPBACK_HOST_ENV}="${escapedGlobalLoopbackHost}"
+  __pm_routes_file="${escapedGlobalNetworkRouteTablePath}"
 else
   export PORT_MANAGER_HOOK=0
   export PORT_MANAGER_HOOK_DISABLED=1
@@ -3302,7 +3380,7 @@ else
   ${removeNativeHookPreloadScript}
 fi
 export PORT_MANAGER_AGENT_SOCKET="${escapedSocketPath}"
-export PORT_MANAGER_ROUTES_FILE="${escapedRouteTablePath}"
+export PORT_MANAGER_ROUTES_FILE="$__pm_routes_file"
 export PORT_MANAGER_GLOBAL_ROUTES_FILE="${escapedRouteTablePath}"
 export PORT_MANAGER_HOST_ACCESS_FILE="${escapedHostAccessFilePath}"
 export PORT_MANAGER_NETWORKS_FILE="${escapedTerminalNetworkSelectionFilePath}"
@@ -3325,6 +3403,7 @@ export ${ROUTE_TABLE_TTL_SECONDS_ENV}="${options.settings.routeTableTtlSeconds}"
 ${escapedRuntimeShimDirectory !== undefined ? `export ${RUNTIME_SHIM_DIRECTORY_ENV}="${escapedRuntimeShimDirectory}"
 ${runtimeShimPathPrependScript}
 hash -r 2>/dev/null || true` : ""}
+unset __pm_routes_file
 ${escapedShellEnvRestorePath !== undefined ? `if [ "\${PORT_MANAGER_HOOK:-0}" = "1" ]; then
   export PORT_MANAGER_DYLD_INSERT_LIBRARIES="${escapedHookLibraryPath}"
   export PORT_MANAGER_LD_PRELOAD="${escapedHookLibraryPath}"
@@ -3375,6 +3454,9 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
   const escapedNodeExecutablePath = shellDoubleQuote(options.nodeExecutablePath);
   const escapedSocketPath = shellDoubleQuote(options.socketPath);
   const escapedRouteTablePath = shellDoubleQuote(options.routeTablePath);
+  const escapedGlobalNetworkRouteTablePath = shellDoubleQuote(
+    getRouteTablePathForNetwork(GLOBAL_LOGICAL_NETWORK_ID, options.routeTablePath),
+  );
   const escapedHostAccessFilePath = shellDoubleQuote(options.hostAccessFilePath);
   const escapedTerminalNetworkSelectionFilePath = shellDoubleQuote(options.terminalNetworkSelectionFilePath);
   const escapedPackageVersion = shellDoubleQuote(options.packageVersion);
@@ -3383,6 +3465,14 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
   const escapedShellEnvRestorePath =
     options.shellEnvRestorePath !== undefined ? shellDoubleQuote(options.shellEnvRestorePath) : undefined;
   const agentRequired = !usesLoopbackAddressOnlyRouting(options.settings);
+  const defaultGlobalScopeEnabled = options.settings.globalNetwork && usesLoopbackAddressOnlyRouting(options.settings);
+  const escapedGlobalNetworkId = shellDoubleQuote(GLOBAL_LOGICAL_NETWORK_ID);
+  const escapedGlobalLoopbackHost = shellDoubleQuote(loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID));
+  const existingScopeRouteSelectionScript = buildExistingShellScopeRouteSelectionScript({
+    escapedGlobalNetworkId,
+    escapedRouteTablePath,
+    escapedGlobalNetworkRouteTablePath,
+  });
   const daemonUnsetVariables = [
     "DYLD_INSERT_LIBRARIES",
     "LD_PRELOAD",
@@ -3597,12 +3687,38 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     options.runtimeShimDirectory !== undefined ? shellPrependPathListEntry("PATH", options.runtimeShimDirectory) : "";
   const runtimeShimPathRemoveScript =
     options.runtimeShimDirectory !== undefined ? shellRemovePathListEntry("PATH", options.runtimeShimDirectory) : "";
+  const nativeHookPreloadScript =
+    process.platform === "darwin"
+      ? [
+          `export PORT_MANAGER_DYLD_INSERT_LIBRARIES="${escapedHookLibraryPath}"`,
+          shellPrependPathListEntry("DYLD_INSERT_LIBRARIES", options.hookLibraryPath),
+        ].join("\n")
+      : process.platform === "linux"
+        ? [
+            `export PORT_MANAGER_LD_PRELOAD="${escapedHookLibraryPath}"`,
+            shellPrependPathListEntry("LD_PRELOAD", options.hookLibraryPath),
+          ].join("\n")
+        : "";
 
   return `# Port Manager shell hook
 # This file is generated by the VS Code Port Manager extension.
+__pm_routes_file="${escapedRouteTablePath}"
 if [ -n "\${PORT_MANAGER_NETWORK_ID:-}" ] || [ -n "\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-}" ] || [ -n "\${PORT_MANAGER_BORROWED_NETWORK_ID:-}" ] || [ -n "\${NEWDLOPS_PM_NETWORK_ID:-}" ] || [ -n "\${NEWDLOPS_PM_BORROWED_NETWORK_ID:-}" ]; then
   unset PORT_MANAGER_HOOK_DISABLED
   export PORT_MANAGER_HOOK=1
+${existingScopeRouteSelectionScript}
+elif [ "${defaultGlobalScopeEnabled ? "1" : "0"}" = "1" ]; then
+  unset PORT_MANAGER_HOOK_DISABLED
+  export PORT_MANAGER_HOOK=1
+  export PORT_MANAGER_NETWORK_ID="${escapedGlobalNetworkId}"
+  export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID="${escapedGlobalNetworkId}"
+  export PORT_MANAGER_BORROWED_NETWORK_ID="${escapedGlobalNetworkId}"
+  export NEWDLOPS_PM_NETWORK_ID="${escapedGlobalNetworkId}"
+  export NEWDLOPS_PM_BORROWED_NETWORK_ID="${escapedGlobalNetworkId}"
+  export ${NETWORK_IS_GLOBAL_ENV}=1
+  export ${ACTUAL_LOOPBACK_HOST_ENV}="${escapedGlobalLoopbackHost}"
+  export ${NETWORK_LOOPBACK_HOST_ENV}="${escapedGlobalLoopbackHost}"
+  __pm_routes_file="${escapedGlobalNetworkRouteTablePath}"
 else
   export PORT_MANAGER_HOOK=0
   export PORT_MANAGER_HOOK_DISABLED=1
@@ -3615,7 +3731,7 @@ else
   ${removeNativeHookPreloadScript}
 fi
 export PORT_MANAGER_AGENT_SOCKET="${escapedSocketPath}"
-export PORT_MANAGER_ROUTES_FILE="${escapedRouteTablePath}"
+export PORT_MANAGER_ROUTES_FILE="$__pm_routes_file"
 export PORT_MANAGER_GLOBAL_ROUTES_FILE="${escapedRouteTablePath}"
 export PORT_MANAGER_HOST_ACCESS_FILE="${escapedHostAccessFilePath}"
 export PORT_MANAGER_NETWORKS_FILE="${escapedTerminalNetworkSelectionFilePath}"
@@ -3638,6 +3754,7 @@ export ${ROUTE_TABLE_TTL_SECONDS_ENV}="${options.settings.routeTableTtlSeconds}"
 ${escapedRuntimeShimDirectory !== undefined ? `export ${RUNTIME_SHIM_DIRECTORY_ENV}="${escapedRuntimeShimDirectory}"
 ${runtimeShimPathPrependScript}
 hash -r 2>/dev/null || true` : ""}
+unset __pm_routes_file
 ${escapedShellEnvRestorePath !== undefined ? `if [ "\${PORT_MANAGER_HOOK:-0}" = "1" ]; then
   export PORT_MANAGER_DYLD_INSERT_LIBRARIES="${escapedHookLibraryPath}"
   export PORT_MANAGER_LD_PRELOAD="${escapedHookLibraryPath}"
@@ -3861,13 +3978,35 @@ pm() {
     fi
     printf '\\033]0;%s\\007' 'Port Manager: detached' 2>/dev/null || true
     if [ -n "\${PORT_MANAGER_GLOBAL_ROUTES_FILE:-}" ]; then export PORT_MANAGER_ROUTES_FILE="$PORT_MANAGER_GLOBAL_ROUTES_FILE"; else unset PORT_MANAGER_ROUTES_FILE; fi
-    unset PORT_MANAGER_HOOK PORT_MANAGER_HOOK_DISABLED PORT_MANAGER_NETWORK_ID PORT_MANAGER_NETWORK_NAME PORT_MANAGER_NETWORK_DNS_ALIAS PORT_MANAGER_ROUTE_TABLE_NETWORK_ID PORT_MANAGER_BORROWED_NETWORK_ID NEWDLOPS_PM_NETWORK_ID NEWDLOPS_PM_BORROWED_NETWORK_ID PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_RUNTIME_SHIM_READY PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_COMPOSE_LOGICAL_PORTS PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS PORT_MANAGER_TERMINAL_ATTACHMENT_DIR PORT_MANAGER_SCAN_RANGE PORT_MANAGER_ROUTING_MODE PORT_MANAGER_VIRTUAL_PORT_START PORT_MANAGER_VIRTUAL_PORT_END PORT_MANAGER_FIXED_PROTOCOL_PORTS PORT_MANAGER_PRESERVE_LISTEN_PORTS ${ROUTE_TABLE_TTL_SECONDS_ENV} ${ACTUAL_LOOPBACK_HOST_ENV} PORT_MANAGER_NETWORK_LOOPBACK_HOST PORT_MANAGER_EXPECTED_VERSION PORT_MANAGER_DYLD_INSERT_LIBRARIES PORT_MANAGER_LD_PRELOAD
-    export PORT_MANAGER_HOOK=0
-    export PORT_MANAGER_HOOK_DISABLED=1
-    export PORT_MANAGER_HOOK_DAEMON_STARTED=0
-    if [ -n "\${PORT_MANAGER_PREV_BASH_ENV:-}" ]; then export BASH_ENV="\${PORT_MANAGER_PREV_BASH_ENV}"; else unset BASH_ENV; fi
-    unset PORT_MANAGER_PREV_BASH_ENV
-    ${removeNativeHookPreloadScript}
+    unset PORT_MANAGER_HOOK PORT_MANAGER_HOOK_DISABLED PORT_MANAGER_NETWORK_ID PORT_MANAGER_NETWORK_NAME PORT_MANAGER_NETWORK_DNS_ALIAS PORT_MANAGER_ROUTE_TABLE_NETWORK_ID PORT_MANAGER_BORROWED_NETWORK_ID NEWDLOPS_PM_NETWORK_ID NEWDLOPS_PM_BORROWED_NETWORK_ID ${NETWORK_IS_GLOBAL_ENV} PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID PORT_MANAGER_HOOK_DAEMON_STARTED PORT_MANAGER_RUNTIME_SHIM_READY PORT_MANAGER_COMPOSE_ROUTING_FILE PORT_MANAGER_COMPOSE_LOGICAL_PORTS PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS PORT_MANAGER_TERMINAL_ATTACHMENT_DIR PORT_MANAGER_SCAN_RANGE PORT_MANAGER_ROUTING_MODE PORT_MANAGER_VIRTUAL_PORT_START PORT_MANAGER_VIRTUAL_PORT_END PORT_MANAGER_FIXED_PROTOCOL_PORTS PORT_MANAGER_PRESERVE_LISTEN_PORTS ${ROUTE_TABLE_TTL_SECONDS_ENV} ${ACTUAL_LOOPBACK_HOST_ENV} PORT_MANAGER_NETWORK_LOOPBACK_HOST PORT_MANAGER_EXPECTED_VERSION PORT_MANAGER_DYLD_INSERT_LIBRARIES PORT_MANAGER_LD_PRELOAD
+    if [ "${defaultGlobalScopeEnabled ? "1" : "0"}" = "1" ]; then
+      export PORT_MANAGER_HOOK=1
+      unset PORT_MANAGER_HOOK_DISABLED
+      export PORT_MANAGER_NETWORK_ID="${escapedGlobalNetworkId}"
+      export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID="${escapedGlobalNetworkId}"
+      export PORT_MANAGER_BORROWED_NETWORK_ID="${escapedGlobalNetworkId}"
+      export NEWDLOPS_PM_NETWORK_ID="${escapedGlobalNetworkId}"
+      export NEWDLOPS_PM_BORROWED_NETWORK_ID="${escapedGlobalNetworkId}"
+      export ${NETWORK_IS_GLOBAL_ENV}=1
+      export ${ACTUAL_LOOPBACK_HOST_ENV}="${escapedGlobalLoopbackHost}"
+      export ${NETWORK_LOOPBACK_HOST_ENV}="${escapedGlobalLoopbackHost}"
+      export PORT_MANAGER_ROUTES_FILE="${escapedGlobalNetworkRouteTablePath}"
+      export PORT_MANAGER_DYLD_INSERT_LIBRARIES="${escapedHookLibraryPath}"
+      export PORT_MANAGER_LD_PRELOAD="${escapedHookLibraryPath}"
+      ${nativeHookPreloadScript}
+      if [ -n "${escapedShellEnvRestorePath !== undefined ? "\\${BASH_ENV:-}" : ""}" ] && [ "${escapedShellEnvRestorePath !== undefined ? "\\${BASH_ENV}" : ""}" != "${escapedShellEnvRestorePath ?? ""}" ]; then
+        export PORT_MANAGER_PREV_BASH_ENV="\${BASH_ENV}"
+      fi
+      ${escapedShellEnvRestorePath !== undefined ? `export BASH_ENV="${escapedShellEnvRestorePath}"` : ""}
+      export PORT_MANAGER_HOOK_DAEMON_STARTED=0
+    else
+      export PORT_MANAGER_HOOK=0
+      export PORT_MANAGER_HOOK_DISABLED=1
+      export PORT_MANAGER_HOOK_DAEMON_STARTED=0
+      if [ -n "\${PORT_MANAGER_PREV_BASH_ENV:-}" ]; then export BASH_ENV="\${PORT_MANAGER_PREV_BASH_ENV}"; else unset BASH_ENV; fi
+      unset PORT_MANAGER_PREV_BASH_ENV
+      ${removeNativeHookPreloadScript}
+    fi
     ${escapedRuntimeShimDirectory !== undefined ? `${runtimeShimPathRemoveScript}
     unset ${RUNTIME_SHIM_DIRECTORY_ENV}
     hash -r 2>/dev/null || true` : ""}
@@ -4175,6 +4314,37 @@ if [ "\${PORT_MANAGER_HOOK:-0}" = "1" ]; then
   __pm_runtime_shim_check
 fi
 `;
+}
+
+/**
+ * Keeps a pre-attached shell on its network route shard when the profile hook is
+ * sourced more than once. Global scope can be injected by VS Code before the
+ * profile script runs, so a base route file with `network-global` is repaired to
+ * the reserved global shard.
+ */
+function buildExistingShellScopeRouteSelectionScript(options: {
+  readonly escapedGlobalNetworkId: string;
+  readonly escapedRouteTablePath: string;
+  readonly escapedGlobalNetworkRouteTablePath: string;
+}): string {
+  return [
+    '  __pm_existing_network_id="${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-${PORT_MANAGER_NETWORK_ID:-${PORT_MANAGER_BORROWED_NETWORK_ID:-${NEWDLOPS_PM_NETWORK_ID:-${NEWDLOPS_PM_BORROWED_NETWORK_ID:-}}}}}"',
+    `  if [ "$__pm_existing_network_id" = "${options.escapedGlobalNetworkId}" ]; then`,
+    `    export ${NETWORK_IS_GLOBAL_ENV}=1`,
+    "  else",
+    `    unset ${NETWORK_IS_GLOBAL_ENV}`,
+    "  fi",
+    '  if [ -n "${PORT_MANAGER_ROUTES_FILE:-}" ]; then',
+    `    if [ "$__pm_existing_network_id" = "${options.escapedGlobalNetworkId}" ] && [ "$PORT_MANAGER_ROUTES_FILE" = "${options.escapedRouteTablePath}" ]; then`,
+    `      __pm_routes_file="${options.escapedGlobalNetworkRouteTablePath}"`,
+    "    else",
+    '      __pm_routes_file="$PORT_MANAGER_ROUTES_FILE"',
+    "    fi",
+    `  elif [ "$__pm_existing_network_id" = "${options.escapedGlobalNetworkId}" ]; then`,
+    `    __pm_routes_file="${options.escapedGlobalNetworkRouteTablePath}"`,
+    "  fi",
+    "  unset __pm_existing_network_id",
+  ].join("\n");
 }
 
 /** Appends one line to a shell profile if it is not already present. */

@@ -36,6 +36,7 @@
 #define PM_DOCKER_SHIM_DEBUG_ENV "PORT_MANAGER_DOCKER_SHIM_DEBUG"
 #define PM_TERMINAL_ATTACHMENT_DIR_ENV "PORT_MANAGER_TERMINAL_ATTACHMENT_DIR"
 #define PM_TERMINAL_SESSION_ID_ENV "PORT_MANAGER_TERMINAL_SESSION_ID"
+#define PM_NETWORK_IS_GLOBAL_ENV "PORT_MANAGER_NETWORK_IS_GLOBAL"
 #define PM_COMPOSE_REFRESH_WAIT_MS 3000
 #define PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"
 #define PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15
@@ -555,6 +556,22 @@ static const char *pm_network_id(void) {
   }
 
   return network_id;
+}
+
+/**
+ * The reserved global scope carries a network id only for loopback-coordinate
+ * virtualization. Docker and Compose identity stays host-real there. Attached
+ * user networks carry PORT_MANAGER_NETWORK_NAME, which also protects against a
+ * stale global flag inherited from a previously global shell.
+ */
+static int pm_network_scope_is_global(void) {
+  const char *flag = getenv(PM_NETWORK_IS_GLOBAL_ENV);
+  const char *network_id = pm_network_id();
+  const char *network_name = getenv("PORT_MANAGER_NETWORK_NAME");
+
+  return flag != NULL && strcmp(flag, "1") == 0 &&
+         network_id != NULL && network_id[0] != '\0' &&
+         (network_name == NULL || network_name[0] == '\0');
 }
 
 /** Returns the daemon's global route table used as the base for scoped tables. */
@@ -1183,6 +1200,171 @@ static int pm_compose_override_for_project(const char *attached_project, char *b
   pm_copy(buffer, size, candidate);
   return 0;
 }
+
+#ifdef __APPLE__
+/** True for generated non-default loopback hosts that macOS must have on lo0 before Docker can bind them. */
+static int pm_is_nondefault_loopback_ipv4(int second, int third, int fourth) {
+  if (second < 0 || second > 255 || third < 0 || third > 255 || fourth < 0 || fourth > 255) {
+    return 0;
+  }
+
+  return !(second == 0 && third == 0 && fourth == 1);
+}
+
+/** Extracts the host from generated Compose port strings such as '127.94.71.93:6379:6379'. */
+static int pm_extract_hidden_publish_host(const char *line, char *host, size_t size) {
+  const char *cursor = line;
+  int second;
+  int third;
+  int fourth;
+  int consumed = 0;
+
+  if (line == NULL || host == NULL || size == 0) {
+    return 0;
+  }
+
+  while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+    cursor++;
+  }
+  if (*cursor != '-') {
+    return 0;
+  }
+  cursor++;
+  while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+    cursor++;
+  }
+  if (*cursor == '\'' || *cursor == '"') {
+    cursor++;
+  }
+
+  if (sscanf(cursor, "127.%d.%d.%d:%n", &second, &third, &fourth, &consumed) != 3 || consumed <= 0) {
+    return 0;
+  }
+  if (!pm_is_nondefault_loopback_ipv4(second, third, fourth)) {
+    return 0;
+  }
+
+  snprintf(host, size, "127.%d.%d.%d", second, third, fourth);
+  return 1;
+}
+
+/** Checks lo0 directly so an already configured alias does not need sudo. */
+static int pm_loopback_alias_configured(const char *host) {
+  FILE *pipe;
+  char line[1024];
+  int configured = 0;
+
+  if (host == NULL || host[0] == '\0') {
+    return 0;
+  }
+
+  pipe = popen("ifconfig lo0 2>/dev/null", "r");
+  if (pipe == NULL) {
+    return 0;
+  }
+
+  while (fgets(line, sizeof(line), pipe) != NULL) {
+    char keyword[32];
+    char address[128];
+    if (sscanf(line, " %31s %127s", keyword, address) == 2 && strcmp(keyword, "inet") == 0 && strcmp(address, host) == 0) {
+      configured = 1;
+      break;
+    }
+  }
+
+  pclose(pipe);
+  return configured;
+}
+
+static int pm_spawn_wait(char *const argv[]) {
+  pid_t pid = fork();
+  int status;
+
+  if (pid < 0) {
+    return -1;
+  }
+
+  if (pid == 0) {
+    execvp(argv[0], argv);
+    _exit(127);
+  }
+
+  do {
+    if (waitpid(pid, &status, 0) < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    break;
+  } while (1);
+
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+}
+
+static int pm_add_loopback_alias_noninteractive(const char *host) {
+  char *ifconfig_argv[] = { "ifconfig", "lo0", "alias", (char *)host, "255.255.255.255", NULL };
+  char *sudo_argv[] = { "sudo", "-n", "ifconfig", "lo0", "alias", (char *)host, "255.255.255.255", NULL };
+
+  return pm_spawn_wait(ifconfig_argv) == 0 || pm_spawn_wait(sudo_argv) == 0 ? 0 : -1;
+}
+
+/** Ensures generated hidden publish hosts exist before Docker tries to bind them. */
+static int pm_prepare_compose_hidden_publish_hosts(const char *override_file) {
+  FILE *file;
+  char *line = NULL;
+  size_t line_capacity = 0;
+
+  if (override_file == NULL || override_file[0] == '\0') {
+    return 0;
+  }
+
+  file = fopen(override_file, "r");
+  if (file == NULL) {
+    return 0;
+  }
+
+  while (getline(&line, &line_capacity, file) >= 0) {
+    char host[128];
+
+    if (!pm_extract_hidden_publish_host(line, host, sizeof(host))) {
+      continue;
+    }
+
+    if (pm_loopback_alias_configured(host)) {
+      continue;
+    }
+
+    if (pm_add_loopback_alias_noninteractive(host) == 0) {
+      continue;
+    }
+
+    fprintf(
+      stderr,
+      "portmanager-docker-shim: Docker needs loopback host %s from %s, but it is not configured on lo0 and could not be added non-interactively\n",
+      host,
+      override_file
+    );
+    fprintf(
+      stderr,
+      "portmanager-docker-shim: run Port Manager: Fix Stale Routing, reattach the Compose project, or add the alias with sudo ifconfig lo0 alias %s 255.255.255.255\n",
+      host
+    );
+    free(line);
+    fclose(file);
+    return -1;
+  }
+
+  free(line);
+  fclose(file);
+  return 0;
+}
+#else
+static int pm_prepare_compose_hidden_publish_hosts(const char *override_file) {
+  (void)override_file;
+  return 0;
+}
+#endif
 
 static int pm_compose_option_takes_value(const char *arg) {
   return strcmp(arg, "-f") == 0 || strcmp(arg, "--file") == 0 ||
@@ -3271,7 +3453,8 @@ int main(int argc, char **argv) {
   pm_debug("command_index=%d standalone_compose=%d", command_index, standalone_compose);
   if (standalone_compose || (command_index >= 0 && strcmp(argv[command_index], "compose") == 0)) {
     const char *compose_network_id = pm_network_id();
-    if (pm_find_compose_route(
+    int compose_network_is_global = pm_network_scope_is_global();
+    if (!compose_network_is_global && pm_find_compose_route(
       runtime,
       argc,
       argv,
@@ -3302,6 +3485,11 @@ int main(int argc, char **argv) {
         return 127;
       }
 
+      if (override_file[0] != '\0' && access(override_file, R_OK) == 0 &&
+          pm_prepare_compose_hidden_publish_hosts(override_file) != 0) {
+        return 127;
+      }
+
       setenv("COMPOSE_PROJECT_NAME", attached_project, 1);
       next_argv = pm_rewrite_compose_args(
         real_runtime_path,
@@ -3313,7 +3501,7 @@ int main(int argc, char **argv) {
         standalone_compose
       );
     } else {
-      if (compose_network_id != NULL && compose_network_id[0] != '\0') {
+      if (compose_network_id != NULL && compose_network_id[0] != '\0' && !compose_network_is_global) {
         fprintf(
           stderr,
           "portmanager-docker-shim: no Compose route for attached network %s; refusing to run host Compose command\n",
@@ -3324,6 +3512,7 @@ int main(int argc, char **argv) {
       next_argv = pm_copy_runtime_args(real_runtime_path, argc, argv);
     }
   } else if (command_index >= 0 && strcmp(argv[command_index], "compose") != 0 &&
+      !pm_network_scope_is_global() &&
       pm_runtime_command_may_reference_container(argc, argv, command_index)) {
     next_argv = pm_rewrite_container_args(runtime, real_runtime_path, argc, argv);
   } else {

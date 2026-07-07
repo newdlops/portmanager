@@ -117,8 +117,11 @@ test("native hook keeps the global network scope host-real", () => {
   // env/file constructors all stay host-real inside the global scope.
   assert.equal(source.slice(hostnameStart, hostnameEnd).includes("pm_network_scope_is_global()"), true);
   assert.equal(source.slice(dockerStart, dockerEnd).includes("pm_network_scope_is_global()"), true);
+  assert.equal(source.includes('getenv("PORT_MANAGER_NETWORK_NAME")'), true);
+  assert.equal(source.includes("network_name == NULL || network_name[0] == '\\0'"), true);
+  assert.equal(source.includes("static int pm_envp_network_scope_is_global(char *const envp[])"), true);
   assert.equal(
-    source.slice(argvStart, argvEnd).includes('pm_envp_value_is(envp, "PORT_MANAGER_NETWORK_IS_GLOBAL", "1")'),
+    source.slice(argvStart, argvEnd).includes("pm_envp_network_scope_is_global(envp)"),
     true,
   );
   assert.equal(source.includes("if (!pm_hook_enabled() || pm_network_scope_is_global()) {"), true);
@@ -414,7 +417,7 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.equal(result.stderr, "ECONNREFUSED\n");
   });
 
-  test("native hook global scope passes unmanaged localhost connects to the host", async (context) => {
+  test("native hook global scope does not raw-passthrough unmanaged localhost connects", async (context) => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-global-raw-"));
     const server = net.createServer((socket) => {
       socket.end("host\n");
@@ -437,17 +440,20 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     const globalEnv = {
       PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE: "loopback-address-only",
       PORT_MANAGER_NETWORK_IS_GLOBAL: "1",
-      PORT_MANAGER_NETWORK_LOOPBACK_HOST: "127.1.0.1",
-      PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "127.1.0.1",
+      PORT_MANAGER_NETWORK_LOOPBACK_HOST: "",
+      PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "",
       PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
       PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
     };
 
-    const result = await runHookedNodeClient(address.port, routeTablePath, networkId, { env: globalEnv });
+    const result = await runHookedNodeClient(address.port, routeTablePath, networkId, {
+      env: globalEnv,
+      timeoutMs: 500,
+    });
 
-    assert.equal(result.exitCode, 0);
-    assert.equal(result.stdout, "host\n");
-    assert.equal(result.stderr, "");
+    assert.equal(result.exitCode, 23);
+    assert.equal(result.stdout, "");
+    assert.notEqual(result.stderr, "", "global localhost must not leak to the host listener");
 
     // The same env without the global flag is a plain network: the dial is
     // pinned to the (unaliased) network loopback and must not reach the host.
@@ -517,26 +523,21 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.equal(result.stderr, "");
   });
 
-  test("native hook global scope keeps a blocking raw fallback for stale managed rows", () => {
+  test("native hook global scope does not raw-fallback stale managed rows", () => {
     const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
     const source = fs.readFileSync(sourcePath, "utf8");
     const connectStart = source.indexOf("static int pm_connect_hook");
     const connectEnd = source.indexOf("static int pm_getsockname_hook", connectStart);
     const connectBody = source.slice(connectStart, connectEnd);
     const globalStart = connectBody.indexOf("connect global managed logical=%d");
-    const fallbackStart = connectBody.indexOf("connect global raw fallback logical=%d", globalStart);
+    const managedFailureStart = connectBody.indexOf("connect global managed failed logical=%d", globalStart);
 
     assert.notEqual(globalStart, -1);
-    assert.notEqual(fallbackStart, -1);
-    // The stale-row fallback re-dials the original address for blocking
-    // clients only; non-blocking dials already returned EINPROGRESS.
-    const fallbackRegion = connectBody.slice(globalStart, fallbackStart);
-    assert.equal(fallbackRegion.includes("errno == EINPROGRESS || errno == EALREADY"), true);
-    assert.equal(fallbackRegion.includes("alias_errno != ECONNREFUSED"), true);
-    assert.equal(
-      connectBody.slice(fallbackStart).includes("return pm_real_connect(sockfd, addr, addrlen);"),
-      true,
-    );
+    assert.notEqual(managedFailureStart, -1);
+    assert.equal(connectBody.includes("connect global raw fallback logical=%d"), false);
+    assert.equal(connectBody.includes("connect global raw passthrough logical=%d"), false);
+    assert.equal(connectBody.includes("connect global raw passthrough (no alias) logical=%d"), false);
+    assert.equal(connectBody.slice(managedFailureStart).includes("return alias_result;"), true);
   });
 
   test("native hook refuses scope-less dials into gateway-owned fixed-protocol dead ends", async (context) => {
@@ -1275,6 +1276,7 @@ async function runHookedNodeClient(
     readonly env?: NodeJS.ProcessEnv;
     readonly host?: string;
     readonly cwd?: string;
+    readonly timeoutMs?: number;
   } = {},
 ): Promise<{ readonly exitCode: number | null; readonly stdout: string; readonly stderr: string }> {
   const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
@@ -1282,6 +1284,11 @@ async function runHookedNodeClient(
   const script = [
     "const net = require('node:net');",
     `const socket = net.createConnection({ host: ${JSON.stringify(host)}, port: ${port} });`,
+    ...(options.timeoutMs === undefined
+      ? []
+      : [
+          `socket.setTimeout(${JSON.stringify(options.timeoutMs)}, () => { process.stderr.write("TIMEOUT\\n"); socket.destroy(); process.exit(23); });`,
+        ]),
     "let data = '';",
     "socket.setEncoding('utf8');",
     "socket.on('data', (chunk) => { data += chunk; });",

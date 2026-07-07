@@ -18,6 +18,7 @@ import {
   shouldExposeNetworkLoopbackHost,
   usesLoopbackAddressOnlyRouting,
 } from "../../src/core/networks/loopback-address";
+import { DEFAULT_PORT_MANAGER_SETTINGS } from "../../src/shared/default-settings";
 
 test("loopback address routing maps network ids to stable non-default loopback hosts", () => {
   const first = loopbackAddressForNetwork("network-a");
@@ -102,6 +103,8 @@ test("loopback experiment mode is the manifest default while legacy mode setting
   assert.equal(properties["portManager.experimentalRouteOwnershipMode"]?.default, "loopback-address-only");
   assert.equal(properties["portManager.enableLoopbackAddressRouting"]?.default, true);
   assert.equal(properties["portManager.loopbackAddressRoutingMode"]?.default, "loopback");
+  assert.equal(properties["portManager.globalNetwork"]?.default, true);
+  assert.equal(DEFAULT_PORT_MANAGER_SETTINGS.globalNetwork, true);
 
   for (const settingName of hiddenModeSettings) {
     assert.equal(properties[settingName]?.included, false, `${settingName} must be hidden from Settings UI`);

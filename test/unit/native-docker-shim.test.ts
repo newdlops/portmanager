@@ -77,6 +77,31 @@ test("docker shim requires explicit network env for compose routing scope", () =
   assert.equal(composeFinderBody.includes("pm_find_compose_route_from_route_table"), true);
 });
 
+test("docker shim lets the reserved global network run host docker commands", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/docker-shim/portmanager_docker_shim.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const globalStart = source.indexOf("static int pm_network_scope_is_global(void)");
+  const globalEnd = source.indexOf("static void pm_default_global_route_table_path", globalStart);
+  const globalBody = source.slice(globalStart, globalEnd);
+  const mainStart = source.indexOf("int main(int argc, char **argv)");
+  const mainBody = source.slice(mainStart);
+
+  assert.notEqual(globalStart, -1);
+  assert.notEqual(mainStart, -1);
+  assert.equal(source.includes('PM_NETWORK_IS_GLOBAL_ENV "PORT_MANAGER_NETWORK_IS_GLOBAL"'), true);
+  assert.equal(globalBody.includes("getenv(PM_NETWORK_IS_GLOBAL_ENV)"), true);
+  assert.equal(globalBody.includes('getenv("PORT_MANAGER_NETWORK_NAME")'), true);
+  assert.equal(globalBody.includes('strcmp(flag, "1") == 0'), true);
+  assert.equal(globalBody.includes("network_name == NULL || network_name[0] == '\\0'"), true);
+  assert.equal(mainBody.includes("int compose_network_is_global = pm_network_scope_is_global();"), true);
+  assert.equal(mainBody.includes("if (!compose_network_is_global && pm_find_compose_route("), true);
+  assert.equal(
+    mainBody.includes("compose_network_id != NULL && compose_network_id[0] != '\\0' && !compose_network_is_global"),
+    true,
+  );
+  assert.equal(mainBody.includes("!pm_network_scope_is_global() &&\n      pm_runtime_command_may_reference_container"), true);
+});
+
 test("docker shim rejects expired route-table and compose routing files", () => {
   const sourcePath = path.resolve(__dirname, "../../../native/docker-shim/portmanager_docker_shim.c");
   const source = fs.readFileSync(sourcePath, "utf8");
@@ -116,4 +141,22 @@ test("docker shim requires generated override for rewritten compose projects", (
   assert.equal(source.includes("int rewrites_project = original_project[0] != '\\0'"), true);
   assert.equal(source.includes("missing generated Compose override for attached project"), true);
   assert.equal(source.includes("refusing unsafe project rewrite"), true);
+});
+
+test("docker shim prepares hidden loopback publish hosts before compose exec", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/docker-shim/portmanager_docker_shim.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const mainStart = source.indexOf("int main(int argc, char **argv)");
+  const mainBody = source.slice(mainStart);
+
+  assert.equal(source.includes("pm_prepare_compose_hidden_publish_hosts"), true);
+  assert.equal(source.includes("pm_extract_hidden_publish_host"), true);
+  assert.equal(source.includes('"sudo", "-n", "ifconfig", "lo0", "alias"'), true);
+  assert.equal(source.includes("Docker needs loopback host %s from %s"), true);
+  assert.notEqual(mainStart, -1);
+  assert.equal(
+    mainBody.indexOf("pm_prepare_compose_hidden_publish_hosts(override_file)") <
+      mainBody.indexOf("pm_rewrite_compose_args("),
+    true,
+  );
 });

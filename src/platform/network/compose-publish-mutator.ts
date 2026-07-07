@@ -154,6 +154,25 @@ interface RuntimeContainerMount {
   readonly RW?: boolean;
 }
 
+interface ComposeConfigService {
+  readonly volumes?: readonly ComposeConfigMount[];
+}
+
+interface ComposeConfigMount {
+  readonly type?: string;
+  readonly source?: string;
+  readonly target?: string;
+  readonly read_only?: boolean;
+  readonly readOnly?: boolean;
+}
+
+interface ComposeConfigVolumeDefinition {
+  readonly name?: string;
+  readonly external?: boolean | {
+    readonly name?: string;
+  };
+}
+
 interface RuntimeNameReservations {
   /** Docker/Podman container names are global and block explicit clone names. */
   readonly containerNames: ReadonlySet<string>;
@@ -319,10 +338,11 @@ export class ComposePublishMutator {
       mode === "clone" && !copyStoppedServices
         ? overrideServices.filter((service) => !activeHiddenServices.includes(service))
         : [];
-    const originalServiceMounts = await this.inspectServiceMounts(
-      input.runtime,
+    const originalServiceMounts = await this.resolveOriginalServiceMounts(
+      originalContext,
       originalContainers,
       originalContainerList.inspectedRows,
+      lifecycleServices,
     );
     const statefulCloneServices = findStatefulCloneServices(lifecycleServices, ports, originalServiceMounts);
     if (createsHiddenProject && statefulCloneServices.length > 0 && input.allowStatefulClone !== true) {
@@ -1073,6 +1093,40 @@ export class ComposePublishMutator {
       containers,
       inspectedRows,
     };
+  }
+
+  /**
+   * Resolves source mounts before generating clone overrides.
+   *
+   * Runtime inspect is exact when a source container exists. A fully stopped
+   * Compose project may have no containers to inspect, so the fallback reads
+   * the normalized Compose config and derives the same named-volume identities
+   * Compose would use when it creates the project.
+   */
+  private async resolveOriginalServiceMounts(
+    context: ComposeCommandContext,
+    containers: readonly ComposeServiceContainer[],
+    inspectedRows: readonly RuntimeContainerInspectRow[],
+    services: readonly string[],
+  ): Promise<ReadonlyMap<string, readonly ComposeServiceMount[]>> {
+    if (containers.length > 0) {
+      return this.inspectServiceMounts(context.runtime, containers, inspectedRows);
+    }
+
+    return this.readComposeConfigServiceMounts(context, services);
+  }
+
+  /** Reads service mount declarations from Docker/Podman's normalized Compose config JSON. */
+  private async readComposeConfigServiceMounts(
+    context: ComposeCommandContext,
+    services: readonly string[],
+  ): Promise<ReadonlyMap<string, readonly ComposeServiceMount[]>> {
+    const result = await this.runCommand(context.runtime, this.buildComposeArgs(context, ["config", "--format", "json"]), {
+      timeoutMs: COMPOSE_TIMEOUT_MS,
+      ...(context.workingDirectory !== undefined ? { cwd: context.workingDirectory } : {}),
+    });
+
+    return parseComposeConfigServiceMounts(result.stdout, context.projectName, context.workingDirectory, services);
   }
 
   /** Converts Docker inspect mount rows into exact hidden-project overrides. */
@@ -2552,6 +2606,245 @@ function looksStatefulServiceName(serviceName: string): boolean {
   return /\b(db|database|postgres|postgresql|mysql|mariadb|redis|amqp|rabbitmq|mqtt|kafka|nats|mongo|mongodb|weaviate|elastic|opensearch)\b/.test(
     serviceName.toLowerCase().replace(/[-_]+/g, " "),
   );
+}
+
+/**
+ * Parses the small normalized Compose config surface needed for attach.
+ *
+ * Docker/Podman Compose has already expanded anchors, env interpolation, and
+ * relative volume syntax before this JSON reaches us. Keeping this parser to
+ * service mounts and top-level volume names avoids coupling Port Manager to the
+ * full Compose YAML grammar.
+ */
+function parseComposeConfigServiceMounts(
+  value: string,
+  projectName: string,
+  workingDirectory: string | undefined,
+  serviceNames: readonly string[],
+): ReadonlyMap<string, readonly ComposeServiceMount[]> {
+  const root = parseJsonObject(value);
+  const serviceConfigs = readRecordProperty(root, "services");
+  if (serviceConfigs === undefined) {
+    return new Map();
+  }
+
+  const volumeDefinitions = parseComposeConfigVolumeDefinitions(readRecordProperty(root, "volumes"));
+  const serviceMounts = new Map<string, readonly ComposeServiceMount[]>();
+
+  for (const serviceName of uniqueStrings(serviceNames)) {
+    const serviceConfig = asComposeConfigService(serviceConfigs[serviceName]);
+    const mounts = (serviceConfig?.volumes ?? [])
+      .map((mount) => parseComposeConfigMount(serviceName, mount, projectName, workingDirectory, volumeDefinitions))
+      .filter((mount): mount is ComposeServiceMount => mount !== undefined);
+    if (mounts.length > 0) {
+      serviceMounts.set(serviceName, mounts);
+    }
+  }
+
+  return serviceMounts;
+}
+
+function parseComposeConfigMount(
+  serviceName: string,
+  mount: ComposeConfigMount,
+  projectName: string,
+  workingDirectory: string | undefined,
+  volumeDefinitions: ReadonlyMap<string, ComposeConfigVolumeDefinition>,
+): ComposeServiceMount | undefined {
+  const target = normalizeOptionalString(mount.target);
+  if (target === undefined) {
+    return undefined;
+  }
+
+  const source = normalizeOptionalString(mount.source);
+  const type = normalizeOptionalString(mount.type)?.toLowerCase() ?? inferComposeConfigMountType(source);
+  const readOnly = mount.read_only === true || mount.readOnly === true;
+
+  switch (type) {
+    case "volume": {
+      if (source === undefined) {
+        return undefined;
+      }
+      const volumeName = resolveComposeConfigVolumeName(source, projectName, volumeDefinitions);
+      return {
+        type: "volume",
+        sourceKey: buildVolumeSourceKey(volumeName),
+        volumeName,
+        originalVolumeName: volumeName,
+        target,
+        readOnly,
+      };
+    }
+    case "bind": {
+      if (source === undefined) {
+        return undefined;
+      }
+      return {
+        type: "bind",
+        source: resolveComposeConfigBindSource(source, workingDirectory),
+        target,
+        readOnly,
+      };
+    }
+    case "tmpfs":
+      return {
+        type: "tmpfs",
+        target,
+        readOnly,
+      };
+    default:
+      throw new Error(`Compose service ${serviceName} uses unsupported config mount type ${type}.`);
+  }
+}
+
+function parseComposeConfigVolumeDefinitions(
+  value: Record<string, unknown> | undefined,
+): ReadonlyMap<string, ComposeConfigVolumeDefinition> {
+  const volumes = new Map<string, ComposeConfigVolumeDefinition>();
+  if (value === undefined) {
+    return volumes;
+  }
+
+  for (const [volumeKey, rawDefinition] of Object.entries(value)) {
+    const definition = asComposeConfigVolumeDefinition(rawDefinition);
+    if (definition !== undefined) {
+      volumes.set(volumeKey, definition);
+    }
+  }
+
+  return volumes;
+}
+
+function asComposeConfigService(value: unknown): ComposeConfigService | undefined {
+  const record = asRecord(value);
+  if (record === undefined) {
+    return undefined;
+  }
+
+  const rawVolumes = record["volumes"];
+  return {
+    volumes: Array.isArray(rawVolumes)
+      ? rawVolumes.map(asComposeConfigMount).filter((mount): mount is ComposeConfigMount => mount !== undefined)
+      : [],
+  };
+}
+
+function asComposeConfigMount(value: unknown): ComposeConfigMount | undefined {
+  const record = asRecord(value);
+  if (record === undefined) {
+    return undefined;
+  }
+
+  const type = readStringProperty(record, "type");
+  const source = readStringProperty(record, "source");
+  const target = readStringProperty(record, "target");
+  const readOnly = readBooleanProperty(record, "read_only");
+  const readOnlyCamel = readBooleanProperty(record, "readOnly");
+
+  return {
+    ...(type !== undefined ? { type } : {}),
+    ...(source !== undefined ? { source } : {}),
+    ...(target !== undefined ? { target } : {}),
+    ...(readOnly !== undefined ? { read_only: readOnly } : {}),
+    ...(readOnlyCamel !== undefined ? { readOnly: readOnlyCamel } : {}),
+  };
+}
+
+function asComposeConfigVolumeDefinition(value: unknown): ComposeConfigVolumeDefinition | undefined {
+  if (value === null || value === undefined) {
+    return {};
+  }
+
+  const record = asRecord(value);
+  if (record === undefined) {
+    return {};
+  }
+
+  const name = readStringProperty(record, "name");
+  const external = readComposeConfigVolumeExternal(record["external"]);
+  return {
+    ...(name !== undefined ? { name } : {}),
+    ...(external !== undefined ? { external } : {}),
+  };
+}
+
+function readComposeConfigVolumeExternal(value: unknown): ComposeConfigVolumeDefinition["external"] | undefined {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  const record = asRecord(value);
+  if (record === undefined) {
+    return undefined;
+  }
+
+  const name = readStringProperty(record, "name");
+  return name === undefined ? {} : { name };
+}
+
+function resolveComposeConfigVolumeName(
+  source: string,
+  projectName: string,
+  volumeDefinitions: ReadonlyMap<string, ComposeConfigVolumeDefinition>,
+): string {
+  const definition = volumeDefinitions.get(source);
+  const configuredName = normalizeOptionalString(definition?.name);
+  if (configuredName !== undefined) {
+    return configuredName;
+  }
+
+  if (definition?.external === true) {
+    return source;
+  }
+  if (typeof definition?.external === "object") {
+    const externalName = normalizeOptionalString(definition.external.name);
+    return externalName ?? source;
+  }
+
+  return `${projectName}_${source}`;
+}
+
+function resolveComposeConfigBindSource(source: string, workingDirectory: string | undefined): string {
+  return path.isAbsolute(source) ? source : path.resolve(workingDirectory ?? process.cwd(), source);
+}
+
+function inferComposeConfigMountType(source: string | undefined): string {
+  if (source === undefined) {
+    return "tmpfs";
+  }
+
+  return path.isAbsolute(source) || source.startsWith(".") ? "bind" : "volume";
+}
+
+function parseJsonObject(value: string): Record<string, unknown> {
+  try {
+    return asRecord(JSON.parse(value) as unknown) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function readRecordProperty(record: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  return asRecord(record[key]);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function readStringProperty(record: Record<string, unknown>, key: string): string | undefined {
+  return normalizeOptionalString(record[key]);
+}
+
+function readBooleanProperty(record: Record<string, unknown>, key: string): boolean | undefined {
+  const value = record[key];
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function normalizeOptionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 
 function parseContainerInspectRows(value: string): readonly RuntimeContainerInspectRow[] {

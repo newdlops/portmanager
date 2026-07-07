@@ -92,15 +92,12 @@ test("non-owner windows show owner status and disable owner actions", () => {
   };
   const viewTitleItems = manifest.contributes?.menus?.["view/title"] ?? [];
   const menuItems = manifest.contributes?.menus?.["view/item/context"] ?? [];
-  const ownerOnlyCommands = [
-    "portManager.createLogicalNetwork",
-    "portManager.attachActiveTerminalToNetwork",
+  const visibleOwnerPromotingCommands = [
+    "portManager.removeLogicalNetwork",
     "portManager.attachContainerToNetwork",
     "portManager.refreshContainerServices",
-    "portManager.restartDaemon",
-    "portManager.fixStaleRouting",
-    "portManager.clearGlobalStorageFiles",
-    "portManager.stopProcess",
+    "portManager.refreshTerminals",
+    "portManager.detachComposeAttachment",
   ];
 
   assert.equal(typesSource.includes('export type ControlPlaneRole = "owner" | "worker" | "unowned";'), true);
@@ -129,7 +126,8 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(source.includes("buildOwnerActionAvailability(snapshot.controlPlane)"), true);
   assert.equal(source.includes('this.contextValue = availability.enabled ? "action" : "action.disabled";'), true);
   assert.equal(source.includes("availability.enabled ? undefined : new vscode.ThemeColor(\"disabledForeground\")"), true);
-  assert.equal(source.includes("if (availability.enabled) {"), true);
+  assert.equal(source.includes("False renders the row as owner-scoped while the command wrapper acquires ownership."), true);
+  assert.equal(source.includes("function buildOwnerTakeoverCommand"), false);
   assert.equal(source.includes("formatOwnerOnlyActionReason(controlPlane)"), true);
   assert.equal(source.includes("buildOwnerUiActionRows(snapshot.controlPlane)"), true);
   assert.equal(source.includes("formatOwnerWindowTitle(controlPlane)"), true);
@@ -144,6 +142,9 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(commandsSource.includes('action: "ownerUi" as const'), true);
   assert.equal(commandsSource.includes('"portManager.openOwnerUi"'), true);
   assert.equal(commandsSource.includes("this.dependencies.networkService.takeControlPlaneOwnership()"), true);
+  assert.equal(commandsSource.includes("ensureControlPlaneOwnerForCommand"), true);
+  assert.equal(commandsSource.includes("requiresControlPlaneOwner: true"), true);
+  assert.equal(commandsSource.includes('"setContext", "portManager.isControlPlaneOwner", true'), true);
   assert.equal(commandsSource.includes("switchControlOwnerToThisWindow"), true);
   assert.equal(commandsSource.includes("is now the control owner"), true);
   assert.equal(commandsSource.includes("switched control ownership to this window"), true);
@@ -152,13 +153,13 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(commandsSource.includes('action: "ownerOnly" as const'), true);
   assert.equal(manifest.activationEvents?.includes("onCommand:portManager.openOwnerUi"), true);
 
-  for (const command of ownerOnlyCommands) {
+  for (const command of visibleOwnerPromotingCommands) {
     const contextItems = menuItems.filter((item) => item.command === command);
     assert.equal(contextItems.length > 0, true, `${command} must have context menu entries`);
     assert.equal(
-      contextItems.every((item) => item.when?.includes("portManager.isControlPlaneOwner")),
+      contextItems.some((item) => !item.when?.includes("portManager.isControlPlaneOwner")),
       true,
-      `${command} context menu entries must require owner context`,
+      `${command} context menu entries must stay visible so the command can acquire ownership`,
     );
   }
 
@@ -178,7 +179,7 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(
     viewTitleItems
       .filter((item) => item.command === "portManager.createLogicalNetwork" || item.command === "portManager.refresh")
-      .every((item) => item.when?.includes("portManager.isControlPlaneOwner")),
+      .every((item) => !item.when?.includes("portManager.isControlPlaneOwner")),
     true,
   );
   assert.equal(
@@ -215,6 +216,22 @@ test("network rows show state first and keep actions grouped", () => {
   assert.equal(source.includes('"Attach Active Terminal"'), true);
   assert.equal(source.includes('"Attach Terminal"'), true);
   assert.equal(source.includes('"Use Quick Actions"'), true);
+});
+
+test("tree action arguments resolve wrapped logical networks", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/ui/sidebar/port-manager-tree.ts");
+  const commandsPath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const commandsSource = fs.readFileSync(commandsPath, "utf8");
+
+  assert.equal(source.includes('"Attach Service"'), true);
+  assert.equal(source.includes("{ network: element.network }"), true);
+  assert.equal(source.includes("const wrappedNetwork = getWrappedLogicalNetwork(argument);"), true);
+  assert.equal(source.includes("function getWrappedLogicalNetwork(argument: unknown): LogicalNetwork | undefined"), true);
+  assert.equal(source.includes('!("network" in argument)'), true);
+  assert.equal(commandsSource.includes("const containerService = getContainerServiceCandidateFromCommandArgument(candidate.containerService);"), true);
+  assert.equal(commandsSource.includes("const network = getLogicalNetworkFromCommandArgument(candidate.network);"), true);
+  assert.equal(commandsSource.includes("function isComposeAttachModeValue(value: unknown): value is ComposeAttachMode"), true);
 });
 
 test("compose attachment copy command is wired through package and sidebar", () => {

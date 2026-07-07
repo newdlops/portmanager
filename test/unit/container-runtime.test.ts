@@ -362,6 +362,50 @@ test("discovers published port candidates through the configured runtime", async
   assert.equal(candidates[0]?.ports[0]?.protocolName, "redis");
 });
 
+test("discovers stopped compose services when published port labels remain", async () => {
+  const adapter = new ContainerServiceDiscoveryAdapter({
+    runCommand: async (_executable, args) => {
+      if (args.includes("-a")) {
+        return {
+          stdout: JSON.stringify({
+            ID: "stopped-db",
+            Names: "payrollstatement-docker-db-1",
+            Image: "postgres:17-alpine",
+            Status: "Exited (0) 2 minutes ago",
+            Ports: "",
+            Labels:
+              "com.docker.compose.project=payrollstatement-docker," +
+              "com.docker.compose.service=db," +
+              "com.docker.compose.project.working_dir=/workspace/docker," +
+              "com.docker.compose.project.config_files=/workspace/docker/development.yaml," +
+              "desktop.docker.io/ports.scheme=v2," +
+              "desktop.docker.io/ports/5432/tcp=127.0.0.1:15432",
+          }),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const candidates = await adapter.list({ containerRuntime: "docker", containerImage: "alpine:3.20" });
+
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0]?.composeProject, "payrollstatement-docker");
+  assert.equal(candidates[0]?.composeService, "db");
+  assert.equal(candidates[0]?.status, "Exited (0) 2 minutes ago");
+  assert.deepEqual(candidates[0]?.ports[0], {
+    serviceName: "db",
+    logicalPort: 15432,
+    actualHostAddress: "127.0.0.1",
+    actualHostPort: 15432,
+    containerPort: 5432,
+    protocol: "tcp",
+    protocolName: "postgresql",
+  });
+});
+
 test("recovers persisted clone attachment logical ports from original container labels", async () => {
   const adapter = new ContainerServiceDiscoveryAdapter({
     runCommand: async (_executable, args) => {
@@ -1656,6 +1700,185 @@ test("copy mode creates stopped langgraph_server discovered from compose ps", as
   ]);
   assert.equal(result.ports[0]?.actualHostPort, 57001);
   assert.equal(result.ports[1], undefined);
+});
+
+test("clone attach copies compose-config volumes when the source project has no containers", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-config-mounts-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: workspace",
+      "services:",
+      "  db:",
+      "    image: postgres:16",
+      "    volumes:",
+      "      - pgdata:/var/lib/postgresql/data",
+      "      - cache:/cache:ro",
+      "    ports:",
+      "      - 15432:5432",
+      "volumes:",
+      "  pgdata:",
+      "  cache:",
+      "    external: true",
+      "    name: shared-cache",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
+  let hiddenStarted = false;
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (executable, args) => {
+      calls.push({ executable, args });
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\n", stderr: "" };
+      }
+      if (args[0] === "compose" && args.includes("config") && args.includes("--format")) {
+        return {
+          stdout: JSON.stringify({
+            services: {
+              db: {
+                volumes: [
+                  {
+                    type: "volume",
+                    source: "pgdata",
+                    target: "/var/lib/postgresql/data",
+                    read_only: false,
+                  },
+                  {
+                    type: "volume",
+                    source: "cache",
+                    target: "/cache",
+                    read_only: true,
+                  },
+                  {
+                    type: "tmpfs",
+                    target: "/tmp",
+                  },
+                ],
+              },
+            },
+            volumes: {
+              pgdata: {},
+              cache: {
+                external: {
+                  name: "shared-cache",
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "compose" && args.includes("up")) {
+        hiddenStarted = true;
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ps") {
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        const hiddenProject = args.includes("label=com.docker.compose.project=network-workspace");
+        if (!hiddenProject || !hiddenStarted) {
+          return { stdout: "", stderr: "" };
+        }
+        return {
+          stdout: JSON.stringify({
+            ID: "hidden-db",
+            Names: "network-workspace-db-1",
+            Status: "Up 1 second",
+            Ports: "127.81.154.127:57001->5432/tcp",
+            Labels: "com.docker.compose.project=network-workspace,com.docker.compose.service=db",
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({
+              Id: id,
+              Name: "/network-workspace-db-1",
+              Config: {
+                Labels: {
+                  "com.docker.compose.project": "network-workspace",
+                  "com.docker.compose.service": "db",
+                },
+              },
+              Mounts: [],
+            })),
+          ),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    allowStatefulClone: true,
+    attachedProjectName: "network-workspace",
+    runtime: "docker",
+    networkName: "network",
+    hiddenHostAddress: "127.81.154.127",
+    originalProjectName: "workspace",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    ports: [
+      {
+        serviceName: "db",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 15432,
+        containerPort: 5432,
+        protocol: "tcp",
+        protocolName: "postgresql",
+      },
+    ],
+  });
+
+  const volumeCopyArgs = calls.filter((call) => call.args[0] === "run").map((call) => call.args);
+  assert.equal(volumeCopyArgs.some((args) => args.includes("workspace_pgdata:/from:ro")), true);
+  assert.equal(volumeCopyArgs.some((args) => args.includes("shared-cache:/from:ro")), true);
+  assert.deepEqual(
+    result.state.clonedVolumes?.map((volume) => ({
+      serviceName: volume.serviceName,
+      sourceKind: volume.sourceKind,
+      sourceName: volume.sourceName,
+      containerPath: volume.containerPath,
+      readOnly: volume.readOnly,
+    })),
+    [
+      {
+        serviceName: "db",
+        sourceKind: "volume",
+        sourceName: "workspace_pgdata",
+        containerPath: "/var/lib/postgresql/data",
+        readOnly: false,
+      },
+      {
+        serviceName: "db",
+        sourceKind: "volume",
+        sourceName: "shared-cache",
+        containerPath: "/cache",
+        readOnly: true,
+      },
+    ],
+  );
+  assert.equal(result.ports[0]?.actualHostAddress, "127.81.154.127");
+  assert.equal(result.ports[0]?.actualHostPort, 57001);
+
+  const overrideText = fs.readFileSync(result.state.overrideFile, "utf8");
+  assert.match(overrideText, /target: '\/var\/lib\/postgresql\/data'/);
+  assert.match(overrideText, /target: '\/cache'/);
+  assert.match(overrideText, /type: tmpfs/);
+  assert.doesNotMatch(overrideText, /name: 'workspace_pgdata'/);
+  assert.doesNotMatch(overrideText, /name: 'shared-cache'/);
 });
 
 test("copies an existing compose clone without stacking the network-scoped project name", async (context) => {

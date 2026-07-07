@@ -161,6 +161,18 @@ test("docker compose wrapper routes as-is attachments by cwd without an original
   }
 });
 
+test("network service records the runtime compose project for as-is routing rows", () => {
+  const source = fs.readFileSync(path.resolve(__dirname, "../../../src/extension/network-service.ts"), "utf8");
+  const rowsStart = source.indexOf("function buildComposeProjectRoutingRows");
+  const rowsEnd = source.indexOf("function mergeComposeRoutingContainerMappings", rowsStart);
+  const rowsBody = source.slice(rowsStart, rowsEnd);
+
+  assert.notEqual(rowsStart, -1);
+  assert.notEqual(rowsEnd, -1);
+  assert.equal(rowsBody.includes("routingFiles.overrideFile === undefined"), true);
+  assert.equal(rowsBody.includes("? attachment.projectName"), true);
+});
+
 test("docker compose wrapper infers original project names for restored clone rows", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-restored-clone-original-project-"));
   const projectDir = path.join(tempDir, "workspace", "docker");
@@ -222,6 +234,107 @@ test("docker compose wrapper infers original project names for restored clone ro
         `<${overrideFile}>`,
         "<stop>",
         "<db>",
+        "",
+      ].join("\n"),
+    );
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("docker compose wrapper prepares hidden loopback publish hosts before lifecycle commands", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-hidden-host-alias-"));
+  const projectDir = path.join(tempDir, "workspace", "docker");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+  const overrideFile = path.join(tempDir, "network-a-app-1234.ports.override.yaml");
+  const aliasLog = path.join(tempDir, "aliases.log");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    overrideFile,
+    [
+      "services:",
+      "  redis:",
+      "    ports: !override",
+      "      - '127.94.71.93:6379:6379/tcp'",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        originalProjectName: "workspace",
+        attachedProjectName: "network-a-app-1234",
+        overrideFile,
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(path.join(binDir, "uname"), "#!/bin/sh\nprintf 'Darwin\\n'\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+  fs.writeFileSync(
+    path.join(binDir, "ifconfig"),
+    [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"lo0\" ] && [ \"$2\" = \"alias\" ]; then",
+      "  printf '%s\\n' \"$3\" >> \"$PM_ALIAS_LOG\"",
+      "  exit 0",
+      "fi",
+      "if [ \"$1\" = \"lo0\" ]; then",
+      "  printf 'lo0: flags=8049<UP,LOOPBACK,RUNNING> mtu 16384\\n'",
+      "  printf '\\tinet 127.0.0.1 netmask 0xff000000\\n'",
+      "  exit 0",
+      "fi",
+      "exit 1",
+      "",
+    ].join("\n"),
+    {
+      encoding: "utf8",
+      mode: 0o700,
+    },
+  );
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PM_ALIAS_LOG=${shellQuote(aliasLog)}`,
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          "docker compose -p workspace start redis",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(fs.readFileSync(aliasLog, "utf8"), "127.94.71.93\n");
+    assert.equal(
+      output,
+      [
+        "<compose>",
+        "<-p>",
+        "<network-a-app-1234>",
+        "<-f>",
+        `<${overrideFile}>`,
+        "<start>",
+        "<redis>",
         "",
       ].join("\n"),
     );

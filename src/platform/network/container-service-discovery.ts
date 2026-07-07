@@ -239,7 +239,7 @@ export class ContainerServiceDiscoverySession {
     runningRows: readonly RuntimeContainerRow[],
     private readonly contextRows: readonly RuntimeContainerRow[],
   ) {
-    this.candidates = parseContainerRows(executable, runningRows, contextRows);
+    this.candidates = parseContainerRows(executable, buildAttachCandidateRows(runningRows, contextRows), contextRows);
   }
 
   listCandidates(): readonly ContainerServiceCandidate[] {
@@ -413,6 +413,57 @@ export function parseContainerRows(
   return rows
     .map((row) => toContainerServiceCandidate(runtime, row, context))
     .filter((candidate): candidate is ContainerServiceCandidate => candidate !== undefined);
+}
+
+/**
+ * UI attach candidates should include stopped Compose services when Docker keeps
+ * their published-port labels. Running rows still win so live state is not
+ * duplicated or replaced by stale `container ls -a` metadata.
+ */
+function buildAttachCandidateRows(
+  runningRows: readonly RuntimeContainerRow[],
+  contextRows: readonly RuntimeContainerRow[],
+): readonly RuntimeContainerRow[] {
+  const rows = [...runningRows];
+  const runningIds = new Set(runningRows.map((row) => readFirstString(row.ID, row.Id)).filter(isDefinedString));
+  const runningNames = new Set(
+    runningRows
+      .map((row) => normalizeContainerName(readFirstString(row.Names, row.Name)))
+      .filter(isDefinedString),
+  );
+
+  for (const row of contextRows) {
+    const id = readFirstString(row.ID, row.Id);
+    const name = normalizeContainerName(readFirstString(row.Names, row.Name));
+    if ((id !== undefined && runningIds.has(id)) || (name !== undefined && runningNames.has(name))) {
+      continue;
+    }
+    if (!isStoppedComposePublishedPortCandidate(row)) {
+      continue;
+    }
+
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+/** True when a stopped compose row still has enough endpoint metadata to attach. */
+function isStoppedComposePublishedPortCandidate(row: RuntimeContainerRow): boolean {
+  const labels = parseLabels(row.Labels);
+  const composeProject = readLabel(labels, "com.docker.compose.project", "io.podman.compose.project");
+  const composeService = readLabel(labels, "com.docker.compose.service", "io.podman.compose.service");
+  if (composeProject === undefined || composeService === undefined) {
+    return false;
+  }
+
+  const logicalPortOverrides = readPortManagerLogicalPortLabels(labels);
+  const dockerDesktopPublishedPorts = readDockerDesktopPublishedPortEndpoints(labels);
+  return parsePublishedPorts(row.Ports ?? "", composeService, logicalPortOverrides, dockerDesktopPublishedPorts).length > 0;
+}
+
+function isDefinedString(value: string | undefined): value is string {
+  return value !== undefined;
 }
 
 function toContainerServiceCandidate(
