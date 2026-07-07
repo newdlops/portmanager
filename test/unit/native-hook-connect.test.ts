@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { getRouteTablePathForComposeClaimPort } from "../../src/agent/route-table";
+import { getRouteTablePathForComposeClaimPort, getRouteTablePathForGatewayClaimPort } from "../../src/agent/route-table";
 
 /**
  * Native hook connect() regression tests.
@@ -98,6 +98,34 @@ test("native hook bypasses route logic when no network scope is attached", () =>
   assert.equal(bindBody.indexOf("if (!pm_has_current_network_scope())") < bindBody.indexOf("pm_loopback_address_only_mode()"), true);
   assert.equal(connectBody.indexOf("if (!pm_has_current_network_scope())") < connectBody.indexOf("pm_connect_route_table_lookup"), true);
   assert.equal(connectBody.indexOf("if (!pm_has_current_network_scope())") < connectBody.indexOf("pm_allocate_route("), true);
+});
+
+test("native hook keeps the global network scope host-real", () => {
+  const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const hostnameStart = source.indexOf("static const char *pm_network_hostname");
+  const hostnameEnd = source.indexOf("static int pm_gethostname_hook", hostnameStart);
+  const dockerStart = source.indexOf("static int pm_should_block_docker_socket");
+  const dockerEnd = source.indexOf("static int pm_has_current_network_scope", dockerStart);
+  const argvStart = source.indexOf("static char **pm_rewrite_localhost_argv");
+  const argvEnd = source.indexOf("pm_envp_network_loopback_host(envp);", argvStart);
+
+  assert.notEqual(hostnameStart, -1);
+  assert.notEqual(dockerStart, -1);
+  assert.notEqual(argvStart, -1);
+  // Identity, the Docker-socket guard, argv rewriting, and the per-network
+  // env/file constructors all stay host-real inside the global scope.
+  assert.equal(source.slice(hostnameStart, hostnameEnd).includes("pm_network_scope_is_global()"), true);
+  assert.equal(source.slice(dockerStart, dockerEnd).includes("pm_network_scope_is_global()"), true);
+  assert.equal(
+    source.slice(argvStart, argvEnd).includes('pm_envp_value_is(envp, "PORT_MANAGER_NETWORK_IS_GLOBAL", "1")'),
+    true,
+  );
+  assert.equal(source.includes("if (!pm_hook_enabled() || pm_network_scope_is_global()) {"), true);
+  assert.equal(
+    source.includes("if (!pm_hook_enabled() || !pm_has_current_network_scope() || pm_network_scope_is_global()) {"),
+    true,
+  );
 });
 
 test("native hook blocks fixed protocol localhost fallback inside a logical network", () => {
@@ -378,6 +406,218 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
         PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
         PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
         PORT_MANAGER_AGENT_ROUNDTRIP_TIMEOUT_MS: "50",
+      },
+    });
+
+    assert.equal(result.exitCode, 23);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "ECONNREFUSED\n");
+  });
+
+  test("native hook global scope passes unmanaged localhost connects to the host", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-global-raw-"));
+    const server = net.createServer((socket) => {
+      socket.end("host\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-global-test";
+    const routeTablePath = path.join(tempDir, `newdlops-portmanager-routes-global-${networkId}.json`);
+    fs.writeFileSync(routeTablePath, JSON.stringify({ updatedAt: "2026-07-07T00:00:00.000Z", routes: [] }), "utf8");
+    const globalEnv = {
+      PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE: "loopback-address-only",
+      PORT_MANAGER_NETWORK_IS_GLOBAL: "1",
+      PORT_MANAGER_NETWORK_LOOPBACK_HOST: "127.1.0.1",
+      PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "127.1.0.1",
+      PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
+      PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
+    };
+
+    const result = await runHookedNodeClient(address.port, routeTablePath, networkId, { env: globalEnv });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "host\n");
+    assert.equal(result.stderr, "");
+
+    // The same env without the global flag is a plain network: the dial is
+    // pinned to the (unaliased) network loopback and must not reach the host.
+    const scoped = await runHookedNodeClient(address.port, routeTablePath, networkId, {
+      env: { ...globalEnv, PORT_MANAGER_NETWORK_IS_GLOBAL: "" },
+    });
+
+    assert.equal(scoped.exitCode, 23);
+    assert.equal(scoped.stdout, "");
+  });
+
+  test("native hook global scope rewrites managed localhost connects through route rows", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-global-managed-"));
+    const server = net.createServer((socket) => {
+      socket.end("managed\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-global-test";
+    const logicalPort = chooseDifferentTcpPort(address.port);
+    const routeTablePath = path.join(tempDir, `newdlops-portmanager-routes-global-${networkId}.json`);
+    fs.writeFileSync(
+      routeTablePath,
+      JSON.stringify({
+        updatedAt: "2026-07-07T00:00:00.000Z",
+        routes: [
+          {
+            logicalPort,
+            actualPort: address.port,
+            routeDirection: "listen",
+            host: "127.0.0.1",
+            cwd: projectRoot,
+            networkId,
+            processId: "managed-process-global",
+            processName: "node server.js",
+            status: "running",
+            source: "managed",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const result = await runHookedNodeClient(logicalPort, routeTablePath, networkId, {
+      env: {
+        PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE: "loopback-address-only",
+        PORT_MANAGER_NETWORK_IS_GLOBAL: "1",
+        PORT_MANAGER_NETWORK_LOOPBACK_HOST: "127.1.0.1",
+        PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "127.1.0.1",
+        PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
+        PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
+      },
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "managed\n");
+    assert.equal(result.stderr, "");
+  });
+
+  test("native hook global scope keeps a blocking raw fallback for stale managed rows", () => {
+    const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
+    const source = fs.readFileSync(sourcePath, "utf8");
+    const connectStart = source.indexOf("static int pm_connect_hook");
+    const connectEnd = source.indexOf("static int pm_getsockname_hook", connectStart);
+    const connectBody = source.slice(connectStart, connectEnd);
+    const globalStart = connectBody.indexOf("connect global managed logical=%d");
+    const fallbackStart = connectBody.indexOf("connect global raw fallback logical=%d", globalStart);
+
+    assert.notEqual(globalStart, -1);
+    assert.notEqual(fallbackStart, -1);
+    // The stale-row fallback re-dials the original address for blocking
+    // clients only; non-blocking dials already returned EINPROGRESS.
+    const fallbackRegion = connectBody.slice(globalStart, fallbackStart);
+    assert.equal(fallbackRegion.includes("errno == EINPROGRESS || errno == EALREADY"), true);
+    assert.equal(fallbackRegion.includes("alias_errno != ECONNREFUSED"), true);
+    assert.equal(
+      connectBody.slice(fallbackStart).includes("return pm_real_connect(sockfd, addr, addrlen);"),
+      true,
+    );
+  });
+
+  test("native hook refuses scope-less dials into gateway-owned fixed-protocol dead ends", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-deadend-"));
+    const server = net.createServer((socket) => {
+      socket.end("host\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const routeTablePath = path.join(tempDir, "newdlops-portmanager-routes-deadend.json");
+    fs.writeFileSync(routeTablePath, JSON.stringify({ updatedAt: "2026-07-07T00:00:00.000Z", routes: [] }), "utf8");
+    const claimPath = getRouteTablePathForGatewayClaimPort(address.port, routeTablePath);
+    const clientEnv = {
+      PORT_MANAGER_GLOBAL_ROUTES_FILE: routeTablePath,
+      PORT_MANAGER_FIXED_PROTOCOL_PORTS: String(address.port),
+      PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
+      PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
+    };
+
+    // A fresh gateway claim on a fixed-protocol port is a dead end for a
+    // scope-less caller: the hook must refuse synchronously, never reaching
+    // the listener that stands in for the gateway here.
+    fs.writeFileSync(claimPath, JSON.stringify({ expiresAtMs: Date.now() + 60_000 }), "utf8");
+    const refused = await runHookedNodeClient(address.port, routeTablePath, undefined, { env: clientEnv });
+
+    assert.equal(refused.exitCode, 23);
+    assert.equal(refused.stdout, "");
+    assert.equal(refused.stderr, "ECONNREFUSED\n");
+
+    // A stale claim means the gateway is gone; the raw coordinate belongs to
+    // whatever really listens there again.
+    fs.writeFileSync(claimPath, JSON.stringify({ expiresAtMs: Date.now() - 60_000 }), "utf8");
+    const passedThrough = await runHookedNodeClient(address.port, routeTablePath, undefined, { env: clientEnv });
+
+    assert.equal(passedThrough.exitCode, 0);
+    assert.equal(passedThrough.stdout, "host\n");
+  });
+
+  test("native hook refuses global-scope dials into gateway-owned fixed-protocol dead ends", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-global-deadend-"));
+    const server = net.createServer((socket) => {
+      socket.end("host\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-global-test";
+    const routeTablePath = path.join(tempDir, `newdlops-portmanager-routes-global-${networkId}.json`);
+    fs.writeFileSync(routeTablePath, JSON.stringify({ updatedAt: "2026-07-07T00:00:00.000Z", routes: [] }), "utf8");
+    const claimPath = getRouteTablePathForGatewayClaimPort(address.port, routeTablePath);
+    fs.writeFileSync(claimPath, JSON.stringify({ expiresAtMs: Date.now() + 60_000 }), "utf8");
+
+    const result = await runHookedNodeClient(address.port, routeTablePath, networkId, {
+      env: {
+        PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE: "loopback-address-only",
+        PORT_MANAGER_NETWORK_IS_GLOBAL: "1",
+        PORT_MANAGER_NETWORK_LOOPBACK_HOST: "127.1.0.1",
+        PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "127.1.0.1",
+        PORT_MANAGER_GLOBAL_ROUTES_FILE: routeTablePath,
+        PORT_MANAGER_FIXED_PROTOCOL_PORTS: String(address.port),
+        PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
+        PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
       },
     });
 

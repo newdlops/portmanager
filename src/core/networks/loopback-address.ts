@@ -10,6 +10,29 @@ import type { ExperimentalRouteOwnershipMode, LoopbackAddressRoutingMode } from 
 
 export const ACTUAL_LOOPBACK_HOST_ENV = "PORT_MANAGER_ACTUAL_LOOPBACK_HOST";
 export const NETWORK_LOOPBACK_HOST_ENV = "PORT_MANAGER_NETWORK_LOOPBACK_HOST";
+
+/**
+ * Reserved id of the global logical network that absorbs processes attached to
+ * no user network. Distinct from the container bridge constant
+ * `portmanager-global` in platform/network/container-runtime.ts; user network
+ * ids are `network-<uuid>` so this literal cannot collide with one.
+ */
+export const GLOBAL_LOGICAL_NETWORK_ID = "network-global";
+/** Env flag telling the native hook a scope is the global network (identity stays host-real). */
+export const NETWORK_IS_GLOBAL_ENV = "PORT_MANAGER_NETWORK_IS_GLOBAL";
+
+/*
+ * The global network's coordinates are fixed constants outside every hashed
+ * band (networks 127.80-111, browser 127.112-143, pf targets 127.144-175) so
+ * they are recognizable at a glance in logs, pf rules, and lsof output.
+ */
+const GLOBAL_NETWORK_LOOPBACK_ADDRESS = "127.1.0.1";
+const GLOBAL_NETWORK_BROWSER_LOOPBACK_ADDRESS = "127.1.1.1";
+const GLOBAL_NETWORK_HOST_LOCAL_GATEWAY_ADDRESS = "127.1.2.1";
+
+export function isGlobalNetworkId(networkId: string | undefined): networkId is string {
+  return networkId === GLOBAL_LOGICAL_NETWORK_ID;
+}
 export const LOOPBACK_ADDRESS_ONLY_ROUTE_OWNERSHIP_MODE: ExperimentalRouteOwnershipMode = "loopback-address-only";
 const DEFAULT_LOOPBACK_ADDRESS_ROUTING_MODE: LoopbackAddressRoutingMode = "loopback";
 
@@ -62,6 +85,10 @@ export function resolveLoopbackAddressRoutingMode(settings: {
 }
 
 export function loopbackAddressForNetwork(networkId: string): string {
+  if (isGlobalNetworkId(networkId)) {
+    return GLOBAL_NETWORK_LOOPBACK_ADDRESS;
+  }
+
   const hash = fnv1a32(networkId);
   const secondOctet = 80 + (hash & 0x1f);
   const thirdOctet = (hash >>> 8) & 0xff;
@@ -71,6 +98,10 @@ export function loopbackAddressForNetwork(networkId: string): string {
 }
 
 export function browserLoopbackAddressForNetwork(networkId: string): string {
+  if (isGlobalNetworkId(networkId)) {
+    return GLOBAL_NETWORK_BROWSER_LOOPBACK_ADDRESS;
+  }
+
   const hash = fnv1a32(`browser:${networkId}`);
   const secondOctet = 112 + (hash & 0x1f);
   const thirdOctet = (hash >>> 8) & 0xff;
@@ -86,6 +117,10 @@ export function browserLoopbackAddressForNetwork(networkId: string): string {
  * be an address nothing ever dials directly, separate from the browser alias.
  */
 export function hostLocalGatewayLoopbackAddressForNetwork(networkId: string): string {
+  if (isGlobalNetworkId(networkId)) {
+    return GLOBAL_NETWORK_HOST_LOCAL_GATEWAY_ADDRESS;
+  }
+
   const hash = fnv1a32(`host-local:${networkId}`);
   const secondOctet = 144 + (hash & 0x1f);
   const thirdOctet = (hash >>> 8) & 0xff;

@@ -172,6 +172,7 @@ static void pm_clear_memory_routes(void);
 static void pm_clear_route_file_cache(void);
 static const char *pm_actual_loopback_host(void);
 static const char *pm_current_network_id(void);
+static int pm_network_scope_is_global(void);
 static const char *pm_network_loopback_host(void);
 static int pm_connect_route_table_lookup(int logical_port, char *target_host, size_t target_host_size, int *is_compose_route);
 extern char **environ;
@@ -624,6 +625,12 @@ static int pm_should_block_docker_socket(const struct sockaddr *addr, socklen_t 
     return 0;
   }
 
+  if (pm_network_scope_is_global()) {
+    /* The global network is the host view; blocking here would only break
+       unshimmed Docker API clients (testcontainers, SDKs) in plain terminals. */
+    return 0;
+  }
+
   network_id = pm_current_network_id();
   return network_id != NULL && network_id[0] != '\0';
 }
@@ -632,6 +639,20 @@ static int pm_has_current_network_scope(void) {
   const char *network_id = pm_current_network_id();
 
   return network_id != NULL && network_id[0] != '\0';
+}
+
+/*
+ * The reserved global logical network absorbs processes that are attached to
+ * no user network. It virtualizes connection coordinates only: identity
+ * (hostname), per-network env/file features, the Docker-socket guard, and
+ * argv rewriting stay host-real, so an unattached terminal keeps behaving
+ * like a plain host shell. Delivered as a flag env rather than a magic id so
+ * the dylib never hard-codes the TS-side network id constant.
+ */
+static int pm_network_scope_is_global(void) {
+  const char *flag = getenv("PORT_MANAGER_NETWORK_IS_GLOBAL");
+
+  return flag != NULL && strcmp(flag, "1") == 0 && pm_has_current_network_scope();
 }
 
 static void pm_normalize_process_preload_env(void) {
@@ -813,7 +834,7 @@ static void pm_apply_network_env_file(void) {
   char line[4096];
   int applied_count = 0;
 
-  if (!pm_hook_enabled()) {
+  if (!pm_hook_enabled() || pm_network_scope_is_global()) {
     return;
   }
   network = getenv("PORT_MANAGER_NETWORK_NAME");
@@ -910,7 +931,7 @@ static void pm_file_substitution_init(void) {
   char network_key[256];
   size_t out = 0;
 
-  if (!pm_hook_enabled()) {
+  if (!pm_hook_enabled() || pm_network_scope_is_global()) {
     return;
   }
   flag = getenv(PM_FILE_SUBSTITUTION_ENV);
@@ -1916,6 +1937,25 @@ static int pm_sockaddr_is_local(const struct sockaddr *addr) {
     static const unsigned char loopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
     static const unsigned char any[16] = {0};
     return memcmp(&in6->sin6_addr, loopback, 16) == 0 || memcmp(&in6->sin6_addr, any, 16) == 0;
+  }
+
+  return 0;
+}
+
+/*
+ * True only for the default local coordinates — 127.0.0.1/0.0.0.0 and ::1/::.
+ * A specific 127.x address names one network's alias deliberately; the global
+ * scope manages default coordinates only and leaves deliberate dials alone.
+ */
+static int pm_sockaddr_is_default_local(const struct sockaddr *addr) {
+  if (addr->sa_family == AF_INET) {
+    const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
+    uint32_t ip = ntohl(in->sin_addr.s_addr);
+    return ip == 0 || ip == 0x7f000001u;
+  }
+
+  if (addr->sa_family == AF_INET6) {
+    return pm_sockaddr_is_local(addr);
   }
 
   return 0;
@@ -3979,6 +4019,23 @@ static int pm_gateway_claim_fresh(int logical_port) {
 }
 
 /*
+ * True when localhost:<port> is a dead end for a caller outside every user
+ * network: the gateway owns the raw fixed-protocol coordinate (fresh mux
+ * claim) purely to demux attached networks' clients. Such a caller can never
+ * be served there — scope-less bind relocation excludes fixed ports, and the
+ * resolver fails fixed ports closed without a route — so the dial would be
+ * accepted and then dropped ("server closed the connection unexpectedly" in
+ * libpq). Refusing synchronously yields a plain connection-refused instead.
+ * A real host server on the coordinate keeps working: the gateway declines
+ * externally-owned ports, so no fresh claim exists for them.
+ */
+static int pm_default_local_connect_is_gateway_dead_end(const struct sockaddr *addr, int logical_port) {
+  return pm_is_fixed_protocol_port(logical_port) &&
+    pm_sockaddr_is_default_local(addr) &&
+    pm_gateway_claim_fresh(logical_port);
+}
+
+/*
  * Relocates a scope-less server off a gateway-owned port.
  *
  * The bind is moved to a daemon-allocated high port on 127.0.0.1 and registered
@@ -4073,12 +4130,48 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
   }
 
   if (logical_port == 0) {
+    if (pm_network_scope_is_global()) {
+      /* Ephemeral listeners hand their port to unhooked peers (browsers,
+         debug adapters) over IPC; the gateway cannot claim a port it has
+         never heard of, so the global scope keeps them on the raw host. */
+      return pm_real_bind(sockfd, addr, addrlen);
+    }
     return pm_bind_ephemeral_local_port(sockfd, addr, addrlen);
   }
 
   if (pm_loopback_address_only_mode()) {
+    if (pm_network_scope_is_global()) {
+      if (!pm_sockaddr_is_default_local(addr)) {
+        /* A concrete-interface (en0) or explicit 127.x-alias bind is a
+           deliberate coordinate, not a default-localhost rendezvous. */
+        pm_debug("bind global raw passthrough logical=%d", logical_port);
+        return pm_real_bind(sockfd, addr, addrlen);
+      }
+      if (pm_should_preserve_listen_bind(logical_port)) {
+        pm_sockaddr_host(addr, host, sizeof(host));
+        result = pm_real_bind(sockfd, addr, addrlen);
+        if (result == 0) {
+          char logical_text[16];
+
+          pm_remember_route(logical_port, logical_port, host, "", 0);
+          snprintf(logical_text, sizeof(logical_text), "%d", logical_port);
+          setenv("PORT_MANAGER_LOGICAL_PORT", logical_text, 1);
+          setenv("PORT_MANAGER_ACTUAL_PORT", logical_text, 1);
+          pm_register_process(logical_port, logical_port, host, "");
+          pm_debug("bind global preserved logical=%d host=%s", logical_port, host);
+        }
+        return result;
+      }
+    }
+
     loopback_host = pm_network_loopback_host();
     if (loopback_host == NULL || !pm_sockaddr_is_local(addr)) {
+      if (pm_network_scope_is_global()) {
+        /* A missing global alias must degrade to the host view, never fail
+           the server: unattached terminals cannot require a sudo alias. */
+        pm_debug("bind global raw fallback (no alias) logical=%d", logical_port);
+        return pm_real_bind(sockfd, addr, addrlen);
+      }
       pm_debug("bind address-only unavailable logical=%d", logical_port);
       errno = EADDRNOTAVAIL;
       return -1;
@@ -4089,6 +4182,19 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
     pm_set_sockaddr_port((struct sockaddr *)&rewritten, logical_port);
 
     result = pm_real_bind(sockfd, (struct sockaddr *)&rewritten, addrlen);
+    if (result != 0 && pm_network_scope_is_global() &&
+        (errno == EADDRNOTAVAIL || errno == EAFNOSUPPORT || errno == EACCES)) {
+      int alias_bind_errno = errno;
+
+      pm_debug(
+        "bind global raw fallback logical=%d alias=%s error=%s",
+        logical_port,
+        loopback_host,
+        strerror(alias_bind_errno));
+      pm_sockaddr_host(addr, host, sizeof(host));
+      loopback_host = host;
+      result = pm_real_bind(sockfd, addr, addrlen);
+    }
     if (result == 0) {
       char logical_text[16];
 
@@ -4280,13 +4386,100 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
     /*
      * Without a network identity, localhost:<port> is the host's own endpoint.
      * Looking up route tables here can bounce back into host proxies or router
-     * listeners and create the localhost -> route -> localhost loop.
+     * listeners and create the localhost -> route -> localhost loop. The one
+     * exception is a gateway-owned fixed-protocol coordinate that only demuxes
+     * other networks' compose services — a dead end for this caller.
      */
+    if (pm_default_local_connect_is_gateway_dead_end(addr, logical_port)) {
+      pm_debug("connect refused scope-less gateway dead end logical=%d", logical_port);
+      errno = ECONNREFUSED;
+      return -1;
+    }
     pm_debug("connect passthrough without network scope logical=%d", logical_port);
     return pm_real_connect(sockfd, addr, addrlen);
   }
 
   if (pm_loopback_address_only_mode()) {
+    if (pm_network_scope_is_global()) {
+      char global_host[128];
+      int global_actual;
+      int global_is_compose = 0;
+      int alias_result;
+      int alias_errno;
+
+      if (!pm_sockaddr_is_default_local(addr)) {
+        /* An explicit 127.x alias names one network deliberately — the same
+           power every unhooked host process has; only default coordinates
+           are managed by the global scope. */
+        pm_debug("connect global explicit-alias passthrough logical=%d", logical_port);
+        return pm_real_connect(sockfd, addr, addrlen);
+      }
+
+      global_host[0] = '\0';
+      global_actual = pm_memory_actual_for_logical(logical_port, global_host, sizeof(global_host));
+      if (global_actual == 0) {
+        global_actual = pm_connect_route_table_lookup(logical_port, global_host, sizeof(global_host), &global_is_compose);
+      }
+      if (global_actual <= 0) {
+        if (pm_default_local_connect_is_gateway_dead_end(addr, logical_port)) {
+          /* The raw coordinate is another network's compose demux, not a host
+             service; the resolver would accept and drop this connection. */
+          pm_debug("connect refused global gateway dead end logical=%d", logical_port);
+          errno = ECONNREFUSED;
+          return -1;
+        }
+        /*
+         * Unmanaged port: the global network is the host view. Services Port
+         * Manager does not manage (launchd daemons, Homebrew DBs, unhooked
+         * servers) stay reachable at their raw coordinates — unlike a user
+         * network, passing through cannot cross an isolation boundary.
+         */
+        pm_debug("connect global raw passthrough logical=%d", logical_port);
+        return pm_real_connect(sockfd, addr, addrlen);
+      }
+
+      if (global_host[0] == '\0' || pm_route_host_is_wildcard_text(global_host)) {
+        loopback_host = pm_network_loopback_host();
+        if (loopback_host == NULL) {
+          pm_debug("connect global raw passthrough (no alias) logical=%d", logical_port);
+          return pm_real_connect(sockfd, addr, addrlen);
+        }
+        snprintf(global_host, sizeof(global_host), "%s", loopback_host);
+      }
+
+      memcpy(&rewritten, addr, addrlen);
+      pm_set_sockaddr_port((struct sockaddr *)&rewritten, global_actual);
+      pm_set_sockaddr_host((struct sockaddr *)&rewritten, global_host);
+      pm_debug("connect global managed logical=%d actual=%d host=%s", logical_port, global_actual, global_host);
+      alias_result = pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
+      if (alias_result == 0 || errno == EINPROGRESS || errno == EALREADY) {
+        return alias_result;
+      }
+      alias_errno = errno;
+      if (
+        alias_errno != ECONNREFUSED &&
+        alias_errno != EADDRNOTAVAIL &&
+        alias_errno != EHOSTUNREACH &&
+        alias_errno != ENETUNREACH &&
+        alias_errno != EAFNOSUPPORT
+      ) {
+        errno = alias_errno;
+        return alias_result;
+      }
+      /*
+       * Stale row — the managed server is gone; fall back to the host view.
+       * Only blocking connects get here: a non-blocking dial already returned
+       * EINPROGRESS above and surfaces the refusal to the app, exactly like a
+       * server dying today. Unmanaged ports never dial the alias at all.
+       */
+      pm_debug(
+        "connect global raw fallback logical=%d host=%s error=%s",
+        logical_port,
+        global_host,
+        strerror(alias_errno));
+      return pm_real_connect(sockfd, addr, addrlen);
+    }
+
     loopback_host = pm_network_loopback_host();
     if (loopback_host == NULL) {
       pm_debug("connect address-only unavailable logical=%d", logical_port);
@@ -5321,6 +5514,7 @@ static char **pm_rewrite_localhost_argv(char *const argv[], char *const envp[]) 
   if (!pm_hook_enabled() || pm_hook_depth > 0 || argv == NULL || envp == NULL ||
       pm_envp_value_is(envp, "PORT_MANAGER_HOOK_DISABLED", "1") ||
       pm_envp_value_is(envp, "PORT_MANAGER_HOOK", "0") ||
+      pm_envp_value_is(envp, "PORT_MANAGER_NETWORK_IS_GLOBAL", "1") ||
       pm_envp_value_is(envp, PM_ARGV_LOCALHOST_REWRITE_ENV, "0")) {
     return NULL;
   }
@@ -5664,7 +5858,8 @@ static int pm_getifaddrs_hook(struct ifaddrs **ifap) {
     return result;
   }
 
-  if (!pm_hook_enabled() || !pm_has_current_network_scope()) {
+  if (!pm_hook_enabled() || !pm_has_current_network_scope() || pm_network_scope_is_global()) {
+    /* Global scope sees the host truth: every alias stays enumerable. */
     return result;
   }
 
@@ -5832,6 +6027,10 @@ static const char *pm_network_hostname(void) {
   size_t out = 0;
 
   if (!pm_hook_enabled()) {
+    return NULL;
+  }
+  if (pm_network_scope_is_global()) {
+    /* The global network keeps the machine's real identity. */
     return NULL;
   }
   network = getenv("PORT_MANAGER_NETWORK_NAME");

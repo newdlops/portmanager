@@ -526,6 +526,13 @@ export interface PortManagerSettings {
    */
   readonly logicalPortGateway: boolean;
   /**
+   * Whether unattached terminals join the reserved global logical network
+   * (fixed loopback 127.1.0.1) instead of living outside every network.
+   * Requires loopback-address-only route ownership and the logical port
+   * gateway; degrades to the plain scopeless environment otherwise.
+   */
+  readonly globalNetwork: boolean;
+  /**
    * EXPERIMENTAL, default off. When on, the daemon detects a network-scoped dev
    * server that escaped the preload through a version-manager/shell shim (bound
    * 0.0.0.0 unhooked) and asks a hooked ancestor to relaunch it hooked. This

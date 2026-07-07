@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -14,7 +15,9 @@ import {
 import { readPortManagerSettings } from "../config/vscode-settings";
 import {
   ACTUAL_LOOPBACK_HOST_ENV,
+  GLOBAL_LOGICAL_NETWORK_ID,
   loopbackAddressForNetwork,
+  NETWORK_IS_GLOBAL_ENV,
   NETWORK_LOOPBACK_HOST_ENV,
   shouldExposeNetworkLoopbackHost,
   usesLoopbackAddressOnlyRouting,
@@ -67,6 +70,12 @@ const PRELOAD_RUNTIME_LAUNCHER_NAMES = [
 // state-path arguments (.celery/celery.log) are remapped to the caller's own
 // network mirror — each terminal tails ITS network (docs/per-network-files.md).
 const OBSERVATION_COMMAND_SHIM_NAMES: readonly string[] = ["tail", "cat"];
+// Process observation follows the caller's network the same way: these resolve
+// to the native process-scope shim, which hides rows belonging to a DIFFERENT
+// logical network so machine-wide kill sweeps (`ps -ef | grep celery | kill`,
+// `pkill -f celery`) only ever see their own scope. Rows with no network
+// identity stay visible; /bin/ps and PORT_MANAGER_PROCESS_SCOPE=0 stay global.
+const PROCESS_SCOPE_SHIM_NAMES: readonly string[] = ["ps", "pgrep", "pkill", "killall"];
 // These names are project-bin commands that commonly bind or probe dev ports.
 // Package managers are intentionally excluded so install/link lifecycle work
 // does not inherit socket routing unless the invoked tool crosses a runtime
@@ -143,13 +152,26 @@ export function applyTerminalHookEnvironment(
   collection.description = "Port Manager routes terminal TCP binds through the local daemon.";
 
   if (scope === undefined) {
+    if (!settings.logicalPortGateway || !shouldInjectTerminalHook(settings)) {
+      return;
+    }
+    // Unattached terminals join the reserved global network when the routing
+    // mode supports it and the fixed global alias exists on lo0; otherwise
+    // they keep the minimal scopeless-gateway environment. A terminal must
+    // never fail to open because the global alias is missing.
+    if (
+      settings.globalNetwork &&
+      usesLoopbackAddressOnlyRouting(settings) &&
+      isGlobalLoopbackAliasConfigured()
+    ) {
+      applyGlobalNetworkEnvironment(context, collection, settings);
+      return;
+    }
     // A terminal not attached to any network still gets a minimal hook so a
     // server it launches on a gateway-owned port relocates instead of being
     // shadowed by the gateway listener. No network id is injected, so the hook
     // stays in pure passthrough for everything except that relocation.
-    if (settings.logicalPortGateway && shouldInjectTerminalHook(settings)) {
-      applyScopelessGatewayEnvironment(context, collection, settings);
-    }
+    applyScopelessGatewayEnvironment(context, collection, settings);
     return;
   }
 
@@ -240,6 +262,86 @@ export function applyTerminalHookEnvironment(
   if (shellEnvRestorePath !== undefined) {
     collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_MUTATOR_OPTIONS);
   }
+}
+
+/**
+ * Attaches an unattached terminal to the reserved global logical network. The
+ * hook then virtualizes connection coordinates only — default-local binds and
+ * managed connects move to the fixed global alias — while identity stays
+ * host-real: no NETWORK_NAME, no DNS alias, no compose vars, no `.portmanager/`
+ * scaffolding, and the NETWORK_IS_GLOBAL flag makes the hook skip hostname
+ * virtualization, env-file injection, file substitution, argv rewriting, and
+ * the Docker-socket guard.
+ */
+function applyGlobalNetworkEnvironment(
+  context: vscode.ExtensionContext,
+  collection: vscode.EnvironmentVariableCollection,
+  settings: PortManagerSettings,
+): void {
+  const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
+  const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
+  const nativeAgentPath = context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
+  const asdfShimLauncherPath = context.asAbsolutePath(getAsdfShimLauncherRelativePath());
+  const runtimeCommandShimPath = context.asAbsolutePath(getRuntimeCommandShimRelativePath());
+  const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
+  const preloadHintVariable = process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD";
+
+  collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_MUTATOR_OPTIONS);
+  if (process.env.PORT_MANAGER_DEV_LOG !== undefined && process.env.PORT_MANAGER_DEV_LOG.length > 0) {
+    collection.replace("PORT_MANAGER_DEV_LOG", process.env.PORT_MANAGER_DEV_LOG, TERMINAL_MUTATOR_OPTIONS);
+  }
+  collection.replace("PORT_MANAGER_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_BORROWED_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("NEWDLOPS_PM_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("NEWDLOPS_PM_BORROWED_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace(NETWORK_IS_GLOBAL_ENV, "1", TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_MAIN", agentMainPath, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_PRELOAD_REPAIR", "1", TERMINAL_MUTATOR_OPTIONS);
+  collection.replace(
+    "PORT_MANAGER_ROUTES_FILE",
+    getRouteTablePathForNetwork(GLOBAL_LOGICAL_NETWORK_ID),
+    TERMINAL_MUTATOR_OPTIONS,
+  );
+  collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_MUTATOR_OPTIONS);
+  applyRoutingSettings(collection, settings);
+  applyLoopbackRoutingHosts(collection, GLOBAL_LOGICAL_NETWORK_ID, settings);
+  collection.replace(
+    preloadVariable,
+    prependUniquePathListEntry(hookLibraryPath, process.env[preloadVariable]),
+    TERMINAL_MUTATOR_OPTIONS,
+  );
+  collection.replace(preloadHintVariable, hookLibraryPath, TERMINAL_MUTATOR_OPTIONS);
+  applyRuntimeShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath, runtimeCommandShimPath);
+}
+
+/** Cached `ifconfig lo0` probe for the fixed global alias (created by the consolidated admin setup). */
+let globalLoopbackAliasProbe: { readonly atMs: number; readonly configured: boolean } | undefined;
+const GLOBAL_LOOPBACK_ALIAS_PROBE_TTL_MS = 30_000;
+
+function isGlobalLoopbackAliasConfigured(): boolean {
+  if (process.platform !== "darwin") {
+    return true;
+  }
+
+  const now = Date.now();
+  if (globalLoopbackAliasProbe !== undefined && now - globalLoopbackAliasProbe.atMs < GLOBAL_LOOPBACK_ALIAS_PROBE_TTL_MS) {
+    return globalLoopbackAliasProbe.configured;
+  }
+
+  let configured = false;
+  try {
+    const output = execFileSync("/sbin/ifconfig", ["lo0"], { encoding: "utf8", timeout: 2_000 });
+    const address = loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID).replace(/\./g, "\\.");
+    configured = new RegExp(`inet[\\t ]+${address}([\\t ]|$)`, "m").test(output);
+  } catch {
+    configured = false;
+  }
+
+  globalLoopbackAliasProbe = { atMs: now, configured };
+  return configured;
 }
 
 /**
@@ -500,6 +602,13 @@ export function prepareRuntimeShimLauncherDirectory(
     ensureExecutableAlias(path.join(targetDirectory, observationName), launcherPath);
   }
 
+  const processScopeShimPath = path.join(path.dirname(launcherPath), "portmanager_process_scope_shim");
+  if (fs.existsSync(processScopeShimPath)) {
+    for (const processScopeName of PROCESS_SCOPE_SHIM_NAMES) {
+      ensureExecutableAlias(path.join(targetDirectory, processScopeName), processScopeShimPath);
+    }
+  }
+
   if (sourceShimDirectory !== undefined) {
     for (const entry of fs.readdirSync(sourceShimDirectory, { withFileTypes: true })) {
       if (
@@ -552,6 +661,8 @@ function buildRuntimeShimDirectorySignature(
         sourceShimDirectory ?? "",
         sourceShimDirectoryMtimeMs,
         OBSERVATION_COMMAND_SHIM_NAMES.join(","),
+        PROCESS_SCOPE_SHIM_NAMES.join(","),
+        fs.existsSync(path.join(path.dirname(launcherPath), "portmanager_process_scope_shim")),
       ]),
     )
     .digest("hex");

@@ -32,6 +32,7 @@ import { selectHostDefaultGatewayExposure } from "../core/networks/host-default-
 import {
   ACTUAL_LOOPBACK_HOST_ENV,
   browserLoopbackAddressForNetwork,
+  GLOBAL_LOGICAL_NETWORK_ID,
   hostLocalGatewayLoopbackAddressForNetwork,
   loopbackAddressForNetwork,
   NETWORK_LOOPBACK_HOST_ENV,
@@ -1305,13 +1306,24 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Terminal-band loopback addresses for every network, for consolidated alias setup. */
   private collectTerminalLoopbackAddresses(): readonly string[] {
+    // The global network's fixed aliases ride the same consolidated approval so
+    // unattached terminals are ready the first time any network prompts.
+    const globalAddresses = readPortManagerSettings().globalNetwork
+      ? [
+          loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID),
+          browserLoopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID),
+          hostLocalGatewayLoopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID),
+        ]
+      : [];
+
     return [
-      ...new Set(
-        this.registry
+      ...new Set([
+        ...globalAddresses,
+        ...this.registry
           .getSnapshot()
           .networks.map((network) => loopbackAddressForNetwork(network.id))
           .filter((address) => address !== "127.0.0.1"),
-      ),
+      ]),
     ];
   }
 
@@ -4865,7 +4877,19 @@ export class PortManagerNetworkService implements DisposableLike {
    * 127.0.0.1 coordinate. With no such owner the connection is refused so a
    * network's port is never leaked to an unrelated client.
    */
-  private resolveNonNetworkClientTarget(logicalPort: number, clientCwd: string | undefined): LogicalPortRouterTarget {
+  private async resolveNonNetworkClientTarget(
+    logicalPort: number,
+    clientCwd: string | undefined,
+  ): Promise<LogicalPortRouterTarget> {
+    // An unattributable client is a global-network client once the global
+    // network exists: its live route wins over the legacy relocated owner.
+    if (readPortManagerSettings().globalNetwork) {
+      const globalRoute = await this.findNetworkRouteForRouter(GLOBAL_LOGICAL_NETWORK_ID, logicalPort, []);
+      if (globalRoute !== undefined) {
+        return { host: globalRoute.host, port: globalRoute.actualPort };
+      }
+    }
+
     const ownerRoute = this.findNonNetworkOwnerRoute(logicalPort, clientCwd);
     if (ownerRoute === undefined) {
       throw new Error(`No non-network owner for localhost:${logicalPort}; refusing.`);

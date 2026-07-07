@@ -1637,6 +1637,7 @@ export class PortManagerCommandController implements DisposableLike {
     const nativeContainerMapPath = context.asAbsolutePath(path.join("media", "native", "portmanager_container_map"));
     const hookDirectory = path.join(os.homedir(), ".portmanager");
     const hookScriptPath = path.join(hookDirectory, "portmanager-hook.sh");
+    const hookCommandLibraryPath = path.join(hookDirectory, "portmanager-commands.sh");
     const terminalNetworkSelectionFilePath = path.join(
       context.globalStorageUri.fsPath,
       TERMINAL_NETWORK_SELECTION_FILE_NAME,
@@ -1677,7 +1678,7 @@ export class PortManagerCommandController implements DisposableLike {
       }
       await fs.chmod(tlsRenewalScriptPath, 0o700).catch(() => undefined);
     }
-    const hookScriptContents = buildShellHookScript({
+    const shellHookOptions: ShellHookScriptOptions = {
       hookLibraryPath,
       agentMainPath,
       nativeAgentPath,
@@ -1693,17 +1694,27 @@ export class PortManagerCommandController implements DisposableLike {
       runtimeShimDirectory,
       shellEnvRestorePath,
       tlsRenewalScriptPath,
+    };
+    const commandScriptContents = buildShellHookScript(shellHookOptions);
+    const hookScriptContents = buildShellHookStartupScript({
+      ...shellHookOptions,
+      commandLibraryPath: hookCommandLibraryPath,
     });
 
     // Every window regenerates these assets at activation; identical content
     // means the shared-file write (and last-writer churn across windows) can
     // be skipped.
+    const existingCommandScript = await fs.readFile(hookCommandLibraryPath, "utf8").catch(() => undefined);
+    if (existingCommandScript !== commandScriptContents) {
+      await fs.writeFile(hookCommandLibraryPath, commandScriptContents, "utf8");
+    }
     const existingHookScript = await fs.readFile(hookScriptPath, "utf8").catch(() => undefined);
     if (existingHookScript !== hookScriptContents) {
       await fs.writeFile(hookScriptPath, hookScriptContents, "utf8");
     }
 
     if (process.platform !== "win32") {
+      await fs.chmod(hookCommandLibraryPath, 0o700).catch(() => undefined);
       await fs.chmod(hookScriptPath, 0o700).catch(() => undefined);
     }
 
@@ -3133,6 +3144,11 @@ interface ShellHookScriptOptions {
   readonly tlsRenewalScriptPath?: string;
 }
 
+interface ShellHookStartupScriptOptions extends ShellHookScriptOptions {
+  /** Full command implementation sourced lazily from the lightweight profile hook. */
+  readonly commandLibraryPath: string;
+}
+
 interface ShellHookAssets {
   /** Generated hook script that profile files source. */
   readonly hookScriptPath: string;
@@ -3224,6 +3240,129 @@ function formatAttachedNetworkNames(
     const network = snapshot.networks.find((item) => item.id === networkId);
     return `${network?.name ?? networkId} (${count})`;
   });
+}
+
+/**
+ * Builds the small file that user profiles source on every terminal startup.
+ * The full `pm` command body carries large diagnostics scripts, so this wrapper
+ * defers parsing it until the user actually runs `pm`; only the routing env
+ * needed by child processes is restored eagerly.
+ */
+function buildShellHookStartupScript(options: ShellHookStartupScriptOptions): string {
+  const escapedHookLibraryPath = shellDoubleQuote(options.hookLibraryPath);
+  const escapedCommandLibraryPath = shellDoubleQuote(options.commandLibraryPath);
+  const escapedAgentMainPath = shellDoubleQuote(options.agentMainPath);
+  const escapedNativeAgentPath = shellDoubleQuote(options.nativeAgentPath);
+  const escapedNativeContainerMapPath = shellDoubleQuote(options.nativeContainerMapPath);
+  const escapedDockerShimPath = shellDoubleQuote(options.dockerShimPath);
+  const escapedSocketPath = shellDoubleQuote(options.socketPath);
+  const escapedRouteTablePath = shellDoubleQuote(options.routeTablePath);
+  const escapedHostAccessFilePath = shellDoubleQuote(options.hostAccessFilePath);
+  const escapedTerminalNetworkSelectionFilePath = shellDoubleQuote(options.terminalNetworkSelectionFilePath);
+  const escapedPackageVersion = shellDoubleQuote(options.packageVersion);
+  const escapedRuntimeShimDirectory =
+    options.runtimeShimDirectory !== undefined ? shellDoubleQuote(options.runtimeShimDirectory) : undefined;
+  const escapedShellEnvRestorePath =
+    options.shellEnvRestorePath !== undefined ? shellDoubleQuote(options.shellEnvRestorePath) : undefined;
+  const agentRequired = !usesLoopbackAddressOnlyRouting(options.settings);
+  const removeNativeHookPreloadScript = [
+    shellRemovePathListEntry("DYLD_INSERT_LIBRARIES", options.hookLibraryPath),
+    shellRemovePathListEntry("LD_PRELOAD", options.hookLibraryPath),
+  ].join("\n");
+  const runtimeShimPathPrependScript =
+    options.runtimeShimDirectory !== undefined ? shellPrependPathListEntry("PATH", options.runtimeShimDirectory) : "";
+  const nativeHookPreloadScript =
+    process.platform === "darwin"
+      ? [
+          `export PORT_MANAGER_DYLD_INSERT_LIBRARIES="${escapedHookLibraryPath}"`,
+          shellPrependPathListEntry("DYLD_INSERT_LIBRARIES", options.hookLibraryPath),
+        ].join("\n")
+      : process.platform === "linux"
+        ? [
+            `export PORT_MANAGER_LD_PRELOAD="${escapedHookLibraryPath}"`,
+            shellPrependPathListEntry("LD_PRELOAD", options.hookLibraryPath),
+          ].join("\n")
+        : "";
+  const runtimeShimSentinelName = process.platform === "darwin" ? "node" : "docker";
+
+  return `# Port Manager shell startup
+# This file is generated by the VS Code Port Manager extension.
+if [ -n "\${PORT_MANAGER_NETWORK_ID:-}" ] || [ -n "\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-}" ] || [ -n "\${PORT_MANAGER_BORROWED_NETWORK_ID:-}" ] || [ -n "\${NEWDLOPS_PM_NETWORK_ID:-}" ] || [ -n "\${NEWDLOPS_PM_BORROWED_NETWORK_ID:-}" ]; then
+  unset PORT_MANAGER_HOOK_DISABLED
+  export PORT_MANAGER_HOOK=1
+else
+  export PORT_MANAGER_HOOK=0
+  export PORT_MANAGER_HOOK_DISABLED=1
+  export PORT_MANAGER_HOOK_DAEMON_STARTED=0
+  export PORT_MANAGER_RUNTIME_SHIM_READY=0
+  unset PORT_MANAGER_DYLD_INSERT_LIBRARIES PORT_MANAGER_LD_PRELOAD
+  unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV} ${AGENT_REQUIRED_ENV}
+  ${escapedShellEnvRestorePath !== undefined ? `if [ -n "\${PORT_MANAGER_PREV_BASH_ENV:-}" ] && [ "\${BASH_ENV:-}" = "${escapedShellEnvRestorePath}" ]; then export BASH_ENV="\${PORT_MANAGER_PREV_BASH_ENV}"; elif [ "\${BASH_ENV:-}" = "${escapedShellEnvRestorePath}" ]; then unset BASH_ENV; fi` : ""}
+  unset PORT_MANAGER_PREV_BASH_ENV
+  ${removeNativeHookPreloadScript}
+fi
+export PORT_MANAGER_AGENT_SOCKET="${escapedSocketPath}"
+export PORT_MANAGER_ROUTES_FILE="${escapedRouteTablePath}"
+export PORT_MANAGER_GLOBAL_ROUTES_FILE="${escapedRouteTablePath}"
+export PORT_MANAGER_HOST_ACCESS_FILE="${escapedHostAccessFilePath}"
+export PORT_MANAGER_NETWORKS_FILE="${escapedTerminalNetworkSelectionFilePath}"
+export PORT_MANAGER_AGENT_MAIN="${escapedAgentMainPath}"
+export PORT_MANAGER_AGENT_EXECUTABLE="${escapedNativeAgentPath}"
+export PORT_MANAGER_EXPECTED_VERSION="${escapedPackageVersion}"
+export PORT_MANAGER_CONTAINER_MAP_HELPER="${escapedNativeContainerMapPath}"
+export ${DOCKER_SHIM_PATH_ENV}="${escapedDockerShimPath}"
+export PORT_MANAGER_SCAN_RANGE="${options.settings.scanRange}"
+export PORT_MANAGER_ROUTING_MODE="${options.settings.routingMode}"
+export ${AGENT_REQUIRED_ENV}="${agentRequired ? "1" : "0"}"
+${options.settings.experimentalRouteOwnershipMode !== "process"
+  ? `export ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}="${options.settings.experimentalRouteOwnershipMode}"`
+  : `unset ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}`}
+export PORT_MANAGER_VIRTUAL_PORT_START="${options.settings.virtualPortRangeStart}"
+export PORT_MANAGER_VIRTUAL_PORT_END="${options.settings.virtualPortRangeEnd}"
+export PORT_MANAGER_FIXED_PROTOCOL_PORTS="${options.settings.fixedProtocolPorts.join(",")}"
+export PORT_MANAGER_PRESERVE_LISTEN_PORTS="${options.settings.preservedListenPorts.join(",")}"
+export ${ROUTE_TABLE_TTL_SECONDS_ENV}="${options.settings.routeTableTtlSeconds}"
+${escapedRuntimeShimDirectory !== undefined ? `export ${RUNTIME_SHIM_DIRECTORY_ENV}="${escapedRuntimeShimDirectory}"
+${runtimeShimPathPrependScript}
+hash -r 2>/dev/null || true` : ""}
+${escapedShellEnvRestorePath !== undefined ? `if [ "\${PORT_MANAGER_HOOK:-0}" = "1" ]; then
+  export PORT_MANAGER_DYLD_INSERT_LIBRARIES="${escapedHookLibraryPath}"
+  export PORT_MANAGER_LD_PRELOAD="${escapedHookLibraryPath}"
+if [ -n "\${BASH_ENV:-}" ] && [ "\${BASH_ENV}" != "${escapedShellEnvRestorePath}" ]; then
+  export PORT_MANAGER_PREV_BASH_ENV="\${BASH_ENV}"
+fi
+  export BASH_ENV="${escapedShellEnvRestorePath}"
+fi` : ""}
+
+if [ -n "\${PORT_MANAGER_NETWORK_NAME:-}" ]; then
+  printf '\\033]0;%s\\007' "Port Manager: \${PORT_MANAGER_NETWORK_NAME}" 2>/dev/null || true
+fi
+
+pm() {
+  . "${escapedCommandLibraryPath}" || return $?
+  pm "$@"
+}
+
+if [ "\${PORT_MANAGER_HOOK:-0}" = "1" ]; then
+  if [ "\${${AGENT_REQUIRED_ENV}:-${agentRequired ? "1" : "0"}}" = "1" ]; then
+    . "${escapedCommandLibraryPath}"
+  else
+${nativeHookPreloadScript
+  .split("\n")
+  .filter((line) => line.length > 0)
+  .map((line) => `    ${line}`)
+  .join("\n")}
+    export PORT_MANAGER_HOOK_DAEMON_STARTED=0
+    if [ -z "\${PORT_MANAGER_RUNTIME_SHIM_DIR:-}" ] || { [ -d "\${PORT_MANAGER_RUNTIME_SHIM_DIR}" ] && [ -x "\${PORT_MANAGER_RUNTIME_SHIM_DIR}/${runtimeShimSentinelName}" ]; }; then
+      export PORT_MANAGER_RUNTIME_SHIM_READY=1
+    else
+      export PORT_MANAGER_HOOK=0
+      export PORT_MANAGER_HOOK_DISABLED=1
+      export PORT_MANAGER_RUNTIME_SHIM_READY=0
+    fi
+  fi
+fi
+`;
 }
 
 /** Builds the POSIX shell snippet that injects the native socket hook. */
@@ -3347,7 +3486,7 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     'const routeEndpointKeys=new Set(routes.map((route)=>hostKey(route.host)+":"+Number(route.logicalPort)).filter((value)=>!/NaN$/.test(value)));',
     'const routeRoots=Array.from(new Set(routes.map((route)=>route.cwd).filter(Boolean).map(normalize)));',
     'let psOutput="";',
-    'try{psOutput=cp.execFileSync("ps",["eww","-Ao","pid=,ppid=,pgid=,tty=,command="],{encoding:"utf8",stdio:["ignore","pipe","ignore"]});}catch{}',
+    'try{psOutput=cp.execFileSync("ps",["eww","-Ao","pid=,ppid=,pgid=,tty=,command="],{encoding:"utf8",stdio:["ignore","pipe","ignore"],maxBuffer:64*1024*1024});}catch{}',
     'const currentRoot=normalize(currentCwd);',
     'const suspicious=[];',
     'for(const rawLine of psOutput.split(/\\r?\\n/)){if(!serverLike(rawLine))continue;const row=rawLine.match(/^\\s*(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\S+)\\s+([\\s\\S]+)$/);if(!row)continue;const command=row[5];if(command.includes("PORT_MANAGER_DOCTOR_PROCESS_SCAN=1"))continue;const hookDisabled=envValue(command,"PORT_MANAGER_HOOK_DISABLED")==="1"||envValue(command,"PORT_MANAGER_HOOK")==="0";const network=envValue(command,"PORT_MANAGER_NETWORK_ID")||envValue(command,"PORT_MANAGER_ROUTE_TABLE_NETWORK_ID")||envValue(command,"PORT_MANAGER_BORROWED_NETWORK_ID")||envValue(command,"NEWDLOPS_PM_NETWORK_ID");const cwd=envValue(command,"PWD")||envValue(command,"INIT_CWD");const normalizedCwd=normalize(cwd);const related=!normalizedCwd||pathsRelated(currentRoot,normalizedCwd)||routeRoots.some((root)=>pathsRelated(root,normalizedCwd));const port=portFromLine(command);const processLoopback=envValue(command,"PORT_MANAGER_NETWORK_LOOPBACK_HOST")||loopbackHost||"127.0.0.1";const endpointKey=hostKey(processLoopback)+":"+Number(port);const portMissing=Number.isInteger(port)&&!routeLogicalPorts.has(Number(port))&&!routeEndpointKeys.has(endpointKey);const wrongNetwork=Boolean(currentNetwork&&network&&network!==currentNetwork);const missingNetwork=Boolean(currentNetwork&&!network);if(!hookDisabled&&!wrongNetwork&&!(missingNetwork&&related)&&!(portMissing&&related))continue;suspicious.push({pid:row[1],pgid:row[3],tty:row[4],hook:hookDisabled?"disabled":envValue(command,"PORT_MANAGER_HOOK")||"unset",network:network||"none",cwd:cwd||"-",port:Number.isInteger(port)?String(port):"-",reason:wrongNetwork?"other-network":hookDisabled?"hook-disabled":portMissing?"no-current-route":"no-network",command:cleanCommand(command)});if(suspicious.length>=12)break;}',
@@ -3381,6 +3520,9 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     'socket.once("error",()=>finish(1));',
     'socket.on("data",(chunk)=>{buffer+=chunk;const lineEnd=buffer.indexOf("\\n");if(lineEnd<0)return;try{const message=JSON.parse(buffer.slice(0,lineEnd));if(!message||message.ok!==true)finish(1);print(message.payload);finish(0);}catch{finish(1);}});',
   ].join("");
+  // Worker lifecycle scans are scoped by network identity: a shell may only warn
+  // about/terminate workers in its own network scope (attached → same network id,
+  // detached → network-less workers). Shared cwd alone never crosses that line.
   const workerEnvScript = [
     'const fs=require("node:fs");',
     'const cp=require("node:child_process");',
@@ -3399,14 +3541,16 @@ function buildShellHookScript(options: ShellHookScriptOptions): string {
     'function networkValue(line){return envValue(line,"PORT_MANAGER_NETWORK_ID")||envValue(line,"PORT_MANAGER_ROUTE_TABLE_NETWORK_ID")||envValue(line,"PORT_MANAGER_BORROWED_NETWORK_ID")||envValue(line,"NEWDLOPS_PM_NETWORK_ID")||envValue(line,"NEWDLOPS_PM_BORROWED_NETWORK_ID");}',
     'function display(value){return value&&value.length>0?value:"-";}',
     'let psOutput="";',
-    'try{psOutput=cp.execFileSync("ps",["eww","-Ao","pid=,ppid=,pgid=,tty=,command="],{encoding:"utf8",stdio:["ignore","pipe","ignore"]});}catch{}',
+    'try{psOutput=cp.execFileSync("ps",["eww","-Ao","pid=,ppid=,pgid=,tty=,command="],{encoding:"utf8",stdio:["ignore","pipe","ignore"],maxBuffer:64*1024*1024});}catch{}',
     'const currentRoot=normalize(currentCwd);',
     'const warnings=[];',
     'let checked=0;',
-    'for(const rawLine of psOutput.split(/\\r?\\n/)){if(!workerLike(rawLine))continue;if(rawLine.includes("PORT_MANAGER_WORKER_ENV_SCAN=1"))continue;const row=rawLine.match(/^\\s*(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\S+)\\s+([\\s\\S]+)$/);if(!row)continue;const command=row[5];const cwd=envValue(command,"PWD")||envValue(command,"INIT_CWD");const normalizedCwd=normalize(cwd);const related=Boolean(normalizedCwd&&pathsRelated(currentRoot,normalizedCwd))||command.includes(currentRoot);if(!related)continue;checked+=1;const hook=envValue(command,"PORT_MANAGER_HOOK")||"unset";const hookDisabled=envValue(command,"PORT_MANAGER_HOOK_DISABLED")==="1"||hook==="0";const version=envValue(command,"PORT_MANAGER_EXPECTED_VERSION")||"unknown";const network=networkValue(command);const reasons=[];if(hookDisabled)reasons.push("hook-disabled");if(known(expected)&&known(version)&&version!==expected)reasons.push("stale-version:"+version);if(known(expected)&&!known(version))reasons.push("missing-version");if(currentNetwork&&network&&network!==currentNetwork)reasons.push("other-network:"+network);if(currentNetwork&&!network)reasons.push("no-network");if(reasons.length>0){warnings.push({pid:row[1],pgid:row[3],tty:row[4],hook,version,network:network||"none",cwd:cwd||"-",reason:reasons.join(",")});}if(warnings.length>=8)break;}',
+    'let foreign=0;',
+    'for(const rawLine of psOutput.split(/\\r?\\n/)){if(!workerLike(rawLine))continue;if(rawLine.includes("PORT_MANAGER_WORKER_ENV_SCAN=1"))continue;const row=rawLine.match(/^\\s*(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\S+)\\s+([\\s\\S]+)$/);if(!row)continue;const command=row[5];const cwd=envValue(command,"PWD")||envValue(command,"INIT_CWD");const normalizedCwd=normalize(cwd);const related=Boolean(normalizedCwd&&pathsRelated(currentRoot,normalizedCwd))||command.includes(currentRoot);if(!related)continue;const network=networkValue(command);if((network||"")!==(currentNetwork||"")){foreign+=1;continue;}checked+=1;const hook=envValue(command,"PORT_MANAGER_HOOK")||"unset";const hookDisabled=envValue(command,"PORT_MANAGER_HOOK_DISABLED")==="1"||hook==="0";const version=envValue(command,"PORT_MANAGER_EXPECTED_VERSION")||"unknown";const reasons=[];if(hookDisabled)reasons.push("hook-disabled");if(known(expected)&&known(version)&&version!==expected)reasons.push("stale-version:"+version);if(known(expected)&&!known(version))reasons.push("missing-version");if(reasons.length>0){warnings.push({pid:row[1],pgid:row[3],tty:row[4],hook,version,network:network||"none",cwd:cwd||"-",reason:reasons.join(",")});}if(warnings.length>=8)break;}',
+    'const scopeNote=foreign>0?", "+foreign+" in other network scopes untouched":"";',
     'function printWarning(item,prefix){console.log(prefix+" pid "+item.pid+" tty="+item.tty+" pgid="+item.pgid+" hook="+display(item.hook)+" version="+display(item.version)+" network="+display(item.network)+" reason="+item.reason+" cwd="+display(item.cwd));}',
-    'if(mode==="clean"){if(checked===0){console.log("Worker clean: no matching workers");process.exit(0);}if(warnings.length===0){console.log("Worker clean: no stale workers ("+checked+" checked)");process.exit(0);}let killed=0;let failed=0;console.log("Worker clean: "+warnings.length+" stale worker"+(warnings.length===1?"":"s")+" ("+checked+" checked)");for(const item of warnings){try{process.kill(Number(item.pid),signal);killed+=1;printWarning(item,"  terminated");}catch(error){failed+=1;console.log("  failed pid "+item.pid+" reason="+item.reason+" error="+(error&&error.code||error&&error.message||String(error)));}}console.log("Worker clean: sent "+signal+" to "+killed+" process"+(killed===1?"":"es")+(failed>0?", "+failed+" failed":""));process.exit(failed>0?1:0);}',
-    'if(checked===0){console.log("Worker env check: no matching workers");}else if(warnings.length===0){console.log("Worker env check: ok ("+checked+" checked)");}else{console.log("Worker env check: "+warnings.length+" warning"+(warnings.length===1?"":"s")+" ("+checked+" checked)");for(const item of warnings){printWarning(item,"  ");}}',
+    'if(mode==="clean"){if(checked===0){console.log("Worker clean: no matching workers in this network scope"+(scopeNote?" ("+foreign+" in other scopes untouched)":""));process.exit(0);}if(warnings.length===0){console.log("Worker clean: no stale workers ("+checked+" checked"+scopeNote+")");process.exit(0);}let killed=0;let failed=0;console.log("Worker clean: "+warnings.length+" stale worker"+(warnings.length===1?"":"s")+" ("+checked+" checked"+scopeNote+")");for(const item of warnings){try{process.kill(Number(item.pid),signal);killed+=1;printWarning(item,"  terminated");}catch(error){failed+=1;console.log("  failed pid "+item.pid+" reason="+item.reason+" error="+(error&&error.code||error&&error.message||String(error)));}}console.log("Worker clean: sent "+signal+" to "+killed+" process"+(killed===1?"":"es")+(failed>0?", "+failed+" failed":""));process.exit(failed>0?1:0);}',
+    'if(checked===0){console.log("Worker env check: no matching workers in this network scope"+(scopeNote?" ("+foreign+" in other scopes untouched)":""));}else if(warnings.length===0){console.log("Worker env check: ok ("+checked+" checked"+scopeNote+")");}else{console.log("Worker env check: "+warnings.length+" warning"+(warnings.length===1?"":"s")+" ("+checked+" checked"+scopeNote+")");for(const item of warnings){printWarning(item,"  ");}}',
   ].join("");
   const nodeProbeScript = [
     'const net=require("node:net");',

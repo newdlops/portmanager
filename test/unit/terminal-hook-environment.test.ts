@@ -37,6 +37,52 @@ test("BASH_ENV restore script promotes runtime shims ahead of inherited PATH ent
   assert.equal(source.includes('export PATH="\\${__pm_path_rest}"'), true);
 });
 
+test("unattached terminals join the global network only when mode and alias allow", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const scopelessStart = source.indexOf("if (scope === undefined) {");
+  const scopelessEnd = source.indexOf("if (!shouldInjectTerminalHook(settings))", scopelessStart);
+  const scopelessBody = source.slice(scopelessStart, scopelessEnd);
+  const globalStart = source.indexOf("function applyGlobalNetworkEnvironment");
+  const globalEnd = source.indexOf("function isGlobalLoopbackAliasConfigured", globalStart);
+  const globalBody = source.slice(globalStart, globalEnd);
+
+  assert.notEqual(scopelessStart, -1);
+  assert.notEqual(globalStart, -1);
+
+  // Gate: setting + loopback-address-only mode + verified lo0 alias. On any
+  // miss the terminal keeps the plain scopeless env — creation never fails.
+  assert.equal(scopelessBody.includes("settings.globalNetwork &&"), true);
+  assert.equal(scopelessBody.includes("usesLoopbackAddressOnlyRouting(settings) &&"), true);
+  assert.equal(scopelessBody.includes("isGlobalLoopbackAliasConfigured()"), true);
+  assert.equal(scopelessBody.includes("applyScopelessGatewayEnvironment(context, collection, settings);"), true);
+
+  // The global scope carries the reserved id on all five id vars plus the
+  // IS_GLOBAL flag; identity vars and workspace scaffolding stay absent.
+  for (const idVar of [
+    "PORT_MANAGER_NETWORK_ID",
+    "PORT_MANAGER_ROUTE_TABLE_NETWORK_ID",
+    "PORT_MANAGER_BORROWED_NETWORK_ID",
+    "NEWDLOPS_PM_NETWORK_ID",
+    "NEWDLOPS_PM_BORROWED_NETWORK_ID",
+  ]) {
+    assert.equal(
+      globalBody.includes(`collection.replace("${idVar}", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_MUTATOR_OPTIONS);`),
+      true,
+      `${idVar} must carry the reserved global network id`,
+    );
+  }
+  assert.equal(globalBody.includes('collection.replace(NETWORK_IS_GLOBAL_ENV, "1", TERMINAL_MUTATOR_OPTIONS);'), true);
+  assert.equal(globalBody.includes("PORT_MANAGER_NETWORK_NAME"), false);
+  assert.equal(globalBody.includes("NETWORK_DNS_ALIAS"), false);
+  assert.equal(globalBody.includes("ensureNetworkEnvFileScaffold"), false);
+  assert.equal(globalBody.includes("PORT_MANAGER_COMPOSE_LOGICAL_PORTS"), false);
+  assert.equal(globalBody.includes("applyLoopbackRoutingHosts(collection, GLOBAL_LOGICAL_NETWORK_ID, settings);"), true);
+
+  // Stage rollout: the setting ships off until the edge normalization lands.
+  assert.equal(DEFAULT_PORT_MANAGER_SETTINGS.globalNetwork, false);
+});
+
 test("terminal hook preload entries are normalized across multiple VS Code windows", () => {
   const terminalHookEnvironmentPath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
   const networkServicePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
@@ -514,6 +560,29 @@ test("extension auto-refreshes shell hook assets without auto-mutating profiles"
   assert.equal(ensureBody.includes("await this.writeShellHookAssets(context);"), true);
   assert.equal(ensureBody.includes("appendLineOnce"), false);
   assert.equal(installBody.includes("appendLineOnce"), true);
+});
+
+test("profile shell hook lazy-loads heavy pm command implementation", () => {
+  const commandSourcePath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const commandSource = fs.readFileSync(commandSourcePath, "utf8");
+  const startupStart = commandSource.indexOf("function buildShellHookStartupScript");
+  const commandLibraryStart = commandSource.indexOf("function buildShellHookScript", startupStart);
+  const startupSource = commandSource.slice(startupStart, commandLibraryStart);
+
+  assert.notEqual(startupStart, -1);
+  assert.notEqual(commandLibraryStart, -1);
+  assert.equal(commandSource.includes('const hookCommandLibraryPath = path.join(hookDirectory, "portmanager-commands.sh");'), true);
+  assert.equal(commandSource.includes("const commandScriptContents = buildShellHookScript(shellHookOptions);"), true);
+  assert.equal(commandSource.includes("const hookScriptContents = buildShellHookStartupScript({"), true);
+  assert.equal(commandSource.includes("existingCommandScript !== commandScriptContents"), true);
+  assert.equal(commandSource.includes("await fs.chmod(hookCommandLibraryPath, 0o700)"), true);
+  assert.equal(startupSource.includes("# Port Manager shell startup"), true);
+  assert.equal(startupSource.includes('pm() {'), true);
+  assert.equal(startupSource.includes('. "${escapedCommandLibraryPath}" || return $?'), true);
+  assert.equal(startupSource.includes('if [ "\\${${AGENT_REQUIRED_ENV}:-${agentRequired ? "1" : "0"}}" = "1" ]; then'), true);
+  assert.equal(startupSource.includes("routePrintScript"), false);
+  assert.equal(startupSource.includes("doctorRoutingScript"), false);
+  assert.equal(startupSource.includes("workerEnvScript"), false);
 });
 
 test("agent client startup avoids blocking on full listener refresh", () => {

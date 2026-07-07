@@ -7,6 +7,7 @@ set -eu
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 HOOK_SOURCE_FILE="$ROOT_DIR/native/hook/portmanager_hook.c"
 ASDF_SHIM_SOURCE_FILE="$ROOT_DIR/native/asdf-shim/portmanager_asdf_shim.c"
+PROCESS_SCOPE_SHIM_SOURCE_FILE="$ROOT_DIR/native/process-scope-shim/portmanager_process_scope_shim.c"
 TTY_INPUT_SOURCE_FILE="$ROOT_DIR/native/tty-input/portmanager_tty_input.c"
 TCP_ROUTER_SOURCE_FILE="$ROOT_DIR/native/router/portmanager_tcp_router.c"
 PEER_PROCESS_SOURCE_FILE="$ROOT_DIR/native/shared/pm_peer_process.c"
@@ -36,6 +37,7 @@ case "$(uname -s)" in
   Darwin)
     cc -Wall -Wextra -O2 -dynamiclib "$HOOK_SOURCE_FILE" "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/libportmanager_hook.dylib"
     cc -Wall -Wextra -O2 "$ASDF_SHIM_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_asdf_shim"
+    cc -Wall -Wextra -O2 "$PROCESS_SCOPE_SHIM_SOURCE_FILE" "$PEER_PROCESS_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_scope_shim"
     cc -Wall -Wextra -O2 "$TTY_INPUT_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tty_input"
     cc -Wall -Wextra -O2 -pthread "$TCP_ROUTER_SOURCE_FILE" "$PEER_PROCESS_SOURCE_FILE" "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tcp_router"
     cc -Wall -Wextra -O2 -pthread "$HOST_EXPOSURE_PROXY_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_host_exposure_proxy"
@@ -50,6 +52,7 @@ case "$(uname -s)" in
       # final artifacts explicitly after every rebuild.
       codesign --force --sign - "$OUTPUT_DIR/libportmanager_hook.dylib" >/dev/null
       codesign --force --sign - "$OUTPUT_DIR/portmanager_asdf_shim" >/dev/null
+      codesign --force --sign - "$OUTPUT_DIR/portmanager_process_scope_shim" >/dev/null
       codesign --force --sign - "$OUTPUT_DIR/portmanager_tty_input" >/dev/null
       codesign --force --sign - "$OUTPUT_DIR/portmanager_tcp_router" >/dev/null
       codesign --force --sign - "$OUTPUT_DIR/portmanager_host_exposure_proxy" >/dev/null

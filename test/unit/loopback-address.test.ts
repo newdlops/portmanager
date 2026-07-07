@@ -6,9 +6,12 @@ import test from "node:test";
 import {
   ACTUAL_LOOPBACK_HOST_ENV,
   browserLoopbackAddressForNetwork,
+  GLOBAL_LOGICAL_NETWORK_ID,
   hostLocalGatewayLoopbackAddressForNetwork,
+  isGlobalNetworkId,
   isLoopbackAddressRoutingEnabled,
   loopbackAddressForNetwork,
+  NETWORK_IS_GLOBAL_ENV,
   NETWORK_LOOPBACK_HOST_ENV,
   resolveLoopbackAddressRoutingMode,
   resolveTerminalLoopbackAddressRoutingMode,
@@ -47,6 +50,19 @@ test("host-local gateway redirect addresses live in their own hidden band", () =
   assert.notEqual(redirectAddress, appAddress);
   assert.notEqual(redirectAddress, browserAddress);
   assert.match(redirectAddress, /^127\.(14[4-9]|15[0-9]|16[0-9]|17[0-5])\.\d{1,3}\.\d{1,3}$/);
+});
+
+test("the global network resolves to fixed band-external coordinates", () => {
+  assert.equal(isGlobalNetworkId(GLOBAL_LOGICAL_NETWORK_ID), true);
+  assert.equal(isGlobalNetworkId("network-a"), false);
+  assert.equal(isGlobalNetworkId(undefined), false);
+  assert.equal(NETWORK_IS_GLOBAL_ENV, "PORT_MANAGER_NETWORK_IS_GLOBAL");
+
+  // Fixed constants outside every hashed band so the global coordinates are
+  // recognizable in logs, pf rules, and lsof output.
+  assert.equal(loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID), "127.1.0.1");
+  assert.equal(browserLoopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID), "127.1.1.1");
+  assert.equal(hostLocalGatewayLoopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID), "127.1.2.1");
 });
 
 test("loopback address routing mode uses loopback as the default actual-port policy", () => {

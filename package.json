@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8180",
+  "version": "0.0.8184",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -960,6 +960,11 @@
           "type": "boolean",
           "default": true,
           "description": "Let Port Manager own logical ports on localhost and route each connection to its logical network by identifying the source process. Turn off to route only through the in-process terminal hook (no daemon-owned localhost listeners)."
+        },
+        "portManager.globalNetwork": {
+          "type": "boolean",
+          "default": false,
+          "description": "Treat unattached terminals as members of the reserved global logical network (fixed loopback 127.1.0.1) so no process lives outside a network. Requires loopback-address-only route ownership and the logical port gateway; unattached terminals keep the plain environment when those are off or the global alias is missing."
         },
         "portManager.developmentLogPath": {
           "type": "string",
