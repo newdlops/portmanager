@@ -4758,10 +4758,19 @@ export class PortManagerNetworkService implements DisposableLike {
   private async findNetworkScopedListener(
     networkId: string,
     logicalPort: number,
+    targetHost?: string,
   ): Promise<ListeningPort | undefined> {
+    const normalizedTargetHost = targetHost === undefined ? undefined : normalizeEndpointHostKey(targetHost);
     const findInSnapshot = async (snapshot: AgentSnapshot): Promise<ListeningPort | undefined> => {
       for (const listener of snapshot.listeners) {
         if (listener.port !== logicalPort || listener.pid === undefined) {
+          continue;
+        }
+
+        if (
+          normalizedTargetHost !== undefined &&
+          normalizeEndpointHostKey(listener.localAddress) !== normalizedTargetHost
+        ) {
           continue;
         }
 
@@ -4938,6 +4947,12 @@ export class PortManagerNetworkService implements DisposableLike {
         await this.waitForBackendReachable(hostDefaultGatewayTarget.host, hostDefaultGatewayTarget.port);
         return hostDefaultGatewayTarget;
       }
+
+      const globalSamePortTarget = await this.resolveGlobalSamePortClientTarget(logicalPort);
+      if (globalSamePortTarget !== undefined) {
+        await this.waitForBackendReachable(globalSamePortTarget.host, globalSamePortTarget.port);
+        return globalSamePortTarget;
+      }
     }
 
     const ownerRoute = this.findNonNetworkOwnerRoute(logicalPort, clientCwd);
@@ -4946,6 +4961,44 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     return { host: ownerRoute.host, port: ownerRoute.actualPort };
+  }
+
+  /**
+   * Resolves host-default clients to a hooked global-scope same-port listener.
+   *
+   * The global network is not an isolated backend namespace, but address-only
+   * hooks still bind global dev servers on the deterministic global loopback.
+   * When no explicit gateway/compose route exists, this lets browser and other
+   * host-default clients reach that listener without falling into the router's
+   * own localhost socket.
+   */
+  private async resolveGlobalSamePortClientTarget(
+    logicalPort: number,
+  ): Promise<LogicalPortRouterTarget | undefined> {
+    const globalLoopbackHost = loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID);
+    const listener = await this.findNetworkScopedListener(GLOBAL_LOGICAL_NETWORK_ID, logicalPort, globalLoopbackHost);
+    if (listener === undefined) {
+      if (devLogEnabled()) {
+        devLog("ts-router", `global-default logical_port=${logicalPort} -> MISS (no listener)`);
+      }
+      return undefined;
+    }
+
+    const host = normalizeBrowserProxyTargetHost(listener.localAddress);
+    if (host !== globalLoopbackHost) {
+      if (devLogEnabled()) {
+        devLog(
+          "ts-router",
+          `global-default logical_port=${logicalPort} host=${host} expected=${globalLoopbackHost} -> MISS (host mismatch)`,
+        );
+      }
+      return undefined;
+    }
+
+    if (devLogEnabled()) {
+      devLog("ts-router", `global-default logical_port=${logicalPort} -> ${host}:${listener.port}`);
+    }
+    return { host, port: listener.port };
   }
 
   /**
@@ -5337,12 +5390,14 @@ export class PortManagerNetworkService implements DisposableLike {
      * keep dialing 127.0.0.1, so their networks need compatibility listeners.
      */
     const snapshot = this.processService?.getSnapshot();
+    const settings = readPortManagerSettings();
     const logicalPorts = collectLogicalRouterPorts(
       snapshot?.routes ?? [],
       snapshot?.listeners ?? [],
       this.registry.getSnapshot().attachments,
       {
-        gatewayEnabled: readPortManagerSettings().logicalPortGateway,
+        gatewayEnabled: settings.logicalPortGateway,
+        globalNetworkEnabled: settings.globalNetwork && usesLoopbackAddressOnlyRouting(settings),
         composeLogicalPorts: this.collectAllComposeLogicalPorts(),
       },
     );
@@ -8674,7 +8729,11 @@ function collectLogicalRouterPorts(
   routes: readonly LogicalPortRoute[],
   listeners: readonly ListeningPort[] = [],
   attachments: readonly TerminalAttachment[] = [],
-  options: { readonly gatewayEnabled?: boolean; readonly composeLogicalPorts?: readonly number[] } = {},
+  options: {
+    readonly gatewayEnabled?: boolean;
+    readonly globalNetworkEnabled?: boolean;
+    readonly composeLogicalPorts?: readonly number[];
+  } = {},
 ): readonly number[] {
   const ports = new Set<number>();
   const hostClientNetworkIds = collectHostClientAttachmentNetworkIds(attachments);
@@ -8700,6 +8759,27 @@ function collectLogicalRouterPorts(
       !externallyCoveredPorts.has(route.logicalPort)
     ) {
       ports.add(route.logicalPort);
+    }
+  }
+
+  /*
+   * Hooked global-scope dev servers bind on the deterministic global loopback
+   * without always publishing a durable route row. Host clients still dial
+   * localhost, so the gateway must own the matching localhost port and then
+   * resolve to the global loopback listener.
+   */
+  if (options.gatewayEnabled === true && options.globalNetworkEnabled === true) {
+    const globalLoopbackHost = loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID);
+    for (const listener of listeners) {
+      const listenerHost = normalizeEndpointHostKey(listener.localAddress);
+      if (
+        listener.protocol === "tcp" &&
+        isTcpPort(listener.port) &&
+        listenerHost === globalLoopbackHost &&
+        !externallyCoveredPorts.has(listener.port)
+      ) {
+        ports.add(listener.port);
+      }
     }
   }
 

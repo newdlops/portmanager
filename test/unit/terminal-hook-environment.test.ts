@@ -1983,7 +1983,12 @@ test("logical routers expose host-client networks without taking unrelated netwo
   // hookless host-client scope remains the legacy fallback when it is off.
   assert.equal(collectLogicalRouterPorts.includes("options.gatewayEnabled === true"), true);
   assert.equal(collectLogicalRouterPorts.includes("hostClientNetworkIds.has(route.networkId)"), true);
-  assert.equal(syncBody.includes("gatewayEnabled: readPortManagerSettings().logicalPortGateway"), true);
+  assert.equal(source.includes("const settings = readPortManagerSettings();"), true);
+  assert.equal(syncBody.includes("gatewayEnabled: settings.logicalPortGateway"), true);
+  assert.equal(
+    syncBody.includes("globalNetworkEnabled: settings.globalNetwork && usesLoopbackAddressOnlyRouting(settings)"),
+    true,
+  );
   assert.equal(source.includes("function collectHostClientAttachmentNetworkIds"), true);
   assert.equal(source.includes("function isHooklessHostClientAttachment"), true);
   assert.equal(source.includes("attachment.id.startsWith(PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX)"), true);
@@ -1997,6 +2002,9 @@ test("logical routers expose host-client networks without taking unrelated netwo
   assert.equal(routeNeedsLogicalRouter.includes("route.actualPort !== route.logicalPort"), true);
   assert.equal(routeNeedsLogicalRouter.includes("!listenerCoversLogicalRouterHost(route.host)"), true);
   assert.equal(collectLogicalRouterPorts.includes("collectExternallyCoveredLogicalRouterPorts(listeners)"), true);
+  assert.equal(collectLogicalRouterPorts.includes("options.globalNetworkEnabled === true"), true);
+  assert.equal(collectLogicalRouterPorts.includes("loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID)"), true);
+  assert.equal(collectLogicalRouterPorts.includes("listenerHost === globalLoopbackHost"), true);
   assert.equal(source.includes("function listenerCoversLogicalRouterHost"), true);
   assert.equal(source.includes("function endpointHostMatches"), true);
   assert.equal(source.includes("function isGeneratedLoopbackHost"), true);
@@ -2033,6 +2041,9 @@ test("logical router classifies clients by process tree label before hook enviro
   const networkTargetStart = source.indexOf("private async resolveNetworkClientTarget");
   const networkTargetEnd = source.indexOf("private async resolveNonNetworkClientTarget", networkTargetStart);
   const resolveNetworkClientTarget = source.slice(networkTargetStart, networkTargetEnd);
+  const scopedListenerStart = source.indexOf("private async findNetworkScopedListener");
+  const scopedListenerEnd = source.indexOf("private async resolveLogicalPortRouterTarget", scopedListenerStart);
+  const findNetworkScopedListener = source.slice(scopedListenerStart, scopedListenerEnd);
   const nonNetworkTargetStart = source.indexOf("private async resolveNonNetworkClientTarget");
   const nonNetworkTargetEnd = source.indexOf("private findNonNetworkOwnerRoute", nonNetworkTargetStart);
   const resolveNonNetworkClientTarget = source.slice(nonNetworkTargetStart, nonNetworkTargetEnd);
@@ -2084,15 +2095,19 @@ test("logical router classifies clients by process tree label before hook enviro
 
   // In address-only mode, an unattributable router client is a pure host
   // execution that did not inherit hook state. It may use the host-default
-  // fixed-protocol gateway or an explicit compose publication, but must not be
-  // synthesized into the reserved global network identity used by explicitly
-  // hooked unattached terminals.
+  // fixed-protocol gateway, an explicit compose publication, or a hooked global
+  // same-port listener, but must not be resolved through the global id as a
+  // normal isolated network route.
   assert.equal(
     resolveNonNetworkClientTarget.includes("settings.globalNetwork && usesLoopbackAddressOnlyRouting(settings)"),
     true,
   );
   assert.equal(
     resolveNonNetworkClientTarget.includes("this.resolveHostDefaultGatewayClientTarget(logicalPort)"),
+    true,
+  );
+  assert.equal(
+    resolveNonNetworkClientTarget.includes("this.resolveGlobalSamePortClientTarget(logicalPort)"),
     true,
   );
   assert.equal(
@@ -2105,9 +2120,20 @@ test("logical router classifies clients by process tree label before hook enviro
   );
   assert.equal(
     resolveNonNetworkClientTarget.indexOf("this.resolveHostDefaultGatewayClientTarget(logicalPort)") <
+      resolveNonNetworkClientTarget.indexOf("this.resolveGlobalSamePortClientTarget(logicalPort)"),
+    true,
+  );
+  assert.equal(
+    resolveNonNetworkClientTarget.indexOf("this.resolveGlobalSamePortClientTarget(logicalPort)") <
       resolveNonNetworkClientTarget.indexOf("this.findNonNetworkOwnerRoute(logicalPort, clientCwd)"),
     true,
   );
+  assert.equal(source.includes("private async resolveGlobalSamePortClientTarget("), true);
+  assert.equal(source.includes("loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID)"), true);
+  assert.equal(source.includes("this.findNetworkScopedListener(GLOBAL_LOGICAL_NETWORK_ID, logicalPort, globalLoopbackHost)"), true);
+  assert.equal(findNetworkScopedListener.includes("targetHost?: string"), true);
+  assert.equal(findNetworkScopedListener.includes("normalizeEndpointHostKey(listener.localAddress) !== normalizedTargetHost"), true);
+  assert.equal(source.includes("global-default logical_port=${logicalPort}"), true);
   assert.equal(source.includes("private resolveHostDefaultGatewayClientTarget(logicalPort: number)"), true);
   assert.equal(source.includes("collectHostGatewayExposures("), true);
   assert.equal(source.includes("selectHostDefaultGatewayExposure(exposures"), true);
