@@ -531,18 +531,27 @@ export class PortManagerCommandController implements DisposableLike {
 
     const existingCloneMutation =
       composeAttachMode === "as-is" ? buildExistingCloneMutationFromCandidate(candidate) : undefined;
+    // In-place Compose adjustment needs the original Compose files; otherwise keep legacy route-only attach.
+    const shouldAdjustComposeInPlace =
+      candidate.composeProject !== undefined &&
+      composeAttachMode === "as-is" &&
+      existingCloneMutation === undefined &&
+      (candidate.composeConfigFiles?.length ?? 0) > 0;
     const composeFiles = existingCloneMutation?.composeFiles ?? candidate.composeConfigFiles;
     const composeWorkingDirectory =
       resolveComposeWorkingDirectory(candidate.composeWorkingDirectory, composeFiles) ??
       getDefaultWorkspaceFolder() ??
       process.cwd();
     const composeMutation =
-      candidate.composeProject !== undefined && isComposeCloneAttachMode(composeAttachMode)
+      candidate.composeProject !== undefined &&
+      (isComposeCloneAttachMode(composeAttachMode) || shouldAdjustComposeInPlace)
         ? {
             composeMutation: {
-              mode: "clone" as const,
-              allowStatefulClone,
-              ...(attachedProjectName !== undefined ? { attachedProjectName } : {}),
+              mode: shouldAdjustComposeInPlace ? ("in-place" as const) : ("clone" as const),
+              ...(isComposeCloneAttachMode(composeAttachMode) ? { allowStatefulClone } : {}),
+              ...(composeAttachMode === "clone-custom" && attachedProjectName !== undefined
+                ? { attachedProjectName }
+                : {}),
               runtime: candidate.runtime,
               workingDirectory: composeWorkingDirectory,
               composeFiles: candidate.composeConfigFiles,
@@ -2544,13 +2553,18 @@ async function promptForComposeAttachMode(
   candidate: ContainerServiceCandidate,
 ): Promise<ComposeAttachMode | undefined> {
   const contextDetail = formatComposeAttachContextDetail(candidate);
+  const canAdjustAsIsInPlace = (candidate.composeConfigFiles?.length ?? 0) > 0;
   const asIsItem =
     candidate.portManagerClone === undefined
       ? {
           label: "Attach as-is",
-          description: "Register the current published ports without restarting Compose",
+          description: canAdjustAsIsInPlace
+            ? "Keep the Compose project name and adjust published ports in-place"
+            : "Register the current published ports without restarting Compose",
           detail: joinQuickPickDetails([
-            "Keeps the original containers exactly as they are and only adds logical-network route rows.",
+            canAdjustAsIsInPlace
+              ? "Recreates selected services with a generated override, preserving project and container names."
+              : "Compose files were not discovered, so the existing containers stay exactly as they are.",
             contextDetail,
           ]),
           mode: "as-is" as const,

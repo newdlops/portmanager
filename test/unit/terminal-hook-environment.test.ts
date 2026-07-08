@@ -1262,6 +1262,7 @@ test("compose attach waits for routing convergence before returning", () => {
 
   assert.equal(attachBody.includes("await this.convergeAfterComposeAttachmentChange([refreshedAttachment]);"), true);
   assert.equal(attachBody.includes("await this.convergeAfterComposeAttachmentChange([updatedAttachment]);"), true);
+  assert.equal(source.includes('requestedMode === "in-place" && mutation === undefined'), true);
   assert.equal(
     convergeBody.includes(
       "await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);",
@@ -1618,6 +1619,12 @@ test("container attach resolves candidates from a fresh Docker discovery pass", 
 
   assert.equal(attachBody.includes("directInput?.containerService === undefined"), true);
   assert.equal(attachBody.includes("directInput.containerService,"), true);
+  assert.equal(attachBody.includes("const shouldAdjustComposeInPlace ="), true);
+  assert.equal(attachBody.includes('composeAttachMode === "as-is"'), true);
+  assert.equal(attachBody.includes("existingCloneMutation === undefined"), true);
+  assert.equal(attachBody.includes("(candidate.composeConfigFiles?.length ?? 0) > 0"), true);
+  assert.equal(attachBody.includes('mode: shouldAdjustComposeInPlace ? ("in-place" as const) : ("clone" as const)'), true);
+  assert.equal(attachBody.includes('...(composeAttachMode === "clone-custom" && attachedProjectName !== undefined'), true);
   assert.equal(resolveBody.includes("await this.dependencies.networkService.refreshContainerServices({ force: true });"), true);
   assert.equal(resolveBody.includes("return resolveLatestContainerServiceCandidate(candidates, candidate);"), true);
   assert.equal(resolveBody.includes("getSnapshot().containerServiceCandidates"), false);

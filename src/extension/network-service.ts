@@ -7177,6 +7177,13 @@ function composeAttachmentMatchesInput(
     const mutation = attachment.mutation;
     const requestedMode = input.composeMutation.mode ?? "clone";
     const requestedComposeFiles = input.composeMutation.composeFiles ?? input.composeFiles ?? [];
+    if (requestedMode === "in-place" && mutation === undefined) {
+      return (
+        attachment.projectName === requested.projectName &&
+        sameStringList(attachment.composeFiles, requestedComposeFiles)
+      );
+    }
+
     return (
       mutation !== undefined &&
       mutation.mode === requestedMode &&
@@ -7339,7 +7346,7 @@ function buildComposeProjectRoutingRows(
       }));
     }
 
-    if (mutation.mode === "in-place" || mutation.attachedProjectName === mutation.originalProjectName) {
+    if (mutation.mode !== "in-place" && mutation.attachedProjectName === mutation.originalProjectName) {
       return [];
     }
 

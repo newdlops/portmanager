@@ -161,6 +161,80 @@ test("docker compose wrapper routes as-is attachments by cwd without an original
   }
 });
 
+test("docker compose wrapper keeps in-place attachments on their generated override", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-in-place-routing-"));
+  const projectDir = path.join(tempDir, "workspace", "docker");
+  const composeFile = path.join(projectDir, "development.yaml");
+  const overrideFile = path.join(tempDir, "workspace.ports.override.yaml");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(composeFile, "services: {}\n", "utf8");
+  fs.writeFileSync(overrideFile, "services: {}\n", "utf8");
+  fs.writeFileSync(
+    routingFile,
+    serializeComposeProjectRoutingRows([
+      {
+        networkId: "network-a",
+        runtime: "docker",
+        workingDirectory: projectDir,
+        composeFiles: [composeFile],
+        originalProjectName: "workspace",
+        attachedProjectName: "workspace",
+        overrideFile,
+      },
+    ]),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(binDir, "docker"),
+    "#!/bin/sh\nprintf 'env=%s\\n' \"${COMPOSE_PROJECT_NAME:-}\"\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n",
+    {
+      encoding: "utf8",
+      mode: 0o700,
+    },
+  );
+
+  try {
+    const output = execFileSync(
+      "sh",
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          `docker compose -p workspace -f ${shellQuote(composeFile)} up db`,
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    assert.equal(
+      output,
+      [
+        "env=workspace",
+        "<compose>",
+        "<-p>",
+        "<workspace>",
+        "<-f>",
+        `<${composeFile}>`,
+        "<-f>",
+        `<${overrideFile}>`,
+        "<up>",
+        "<--detach>",
+        "<db>",
+        "",
+      ].join("\n"),
+    );
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("network service records the runtime compose project for as-is routing rows", () => {
   const source = fs.readFileSync(path.resolve(__dirname, "../../../src/extension/network-service.ts"), "utf8");
   const rowsStart = source.indexOf("function buildComposeProjectRoutingRows");
@@ -171,6 +245,10 @@ test("network service records the runtime compose project for as-is routing rows
   assert.notEqual(rowsEnd, -1);
   assert.equal(rowsBody.includes("routingFiles.overrideFile === undefined"), true);
   assert.equal(rowsBody.includes("? attachment.projectName"), true);
+  assert.equal(
+    rowsBody.includes('mutation.mode !== "in-place" && mutation.attachedProjectName === mutation.originalProjectName'),
+    true,
+  );
 });
 
 test("docker compose wrapper infers original project names for restored clone rows", () => {
