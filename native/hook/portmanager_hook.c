@@ -4509,11 +4509,14 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
       }
       if (global_actual <= 0) {
         if (pm_default_local_connect_is_gateway_dead_end(addr, logical_port)) {
-          /* The raw coordinate is another network's compose demux, not a host
-             service; the resolver would accept and drop this connection. */
-          pm_debug("connect refused global gateway dead end logical=%d", logical_port);
-          errno = ECONNREFUSED;
-          return -1;
+          /*
+           * The raw coordinate is gateway-owned, but a global client is still a
+           * host-default caller. The TypeScript router can resolve compose
+           * exposures that are not present in the native route table yet, so let
+           * the gateway resolver make the final routing decision.
+           */
+          pm_debug("connect global gateway passthrough logical=%d", logical_port);
+          return pm_real_connect(sockfd, addr, addrlen);
         }
         if (!pm_gateway_claim_fresh(logical_port)) {
           /*

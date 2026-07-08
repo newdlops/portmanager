@@ -4969,13 +4969,15 @@ export class PortManagerNetworkService implements DisposableLike {
       [],
       registrySnapshot.composeAttachments,
     ).filter((exposure) => exposure.hostPort === logicalPort);
-    const exposures = dedupeHostGatewayExposures([...routeExposures, ...composeExposures]);
+    const generatedComposeExposures = this.collectGeneratedComposeHostGatewayExposures(logicalPort);
+    const exposures = dedupeHostGatewayExposures([...routeExposures, ...composeExposures, ...generatedComposeExposures]);
     if (exposures.length === 0) {
       if (devLogEnabled()) {
         devLog(
           "ts-router",
           `host-default logical_port=${logicalPort} fixed=${isFixedProtocolPort ? 1 : 0} ` +
-            `routeCandidates=${routeExposures.length} composeCandidates=${composeExposures.length} -> MISS (no exposure)`,
+            `routeCandidates=${routeExposures.length} composeCandidates=${composeExposures.length} ` +
+            `generatedComposeCandidates=${generatedComposeExposures.length} -> MISS (no exposure)`,
         );
       }
       return undefined;
@@ -4992,7 +4994,8 @@ export class PortManagerNetworkService implements DisposableLike {
         devLog(
           "ts-router",
           `host-default logical_port=${logicalPort} fixed=${isFixedProtocolPort ? 1 : 0} ` +
-            `routeCandidates=${routeExposures.length} composeCandidates=${composeExposures.length} -> MISS (self-loop)`,
+            `routeCandidates=${routeExposures.length} composeCandidates=${composeExposures.length} ` +
+            `generatedComposeCandidates=${generatedComposeExposures.length} -> MISS (self-loop)`,
         );
       }
       return undefined;
@@ -5007,6 +5010,74 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     return { host, port: exposure.targetPort };
+  }
+
+  /**
+   * Recovers host-default compose candidates from generated routing artifacts.
+   *
+   * The registry is the durable source of truth, but extension reload or storage
+   * repair can briefly leave it empty while Docker clones and generated override
+   * files are still alive. Router fallback reads only Port Manager-generated TSV
+   * rows and the matching `.ports.override.yaml` shape, so arbitrary user Compose
+   * YAML is not interpreted here.
+   */
+  private collectGeneratedComposeHostGatewayExposures(logicalPort: number): readonly HostPortExposure[] {
+    const storageDirectory = this.context.globalStorageUri.fsPath;
+    let entries: readonly syncFs.Dirent[];
+    try {
+      entries = syncFs.readdirSync(storageDirectory, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+
+    const overrideFilesByNetwork = new Map<string, Set<string>>();
+    for (const entry of entries) {
+      if (
+        !entry.isFile() ||
+        !entry.name.startsWith("compose-project-routing-") ||
+        !entry.name.endsWith(".tsv")
+      ) {
+        continue;
+      }
+
+      const routingFilePath = path.join(storageDirectory, entry.name);
+      let contents: string;
+      try {
+        contents = syncFs.readFileSync(routingFilePath, "utf8");
+      } catch {
+        continue;
+      }
+
+      for (const line of contents.split(/\r?\n/)) {
+        if (line.trim().length === 0) {
+          continue;
+        }
+        const fields = line.split("\t");
+        const networkId = fields[1];
+        const overrideFile = fields[fields.length - 1];
+        if (
+          networkId === undefined ||
+          networkId.length === 0 ||
+          overrideFile === undefined ||
+          !overrideFile.endsWith(".ports.override.yaml") ||
+          !path.isAbsolute(overrideFile)
+        ) {
+          continue;
+        }
+        const networkOverrides = overrideFilesByNetwork.get(networkId) ?? new Set<string>();
+        networkOverrides.add(overrideFile);
+        overrideFilesByNetwork.set(networkId, networkOverrides);
+      }
+    }
+
+    const exposures: HostPortExposure[] = [];
+    for (const [networkId, overrideFiles] of overrideFilesByNetwork) {
+      for (const overrideFile of overrideFiles) {
+        exposures.push(...collectGeneratedComposeOverrideExposures(networkId, overrideFile, logicalPort));
+      }
+    }
+
+    return dedupeHostGatewayExposures(exposures);
   }
 
   /** Finds the network-less relocated listen route that owns a logical port. */
@@ -8937,6 +9008,90 @@ function dedupeHostGatewayExposures(exposures: readonly HostPortExposure[]): rea
   return [...byId.values()];
 }
 
+function collectGeneratedComposeOverrideExposures(
+  networkId: string,
+  overrideFile: string,
+  logicalPort: number,
+): readonly HostPortExposure[] {
+  let contents: string;
+  try {
+    contents = syncFs.readFileSync(overrideFile, "utf8");
+  } catch {
+    return [];
+  }
+
+  const exposures: HostPortExposure[] = [];
+  let serviceName = "";
+  let logicalPortByContainerPort = new Map<number, number>();
+
+  for (const line of contents.split(/\r?\n/)) {
+    const serviceMatch = /^  '([^']+)':\s*$/.exec(line);
+    if (serviceMatch !== null) {
+      serviceName = serviceMatch[1] ?? "";
+      logicalPortByContainerPort = new Map<number, number>();
+      continue;
+    }
+
+    const labelMatch =
+      /newdlops\.portmanager\.logical-port\.(\d+)\.tcp['"]?:\s*['"]?(\d+)['"]?/.exec(line);
+    if (labelMatch !== null) {
+      const containerPort = Number(labelMatch[1]);
+      const serviceLogicalPort = Number(labelMatch[2]);
+      if (isTcpPort(containerPort) && isTcpPort(serviceLogicalPort)) {
+        logicalPortByContainerPort.set(containerPort, serviceLogicalPort);
+      }
+      continue;
+    }
+
+    const publishMatch = /^\s*-\s*'([^']+)'/.exec(line);
+    if (publishMatch === null) {
+      continue;
+    }
+
+    const published = parseGeneratedComposePublishedPort(publishMatch[1] ?? "");
+    if (published === undefined) {
+      continue;
+    }
+
+    const serviceLogicalPort = logicalPortByContainerPort.get(published.containerPort);
+    if (serviceLogicalPort !== logicalPort) {
+      continue;
+    }
+
+    exposures.push({
+      id: `host-gateway-generated:${networkId}:${logicalPort}:${published.hostAddress}:${published.hostPort}:${serviceName}`,
+      networkId,
+      hostAddress: browserLoopbackAddressForNetwork(networkId),
+      hostPort: logicalPort,
+      targetAddress: published.hostAddress,
+      targetPort: published.hostPort,
+      protocol: "tcp",
+      status: "active",
+      createdAt: "host-gateway-generated",
+    });
+  }
+
+  return exposures;
+}
+
+function parseGeneratedComposePublishedPort(
+  value: string,
+): { readonly hostAddress: string; readonly hostPort: number; readonly containerPort: number } | undefined {
+  const match = /^([^:]+):(\d+):(\d+)\/tcp$/.exec(value.trim());
+  if (match === null) {
+    return undefined;
+  }
+
+  const hostAddress = match[1]?.trim() ?? "";
+  const hostPort = Number(match[2]);
+  const containerPort = Number(match[3]);
+  if (hostAddress.length === 0 || !isTcpPort(hostPort) || !isTcpPort(containerPort)) {
+    return undefined;
+  }
+
+  return { hostAddress, hostPort, containerPort };
+}
+
 function hostGatewayExposureId(networkId: string, logicalPort: number): string {
   return `host-gateway:${networkId}:${logicalPort}`;
 }
@@ -11194,6 +11349,13 @@ function shellPrependLibrary(name: string, libraryPath: string): string {
 }
 
 function shellPrependPathListEntry(name: string, entry: string): string {
+  const staleHookSkip = isPortManagerHookLibraryPath(entry)
+    ? [
+        '  case "$__pm_path_entry" in',
+        "    */media/native/libportmanager_hook.dylib) continue ;;",
+        "  esac",
+      ]
+    : [];
   return [
     '__pm_path_rest=""',
     '__pm_old_ifs="${IFS}"',
@@ -11202,6 +11364,7 @@ function shellPrependPathListEntry(name: string, entry: string): string {
     `  if [ -z "$__pm_path_entry" ] || [ "$__pm_path_entry" = ${shellQuote(entry)} ]; then`,
     "    continue",
     "  fi",
+    ...staleHookSkip,
     '  if [ -z "$__pm_path_rest" ]; then',
     '    __pm_path_rest="$__pm_path_entry"',
     "  else",
@@ -11212,6 +11375,10 @@ function shellPrependPathListEntry(name: string, entry: string): string {
     `export ${name}=${shellQuote(entry)}\${__pm_path_rest:+:$__pm_path_rest}`,
     "unset __pm_path_entry __pm_path_rest __pm_old_ifs",
   ].join("\n");
+}
+
+function isPortManagerHookLibraryPath(entry: string): boolean {
+  return /(?:^|[/\\])media[/\\]native[/\\]libportmanager_hook\.dylib$/.test(entry);
 }
 
 function shellRemovePathListEntry(name: string, entry: string): string {

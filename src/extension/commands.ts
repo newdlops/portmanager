@@ -4391,6 +4391,13 @@ function shellDoubleQuote(value: string): string {
  */
 function shellPrependPathListEntry(name: string, entry: string): string {
   const escapedEntry = shellDoubleQuote(entry);
+  const staleHookSkip = isPortManagerHookLibraryPath(entry)
+    ? [
+        '  case "$__pm_path_entry" in',
+        "    */media/native/libportmanager_hook.dylib) continue ;;",
+        "  esac",
+      ]
+    : [];
   return [
     '__pm_path_rest=""',
     '__pm_old_ifs="${IFS}"',
@@ -4399,6 +4406,7 @@ function shellPrependPathListEntry(name: string, entry: string): string {
     `  if [ -z "$__pm_path_entry" ] || [ "$__pm_path_entry" = "${escapedEntry}" ]; then`,
     "    continue",
     "  fi",
+    ...staleHookSkip,
     '  if [ -z "$__pm_path_rest" ]; then',
     '    __pm_path_rest="$__pm_path_entry"',
     "  else",
@@ -4409,6 +4417,10 @@ function shellPrependPathListEntry(name: string, entry: string): string {
     `export ${name}="${escapedEntry}\${__pm_path_rest:+:$__pm_path_rest}"`,
     "unset __pm_path_entry __pm_path_rest __pm_old_ifs",
   ].join("\n");
+}
+
+function isPortManagerHookLibraryPath(entry: string): boolean {
+  return /(?:^|[/\\])media[/\\]native[/\\]libportmanager_hook\.dylib$/.test(entry);
 }
 
 /**

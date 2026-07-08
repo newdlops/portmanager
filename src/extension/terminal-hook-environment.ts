@@ -844,7 +844,7 @@ export function prepareShellEnvRestoreScript(
   }
 
   const targetPath = path.join(baseDirectory, shellEnvRestoreFileName(scope));
-  const contents = buildShellEnvRestoreScript(scope, targetPath);
+  const contents = buildShellEnvRestoreScript(scope, targetPath, hookLibraryPath);
 
   // Refresh loops regenerate this script far more often than its inputs
   // change; matching content means the write (and its watcher fan-out) can be
@@ -1460,7 +1460,7 @@ function sanitizeFileNamePart(value: string): string {
   return sanitized.length > 0 ? sanitized : "network";
 }
 
-function buildShellEnvRestoreScript(scope: ShellEnvRestoreScope, scriptPath: string): string {
+function buildShellEnvRestoreScript(scope: ShellEnvRestoreScope, scriptPath: string, hookLibraryPath: string): string {
   const globalRouteTablePath = scope.globalRouteTablePath ?? getDefaultRouteTablePath();
   const hostAccessFilePath = scope.hostAccessFilePath ?? getDefaultHostAccessBindingsPath();
   const networkName = scope.networkName ?? scope.networkId ?? "";
@@ -1532,6 +1532,10 @@ export NEWDLOPS_PM_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}`;
     scope.dockerShimPath === undefined ? "" : `export ${DOCKER_SHIM_PATH_ENV}=${shellQuote(scope.dockerShimPath)}`;
   const preloadRepairExport =
     scope.networkId === undefined && scope.hookWithoutNetwork !== true ? "" : "export PORT_MANAGER_PRELOAD_REPAIR=1";
+  const preloadHintExport =
+    scope.networkId === undefined && scope.hookWithoutNetwork !== true
+      ? ""
+      : `export PORT_MANAGER_DYLD_INSERT_LIBRARIES=${shellQuote(hookLibraryPath)}`;
   const loopbackHost = scope.networkId === undefined ? undefined : loopbackAddressForNetwork(scope.networkId);
   const loopbackExports =
     loopbackHost === undefined
@@ -1590,6 +1594,7 @@ ${terminalAttachmentExport}
 ${composeLogicalPortsExport}
 ${composeRefreshWaitExport}
 ${dockerShimExport}
+${preloadHintExport}
 ${preloadRepairExport}
 
 if [ -z "\${PORT_MANAGER_HOST_ACCESS_FILE:-}" ]; then
@@ -1597,7 +1602,7 @@ if [ -z "\${PORT_MANAGER_HOST_ACCESS_FILE:-}" ]; then
 fi
 
 if [ "\${PORT_MANAGER_HOOK_DISABLED:-}" != "1" ] && [ "\${PORT_MANAGER_HOOK:-1}" != "0" ] && [ "\${PORT_MANAGER_PRELOAD_REPAIR:-}" = "1" ] && [ -n "\${PORT_MANAGER_DYLD_INSERT_LIBRARIES:-}" ]; then
-${buildShellPrependVariablePathListEntry("DYLD_INSERT_LIBRARIES", "PORT_MANAGER_DYLD_INSERT_LIBRARIES")}
+${buildShellPrependPortManagerPreloadEntry("DYLD_INSERT_LIBRARIES", "PORT_MANAGER_DYLD_INSERT_LIBRARIES")}
 fi
 
 if [ -n "\${PORT_MANAGER_RUNTIME_SHIM_DIR:-}" ]; then
@@ -1657,6 +1662,30 @@ function buildShellPrependVariablePathListEntry(targetVariableName: string, entr
     `    if [ -z "$__pm_path_entry" ] || [ "$__pm_path_entry" = "$${entryVariableName}" ]; then`,
     "      continue",
     "    fi",
+    '    if [ -z "$__pm_path_rest" ]; then',
+    '      __pm_path_rest="$__pm_path_entry"',
+    "    else",
+    '      __pm_path_rest="$__pm_path_rest:$__pm_path_entry"',
+    "    fi",
+    "  done",
+    '  IFS="${__pm_old_ifs}"',
+    `  export ${targetVariableName}="$${entryVariableName}\${__pm_path_rest:+:$__pm_path_rest}"`,
+    "  unset __pm_path_entry __pm_path_rest __pm_old_ifs",
+  ].join("\n");
+}
+
+function buildShellPrependPortManagerPreloadEntry(targetVariableName: string, entryVariableName: string): string {
+  return [
+    '  __pm_path_rest=""',
+    '  __pm_old_ifs="${IFS}"',
+    "  IFS=:",
+    `  for __pm_path_entry in \${${targetVariableName}:-}; do`,
+    `    if [ -z "$__pm_path_entry" ] || [ "$__pm_path_entry" = "$${entryVariableName}" ]; then`,
+    "      continue",
+    "    fi",
+    '    case "$__pm_path_entry" in',
+    "      */media/native/libportmanager_hook.dylib) continue ;;",
+    "    esac",
     '    if [ -z "$__pm_path_rest" ]; then',
     '      __pm_path_rest="$__pm_path_entry"',
     "    else",

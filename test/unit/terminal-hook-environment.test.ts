@@ -147,6 +147,16 @@ test("terminal hook preload entries are normalized across multiple VS Code windo
   assert.equal(terminalHookEnvironmentSource.includes('process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD"'), true);
   assert.equal(terminalHookEnvironmentSource.includes("function prependUniquePathListEntry"), true);
   assert.equal(terminalHookEnvironmentSource.includes("function buildShellPrependVariablePathListEntry"), true);
+  assert.equal(terminalHookEnvironmentSource.includes("function buildShellPrependPortManagerPreloadEntry"), true);
+  assert.equal(
+    terminalHookEnvironmentSource.includes("const contents = buildShellEnvRestoreScript(scope, targetPath, hookLibraryPath);"),
+    true,
+  );
+  assert.equal(
+    terminalHookEnvironmentSource.includes("export PORT_MANAGER_DYLD_INSERT_LIBRARIES=${shellQuote(hookLibraryPath)}"),
+    true,
+  );
+  assert.equal(terminalHookEnvironmentSource.includes("*/media/native/libportmanager_hook.dylib) continue ;;"), true);
   assert.equal(attachBody.includes("shellPrependLibrary(preloadVariable, hookLibraryPath)"), true);
   assert.equal(attachBody.includes("${NETWORK_IS_GLOBAL_ENV}"), true);
   assert.equal(attachBody.includes("shellExport(\"PORT_MANAGER_NETWORK_NAME\", networkName)"), true);
@@ -154,6 +164,8 @@ test("terminal hook preload entries are normalized across multiple VS Code windo
   assert.equal(detachBody.includes("shellRemovePathListEntry(preloadVariable, hookLibraryPath)"), true);
   assert.equal(detachBody.includes("shellRemovePathListEntry(\"PATH\", runtimeShimDirectory)"), true);
   assert.equal(networkServiceSource.includes("function shellPrependPathListEntry"), true);
+  assert.equal(networkServiceSource.includes("function isPortManagerHookLibraryPath"), true);
+  assert.equal(networkServiceSource.includes("*/media/native/libportmanager_hook.dylib) continue ;;"), true);
   assert.equal(networkServiceSource.includes("function shellRemovePathListEntry"), true);
   assert.equal(networkServiceSource.includes('"PORT_MANAGER_LD_PRELOAD"'), true);
   assert.equal(nativeHookSource.includes("static int pm_preload_value_is_normalized"), true);
@@ -353,6 +365,8 @@ test("global shell hook routes no-network shells through the global scope", () =
   assert.equal(hookTemplate.includes('if [ "\\${PORT_MANAGER_HOOK:-0}" != "1" ] || [ ! -f "${escapedHookLibraryPath}" ]; then'), true);
   assert.equal(hookTemplate.includes('shellPrependPathListEntry("DYLD_INSERT_LIBRARIES", options.hookLibraryPath)'), true);
   assert.equal(hookTemplate.includes('shellPrependPathListEntry("LD_PRELOAD", options.hookLibraryPath)'), true);
+  assert.equal(source.includes("function isPortManagerHookLibraryPath"), true);
+  assert.equal(source.includes("*/media/native/libportmanager_hook.dylib) continue ;;"), true);
   assert.equal(hookTemplate.includes("removeNativeHookPreloadScript"), true);
   assert.equal(source.includes('shellRemovePathListEntry("DYLD_INSERT_LIBRARIES", options.hookLibraryPath)'), true);
   assert.equal(source.includes('shellRemovePathListEntry("LD_PRELOAD", options.hookLibraryPath)'), true);
@@ -1904,7 +1918,8 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   assert.equal(source.includes("errno = EADDRNOTAVAIL;\n      return -1;"), true);
   assert.equal(source.includes("bind global raw fallback"), false);
   assert.equal(source.includes("connect global raw fallback"), false);
-  assert.equal(source.includes("connect global raw passthrough"), false);
+  assert.equal(source.includes("connect global raw passthrough logical=%d"), false);
+  assert.equal(source.includes("connect global raw passthrough unmanaged logical=%d"), true);
   assert.equal(source.includes("connect global address-only logical=%d host=%s"), true);
   assert.equal(ephemeralBindStart < addressOnlyBindStart, true);
   assert.equal(source.includes("bind address-only logical=%d host=%s"), true);
@@ -2101,8 +2116,21 @@ test("logical router classifies clients by process tree label before hook enviro
   assert.equal(resolveHostDefaultGatewayClientTarget.includes("const routeExposures = isFixedProtocolPort"), true);
   assert.equal(resolveHostDefaultGatewayClientTarget.includes("? collectHostGatewayExposures"), true);
   assert.equal(resolveHostDefaultGatewayClientTarget.includes("registrySnapshot.composeAttachments"), true);
-  assert.equal(resolveHostDefaultGatewayClientTarget.includes("dedupeHostGatewayExposures([...routeExposures, ...composeExposures])"), true);
+  assert.equal(resolveHostDefaultGatewayClientTarget.includes("this.collectGeneratedComposeHostGatewayExposures(logicalPort)"), true);
+  assert.equal(
+    resolveHostDefaultGatewayClientTarget.includes(
+      "dedupeHostGatewayExposures([...routeExposures, ...composeExposures, ...generatedComposeExposures])",
+    ),
+    true,
+  );
   assert.equal(resolveHostDefaultGatewayClientTarget.includes("composeCandidates=${composeExposures.length}"), true);
+  assert.equal(resolveHostDefaultGatewayClientTarget.includes("generatedComposeCandidates=${generatedComposeExposures.length}"), true);
+  assert.equal(source.includes("private collectGeneratedComposeHostGatewayExposures(logicalPort: number)"), true);
+  assert.equal(source.includes("compose-project-routing-"), true);
+  assert.equal(source.includes(".ports.override.yaml"), true);
+  assert.equal(source.includes("function collectGeneratedComposeOverrideExposures("), true);
+  assert.equal(source.includes("function parseGeneratedComposePublishedPort("), true);
+  assert.equal(source.includes("newdlops\\.portmanager\\.logical-port"), true);
 
   // The older cwd/unique-route guessing fallbacks are removed; the legacy
   // non-network path forwards only to an explicit relocated owner.

@@ -590,7 +590,7 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.equal(passedThrough.stdout, "host\n");
   });
 
-  test("native hook refuses global-scope dials into gateway-owned fixed-protocol dead ends", async (context) => {
+  test("native hook passes global-scope gateway-owned fixed-protocol dials to the router", async (context) => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-global-deadend-"));
     const server = net.createServer((socket) => {
       socket.end("host\n");
@@ -626,9 +626,9 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
       },
     });
 
-    assert.equal(result.exitCode, 23);
-    assert.equal(result.stdout, "");
-    assert.equal(result.stderr, "ECONNREFUSED\n");
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "host\n");
+    assert.equal(result.stderr, "");
   });
 
   test("native hook does not leak fixed protocol connects to host localhost", async (context) => {
