@@ -46,9 +46,17 @@ test("unattached terminals join the global network by default in address-only mo
   const globalStart = source.indexOf("function applyGlobalNetworkEnvironment");
   const globalEnd = source.indexOf("function applyScopelessGatewayEnvironment", globalStart);
   const globalBody = source.slice(globalStart, globalEnd);
+  const gatewayStart = source.indexOf("function applyScopelessGatewayEnvironment");
+  const gatewayEnd = source.indexOf("/** Mirrors the per-network bind hosts", gatewayStart);
+  const gatewayBody = source.slice(gatewayStart, gatewayEnd);
+  const restoreStart = source.indexOf("function buildShellEnvRestoreScript");
+  const restoreEnd = source.indexOf("function shellQuote", restoreStart);
+  const restoreBody = source.slice(restoreStart, restoreEnd);
 
   assert.notEqual(scopelessStart, -1);
   assert.notEqual(globalStart, -1);
+  assert.notEqual(gatewayStart, -1);
+  assert.notEqual(restoreStart, -1);
 
   // Gate: setting + loopback-address-only mode. Alias preparation is async in
   // the network service; env generation must not fall back to unmanaged
@@ -79,6 +87,24 @@ test("unattached terminals join the global network by default in address-only mo
   assert.equal(globalBody.includes("ensureNetworkEnvFileScaffold"), false);
   assert.equal(globalBody.includes("PORT_MANAGER_COMPOSE_LOGICAL_PORTS"), false);
   assert.equal(globalBody.includes("applyLoopbackRoutingHosts(collection, GLOBAL_LOGICAL_NETWORK_ID, settings);"), true);
+  assert.equal(globalBody.includes("globalNetworkScope: true"), true);
+  assert.equal(globalBody.includes('collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_MUTATOR_OPTIONS);'), true);
+  assert.equal(globalBody.includes("applyRuntimeShimLauncherPath("), true);
+  assert.equal(globalBody.includes('collection.replace("PORT_MANAGER_HOST_ACCESS_FILE"'), true);
+  assert.equal(globalBody.includes("collection.replace(DOCKER_SHIM_PATH_ENV, runtimeCommandShimPath"), true);
+  assert.equal(source.includes("readonly globalNetworkScope?: boolean"), true);
+  assert.equal(source.includes("readonly hookWithoutNetwork?: boolean"), true);
+  assert.equal(restoreBody.includes("scope.globalNetworkScope === true"), true);
+  assert.equal(restoreBody.includes(`export \${NETWORK_IS_GLOBAL_ENV}=1`), true);
+  assert.equal(restoreBody.includes("unset PORT_MANAGER_NETWORK_NAME"), true);
+
+  // If the global feature is disabled, a plain host terminal still needs the
+  // preload hook and BASH_ENV repair; it just carries no network id.
+  assert.equal(gatewayBody.includes("hookWithoutNetwork: true"), true);
+  assert.equal(gatewayBody.includes('collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_MUTATOR_OPTIONS);'), true);
+  assert.equal(gatewayBody.includes("applyRuntimeShimLauncherPath("), true);
+  assert.equal(restoreBody.includes("scope.hookWithoutNetwork === true"), true);
+  assert.equal(restoreBody.includes("export PORT_MANAGER_HOOK=1"), true);
 
   // The reserved global network is the default non-network terminal identity.
   assert.equal(DEFAULT_PORT_MANAGER_SETTINGS.globalNetwork, true);
@@ -1948,10 +1974,14 @@ test("logical routers expose host-client networks without taking unrelated netwo
   assert.equal(source.includes("attachment.id.startsWith(PROCESS_TERMINAL_ATTACHMENT_ID_PREFIX)"), true);
   assert.equal(source.includes("attachment.id.startsWith(VSCODE_WINDOW_PROCESS_ATTACHMENT_ID_PREFIX)"), true);
   assert.equal(source.includes("function isDetachedNetworkRoute"), false);
-  assert.equal(collectLogicalRouterPorts.includes("!externallyOwnedPorts.has(route.logicalPort)"), true);
+  assert.equal(collectLogicalRouterPorts.includes("!externallyCoveredPorts.has(route.logicalPort)"), true);
+  assert.equal(source.includes("function collectExternallyCoveredLogicalRouterPorts"), true);
+  assert.equal(source.includes('listenerCoversLogicalRouterHostFamily(listener.localAddress, "ipv4")'), true);
+  assert.equal(source.includes('listenerCoversLogicalRouterHostFamily(listener.localAddress, "ipv6")'), true);
+  assert.equal(source.includes('rawHost === "0.0.0.0"'), true);
   assert.equal(routeNeedsLogicalRouter.includes("route.actualPort !== route.logicalPort"), true);
   assert.equal(routeNeedsLogicalRouter.includes("!listenerCoversLogicalRouterHost(route.host)"), true);
-  assert.equal(collectLogicalRouterPorts.includes("listenerCoversLogicalRouterHost(listener.localAddress)"), true);
+  assert.equal(collectLogicalRouterPorts.includes("collectExternallyCoveredLogicalRouterPorts(listeners)"), true);
   assert.equal(source.includes("function listenerCoversLogicalRouterHost"), true);
   assert.equal(source.includes("function endpointHostMatches"), true);
   assert.equal(source.includes("function isGeneratedLoopbackHost"), true);
@@ -1963,11 +1993,11 @@ test("logical routers expose host-client networks without taking unrelated netwo
 
   // Compose service containers publish on the per-network loopback and are not
   // hook-tracked, so the gateway also claims their logical ports (gated by the
-  // gateway flag, and skipped when the localhost port is externally owned) so
-  // hookless/host clients dialing localhost reach their network's container.
+  // gateway flag, and skipped only when both localhost families are externally
+  // owned) so hookless/host clients dialing localhost reach their network's container.
   assert.equal(collectLogicalRouterPorts.includes("options.composeLogicalPorts ?? []"), true);
   assert.equal(collectLogicalRouterPorts.includes("Compose service containers publish on the per-network loopback"), true);
-  assert.equal(collectLogicalRouterPorts.includes("!externallyOwnedPorts.has(composePort)"), true);
+  assert.equal(collectLogicalRouterPorts.includes("!externallyCoveredPorts.has(composePort)"), true);
   assert.equal(syncBody.includes("composeLogicalPorts: this.collectAllComposeLogicalPorts()"), true);
   assert.equal(source.includes("private collectAllComposeLogicalPorts(): readonly number[]"), true);
   assert.equal(source.includes("private isComposeLogicalPortForNetwork(networkId: string, logicalPort: number): boolean"), true);
@@ -1979,6 +2009,9 @@ test("logical router classifies clients by process tree label before hook enviro
   const methodStart = source.indexOf("private async findClientNetworkForRouter");
   const methodEnd = source.indexOf("private async findNetworkRouteForRouter", methodStart);
   const findClientNetworkForRouter = source.slice(methodStart, methodEnd);
+  const routerTargetStart = source.indexOf("private async resolveLogicalPortRouterTarget");
+  const routerTargetEnd = source.indexOf("private async resolveRouterClientVerdict", routerTargetStart);
+  const resolveLogicalPortRouterTarget = source.slice(routerTargetStart, routerTargetEnd);
   const verdictStart = source.indexOf("private async resolveRouterClientVerdict");
   const verdictEnd = source.indexOf("private async resolveNetworkClientTarget", verdictStart);
   const resolveRouterClientVerdict = source.slice(verdictStart, verdictEnd);
@@ -1988,6 +2021,9 @@ test("logical router classifies clients by process tree label before hook enviro
   const nonNetworkTargetStart = source.indexOf("private async resolveNonNetworkClientTarget");
   const nonNetworkTargetEnd = source.indexOf("private findNonNetworkOwnerRoute", nonNetworkTargetStart);
   const resolveNonNetworkClientTarget = source.slice(nonNetworkTargetStart, nonNetworkTargetEnd);
+  const hostDefaultTargetStart = source.indexOf("private resolveHostDefaultGatewayClientTarget");
+  const hostDefaultTargetEnd = source.indexOf("private findNonNetworkOwnerRoute", hostDefaultTargetStart);
+  const resolveHostDefaultGatewayClientTarget = source.slice(hostDefaultTargetStart, hostDefaultTargetEnd);
 
   assert.equal(source.includes('from "../core/process-network-labels"'), true);
   assert.equal(
@@ -2004,6 +2040,20 @@ test("logical router classifies clients by process tree label before hook enviro
   assert.equal(resolveRouterClientVerdict.includes("this.routerVerdictCache.store("), true);
   assert.equal(resolveRouterClientVerdict.includes("ROUTER_NON_NETWORK_VERDICT"), true);
 
+  // The reserved global id means a hooked but unattached host client, not an
+  // isolated backend namespace. It must use the same host-default policy as a
+  // hookless client instead of failing closed as a fixed-protocol network client.
+  assert.equal(resolveLogicalPortRouterTarget.includes("verdict.networkId === GLOBAL_LOGICAL_NETWORK_ID"), true);
+  assert.equal(
+    resolveLogicalPortRouterTarget.indexOf("verdict.networkId === GLOBAL_LOGICAL_NETWORK_ID") <
+      resolveLogicalPortRouterTarget.indexOf("this.resolveNetworkClientTarget("),
+    true,
+  );
+  assert.equal(
+    resolveLogicalPortRouterTarget.includes("this.resolveNonNetworkClientTarget(connection.logicalPort, verdict.clientCwd)"),
+    true,
+  );
+
   // Attributed network clients fail closed on fixed-protocol ports EXCEPT
   // compose service ports (a known container on the per-network loopback), and
   // otherwise synthesize the per-network loopback backend; they never inherit
@@ -2017,9 +2067,11 @@ test("logical router classifies clients by process tree label before hook enviro
   );
   assert.equal(resolveNetworkClientTarget.includes("this.isFixedProtocolPort(logicalPort) && !isComposePort"), true);
 
-  // In address-only mode, unattributable fixed-protocol host clients first reuse
-  // the host-default gateway policy, then join the reserved global network
-  // instead of falling through to legacy network-less localhost owners.
+  // In address-only mode, an unattributable router client is a pure host
+  // execution that did not inherit hook state. It may use the host-default
+  // fixed-protocol gateway or an explicit compose publication, but must not be
+  // synthesized into the reserved global network identity used by explicitly
+  // hooked unattached terminals.
   assert.equal(
     resolveNonNetworkClientTarget.includes("settings.globalNetwork && usesLoopbackAddressOnlyRouting(settings)"),
     true,
@@ -2029,18 +2081,15 @@ test("logical router classifies clients by process tree label before hook enviro
     true,
   );
   assert.equal(
+    resolveNonNetworkClientTarget.includes("hostDefaultGatewayTarget !== undefined"),
+    true,
+  );
+  assert.equal(
+    resolveNonNetworkClientTarget.includes("this.resolveNetworkClientTarget(GLOBAL_LOGICAL_NETWORK_ID"),
+    false,
+  );
+  assert.equal(
     resolveNonNetworkClientTarget.indexOf("this.resolveHostDefaultGatewayClientTarget(logicalPort)") <
-      resolveNonNetworkClientTarget.indexOf("this.resolveNetworkClientTarget(GLOBAL_LOGICAL_NETWORK_ID"),
-    true,
-  );
-  assert.equal(
-    resolveNonNetworkClientTarget.includes(
-      "return this.resolveNetworkClientTarget(GLOBAL_LOGICAL_NETWORK_ID, logicalPort, []);",
-    ),
-    true,
-  );
-  assert.equal(
-    resolveNonNetworkClientTarget.indexOf("this.resolveNetworkClientTarget(GLOBAL_LOGICAL_NETWORK_ID") <
       resolveNonNetworkClientTarget.indexOf("this.findNonNetworkOwnerRoute(logicalPort, clientCwd)"),
     true,
   );
@@ -2048,6 +2097,12 @@ test("logical router classifies clients by process tree label before hook enviro
   assert.equal(source.includes("collectHostGatewayExposures("), true);
   assert.equal(source.includes("selectHostDefaultGatewayExposure(exposures"), true);
   assert.equal(source.includes("this.vscodeWindowTerminalBinding?.status === \"attached\""), true);
+  assert.equal(resolveHostDefaultGatewayClientTarget.includes("const isFixedProtocolPort = this.isFixedProtocolPort(logicalPort)"), true);
+  assert.equal(resolveHostDefaultGatewayClientTarget.includes("const routeExposures = isFixedProtocolPort"), true);
+  assert.equal(resolveHostDefaultGatewayClientTarget.includes("? collectHostGatewayExposures"), true);
+  assert.equal(resolveHostDefaultGatewayClientTarget.includes("registrySnapshot.composeAttachments"), true);
+  assert.equal(resolveHostDefaultGatewayClientTarget.includes("dedupeHostGatewayExposures([...routeExposures, ...composeExposures])"), true);
+  assert.equal(resolveHostDefaultGatewayClientTarget.includes("composeCandidates=${composeExposures.length}"), true);
 
   // The older cwd/unique-route guessing fallbacks are removed; the legacy
   // non-network path forwards only to an explicit relocated owner.

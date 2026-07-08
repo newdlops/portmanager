@@ -4515,11 +4515,20 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
           errno = ECONNREFUSED;
           return -1;
         }
+        if (!pm_gateway_claim_fresh(logical_port)) {
+          /*
+           * A non-network shell is still host-real. If the gateway has not
+           * claimed the raw coordinate, an unmanaged localhost client must be
+           * allowed to reach whatever the host kernel already exposes there.
+           */
+          pm_debug("connect global raw passthrough unmanaged logical=%d", logical_port);
+          return pm_real_connect(sockfd, addr, addrlen);
+        }
+
         /*
-         * Unmanaged or not-yet-published port: the global network still owns a
-         * concrete loopback identity. Dial the global alias directly instead of
-         * falling back to ::1/127.0.0.1, which are daemon-owned ingress
-         * coordinates and may be the logical router itself.
+         * The gateway owns the raw coordinate, but no route row has been flushed
+         * yet. Try the global alias directly so a just-started global listener
+         * can still be reached without looping back into the gateway.
          */
         loopback_host = pm_network_loopback_host();
         if (loopback_host == NULL) {

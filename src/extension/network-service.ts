@@ -4791,23 +4791,26 @@ export class PortManagerNetworkService implements DisposableLike {
    * The decision is source-first and application-agnostic: attribute the client
    * process to a logical network (native attribution when available, else the
    * process table ancestry and environment), then forward to that network's
-   * backend. Clients with no network identity join the reserved global network
-   * in the address-only model; legacy network-less owners are used only when the
-   * global model is disabled or unavailable.
+   * backend. Clients with no network identity are treated as pure host
+   * executions: they did not inherit Port Manager hook state, so the router must
+   * not synthesize a global network identity for them.
    */
   private async resolveLogicalPortRouterTarget(
     connection: LogicalPortRouterConnection,
   ): Promise<LogicalPortRouterTarget> {
     const verdict = await this.resolveRouterClientVerdict(connection);
 
+    const attributedNetworkId =
+      verdict.networkId !== undefined && verdict.networkId !== GLOBAL_LOGICAL_NETWORK_ID ? verdict.networkId : undefined;
+
     if (devLogEnabled()) {
       const composeForNet =
-        verdict.networkId !== undefined
-          ? this.isComposeLogicalPortForNetwork(verdict.networkId, connection.logicalPort)
+        attributedNetworkId !== undefined
+          ? this.isComposeLogicalPortForNetwork(attributedNetworkId, connection.logicalPort)
           : "-";
       const composePorts =
-        verdict.networkId !== undefined
-          ? this.getComposeLogicalPortsForNetwork(verdict.networkId).join("|")
+        attributedNetworkId !== undefined
+          ? this.getComposeLogicalPortsForNetwork(attributedNetworkId).join("|")
           : "-";
       devLog(
         "ts-router",
@@ -4818,6 +4821,11 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     if (verdict.networkId !== undefined) {
+      if (verdict.networkId === GLOBAL_LOGICAL_NETWORK_ID) {
+        // The reserved global id marks a hooked but unattached host client. It
+        // is not an isolated backend namespace, so use the host-visible policy.
+        return this.resolveNonNetworkClientTarget(connection.logicalPort, verdict.clientCwd);
+      }
       return this.resolveNetworkClientTarget(verdict.networkId, connection.logicalPort, verdict.processRows);
     }
 
@@ -4914,27 +4922,22 @@ export class PortManagerNetworkService implements DisposableLike {
   /**
    * Resolves the target for a client with no network identity.
    *
-   * Address-only routing treats that client as part of the reserved global
-   * network. The legacy network-less owner route remains only for non-global
-   * modes where terminals still run without a network id.
+   * A missing network id here means the client is hookless, host-scoped, or
+   * otherwise unattributable. Route only through host-observable policy:
+   * fixed-protocol host-default gateway first, then an explicit legacy
+   * network-less owner.
    */
   private async resolveNonNetworkClientTarget(
     logicalPort: number,
     clientCwd: string | undefined,
   ): Promise<LogicalPortRouterTarget> {
     const settings = readPortManagerSettings();
-    // In the address-only model, an unattributable client belongs to the
-    // reserved global network. Fixed-protocol host clients first reuse the
-    // host-default gateway policy so IPv6 ::1 clients behave like the pf IPv4
-    // redirect path instead of probing the empty global network for compose DBs.
     if (settings.globalNetwork && usesLoopbackAddressOnlyRouting(settings)) {
       const hostDefaultGatewayTarget = this.resolveHostDefaultGatewayClientTarget(logicalPort);
       if (hostDefaultGatewayTarget !== undefined) {
         await this.waitForBackendReachable(hostDefaultGatewayTarget.host, hostDefaultGatewayTarget.port);
         return hostDefaultGatewayTarget;
       }
-
-      return this.resolveNetworkClientTarget(GLOBAL_LOGICAL_NETWORK_ID, logicalPort, []);
     }
 
     const ownerRoute = this.findNonNetworkOwnerRoute(logicalPort, clientCwd);
@@ -4946,23 +4949,38 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * Selects the raw TCP target used by hookless host clients on fixed-protocol
-   * ports. This mirrors the host-local pf redirect policy but runs inside the
-   * logical router too, which covers IPv6 localhost and systems without pf rules.
+   * Selects the raw TCP target used by hookless host clients. Fixed-protocol
+   * route candidates mirror the host-local pf redirect policy; compose service
+   * candidates are also eligible because they are already explicit host-visible
+   * service publications even when the user overrides the fixed-protocol list.
    */
   private resolveHostDefaultGatewayClientTarget(logicalPort: number): LogicalPortRouterTarget | undefined {
-    if (!this.isFixedProtocolPort(logicalPort)) {
-      return undefined;
-    }
-
     const registrySnapshot = this.registry.getSnapshot();
     const processSnapshot = this.processService?.getSnapshot();
-    const exposures = collectHostGatewayExposures(
-      processSnapshot?.routes ?? [],
+    const isFixedProtocolPort = this.isFixedProtocolPort(logicalPort);
+    const routeExposures = isFixedProtocolPort
+      ? collectHostGatewayExposures(processSnapshot?.routes ?? [], registrySnapshot.networks, [], []).filter(
+          (exposure) => exposure.hostPort === logicalPort,
+        )
+      : [];
+    const composeExposures = collectHostGatewayExposures(
+      [],
       registrySnapshot.networks,
       [],
       registrySnapshot.composeAttachments,
     ).filter((exposure) => exposure.hostPort === logicalPort);
+    const exposures = dedupeHostGatewayExposures([...routeExposures, ...composeExposures]);
+    if (exposures.length === 0) {
+      if (devLogEnabled()) {
+        devLog(
+          "ts-router",
+          `host-default logical_port=${logicalPort} fixed=${isFixedProtocolPort ? 1 : 0} ` +
+            `routeCandidates=${routeExposures.length} composeCandidates=${composeExposures.length} -> MISS (no exposure)`,
+        );
+      }
+      return undefined;
+    }
+
     const exposure = selectHostDefaultGatewayExposure(exposures, {
       networks: registrySnapshot.networks,
       preferredNetworkId:
@@ -4971,7 +4989,11 @@ export class PortManagerNetworkService implements DisposableLike {
 
     if (exposure === undefined) {
       if (devLogEnabled()) {
-        devLog("ts-router", `host-default logical_port=${logicalPort} -> MISS`);
+        devLog(
+          "ts-router",
+          `host-default logical_port=${logicalPort} fixed=${isFixedProtocolPort ? 1 : 0} ` +
+            `routeCandidates=${routeExposures.length} composeCandidates=${composeExposures.length} -> MISS (self-loop)`,
+        );
       }
       return undefined;
     }
@@ -8585,12 +8607,7 @@ function collectLogicalRouterPorts(
 ): readonly number[] {
   const ports = new Set<number>();
   const hostClientNetworkIds = collectHostClientAttachmentNetworkIds(attachments);
-  const externallyOwnedPorts = new Set(
-    listeners
-      .filter((listener) => listener.protocol === "tcp" && !isPortManagerLogicalRouterListener(listener))
-      .filter((listener) => listenerCoversLogicalRouterHost(listener.localAddress))
-      .map((listener) => listener.port),
-  );
+  const externallyCoveredPorts = collectExternallyCoveredLogicalRouterPorts(listeners);
 
   for (const route of routes) {
     /*
@@ -8609,7 +8626,7 @@ function collectLogicalRouterPorts(
       networkScopeQualifies &&
       isTcpPort(route.logicalPort) &&
       routeNeedsLogicalRouter(route) &&
-      !externallyOwnedPorts.has(route.logicalPort)
+      !externallyCoveredPorts.has(route.logicalPort)
     ) {
       ports.add(route.logicalPort);
     }
@@ -8626,7 +8643,7 @@ function collectLogicalRouterPorts(
    */
   if (options.gatewayEnabled === true) {
     for (const composePort of options.composeLogicalPorts ?? []) {
-      if (isTcpPort(composePort) && !externallyOwnedPorts.has(composePort)) {
+      if (isTcpPort(composePort) && !externallyCoveredPorts.has(composePort)) {
         ports.add(composePort);
       }
     }
@@ -8667,6 +8684,44 @@ function routeNeedsLogicalRouter(route: LogicalPortRoute): boolean {
 /** True only when an OS listener occupies the localhost hosts used by logical routers. */
 function listenerCoversLogicalRouterHost(listenerHost: string): boolean {
   return endpointHostMatches(listenerHost, "127.0.0.1") || endpointHostMatches(listenerHost, "::1");
+}
+
+function collectExternallyCoveredLogicalRouterPorts(listeners: readonly ListeningPort[]): ReadonlySet<number> {
+  const coverageByPort = new Map<number, { ipv4: boolean; ipv6: boolean }>();
+
+  for (const listener of listeners) {
+    if (listener.protocol !== "tcp" || isPortManagerLogicalRouterListener(listener)) {
+      continue;
+    }
+
+    const coverage = coverageByPort.get(listener.port) ?? { ipv4: false, ipv6: false };
+    coverage.ipv4 ||= listenerCoversLogicalRouterHostFamily(listener.localAddress, "ipv4");
+    coverage.ipv6 ||= listenerCoversLogicalRouterHostFamily(listener.localAddress, "ipv6");
+    coverageByPort.set(listener.port, coverage);
+  }
+
+  return new Set(
+    [...coverageByPort]
+      .filter(([, coverage]) => coverage.ipv4 && coverage.ipv6)
+      .map(([port]) => port),
+  );
+}
+
+function listenerCoversLogicalRouterHostFamily(listenerHost: string, family: "ipv4" | "ipv6"): boolean {
+  const rawHost = listenerHost.trim().toLowerCase();
+  const normalizedHost = normalizeEndpointHostKey(listenerHost);
+
+  if (normalizedHost === "*") {
+    if (rawHost === "0.0.0.0") {
+      return family === "ipv4";
+    }
+    if (rawHost === "::" || rawHost === "[::]") {
+      return family === "ipv6";
+    }
+    return true;
+  }
+
+  return family === "ipv4" ? normalizedHost === "127.0.0.1" : normalizedHost === "::1";
 }
 
 /** Compares socket bind hosts while keeping generated network loopbacks distinct. */
@@ -8872,6 +8927,14 @@ function collectHostGatewayExposures(
   }
 
   return [...exposures.values()];
+}
+
+function dedupeHostGatewayExposures(exposures: readonly HostPortExposure[]): readonly HostPortExposure[] {
+  const byId = new Map<string, HostPortExposure>();
+  for (const exposure of exposures) {
+    byId.set(exposure.id, exposure);
+  }
+  return [...byId.values()];
 }
 
 function hostGatewayExposureId(networkId: string, logicalPort: number): string {
@@ -9350,7 +9413,12 @@ function browserPublicHostForNetwork(networkId: string, networks: readonly Logic
     return record.secureHostname;
   }
 
-  return undefined;
+  /*
+   * The DNS record is already the configured browser-facing name. If the local
+   * resolver probe is stale or the alias was provided through another supported
+   * path, keep generated links on the name instead of leaking the loopback IP.
+   */
+  return record.hostname;
 }
 
 interface StatValidatedTextCacheEntry {

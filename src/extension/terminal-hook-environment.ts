@@ -281,8 +281,21 @@ function applyGlobalNetworkEnvironment(
   const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
   const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
   const nativeAgentPath = context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
+  const nativeContainerMapPath = context.asAbsolutePath(path.join("media", "native", "portmanager_container_map"));
   const asdfShimLauncherPath = context.asAbsolutePath(getAsdfShimLauncherRelativePath());
   const runtimeCommandShimPath = context.asAbsolutePath(getRuntimeCommandShimRelativePath());
+  const shellEnvRestorePath = prepareShellEnvRestoreScript(context.globalStorageUri.fsPath, hookLibraryPath, {
+    networkId: GLOBAL_LOGICAL_NETWORK_ID,
+    globalNetworkScope: true,
+    agentSocketPath: getAgentSocketPath(),
+    agentMainPath,
+    agentExecutablePath: nativeAgentPath,
+    containerMapHelperPath: nativeContainerMapPath,
+    globalRouteTablePath: getDefaultRouteTablePath(),
+    hostAccessFilePath: getDefaultHostAccessBindingsPath(),
+    settings,
+    dockerShimPath: runtimeCommandShimPath,
+  });
   const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
   const preloadHintVariable = process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD";
 
@@ -299,6 +312,8 @@ function applyGlobalNetworkEnvironment(
   collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_AGENT_MAIN", agentMainPath, TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace(DOCKER_SHIM_PATH_ENV, runtimeCommandShimPath, TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_PRELOAD_REPAIR", "1", TERMINAL_MUTATOR_OPTIONS);
   collection.replace(
     "PORT_MANAGER_ROUTES_FILE",
@@ -306,6 +321,7 @@ function applyGlobalNetworkEnvironment(
     TERMINAL_MUTATOR_OPTIONS,
   );
   collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath(), TERMINAL_MUTATOR_OPTIONS);
   applyRoutingSettings(collection, settings);
   applyLoopbackRoutingHosts(collection, GLOBAL_LOGICAL_NETWORK_ID, settings);
   collection.replace(
@@ -315,6 +331,9 @@ function applyGlobalNetworkEnvironment(
   );
   collection.replace(preloadHintVariable, hookLibraryPath, TERMINAL_MUTATOR_OPTIONS);
   applyRuntimeShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath, runtimeCommandShimPath);
+  if (shellEnvRestorePath !== undefined) {
+    collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_MUTATOR_OPTIONS);
+  }
 }
 
 /**
@@ -329,6 +348,22 @@ function applyScopelessGatewayEnvironment(
   settings: PortManagerSettings,
 ): void {
   const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
+  const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
+  const nativeAgentPath = context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
+  const nativeContainerMapPath = context.asAbsolutePath(path.join("media", "native", "portmanager_container_map"));
+  const asdfShimLauncherPath = context.asAbsolutePath(getAsdfShimLauncherRelativePath());
+  const runtimeCommandShimPath = context.asAbsolutePath(getRuntimeCommandShimRelativePath());
+  const shellEnvRestorePath = prepareShellEnvRestoreScript(context.globalStorageUri.fsPath, hookLibraryPath, {
+    hookWithoutNetwork: true,
+    agentSocketPath: getAgentSocketPath(),
+    agentMainPath,
+    agentExecutablePath: nativeAgentPath,
+    containerMapHelperPath: nativeContainerMapPath,
+    globalRouteTablePath: getDefaultRouteTablePath(),
+    hostAccessFilePath: getDefaultHostAccessBindingsPath(),
+    settings,
+    dockerShimPath: runtimeCommandShimPath,
+  });
   const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
   const preloadHintVariable = process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD";
 
@@ -338,7 +373,12 @@ function applyScopelessGatewayEnvironment(
     collection.replace("PORT_MANAGER_DEV_LOG", process.env.PORT_MANAGER_DEV_LOG, TERMINAL_MUTATOR_OPTIONS);
   }
   collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_MAIN", agentMainPath, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace(DOCKER_SHIM_PATH_ENV, runtimeCommandShimPath, TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath(), TERMINAL_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_PRELOAD_REPAIR", "1", TERMINAL_MUTATOR_OPTIONS);
   applyRoutingSettings(collection, settings);
   collection.replace(
@@ -347,6 +387,10 @@ function applyScopelessGatewayEnvironment(
     TERMINAL_MUTATOR_OPTIONS,
   );
   collection.replace(preloadHintVariable, hookLibraryPath, TERMINAL_MUTATOR_OPTIONS);
+  applyRuntimeShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath, runtimeCommandShimPath);
+  if (shellEnvRestorePath !== undefined) {
+    collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_MUTATOR_OPTIONS);
+  }
 }
 
 /** Mirrors the per-network bind hosts used by native high-port and same-port routing. */
@@ -758,6 +802,10 @@ function isStaleGeneratedRuntimeShim(filePath: string): boolean {
 export interface ShellEnvRestoreScope {
   /** Logical network scope that must survive protected shebang and bash boundaries. */
   readonly networkId?: string;
+  /** Reserved host/global scope: carries a network id only for routing, not app identity. */
+  readonly globalNetworkScope?: boolean;
+  /** Hooked host scope with no logical network id. */
+  readonly hookWithoutNetwork?: boolean;
   /** Human-visible network name; non-empty value marks user networks as not the reserved global scope. */
   readonly networkName?: string;
   /** Single-label network alias used to fold dev-server --host aliases back to localhost. */
@@ -1428,7 +1476,10 @@ fi`
 export PORT_MANAGER_GLOBAL_ROUTES_FILE=${shellQuote(globalRouteTablePath)}`;
   const networkScope =
     scope.networkId === undefined
-      ? `if [ -z "\${PORT_MANAGER_NETWORK_ID:-}" ] && [ -n "\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-}" ]; then
+      ? `${scope.hookWithoutNetwork === true ? `export PORT_MANAGER_HOOK=1
+unset ${NETWORK_IS_GLOBAL_ENV}
+
+` : ""}if [ -z "\${PORT_MANAGER_NETWORK_ID:-}" ] && [ -n "\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID:-}" ]; then
   export PORT_MANAGER_NETWORK_ID="\${PORT_MANAGER_ROUTE_TABLE_NETWORK_ID}"
 fi
 
@@ -1443,14 +1494,23 @@ fi
 if [ -z "\${PORT_MANAGER_NETWORK_ID:-}" ] && [ -n "\${NEWDLOPS_PM_BORROWED_NETWORK_ID:-}" ]; then
   export PORT_MANAGER_NETWORK_ID="\${NEWDLOPS_PM_BORROWED_NETWORK_ID}"
 fi`
+      : scope.globalNetworkScope === true
+        ? `export PORT_MANAGER_HOOK=1
+export ${NETWORK_IS_GLOBAL_ENV}=1
+export PORT_MANAGER_NETWORK_ID=${shellQuote(scope.networkId)}
+export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID=${shellQuote(scope.networkId)}
+export PORT_MANAGER_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}
+export NEWDLOPS_PM_NETWORK_ID=${shellQuote(scope.networkId)}
+export NEWDLOPS_PM_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}
+unset PORT_MANAGER_NETWORK_NAME`
       : `export PORT_MANAGER_HOOK=1
 unset ${NETWORK_IS_GLOBAL_ENV}
 export PORT_MANAGER_NETWORK_ID=${shellQuote(scope.networkId)}
 export PORT_MANAGER_NETWORK_NAME=${shellQuote(networkName)}
 export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID=${shellQuote(scope.networkId)}
-	export PORT_MANAGER_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}
-	export NEWDLOPS_PM_NETWORK_ID=${shellQuote(scope.networkId)}
-	export NEWDLOPS_PM_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}`;
+export PORT_MANAGER_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}
+export NEWDLOPS_PM_NETWORK_ID=${shellQuote(scope.networkId)}
+export NEWDLOPS_PM_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}`;
   const networkDnsAliasExport =
     scope.networkDnsAlias === undefined
       ? `unset ${NETWORK_DNS_ALIAS_ENV}`
@@ -1470,7 +1530,8 @@ export PORT_MANAGER_ROUTE_TABLE_NETWORK_ID=${shellQuote(scope.networkId)}
     scope.networkId === undefined ? "" : `export PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS=${shellQuote(COMPOSE_REFRESH_WAIT_MS)}`;
   const dockerShimExport =
     scope.dockerShimPath === undefined ? "" : `export ${DOCKER_SHIM_PATH_ENV}=${shellQuote(scope.dockerShimPath)}`;
-  const preloadRepairExport = scope.networkId === undefined ? "" : "export PORT_MANAGER_PRELOAD_REPAIR=1";
+  const preloadRepairExport =
+    scope.networkId === undefined && scope.hookWithoutNetwork !== true ? "" : "export PORT_MANAGER_PRELOAD_REPAIR=1";
   const loopbackHost = scope.networkId === undefined ? undefined : loopbackAddressForNetwork(scope.networkId);
   const loopbackExports =
     loopbackHost === undefined

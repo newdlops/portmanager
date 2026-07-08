@@ -417,7 +417,7 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.equal(result.stderr, "ECONNREFUSED\n");
   });
 
-  test("native hook global scope does not raw-passthrough unmanaged localhost connects", async (context) => {
+  test("native hook global scope raw-passthroughs unmanaged localhost connects", async (context) => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-global-raw-"));
     const server = net.createServer((socket) => {
       socket.end("host\n");
@@ -440,8 +440,8 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     const globalEnv = {
       PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE: "loopback-address-only",
       PORT_MANAGER_NETWORK_IS_GLOBAL: "1",
-      PORT_MANAGER_NETWORK_LOOPBACK_HOST: "",
-      PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "",
+      PORT_MANAGER_NETWORK_LOOPBACK_HOST: "127.1.0.1",
+      PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "127.1.0.1",
       PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
       PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
     };
@@ -451,12 +451,12 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
       timeoutMs: 500,
     });
 
-    assert.equal(result.exitCode, 23);
-    assert.equal(result.stdout, "");
-    assert.notEqual(result.stderr, "", "global localhost must not leak to the host listener");
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "host\n");
+    assert.equal(result.stderr, "");
 
     // The same env without the global flag is a plain network: the dial is
-    // pinned to the (unaliased) network loopback and must not reach the host.
+    // pinned to the network loopback and must not reach the host.
     const scoped = await runHookedNodeClient(address.port, routeTablePath, networkId, {
       env: { ...globalEnv, PORT_MANAGER_NETWORK_IS_GLOBAL: "" },
     });
@@ -531,12 +531,16 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     const connectBody = source.slice(connectStart, connectEnd);
     const globalStart = connectBody.indexOf("connect global managed logical=%d");
     const managedFailureStart = connectBody.indexOf("connect global managed failed logical=%d", globalStart);
+    const unmanagedPassthroughStart = connectBody.indexOf("connect global raw passthrough unmanaged logical=%d");
 
     assert.notEqual(globalStart, -1);
     assert.notEqual(managedFailureStart, -1);
+    assert.notEqual(unmanagedPassthroughStart, -1);
+    assert.equal(unmanagedPassthroughStart < globalStart, true);
     assert.equal(connectBody.includes("connect global raw fallback logical=%d"), false);
     assert.equal(connectBody.includes("connect global raw passthrough logical=%d"), false);
     assert.equal(connectBody.includes("connect global raw passthrough (no alias) logical=%d"), false);
+    assert.equal(connectBody.slice(managedFailureStart).includes("connect global raw passthrough unmanaged logical=%d"), false);
     assert.equal(connectBody.slice(managedFailureStart).includes("return alias_result;"), true);
   });
 
