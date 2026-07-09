@@ -1242,10 +1242,11 @@ export class ComposePublishMutator {
   /**
    * Resolves source mounts before generating clone overrides.
    *
-   * Runtime inspect is exact when a source container exists. A fully stopped
-   * Compose project may have no containers to inspect, so the fallback reads
-   * the normalized Compose config and derives the same named-volume identities
-   * Compose would use when it creates the project.
+   * Runtime inspect is exact for containers that Compose managed to create, but
+   * attach also needs services that failed before reaching a running container.
+   * The normalized Compose config supplies those declared bind/volume mounts;
+   * inspected mounts win for materialized containers, and copied-clone metadata
+   * wins last so an existing hidden project's state remains the source.
    */
   private async resolveOriginalServiceMounts(
     context: ComposeCommandContext,
@@ -1257,7 +1258,23 @@ export class ComposePublishMutator {
     } = {},
   ): Promise<ReadonlyMap<string, readonly ComposeServiceMount[]>> {
     if (containers.length > 0) {
-      return this.inspectServiceMounts(context.runtime, containers, inspectedRows);
+      const inspectedMounts = await this.inspectServiceMounts(context.runtime, containers, inspectedRows);
+      const inspectedServices = new Set(containers.map((container) => container.serviceName));
+      const hasServiceWithoutContainer = services.some((serviceName) => !inspectedServices.has(serviceName));
+      if (!hasServiceWithoutContainer) {
+        const sourceCloneMounts = buildServiceMountsFromCopySourceVolumes(options.sourceClonedVolumes, services);
+        return mergeRestoredServiceMounts(inspectedMounts, sourceCloneMounts);
+      }
+      try {
+        const configMounts = await this.readComposeConfigServiceMounts(context, services);
+        const sourceCloneMounts = buildServiceMountsFromCopySourceVolumes(options.sourceClonedVolumes, services);
+        const configAndInspectedMounts = mergeRestoredServiceMounts(configMounts, inspectedMounts);
+
+        return mergeRestoredServiceMounts(configAndInspectedMounts, sourceCloneMounts);
+      } catch {
+        const sourceCloneMounts = buildServiceMountsFromCopySourceVolumes(options.sourceClonedVolumes, services);
+        return mergeRestoredServiceMounts(inspectedMounts, sourceCloneMounts);
+      }
     }
 
     const configMounts = await this.readComposeConfigServiceMounts(context, services);

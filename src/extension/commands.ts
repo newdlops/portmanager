@@ -548,7 +548,9 @@ export class PortManagerCommandController implements DisposableLike {
         ? {
             composeMutation: {
               mode: shouldAdjustComposeInPlace ? ("in-place" as const) : ("clone" as const),
-              ...(isComposeCloneAttachMode(composeAttachMode) ? { allowStatefulClone } : {}),
+              ...(isComposeCloneAttachMode(composeAttachMode)
+                ? { allowStatefulClone, copyStoppedServices: true }
+                : {}),
               ...(composeAttachMode === "clone-custom" && attachedProjectName !== undefined
                 ? { attachedProjectName }
                 : {}),

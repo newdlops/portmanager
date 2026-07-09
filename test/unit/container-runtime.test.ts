@@ -2297,6 +2297,200 @@ test("copy mode creates stopped langgraph_server discovered from compose ps", as
   assert.equal(result.ports[1], undefined);
 });
 
+test("clone attach copies compose-config bind mounts for registered services without source containers", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-registered-service-copy-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const composeFile = path.join(tempDir, "compose.yaml");
+  const serviceDir = path.join(tempDir, "services", "langgraph_server");
+  fs.mkdirSync(serviceDir, { recursive: true });
+  fs.writeFileSync(path.join(serviceDir, ".env"), "TOKEN=ok\n", "utf8");
+  fs.writeFileSync(
+    composeFile,
+    [
+      "name: workspace",
+      "services:",
+      "  db:",
+      "    image: postgres:16",
+      "    ports:",
+      "      - 15432:5432",
+      "  langgraph_server:",
+      "    image: busybox",
+      "    volumes:",
+      "      - ./services/langgraph_server:/app",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const calls: Array<{ readonly executable: string; readonly args: readonly string[] }> = [];
+  let hiddenStarted = false;
+  let hiddenCreated = false;
+  const rowFor = (id: string, project: string, serviceName: string, status: string, ports: string, name?: string) => ({
+    ID: id,
+    Names: name ?? `${project}_${serviceName}_1`,
+    Status: status,
+    Ports: ports,
+    Labels: `com.docker.compose.project=${project},com.docker.compose.service=${serviceName}`,
+  });
+  const sourceRows = [
+    rowFor("source-db", "workspace", "db", "Up 10 seconds", "127.0.0.1:15432->5432/tcp"),
+  ];
+  const hiddenRows = () => [
+    ...(hiddenStarted
+      ? [
+          rowFor(
+            "hidden-db",
+            "alpha-workspace",
+            "db",
+            "Up 1 second",
+            "127.81.154.127:57001->5432/tcp",
+            "alpha-workspace-db-1",
+          ),
+        ]
+      : []),
+    ...(hiddenCreated
+      ? [
+          rowFor(
+            "hidden-langgraph",
+            "alpha-workspace",
+            "langgraph_server",
+            "Created",
+            "",
+            "alpha-workspace-langgraph_server-1",
+          ),
+        ]
+      : []),
+  ];
+
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (executable, args) => {
+      calls.push({ executable, args });
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "db\nlanggraph_server\n", stderr: "" };
+      }
+      if (args[0] === "compose" && args.includes("ps") && args.includes("--all") && args.includes("--services")) {
+        return { stdout: "db\nlanggraph_server\n", stderr: "" };
+      }
+      if (args[0] === "compose" && args.includes("config") && args.includes("--format")) {
+        return {
+          stdout: JSON.stringify({
+            services: {
+              db: {},
+              langgraph_server: {
+                volumes: [
+                  {
+                    type: "bind",
+                    source: "./services/langgraph_server",
+                    target: "/app",
+                    read_only: false,
+                  },
+                ],
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "compose" && args.includes("up")) {
+        hiddenStarted = true;
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "compose" && args.includes("create")) {
+        hiddenCreated = true;
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ps") {
+        return { stdout: sourceRows.map((row) => JSON.stringify(row)).join("\n"), stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        const projectFilter = args.find((arg) => arg.startsWith("label=com.docker.compose.project="));
+        const rows =
+          projectFilter === "label=com.docker.compose.project=workspace"
+            ? sourceRows
+            : projectFilter === "label=com.docker.compose.project=alpha-workspace"
+              ? hiddenRows()
+              : [...sourceRows, ...hiddenRows()];
+        return { stdout: rows.map((row) => JSON.stringify(row)).join("\n"), stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        const rowsById = new Map(
+          [...sourceRows, ...hiddenRows()].map((row) => [
+            row.ID,
+            {
+              Id: row.ID,
+              Name: `/${row.Names}`,
+              Config: {
+                Labels: Object.fromEntries(row.Labels.split(",").map((label) => label.split("=") as [string, string])),
+              },
+              Mounts: [],
+            },
+          ]),
+        );
+        return {
+          stdout: JSON.stringify(args.slice(2).map((id) => rowsById.get(id) ?? { Id: id, Name: `/${id}`, Mounts: [] })),
+          stderr: "",
+        };
+      }
+
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    allowStatefulClone: true,
+    attachedProjectName: "alpha-workspace",
+    runtime: "docker",
+    networkName: "alpha",
+    hiddenHostAddress: "127.81.154.127",
+    originalProjectName: "workspace",
+    workingDirectory: tempDir,
+    composeFiles: [composeFile],
+    copyStoppedServices: true,
+    ports: [
+      {
+        serviceName: "db",
+        logicalPort: 15432,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 15432,
+        containerPort: 5432,
+        protocol: "tcp",
+        protocolName: "postgresql",
+      },
+    ],
+  });
+
+  const volumeCopyArgs = calls.filter((call) => call.args[0] === "run").map((call) => call.args);
+  assert.equal(volumeCopyArgs.some((args) => args.includes(`${serviceDir}:/from:ro`)), true);
+  assert.deepEqual(result.state.services, ["db", "langgraph_server"]);
+  assert.deepEqual(
+    result.state.clonedVolumes?.map((volume) => ({
+      serviceName: volume.serviceName,
+      sourceKind: volume.sourceKind,
+      sourceName: volume.sourceName,
+      containerPath: volume.containerPath,
+    })),
+    [
+      {
+        serviceName: "langgraph_server",
+        sourceKind: "bind",
+        sourceName: serviceDir,
+        containerPath: "/app",
+      },
+    ],
+  );
+  assert.ok(calls.some((call) => call.args.includes("up") && call.args.includes("db")));
+  assert.equal(calls.some((call) => call.args.includes("up") && call.args.includes("langgraph_server")), false);
+  assert.ok(calls.some((call) => call.args.includes("create") && call.args.includes("langgraph_server")));
+  assert.equal(result.ports[0]?.actualHostAddress, "127.81.154.127");
+  assert.equal(result.ports[0]?.actualHostPort, 57001);
+
+  const overrideText = fs.readFileSync(result.state.overrideFile, "utf8");
+  assert.match(overrideText, /'langgraph_server':/);
+  assert.match(overrideText, /target: '\/app'/);
+  assert.equal(overrideText.includes(serviceDir), false);
+});
+
 test("clone attach copies compose-config volumes when the source project has no containers", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-config-mounts-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
