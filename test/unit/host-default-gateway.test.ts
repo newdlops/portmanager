@@ -20,21 +20,30 @@ test("host default gateway prefers the current window network for duplicate loca
 });
 
 test("host default gateway uses stable network order when no preferred network matches", () => {
-  const selected = selectHostDefaultGatewayExposure(
-    [
-      exposure({ id: "production2", networkId: "production2", targetAddress: "127.83.116.219" }),
-      exposure({ id: "production1", networkId: "production1", targetAddress: "127.81.154.127" }),
-    ],
-    {
-      networks: networks(["production1", "production2"]),
-      preferredNetworkId: "missing",
-    },
-  );
+  const exposures = [
+    exposure({ id: "production2", networkId: "production2", targetAddress: "127.83.116.219" }),
+    exposure({ id: "production1", networkId: "production1", targetAddress: "127.81.154.127" }),
+  ];
+  const networkOrder = networks(["production1", "production2"]);
 
-  assert.equal(selected?.networkId, "production1");
+  assert.equal(selectHostDefaultGatewayExposure(exposures, { networks: networkOrder })?.networkId, "production1");
+  assert.equal(
+    selectHostDefaultGatewayExposure(exposures, {
+      networks: networkOrder,
+      observedExposureIds: new Set(),
+    })?.networkId,
+    "production1",
+  );
+  assert.equal(
+    selectHostDefaultGatewayExposure(exposures, {
+      networks: networkOrder,
+      preferredNetworkId: "missing",
+    })?.networkId,
+    "production1",
+  );
 });
 
-test("host default gateway refuses arbitrary networks when an explicit preference is required", () => {
+test("host default gateway prefers an observed backend when no network preference matches", () => {
   const exposures = [
     exposure({ id: "production1", networkId: "production1", targetAddress: "127.81.154.127" }),
     exposure({ id: "production2", networkId: "production2", targetAddress: "127.83.116.219" }),
@@ -43,17 +52,17 @@ test("host default gateway refuses arbitrary networks when an explicit preferenc
   assert.equal(
     selectHostDefaultGatewayExposure(exposures, {
       networks: networks(["production1", "production2"]),
-      requirePreferredNetwork: true,
-    }),
-    undefined,
+      observedExposureIds: new Set(["production2"]),
+    })?.networkId,
+    "production2",
   );
   assert.equal(
     selectHostDefaultGatewayExposure(exposures, {
       networks: networks(["production1", "production2"]),
-      preferredNetworkId: "missing",
-      requirePreferredNetwork: true,
-    }),
-    undefined,
+      preferredNetworkId: "production1",
+      observedExposureIds: new Set(["production2"]),
+    })?.networkId,
+    "production1",
   );
 });
 

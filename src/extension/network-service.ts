@@ -4966,8 +4966,8 @@ export class PortManagerNetworkService implements DisposableLike {
    *
    * A missing network id here means the client is hookless, host-scoped, or
    * otherwise unattributable. Route only through host-observable policy:
-   * a live host-global listener first, then an explicitly selected user
-   * network, then an explicit legacy network-less owner.
+   * a live host-global listener first, then the stable host-default route,
+   * then an explicit legacy network-less owner.
    */
   private async resolveNonNetworkClientTarget(
     logicalPort: number,
@@ -5074,7 +5074,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const exposure = selectHostDefaultGatewayExposure(exposures, {
       networks: registrySnapshot.networks,
       preferredNetworkId,
-      requirePreferredNetwork: true,
+      observedExposureIds: collectObservedHostGatewayExposureIds(exposures, processSnapshot?.listeners ?? []),
     });
 
     if (exposure === undefined) {
@@ -5084,7 +5084,7 @@ export class PortManagerNetworkService implements DisposableLike {
           `host-default logical_port=${logicalPort} preferred=${preferredNetworkId ?? "-"} ` +
             `fixed=${isFixedProtocolPort ? 1 : 0} ` +
             `routeCandidates=${routeExposures.length} composeCandidates=${composeExposures.length} ` +
-            `generatedComposeCandidates=${generatedComposeExposures.length} -> MISS (no selected target)`,
+            `generatedComposeCandidates=${generatedComposeExposures.length} -> MISS (no target)`,
         );
       }
       return undefined;
@@ -5570,15 +5570,22 @@ export class PortManagerNetworkService implements DisposableLike {
       exposureEndpointPairs.map(([exposureEndpoint, exposure]) => [exposureEndpoint.id, exposure]),
     );
     const hostLocalGatewayPorts = new Set(readPortManagerSettings().fixedProtocolPorts);
-    // Host-local fixed-protocol redirects require an explicit window network
-    // and never shadow a live global listener. Their sniffing listeners live on
-    // the hidden redirect alias rather than the browser alias.
+    const hostLocalGatewayExposures = collectHostGatewayExposures(
+      routes,
+      networks,
+      [],
+      registrySnapshot.composeAttachments,
+    );
+    // Prefer the explicit window network, otherwise use the stable first
+    // currently observed backend. A live global listener always wins. Redirect
+    // sniffers live on the hidden alias rather than the browser alias.
     const hostLocalGatewayRedirects = selectHostLocalGatewayRedirects(
-      collectHostGatewayExposures(routes, networks, [], registrySnapshot.composeAttachments),
+      hostLocalGatewayExposures,
       networks,
       hostLocalGatewayPorts,
       this.vscodeWindowTerminalBinding?.status === "attached" ? this.vscodeWindowTerminalBinding.networkId : undefined,
       collectGlobalSamePortListenerPorts(snapshot?.listeners ?? []),
+      collectObservedHostGatewayExposureIds(hostLocalGatewayExposures, snapshot?.listeners ?? []),
     );
     const endpoints = mergeBrowserProxyEndpoints(
       exposureEndpointPairs.map(([exposureEndpoint]) => exposureEndpoint),
@@ -9238,6 +9245,7 @@ function selectHostLocalGatewayRedirects(
   hostLocalGatewayPorts: ReadonlySet<number>,
   preferredHostDefaultNetworkId: string | undefined,
   globalSamePortListenerPorts: ReadonlySet<number> = new Set(),
+  observedExposureIds: ReadonlySet<string> = new Set(),
 ): readonly HostLocalGatewayRedirect[] {
   const exposuresByPort = new Map<number, HostPortExposure[]>();
 
@@ -9259,7 +9267,7 @@ function selectHostLocalGatewayRedirects(
     const exposure = selectHostDefaultGatewayExposure(portExposures, {
       networks,
       preferredNetworkId: preferredHostDefaultNetworkId,
-      requirePreferredNetwork: true,
+      observedExposureIds,
     });
     if (exposure === undefined) {
       continue;
@@ -9282,6 +9290,30 @@ function selectHostLocalGatewayRedirects(
   }
 
   return redirects.sort((left, right) => left.port - right.port || left.networkId.localeCompare(right.networkId));
+}
+
+/** Matches host-gateway candidates to the latest OS listener snapshot. */
+function collectObservedHostGatewayExposureIds(
+  exposures: readonly HostPortExposure[],
+  listeners: readonly ListeningPort[],
+): ReadonlySet<string> {
+  const observedIds = new Set<string>();
+
+  for (const exposure of exposures) {
+    const targetHost = exposure.targetAddress.trim().length === 0 ? "127.0.0.1" : exposure.targetAddress;
+    if (
+      listeners.some(
+        (listener) =>
+          listener.protocol === "tcp" &&
+          listener.port === exposure.targetPort &&
+          endpointHostMatches(listener.localAddress, targetHost),
+      )
+    ) {
+      observedIds.add(exposure.id);
+    }
+  }
+
+  return observedIds;
 }
 
 /** Ports already owned by the reserved host-global loopback must bypass PF redirects. */

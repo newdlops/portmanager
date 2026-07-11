@@ -2237,7 +2237,7 @@ test("logical router classifies clients by process tree label before hook enviro
 
   // In address-only mode, an unattributable router client is a pure host
   // execution that did not inherit hook state. A hooked global same-port
-  // listener wins; an explicitly selected user network is only the fallback.
+  // listener wins; the stable host-default route remains the fallback.
   assert.equal(
     resolveNonNetworkClientTarget.includes("settings.globalNetwork && usesLoopbackAddressOnlyRouting(settings)"),
     true,
@@ -2278,7 +2278,9 @@ test("logical router classifies clients by process tree label before hook enviro
   assert.equal(source.includes("collectHostGatewayExposures("), true);
   assert.equal(source.includes("selectHostDefaultGatewayExposure(exposures"), true);
   assert.equal(source.includes("this.vscodeWindowTerminalBinding?.status === \"attached\""), true);
-  assert.equal(resolveHostDefaultGatewayClientTarget.includes("requirePreferredNetwork: true"), true);
+  assert.equal(resolveHostDefaultGatewayClientTarget.includes("requirePreferredNetwork"), false);
+  assert.equal(resolveHostDefaultGatewayClientTarget.includes("observedExposureIds:"), true);
+  assert.equal(source.includes("function collectObservedHostGatewayExposureIds("), true);
   assert.equal(source.includes("function collectGlobalSamePortListenerPorts("), true);
   assert.equal(source.includes("globalSamePortListenerPorts.has(hostPort)"), true);
   assert.equal(resolveHostDefaultGatewayClientTarget.includes("const isFixedProtocolPort = this.isFixedProtocolPort(logicalPort)"), true);

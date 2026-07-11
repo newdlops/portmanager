@@ -203,7 +203,8 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(networkServiceSource.includes('createdAt: "hidden-host-local-gateway"'), false);
   assert.equal(networkServiceSource.includes("selectHostLocalGatewayRedirects"), true);
   assert.equal(networkServiceSource.includes("collectGlobalSamePortListenerPorts(snapshot?.listeners ?? [])"), true);
-  assert.equal(networkServiceSource.includes("requirePreferredNetwork: true"), true);
+  assert.equal(networkServiceSource.includes("collectObservedHostGatewayExposureIds"), true);
+  assert.equal(networkServiceSource.includes("requirePreferredNetwork"), false);
   assert.equal(networkServiceSource.includes("syncHostLocalGatewayRedirects"), true);
   // The pf rdr target must be the hidden redirect alias, not the browser alias:
   // macOS pf reply translation breaks every direct dial to an rdr target
