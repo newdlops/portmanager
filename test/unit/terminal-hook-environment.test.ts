@@ -14,27 +14,69 @@ import { DEFAULT_PORT_MANAGER_SETTINGS } from "../../src/shared/default-settings
  * even when they are already present later in the inherited shell environment.
  */
 
-test("BASH_ENV restore script promotes runtime shims ahead of inherited PATH entries", () => {
+test("BASH_ENV restore script keeps the common runtime-shim path hot", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
+  const restoreStart = source.indexOf("function buildShellEnvRestoreScript");
+  const restoreEnd = source.indexOf("function shellQuote", restoreStart);
+  const restoreBody = source.slice(restoreStart, restoreEnd);
 
   assert.equal(
-    source.includes('case ":\\${PATH:-}:"'),
+    restoreBody.includes('"0:\\${PORT_MANAGER_RUNTIME_SHIM_DIR}"|"0:\\${PORT_MANAGER_RUNTIME_SHIM_DIR}":*)'),
+    true,
+    "an already-leading, stamped shim directory must avoid a full PATH rebuild",
+  );
+  assert.equal(restoreBody.includes("RUNTIME_SHIM_STAMP_FILE_NAME"), true);
+  assert.equal(restoreBody.includes('for __pm_path_entry in \\${PATH:-}; do'), true);
+  assert.equal(
+    restoreBody.includes('if [ "\\${__pm_path_entry}" = "\\${PORT_MANAGER_RUNTIME_SHIM_DIR}" ]; then'),
+    true,
+  );
+  assert.equal(
+    restoreBody.includes('export PATH="\\${PORT_MANAGER_RUNTIME_SHIM_DIR}\\${__pm_path_rest:+:$__pm_path_rest}"'),
+    true,
+  );
+  assert.equal(restoreBody.includes("export PORT_MANAGER_RUNTIME_SHIM_READY=0"), true);
+  assert.equal(restoreBody.includes("for __pm_shim_name in ${TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES.join(\" \")}"), false);
+  assert.equal(restoreBody.includes('export PATH="\\${__pm_path_rest}"'), true);
+  assert.equal(
+    restoreBody.includes("buildComposeProjectRoutingFunctionScript"),
     false,
-    "runtime shim restore must not skip PATH repair just because the shim directory is already present",
+    "ordinary bash children must not parse the large Compose wrapper library",
   );
-  assert.equal(source.includes('for __pm_path_entry in \\${PATH:-}; do'), true);
+});
+
+test("VS Code sends only activation variables through shell integration", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const contextStart = source.indexOf("const TERMINAL_CONTEXT_MUTATOR_OPTIONS");
+  const contextEnd = source.indexOf("};", contextStart);
+  const contextBody = source.slice(contextStart, contextEnd);
+  const activationStart = source.indexOf("const TERMINAL_ACTIVATION_MUTATOR_OPTIONS");
+  const activationEnd = source.indexOf("};", activationStart);
+  const activationBody = source.slice(activationStart, activationEnd);
+
+  assert.equal(contextBody.includes("applyAtProcessCreation: true"), true);
+  assert.equal(contextBody.includes("applyAtShellIntegration: false"), true);
+  assert.equal(activationBody.includes("applyAtProcessCreation: false"), true);
+  assert.equal(activationBody.includes("applyAtShellIntegration: true"), true);
+  assert.equal(activationBody.includes("nvm/asdf/pyenv"), true);
   assert.equal(
-    source.includes('if [ "\\${__pm_path_entry}" = "\\${PORT_MANAGER_RUNTIME_SHIM_DIR}" ]; then'),
+    source.includes('collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_ACTIVATION_MUTATOR_OPTIONS);'),
     true,
   );
   assert.equal(
-    source.includes('export PATH="\\${PORT_MANAGER_RUNTIME_SHIM_DIR}\\${__pm_path_rest:+:$__pm_path_rest}"'),
+    source.includes('collection.replace("PORT_MANAGER_NETWORK_ID", scope.networkId, TERMINAL_CONTEXT_MUTATOR_OPTIONS);'),
     true,
   );
-  assert.equal(source.includes("export PORT_MANAGER_RUNTIME_SHIM_READY=0"), true);
-  assert.equal(source.includes("for __pm_shim_name in ${TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES.join(\" \")}"), true);
-  assert.equal(source.includes('export PATH="\\${__pm_path_rest}"'), true);
+  assert.equal(
+    source.includes('collection.prepend("PATH", `${launcherDirectory}${path.delimiter}`, TERMINAL_ACTIVATION_MUTATOR_OPTIONS);'),
+    true,
+  );
+  assert.equal(
+    source.includes('collection.replace("PORT_MANAGER_EXPECTED_VERSION", packageVersion, TERMINAL_CONTEXT_MUTATOR_OPTIONS);'),
+    true,
+  );
 });
 
 test("unattached terminals join the global network by default in address-only mode", () => {
@@ -76,19 +118,19 @@ test("unattached terminals join the global network by default in address-only mo
     "NEWDLOPS_PM_BORROWED_NETWORK_ID",
   ]) {
     assert.equal(
-      globalBody.includes(`collection.replace("${idVar}", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_MUTATOR_OPTIONS);`),
+      globalBody.includes(`collection.replace("${idVar}", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_CONTEXT_MUTATOR_OPTIONS);`),
       true,
       `${idVar} must carry the reserved global network id`,
     );
   }
-  assert.equal(globalBody.includes('collection.replace(NETWORK_IS_GLOBAL_ENV, "1", TERMINAL_MUTATOR_OPTIONS);'), true);
+  assert.equal(globalBody.includes('collection.replace(NETWORK_IS_GLOBAL_ENV, "1", TERMINAL_CONTEXT_MUTATOR_OPTIONS);'), true);
   assert.equal(globalBody.includes("PORT_MANAGER_NETWORK_NAME"), false);
   assert.equal(globalBody.includes("NETWORK_DNS_ALIAS"), false);
   assert.equal(globalBody.includes("ensureNetworkEnvFileScaffold"), false);
   assert.equal(globalBody.includes("PORT_MANAGER_COMPOSE_LOGICAL_PORTS"), false);
   assert.equal(globalBody.includes("applyLoopbackRoutingHosts(collection, GLOBAL_LOGICAL_NETWORK_ID, settings);"), true);
   assert.equal(globalBody.includes("globalNetworkScope: true"), true);
-  assert.equal(globalBody.includes('collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_MUTATOR_OPTIONS);'), true);
+  assert.equal(globalBody.includes('collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_ACTIVATION_MUTATOR_OPTIONS);'), true);
   assert.equal(globalBody.includes("applyRuntimeShimLauncherPath("), true);
   assert.equal(globalBody.includes('collection.replace("PORT_MANAGER_HOST_ACCESS_FILE"'), true);
   assert.equal(globalBody.includes("collection.replace(DOCKER_SHIM_PATH_ENV, runtimeCommandShimPath"), true);
@@ -101,7 +143,7 @@ test("unattached terminals join the global network by default in address-only mo
   // If the global feature is disabled, a plain host terminal still needs the
   // preload hook and BASH_ENV repair; it just carries no network id.
   assert.equal(gatewayBody.includes("hookWithoutNetwork: true"), true);
-  assert.equal(gatewayBody.includes('collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_MUTATOR_OPTIONS);'), true);
+  assert.equal(gatewayBody.includes('collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_ACTIVATION_MUTATOR_OPTIONS);'), true);
   assert.equal(gatewayBody.includes("applyRuntimeShimLauncherPath("), true);
   assert.equal(restoreBody.includes("scope.hookWithoutNetwork === true"), true);
   assert.equal(restoreBody.includes("export PORT_MANAGER_HOOK=1"), true);
@@ -114,7 +156,7 @@ test("terminal environment overwrites stale network loopback host when hidden", 
   const sourcePath = path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
 
-  assert.equal(source.includes('collection.replace(NETWORK_LOOPBACK_HOST_ENV, "", TERMINAL_MUTATOR_OPTIONS);'), true);
+  assert.equal(source.includes('collection.replace(NETWORK_LOOPBACK_HOST_ENV, "", TERMINAL_CONTEXT_MUTATOR_OPTIONS);'), true);
   assert.equal(source.includes("older terminal attachment"), true);
 });
 
@@ -136,12 +178,12 @@ test("terminal hook preload entries are normalized across multiple VS Code windo
   const detachBody = networkServiceSource.slice(detachStart, networkServiceSource.indexOf("export interface", detachStart));
 
   assert.equal(applyBody.includes("collection.prepend(preloadVariable"), false);
-  assert.equal(applyBody.includes('collection.replace(NETWORK_IS_GLOBAL_ENV, "", TERMINAL_MUTATOR_OPTIONS);'), true);
+  assert.equal(applyBody.includes('collection.replace(NETWORK_IS_GLOBAL_ENV, "", TERMINAL_CONTEXT_MUTATOR_OPTIONS);'), true);
   assert.equal(applyBody.includes("prependUniquePathListEntry(hookLibraryPath, process.env[preloadVariable])"), true);
   assert.equal(applyBody.includes("collection.replace(preloadHintVariable, hookLibraryPath"), true);
   assert.equal(terminalHookEnvironmentSource.includes('collection.replace(\n      "PATH"'), false);
   assert.equal(
-    terminalHookEnvironmentSource.includes('collection.prepend("PATH", `${launcherDirectory}${path.delimiter}`, TERMINAL_MUTATOR_OPTIONS);'),
+    terminalHookEnvironmentSource.includes('collection.prepend("PATH", `${launcherDirectory}${path.delimiter}`, TERMINAL_ACTIVATION_MUTATOR_OPTIONS);'),
     true,
   );
   assert.equal(terminalHookEnvironmentSource.includes('process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD"'), true);
@@ -156,7 +198,7 @@ test("terminal hook preload entries are normalized across multiple VS Code windo
     terminalHookEnvironmentSource.includes("export PORT_MANAGER_DYLD_INSERT_LIBRARIES=${shellQuote(hookLibraryPath)}"),
     true,
   );
-  assert.equal(terminalHookEnvironmentSource.includes("*/media/native/libportmanager_hook.dylib) continue ;;"), true);
+  assert.equal(terminalHookEnvironmentSource.includes("*/media/native/libportmanager_hook.dylib"), true);
   assert.equal(attachBody.includes("shellPrependLibrary(preloadVariable, hookLibraryPath)"), true);
   assert.equal(attachBody.includes("${NETWORK_IS_GLOBAL_ENV}"), true);
   assert.equal(attachBody.includes("shellExport(\"PORT_MANAGER_NETWORK_NAME\", networkName)"), true);
@@ -165,7 +207,10 @@ test("terminal hook preload entries are normalized across multiple VS Code windo
   assert.equal(detachBody.includes("shellRemovePathListEntry(\"PATH\", runtimeShimDirectory)"), true);
   assert.equal(networkServiceSource.includes("function shellPrependPathListEntry"), true);
   assert.equal(networkServiceSource.includes("function isPortManagerHookLibraryPath"), true);
-  assert.equal(networkServiceSource.includes("*/media/native/libportmanager_hook.dylib) continue ;;"), true);
+  assert.equal(
+    networkServiceSource.includes("*/media/native/libportmanager_hook.dylib|*/media/native/libportmanager_hook.so) continue ;;"),
+    true,
+  );
   assert.equal(networkServiceSource.includes("function shellRemovePathListEntry"), true);
   assert.equal(networkServiceSource.includes('"PORT_MANAGER_LD_PRELOAD"'), true);
   assert.equal(nativeHookSource.includes("static int pm_preload_value_is_normalized"), true);
@@ -195,6 +240,43 @@ test("experimental route ownership env is opt-in and cleaned from legacy paths",
   assert.equal(networkServiceSource.includes("EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV"), true);
   assert.equal(commandsSource.includes("EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV"), true);
   assert.equal(nodeRuntimeSource.includes('"PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE"'), true);
+});
+
+test("escaped-server control channel stays cold unless its setting is enabled", () => {
+  const terminalHookEnvironmentSource = fs.readFileSync(
+    path.resolve(__dirname, "../../../src/extension/terminal-hook-environment.ts"),
+    "utf8",
+  );
+  const networkServiceSource = fs.readFileSync(
+    path.resolve(__dirname, "../../../src/extension/network-service.ts"),
+    "utf8",
+  );
+  const commandsSource = fs.readFileSync(path.resolve(__dirname, "../../../src/extension/commands.ts"), "utf8");
+  const nativeHookSource = fs.readFileSync(
+    path.resolve(__dirname, "../../../native/hook/portmanager_hook.c"),
+    "utf8",
+  );
+  const defaultSettingsSource = fs.readFileSync(
+    path.resolve(__dirname, "../../../src/shared/default-settings.ts"),
+    "utf8",
+  );
+
+  assert.equal(terminalHookEnvironmentSource.includes('ESCAPED_SERVER_RESPAWN_ENV = "PORT_MANAGER_ESCAPED_SERVER_RESPAWN"'), true);
+  assert.equal(terminalHookEnvironmentSource.includes("settings.escapedServerRespawn ? \"1\" : \"\""), true);
+  assert.equal(networkServiceSource.includes("settings.escapedServerRespawn"), true);
+  assert.equal(commandsSource.includes("options.settings.escapedServerRespawn"), true);
+  assert.equal(defaultSettingsSource.includes("escapedServerRespawn: false"), true);
+
+  const initStart = nativeHookSource.indexOf("static void pm_control_channel_init");
+  const initEnd = nativeHookSource.indexOf("#define PM_SH_C_SENTINEL", initStart);
+  const initBody = nativeHookSource.slice(initStart, initEnd);
+  assert.notEqual(initStart, -1);
+  assert.equal(initBody.includes('pm_env_flag_is_one("PORT_MANAGER_ESCAPED_SERVER_RESPAWN")'), true);
+  assert.equal(
+    initBody.indexOf('pm_env_flag_is_one("PORT_MANAGER_ESCAPED_SERVER_RESPAWN")') <
+      initBody.indexOf("pthread_mutex_lock(&pm_control_start_mutex)"),
+    true,
+  );
 });
 
 test("package command shims rerun client tools without native runtime alias semantics", () => {
@@ -366,7 +448,10 @@ test("global shell hook routes no-network shells through the global scope", () =
   assert.equal(hookTemplate.includes('shellPrependPathListEntry("DYLD_INSERT_LIBRARIES", options.hookLibraryPath)'), true);
   assert.equal(hookTemplate.includes('shellPrependPathListEntry("LD_PRELOAD", options.hookLibraryPath)'), true);
   assert.equal(source.includes("function isPortManagerHookLibraryPath"), true);
-  assert.equal(source.includes("*/media/native/libportmanager_hook.dylib) continue ;;"), true);
+  assert.equal(
+    source.includes("*/media/native/libportmanager_hook.dylib|*/media/native/libportmanager_hook.so) continue ;;"),
+    true,
+  );
   assert.equal(hookTemplate.includes("removeNativeHookPreloadScript"), true);
   assert.equal(source.includes('shellRemovePathListEntry("DYLD_INSERT_LIBRARIES", options.hookLibraryPath)'), true);
   assert.equal(source.includes('shellRemovePathListEntry("LD_PRELOAD", options.hookLibraryPath)'), true);
@@ -423,6 +508,13 @@ test("terminal attach markers are scoped by terminal session id", () => {
   const composeRoutingSource = fs.readFileSync(composeRoutingPath, "utf8");
   const registrySource = fs.readFileSync(registryPath, "utf8");
   const commandSource = fs.readFileSync(commandSourcePath, "utf8");
+  const sessionStart = networkServiceSource.indexOf("function buildTerminalSessionIsolationShell");
+  const markerWriteStart = networkServiceSource.indexOf("function buildTerminalAttachmentMarkerWriteShell", sessionStart);
+  const markerRemoveStart = networkServiceSource.indexOf("function buildTerminalAttachmentMarkerRemoveShell", markerWriteStart);
+  const markerHelpersEnd = networkServiceSource.indexOf("function shellExport", markerRemoveStart);
+  const sessionBody = networkServiceSource.slice(sessionStart, markerWriteStart);
+  const markerWriteBody = networkServiceSource.slice(markerWriteStart, markerRemoveStart);
+  const markerRemoveBody = networkServiceSource.slice(markerRemoveStart, markerHelpersEnd);
 
   assert.equal(networkServiceSource.includes("function buildTerminalSessionIsolationShell(): string"), true);
   assert.equal(networkServiceSource.includes("PORT_MANAGER_TERMINAL_SESSION_ID"), true);
@@ -446,6 +538,21 @@ test("terminal attach markers are scoped by terminal session id", () => {
   );
   assert.equal(commandSource.includes("__pm_marker_identity=\"\\${PORT_MANAGER_TERMINAL_SESSION_ID:-"), true);
   assert.equal(commandSource.includes("PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID"), true);
+
+  // Attaching used to launch tty/ps/tr/date/sed twice. Capture identity once,
+  // reuse it for the marker, and keep marker-key derivation builtin-only when a
+  // modern session id already exists.
+  assert.equal((sessionBody.match(/command -p ps/g) ?? []).length, 1);
+  assert.equal((sessionBody.match(/command -p date/g) ?? []).length, 1);
+  assert.equal(sessionBody.includes("__pm_terminal_session_sequence"), true);
+  assert.equal(sessionBody.includes(" | tr "), false);
+  assert.equal(sessionBody.includes(" | sed "), false);
+  assert.equal(markerWriteBody.includes("command -p tty"), false);
+  assert.equal(markerWriteBody.includes("command -p ps"), false);
+  assert.equal(markerWriteBody.includes("command -p date"), false);
+  assert.equal(markerWriteBody.includes('"$__pm_attached_at"'), true);
+  assert.equal(markerWriteBody.includes('if [ ! -d "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR" ]'), true);
+  assert.equal(markerRemoveBody.includes("sed "), false);
 });
 
 test("external pm shell function selects a network and sources its attach script", () => {
@@ -650,6 +757,8 @@ test("profile shell hook lazy-loads heavy pm command implementation", () => {
   assert.equal(commandSource.includes("const hookScriptContents = buildShellHookStartupScript({"), true);
   assert.equal(commandSource.includes("existingCommandScript !== commandScriptContents"), true);
   assert.equal(commandSource.includes("await fs.chmod(hookCommandLibraryPath, 0o700)"), true);
+  assert.equal(commandSource.includes('return [path.join(os.homedir(), ".zshrc")];'), true);
+  assert.equal(commandSource.includes('path.join(os.homedir(), ".zprofile"), path.join(os.homedir(), ".zshrc")'), false);
   assert.equal(startupSource.includes("# Port Manager shell startup"), true);
   assert.equal(startupSource.includes('pm() {'), true);
   assert.equal(startupSource.includes('. "${escapedCommandLibraryPath}" || return $?'), true);
@@ -657,6 +766,13 @@ test("profile shell hook lazy-loads heavy pm command implementation", () => {
   assert.equal(startupSource.includes("routePrintScript"), false);
   assert.equal(startupSource.includes("doctorRoutingScript"), false);
   assert.equal(startupSource.includes("workerEnvScript"), false);
+  assert.equal(startupSource.includes('[ "\\${TERM_PROGRAM:-}" = "vscode" ]'), true);
+  assert.equal(startupSource.includes("VSCODE_ENV_REPLACE"), true);
+  assert.equal(startupSource.includes("VSCODE_ENV_PREPEND"), true);
+  assert.equal(startupSource.includes("runtimeShimPathRemoveScript"), true);
+  assert.equal(startupSource.includes("return 0 2>/dev/null || true"), true);
+  assert.equal(commandSource.includes('__pm_path_remaining="\\${${name}:-}"'), true);
+  assert.equal(commandSource.includes('while [ -n "$__pm_path_remaining" ]; do'), true);
 });
 
 test("agent client startup avoids blocking on full listener refresh", () => {
@@ -1764,18 +1880,20 @@ test("terminal attach switches loopback identity before long shell bootstrap wor
   const scriptBody = source.slice(scriptStart, scriptEnd);
   const networkExportIndex = scriptBody.indexOf('shellExport("PORT_MANAGER_NETWORK_ID", networkId)');
   const identityExportIndex = scriptBody.indexOf("buildLoopbackIdentityExportShell(loopbackHost, terminalLoopbackMode)");
-  const composeShellIndex = scriptBody.indexOf("buildComposeProjectRoutingShell");
+  const composeFileExportIndex = scriptBody.indexOf('shellExport("PORT_MANAGER_COMPOSE_ROUTING_FILE"');
   const aliasCheckIndex = scriptBody.indexOf("buildLoopbackAddressRoutingShell(loopbackHost, terminalLoopbackMode)");
 
   assert.notEqual(scriptStart, -1);
   assert.notEqual(scriptEnd, -1);
   assert.notEqual(networkExportIndex, -1);
   assert.notEqual(identityExportIndex, -1);
-  assert.notEqual(composeShellIndex, -1);
+  assert.notEqual(composeFileExportIndex, -1);
   assert.notEqual(aliasCheckIndex, -1);
   assert.equal(networkExportIndex < identityExportIndex, true);
-  assert.equal(identityExportIndex < composeShellIndex, true);
+  assert.equal(identityExportIndex < composeFileExportIndex, true);
   assert.equal(identityExportIndex < aliasCheckIndex, true);
+  assert.equal(scriptBody.includes("buildComposeProjectRoutingShell"), false);
+  assert.equal(scriptBody.includes("~48KB function body"), true);
   assert.equal(source.includes("leaving the new network id paired with a stale loopback"), true);
 });
 

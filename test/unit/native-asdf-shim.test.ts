@@ -50,6 +50,17 @@ test("runtime launcher restores preload and network scope then execs the real ru
   assert.equal(source.includes("execv(executable_path, next_argv);"), true);
 });
 
+test("runtime launcher fails open when an upgraded extension removed the hinted hook", () => {
+  const source = fs.readFileSync(sourcePath, "utf8");
+
+  assert.equal(source.includes("pm_preload_segment_is_portmanager_hook"), true);
+  assert.equal(source.includes("pm_without_portmanager_preloads"), true);
+  assert.equal(source.includes("if (access(hook, R_OK) != 0)"), true);
+  assert.equal(source.includes('unsetenv(PM_PRELOAD_ENV);'), true);
+  assert.equal(source.includes('setenv("PORT_MANAGER_HOOK", "0", 1);'), true);
+  assert.equal(source.includes("Never pass a missing dylib to dyld"), true);
+});
+
 test("runtime launcher guards against a resolution loop", () => {
   const source = fs.readFileSync(sourcePath, "utf8");
 

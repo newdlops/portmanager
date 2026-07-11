@@ -137,6 +137,7 @@ import {
   applyTerminalHookEnvironment,
   AGENT_REQUIRED_ENV,
   DOCKER_SHIM_PATH_ENV,
+  ESCAPED_SERVER_RESPAWN_ENV,
   EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV,
   getAsdfShimLauncherRelativePath,
   ensureNetworkEnvFileScaffold,
@@ -150,7 +151,6 @@ import {
   TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES,
 } from "./terminal-hook-environment";
 import {
-  buildComposeProjectRoutingShell,
   inferContainerMappingsFromComposeRoutingFiles,
   serializeComposeProjectRoutingRows,
   splitGeneratedComposeRoutingFiles,
@@ -6928,7 +6928,7 @@ export class PortManagerNetworkService implements DisposableLike {
       buildTerminalAttachmentMarkerRemoveShell(),
       shellRemovePathListEntry(preloadVariable, hookLibraryPath),
       ...(runtimeShimDirectory === undefined ? [] : [shellRemovePathListEntry("PATH", runtimeShimDirectory)]),
-      `unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV} ${AGENT_REQUIRED_ENV} ${NETWORK_IS_GLOBAL_ENV}`,
+      `unset PORT_MANAGER_TERMINAL_SESSION_ID PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV} ${ESCAPED_SERVER_RESPAWN_ENV} ${AGENT_REQUIRED_ENV} ${NETWORK_IS_GLOBAL_ENV}`,
       "unset PORT_MANAGER_HOOK_DISABLED",
       shellExport("PORT_MANAGER_HOOK", "1"),
       shellExport("PORT_MANAGER_RUNTIME_SHIM_READY", "0"),
@@ -6955,10 +6955,18 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS", "3000"),
       shellExport("PORT_MANAGER_TERMINAL_ATTACHMENT_DIR", this.getTerminalAttachmentMarkerDirectoryPath()),
       shellExport("PORT_MANAGER_COMPOSE_LOGICAL_PORTS", this.getComposeLogicalPortsForNetwork(networkId).join(",")),
-      buildComposeProjectRoutingShell(this.getComposeProjectRoutingFilePath(networkId), nativeContainerMapPath),
+      /*
+       * Docker/Podman PATH shims load the Compose routing library only when a
+       * runtime command is actually invoked. Embedding its ~48KB function body
+       * here made every attach parse Docker logic even when Docker was unused.
+       */
+      shellExport("PORT_MANAGER_COMPOSE_ROUTING_FILE", this.getComposeProjectRoutingFilePath(networkId)),
       shellExport("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange)),
       shellExport("PORT_MANAGER_ROUTING_MODE", settings.routingMode),
       shellExport(AGENT_REQUIRED_ENV, agentRequired ? "1" : "0"),
+      settings.escapedServerRespawn
+        ? shellExport(ESCAPED_SERVER_RESPAWN_ENV, "1")
+        : `unset ${ESCAPED_SERVER_RESPAWN_ENV}`,
       settings.experimentalRouteOwnershipMode !== "process"
         ? shellExport(EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV, settings.experimentalRouteOwnershipMode)
         : `unset ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}`,
@@ -6976,8 +6984,6 @@ export class PortManagerNetworkService implements DisposableLike {
     } else {
       commands.push(shellExport("PORT_MANAGER_HOOK_DAEMON_STARTED", "0"));
     }
-    commands.push(buildTerminalSessionIsolationShell());
-
     if (process.platform === "darwin" && shellEnvRestorePath !== undefined) {
       commands.push(buildShellEnvRestoreSelectionShell(this.context.globalStorageUri.fsPath, shellEnvRestorePath));
     }
@@ -6993,6 +6999,7 @@ export class PortManagerNetworkService implements DisposableLike {
     commands.push(
       buildRuntimeShimReadinessShell(runtimeShimDirectory),
       `if [ "\${PORT_MANAGER_RUNTIME_SHIM_READY:-0}" != "1" ]; then return 1 2>/dev/null || exit 1; fi`,
+      buildTerminalSessionIsolationShell(),
       buildTerminalAttachmentMarkerWriteShell(),
       buildTerminalTitleShell(buildPortManagerTerminalTitle(networkName)),
       agentRequired
@@ -7042,6 +7049,7 @@ export class PortManagerNetworkService implements DisposableLike {
       "PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID",
       "PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID",
       EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV,
+      ESCAPED_SERVER_RESPAWN_ENV,
       "PORT_MANAGER_AGENT_SOCKET",
       "PORT_MANAGER_AGENT_MAIN",
       "PORT_MANAGER_AGENT_EXECUTABLE",
@@ -7073,6 +7081,7 @@ export class PortManagerNetworkService implements DisposableLike {
       buildTerminalAttachmentMarkerRemoveShell(),
       buildTerminalTitleShell("Port Manager: detached"),
       ...variables.map((variable) => `unset ${variable}`),
+      "unset __pm_terminal_session_sequence",
       shellExport("PORT_MANAGER_HOOK", "0"),
       shellExport("PORT_MANAGER_HOOK_DISABLED", "1"),
       shellExport("PORT_MANAGER_HOOK_DAEMON_STARTED", "0"),
@@ -11371,51 +11380,77 @@ function buildTerminalTitleShell(title: string): string {
   return `printf '\\033]0;%s\\007' ${shellQuote(title)} 2>/dev/null || true`;
 }
 
-/** Shell fragment that starts a new Port Manager terminal attachment generation. */
+/**
+ * Starts a terminal attachment generation and retains its shell-local metadata
+ * until the marker writer consumes it. The session id is opaque to consumers
+ * and uses only filename-safe components. A non-exported sequence keeps rapid
+ * reattachments distinct even in plain sh, where RANDOM is not available.
+ */
 function buildTerminalSessionIsolationShell(): string {
   return [
-    '__pm_tty="$(tty 2>/dev/null || true)"',
+    '__pm_tty="${TTY:-}"',
+    'if [ -z "$__pm_tty" ]; then __pm_tty="$(command -p tty 2>/dev/null || true)"; fi',
     '__pm_tty="${__pm_tty#/dev/}"',
-    'if [ "$__pm_tty" = "not a tty" ]; then __pm_tty=""; fi',
+    'if [ "$__pm_tty" = "not a tty" ] || [ "$__pm_tty" = "?" ]; then __pm_tty=""; fi',
     '__pm_pid="$$"',
-    '__pm_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d " " || true)"',
-    '__pm_session_time="$(date -u \'+%Y%m%dT%H%M%SZ\' 2>/dev/null || date \'+%Y%m%dT%H%M%SZ\')"',
-    '__pm_session_source="${PORT_MANAGER_NETWORK_ID}:${__pm_tty:-pid-$__pm_pid}:${__pm_pgid:-pgid-unknown}:$__pm_pid:$__pm_session_time"',
-    'export PORT_MANAGER_TERMINAL_SESSION_ID="$(printf \'%s\' "$__pm_session_source" | sed \'s#[^A-Za-z0-9._-]#_#g\')"',
+    '__pm_pgid="$(command -p ps -o pgid= -p "$$" 2>/dev/null || true)"',
+    '__pm_pgid="${__pm_pgid#"${__pm_pgid%%[![:space:]]*}"}"',
+    '__pm_pgid="${__pm_pgid%"${__pm_pgid##*[![:space:]]}"}"',
+    '__pm_time_values="$(command -p date -u \'+%Y-%m-%dT%H:%M:%SZ|%s\' 2>/dev/null || printf \'%s\' \'1970-01-01T00:00:00Z|0\')"',
+    '__pm_attached_at="${__pm_time_values%%|*}"',
+    '__pm_session_epoch="${__pm_time_values#*|}"',
+    '__pm_session_nonce="${RANDOM:-0}"',
+    'case "${__pm_terminal_session_sequence:-}" in ""|*[!0-9]*) __pm_terminal_session_sequence=1 ;; *) __pm_terminal_session_sequence=$((__pm_terminal_session_sequence + 1)) ;; esac',
+    'export PORT_MANAGER_TERMINAL_SESSION_ID="pm-${__pm_pid}-${__pm_pgid:-0}-${__pm_session_epoch}-${__pm_terminal_session_sequence}-${__pm_session_nonce}"',
     'export PORT_MANAGER_TERMINAL_SESSION_NETWORK_ID="$PORT_MANAGER_NETWORK_ID"',
     'if [ -n "$__pm_pgid" ]; then export PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID="$__pm_pgid"; else unset PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID; fi',
-    "unset __pm_tty __pm_pid __pm_pgid __pm_session_time __pm_session_source",
   ].join("; ");
 }
 
-/** Shell fragment that records a manually routed shell for later sidebar refresh. */
+/** Records the metadata already captured by the session initializer. */
 function buildTerminalAttachmentMarkerWriteShell(): string {
   return [
-    'mkdir -p "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR" 2>/dev/null || true',
-    '__pm_tty="$(tty 2>/dev/null || true)"',
-    '__pm_tty="${__pm_tty#/dev/}"',
-    'if [ "$__pm_tty" = "not a tty" ]; then __pm_tty=""; fi',
-    '__pm_pid="$$"',
-    '__pm_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d " " || true)"',
+    'if [ ! -d "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR" ]; then mkdir -p "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR" 2>/dev/null || true; fi',
     '__pm_marker_identity="${PORT_MANAGER_TERMINAL_SESSION_ID:-${__pm_tty:-pid-$__pm_pid}}"',
-    '__pm_marker_key="$(printf \'%s\' "$__pm_marker_identity" | sed \'s#[^A-Za-z0-9._-]#_#g\')"',
-    'printf \'%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\' "$PORT_MANAGER_NETWORK_ID" "$__pm_tty" "$__pm_pid" "$__pm_pgid" "$(date -u \'+%Y-%m-%dT%H:%M:%SZ\' 2>/dev/null || date \'+%Y-%m-%dT%H:%M:%SZ\')" "${PORT_MANAGER_TERMINAL_SESSION_ID:-}" > "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR/$__pm_marker_key.tsv" 2>/dev/null || true',
-    "unset __pm_tty __pm_pid __pm_pgid __pm_marker_identity __pm_marker_key",
+    '__pm_marker_key="$__pm_marker_identity"',
+    'printf \'%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\' "$PORT_MANAGER_NETWORK_ID" "$__pm_tty" "$__pm_pid" "$__pm_pgid" "$__pm_attached_at" "${PORT_MANAGER_TERMINAL_SESSION_ID:-}" > "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR/$__pm_marker_key.tsv" 2>/dev/null || true',
+    "unset __pm_tty __pm_pid __pm_pgid __pm_time_values __pm_attached_at __pm_session_epoch __pm_session_nonce __pm_marker_identity __pm_marker_key",
   ].join("; ");
 }
 
-/** Shell fragment that removes the marker for the current shell before env reset. */
+/**
+ * Removes the previous generation marker. Modern markers use the existing
+ * session id directly and therefore avoid terminal discovery; the builtin-only
+ * sanitizer remains for legacy tty-keyed markers.
+ */
 function buildTerminalAttachmentMarkerRemoveShell(): string {
   return [
     'if [ -n "${PORT_MANAGER_TERMINAL_ATTACHMENT_DIR:-}" ]; then',
-    '__pm_tty="$(tty 2>/dev/null || true)"',
-    '__pm_tty="${__pm_tty#/dev/}"',
-    'if [ "$__pm_tty" = "not a tty" ]; then __pm_tty=""; fi',
-    '__pm_pid="$$"',
-    '__pm_marker_identity="${PORT_MANAGER_TERMINAL_SESSION_ID:-${__pm_tty:-pid-$__pm_pid}}"',
-    '__pm_marker_key="$(printf \'%s\' "$__pm_marker_identity" | sed \'s#[^A-Za-z0-9._-]#_#g\')"',
+    '__pm_marker_identity="${PORT_MANAGER_TERMINAL_SESSION_ID:-}"',
+    'if [ -z "$__pm_marker_identity" ]; then',
+    '  __pm_tty="${TTY:-}"',
+    '  if [ -z "$__pm_tty" ]; then __pm_tty="$(command -p tty 2>/dev/null || true)"; fi',
+    '  __pm_tty="${__pm_tty#/dev/}"',
+    '  if [ "$__pm_tty" = "not a tty" ] || [ "$__pm_tty" = "?" ]; then __pm_tty=""; fi',
+    '  __pm_marker_identity="${__pm_tty:-pid-$$}"',
+    "fi",
+    'case "$__pm_marker_identity" in',
+    '  *[!A-Za-z0-9._-]*)',
+    '    __pm_marker_key=""',
+    '    while [ -n "$__pm_marker_identity" ]; do',
+    '      __pm_marker_character="${__pm_marker_identity%"${__pm_marker_identity#?}"}"',
+    '      __pm_marker_identity="${__pm_marker_identity#?}"',
+    '      case "$__pm_marker_character" in',
+    '        [A-Za-z0-9._-]) __pm_marker_key="${__pm_marker_key}${__pm_marker_character}" ;;',
+    '        *) __pm_marker_key="${__pm_marker_key}_" ;;',
+    '      esac',
+    "    done",
+    "    ;;",
+    '  *) __pm_marker_key="$__pm_marker_identity" ;;',
+    "esac",
+    'if [ -z "$__pm_marker_key" ]; then __pm_marker_key="terminal"; fi',
     'rm -f "$PORT_MANAGER_TERMINAL_ATTACHMENT_DIR/$__pm_marker_key.tsv" 2>/dev/null || true',
-    "unset __pm_tty __pm_pid __pm_marker_identity __pm_marker_key",
+    "unset __pm_tty __pm_marker_identity __pm_marker_character __pm_marker_key",
     "fi",
   ].join("\n");
 }
@@ -11432,15 +11467,18 @@ function shellPrependPathListEntry(name: string, entry: string): string {
   const staleHookSkip = isPortManagerHookLibraryPath(entry)
     ? [
         '  case "$__pm_path_entry" in',
-        "    */media/native/libportmanager_hook.dylib) continue ;;",
+        "    */media/native/libportmanager_hook.dylib|*/media/native/libportmanager_hook.so) continue ;;",
         "  esac",
       ]
     : [];
   return [
     '__pm_path_rest=""',
-    '__pm_old_ifs="${IFS}"',
-    "IFS=:",
-    `for __pm_path_entry in \${${name}:-}; do`,
+    `__pm_path_remaining="\${${name}:-}"`,
+    'while [ -n "$__pm_path_remaining" ]; do',
+    '  case "$__pm_path_remaining" in',
+    '    *:*) __pm_path_entry="${__pm_path_remaining%%:*}"; __pm_path_remaining="${__pm_path_remaining#*:}" ;;',
+    '    *) __pm_path_entry="$__pm_path_remaining"; __pm_path_remaining="" ;;',
+    '  esac',
     `  if [ -z "$__pm_path_entry" ] || [ "$__pm_path_entry" = ${shellQuote(entry)} ]; then`,
     "    continue",
     "  fi",
@@ -11451,34 +11489,43 @@ function shellPrependPathListEntry(name: string, entry: string): string {
     '    __pm_path_rest="$__pm_path_rest:$__pm_path_entry"',
     "  fi",
     "done",
-    'IFS="${__pm_old_ifs}"',
     `export ${name}=${shellQuote(entry)}\${__pm_path_rest:+:$__pm_path_rest}`,
-    "unset __pm_path_entry __pm_path_rest __pm_old_ifs",
+    "unset __pm_path_entry __pm_path_remaining __pm_path_rest",
   ].join("\n");
 }
 
 function isPortManagerHookLibraryPath(entry: string): boolean {
-  return /(?:^|[/\\])media[/\\]native[/\\]libportmanager_hook\.dylib$/.test(entry);
+  return /(?:^|[/\\])media[/\\]native[/\\]libportmanager_hook\.(?:dylib|so)$/.test(entry);
 }
 
 function shellRemovePathListEntry(name: string, entry: string): string {
+  const staleHookSkip = isPortManagerHookLibraryPath(entry)
+    ? [
+        '  case "$__pm_path_entry" in',
+        "    */media/native/libportmanager_hook.dylib|*/media/native/libportmanager_hook.so) continue ;;",
+        "  esac",
+      ]
+    : [];
   return [
     '__pm_path_rest=""',
-    '__pm_old_ifs="${IFS}"',
-    "IFS=:",
-    `for __pm_path_entry in \${${name}:-}; do`,
+    `__pm_path_remaining="\${${name}:-}"`,
+    'while [ -n "$__pm_path_remaining" ]; do',
+    '  case "$__pm_path_remaining" in',
+    '    *:*) __pm_path_entry="${__pm_path_remaining%%:*}"; __pm_path_remaining="${__pm_path_remaining#*:}" ;;',
+    '    *) __pm_path_entry="$__pm_path_remaining"; __pm_path_remaining="" ;;',
+    '  esac',
     `  if [ -z "$__pm_path_entry" ] || [ "$__pm_path_entry" = ${shellQuote(entry)} ]; then`,
     "    continue",
     "  fi",
+    ...staleHookSkip,
     '  if [ -z "$__pm_path_rest" ]; then',
     '    __pm_path_rest="$__pm_path_entry"',
     "  else",
     '    __pm_path_rest="$__pm_path_rest:$__pm_path_entry"',
     "  fi",
     "done",
-    'IFS="${__pm_old_ifs}"',
     `if [ -n "$__pm_path_rest" ]; then export ${name}="$__pm_path_rest"; else unset ${name}; fi`,
-    "unset __pm_path_entry __pm_path_rest __pm_old_ifs",
+    "unset __pm_path_entry __pm_path_remaining __pm_path_rest",
   ].join("\n");
 }
 

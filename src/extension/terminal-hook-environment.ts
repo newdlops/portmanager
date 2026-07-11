@@ -23,7 +23,6 @@ import {
 } from "../core/networks/loopback-address";
 import type { DisposableLike, PortManagerSettings } from "../shared/types";
 import {
-  buildComposeProjectRoutingFunctionScript,
   buildRuntimeCommandShimScript,
   type RuntimeCommandShimName,
 } from "./compose-project-routing";
@@ -38,8 +37,32 @@ import { normalizeBrowserDnsHostname } from "../platform/network/browser-dns-ser
  * bind() reaches the operating system.
  */
 
-const TERMINAL_MUTATOR_OPTIONS: vscode.EnvironmentVariableMutatorOptions = {
+/**
+ * Static routing context is copied into the new process directly. VS Code's
+ * shell integration decodes each integration-time mutator with helper
+ * processes, so sending dozens of immutable values through that path adds a
+ * visible delay before the first prompt.
+ */
+const TERMINAL_CONTEXT_MUTATOR_OPTIONS: vscode.EnvironmentVariableMutatorOptions = {
   applyAtProcessCreation: true,
+  applyAtShellIntegration: false,
+};
+
+/**
+ * Only the variables that turn routing on are delayed until shell profiles
+ * finish. Runtime managers and prompt setup therefore run without preload or
+ * PATH shims, while commands launched from the ready prompt stay routed.
+ */
+const TERMINAL_ACTIVATION_MUTATOR_OPTIONS: vscode.EnvironmentVariableMutatorOptions = {
+  /*
+   * VS Code's shell-integration script runs after the user's shell profiles.
+   * Delaying preload/PATH mutation until that point keeps nvm/asdf/pyenv and
+   * prompt setup out of the native hook while preserving routing for every
+   * command the user starts from the ready prompt. A terminal without working
+   * shell integration stays untouched and can still use the explicit attach
+   * path, which sources its generated routing script directly.
+   */
+  applyAtProcessCreation: false,
   applyAtShellIntegration: true,
 };
 
@@ -47,6 +70,7 @@ export const RUNTIME_SHIM_DIRECTORY_ENV = "PORT_MANAGER_RUNTIME_SHIM_DIR";
 export const DOCKER_SHIM_PATH_ENV = "PORT_MANAGER_DOCKER_SHIM";
 export const EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV = "PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE";
 export const AGENT_REQUIRED_ENV = "PORT_MANAGER_AGENT_REQUIRED";
+export const ESCAPED_SERVER_RESPAWN_ENV = "PORT_MANAGER_ESCAPED_SERVER_RESPAWN";
 export const NETWORK_DNS_ALIAS_ENV = "PORT_MANAGER_NETWORK_DNS_ALIAS";
 const PRELOAD_PACKAGE_MANAGER_NAMES: readonly string[] = ["npm", "npx", "pnpm", "pnpx", "corepack", "uv", "uvx", "yarn", "yarnpkg"];
 const RUNTIME_COMMAND_SHIM_NAMES: readonly RuntimeCommandShimName[] = ["docker", "podman", "docker-compose", "podman-compose"];
@@ -207,60 +231,61 @@ export function applyTerminalHookEnvironment(
   const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
   const preloadHintVariable = process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD";
 
-  collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_MUTATOR_OPTIONS);
-  collection.replace(NETWORK_IS_GLOBAL_ENV, "", TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_ACTIVATION_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_HOOK_DISABLED", "", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace(NETWORK_IS_GLOBAL_ENV, "", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   // Dev-log endpoint (docs/dev-logging.md): hooked servers/clients write to the
   // shared trace file when PORT_MANAGER_DEV_LOG is set in the host env.
   if (process.env.PORT_MANAGER_DEV_LOG !== undefined && process.env.PORT_MANAGER_DEV_LOG.length > 0) {
-    collection.replace("PORT_MANAGER_DEV_LOG", process.env.PORT_MANAGER_DEV_LOG, TERMINAL_MUTATOR_OPTIONS);
+    collection.replace("PORT_MANAGER_DEV_LOG", process.env.PORT_MANAGER_DEV_LOG, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   }
-  collection.replace("PORT_MANAGER_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_NETWORK_NAME", networkName, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_NETWORK_ID", scope.networkId, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_NETWORK_NAME", networkName, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   // Per-network identity uses the hook's hostname virtualization: loopback
   // address first, network name as fallback. A non-empty name also prevents a
   // stale global-scope flag from making this user network host-real.
   // See docs/per-network-hostname.md.
   if (networkDnsAlias !== undefined) {
-    collection.replace(NETWORK_DNS_ALIAS_ENV, networkDnsAlias, TERMINAL_MUTATOR_OPTIONS);
+    collection.replace(NETWORK_DNS_ALIAS_ENV, networkDnsAlias, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   }
-  collection.replace("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_BORROWED_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("NEWDLOPS_PM_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("NEWDLOPS_PM_BORROWED_NETWORK_ID", scope.networkId, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_AGENT_MAIN", agentMainPath, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace(DOCKER_SHIM_PATH_ENV, runtimeCommandShimPath, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_PRELOAD_REPAIR", "1", TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_ROUTES_FILE", getRouteTablePathForNetwork(scope.networkId), TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath(), TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS", COMPOSE_REFRESH_WAIT_MS, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID", scope.networkId, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_BORROWED_NETWORK_ID", scope.networkId, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("NEWDLOPS_PM_NETWORK_ID", scope.networkId, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("NEWDLOPS_PM_BORROWED_NETWORK_ID", scope.networkId, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_MAIN", agentMainPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace(DOCKER_SHIM_PATH_ENV, runtimeCommandShimPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_PRELOAD_REPAIR", "1", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_ROUTES_FILE", getRouteTablePathForNetwork(scope.networkId), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath(), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS", COMPOSE_REFRESH_WAIT_MS, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   if (scope.composeRoutingFilePath !== undefined) {
-    collection.replace("PORT_MANAGER_COMPOSE_ROUTING_FILE", scope.composeRoutingFilePath, TERMINAL_MUTATOR_OPTIONS);
+    collection.replace("PORT_MANAGER_COMPOSE_ROUTING_FILE", scope.composeRoutingFilePath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   }
   if (scope.terminalAttachmentMarkerDirectoryPath !== undefined) {
     collection.replace(
       "PORT_MANAGER_TERMINAL_ATTACHMENT_DIR",
       scope.terminalAttachmentMarkerDirectoryPath,
-      TERMINAL_MUTATOR_OPTIONS,
+      TERMINAL_CONTEXT_MUTATOR_OPTIONS,
     );
   }
   const composeLogicalPorts = serializeTcpPortList(scope.composeLogicalPorts);
-  collection.replace("PORT_MANAGER_COMPOSE_LOGICAL_PORTS", composeLogicalPorts, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_COMPOSE_LOGICAL_PORTS", composeLogicalPorts, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   applyRoutingSettings(collection, settings);
   applyLoopbackRoutingHosts(collection, scope.networkId, settings);
   collection.replace(
     preloadVariable,
     prependUniquePathListEntry(hookLibraryPath, process.env[preloadVariable]),
-    TERMINAL_MUTATOR_OPTIONS,
+    TERMINAL_ACTIVATION_MUTATOR_OPTIONS,
   );
-  collection.replace(preloadHintVariable, hookLibraryPath, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace(preloadHintVariable, hookLibraryPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   applyRuntimeShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath, runtimeCommandShimPath);
 
   if (shellEnvRestorePath !== undefined) {
-    collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_MUTATOR_OPTIONS);
+    collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_ACTIVATION_MUTATOR_OPTIONS);
   }
 }
 
@@ -299,40 +324,41 @@ function applyGlobalNetworkEnvironment(
   const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
   const preloadHintVariable = process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD";
 
-  collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_ACTIVATION_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_HOOK_DISABLED", "", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   if (process.env.PORT_MANAGER_DEV_LOG !== undefined && process.env.PORT_MANAGER_DEV_LOG.length > 0) {
-    collection.replace("PORT_MANAGER_DEV_LOG", process.env.PORT_MANAGER_DEV_LOG, TERMINAL_MUTATOR_OPTIONS);
+    collection.replace("PORT_MANAGER_DEV_LOG", process.env.PORT_MANAGER_DEV_LOG, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   }
-  collection.replace("PORT_MANAGER_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_BORROWED_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("NEWDLOPS_PM_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("NEWDLOPS_PM_BORROWED_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace(NETWORK_IS_GLOBAL_ENV, "1", TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_AGENT_MAIN", agentMainPath, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace(DOCKER_SHIM_PATH_ENV, runtimeCommandShimPath, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_PRELOAD_REPAIR", "1", TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_ROUTE_TABLE_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_BORROWED_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("NEWDLOPS_PM_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("NEWDLOPS_PM_BORROWED_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace(NETWORK_IS_GLOBAL_ENV, "1", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_MAIN", agentMainPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace(DOCKER_SHIM_PATH_ENV, runtimeCommandShimPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_PRELOAD_REPAIR", "1", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   collection.replace(
     "PORT_MANAGER_ROUTES_FILE",
     getRouteTablePathForNetwork(GLOBAL_LOGICAL_NETWORK_ID),
-    TERMINAL_MUTATOR_OPTIONS,
+    TERMINAL_CONTEXT_MUTATOR_OPTIONS,
   );
-  collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath(), TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath(), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   applyRoutingSettings(collection, settings);
   applyLoopbackRoutingHosts(collection, GLOBAL_LOGICAL_NETWORK_ID, settings);
   collection.replace(
     preloadVariable,
     prependUniquePathListEntry(hookLibraryPath, process.env[preloadVariable]),
-    TERMINAL_MUTATOR_OPTIONS,
+    TERMINAL_ACTIVATION_MUTATOR_OPTIONS,
   );
-  collection.replace(preloadHintVariable, hookLibraryPath, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace(preloadHintVariable, hookLibraryPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   applyRuntimeShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath, runtimeCommandShimPath);
   if (shellEnvRestorePath !== undefined) {
-    collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_MUTATOR_OPTIONS);
+    collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_ACTIVATION_MUTATOR_OPTIONS);
   }
 }
 
@@ -367,29 +393,30 @@ function applyScopelessGatewayEnvironment(
   const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
   const preloadHintVariable = process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD";
 
-  collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_ACTIVATION_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_HOOK_DISABLED", "", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   // Dev-log endpoint (docs/dev-logging.md): even scopeless gateway terminals log.
   if (process.env.PORT_MANAGER_DEV_LOG !== undefined && process.env.PORT_MANAGER_DEV_LOG.length > 0) {
-    collection.replace("PORT_MANAGER_DEV_LOG", process.env.PORT_MANAGER_DEV_LOG, TERMINAL_MUTATOR_OPTIONS);
+    collection.replace("PORT_MANAGER_DEV_LOG", process.env.PORT_MANAGER_DEV_LOG, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   }
-  collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_AGENT_MAIN", agentMainPath, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace(DOCKER_SHIM_PATH_ENV, runtimeCommandShimPath, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath(), TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_PRELOAD_REPAIR", "1", TERMINAL_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_MAIN", agentMainPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace(DOCKER_SHIM_PATH_ENV, runtimeCommandShimPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_GLOBAL_ROUTES_FILE", getDefaultRouteTablePath(), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_HOST_ACCESS_FILE", getDefaultHostAccessBindingsPath(), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_PRELOAD_REPAIR", "1", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   applyRoutingSettings(collection, settings);
   collection.replace(
     preloadVariable,
     prependUniquePathListEntry(hookLibraryPath, process.env[preloadVariable]),
-    TERMINAL_MUTATOR_OPTIONS,
+    TERMINAL_ACTIVATION_MUTATOR_OPTIONS,
   );
-  collection.replace(preloadHintVariable, hookLibraryPath, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace(preloadHintVariable, hookLibraryPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   applyRuntimeShimLauncherPath(collection, context.globalStorageUri.fsPath, asdfShimLauncherPath, runtimeCommandShimPath);
   if (shellEnvRestorePath !== undefined) {
-    collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_MUTATOR_OPTIONS);
+    collection.replace("BASH_ENV", shellEnvRestorePath, TERMINAL_ACTIVATION_MUTATOR_OPTIONS);
   }
 }
 
@@ -401,14 +428,14 @@ function applyLoopbackRoutingHosts(
 ): void {
   const loopbackHost = loopbackAddressForNetwork(networkId);
 
-  collection.replace(ACTUAL_LOOPBACK_HOST_ENV, loopbackHost, TERMINAL_MUTATOR_OPTIONS);
+  collection.replace(ACTUAL_LOOPBACK_HOST_ENV, loopbackHost, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
 
   if (shouldExposeNetworkLoopbackHost(settings)) {
-    collection.replace(NETWORK_LOOPBACK_HOST_ENV, loopbackHost, TERMINAL_MUTATOR_OPTIONS);
+    collection.replace(NETWORK_LOOPBACK_HOST_ENV, loopbackHost, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   } else {
     // Replace with empty rather than deleting the mutator so an inherited value
     // from an older terminal attachment cannot survive into a new process tree.
-    collection.replace(NETWORK_LOOPBACK_HOST_ENV, "", TERMINAL_MUTATOR_OPTIONS);
+    collection.replace(NETWORK_LOOPBACK_HOST_ENV, "", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   }
 }
 
@@ -516,40 +543,45 @@ function applyRoutingSettings(
   collection: vscode.EnvironmentVariableCollection,
   settings: PortManagerSettings,
 ): void {
-  collection.replace("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange), TERMINAL_MUTATOR_OPTIONS);
-  collection.replace("PORT_MANAGER_ROUTING_MODE", settings.routingMode, TERMINAL_MUTATOR_OPTIONS);
-  collection.replace(AGENT_REQUIRED_ENV, usesLoopbackAddressOnlyRouting(settings) ? "0" : "1", TERMINAL_MUTATOR_OPTIONS);
+  const packageVersion = readPortManagerPackageVersion();
+  if (packageVersion !== undefined) {
+    collection.replace("PORT_MANAGER_EXPECTED_VERSION", packageVersion, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  }
+  collection.replace("PORT_MANAGER_SCAN_RANGE", String(settings.scanRange), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace("PORT_MANAGER_ROUTING_MODE", settings.routingMode, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace(AGENT_REQUIRED_ENV, usesLoopbackAddressOnlyRouting(settings) ? "0" : "1", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace(ESCAPED_SERVER_RESPAWN_ENV, settings.escapedServerRespawn ? "1" : "", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   if (settings.experimentalRouteOwnershipMode !== "process") {
     collection.replace(
       EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV,
       settings.experimentalRouteOwnershipMode,
-      TERMINAL_MUTATOR_OPTIONS,
+      TERMINAL_CONTEXT_MUTATOR_OPTIONS,
     );
   }
   collection.replace(
     "PORT_MANAGER_VIRTUAL_PORT_START",
     String(settings.virtualPortRangeStart),
-    TERMINAL_MUTATOR_OPTIONS,
+    TERMINAL_CONTEXT_MUTATOR_OPTIONS,
   );
   collection.replace(
     "PORT_MANAGER_VIRTUAL_PORT_END",
     String(settings.virtualPortRangeEnd),
-    TERMINAL_MUTATOR_OPTIONS,
+    TERMINAL_CONTEXT_MUTATOR_OPTIONS,
   );
   collection.replace(
     "PORT_MANAGER_FIXED_PROTOCOL_PORTS",
     settings.fixedProtocolPorts.join(","),
-    TERMINAL_MUTATOR_OPTIONS,
+    TERMINAL_CONTEXT_MUTATOR_OPTIONS,
   );
   collection.replace(
     "PORT_MANAGER_PRESERVE_LISTEN_PORTS",
     settings.preservedListenPorts.join(","),
-    TERMINAL_MUTATOR_OPTIONS,
+    TERMINAL_CONTEXT_MUTATOR_OPTIONS,
   );
   collection.replace(
     ROUTE_TABLE_TTL_SECONDS_ENV,
     String(settings.routeTableTtlSeconds),
-    TERMINAL_MUTATOR_OPTIONS,
+    TERMINAL_CONTEXT_MUTATOR_OPTIONS,
   );
 }
 
@@ -567,9 +599,14 @@ export function shouldInjectTerminalHook(settings: PortManagerSettings): boolean
 function prependUniquePathListEntry(entry: string, currentValue: string | undefined): string {
   const existingEntries = (currentValue ?? "")
     .split(path.delimiter)
-    .filter((value) => value.length > 0 && value !== entry);
+    .filter((value) => value.length > 0 && value !== entry && !isPortManagerPreloadLibraryPath(value));
 
   return [entry, ...existingEntries].join(path.delimiter);
+}
+
+/** Drops version-specific PM hook paths inherited from an older extension. */
+function isPortManagerPreloadLibraryPath(value: string): boolean {
+  return /(?:^|[/\\])media[/\\]native[/\\]libportmanager_hook\.(?:dylib|so)$/.test(value);
 }
 
 /**
@@ -872,13 +909,14 @@ function applyRuntimeShimLauncherPath(
   const launcherDirectory = prepareRuntimeShimLauncherDirectory(baseDirectory, launcherPath, runtimeCommandShimPath);
 
   if (launcherDirectory !== undefined) {
-    collection.replace(RUNTIME_SHIM_DIRECTORY_ENV, launcherDirectory, TERMINAL_MUTATOR_OPTIONS);
+    collection.replace(RUNTIME_SHIM_DIRECTORY_ENV, launcherDirectory, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+    collection.replace("PORT_MANAGER_RUNTIME_SHIM_READY", "1", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
     /*
      * Preserve the terminal shell's real PATH. Replacing PATH from the extension
      * host environment can hide Docker/Compose/runtime entries and bypass the
      * lifecycle-signal shims; attach and BASH_ENV scripts normalize duplicates.
      */
-    collection.prepend("PATH", `${launcherDirectory}${path.delimiter}`, TERMINAL_MUTATOR_OPTIONS);
+    collection.prepend("PATH", `${launcherDirectory}${path.delimiter}`, TERMINAL_ACTIVATION_MUTATOR_OPTIONS);
   }
 }
 
@@ -1530,12 +1568,13 @@ export NEWDLOPS_PM_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}`;
     scope.networkId === undefined ? "" : `export PORT_MANAGER_COMPOSE_REFRESH_WAIT_MS=${shellQuote(COMPOSE_REFRESH_WAIT_MS)}`;
   const dockerShimExport =
     scope.dockerShimPath === undefined ? "" : `export ${DOCKER_SHIM_PATH_ENV}=${shellQuote(scope.dockerShimPath)}`;
-  const preloadRepairExport =
-    scope.networkId === undefined && scope.hookWithoutNetwork !== true ? "" : "export PORT_MANAGER_PRELOAD_REPAIR=1";
-  const preloadHintExport =
-    scope.networkId === undefined && scope.hookWithoutNetwork !== true
-      ? ""
-      : `export PORT_MANAGER_DYLD_INSERT_LIBRARIES=${shellQuote(hookLibraryPath)}`;
+  /*
+   * BASH_ENV outlives an installed extension version. Always refresh both the
+   * hint and repair flag so a long-running terminal cannot keep sending runtime
+   * shims to a dylib path removed by an extension upgrade.
+   */
+  const preloadRepairExport = "export PORT_MANAGER_PRELOAD_REPAIR=1";
+  const preloadHintExport = `export PORT_MANAGER_DYLD_INSERT_LIBRARIES=${shellQuote(hookLibraryPath)}`;
   const loopbackHost = scope.networkId === undefined ? undefined : loopbackAddressForNetwork(scope.networkId);
   const loopbackExports =
     loopbackHost === undefined
@@ -1568,13 +1607,23 @@ export NEWDLOPS_PM_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}`;
             ? `export ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}=${shellQuote(scope.settings.experimentalRouteOwnershipMode)}`
             : `unset ${EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV}`,
           `export ${AGENT_REQUIRED_ENV}=${shellQuote(usesLoopbackAddressOnlyRouting(scope.settings) ? "0" : "1")}`,
+          scope.settings.escapedServerRespawn
+            ? `export ${ESCAPED_SERVER_RESPAWN_ENV}=1`
+            : `unset ${ESCAPED_SERVER_RESPAWN_ENV}`,
           `export PORT_MANAGER_VIRTUAL_PORT_START=${shellQuote(String(scope.settings.virtualPortRangeStart))}`,
           `export PORT_MANAGER_VIRTUAL_PORT_END=${shellQuote(String(scope.settings.virtualPortRangeEnd))}`,
           `export PORT_MANAGER_FIXED_PROTOCOL_PORTS=${shellQuote(scope.settings.fixedProtocolPorts.join(","))}`,
           `export PORT_MANAGER_PRESERVE_LISTEN_PORTS=${shellQuote(scope.settings.preservedListenPorts.join(","))}`,
           `export ${ROUTE_TABLE_TTL_SECONDS_ENV}=${shellQuote(String(scope.settings.routeTableTtlSeconds))}`,
         ].join("\n");
+  const runtimeShimSentinelName =
+    process.platform === "darwin" ? PRELOAD_RUNTIME_LAUNCHER_NAMES[0] : RUNTIME_COMMAND_SHIM_NAMES[0];
 
+  /*
+   * Compose routing deliberately stays out of BASH_ENV. Docker/Podman PATH
+   * shims already consume PORT_MANAGER_COMPOSE_ROUTING_FILE and load routing
+   * logic on demand; embedding that library made every bash child parse ~48KB.
+   */
   return `# Generated by Port Manager. Sourced by non-interactive bash shells.
 if [ -n "\${PORT_MANAGER_PREV_BASH_ENV:-}" ] && [ "\${PORT_MANAGER_PREV_BASH_ENV}" != ${shellQuote(
     scriptPath,
@@ -1608,43 +1657,40 @@ fi
 if [ -n "\${PORT_MANAGER_RUNTIME_SHIM_DIR:-}" ]; then
   export PORT_MANAGER_RUNTIME_SHIM_READY=0
   __pm_runtime_shim_missing=0
-  if [ ! -d "\${PORT_MANAGER_RUNTIME_SHIM_DIR}" ]; then
+  if [ ! -s "\${PORT_MANAGER_RUNTIME_SHIM_DIR}/${RUNTIME_SHIM_STAMP_FILE_NAME}" ] || [ ! -x "\${PORT_MANAGER_RUNTIME_SHIM_DIR}/${runtimeShimSentinelName}" ]; then
     __pm_runtime_shim_missing=1
-  else
-    for __pm_shim_name in ${TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES.join(" ")}; do
-      if [ ! -x "\${PORT_MANAGER_RUNTIME_SHIM_DIR}/\${__pm_shim_name}" ]; then
-        __pm_runtime_shim_missing=1
-        break
+  fi
+
+  case "\${__pm_runtime_shim_missing}:\${PATH:-}" in
+    "0:\${PORT_MANAGER_RUNTIME_SHIM_DIR}"|"0:\${PORT_MANAGER_RUNTIME_SHIM_DIR}":*)
+      export PORT_MANAGER_RUNTIME_SHIM_READY=1
+      ;;
+    *)
+      __pm_path_rest=""
+      __pm_old_ifs="\${IFS}"
+      IFS=:
+      for __pm_path_entry in \${PATH:-}; do
+        if [ "\${__pm_path_entry}" = "\${PORT_MANAGER_RUNTIME_SHIM_DIR}" ]; then
+          continue
+        fi
+        if [ -z "\${__pm_path_rest}" ]; then
+          __pm_path_rest="\${__pm_path_entry}"
+        else
+          __pm_path_rest="\${__pm_path_rest}:\${__pm_path_entry}"
+        fi
+      done
+      IFS="\${__pm_old_ifs}"
+      if [ "\${__pm_runtime_shim_missing}" = "0" ]; then
+        export PATH="\${PORT_MANAGER_RUNTIME_SHIM_DIR}\${__pm_path_rest:+:$__pm_path_rest}"
+        export PORT_MANAGER_RUNTIME_SHIM_READY=1
+      else
+        export PATH="\${__pm_path_rest}"
       fi
-    done
-  fi
-
-  __pm_path_rest=""
-  __pm_old_ifs="\${IFS}"
-  IFS=:
-  for __pm_path_entry in \${PATH:-}; do
-    if [ "\${__pm_path_entry}" = "\${PORT_MANAGER_RUNTIME_SHIM_DIR}" ]; then
-      continue
-    fi
-    if [ -z "\${__pm_path_rest}" ]; then
-      __pm_path_rest="\${__pm_path_entry}"
-    else
-      __pm_path_rest="\${__pm_path_rest}:\${__pm_path_entry}"
-    fi
-  done
-  IFS="\${__pm_old_ifs}"
-  if [ "\${__pm_runtime_shim_missing}" = "0" ]; then
-    export PATH="\${PORT_MANAGER_RUNTIME_SHIM_DIR}\${__pm_path_rest:+:$__pm_path_rest}"
-    export PORT_MANAGER_RUNTIME_SHIM_READY=1
-  else
-    export PATH="\${__pm_path_rest}"
-  fi
-  unset __pm_path_entry __pm_path_rest __pm_old_ifs __pm_runtime_shim_missing __pm_shim_name
-  hash -r 2>/dev/null || true
-fi
-
-if [ -n "\${PORT_MANAGER_COMPOSE_ROUTING_FILE:-}" ]; then
-${buildComposeProjectRoutingFunctionScript()}
+      unset __pm_path_entry __pm_path_rest __pm_old_ifs
+      hash -r 2>/dev/null || true
+      ;;
+  esac
+  unset __pm_runtime_shim_missing
 fi
 `;
 }

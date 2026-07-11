@@ -1602,6 +1602,8 @@ test("compose mutation writes dev-log diagnostics when hidden compose up fails",
   );
 
   const logText = fs.readFileSync(devLogPath, "utf8");
+  assert.match(logText, /cmd#\d+ ok durationMs=\d+ stdoutBytes=\d+ stderrBytes=\d+/);
+  assert.doesNotMatch(logText, /cmd#\d+ ok .*stdout=/);
   assert.match(logText, /mutation plan .*attached=alpha-workspace-12345678/);
   assert.match(logText, /cmd#\d+ fail .*compose up exploded/);
   assert.match(logText, /mutation failure project=alpha-workspace-12345678/);

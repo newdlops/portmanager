@@ -25,9 +25,11 @@
 #if defined(__APPLE__)
 #define PM_PRELOAD_ENV "DYLD_INSERT_LIBRARIES"
 #define PM_PRELOAD_HINT_ENV "PORT_MANAGER_DYLD_INSERT_LIBRARIES"
+#define PM_HOOK_LIBRARY_SUFFIX "/media/native/libportmanager_hook.dylib"
 #else
 #define PM_PRELOAD_ENV "LD_PRELOAD"
 #define PM_PRELOAD_HINT_ENV "PORT_MANAGER_LD_PRELOAD"
+#define PM_HOOK_LIBRARY_SUFFIX "/media/native/libportmanager_hook.so"
 #endif
 
 static const char *pm_basename(const char *path) {
@@ -54,6 +56,14 @@ static const char *pm_basename(const char *path) {
   return name;
 }
 
+/** True for any version-specific Port Manager hook path in a preload list. */
+static int pm_preload_segment_is_portmanager_hook(const char *segment, size_t length) {
+  const size_t suffix_length = strlen(PM_HOOK_LIBRARY_SUFFIX);
+
+  return length >= suffix_length &&
+    strncmp(segment + length - suffix_length, PM_HOOK_LIBRARY_SUFFIX, suffix_length) == 0;
+}
+
 static int pm_preload_value_is_normalized(const char *value, const char *hook_path) {
   size_t hook_length;
   const char *cursor;
@@ -70,8 +80,9 @@ static int pm_preload_value_is_normalized(const char *value, const char *hook_pa
     const char *end = strchr(cursor, ':');
     size_t segment_length = end == NULL ? strlen(cursor) : (size_t)(end - cursor);
     int is_hook = segment_length == hook_length && strncmp(cursor, hook_path, segment_length) == 0;
+    int is_stale_hook = pm_preload_segment_is_portmanager_hook(cursor, segment_length) && !is_hook;
 
-    if (segment_length == 0) {
+    if (segment_length == 0 || is_stale_hook) {
       return 0;
     }
 
@@ -128,7 +139,7 @@ static char *pm_make_preload_value(const char *hook_path, const char *current_va
   while (*cursor != '\0') {
     const char *end = strchr(cursor, ':');
     size_t segment_length = end == NULL ? strlen(cursor) : (size_t)(end - cursor);
-    int is_hook = segment_length == hook_length && strncmp(cursor, hook_path, segment_length) == 0;
+    int is_hook = pm_preload_segment_is_portmanager_hook(cursor, segment_length);
 
     if (segment_length > 0 && !is_hook) {
       value[offset++] = ':';
@@ -147,12 +158,71 @@ static char *pm_make_preload_value(const char *hook_path, const char *current_va
   return value;
 }
 
+/** Removes stale PM entries while preserving unrelated preload libraries. */
+static char *pm_without_portmanager_preloads(const char *current_value) {
+  char *value;
+  size_t offset = 0;
+  const char *cursor;
+
+  if (current_value == NULL || current_value[0] == '\0') {
+    return strdup("");
+  }
+
+  value = calloc(strlen(current_value) + 1, 1);
+  if (value == NULL) {
+    return NULL;
+  }
+
+  cursor = current_value;
+  while (*cursor != '\0') {
+    const char *end = strchr(cursor, ':');
+    size_t segment_length = end == NULL ? strlen(cursor) : (size_t)(end - cursor);
+
+    if (segment_length > 0 && !pm_preload_segment_is_portmanager_hook(cursor, segment_length)) {
+      if (offset > 0) {
+        value[offset++] = ':';
+      }
+      memcpy(value + offset, cursor, segment_length);
+      offset += segment_length;
+      value[offset] = '\0';
+    }
+
+    if (end == NULL) {
+      break;
+    }
+    cursor = end + 1;
+  }
+
+  return value;
+}
+
 static void pm_restore_dyld(void) {
   const char *hook = getenv(PM_PRELOAD_HINT_ENV);
   const char *current = getenv(PM_PRELOAD_ENV);
   char *merged;
 
   if (hook == NULL || hook[0] == '\0') {
+    return;
+  }
+
+  /*
+   * Extension upgrades remove versioned install directories while existing
+   * terminals keep their old hint. Never pass a missing dylib to dyld: that
+   * aborts ordinary commands before main(). Fail open and let the refreshed
+   * shell hook/BASH_ENV supply the current path on the next boundary.
+   */
+  if (access(hook, R_OK) != 0) {
+    merged = pm_without_portmanager_preloads(current);
+    if (merged != NULL) {
+      if (merged[0] == '\0') {
+        unsetenv(PM_PRELOAD_ENV);
+      } else {
+        setenv(PM_PRELOAD_ENV, merged, 1);
+      }
+      free(merged);
+    }
+    unsetenv("PORT_MANAGER_PRELOAD_REPAIR");
+    setenv("PORT_MANAGER_HOOK", "0", 1);
     return;
   }
 

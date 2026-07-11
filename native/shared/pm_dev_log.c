@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -26,10 +27,28 @@
 #define PM_DEV_LOG_ENV "PORT_MANAGER_DEV_LOG"
 #define PM_DEV_LOG_BODY_MAX 2048
 #define PM_DEV_LOG_LINE_MAX (PM_DEV_LOG_BODY_MAX + 128)
+#define PM_DEV_LOG_MAX_BYTES ((off_t)64 * 1024 * 1024)
+
+/**
+ * An enabled development endpoint still stops at a bounded size. The hook is
+ * loaded into every routed child, so unlimited synchronous append traffic can
+ * otherwise dominate shell and process startup long after a trace is useful.
+ */
+static int pm_dev_log_path_has_capacity(const char *path) {
+  struct stat path_stat;
+
+  if (path == NULL || path[0] == '\0') {
+    return 0;
+  }
+  if (stat(path, &path_stat) != 0) {
+    return 1;
+  }
+  return path_stat.st_size < PM_DEV_LOG_MAX_BYTES;
+}
 
 int pm_dev_log_enabled(void) {
   const char *path = getenv(PM_DEV_LOG_ENV);
-  return path != NULL && path[0] != '\0';
+  return pm_dev_log_path_has_capacity(path);
 }
 
 void pm_dev_log(const char *component, const char *format, ...) {
@@ -74,6 +93,13 @@ void pm_dev_log(const char *component, const char *format, ...) {
 
   int fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0644);
   if (fd < 0) {
+    return;
+  }
+  struct stat file_stat;
+  if (fstat(fd, &file_stat) != 0 ||
+      file_stat.st_size >= PM_DEV_LOG_MAX_BYTES ||
+      (off_t)total > PM_DEV_LOG_MAX_BYTES - file_stat.st_size) {
+    close(fd);
     return;
   }
   ssize_t ignored = write(fd, line, (size_t)total);

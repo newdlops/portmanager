@@ -10,6 +10,7 @@ import { PortManagerNetworkService } from "./network-service";
 import { PortManagerTerminalSecureBrowserLinkProvider } from "./terminal-secure-browser-link-provider";
 import { ensureLocalGitExclude } from "./terminal-hook-environment";
 import type { DisposableLike, LogicalNetwork, NetworkSnapshot } from "../shared/types";
+import { DEV_LOG_ENV, DEV_LOG_MAX_BYTES, devLogPathAtCapacity } from "../platform/dev-log";
 
 const DEVELOPMENT_LOG_DIRECTORY = ".portmanager";
 const DEFAULT_DEVELOPMENT_LOG_FILE = "portmanager-dev.log";
@@ -34,12 +35,26 @@ export interface PortManagerExtensionApi {
 function applyDevelopmentLogSetting(context: vscode.ExtensionContext): void {
   const configured = readDevelopmentLogPathSetting();
   if (configured.trim().length === 0) {
-    delete process.env.PORT_MANAGER_DEV_LOG;
+    delete process.env[DEV_LOG_ENV];
     return;
   }
 
   const workspaceRoot = findPrimaryWorkspaceRoot();
   const resolved = resolveDevelopmentLogPath(configured, workspaceRoot ?? context.globalStorageUri.fsPath);
+  if (devLogPathAtCapacity(resolved)) {
+    /*
+     * Do not propagate an exhausted diagnostic sink into terminals. The native
+     * hook otherwise pays synchronous file I/O in every short-lived process,
+     * which is especially visible while a shell builds its first prompt.
+     */
+    delete process.env[DEV_LOG_ENV];
+    void vscode.window.showWarningMessage(
+      `Port Manager development logging was disabled because ${resolved} reached the ${formatByteCount(
+        DEV_LOG_MAX_BYTES,
+      )} safety limit. Clear the file or choose another path before enabling it again.`,
+    );
+    return;
+  }
   try {
     fs.mkdirSync(path.dirname(resolved), { recursive: true });
     if (workspaceRoot !== undefined && isInsidePath(resolved, path.join(workspaceRoot, DEVELOPMENT_LOG_DIRECTORY))) {
@@ -48,7 +63,7 @@ function applyDevelopmentLogSetting(context: vscode.ExtensionContext): void {
   } catch {
     // Dev logging is diagnostic-only; a read-only workspace must not block activation.
   }
-  process.env.PORT_MANAGER_DEV_LOG = resolved;
+  process.env[DEV_LOG_ENV] = resolved;
 }
 
 function readDevelopmentLogPathSetting(): string {
@@ -66,7 +81,7 @@ function readDevelopmentLogPathSetting(): string {
     return explicit;
   }
 
-  const rawEnv = process.env.PORT_MANAGER_DEV_LOG;
+  const rawEnv = process.env[DEV_LOG_ENV];
   if (rawEnv !== undefined && rawEnv.trim().length > 0) {
     return rawEnv;
   }
@@ -110,6 +125,11 @@ function firstDefinedString(values: readonly (string | undefined)[]): string | u
 function isInsidePath(candidate: string, parent: string): boolean {
   const relative = path.relative(parent, candidate);
   return relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/** Formats the fixed log cap for the one actionable activation warning. */
+function formatByteCount(bytes: number): string {
+  return `${Math.floor(bytes / (1024 * 1024))} MiB`;
 }
 
 /**

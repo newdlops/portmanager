@@ -1473,7 +1473,6 @@ __attribute__((constructor)) static void pm_hook_loaded(void) {
   pm_normalize_process_preload_env();
   pm_apply_network_env_file();
   pm_file_substitution_init();
-  pm_debug("loaded");
 }
 
 __attribute__((destructor)) static void pm_hook_unloaded(void) {
@@ -5378,7 +5377,14 @@ static void pm_control_channel_init(void) {
   pthread_attr_t attr;
   pthread_t thread;
 
-  pm_debug("control init enabled=%d scope=%d started=%d", pm_hook_enabled(), pm_has_current_network_scope(), (int)pm_control_started);
+  /*
+   * The channel only serves the destructive escaped-server recovery feature.
+   * Keep the default-off setting truly cold: prompt helpers that spawn git or
+   * runtime probes must not create a thread and persistent agent socket.
+   */
+  if (!pm_env_flag_is_one("PORT_MANAGER_ESCAPED_SERVER_RESPAWN")) {
+    return;
+  }
   if (!pm_hook_enabled() || !pm_has_current_network_scope()) {
     return;
   }
@@ -5391,6 +5397,7 @@ static void pm_control_channel_init(void) {
   pm_control_started = 1;
   pthread_mutex_unlock(&pm_control_start_mutex);
 
+  pm_debug("control init enabled=1 scope=1 started=0");
   pm_control_should_run = 1;
   if (pthread_attr_init(&attr) != 0) {
     pm_control_should_run = 0;

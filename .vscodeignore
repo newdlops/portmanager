@@ -1,4 +1,6 @@
 .vscode/**
+.portmanager/**
+.django-shell/**
 .claude/**
 .codex/**
 .mcp.json
@@ -16,6 +18,8 @@ out/test/**
 dist/**
 *.vsix
 log*.txt
+*.log
+process_sampling.txt
 *.map
 **/*.map
 tsconfig.json

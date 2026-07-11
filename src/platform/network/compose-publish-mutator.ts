@@ -332,7 +332,7 @@ export class ComposePublishMutator {
       const result = commandOptions === undefined ? await runner(executable, args) : await runner(executable, args, commandOptions);
       devLog(
         "ts-compose",
-        `cmd#${commandId} ok durationMs=${Date.now() - startedAt} ${formatCommandResultForLog(result)}`,
+        `cmd#${commandId} ok durationMs=${Date.now() - startedAt} ${formatCommandResultSummaryForLog(result)}`,
       );
       return result;
     } catch (error) {
@@ -1915,10 +1915,17 @@ function quoteCommandPartForLog(value: string): string {
 
 function formatCommandResultForLog(result: ContainerCommandResult, previewLimit = 8_000): string {
   return [
-    `stdoutBytes=${Buffer.byteLength(result.stdout, "utf8")}`,
-    `stderrBytes=${Buffer.byteLength(result.stderr, "utf8")}`,
+    formatCommandResultSummaryForLog(result),
     `stdout=${JSON.stringify(sanitizeLogText(result.stdout, previewLimit))}`,
     `stderr=${JSON.stringify(sanitizeLogText(result.stderr, previewLimit))}`,
+  ].join(" ");
+}
+
+/** Success rows stay compact; full command output is retained for failure diagnostics. */
+function formatCommandResultSummaryForLog(result: ContainerCommandResult): string {
+  return [
+    `stdoutBytes=${Buffer.byteLength(result.stdout, "utf8")}`,
+    `stderrBytes=${Buffer.byteLength(result.stderr, "utf8")}`,
   ].join(" ");
 }
 

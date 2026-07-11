@@ -16,7 +16,9 @@
  *   Enable  : set PORT_MANAGER_DEV_LOG=/absolute/path/to/log in the process
  *             environment (or the VS Code setting `portManager.developmentLogPath`,
  *             which the extension propagates into every native child + hooked
- *             terminal). Unset/empty => zero overhead, no file touched.
+ *             terminal). Unset/empty => zero overhead, no file touched. Each
+ *             sink stops accepting lines at 64 MiB so forgotten diagnostics
+ *             cannot degrade process startup or grow without bound.
  *   Format  : "HH:MM:SS.mmmuuu [<component> pid=<n>] <message>\n"
  *   Sinks   : all components append to the SAME file; the component + pid
  *             fields disambiguate the interleaved timeline.
@@ -39,8 +41,9 @@ void pm_dev_log(const char *component, const char *format, ...)
     __attribute__((format(printf, 2, 3)));
 
 /*
- * Non-zero when PORT_MANAGER_DEV_LOG is set. Use to guard call sites that would
- * do expensive work only to build a log argument.
+ * Non-zero when PORT_MANAGER_DEV_LOG is set and its file is below the 64 MiB
+ * safety limit. Use to guard call sites that would do expensive work only to
+ * build a log argument.
  */
 int pm_dev_log_enabled(void);
 

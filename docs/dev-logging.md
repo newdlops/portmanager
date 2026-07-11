@@ -1,12 +1,12 @@
 # Port Manager development log endpoint
 
-> **TL;DR** — Port Manager writes the shared dev-log to
-> `.portmanager/portmanager-dev.log` by default. Override
+> **TL;DR** — Development logging is disabled by default. Set
 > `portManager.developmentLogPath` (or the `PORT_MANAGER_DEV_LOG` env var),
 > reload the window, then `tail -f` that file. The native hook, TCP router, and
 > agent — plus the extension host — all append their routing/attribution
-> decisions to that one file. Set the VS Code setting to empty to disable.
-> **No rebuild needed to turn logging on or off.**
+> decisions to that one file. Logging stops at 64 MiB so a forgotten trace
+> cannot slow every routed process or grow without bound. **No rebuild needed
+> to turn logging on or off.**
 
 This endpoint exists so we can trace how a connection is attributed and routed
 **without** editing C, rebuilding native binaries, and reloading for every probe
@@ -19,7 +19,7 @@ shared by every component.
 There are two switches; either one turns the endpoint on:
 
 1. **VS Code setting (recommended):** `portManager.developmentLogPath`
-   - Default: `.portmanager/portmanager-dev.log` in the first workspace folder.
+   - Default: empty (disabled).
    - Relative paths are kept under the workspace-local `.portmanager/`
      directory; a leading `.portmanager/` is accepted as already scoped.
    - Absolute paths and a leading `~/` are respected.
@@ -40,7 +40,9 @@ There are two switches; either one turns the endpoint on:
    `portmanager_tcp_router`, `portmanager_agent`, or a hooked shell in tests.
 
 When disabled the logger is a no-op in every component (a single `getenv`
-check).
+check). When enabled, native and TypeScript writers reject new lines once the
+file reaches 64 MiB. Reload after clearing or changing a capped log so all
+long-lived components pick up the intended sink.
 
 ## Line format
 
@@ -54,9 +56,10 @@ HH:MM:SS.mmmuuu [<component> pid=<n>] <message>
 - `<component>` is one of `hook`, `router`, `agent` (native) or `ts-router`,
   `ts-*` (extension host). `pid` disambiguates interleaved processes.
 
-All writers `open(O_APPEND|O_CREAT)` + one `write()` + `close()` per line, so
-concurrent processes/threads interleave by whole lines instead of corrupting
-each other, and no descriptor leaks into a hooked child across `fork`/`exec`.
+All writers `open(O_APPEND|O_CREAT)` + size check + one `write()` + `close()` per
+line, so concurrent processes/threads interleave by whole lines instead of
+corrupting each other, and no descriptor leaks into a hooked child across
+`fork`/`exec`.
 
 ## What each component logs
 

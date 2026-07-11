@@ -26,6 +26,7 @@ test("daemon runtime environment disables native socket hook variables", () => {
     PORT_MANAGER_DYLD_INSERT_LIBRARIES: "/tmp/libportmanager_hook.dylib",
     PORT_MANAGER_LD_PRELOAD: "/tmp/libportmanager_hook.so",
     PORT_MANAGER_RUNTIME_SHIM_DIR: "/tmp/runtime-shims",
+    PORT_MANAGER_ESCAPED_SERVER_RESPAWN: "1",
     BASH_ENV: "/tmp/portmanager-bash-env.sh",
     DYLD_INSERT_LIBRARIES: "/tmp/libportmanager_hook.dylib",
     LD_PRELOAD: "/tmp/libportmanager_hook.so",
@@ -44,6 +45,7 @@ test("daemon runtime environment disables native socket hook variables", () => {
   assert.equal(environment.PORT_MANAGER_DYLD_INSERT_LIBRARIES, undefined);
   assert.equal(environment.PORT_MANAGER_LD_PRELOAD, undefined);
   assert.equal(environment.PORT_MANAGER_RUNTIME_SHIM_DIR, undefined);
+  assert.equal(environment.PORT_MANAGER_ESCAPED_SERVER_RESPAWN, undefined);
   assert.equal(environment.BASH_ENV, undefined);
   assert.equal(environment.DYLD_INSERT_LIBRARIES, undefined);
   assert.equal(environment.LD_PRELOAD, undefined);
