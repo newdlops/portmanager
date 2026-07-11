@@ -83,16 +83,17 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(networkServiceSource.includes("isBrowserDnsOwnedHostsEntryCurrent"), true);
   assert.equal(networkServiceSource.includes("readBrowserDnsOwnedHostsEntries"), true);
   assert.equal(networkServiceSource.includes("macOS hosts lookup can"), true);
-  assert.equal(networkServiceSource.includes("this.browserDnsAutoInstallSignature = undefined;"), true);
+  assert.equal(networkServiceSource.includes("this.browserDnsInstallOfferSignature = undefined;"), true);
   assert.equal(networkServiceSource.includes("buildBrowserDnsResolverCleanupScript"), true);
   assert.equal(networkServiceSource.includes("ifconfig lo0 alias"), true);
   assert.equal(networkServiceSource.includes("ifconfig lo0 -alias"), true);
   assert.equal(networkServiceSource.includes("with administrator privileges"), true);
   assert.equal(networkServiceSource.includes("with prompt"), true);
-  assert.equal(networkServiceSource.includes("maybeAutoInstallBrowserDnsResolvers"), true);
-  assert.equal(networkServiceSource.includes("BROWSER_DNS_AUTO_INSTALL_SIGNATURE_KEY"), true);
-  assert.equal(networkServiceSource.includes("rememberBrowserDnsAutoInstallSignature(signature)"), true);
-  assert.equal(networkServiceSource.includes("clearBrowserDnsAutoInstallSignature"), true);
+  assert.equal(networkServiceSource.includes("maybeOfferBrowserDnsResolverInstall"), true);
+  assert.equal(networkServiceSource.includes("BROWSER_DNS_INSTALL_OFFER_SIGNATURE_KEY"), true);
+  assert.equal(networkServiceSource.includes("rememberBrowserDnsInstallOfferSignature(signature)"), true);
+  assert.equal(networkServiceSource.includes("clearBrowserDnsInstallOfferSignature"), true);
+  assert.equal(networkServiceSource.includes("installBrowserDnsResolvers({ automatic: true })"), false);
   assert.equal(networkServiceSource.includes("BROWSER_SECURE_DNS_SUFFIX"), true);
   assert.equal(networkServiceSource.includes("BROWSER_LEGACY_SECURE_DNS_SUFFIXES"), true);
   assert.equal(networkServiceSource.includes("*.${BROWSER_SECURE_DNS_SUFFIX}"), true);
@@ -146,7 +147,7 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
     browserProxyApplyIndex,
   );
   const hostLocalGatewayRedirectSyncIndex = browserProxySyncSource.indexOf(
-    "void this.syncHostLocalGatewayRedirects(",
+    "await this.syncHostLocalGatewayRedirects(",
     hostGatewaySyncIndex,
   );
   const reloadSharedStateStart = networkServiceSource.indexOf("private async reloadSharedNetworkState");

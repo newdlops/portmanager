@@ -99,7 +99,10 @@ test("background terminal discovery skips scans without consumers", () => {
   const commandsSource = readSource("src/extension/commands.ts");
   const resolverStart = commandsSource.indexOf("private async resolveTerminalWindowArgument");
   const resolverBody = commandsSource.slice(resolverStart, resolverStart + 900);
-  assert.equal(resolverBody.includes("refreshTerminals({ force: true })"), true);
+  assert.equal(
+    resolverBody.includes("refreshTerminals({ force: true, allowPlatformAutomation: true })"),
+    true,
+  );
 });
 
 test("owner lease renewals are throttled below the lease period", () => {

@@ -288,7 +288,7 @@ export class PortManagerCommandController implements DisposableLike {
 
   /** Refreshes OS and VS Code terminal windows. */
   private async refreshTerminals(): Promise<void> {
-    const windows = await this.dependencies.networkService.refreshTerminals();
+    const windows = await this.dependencies.networkService.refreshTerminals({ allowPlatformAutomation: true });
     this.dependencies.treeProvider.refresh();
     await vscode.window.showInformationMessage(`Discovered ${windows.length} terminal windows.`);
   }
@@ -1310,7 +1310,7 @@ export class PortManagerCommandController implements DisposableLike {
   /** Forces the tree provider to request the latest registry snapshot. */
   private async refresh(): Promise<void> {
     await Promise.all([
-      this.dependencies.networkService.refreshTerminals(),
+      this.dependencies.networkService.refreshTerminals({ allowPlatformAutomation: true }),
       this.dependencies.networkService.refreshContainerServices(),
     ]);
     await this.dependencies.networkService.refreshNetworkRoutingState();
@@ -1898,7 +1898,9 @@ export class PortManagerCommandController implements DisposableLike {
 
     // Background terminal discovery idles while nothing consumes it, so a
     // user-facing picker refreshes in the foreground before listing windows.
-    await this.dependencies.networkService.refreshTerminals({ force: true }).catch(() => []);
+    await this.dependencies.networkService
+      .refreshTerminals({ force: true, allowPlatformAutomation: true })
+      .catch(() => []);
     const windows = this.dependencies.networkService.getSnapshot().terminalWindows;
     if (windows.length === 0) {
       await vscode.window.showInformationMessage("No terminal windows discovered.");

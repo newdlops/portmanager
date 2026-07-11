@@ -51,22 +51,27 @@ test("daemon-down override regeneration keeps attachments and existing overrides
   assert.equal(matcherBody.includes("is the docker daemon running"), true);
 });
 
-test("empty packet-filter redirect selections wait out transient blinks", () => {
+test("background packet-filter changes never open authorization while explicit cleanup stays immediate", () => {
   const source = readSource("src/extension/network-service.ts");
-
-  assert.equal(source.includes("HOST_LOCAL_GATEWAY_EMPTY_REDIRECT_STABLE_MS = 30_000"), true);
-  assert.equal(source.includes("private hostLocalGatewayEmptyRedirectSinceMs = 0;"), true);
 
   const syncStart = source.indexOf("private async syncHostLocalGatewayRedirects");
   const syncBody = source.slice(syncStart, syncStart + 2600);
-  assert.equal(syncBody.includes("if (redirects.length === 0) {"), true);
-  assert.equal(syncBody.includes("HOST_LOCAL_GATEWAY_EMPTY_REDIRECT_STABLE_MS"), true);
-  // Non-empty selections stay immediate for explicit attach flows.
-  assert.equal(syncBody.includes("this.hostLocalGatewayEmptyRedirectSinceMs = 0;"), true);
-  // A matching anchor resets both the signature and the empty-blink clock.
+  assert.equal(source.includes("HOST_LOCAL_GATEWAY_EMPTY_REDIRECT_STABLE_MS"), false);
+  assert.equal(source.includes("hostLocalGatewayEmptyRedirectSinceMs"), false);
+  // Empty and non-empty selections can both blink between networks. Background
+  // convergence is read-only, while an explicit empty detach reaches cleanup
+  // without a timer or a special-case early return.
+  assert.equal(syncBody.includes("redirects.length === 0"), false);
+  assert.equal(syncBody.includes("if (options.allowAdministratorPrompt !== true)"), true);
+  assert.equal(
+    syncBody.indexOf("if (options.allowAdministratorPrompt !== true)") <
+      syncBody.indexOf("runShellScriptWithAdministratorPrivileges("),
+    true,
+  );
+  // A matching anchor still avoids unnecessary privileged work.
   assert.equal(
     syncBody.indexOf("isHostLocalGatewayRedirectAnchorCurrent(redirects)") <
-      syncBody.indexOf("if (redirects.length === 0) {"),
+      syncBody.indexOf("if (options.allowAdministratorPrompt !== true)"),
     true,
   );
 });

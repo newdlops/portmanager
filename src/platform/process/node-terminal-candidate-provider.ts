@@ -1,6 +1,10 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { TerminalCandidate, TerminalCandidateProvider } from "../../shared/types";
+import type {
+  TerminalCandidate,
+  TerminalCandidateListOptions,
+  TerminalCandidateProvider,
+} from "../../shared/types";
 
 const execFileAsync = promisify(execFile);
 
@@ -12,13 +16,20 @@ const execFileAsync = promisify(execFile);
  * limits mean cwd/tty/process group are optional rather than guaranteed.
  */
 export class NodeTerminalCandidateProvider implements TerminalCandidateProvider {
+  /** Last explicitly discovered titles, reused by permission-free background scans. */
+  private terminalTitleByTerminalId: ReadonlyMap<string, string> = new Map();
+
   /** Lists terminal-like processes for the current platform. */
-  async list(): Promise<readonly TerminalCandidate[]> {
+  async list(options: TerminalCandidateListOptions = {}): Promise<readonly TerminalCandidate[]> {
     if (process.platform === "win32") {
       return listWindowsTerminals();
     }
 
-    return listPosixTerminals();
+    if (options.allowPlatformAutomation === true) {
+      this.terminalTitleByTerminalId = await listTerminalTitlesByTty();
+    }
+
+    return listPosixTerminals(this.terminalTitleByTerminalId);
   }
 }
 
@@ -46,13 +57,12 @@ interface WindowsProcessRow {
 }
 
 /** Uses ps so macOS and Linux share one process scanner path. */
-async function listPosixTerminals(): Promise<readonly TerminalCandidate[]> {
-  const [{ stdout }, titleByTerminalId] = await Promise.all([
-    execFileAsync("ps", ["-Ao", "pid=,ppid=,pgid=,tty=,comm=,args="], {
-      maxBuffer: 1024 * 1024,
-    }),
-    listTerminalTitlesByTty(),
-  ]);
+async function listPosixTerminals(
+  titleByTerminalId: ReadonlyMap<string, string>,
+): Promise<readonly TerminalCandidate[]> {
+  const { stdout } = await execFileAsync("ps", ["-Ao", "pid=,ppid=,pgid=,tty=,comm=,args="], {
+    maxBuffer: 1024 * 1024,
+  });
 
   return stdout
     .split(/\r?\n/)

@@ -468,7 +468,16 @@ export interface TerminalCandidateProvider {
    * Implementations belong to platform or extension layers because discovery
    * reads OS process tables or VS Code terminal APIs.
    */
-  list(): Promise<readonly TerminalCandidate[]>;
+  list(options?: TerminalCandidateListOptions): Promise<readonly TerminalCandidate[]>;
+}
+
+export interface TerminalCandidateListOptions {
+  /**
+   * Allows a direct user action to query terminal applications for window/tab
+   * titles. On macOS that query can open Automation authorization UI, so
+   * background discovery must leave this disabled and reuse cached titles.
+   */
+  readonly allowPlatformAutomation?: boolean;
 }
 
 export type ExperimentalRouteOwnershipMode = "process" | "terminal-scope-listener" | "loopback-address-only";

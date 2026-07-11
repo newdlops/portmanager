@@ -867,8 +867,11 @@ test("background routing refresh polls terminals and containers", () => {
   const burstEnd = source.indexOf("private async readTerminalAttachmentMarkerSignature", burstStart);
   const burstBody = source.slice(burstStart, burstEnd);
   const refreshStart = source.indexOf("private async refreshRoutingSignalsExclusive");
-  const refreshEnd = source.indexOf("private async convergeAfterComposeAttachmentChange", refreshStart);
+  const refreshEnd = source.indexOf("private syncComposeRoutingFreshnessHeartbeat", refreshStart);
   const refreshBody = source.slice(refreshStart, refreshEnd);
+  const eventStart = source.indexOf("private async handleContainerRuntimeEvent");
+  const eventEnd = source.indexOf("private async convergeAfterComposeAttachmentChange", eventStart);
+  const eventBody = source.slice(eventStart, eventEnd);
 
   assert.equal(source.includes("private startRoutingSignalRefreshLoop(): void"), true);
   assert.equal(source.includes("this.refreshTerminals().catch(() => [])"), true);
@@ -905,11 +908,29 @@ test("background routing refresh polls terminals and containers", () => {
     true,
   );
   assert.equal(source.includes("this.refreshContainerServices({ background: true }).catch(() => [])"), true);
-  assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts({ background: true }).catch(() => undefined);"), false);
-  assert.equal(source.includes("await this.reconcileComposeAttachmentPublishedPorts({ background: true, force: true }).catch(() => undefined);"), true);
+  assert.equal(
+    refreshBody.includes(
+      "await this.reconcileComposeAttachmentPublishedPorts({ background: true, force: true }).catch(() => undefined);",
+    ),
+    true,
+  );
+  assert.equal(refreshBody.includes("forceComposeOverrideRefresh"), false);
+  assert.equal(refreshBody.includes("writeComposeProjectRoutingFile"), false);
   assert.equal(source.includes("FORCED_COMPOSE_RECONCILE_COALESCE_MS = 750"), true);
   assert.equal(source.includes("forceComposeOverrideRefresh: true,"), true);
-  assert.equal(source.includes("await this.convergeDaemonAndRoutingState();"), true);
+  assert.equal(refreshBody.includes("await this.convergeDaemonAndRoutingState();"), true);
+  assert.equal(
+    eventBody.includes(
+      "await this.reconcileComposeAttachmentPublishedPorts({ force: true, coalesceForce: true }).catch(() => undefined);",
+    ),
+    true,
+  );
+  assert.equal(
+    eventBody.includes(
+      "await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);",
+    ),
+    true,
+  );
   assert.equal(refreshBody.includes("this.syncLogicalPortRouters().catch(() => undefined),"), true);
   assert.equal(refreshBody.includes("this.syncBrowserNetworkProxies().catch(() => undefined),"), true);
   assert.equal(source.includes("ROUTING_SIGNAL_REFRESH_INTERVAL_MS = 10_000"), true);
@@ -952,6 +973,7 @@ test("compose reconcile preserves persisted routes when live runtime discovery i
   assert.equal(reconcileBody.includes(".listLiveComposePublishedPorts("), true);
   assert.equal(reconcileBody.includes("this.containerServiceDiscovery.listLiveComposePublishedPorts("), false);
   assert.equal(reconcileBody.includes("reconcileComposeOverrideFileForAttachment("), true);
+  assert.equal(reconcileBody.includes("force: options.force === true"), false);
   assert.equal(reconcileBody.includes('if (overrideRestoredAttachment.status === "error")'), true);
   assert.equal(reconcileBody.includes("replaceComposeRouteProcesses(overrideRestoredAttachment, livePorts)"), true);
   assert.equal(reconcileBody.includes("ensureComposeRouteProcesses(overrideRestoredAttachment, overrideRestoredAttachment.ports)"), true);
@@ -1151,7 +1173,7 @@ test("global storage cleanup rehydrates generated routing from live attachment s
   assert.equal(source.includes("private async rehydrateBrowserDnsAndProxies(): Promise<void>"), true);
   assert.equal(source.includes("await this.startBrowserDnsServer().catch(() => undefined);"), true);
   assert.equal(source.includes("this.syncBrowserDnsRecords();"), true);
-  assert.equal(source.includes("this.maybeAutoInstallBrowserDnsResolvers();"), true);
+  assert.equal(source.includes("this.maybeOfferBrowserDnsResolverInstall();"), true);
   assert.equal(source.includes("await this.syncBrowserNetworkProxies().catch(() => undefined);"), true);
   assert.equal(rehydrateBody.includes("await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);"), true);
   assert.equal(source.includes("private shouldPreserveComposeHiddenPublishedHostPorts(): boolean"), true);
@@ -1190,7 +1212,7 @@ test("logical port routers use a single cross-window owner lease", () => {
   const syncStart = source.indexOf("private async syncLogicalPortRouters(): Promise<void>");
   const syncEnd = source.indexOf("private async findClientNetworkForRouter", syncStart);
   const syncBody = source.slice(syncStart, syncEnd);
-  const browserSyncStart = source.indexOf("private async syncBrowserNetworkProxiesExclusive(): Promise<void>");
+  const browserSyncStart = source.indexOf("private async syncBrowserNetworkProxiesExclusive(");
   const browserSyncEnd = source.indexOf("private async readBrowserProxyProcessCommandTexts", browserSyncStart);
   const browserSyncBody = source.slice(browserSyncStart, browserSyncEnd);
   const browserCommandCacheStart = source.indexOf("private async readBrowserProxyProcessCommandTexts");

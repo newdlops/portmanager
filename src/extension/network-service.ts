@@ -161,7 +161,8 @@ import type { PortManagerProcessService } from "./process-service";
 const NETWORK_STATE_KEY = "portManager.logicalNetworkState.v1";
 const BINDING_PRESETS_KEY = "portManager.bindingPresets.v1";
 const VSCODE_WINDOW_TERMINAL_BINDING_KEY = "portManager.vscodeWindowTerminalBinding.v1";
-const BROWSER_DNS_AUTO_INSTALL_SIGNATURE_KEY = "portManager.browserDnsAutoInstallSignature.v1";
+// Keep the existing storage key so upgrades preserve the one-off offer throttle.
+const BROWSER_DNS_INSTALL_OFFER_SIGNATURE_KEY = "portManager.browserDnsAutoInstallSignature.v1";
 const COMPOSE_PROJECT_ROUTING_FILE_NAME = "compose-project-routing.tsv";
 const COMPOSE_PROJECT_ROUTING_FILE_PREFIX = "compose-project-routing-";
 const COMPOSE_PROJECT_ROUTING_COMPOSE_SEPARATOR = ".compose-";
@@ -237,10 +238,6 @@ const FORCED_COMPOSE_RECONCILE_COALESCE_MS = 750;
 // cannot succeed; skipping retries for a short window prevents every refresh
 // tick from spawning doomed docker/compose commands for each attachment.
 const DOCKER_DAEMON_UNAVAILABLE_RETRY_BACKOFF_MS = 30_000;
-// Removing every packet-filter redirect needs an admin prompt. A transient
-// blink to zero redirects (daemon restart, attachment repair) must not ask for
-// a password, so empty sets only clear rules after staying empty this long.
-const HOST_LOCAL_GATEWAY_EMPTY_REDIRECT_STABLE_MS = 30_000;
 const TERMINAL_NETWORK_SERVICE_ENTRY_SEPARATOR = " || ";
 // A live PID's command line is immutable, so hits can outlive many sync
 // passes; rows are pruned as soon as the PID leaves the process snapshot.
@@ -324,8 +321,10 @@ export interface TerminalNetworkResetSummary {
 interface BackgroundRefreshOptions {
   /** True when called from the low-frequency repair loop instead of a user action. */
   readonly background?: boolean;
-  /** True when a terminal-side signal observed user activity that can change routes. */
+  /** Refresh live runtime projections immediately; generated override refreshes stay explicit. */
   readonly force?: boolean;
+  /** Allows a direct UI action to query terminal apps through platform Automation APIs. */
+  readonly allowPlatformAutomation?: boolean;
   /** Limits forced runtime reconciliation to the logical networks that emitted a lifecycle signal. */
   readonly networkIds?: readonly string[];
   /** Internal flag used when one outer Docker refresh already owns the shared lock. */
@@ -346,6 +345,11 @@ interface ComposeOverrideReconcileOptions {
   readonly force?: boolean;
   /** Keep Docker host publishes on logical ports when the current loopback model requires it. */
   readonly preservePublishedHostPorts?: boolean;
+}
+
+interface BrowserNetworkProxySyncOptions {
+  /** Allows a user-initiated sync to open the macOS administrator authorization UI. */
+  readonly allowAdministratorPrompt?: boolean;
 }
 
 interface NetworkDnsRecord {
@@ -620,6 +624,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Requests one more browser proxy reconciliation after the current sync completes. */
   private browserProxySyncQueued = false;
 
+  /** Carries an explicit user gesture across a coalesced browser-proxy sync. */
+  private browserProxyAdministratorPromptQueued = false;
+
   /** True only after this extension host acquired the cross-window browser proxy owner lease. */
   private ownsBrowserNetworkProxyLease = false;
 
@@ -681,17 +688,14 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Short-lived cwd hint cache used to classify route-file web endpoints. */
   private readonly browserProxyRouteHintTextCache = new Map<string, BrowserProxyRouteHintCacheEntry>();
 
-  /** Guards privileged resolver installation so duplicate UI/registry events cannot stack prompts. */
+  /** Guards explicit resolver installation so duplicate UI actions cannot stack prompts. */
   private browserDnsResolverInstallInFlight: Promise<BrowserDnsResolverStatus> | undefined;
 
-  /** Last missing-resolver signature that already triggered an automatic admin prompt. */
-  private browserDnsAutoInstallSignature: string | undefined;
+  /** Last missing-resolver signature already offered through non-privileged UI. */
+  private browserDnsInstallOfferSignature: string | undefined;
 
-  /** Last host-local redirect signature that already triggered an automatic admin prompt. */
+  /** Last host-local redirect signature offered during this extension-host lifetime. */
   private hostLocalGatewayRedirectInstallSignature: string | undefined;
-
-  /** First time the redirect selection was observed empty while rules are still installed. */
-  private hostLocalGatewayEmptyRedirectSinceMs = 0;
 
   /** Retry gate set when compose regeneration fails because the container daemon is down. */
   private dockerDaemonUnavailableUntilMs = 0;
@@ -713,6 +717,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Requests one more terminal refresh after the current process-table scan completes. */
   private terminalRefreshQueued = false;
+
+  /** Carries an explicit title-query gesture across a coalesced terminal refresh. */
+  private terminalPlatformAutomationQueued = false;
 
   /** Background poller that keeps terminals, containers, and compose routes current. */
   private routingSignalRefreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -986,7 +993,7 @@ export class PortManagerNetworkService implements DisposableLike {
      */
     await this.startBrowserDnsServer();
     this.syncBrowserDnsRecords();
-    void this.maybeAutoInstallBrowserDnsResolvers();
+    void this.maybeOfferBrowserDnsResolverInstall();
     await this.convergeDaemonAndRoutingState();
     await this.syncLogicalPortRouters();
     this.startRoutingSignalRefreshLoop();
@@ -1056,7 +1063,7 @@ export class PortManagerNetworkService implements DisposableLike {
     void this.writeComposeProjectRoutingFile();
     void this.writeTerminalNetworkSelectionFile();
     this.syncBrowserDnsRecords();
-    void this.maybeAutoInstallBrowserDnsResolvers();
+    void this.maybeOfferBrowserDnsResolverInstall();
     void this.syncLogicalPortRouters();
     void this.syncBrowserNetworkProxies();
   }
@@ -1258,7 +1265,6 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Installs macOS resolver rows so browser URLs can use network names as hosts. */
   async installBrowserDnsResolvers(
     options: {
-      readonly automatic?: boolean;
       readonly forceTlsRenewal?: boolean;
       readonly triggerDescription?: string;
     } = {},
@@ -1372,8 +1378,8 @@ export class PortManagerNetworkService implements DisposableLike {
       if (records.length > 0) {
         await trustBrowserTlsCertificateForCurrentUser().catch(() => undefined);
         // The approval already covered the full browser DNS setup, so the
-        // automatic installer must not prompt again for the same state.
-        this.clearBrowserDnsAutoInstallSignature();
+        // background path must not offer the same setup again.
+        this.clearBrowserDnsInstallOfferSignature();
         this.browserNetworkProxy.retryFailedEndpointsNow();
         void this.syncBrowserNetworkProxies().catch(() => undefined);
       }
@@ -1408,7 +1414,6 @@ export class PortManagerNetworkService implements DisposableLike {
 
   private async installBrowserDnsResolversExclusive(
     options: {
-      readonly automatic?: boolean;
       readonly forceTlsRenewal?: boolean;
       readonly triggerDescription?: string;
     },
@@ -1421,7 +1426,7 @@ export class PortManagerNetworkService implements DisposableLike {
     // configured: renewal exists precisely for certificates that still work
     // but are inside the renewal window.
     if (status.missingCount === 0 && options.forceTlsRenewal !== true) {
-      this.clearBrowserDnsAutoInstallSignature();
+      this.clearBrowserDnsInstallOfferSignature();
       return status;
     }
 
@@ -1454,20 +1459,16 @@ export class PortManagerNetworkService implements DisposableLike {
     this.browserNetworkProxy.retryFailedEndpointsNow();
     await this.syncBrowserNetworkProxies().catch(() => undefined);
 
-    if (options.automatic === true) {
-      void vscode.window.showInformationMessage("Port Manager browser DNS aliases and dev TLS certificate installed.");
-    }
-
-    this.clearBrowserDnsAutoInstallSignature();
+    this.clearBrowserDnsInstallOfferSignature();
     return this.getBrowserDnsResolverStatus();
   }
 
-  /** Starts one automatic resolver repair for each distinct missing alias set. */
-  private maybeAutoInstallBrowserDnsResolvers(): void {
+  /** Offers one user-driven resolver repair for each distinct missing alias set. */
+  private maybeOfferBrowserDnsResolverInstall(): void {
     const status = this.getBrowserDnsResolverStatus();
     if (!status.supported || !status.dnsRunning || status.missingCount === 0) {
       if (status.supported && status.missingCount === 0) {
-        this.clearBrowserDnsAutoInstallSignature();
+        this.clearBrowserDnsInstallOfferSignature();
       }
       return;
     }
@@ -1489,44 +1490,53 @@ export class PortManagerNetworkService implements DisposableLike {
       .join("|");
     if (
       signature.length === 0 ||
-      this.browserDnsAutoInstallSignature === signature ||
-      this.context.globalState.get<string>(BROWSER_DNS_AUTO_INSTALL_SIGNATURE_KEY) === signature
+      this.browserDnsInstallOfferSignature === signature ||
+      this.context.globalState.get<string>(BROWSER_DNS_INSTALL_OFFER_SIGNATURE_KEY) === signature
     ) {
       return;
     }
 
-    this.rememberBrowserDnsAutoInstallSignature(signature);
-    void this.installBrowserDnsResolvers({ automatic: true })
-      .then((result) => {
-        if (result.missingCount === 0) {
-          this.clearBrowserDnsAutoInstallSignature();
+    this.rememberBrowserDnsInstallOfferSignature(signature);
+    const installAction = "Install Browser DNS";
+    void vscode.window
+      .showInformationMessage(
+        "Port Manager browser aliases need one-time macOS DNS and dev TLS setup.",
+        installAction,
+      )
+      .then((selection) => {
+        if (selection !== installAction) {
+          return;
         }
-      })
-      .catch(() => undefined);
+
+        // Only the notification action, sidebar command, or another explicit
+        // user gesture may cross into the privileged installer.
+        void this.installBrowserDnsResolvers({
+          triggerDescription: "browser alias installation was requested from the Port Manager notification",
+        }).catch(() => undefined);
+      });
   }
 
   /**
-   * Automatic DNS/TLS setup is privileged. Remembering the attempted state in
-   * VS Code storage prevents the same admin prompt from returning every launch
-   * when the user cancels or the machine rejects the script; a network rename or
-   * changed alias set produces a new signature and can prompt again.
+   * The background path may advertise missing DNS/TLS setup but must never run
+   * it. Remembering the offered state prevents repeat notifications every launch;
+   * a network rename or changed alias set produces a new one-time offer.
    */
-  private rememberBrowserDnsAutoInstallSignature(signature: string): void {
-    this.browserDnsAutoInstallSignature = signature;
-    void this.context.globalState.update(BROWSER_DNS_AUTO_INSTALL_SIGNATURE_KEY, signature);
+  private rememberBrowserDnsInstallOfferSignature(signature: string): void {
+    this.browserDnsInstallOfferSignature = signature;
+    void this.context.globalState.update(BROWSER_DNS_INSTALL_OFFER_SIGNATURE_KEY, signature);
   }
 
-  /** Clears the automatic prompt throttle after the current browser alias set is fully installed. */
-  private clearBrowserDnsAutoInstallSignature(): void {
+  /** Clears the offer throttle after the current browser alias set is fully installed. */
+  private clearBrowserDnsInstallOfferSignature(): void {
     if (
-      this.browserDnsAutoInstallSignature === undefined &&
-      this.context.globalState.get<string>(BROWSER_DNS_AUTO_INSTALL_SIGNATURE_KEY) === undefined
+      this.browserDnsInstallOfferSignature === undefined &&
+      this.context.globalState.get<string>(BROWSER_DNS_INSTALL_OFFER_SIGNATURE_KEY) === undefined
     ) {
       return;
     }
 
-    this.browserDnsAutoInstallSignature = undefined;
-    void this.context.globalState.update(BROWSER_DNS_AUTO_INSTALL_SIGNATURE_KEY, undefined);
+    this.browserDnsInstallOfferSignature = undefined;
+    void this.context.globalState.update(BROWSER_DNS_INSTALL_OFFER_SIGNATURE_KEY, undefined);
   }
 
   /** Starts the local DNS responder used for single-label browser aliases. */
@@ -1637,7 +1647,13 @@ export class PortManagerNetworkService implements DisposableLike {
 
     await this.removeManualTerminalAttachmentMarkersForNetwork(networkId).catch(() => undefined);
 
-    return this.registry.removeNetwork(networkId);
+    const removedNetwork = this.registry.removeNetwork(networkId);
+    if (removedNetwork !== undefined) {
+      // Network removal is an explicit user gesture. Reconcile after the
+      // registry mutation so a last-network removal can clear its PF rules.
+      await this.syncBrowserNetworkProxies({ allowAdministratorPrompt: true }).catch(() => undefined);
+    }
+    return removedNetwork;
   }
 
   /** Refreshes VS Code and external OS terminal windows. */
@@ -1661,6 +1677,9 @@ export class PortManagerNetworkService implements DisposableLike {
       return this.registry.getSnapshot().terminalWindows;
     }
 
+    if (options.allowPlatformAutomation === true) {
+      this.terminalPlatformAutomationQueued = true;
+    }
     if (this.terminalRefreshInFlight !== undefined) {
       this.terminalRefreshQueued = true;
       return this.terminalRefreshInFlight;
@@ -1691,19 +1710,25 @@ export class PortManagerNetworkService implements DisposableLike {
     let terminalWindows: readonly TerminalWindow[] = [];
 
     do {
+      const allowPlatformAutomation = this.terminalPlatformAutomationQueued;
       this.terminalRefreshQueued = false;
-      terminalWindows = await this.refreshTerminalsExclusive();
-    } while (this.terminalRefreshQueued);
+      this.terminalPlatformAutomationQueued = false;
+      terminalWindows = await this.refreshTerminalsExclusive({ allowPlatformAutomation });
+    } while (this.terminalRefreshQueued || this.terminalPlatformAutomationQueued);
 
     return terminalWindows;
   }
 
   /** Reads terminal/process state once and reconciles hook marker files into attachments. */
-  private async refreshTerminalsExclusive(): Promise<readonly TerminalWindow[]> {
+  private async refreshTerminalsExclusive(
+    options: Pick<BackgroundRefreshOptions, "allowPlatformAutomation"> = {},
+  ): Promise<readonly TerminalWindow[]> {
     const processRows = await this.listProcessRowsForTerminalControl();
     const [vscodeCandidates, osCandidates] = await Promise.all([
       listVscodeTerminalCandidates(processRows),
-      this.terminalCandidateProvider.list().catch(() => []),
+      this.terminalCandidateProvider
+        .list({ allowPlatformAutomation: options.allowPlatformAutomation })
+        .catch(() => []),
     ]);
     const candidates = [...vscodeCandidates, ...osCandidates];
     this.registry.setTerminalCandidates(candidates);
@@ -1803,7 +1828,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
     await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
     await this.convergeDaemonAndRoutingState();
-    await this.syncBrowserNetworkProxies();
+    await this.syncBrowserNetworkProxies({ allowAdministratorPrompt: true });
   }
 
   /** Runs one Docker/Podman discovery pass and records its refresh timestamp. */
@@ -1881,7 +1906,7 @@ export class PortManagerNetworkService implements DisposableLike {
       }
     }
 
-    return this.registry.addAttachment({
+    const attachment = this.registry.addAttachment({
       id: createId("attachment"),
       networkId,
       rootPid: terminalWindow.rootPid,
@@ -1892,6 +1917,8 @@ export class PortManagerNetworkService implements DisposableLike {
       status: "attached",
       attachedAt: new Date().toISOString(),
     });
+    await this.syncBrowserNetworkProxies({ allowAdministratorPrompt: true }).catch(() => undefined);
+    return attachment;
   }
 
   /** Brings a discovered terminal window to the foreground when the platform exposes a focus route. */
@@ -1956,7 +1983,7 @@ export class PortManagerNetworkService implements DisposableLike {
     };
     this.vscodeWindowTerminalBinding = updatedBinding;
     this.saveVscodeWindowTerminalBinding();
-    await this.syncBrowserNetworkProxies().catch(() => undefined);
+    await this.syncBrowserNetworkProxies({ allowAdministratorPrompt: true }).catch(() => undefined);
     this.localChangeEvents.emit();
 
     return {
@@ -1975,7 +2002,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const detachedTerminalCount = sendCommandToOpenVscodeTerminals(this.buildTerminalDetachScript());
     await this.refreshTerminals().catch(() => []);
-    await this.syncBrowserNetworkProxies().catch(() => undefined);
+    await this.syncBrowserNetworkProxies({ allowAdministratorPrompt: true }).catch(() => undefined);
 
     this.localChangeEvents.emit();
     return {
@@ -3495,8 +3522,13 @@ export class PortManagerNetworkService implements DisposableLike {
       this.refreshTerminals({ background: true }).catch(() => []),
       this.refreshContainerServices({ background: true }).catch(() => []),
     ]);
+    /*
+     * Keep the live runtime fallback for Docker events that were missed, but
+     * do not force generated override recovery here. The convergence step
+     * below republishes routing files and recreates an override only when its
+     * generated file is actually missing.
+     */
     await this.reconcileComposeAttachmentPublishedPorts({ background: true, force: true }).catch(() => undefined);
-    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
     await this.convergeDaemonAndRoutingState();
     await Promise.all([
       this.syncLogicalPortRouters().catch(() => undefined),
@@ -3624,6 +3656,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);
     await this.reapplyRoutingToAttachedTerminalWindows().catch(() => 0);
     await this.refreshContainerServices().catch(() => []);
+    await this.syncBrowserNetworkProxies({ allowAdministratorPrompt: true }).catch(() => undefined);
     this.localChangeEvents.emit();
   }
 
@@ -3646,6 +3679,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);
     await this.reapplyRoutingToAttachedTerminalWindows().catch(() => 0);
     await this.refreshContainerServices().catch(() => []);
+    await this.syncBrowserNetworkProxies({ allowAdministratorPrompt: true }).catch(() => undefined);
     this.localChangeEvents.emit();
   }
 
@@ -4315,7 +4349,6 @@ export class PortManagerNetworkService implements DisposableLike {
           ...attachment,
           ...(refreshedMutation !== undefined ? { mutation: refreshedMutation } : {}),
         },
-        { force: options.force === true },
       );
       if (overrideRestoredAttachment.status === "error") {
         await this.removeComposeRouteProcesses(overrideRestoredAttachment, overrideRestoredAttachment.ports);
@@ -5455,7 +5488,12 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /** Keeps per-network browser entrypoints in sync with running web process rows. */
-  private async syncBrowserNetworkProxies(): Promise<void> {
+  private async syncBrowserNetworkProxies(
+    options: BrowserNetworkProxySyncOptions = {},
+  ): Promise<void> {
+    if (options.allowAdministratorPrompt === true) {
+      this.browserProxyAdministratorPromptQueued = true;
+    }
     if (this.browserProxySyncInFlight !== undefined) {
       this.browserProxySyncQueued = true;
       return this.browserProxySyncInFlight;
@@ -5471,12 +5509,16 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Runs browser proxy reconciliation until one queued refresh sees the latest snapshot. */
   private async syncBrowserNetworkProxiesQueued(): Promise<void> {
     do {
+      const allowAdministratorPrompt = this.browserProxyAdministratorPromptQueued;
       this.browserProxySyncQueued = false;
-      await this.syncBrowserNetworkProxiesExclusive();
-    } while (this.browserProxySyncQueued);
+      this.browserProxyAdministratorPromptQueued = false;
+      await this.syncBrowserNetworkProxiesExclusive({ allowAdministratorPrompt });
+    } while (this.browserProxySyncQueued || this.browserProxyAdministratorPromptQueued);
   }
 
-  private async syncBrowserNetworkProxiesExclusive(): Promise<void> {
+  private async syncBrowserNetworkProxiesExclusive(
+    options: BrowserNetworkProxySyncOptions = {},
+  ): Promise<void> {
     const snapshot = this.processService?.getSnapshot();
     const registrySnapshot = this.registry.getSnapshot();
     const networks = registrySnapshot.networks;
@@ -5571,7 +5613,10 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.releaseHostGatewayPortsForBrowserEndpoints(endpoints).catch(() => undefined);
     await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);
     await this.syncHostGatewayProxies(hostGatewayExposures).catch(() => undefined);
-    void this.syncHostLocalGatewayRedirects(hostLocalGatewayRedirects);
+    // Keep privileged reconciliation inside the outer coalescer. Explicit
+    // state changes that arrive while macOS authorization is open are queued
+    // and replayed against the latest snapshot after the prompt completes.
+    await this.syncHostLocalGatewayRedirects(hostLocalGatewayRedirects, options);
   }
 
   /**
@@ -5651,7 +5696,10 @@ export class PortManagerNetworkService implements DisposableLike {
    * 127.0.0.1:port; it only rewrites outbound loopback connect packets to the
    * already-open invisible network gateway, so server listen calls stay free.
    */
-  private async syncHostLocalGatewayRedirects(redirects: readonly HostLocalGatewayRedirect[]): Promise<void> {
+  private async syncHostLocalGatewayRedirects(
+    redirects: readonly HostLocalGatewayRedirect[],
+    options: BrowserNetworkProxySyncOptions = {},
+  ): Promise<void> {
     if (process.platform !== "darwin") {
       return;
     }
@@ -5663,43 +5711,38 @@ export class PortManagerNetworkService implements DisposableLike {
     const signature = hostLocalGatewayRedirectSignature(redirects);
     if (isHostLocalGatewayRedirectAnchorCurrent(redirects)) {
       this.hostLocalGatewayRedirectInstallSignature = undefined;
-      this.hostLocalGatewayEmptyRedirectSinceMs = 0;
       return;
     }
 
-    /*
-     * Clearing installed rules is an admin prompt. Redirect selections can
-     * blink to empty while attachments repair or the container daemon
-     * restarts, so rules are only removed after the selection stays empty for
-     * a stability window. Non-empty changes stay immediate: they come from
-     * explicit attach flows that expect localhost routing to work right away.
-     */
-    if (redirects.length === 0) {
-      const nowMs = Date.now();
-      if (this.hostLocalGatewayEmptyRedirectSinceMs === 0) {
-        this.hostLocalGatewayEmptyRedirectSinceMs = nowMs;
-        return;
-      }
-      if (nowMs - this.hostLocalGatewayEmptyRedirectSinceMs < HOST_LOCAL_GATEWAY_EMPTY_REDIRECT_STABLE_MS) {
-        return;
-      }
-    } else {
-      this.hostLocalGatewayEmptyRedirectSinceMs = 0;
+    // Attachment repair and daemon restarts may change the desired rules in
+    // background. Only the explicit command path may open authorization UI;
+    // this also lets an explicit empty selection remove stale rules immediately.
+    if (options.allowAdministratorPrompt !== true) {
+      return;
     }
 
     if (this.hostLocalGatewayRedirectInstallSignature === signature) {
       return;
     }
+
     this.hostLocalGatewayRedirectInstallSignature = signature;
 
     this.hostLocalGatewayRedirectInstallInFlight = runShellScriptWithAdministratorPrivileges(
       buildHostLocalGatewayRedirectSetupScript(redirects),
       "Port Manager needs administrator privileges to configure macOS packet-filter redirects for logical-network host access. This lets host processes reach the selected network without occupying the original localhost port.",
-    ).finally(() => {
-      this.hostLocalGatewayRedirectInstallInFlight = undefined;
-    });
+    )
+      .catch(() => {
+        // A cancelled prompt is not an installed state. Background callers are
+        // still gated, while a later explicit action may retry the same rules.
+        if (this.hostLocalGatewayRedirectInstallSignature === signature) {
+          this.hostLocalGatewayRedirectInstallSignature = undefined;
+        }
+      })
+      .finally(() => {
+        this.hostLocalGatewayRedirectInstallInFlight = undefined;
+      });
 
-    await this.hostLocalGatewayRedirectInstallInFlight.catch(() => undefined);
+    await this.hostLocalGatewayRedirectInstallInFlight;
   }
 
   /** Wrapper-launched dev servers can register as `node`; inspect argv before classifying browser routes. */
@@ -6512,7 +6555,7 @@ export class PortManagerNetworkService implements DisposableLike {
   private async rehydrateBrowserDnsAndProxies(): Promise<void> {
     await this.startBrowserDnsServer().catch(() => undefined);
     this.syncBrowserDnsRecords();
-    this.maybeAutoInstallBrowserDnsResolvers();
+    this.maybeOfferBrowserDnsResolverInstall();
     await this.syncBrowserNetworkProxies().catch(() => undefined);
   }
 

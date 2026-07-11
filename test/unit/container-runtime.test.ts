@@ -4712,6 +4712,40 @@ test("restores original compose services before removing the hidden project", as
   assert.equal(fs.existsSync(overrideFile), false);
 });
 
+test("reuses a readable compose override without querying the container runtime", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-readable-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const overrideFile = path.join(tempDir, "network-workspace.ports.override.yaml");
+  const overrideContents = "services:\n  db:\n    ports:\n      - '127.81.154.127::5432/tcp'\n";
+  let commandCount = 0;
+
+  fs.writeFileSync(overrideFile, overrideContents, "utf8");
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async () => {
+      commandCount += 1;
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const restoredOverrideFile = await mutator.restoreHiddenPortsOverride({
+    mode: "clone",
+    runtime: "docker",
+    originalProjectName: "workspace",
+    attachedProjectName: "network-workspace",
+    workingDirectory: tempDir,
+    composeFiles: [],
+    services: ["db"],
+    overrideFile,
+    originalPorts: [],
+    hiddenPorts: [],
+  });
+
+  assert.equal(restoredOverrideFile, overrideFile);
+  assert.equal(commandCount, 0);
+  assert.equal(fs.readFileSync(overrideFile, "utf8"), overrideContents);
+});
+
 test("recreates missing compose clone override from persisted mutation state", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-override-restore-"));
   context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
