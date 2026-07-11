@@ -34,6 +34,29 @@ test("host default gateway uses stable network order when no preferred network m
   assert.equal(selected?.networkId, "production1");
 });
 
+test("host default gateway refuses arbitrary networks when an explicit preference is required", () => {
+  const exposures = [
+    exposure({ id: "production1", networkId: "production1", targetAddress: "127.81.154.127" }),
+    exposure({ id: "production2", networkId: "production2", targetAddress: "127.83.116.219" }),
+  ];
+
+  assert.equal(
+    selectHostDefaultGatewayExposure(exposures, {
+      networks: networks(["production1", "production2"]),
+      requirePreferredNetwork: true,
+    }),
+    undefined,
+  );
+  assert.equal(
+    selectHostDefaultGatewayExposure(exposures, {
+      networks: networks(["production1", "production2"]),
+      preferredNetworkId: "missing",
+      requirePreferredNetwork: true,
+    }),
+    undefined,
+  );
+});
+
 test("host default gateway refuses targets that would loop back to the same localhost port", () => {
   const selected = selectHostDefaultGatewayExposure(
     [

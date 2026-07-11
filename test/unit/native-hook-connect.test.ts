@@ -631,6 +631,48 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.equal(result.stderr, "");
   });
 
+  test("native hook passes global-scope gateway-owned application dials to the router", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-global-application-"));
+    const server = net.createServer((socket) => {
+      socket.end("router\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-global-test";
+    const routeTablePath = path.join(tempDir, `newdlops-portmanager-routes-global-${networkId}.json`);
+    fs.writeFileSync(routeTablePath, JSON.stringify({ updatedAt: "2026-07-07T00:00:00.000Z", routes: [] }), "utf8");
+    const claimPath = getRouteTablePathForGatewayClaimPort(address.port, routeTablePath);
+    fs.writeFileSync(claimPath, JSON.stringify({ expiresAtMs: Date.now() + 60_000 }), "utf8");
+
+    const result = await runHookedNodeClient(address.port, routeTablePath, networkId, {
+      env: {
+        PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE: "loopback-address-only",
+        PORT_MANAGER_NETWORK_IS_GLOBAL: "1",
+        PORT_MANAGER_NETWORK_LOOPBACK_HOST: "127.1.0.1",
+        PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "127.1.0.1",
+        PORT_MANAGER_GLOBAL_ROUTES_FILE: routeTablePath,
+        // Non-fixed application ports such as Compose 3000 are gateway-owned too.
+        PORT_MANAGER_FIXED_PROTOCOL_PORTS: "",
+        PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
+        PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
+      },
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "router\n");
+    assert.equal(result.stderr, "");
+  });
+
   test("native hook does not leak fixed protocol connects to host localhost", async (context) => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-fixed-connect-"));
     const server = net.createServer((socket) => {
@@ -1305,6 +1347,11 @@ async function runHookedNodeClient(
     env: {
       ...process.env,
       [preloadVariable]: hookLibraryPath,
+      // A Port Manager-scoped parent shell may carry an installed hook path.
+      // Pin exec-boundary preload repair to this workspace build so native
+      // regression tests never exercise the previously installed extension.
+      PORT_MANAGER_DYLD_INSERT_LIBRARIES: process.platform === "darwin" ? hookLibraryPath : "",
+      PORT_MANAGER_LD_PRELOAD: process.platform === "linux" ? hookLibraryPath : "",
       PORT_MANAGER_HOOK: "1",
       PORT_MANAGER_HOOK_DISABLED: "",
       PORT_MANAGER_ROUTES_FILE: routeTablePath,

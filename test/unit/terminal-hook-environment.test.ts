@@ -2061,7 +2061,8 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   assert.equal(source.includes("connect global raw fallback"), false);
   assert.equal(source.includes("connect global raw passthrough logical=%d"), false);
   assert.equal(source.includes("connect global raw passthrough unmanaged logical=%d"), true);
-  assert.equal(source.includes("connect global address-only logical=%d host=%s"), true);
+  assert.equal(source.includes("connect global gateway passthrough logical=%d"), true);
+  assert.equal(source.includes("connect global address-only logical=%d host=%s"), false);
   assert.equal(ephemeralBindStart < addressOnlyBindStart, true);
   assert.equal(source.includes("bind address-only logical=%d host=%s"), true);
   assert.equal(addressOnlyBindStart < allocationStart, true);
@@ -2235,10 +2236,8 @@ test("logical router classifies clients by process tree label before hook enviro
   assert.equal(resolveNetworkClientTarget.includes("this.isFixedProtocolPort(logicalPort) && !isComposePort"), true);
 
   // In address-only mode, an unattributable router client is a pure host
-  // execution that did not inherit hook state. It may use the host-default
-  // fixed-protocol gateway, an explicit compose publication, or a hooked global
-  // same-port listener, but must not be resolved through the global id as a
-  // normal isolated network route.
+  // execution that did not inherit hook state. A hooked global same-port
+  // listener wins; an explicitly selected user network is only the fallback.
   assert.equal(
     resolveNonNetworkClientTarget.includes("settings.globalNetwork && usesLoopbackAddressOnlyRouting(settings)"),
     true,
@@ -2260,12 +2259,12 @@ test("logical router classifies clients by process tree label before hook enviro
     false,
   );
   assert.equal(
-    resolveNonNetworkClientTarget.indexOf("this.resolveHostDefaultGatewayClientTarget(logicalPort)") <
-      resolveNonNetworkClientTarget.indexOf("this.resolveGlobalSamePortClientTarget(logicalPort)"),
+    resolveNonNetworkClientTarget.indexOf("this.resolveGlobalSamePortClientTarget(logicalPort)") <
+      resolveNonNetworkClientTarget.indexOf("this.resolveHostDefaultGatewayClientTarget(logicalPort)"),
     true,
   );
   assert.equal(
-    resolveNonNetworkClientTarget.indexOf("this.resolveGlobalSamePortClientTarget(logicalPort)") <
+    resolveNonNetworkClientTarget.indexOf("this.resolveHostDefaultGatewayClientTarget(logicalPort)") <
       resolveNonNetworkClientTarget.indexOf("this.findNonNetworkOwnerRoute(logicalPort, clientCwd)"),
     true,
   );
@@ -2279,6 +2278,9 @@ test("logical router classifies clients by process tree label before hook enviro
   assert.equal(source.includes("collectHostGatewayExposures("), true);
   assert.equal(source.includes("selectHostDefaultGatewayExposure(exposures"), true);
   assert.equal(source.includes("this.vscodeWindowTerminalBinding?.status === \"attached\""), true);
+  assert.equal(resolveHostDefaultGatewayClientTarget.includes("requirePreferredNetwork: true"), true);
+  assert.equal(source.includes("function collectGlobalSamePortListenerPorts("), true);
+  assert.equal(source.includes("globalSamePortListenerPorts.has(hostPort)"), true);
   assert.equal(resolveHostDefaultGatewayClientTarget.includes("const isFixedProtocolPort = this.isFixedProtocolPort(logicalPort)"), true);
   assert.equal(resolveHostDefaultGatewayClientTarget.includes("const routeExposures = isFixedProtocolPort"), true);
   assert.equal(resolveHostDefaultGatewayClientTarget.includes("? collectHostGatewayExposures"), true);

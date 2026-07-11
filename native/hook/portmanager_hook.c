@@ -4507,42 +4507,23 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
         global_actual = pm_connect_route_table_lookup(logical_port, global_host, sizeof(global_host), &global_is_compose);
       }
       if (global_actual <= 0) {
-        if (pm_default_local_connect_is_gateway_dead_end(addr, logical_port)) {
+        if (pm_gateway_claim_fresh(logical_port)) {
           /*
-           * The raw coordinate is gateway-owned, but a global client is still a
-           * host-default caller. The TypeScript router can resolve compose
-           * exposures that are not present in the native route table yet, so let
-           * the gateway resolver make the final routing decision.
+           * A fresh claim means the raw localhost coordinate is the TypeScript
+           * router for every protocol, not just fixed ports. Let that router
+           * choose a compose exposure, a live global same-port listener, or a
+           * network-less owner. Rewriting a non-fixed claim to the global alias
+           * here dead-ends when no global listener exists there.
            */
           pm_debug("connect global gateway passthrough logical=%d", logical_port);
           return pm_real_connect(sockfd, addr, addrlen);
         }
-        if (!pm_gateway_claim_fresh(logical_port)) {
-          /*
-           * A non-network shell is still host-real. If the gateway has not
-           * claimed the raw coordinate, an unmanaged localhost client must be
-           * allowed to reach whatever the host kernel already exposes there.
-           */
-          pm_debug("connect global raw passthrough unmanaged logical=%d", logical_port);
-          return pm_real_connect(sockfd, addr, addrlen);
-        }
-
         /*
-         * The gateway owns the raw coordinate, but no route row has been flushed
-         * yet. Try the global alias directly so a just-started global listener
-         * can still be reached without looping back into the gateway.
+         * A non-network shell is still host-real. With no gateway claim and no
+         * managed route, preserve the kernel's ordinary localhost behavior.
          */
-        loopback_host = pm_network_loopback_host();
-        if (loopback_host == NULL) {
-          pm_debug("connect global unavailable logical=%d", logical_port);
-          errno = ECONNREFUSED;
-          return -1;
-        }
-        memcpy(&rewritten, addr, addrlen);
-        pm_set_sockaddr_port((struct sockaddr *)&rewritten, logical_port);
-        pm_set_sockaddr_host((struct sockaddr *)&rewritten, loopback_host);
-        pm_debug("connect global address-only logical=%d host=%s", logical_port, loopback_host);
-        return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
+        pm_debug("connect global raw passthrough unmanaged logical=%d", logical_port);
+        return pm_real_connect(sockfd, addr, addrlen);
       }
 
       if (global_host[0] == '\0' || pm_route_host_is_wildcard_text(global_host)) {

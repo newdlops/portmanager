@@ -4966,8 +4966,8 @@ export class PortManagerNetworkService implements DisposableLike {
    *
    * A missing network id here means the client is hookless, host-scoped, or
    * otherwise unattributable. Route only through host-observable policy:
-   * fixed-protocol host-default gateway first, then an explicit legacy
-   * network-less owner.
+   * a live host-global listener first, then an explicitly selected user
+   * network, then an explicit legacy network-less owner.
    */
   private async resolveNonNetworkClientTarget(
     logicalPort: number,
@@ -4975,16 +4975,16 @@ export class PortManagerNetworkService implements DisposableLike {
   ): Promise<LogicalPortRouterTarget> {
     const settings = readPortManagerSettings();
     if (settings.globalNetwork && usesLoopbackAddressOnlyRouting(settings)) {
-      const hostDefaultGatewayTarget = this.resolveHostDefaultGatewayClientTarget(logicalPort);
-      if (hostDefaultGatewayTarget !== undefined) {
-        await this.waitForBackendReachable(hostDefaultGatewayTarget.host, hostDefaultGatewayTarget.port);
-        return hostDefaultGatewayTarget;
-      }
-
       const globalSamePortTarget = await this.resolveGlobalSamePortClientTarget(logicalPort);
       if (globalSamePortTarget !== undefined) {
         await this.waitForBackendReachable(globalSamePortTarget.host, globalSamePortTarget.port);
         return globalSamePortTarget;
+      }
+
+      const hostDefaultGatewayTarget = this.resolveHostDefaultGatewayClientTarget(logicalPort);
+      if (hostDefaultGatewayTarget !== undefined) {
+        await this.waitForBackendReachable(hostDefaultGatewayTarget.host, hostDefaultGatewayTarget.port);
+        return hostDefaultGatewayTarget;
       }
     }
 
@@ -5001,9 +5001,9 @@ export class PortManagerNetworkService implements DisposableLike {
    *
    * The global network is not an isolated backend namespace, but address-only
    * hooks still bind global dev servers on the deterministic global loopback.
-   * When no explicit gateway/compose route exists, this lets browser and other
-   * host-default clients reach that listener without falling into the router's
-   * own localhost socket.
+   * Browser and other host-default clients must reach this listener before any
+   * user-network fallback, or an unattached host server becomes shadowed by the
+   * first Compose attachment that happens to publish the same port.
    */
   private async resolveGlobalSamePortClientTarget(
     logicalPort: number,
@@ -5069,19 +5069,22 @@ export class PortManagerNetworkService implements DisposableLike {
       return undefined;
     }
 
+    const preferredNetworkId =
+      this.vscodeWindowTerminalBinding?.status === "attached" ? this.vscodeWindowTerminalBinding.networkId : undefined;
     const exposure = selectHostDefaultGatewayExposure(exposures, {
       networks: registrySnapshot.networks,
-      preferredNetworkId:
-        this.vscodeWindowTerminalBinding?.status === "attached" ? this.vscodeWindowTerminalBinding.networkId : undefined,
+      preferredNetworkId,
+      requirePreferredNetwork: true,
     });
 
     if (exposure === undefined) {
       if (devLogEnabled()) {
         devLog(
           "ts-router",
-          `host-default logical_port=${logicalPort} fixed=${isFixedProtocolPort ? 1 : 0} ` +
+          `host-default logical_port=${logicalPort} preferred=${preferredNetworkId ?? "-"} ` +
+            `fixed=${isFixedProtocolPort ? 1 : 0} ` +
             `routeCandidates=${routeExposures.length} composeCandidates=${composeExposures.length} ` +
-            `generatedComposeCandidates=${generatedComposeExposures.length} -> MISS (self-loop)`,
+            `generatedComposeCandidates=${generatedComposeExposures.length} -> MISS (no selected target)`,
         );
       }
       return undefined;
@@ -5567,14 +5570,15 @@ export class PortManagerNetworkService implements DisposableLike {
       exposureEndpointPairs.map(([exposureEndpoint, exposure]) => [exposureEndpoint.id, exposure]),
     );
     const hostLocalGatewayPorts = new Set(readPortManagerSettings().fixedProtocolPorts);
-    // Host-local fixed-protocol redirects are computed from the full exposure
-    // set, ignoring browser-endpoint ownership; their sniffing listeners live
-    // on the hidden redirect alias rather than the browser alias.
+    // Host-local fixed-protocol redirects require an explicit window network
+    // and never shadow a live global listener. Their sniffing listeners live on
+    // the hidden redirect alias rather than the browser alias.
     const hostLocalGatewayRedirects = selectHostLocalGatewayRedirects(
       collectHostGatewayExposures(routes, networks, [], registrySnapshot.composeAttachments),
       networks,
       hostLocalGatewayPorts,
       this.vscodeWindowTerminalBinding?.status === "attached" ? this.vscodeWindowTerminalBinding.networkId : undefined,
+      collectGlobalSamePortListenerPorts(snapshot?.listeners ?? []),
     );
     const endpoints = mergeBrowserProxyEndpoints(
       exposureEndpointPairs.map(([exposureEndpoint]) => exposureEndpoint),
@@ -9233,6 +9237,7 @@ function selectHostLocalGatewayRedirects(
   networks: readonly LogicalNetwork[],
   hostLocalGatewayPorts: ReadonlySet<number>,
   preferredHostDefaultNetworkId: string | undefined,
+  globalSamePortListenerPorts: ReadonlySet<number> = new Set(),
 ): readonly HostLocalGatewayRedirect[] {
   const exposuresByPort = new Map<number, HostPortExposure[]>();
 
@@ -9247,13 +9252,14 @@ function selectHostLocalGatewayRedirects(
 
   const redirects: HostLocalGatewayRedirect[] = [];
   for (const [hostPort, portExposures] of exposuresByPort) {
-    if (!hostLocalGatewayPorts.has(hostPort)) {
+    if (!hostLocalGatewayPorts.has(hostPort) || globalSamePortListenerPorts.has(hostPort)) {
       continue;
     }
 
     const exposure = selectHostDefaultGatewayExposure(portExposures, {
       networks,
       preferredNetworkId: preferredHostDefaultNetworkId,
+      requirePreferredNetwork: true,
     });
     if (exposure === undefined) {
       continue;
@@ -9276,6 +9282,22 @@ function selectHostLocalGatewayRedirects(
   }
 
   return redirects.sort((left, right) => left.port - right.port || left.networkId.localeCompare(right.networkId));
+}
+
+/** Ports already owned by the reserved host-global loopback must bypass PF redirects. */
+function collectGlobalSamePortListenerPorts(listeners: readonly ListeningPort[]): ReadonlySet<number> {
+  const globalLoopbackHost = normalizeEndpointHostKey(loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID));
+
+  return new Set(
+    listeners
+      .filter(
+        (listener) =>
+          listener.protocol === "tcp" &&
+          isTcpPort(listener.port) &&
+          normalizeEndpointHostKey(listener.localAddress) === globalLoopbackHost,
+      )
+      .map((listener) => listener.port),
+  );
 }
 
 /**

@@ -12,6 +12,8 @@ import type { HostPortExposure, LogicalNetwork } from "../../shared/types";
 export interface HostDefaultGatewaySelectionOptions {
   /** User/window-selected network wins when it has a candidate for the port. */
   readonly preferredNetworkId?: string;
+  /** Refuses an arbitrary fallback when no explicit network owns host-default traffic. */
+  readonly requirePreferredNetwork?: boolean;
   /** Stable logical network order used when no explicit preference exists. */
   readonly networks?: readonly Pick<LogicalNetwork, "id" | "name">[];
 }
@@ -31,6 +33,10 @@ export function selectHostDefaultGatewayExposure(
     if (preferred !== undefined) {
       return preferred;
     }
+  }
+
+  if (options.requirePreferredNetwork === true) {
+    return undefined;
   }
 
   return sortedCandidates[0];
