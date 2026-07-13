@@ -111,6 +111,18 @@ typedef struct {
   pm_pending_route *pending_routes;
   size_t pending_count;
   size_t pending_capacity;
+  /*
+   * Best-effort array-index hints for the allocation hot path. A hint is
+   * always validated against pending_routes before use, so array compaction,
+   * hash collisions, or allocation failure only fall back to a linear scan.
+   */
+  unsigned int *pending_endpoint_hints;
+  unsigned int *pending_actual_port_hints;
+  /*
+   * Earliest time any pending route can require expiry work. Mutations may
+   * leave this conservatively early, but never later than a live route expiry.
+   */
+  time_t next_pending_expiry_scan_at;
   pm_bidirectional_route_refresh *bidirectional_refreshes;
   size_t bidirectional_refresh_count;
   size_t bidirectional_refresh_capacity;
@@ -260,6 +272,8 @@ int pm_state_restart_process(pm_agent_state *state, const char *id, const char *
 int pm_state_remove_process(pm_agent_state *state, const char *id, pm_buffer *payload);
 int pm_state_daemon_status(pm_agent_state *state, pm_buffer *payload);
 int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload);
+/** Builds an event snapshot from in-memory state and the last listener cache only. */
+int pm_state_cached_snapshot(pm_agent_state *state, pm_buffer *payload);
 int pm_state_refresh_snapshot(pm_agent_state *state, pm_buffer *payload);
 int pm_state_reap_children(pm_agent_state *state);
 int pm_state_listener_signature(pm_agent_state *state, pm_buffer *signature);

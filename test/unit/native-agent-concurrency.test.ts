@@ -33,9 +33,24 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   const snapshotStart = source.indexOf("int pm_state_snapshot");
   const snapshotEnd = source.indexOf("int pm_state_refresh_snapshot", snapshotStart);
   const snapshotBody = source.slice(snapshotStart, snapshotEnd);
+  const cachedSnapshotStart = source.indexOf("int pm_state_cached_snapshot");
+  const cachedSnapshotEnd = source.indexOf("int pm_state_daemon_status", cachedSnapshotStart);
+  const cachedSnapshotBody = source.slice(cachedSnapshotStart, cachedSnapshotEnd);
+  const cleanupStart = source.indexOf("static int pm_cleanup_pending");
+  const cleanupEnd = source.indexOf("static pm_route *pm_find_active_route", cleanupStart);
+  const cleanupBody = source.slice(cleanupStart, cleanupEnd);
+  const eventSnapshotStart = agentSource.indexOf("static int pm_build_snapshot_event");
+  const eventSnapshotEnd = agentSource.indexOf("static int pm_broadcast_snapshot", eventSnapshotStart);
+  const eventSnapshotBody = agentSource.slice(eventSnapshotStart, eventSnapshotEnd);
   const allocationStart = source.indexOf("int pm_state_allocate_route");
   const allocationEnd = source.indexOf("static void pm_remove_pending_allocation", allocationStart);
   const allocationBody = source.slice(allocationStart, allocationEnd);
+  const reservationStart = source.indexOf("static int pm_actual_port_reserved");
+  const reservationEnd = source.indexOf("static int pm_port_available", reservationStart);
+  const reservationBody = source.slice(reservationStart, reservationEnd);
+  const pendingEndpointStart = source.indexOf("static pm_pending_route *pm_find_pending_endpoint");
+  const pendingEndpointEnd = source.indexOf("static pm_pending_route *pm_find_pending_allocation", pendingEndpointStart);
+  const pendingEndpointBody = source.slice(pendingEndpointStart, pendingEndpointEnd);
   const registrationStart = source.indexOf("int pm_state_register_process");
   const registrationEnd = source.indexOf("int pm_state_release_allocation", registrationStart);
   const registrationBody = source.slice(registrationStart, registrationEnd);
@@ -45,7 +60,25 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(header.includes("char version[PM_SMALL];"), true);
   assert.equal(header.includes("endpoint security agents"), true);
   assert.equal(header.includes("pm_listener *listener_cache_items;"), true);
+  assert.equal(header.includes("time_t next_pending_expiry_scan_at;"), true);
+  assert.equal(header.includes("unsigned int *pending_endpoint_hints;"), true);
+  assert.equal(header.includes("unsigned int *pending_actual_port_hints;"), true);
+  assert.equal(header.includes("int pm_state_cached_snapshot"), true);
   assert.equal(agentSource.includes("PM_LISTENER_POLL_INTERVAL_SECONDS 300"), true);
+  assert.equal(agentSource.includes("PM_SNAPSHOT_BROADCAST_IDLE_MS 40"), true);
+  assert.equal(agentSource.includes("PM_SNAPSHOT_BROADCAST_MAX_DELAY_MS 250"), true);
+  assert.equal(agentSource.includes("PM_ACCEPT_BUDGET_PER_TURN 512"), true);
+  assert.equal(agentSource.includes("PM_CLIENT_READ_BUDGET_PER_TURN 512"), true);
+  assert.equal(agentSource.includes("PM_CLIENT_RESPONSE_WRITE_BUDGET_MS 100"), true);
+  assert.equal(agentSource.includes("PM_CONTROL_WRITE_BUDGET_MS 100"), true);
+  assert.equal(agentSource.includes("PM_SNAPSHOT_BROADCAST_WRITE_BUDGET_MS 100"), true);
+  assert.equal(agentSource.includes("PM_SNAPSHOT_BROADCAST_START_MAX_DELAY_MS"), true);
+  assert.equal(agentSource.includes("snapshot_dirty_since_ms"), true);
+  assert.equal(agentSource.includes("size_t client_scan_cursor = 0;"), true);
+  assert.equal(agentSource.includes("pm_client_has_complete_frame(&clients[index])"), true);
+  assert.equal(agentSource.includes("pm_process_client_buffer(client, state, snapshot_dirty, route_tables_dirty, 1)"), true);
+  assert.equal(agentSource.includes("static int pm_write_event_progress("), true);
+  assert.equal(agentSource.includes("ready = poll(write_fds"), true);
   assert.equal(agentSource.includes("PM_LISTEN_BACKLOG 16384"), true);
   assert.equal(agentSource.includes("static int pm_socket_has_live_server"), true);
   assert.equal(agentSource.includes("Port Manager agent is already listening"), true);
@@ -94,6 +127,28 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(source.includes("pm_listener_cache_invalidate(state);"), true);
   assert.equal(snapshotBody.includes("listener_scan_fresh &&"), true);
   assert.equal(snapshotBody.includes("pm_scan_lsof_cached(state, &listeners"), true);
+  assert.notEqual(cachedSnapshotStart, -1);
+  assert.equal(cachedSnapshotBody.includes("pm_listener_list_copy(&listeners, state->listener_cache_items"), true);
+  assert.equal(cachedSnapshotBody.includes("pm_append_snapshot_from_listeners"), true);
+  assert.equal(cachedSnapshotBody.includes("state->listener_cache_updated_at[0] != '\\0'"), true);
+  assert.equal(source.includes("if (!synthesize_detected_processes)"), true);
+  assert.equal(cachedSnapshotBody.includes("pm_cleanup_pending"), false);
+  assert.equal(cachedSnapshotBody.includes("pm_scan_lsof"), false);
+  assert.equal(eventSnapshotBody.includes("pm_state_cached_snapshot"), true);
+  assert.equal(eventSnapshotBody.includes("pm_state_snapshot("), false);
+  assert.notEqual(cleanupStart, -1);
+  assert.equal(cleanupBody.includes("state->next_pending_expiry_scan_at > now"), true);
+  assert.equal(cleanupBody.includes("pm_note_pending_expiry"), true);
+  assert.equal(source.includes("static void pm_remember_pending_route_hints"), true);
+  assert.equal(source.includes("calloc(PM_PENDING_HINT_SLOT_COUNT"), true);
+  assert.equal(source.includes("free(state->pending_endpoint_hints);"), true);
+  assert.equal(source.includes("free(state->pending_actual_port_hints);"), true);
+  assert.equal(reservationBody.includes("state->pending_actual_port_hints[port]"), true);
+  assert.equal(reservationBody.includes("for (size_t index = 0; index < state->pending_count; index++)"), true);
+  assert.equal(pendingEndpointBody.includes("state->pending_endpoint_hints["), true);
+  assert.equal(pendingEndpointBody.includes("hinted_route->logical_port == logical_port"), true);
+  assert.equal(pendingEndpointBody.includes("for (size_t index = 0; index < state->pending_count; index++)"), true);
+  assert.equal(allocationBody.includes("pm_remember_pending_route_hints(state, state->pending_count - 1)"), true);
   assert.equal(allocationBody.includes("pm_scan_lsof_cached(state, &listeners"), false);
   assert.equal(allocationBody.includes("listener_scan_fresh &&"), false);
   assert.equal(allocationBody.includes("pm_scan_lsof(&listeners"), false);
@@ -212,6 +267,249 @@ if (!fs.existsSync(nativeAgentPath)) {
 
     assert.equal(daemon.version, packageJson.version);
     assert.equal(typeof daemon.pid, "number");
+  });
+
+  test("native agent yields after one frame from a pipelined client", async (context) => {
+    const fixture = await startNativeAgent(context);
+    if (fixture === undefined) {
+      return;
+    }
+
+    const socket = await connectSocket(fixture.socketPath);
+    const messages = collectSocketMessages(socket);
+    context.after(() => socket.destroy());
+
+    const shutdownId = `hook-${process.pid}-pipeline-shutdown`;
+    const trailingIds = [
+      `hook-${process.pid}-pipeline-after-1`,
+      `hook-${process.pid}-pipeline-after-2`,
+    ];
+    socket.write([
+      JSON.stringify({ id: shutdownId, method: "shutdownDaemon" }),
+      ...trailingIds.map((id) => JSON.stringify({ id, method: "daemonStatus" })),
+      "",
+    ].join("\n"));
+
+    await waitForSocketMessage(
+      messages,
+      (message) => isMessageWithType(message, "response") && message.id === shutdownId && message.ok === true,
+      1_000,
+    );
+    await new Promise<void>((resolve) => {
+      if (socket.destroyed) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(resolve, 1_000);
+      socket.once("close", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+
+    const responseIds = messages.flatMap((message) =>
+      isMessageWithType(message, "response") && typeof message.id === "string" ? [message.id] : []);
+    assert.deepEqual(responseIds, [shutdownId]);
+  });
+
+  test("native agent pushes the first cached event without launching lsof", async (context) => {
+    const shimDirectory = path.join(
+      projectRoot,
+      ".tmp",
+      "native-agent-tests",
+      `cached-event-${process.pid}-${Date.now().toString(36)}`,
+    );
+    const lsofLogPath = path.join(shimDirectory, "lsof.log");
+    fs.mkdirSync(shimDirectory, { recursive: true });
+    fs.writeFileSync(lsofLogPath, "");
+    fs.writeFileSync(path.join(shimDirectory, "lsof"), [
+      "#!/bin/sh",
+      "printf '%s\\n' \"$*\" >> \"$PM_TEST_LSOF_LOG\"",
+      "sleep 2",
+    ].join("\n"), { mode: 0o755 });
+    context.after(async () => {
+      await fs.promises.rm(shimDirectory, { recursive: true, force: true }).catch(() => undefined);
+    });
+
+    const fixture = await startNativeAgent(context, {
+      PATH: `${shimDirectory}${path.delimiter}${process.env.PATH ?? ""}`,
+      PM_TEST_LSOF_LOG: lsofLogPath,
+    });
+    if (fixture === undefined) {
+      return;
+    }
+
+    const socket = await connectSocket(fixture.socketPath);
+    const messages = collectSocketMessages(socket);
+    const requestId = `extension-${process.pid}-cached-first-event`;
+    context.after(() => socket.destroy());
+
+    const startedAt = Date.now();
+    socket.write(`${JSON.stringify({ id: requestId, method: "daemonStatus" })}\n`);
+    await waitForSocketMessage(
+      messages,
+      (message) => isMessageWithType(message, "response") && message.id === requestId && message.ok === true,
+      1_000,
+    );
+    await waitForSocketMessage(messages, (message) => isMessageWithType(message, "snapshot"), 1_000);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.ok(elapsedMs < 750, `cached subscription event took ${elapsedMs}ms`);
+    assert.equal(fs.readFileSync(lsofLogPath, "utf8"), "");
+  });
+
+  test("native agent bounds event delivery during sustained hook traffic", async (context) => {
+    const fixture = await startNativeAgent(context);
+    if (fixture === undefined) {
+      return;
+    }
+
+    const extensionSocket = await connectSocket(fixture.socketPath);
+    const messages = collectSocketMessages(extensionSocket);
+    const subscriptionId = `extension-${process.pid}-fair-events`;
+    context.after(() => extensionSocket.destroy());
+    extensionSocket.write(`${JSON.stringify({ id: subscriptionId, method: "daemonStatus" })}\n`);
+    await waitForSocketMessage(
+      messages,
+      (message) => isMessageWithType(message, "response") && message.id === subscriptionId && message.ok === true,
+      1_000,
+    );
+    await waitForSocketMessage(messages, (message) => isMessageWithType(message, "snapshot"), 1_000);
+    messages.splice(0, messages.length);
+
+    const chatterSocket = await connectSocket(fixture.socketPath);
+    chatterSocket.on("data", () => undefined);
+    let chatterSequence = 0;
+    const sendChatter = (): void => {
+      if (!chatterSocket.destroyed) {
+        chatterSocket.write(`${JSON.stringify({
+          id: `hook-${process.pid}-fairness-chatter-${chatterSequence++}`,
+          method: "daemonStatus",
+        })}\n`);
+      }
+    };
+    const chatterTimer = setInterval(sendChatter, 5);
+    context.after(() => {
+      clearInterval(chatterTimer);
+      chatterSocket.destroy();
+    });
+    sendChatter();
+
+    const processName = `fairness-fixture-${process.pid}-${Date.now().toString(36)}`;
+    const actualPort = await reserveUnusedTcpPort();
+    const startedAt = Date.now();
+    await requestOnce(fixture.socketPath, {
+      id: `hook-${process.pid}-fairness-register`,
+      method: "registerExistingProcess",
+      payload: {
+        pid: process.pid,
+        name: processName,
+        command: processName,
+        cwd: projectRoot,
+        requestedPort: actualPort,
+        actualPort,
+        host: "127.0.0.1",
+        networkId: `network-fairness-${process.pid}`,
+        source: "hooked",
+      },
+    });
+    await waitForSocketMessage(messages, (message) => {
+      if (!isMessageWithType(message, "snapshot")) {
+        return false;
+      }
+      const processes = (message.payload as { readonly processes?: readonly { readonly name?: string }[] } | undefined)?.processes;
+      return processes?.some((candidate) => candidate.name === processName) === true;
+    }, 1_000);
+    const elapsedMs = Date.now() - startedAt;
+
+    clearInterval(chatterTimer);
+    assert.ok(elapsedMs < 750, `snapshot starved behind sustained traffic for ${elapsedMs}ms`);
+  });
+
+  test("native agent does not synthesize detected processes from an invalidated listener cache", async (context) => {
+    const fixture = await startNativeAgent(context);
+    if (fixture === undefined) {
+      return;
+    }
+
+    const stoppedServer = await openTcpServer();
+    const unrelatedServer = await openTcpServer();
+    context.after(async () => {
+      await Promise.all([closeTcpServer(stoppedServer), closeTcpServer(unrelatedServer)]);
+    });
+    const stoppedAddress = stoppedServer.address();
+    const unrelatedAddress = unrelatedServer.address();
+    if (
+      stoppedAddress === null ||
+      typeof stoppedAddress === "string" ||
+      unrelatedAddress === null ||
+      typeof unrelatedAddress === "string"
+    ) {
+      throw new Error("Failed to read listener-cache test ports.");
+    }
+
+    const registered = await requestOnce<{ readonly id: string }>(fixture.socketPath, {
+      id: `hook-${process.pid}-cached-listener-register`,
+      method: "registerExistingProcess",
+      payload: {
+        pid: process.pid,
+        name: "cached-listener-fixture",
+        command: "cached-listener-fixture",
+        cwd: projectRoot,
+        requestedPort: stoppedAddress.port,
+        actualPort: stoppedAddress.port,
+        host: "127.0.0.1",
+        networkId: `network-cached-listener-${process.pid}`,
+        source: "hooked",
+      },
+    });
+
+    // Populate the listener cache with both the managed and unrelated sockets.
+    await requestOnce(fixture.socketPath, {
+      id: `hook-${process.pid}-cached-listener-refresh`,
+      method: "refreshSnapshot",
+    });
+
+    const extensionSocket = await connectSocket(fixture.socketPath);
+    const messages = collectSocketMessages(extensionSocket);
+    const subscriptionId = `extension-${process.pid}-cached-listener-events`;
+    context.after(() => extensionSocket.destroy());
+    extensionSocket.write(`${JSON.stringify({ id: subscriptionId, method: "daemonStatus" })}\n`);
+    await waitForSocketMessage(
+      messages,
+      (message) => isMessageWithType(message, "response") && message.id === subscriptionId && message.ok === true,
+      1_000,
+    );
+    await waitForSocketMessage(messages, (message) => isMessageWithType(message, "snapshot"), 1_000);
+    messages.splice(0, messages.length);
+
+    await requestOnce(fixture.socketPath, {
+      id: `hook-${process.pid}-cached-listener-stop`,
+      method: "stopProcess",
+      payload: { id: registered.id, signal: "SIGTERM" },
+    });
+
+    const event = await waitForSocketMessage(messages, (message) => {
+      if (!isMessageWithType(message, "snapshot")) {
+        return false;
+      }
+      const processes = (message.payload as {
+        readonly processes?: readonly { readonly id?: string; readonly status?: string }[];
+      } | undefined)?.processes;
+      return processes?.some((candidate) => candidate.id === registered.id && candidate.status === "stopped") === true;
+    }, 1_000) as AgentWireMessage;
+    const payload = event.payload as {
+      readonly processes?: readonly { readonly actualPort?: number; readonly source?: string }[];
+      readonly listeners?: readonly { readonly port?: number }[];
+    };
+
+    assert.equal(
+      payload.processes?.some(
+        (candidate) => candidate.actualPort === stoppedAddress.port && candidate.source === "detected",
+      ),
+      false,
+    );
+    assert.equal(payload.listeners?.some((listener) => listener.port === unrelatedAddress.port), true);
   });
 
   test("native agent inspects process metadata once for all listeners owned by one PID", async (context) => {
@@ -991,6 +1289,60 @@ interface AgentResponse<T> {
   readonly ok: boolean;
   readonly payload?: T;
   readonly error?: string;
+}
+
+interface AgentWireMessage {
+  readonly type?: string;
+  readonly id?: string;
+  readonly ok?: boolean;
+  readonly payload?: unknown;
+}
+
+function isMessageWithType(message: unknown, type: string): message is AgentWireMessage {
+  return typeof message === "object" && message !== null && (message as AgentWireMessage).type === type;
+}
+
+/** Collects newline-delimited agent frames while keeping the socket reusable. */
+function collectSocketMessages(socket: net.Socket): unknown[] {
+  const messages: unknown[] = [];
+  let buffer = "";
+
+  socket.setEncoding("utf8");
+  socket.on("data", (chunk) => {
+    buffer += chunk;
+    for (;;) {
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) {
+        return;
+      }
+
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      if (line !== "") {
+        messages.push(JSON.parse(line) as unknown);
+      }
+    }
+  });
+
+  return messages;
+}
+
+async function waitForSocketMessage(
+  messages: readonly unknown[],
+  predicate: (message: unknown) => boolean,
+  timeoutMs: number,
+): Promise<unknown> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const message = messages.find(predicate);
+    if (message !== undefined) {
+      return message;
+    }
+    await delay(5);
+  }
+
+  throw new Error(`Timed out waiting for native agent socket message after ${timeoutMs}ms.`);
 }
 
 async function startNativeAgent(

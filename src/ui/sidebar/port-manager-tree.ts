@@ -56,7 +56,7 @@ export interface PortManagerNetworkTreeSource {
 type TreeSectionKind = "current" | "networks" | "containers" | "daemon";
 type NetworkActionGroupKind = "quick" | "advanced";
 const TERMINAL_WINDOW_MIME = "application/vnd.newdlops.portmanager.terminal-window";
-const TREE_REFRESH_DEBOUNCE_MS = 50;
+const TREE_REFRESH_DEBOUNCE_MS = 16;
 
 interface NetworkRouteConnection {
   /** Stable row id across refreshes so VS Code can preserve expansion and focus. */
@@ -100,6 +100,26 @@ interface ActionAvailability {
   /** Short reason appended to disabled action rows. */
   readonly disabledReason?: string;
 }
+
+/**
+ * Stable inputs shared by every getChildren call in one VS Code repaint.
+ *
+ * VS Code asks for the root and each expanded section separately. Capturing the
+ * source once prevents those calls from rebuilding snapshots and route rows for
+ * the same state generation. A source event invalidates the generation before
+ * the repaint is queued, so no stale rows survive the debounce window.
+ */
+interface TreeRenderGeneration {
+  readonly snapshot: NetworkSnapshot;
+  readonly agentSnapshot: AgentSnapshot;
+  readonly daemon: AgentDaemonStatus;
+  readonly ownerAction: ActionAvailability;
+  readonly routeRowsByNetworkId: Map<string, readonly NetworkRouteConnection[]>;
+  /** Expensive platform diagnostics stay lazy until Diagnostics is expanded. */
+  browserDns?: BrowserDnsResolverStatus;
+}
+
+type NetworkRouteRowsResolver = (networkId: string) => readonly NetworkRouteConnection[];
 
 type PortManagerTreeItem =
   | TreeSectionItem
@@ -159,12 +179,19 @@ export class PortManagerTreeProvider
   /** Timer used to collapse rapid network/process updates into one tree repaint. */
   private refreshTimer: NodeJS.Timeout | undefined;
 
+  /** Snapshot/index cache shared by every expanded branch in the current repaint. */
+  private renderGeneration: TreeRenderGeneration | undefined;
+
   constructor(private readonly source: PortManagerNetworkTreeSource) {
     this.sourceSubscription = this.source.onDidChange(() => this.refresh());
   }
 
   /** Triggers a full tree refresh after process state changes or manual refresh. */
   refresh(): void {
+    // Invalidate immediately even when a repaint timer already exists. VS Code
+    // may ask for children before that timer fires, and those reads must observe
+    // the newest source state rather than a cache from the previous generation.
+    this.renderGeneration = undefined;
     if (this.refreshTimer !== undefined) {
       return;
     }
@@ -174,6 +201,44 @@ export class PortManagerTreeProvider
       this.onDidChangeTreeDataEmitter.fire(undefined);
     }, TREE_REFRESH_DEBOUNCE_MS);
     this.refreshTimer.unref();
+  }
+
+  /** Captures all cheap render inputs once for the current tree generation. */
+  private getRenderGeneration(): TreeRenderGeneration {
+    if (this.renderGeneration !== undefined) {
+      return this.renderGeneration;
+    }
+
+    const snapshot = this.source.getSnapshot();
+    this.renderGeneration = {
+      snapshot,
+      agentSnapshot: this.source.getAgentSnapshot(),
+      daemon: this.source.getDaemonStatus(),
+      ownerAction: buildOwnerActionAvailability(snapshot.controlPlane),
+      routeRowsByNetworkId: new Map(),
+    };
+    return this.renderGeneration;
+  }
+
+  /** Builds normalized route rows at most once per network and render generation. */
+  private getNetworkRouteRows(
+    generation: TreeRenderGeneration,
+    networkId: string,
+  ): readonly NetworkRouteConnection[] {
+    const cached = generation.routeRowsByNetworkId.get(networkId);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const rows = buildNetworkRouteConnectionRows(networkId, generation.snapshot, generation.agentSnapshot);
+    generation.routeRowsByNetworkId.set(networkId, rows);
+    return rows;
+  }
+
+  /** Reads synchronous platform diagnostics only when their collapsed section opens. */
+  private getBrowserDnsStatus(generation: TreeRenderGeneration): BrowserDnsResolverStatus {
+    generation.browserDns ??= this.source.getBrowserDnsResolverStatus();
+    return generation.browserDns;
   }
 
   /** Returns the already constructed TreeItem object. */
@@ -241,15 +306,19 @@ export class PortManagerTreeProvider
    * compatibility, but they are intentionally not surfaced from the root.
    */
   getChildren(element?: PortManagerTreeItem): PortManagerTreeItem[] {
-    const snapshot = this.source.getSnapshot();
-    const agentSnapshot = this.source.getAgentSnapshot();
-    const daemon = this.source.getDaemonStatus();
-    const browserDns = this.source.getBrowserDnsResolverStatus();
-    const ownerAction = buildOwnerActionAvailability(snapshot.controlPlane);
+    const generation = this.getRenderGeneration();
+    const { snapshot, agentSnapshot, daemon, ownerAction } = generation;
+    const getRouteRows: NetworkRouteRowsResolver = (networkId) =>
+      this.getNetworkRouteRows(generation, networkId);
 
     if (element === undefined) {
       return [
-        new TreeSectionItem("current", "Current Routing", formatCurrentRoutingSummary(snapshot, agentSnapshot), "target"),
+        new TreeSectionItem(
+          "current",
+          "Current Routing",
+          formatCurrentRoutingSummary(snapshot, agentSnapshot, getRouteRows),
+          "target",
+        ),
         new TreeSectionItem("networks", "Logical Networks", `${snapshot.networks.length} networks`, "vm"),
         new TreeSectionItem(
           "containers",
@@ -276,7 +345,7 @@ export class PortManagerTreeProvider
       const windowTerminalBinding = snapshot.vscodeWindowTerminalBinding?.networkId === element.network.id
         ? snapshot.vscodeWindowTerminalBinding
         : undefined;
-      const routeRows = buildNetworkRouteConnectionRows(element.network.id, snapshot, agentSnapshot);
+      const routeRows = getRouteRows(element.network.id);
       const stateRows = [
         ...(routeRows.length > 0
           ? [
@@ -479,7 +548,7 @@ export class PortManagerTreeProvider
 
     switch (element.kind) {
       case "current":
-        return buildCurrentRoutingGroupItems(snapshot, agentSnapshot);
+        return buildCurrentRoutingGroupItems(snapshot, agentSnapshot, getRouteRows);
       case "networks":
         return [
           ...(snapshot.networks.length > 0
@@ -490,7 +559,7 @@ export class PortManagerTreeProvider
                   snapshot.exposures,
                   snapshot.hostAccessBindings,
                   snapshot.composeAttachments,
-                  buildNetworkRouteConnectionRows(network.id, snapshot, agentSnapshot).length,
+                  getRouteRows(network.id).length,
                   snapshot.vscodeWindowTerminalBinding?.networkId === network.id,
                 ),
               )
@@ -503,6 +572,7 @@ export class PortManagerTreeProvider
             : [new EmptyTreeItem("No published services", "Start compose services")]),
         ];
       case "daemon":
+        const browserDns = this.getBrowserDnsStatus(generation);
         return [
           ...(snapshot.vscodeWindowTerminalBinding !== undefined
             ? [
@@ -535,6 +605,7 @@ export class PortManagerTreeProvider
       clearTimeout(this.refreshTimer);
       this.refreshTimer = undefined;
     }
+    this.renderGeneration = undefined;
     this.onDidChangeTreeDataEmitter.dispose();
   }
 }
@@ -1430,7 +1501,7 @@ function buildRoutingTimelineRows(
     rows.push(
       createRoutingTimelineRow({
         id: "timeline:daemon-routes",
-        label: "Daemon route table refreshed",
+        label: "Daemon routes updated",
         description: `${formatRouteCount(agentSnapshot.routes.length)} active`,
         updatedAt: agentSnapshot.updatedAt,
         icon: "references",
@@ -1536,10 +1607,14 @@ function formatDiagnosticsSummary(daemon: AgentDaemonStatus, snapshot: NetworkSn
 }
 
 /** One-line current routing summary for the root section. */
-function formatCurrentRoutingSummary(snapshot: NetworkSnapshot, agentSnapshot: AgentSnapshot): string {
+function formatCurrentRoutingSummary(
+  snapshot: NetworkSnapshot,
+  agentSnapshot: AgentSnapshot,
+  getRouteRows: NetworkRouteRowsResolver,
+): string {
   const currentNetwork = snapshot.networks.find((network) => network.id === snapshot.vscodeWindowTerminalBinding?.networkId);
   const attachedTerminalCount = snapshot.attachments.filter((attachment) => attachment.status === "attached").length;
-  const routeCount = countAllNetworkRouteConnections(snapshot, agentSnapshot);
+  const routeCount = countAllNetworkRouteConnections(snapshot, agentSnapshot, getRouteRows);
 
   if (currentNetwork !== undefined) {
     return `VS Code -> ${currentNetwork.name}, ${routeCount} routes`;
@@ -1553,7 +1628,11 @@ function formatCurrentRoutingSummary(snapshot: NetworkSnapshot, agentSnapshot: A
 }
 
 /** Builds the root current-routing groups, including stale route scopes. */
-function buildCurrentRoutingGroupItems(snapshot: NetworkSnapshot, agentSnapshot: AgentSnapshot): PortManagerTreeItem[] {
+function buildCurrentRoutingGroupItems(
+  snapshot: NetworkSnapshot,
+  agentSnapshot: AgentSnapshot,
+  getRouteRows: NetworkRouteRowsResolver,
+): PortManagerTreeItem[] {
   const networkIds = collectRoutingNetworkIds(snapshot, agentSnapshot);
 
   const knownNetworks = snapshot.networks.filter((network) => networkIds.has(network.id));
@@ -1562,7 +1641,7 @@ function buildCurrentRoutingGroupItems(snapshot: NetworkSnapshot, agentSnapshot:
     .filter((networkId) => !knownNetworkIds.has(networkId))
     .map((networkId) => ({ id: networkId, name: `Unknown Network ${networkId.slice(0, 8)}` }));
   const groups = [...knownNetworks, ...staleNetworkScopes].map((network) => {
-    const routeRows = buildNetworkRouteConnectionRows(network.id, snapshot, agentSnapshot);
+    const routeRows = getRouteRows(network.id);
     const attachments = snapshot.attachments.filter((attachment) => attachment.networkId === network.id);
     const binding = snapshot.vscodeWindowTerminalBinding?.networkId === network.id
       ? snapshot.vscodeWindowTerminalBinding
@@ -1576,9 +1655,13 @@ function buildCurrentRoutingGroupItems(snapshot: NetworkSnapshot, agentSnapshot:
 }
 
 /** Counts all displayed network-scoped route connections. */
-function countAllNetworkRouteConnections(snapshot: NetworkSnapshot, agentSnapshot: AgentSnapshot): number {
+function countAllNetworkRouteConnections(
+  snapshot: NetworkSnapshot,
+  agentSnapshot: AgentSnapshot,
+  getRouteRows: NetworkRouteRowsResolver,
+): number {
   return [...collectRoutingNetworkIds(snapshot, agentSnapshot)].reduce(
-    (total, networkId) => total + buildNetworkRouteConnectionRows(networkId, snapshot, agentSnapshot).length,
+    (total, networkId) => total + getRouteRows(networkId).length,
     0,
   );
 }

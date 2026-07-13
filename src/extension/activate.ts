@@ -210,6 +210,13 @@ class PortManagerStatusBar implements DisposableLike {
   private readonly item: vscode.StatusBarItem;
   private readonly sourceSubscription: DisposableLike;
 
+  /** Last context value sent to VS Code; process/listener churn must not re-run the command. */
+  private ownerContextValue: boolean | undefined;
+
+  /** Last rendered strings keep no-op registry events off the VS Code UI bridge. */
+  private renderedText: string | undefined;
+  private renderedTooltip: string | undefined;
+
   constructor(private readonly networkService: PortManagerNetworkService) {
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
     this.item.name = "Port Manager Network";
@@ -222,13 +229,24 @@ class PortManagerStatusBar implements DisposableLike {
   /** Recomputes the compact status text from the latest logical network snapshot. */
   private update(): void {
     const snapshot = this.networkService.getSnapshot();
-    void vscode.commands.executeCommand(
-      "setContext",
-      "portManager.isControlPlaneOwner",
-      snapshot.controlPlane?.role === "owner",
-    );
-    this.item.text = formatStatusBarNetworkText(snapshot);
-    this.item.tooltip = formatStatusBarNetworkTooltip(snapshot);
+    const ownerContextValue = snapshot.controlPlane?.role === "owner";
+    const text = formatStatusBarNetworkText(snapshot);
+    const tooltip = formatStatusBarNetworkTooltip(snapshot);
+
+    if (ownerContextValue !== this.ownerContextValue) {
+      this.ownerContextValue = ownerContextValue;
+      void vscode.commands.executeCommand("setContext", "portManager.isControlPlaneOwner", ownerContextValue);
+    }
+
+    if (text !== this.renderedText) {
+      this.renderedText = text;
+      this.item.text = text;
+    }
+
+    if (tooltip !== this.renderedTooltip) {
+      this.renderedTooltip = tooltip;
+      this.item.tooltip = tooltip;
+    }
   }
 
   dispose(): void {

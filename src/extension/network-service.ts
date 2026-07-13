@@ -1,4 +1,4 @@
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash, randomUUID, X509Certificate } from "node:crypto";
 import * as syncFs from "node:fs";
 import type { Dirent } from "node:fs";
@@ -691,6 +691,13 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Guards explicit resolver installation so duplicate UI actions cannot stack prompts. */
   private browserDnsResolverInstallInFlight: Promise<BrowserDnsResolverStatus> | undefined;
 
+  /**
+   * Warms the lo0 alias cache without blocking diagnostics renders. The promise
+   * is instance-scoped so repeated tree reads join one refresh and publish one
+   * follow-up UI change when the async ifconfig probe completes.
+   */
+  private browserDnsAliasStatusRefreshInFlight: Promise<void> | undefined;
+
   /** Last missing-resolver signature already offered through non-privileged UI. */
   private browserDnsInstallOfferSignature: string | undefined;
 
@@ -1250,9 +1257,14 @@ export class PortManagerNetworkService implements DisposableLike {
   getBrowserDnsResolverStatus(): BrowserDnsResolverStatus {
     const networkSnapshot = this.registry.getSnapshot();
     const agentSnapshot = this.getAgentSnapshot();
+    const records = this.buildBrowserDnsRecordsForCurrentSettings(networkSnapshot.networks);
+
+    if (records.length > 0) {
+      this.warmBrowserDnsAliasStatus();
+    }
 
     return buildBrowserDnsResolverStatus(
-      this.buildBrowserDnsRecordsForCurrentSettings(networkSnapshot.networks),
+      records,
       this.browserDnsServer.getPort(),
       this.browserDnsServer.isRunning(),
       agentSnapshot.processes,
@@ -1260,6 +1272,36 @@ export class PortManagerNetworkService implements DisposableLike {
       networkSnapshot.networks,
       this.browserNetworkProxy,
     );
+  }
+
+  /**
+   * Starts one non-blocking lo0 probe when cached diagnostics are stale.
+   *
+   * The synchronous status getter deliberately returns the last cached aliases
+   * immediately. Completion invalidates the tree through the service's local
+   * event channel, so Diagnostics repaints with the fresh result without ever
+   * spawning ifconfig on the extension-host render stack.
+   */
+  private warmBrowserDnsAliasStatus(): void {
+    if (process.platform !== "darwin" || loopbackAliasCacheIsFresh()) {
+      return;
+    }
+    if (this.browserDnsAliasStatusRefreshInFlight !== undefined) {
+      return;
+    }
+
+    const refresh = readLoopbackAliasAddresses()
+      .then(() => {
+        this.localChangeEvents.emit();
+        this.maybeOfferBrowserDnsResolverInstall();
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.browserDnsAliasStatusRefreshInFlight === refresh) {
+          this.browserDnsAliasStatusRefreshInFlight = undefined;
+        }
+      });
+    this.browserDnsAliasStatusRefreshInFlight = refresh;
   }
 
   /** Installs macOS resolver rows so browser URLs can use network names as hosts. */
@@ -9909,6 +9951,7 @@ interface LoopbackAliasCacheState {
 
 let loopbackAliasCache: LoopbackAliasCacheState | undefined;
 let loopbackAliasCacheRefreshInFlight: Promise<LoopbackAliasCacheState> | undefined;
+const EMPTY_LOOPBACK_ALIAS_ADDRESSES: ReadonlySet<string> = new Set<string>();
 
 /** Collects every inet address on lo0 so one spawn answers all alias checks. */
 function parseLoopbackAliasAddresses(output: string): ReadonlySet<string> {
@@ -9925,27 +9968,20 @@ function invalidateLoopbackAliasCache(): void {
   loopbackAliasCache = undefined;
 }
 
-function readLoopbackAliasAddressesSync(): ReadonlySet<string> {
-  const cache = loopbackAliasCache;
-  if (cache !== undefined && Date.now() - cache.readAtMs < LOOPBACK_ALIAS_CACHE_TTL_MS) {
-    return cache.addresses;
-  }
+/** True while the cached lo0 snapshot is safe to serve without another probe. */
+function loopbackAliasCacheIsFresh(nowMs = Date.now()): boolean {
+  return loopbackAliasCache !== undefined && nowMs - loopbackAliasCache.readAtMs < LOOPBACK_ALIAS_CACHE_TTL_MS;
+}
 
-  try {
-    const output = execFileSync("ifconfig", ["lo0"], { encoding: "utf8", timeout: 1000 });
-    loopbackAliasCache = { readAtMs: Date.now(), addresses: parseLoopbackAliasAddresses(output) };
-  } catch {
-    // Failures are cached too; retrying on every check would spawn ifconfig in a loop.
-    loopbackAliasCache = { readAtMs: Date.now(), addresses: cache?.addresses ?? new Set<string>() };
-  }
-
-  return loopbackAliasCache.addresses;
+/** Returns the last lo0 snapshot immediately; callers schedule refresh separately. */
+function readCachedLoopbackAliasAddresses(): ReadonlySet<string> {
+  return loopbackAliasCache?.addresses ?? EMPTY_LOOPBACK_ALIAS_ADDRESSES;
 }
 
 /** Async variant used by activation and sync paths so the event loop never blocks on ifconfig. */
 async function readLoopbackAliasAddresses(): Promise<ReadonlySet<string>> {
   const cache = loopbackAliasCache;
-  if (cache !== undefined && Date.now() - cache.readAtMs < LOOPBACK_ALIAS_CACHE_TTL_MS) {
+  if (cache !== undefined && loopbackAliasCacheIsFresh()) {
     return cache.addresses;
   }
 
@@ -9983,7 +10019,7 @@ function isLoopbackAddressAliasConfigured(address: string): boolean {
     return true;
   }
 
-  return readLoopbackAliasAddressesSync().has(address);
+  return readCachedLoopbackAliasAddresses().has(address);
 }
 
 function isNonDefaultLoopbackIpv4Address(host: string): boolean {

@@ -224,6 +224,25 @@ test("does not emit when transient discovery results are unchanged", () => {
   assert.equal(eventCount, 2);
 });
 
+test("reuses one snapshot until a mutation invalidates it before notifying listeners", () => {
+  const registry = new LogicalNetworkRegistry([runtime]);
+  const initialSnapshot = registry.getSnapshot();
+  let snapshotObservedByListener: ReturnType<LogicalNetworkRegistry["getSnapshot"]> | undefined;
+
+  registry.onDidChange(() => {
+    snapshotObservedByListener = registry.getSnapshot();
+  });
+
+  assert.strictEqual(registry.getSnapshot(), initialSnapshot);
+
+  registry.addNetwork(createNetwork());
+
+  assert.notStrictEqual(snapshotObservedByListener, initialSnapshot);
+  assert.strictEqual(registry.getSnapshot(), snapshotObservedByListener);
+  assert.deepEqual(initialSnapshot.networks, []);
+  assert.deepEqual(snapshotObservedByListener?.networks.map((network) => network.id), ["network-1"]);
+});
+
 test("groups noisy terminal process candidates into terminal windows", () => {
   const registry = new LogicalNetworkRegistry([runtime]);
   registry.setTerminalCandidates([

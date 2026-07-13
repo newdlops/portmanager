@@ -51,6 +51,14 @@ export class LogicalNetworkRegistry implements DisposableLike {
   /** Event stream used by the sidebar and commands to refresh after mutations. */
   private readonly changeEvents = new SimpleEventEmitter<void>();
 
+  /**
+   * Immutable view shared by repeated readers until the next registry mutation.
+   * Tree and status renders often request the same state several times in one
+   * repaint, so rebuilding every collection and timestamp on each read adds work
+   * without exposing any newer state.
+   */
+  private cachedSnapshot: NetworkSnapshot | undefined;
+
   constructor(runtimes: readonly NetworkRuntimeDescriptor[], initialState?: LogicalNetworkRegistryState) {
     this.runtimes = [...runtimes];
 
@@ -82,7 +90,11 @@ export class LogicalNetworkRegistry implements DisposableLike {
 
   /** Returns a complete immutable snapshot for UI rendering and persistence. */
   getSnapshot(): NetworkSnapshot {
-    return {
+    if (this.cachedSnapshot !== undefined) {
+      return this.cachedSnapshot;
+    }
+
+    this.cachedSnapshot = {
       networks: [...this.networks.values()],
       terminalCandidates: this.terminalCandidates,
       terminalWindows: this.terminalWindows,
@@ -94,6 +106,8 @@ export class LogicalNetworkRegistry implements DisposableLike {
       runtimes: this.runtimes,
       updatedAt: new Date().toISOString(),
     };
+
+    return this.cachedSnapshot;
   }
 
   /** Returns the persistable subset. Terminal candidates are intentionally transient. */
@@ -389,6 +403,9 @@ export class LogicalNetworkRegistry implements DisposableLike {
   }
 
   private emitChange(): void {
+    // Listeners must observe the committed mutation rather than the snapshot
+    // that may have been cached by a render immediately before this change.
+    this.cachedSnapshot = undefined;
     this.changeEvents.emit();
   }
 

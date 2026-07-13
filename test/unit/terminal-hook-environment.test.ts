@@ -812,14 +812,30 @@ test("profile shell hook lazy-loads heavy pm command implementation", () => {
   assert.equal(commandSource.includes("Most VS Code profile starts have no preload entry yet"), true);
 });
 
-test("agent client startup avoids blocking on full listener refresh", () => {
+test("agent client startup and process mutations avoid blocking on full listener refresh", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/local-agent-client.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
   const startBody = /async start\(\): Promise<void> \{([\s\S]*?)\n  \}/.exec(source)?.[1] ?? "";
   const refreshBody = /private refreshInBackground\(\): void \{([\s\S]*?)\n  \}/.exec(source)?.[1] ?? "";
+  const startProcessBody = /async startManagedProcess\([\s\S]*?\): Promise<ManagedProcess> \{([\s\S]*?)\n  \}/.exec(
+    source,
+  )?.[1] ?? "";
   const registerBody = /async registerExistingProcess\(input: RegisteredProcessInput\): Promise<ManagedProcess> \{([\s\S]*?)\n  \}/.exec(
     source,
   )?.[1] ?? "";
+  const stopBody = /async stopProcess\(id: string, settings: PortManagerSettings\): Promise<ManagedProcess \| undefined> \{([\s\S]*?)\n  \}/.exec(
+    source,
+  )?.[1] ?? "";
+  const restartBody = /async restartProcess\(id: string, settings: PortManagerSettings\): Promise<ManagedProcess \| undefined> \{([\s\S]*?)\n  \}/.exec(
+    source,
+  )?.[1] ?? "";
+  const removeBody = /async removeProcess\(id: string\): Promise<ManagedProcess \| undefined> \{([\s\S]*?)\n  \}/.exec(
+    source,
+  )?.[1] ?? "";
+  const removeKnownStart = source.indexOf("private removeKnownProcess(processId: string): void");
+  const removeKnownEnd = source.indexOf("private applyOptimisticProcessSnapshot", removeKnownStart);
+  const removeKnownBody = source.slice(removeKnownStart, removeKnownEnd);
+  const mutationBodies = [startProcessBody, registerBody, stopBody, restartBody, removeBody];
 
   assert.equal(startBody.includes("await this.ensureConnected();"), true);
   assert.equal(startBody.includes("await this.loadDaemonStatusForStartup();"), true);
@@ -838,12 +854,34 @@ test("agent client startup avoids blocking on full listener refresh", () => {
   assert.equal(source.includes('const snapshot = await this.request<AgentSnapshot>("refreshSnapshot");'), true);
   assert.equal(source.includes("const id = `extension-${process.pid}-${this.nextRequestId++}`;"), true);
   assert.equal(refreshBody.includes("void this.refresh().catch"), true);
+  for (const mutationBody of mutationBodies) {
+    assert.equal(mutationBody.match(/this\.request</g)?.length, 1, "each process mutation must remain one agent RPC");
+    assert.equal(mutationBody.includes("this.refresh"), false, "process mutations must rely on agent broadcasts");
+    assert.equal(mutationBody.includes("listSnapshot"), false, "process mutations must not launch snapshot scans");
+  }
+  assert.equal(startProcessBody.includes('await this.request<ManagedProcess>("startManagedProcess"'), true);
+  assert.equal(startProcessBody.includes("this.upsertKnownProcess(process);"), true);
+  assert.equal(startProcessBody.includes("this.refresh("), false);
   assert.equal(registerBody.includes('await this.request<ManagedProcess>("registerExistingProcess", input);'), true);
   assert.equal(registerBody.includes("this.upsertKnownProcess(process);"), true);
-  assert.equal(registerBody.includes("this.refreshInBackground();"), true);
-  assert.equal(registerBody.includes("await this.refresh();"), false);
+  assert.equal(registerBody.includes("this.refresh("), false);
+  assert.equal(stopBody.includes('await this.request<ManagedProcess | undefined>("stopProcess"'), true);
+  assert.equal(stopBody.includes("this.upsertKnownProcess(process);"), true);
+  assert.equal(stopBody.includes("this.removeKnownProcess(id);"), true);
+  assert.equal(stopBody.includes("this.refresh("), false);
+  assert.equal(restartBody.includes('await this.request<ManagedProcess | undefined>("restartProcess"'), true);
+  assert.equal(restartBody.includes("this.upsertKnownProcess(process);"), true);
+  assert.equal(restartBody.includes("this.removeKnownProcess(id);"), true);
+  assert.equal(restartBody.includes("this.refresh("), false);
+  assert.equal(removeBody.includes('await this.request<ManagedProcess | undefined>("removeProcess", { id });'), true);
+  assert.equal(removeBody.includes("this.removeKnownProcess(id);"), true);
+  assert.equal(removeBody.includes("this.refresh("), false);
+  assert.equal(removeKnownBody.includes("route.processId !== processId"), true);
+  assert.equal(source.includes("private applyOptimisticProcessSnapshot("), true);
+  assert.equal(source.includes("routeCount: routes.length"), true);
   assert.equal(source.includes("function upsertLogicalRouteForProcess"), true);
   assert.equal(source.includes("isUnsupportedDaemonStatusError"), true);
+  assert.equal(source.includes("CLIENT_CHANGE_EVENT_DEBOUNCE_MS = 16"), true);
 });
 
 test("agent client suppresses unchanged snapshot change events", () => {
@@ -864,6 +902,53 @@ test("agent client suppresses unchanged snapshot change events", () => {
   assert.equal(signatureBody.includes("daemon.updatedAt"), false);
   assert.equal(signatureBody.includes("snapshot.updatedAt"), false);
   assert.equal(signatureBody.includes("function buildClientRouteSignatureRows"), true);
+});
+
+test("agent client resets partial frames when a slow event stream reconnects", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/extension/local-agent-client.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const attachStart = source.indexOf("private attachSocketHandlers(socket: net.Socket): void");
+  const attachEnd = source.indexOf("private enableAutomaticEventReconnect(): void", attachStart);
+  const attachBody = source.slice(attachStart, attachEnd);
+  const messageStart = source.indexOf("private handleMessage(line: string): void");
+  const messageEnd = source.indexOf("private handleResponse(response: AgentResponse): void", messageStart);
+  const messageBody = source.slice(messageStart, messageEnd);
+  const reconnectStart = source.indexOf("private async reconnectEventStreamToExistingAgent(): Promise<void>");
+  const reconnectEnd = source.indexOf("private handleData(chunk: string): void", reconnectStart);
+  const reconnectBody = source.slice(reconnectStart, reconnectEnd);
+  const requestStart = source.indexOf("private async request<T>(method: AgentMethod");
+  const requestEnd = source.indexOf("private applySnapshot(snapshot: AgentSnapshot)", requestStart);
+  const requestBody = source.slice(requestStart, requestEnd);
+
+  assert.notEqual(attachStart, -1);
+  assert.equal(attachBody.match(/this\.incomingBuffer = "";/g)?.length, 2);
+  assert.equal(attachBody.includes("if (this.socket === socket)"), true);
+  assert.equal(attachBody.includes("if (this.eventReconnectAwaitingSnapshot)"), true);
+  assert.equal(
+    source.includes("this.automaticEventReconnectEnabled = false;\n    this.eventReconnectAwaitingSnapshot = false;"),
+    true,
+  );
+  assert.notEqual(messageStart, -1);
+  assert.equal(messageBody.includes("try {"), true);
+  assert.equal(messageBody.includes("message = JSON.parse(line)"), true);
+  assert.equal(messageBody.includes("catch {"), true);
+  assert.equal(messageBody.includes("this.eventReconnectAwaitingSnapshot = false;"), true);
+  assert.equal(messageBody.includes("this.eventReconnectDelayMs = AGENT_EVENT_RECONNECT_INITIAL_DELAY_MS;"), true);
+  assert.notEqual(reconnectStart, -1);
+  assert.equal(reconnectBody.includes("const socket = await this.openSocket();"), true);
+  assert.equal(reconnectBody.includes("await this.loadDaemonStatus();"), true);
+  assert.equal(reconnectBody.includes("this.eventReconnectAwaitingSnapshot = true;"), true);
+  assert.equal(reconnectBody.includes("let shouldAdvanceBackoff = candidateSocket === undefined;"), true);
+  assert.equal(reconnectBody.includes("const generation = this.connectionGeneration;"), true);
+  assert.equal(reconnectBody.includes("this.startAgentProcess()"), false);
+  assert.equal(reconnectBody.includes("this.connectWithAgentStartup()"), false);
+  assert.equal(requestBody.includes('if (method !== "shutdownDaemon")'), true);
+  assert.equal(requestBody.includes("this.enableAutomaticEventReconnect();"), true);
+  assert.equal(source.includes("private assertConnectionGeneration(generation: number): void"), true);
+  assert.equal(source.includes("this.connectionGeneration += 1;"), true);
+  assert.equal(source.includes("const restartGeneration = this.connectionGeneration + 1;"), true);
+  assert.equal(source.includes("this.assertConnectionGeneration(restartGeneration);"), true);
+  assert.equal(source.includes('this.rejectAllPending(new Error("Port Manager agent daemon stopped."));'), true);
 });
 
 test("agent compatibility rejects daemons with stale route table storage", () => {

@@ -26,6 +26,7 @@
 /* Pre-handshake routes use a cleanup lease; observed routes use the short TTL only as a stale-writer guard. */
 #define PM_PRE_HANDSHAKE_ROUTE_TABLE_LEASE_SECONDS PM_ROUTE_TTL_SECONDS
 #define PM_ESTABLISHED_ROUTE_OBSERVATION_SCAN_INTERVAL_SECONDS 2
+#define PM_PENDING_HINT_SLOT_COUNT 65536U
 
 typedef struct {
   pm_route *items;
@@ -682,6 +683,12 @@ static void pm_adopt_previous_generation_route_files(pm_agent_state *state) {
 
 void pm_state_init(pm_agent_state *state, const char *route_table_path, const char *agent_main_path) {
   memset(state, 0, sizeof(*state));
+  /*
+   * Hints are an optional accelerator, never registry state. If either
+   * allocation fails, its lookup path retains the original linear scan.
+   */
+  state->pending_endpoint_hints = (unsigned int *)calloc(PM_PENDING_HINT_SLOT_COUNT, sizeof(unsigned int));
+  state->pending_actual_port_hints = (unsigned int *)calloc(PM_PENDING_HINT_SLOT_COUNT, sizeof(unsigned int));
   if (!pm_text_empty(route_table_path)) {
     pm_copy(state->route_table_path, sizeof(state->route_table_path), route_table_path);
   } else {
@@ -709,6 +716,8 @@ void pm_state_init(pm_agent_state *state, const char *route_table_path, const ch
 void pm_state_dispose(pm_agent_state *state) {
   free(state->processes);
   free(state->pending_routes);
+  free(state->pending_endpoint_hints);
+  free(state->pending_actual_port_hints);
   free(state->bidirectional_refreshes);
   pm_string_array_clear(&state->suppressed_detected_ids, &state->suppressed_count, &state->suppressed_capacity);
   pm_string_array_clear(&state->written_network_ids, &state->written_network_count, &state->written_network_capacity);
@@ -1223,6 +1232,47 @@ static unsigned int pm_hash_text(const char *value) {
   return hash;
 }
 
+/** Selects a compact hint slot; collisions are resolved by validation + scan. */
+static size_t pm_pending_endpoint_hint_slot(int logical_port, const char *network_id) {
+  unsigned int endpoint_hash = pm_hash_text(network_id == NULL ? "" : network_id) ^
+    ((unsigned int)logical_port * 0x9e3779b1u);
+
+  return (size_t)(endpoint_hash & (PM_PENDING_HINT_SLOT_COUNT - 1U));
+}
+
+/**
+ * Records a non-authoritative pending-array location for the two allocation
+ * lookups. One-based indexes keep calloc's zero value as "never observed".
+ */
+static void pm_remember_pending_route_hints(pm_agent_state *state, size_t index) {
+  pm_pending_route *pending;
+  unsigned int hint;
+
+  if (index >= state->pending_count) {
+    return;
+  }
+  if (index >= (size_t)UINT_MAX) {
+    /* A one-based unsigned index cannot represent this row; disable hints. */
+    free(state->pending_endpoint_hints);
+    free(state->pending_actual_port_hints);
+    state->pending_endpoint_hints = NULL;
+    state->pending_actual_port_hints = NULL;
+    return;
+  }
+
+  pending = &state->pending_routes[index];
+  hint = (unsigned int)index + 1U;
+  if (state->pending_endpoint_hints != NULL) {
+    state->pending_endpoint_hints[
+      pm_pending_endpoint_hint_slot(pending->route.logical_port, pending->route.network_id)
+    ] = hint;
+  }
+  if (state->pending_actual_port_hints != NULL &&
+      pending->route.actual_port >= 1 && pending->route.actual_port <= 65535) {
+    state->pending_actual_port_hints[pending->route.actual_port] = hint;
+  }
+}
+
 static int pm_is_valid_port(int port) {
   return port >= 1 && port <= 65535;
 }
@@ -1266,12 +1316,32 @@ static int pm_bind_available(int port, const char *host) {
 }
 
 static int pm_actual_port_reserved(pm_agent_state *state, int port) {
-  for (size_t index = 0; index < state->pending_count; index++) {
-    if (state->pending_routes[index].route.actual_port == port) {
+  if (state->pending_actual_port_hints != NULL && pm_is_valid_port(port)) {
+    unsigned int hint = state->pending_actual_port_hints[port];
+
+    if (hint == 0) {
+      goto scan_processes;
+    }
+    if ((size_t)(hint - 1U) < state->pending_count &&
+        state->pending_routes[hint - 1U].route.actual_port == port) {
       return 1;
     }
   }
 
+  /* Stale hints after compaction deliberately retain the exact old fallback. */
+  for (size_t index = 0; index < state->pending_count; index++) {
+    if (state->pending_routes[index].route.actual_port == port) {
+      pm_remember_pending_route_hints(state, index);
+      return 1;
+    }
+  }
+
+  /* Actual-port slots do not hash, so a completed miss can safely clear one. */
+  if (state->pending_actual_port_hints != NULL && pm_is_valid_port(port)) {
+    state->pending_actual_port_hints[port] = 0;
+  }
+
+scan_processes:
   for (size_t index = 0; index < state->process_count; index++) {
     pm_process *process = &state->processes[index];
     if (strcmp(process->status, "running") == 0 && strcmp(process->source, "detected") != 0 && process->actual_port == port) {
@@ -2307,9 +2377,24 @@ static int pm_cleanup_pending(pm_agent_state *state) {
   time_t now = time(NULL);
   size_t before = state->pending_count;
   size_t write_index = 0;
+  time_t next_expiry_scan_at = 0;
   pm_listener_list listeners = {0};
   int listener_scan_attempted = 0;
   int listener_scan_ok = 0;
+
+  /*
+   * Pending allocations all have a fixed, long TTL. Most daemon requests
+   * arrive well before the first expiry, so avoid repeatedly walking the same
+   * array. Removal/extension paths may leave an earlier deadline behind; that
+   * costs one harmless early scan and preserves the no-late-cleanup invariant.
+   */
+  if (state->pending_count == 0) {
+    state->next_pending_expiry_scan_at = 0;
+    return 0;
+  }
+  if (state->next_pending_expiry_scan_at > now) {
+    return 0;
+  }
 
   for (size_t read_index = 0; read_index < state->pending_count; read_index++) {
     int keep_route = state->pending_routes[read_index].expires_at > now;
@@ -2341,13 +2426,24 @@ static int pm_cleanup_pending(pm_agent_state *state) {
       if (write_index != read_index) {
         state->pending_routes[write_index] = state->pending_routes[read_index];
       }
+      if (next_expiry_scan_at == 0 || state->pending_routes[read_index].expires_at < next_expiry_scan_at) {
+        next_expiry_scan_at = state->pending_routes[read_index].expires_at;
+      }
       write_index++;
     }
   }
 
   state->pending_count = write_index;
+  state->next_pending_expiry_scan_at = next_expiry_scan_at;
   free(listeners.items);
   return before != state->pending_count;
+}
+
+/** Records a no-later-than cleanup deadline without rescanning pending routes. */
+static void pm_note_pending_expiry(pm_agent_state *state, time_t expires_at) {
+  if (state->next_pending_expiry_scan_at == 0 || expires_at < state->next_pending_expiry_scan_at) {
+    state->next_pending_expiry_scan_at = expires_at;
+  }
 }
 
 static pm_route *pm_find_active_route(pm_agent_state *state, int logical_port, const char *network_id, pm_route *scratch) {
@@ -2376,11 +2472,30 @@ static pm_route *pm_find_active_route(pm_agent_state *state, int logical_port, c
 static pm_pending_route *pm_find_pending_endpoint(pm_agent_state *state, int logical_port, const char *network_id) {
   char endpoint[PM_SMALL];
   char candidate[PM_SMALL];
+  const char *effective_network_id = network_id == NULL ? "" : network_id;
 
-  pm_endpoint_identity(logical_port, network_id, endpoint, sizeof(endpoint));
+  if (state->pending_endpoint_hints != NULL) {
+    unsigned int hint = state->pending_endpoint_hints[
+      pm_pending_endpoint_hint_slot(logical_port, effective_network_id)
+    ];
+
+    if (hint == 0) {
+      return NULL;
+    }
+    if ((size_t)(hint - 1U) < state->pending_count) {
+      pm_route *hinted_route = &state->pending_routes[hint - 1U].route;
+      if (hinted_route->logical_port == logical_port && strcmp(hinted_route->network_id, effective_network_id) == 0) {
+        return &state->pending_routes[hint - 1U];
+      }
+    }
+  }
+
+  pm_endpoint_identity(logical_port, effective_network_id, endpoint, sizeof(endpoint));
+  /* Hash collisions and stale compacted indexes retain the exact old scan. */
   for (size_t index = 0; index < state->pending_count; index++) {
     pm_endpoint_identity(state->pending_routes[index].route.logical_port, state->pending_routes[index].route.network_id, candidate, sizeof(candidate));
     if (strcmp(endpoint, candidate) == 0) {
+      pm_remember_pending_route_hints(state, index);
       return &state->pending_routes[index];
     }
   }
@@ -3342,6 +3457,7 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
       pm_mark_bidirectional_route_observed(state, input->requested_port, network_id);
     }
     reusable->expires_at = time(NULL) + PM_ROUTE_TTL_SECONDS;
+    pm_note_pending_expiry(state, reusable->expires_at);
     if (pm_flush_route_tables_for_allocation(state, &reusable->route, input->compact_response) != 0) {
       return -1;
     }
@@ -3408,6 +3524,8 @@ int pm_state_allocate_route(pm_agent_state *state, const pm_allocate_input *inpu
   }
 
   state->pending_routes[state->pending_count++] = pending;
+  pm_remember_pending_route_hints(state, state->pending_count - 1);
+  pm_note_pending_expiry(state, pending.expires_at);
   if (pm_flush_route_tables_for_allocation(state, &pending.route, input->compact_response) != 0) {
     return -1;
   }
@@ -3428,6 +3546,9 @@ static void pm_remove_pending_allocation(pm_agent_state *state, const char *allo
     if (strcmp(state->pending_routes[index].id, allocation_id) == 0) {
       memmove(&state->pending_routes[index], &state->pending_routes[index + 1], (state->pending_count - index - 1) * sizeof(pm_pending_route));
       state->pending_count--;
+      if (state->pending_count == 0) {
+        state->next_pending_expiry_scan_at = 0;
+      }
       return;
     }
   }
@@ -3450,6 +3571,9 @@ static void pm_remove_pending_endpoint(pm_agent_state *state, int logical_port, 
   }
 
   state->pending_count = write_index;
+  if (state->pending_count == 0) {
+    state->next_pending_expiry_scan_at = 0;
+  }
 }
 
 static pm_process *pm_find_registered_route(pm_agent_state *state, const pm_register_input *input, const char *source, const char *network_id) {
@@ -4285,11 +4409,112 @@ static int pm_append_detected_process_json(pm_buffer *buffer, const pm_listener 
          pm_buffer_append(buffer, ",\"source\":\"detected\"}");
 }
 
+/**
+ * Serializes one coherent snapshot from caller-owned listener rows.
+ *
+ * Event broadcasts pass a copy of the last listener cache here, while explicit
+ * snapshot requests perform their scan/reconciliation before calling it. This
+ * keeps the socket loop's UI fan-out path free of lsof and cleanup side effects.
+ */
+static int pm_append_snapshot_from_listeners(
+  pm_agent_state *state,
+  pm_listener_list *listeners,
+  const char *updated_at,
+  int synthesize_detected_processes,
+  pm_buffer *payload) {
+  pm_route_list routes = {0};
+  int needs_comma = 0;
+  int result = -1;
+
+  for (size_t index = 0; index < listeners->count; index++) {
+    if (pm_listener_is_tracked(state, &listeners->items[index])) {
+      pm_copy(listeners->items[index].source, sizeof(listeners->items[index].source), "managed");
+    }
+  }
+
+  if (pm_build_routes(state, NULL, &routes) != 0) {
+    goto cleanup;
+  }
+
+  if (pm_buffer_appendf(payload, "{\"agentPid\":%ld,\"daemon\":{\"status\":\"running\",\"pid\":%ld,\"startedAt\":", (long)state->agent_pid, (long)state->agent_pid) != 0 ||
+      pm_json_append_string(payload, state->started_at) != 0 ||
+      pm_buffer_append(payload, ",\"updatedAt\":") != 0 ||
+      pm_json_append_string(payload, updated_at) != 0 ||
+      pm_buffer_append(payload, ",\"routeTablePath\":") != 0 ||
+      pm_json_append_string(payload, state->route_table_path) != 0 ||
+      pm_buffer_append(payload, ",\"agentMainPath\":") != 0 ||
+      pm_json_append_string(payload, state->agent_main_path) != 0 ||
+      pm_buffer_append(payload, ",\"version\":") != 0 ||
+      pm_json_append_string(payload, state->version) != 0 ||
+      pm_buffer_appendf(payload, ",\"listenerCount\":%zu,\"routeCount\":%zu,\"monitoringAllListeners\":true},\"processes\":[", listeners->count, routes.count) != 0) {
+    goto cleanup;
+  }
+
+  for (size_t index = 0; index < state->process_count; index++) {
+    if (needs_comma && pm_buffer_append_char(payload, ',') != 0) {
+      goto cleanup;
+    }
+    if (pm_append_process_json(payload, &state->processes[index]) != 0) {
+      goto cleanup;
+    }
+    needs_comma = 1;
+  }
+
+  for (size_t index = 0; index < listeners->count; index++) {
+    char detected_id[PM_TEXT];
+    if (pm_listener_is_tracked(state, &listeners->items[index])) {
+      continue;
+    }
+    if (!synthesize_detected_processes) {
+      /* An invalidated cache can retain unrelated diagnostics rows, but it is
+       * not authoritative enough to invent a new process after stop/remove. */
+      continue;
+    }
+    snprintf(detected_id, sizeof(detected_id), "detected:%s", listeners->items[index].id);
+    if (pm_string_array_contains(state->suppressed_detected_ids, state->suppressed_count, detected_id)) {
+      continue;
+    }
+    if (needs_comma && pm_buffer_append_char(payload, ',') != 0) {
+      goto cleanup;
+    }
+    if (pm_append_detected_process_json(payload, &listeners->items[index]) != 0) {
+      goto cleanup;
+    }
+    needs_comma = 1;
+  }
+
+  if (pm_buffer_append(payload, "],\"listeners\":[") != 0) {
+    goto cleanup;
+  }
+  for (size_t index = 0; index < listeners->count; index++) {
+    if (index > 0 && pm_buffer_append_char(payload, ',') != 0) {
+      goto cleanup;
+    }
+    if (pm_append_listener_json(payload, &listeners->items[index]) != 0) {
+      goto cleanup;
+    }
+  }
+
+  if (pm_buffer_append(payload, "],\"routes\":") != 0 ||
+      pm_append_routes_json(payload, routes.items, routes.count) != 0 ||
+      pm_buffer_append(payload, ",\"updatedAt\":") != 0 ||
+      pm_json_append_string(payload, updated_at) != 0 ||
+      pm_buffer_append_char(payload, '}') != 0) {
+    goto cleanup;
+  }
+
+  result = 0;
+
+cleanup:
+  free(routes.items);
+  return result;
+}
+
 int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload) {
   pm_listener_list listeners = {0};
-  pm_route_list routes;
   char updated_at[PM_TIME];
   int listener_scan_fresh = 0;
+  int result;
 
   pm_iso_now(updated_at, sizeof(updated_at));
   if (pm_cleanup_pending(state)) {
@@ -4303,87 +4528,37 @@ int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload) {
       pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
     pm_mark_route_tables_dirty(state);
   }
-  for (size_t index = 0; index < listeners.count; index++) {
-    if (pm_listener_is_tracked(state, &listeners.items[index])) {
-      pm_copy(listeners.items[index].source, sizeof(listeners.items[index].source), "managed");
-    }
-  }
 
-  if (pm_build_routes(state, NULL, &routes) != 0) {
-    free(listeners.items);
-    return -1;
-  }
-
-  if (pm_buffer_appendf(payload, "{\"agentPid\":%ld,\"daemon\":{\"status\":\"running\",\"pid\":%ld,\"startedAt\":", (long)state->agent_pid, (long)state->agent_pid) != 0 ||
-      pm_json_append_string(payload, state->started_at) != 0 ||
-      pm_buffer_append(payload, ",\"updatedAt\":") != 0 ||
-      pm_json_append_string(payload, updated_at) != 0 ||
-      pm_buffer_append(payload, ",\"routeTablePath\":") != 0 ||
-      pm_json_append_string(payload, state->route_table_path) != 0 ||
-      pm_buffer_append(payload, ",\"agentMainPath\":") != 0 ||
-      pm_json_append_string(payload, state->agent_main_path) != 0 ||
-      pm_buffer_append(payload, ",\"version\":") != 0 ||
-      pm_json_append_string(payload, state->version) != 0 ||
-      pm_buffer_appendf(payload, ",\"listenerCount\":%zu,\"routeCount\":%zu,\"monitoringAllListeners\":true},\"processes\":[", listeners.count, routes.count) != 0) {
-    free(listeners.items);
-    free(routes.items);
-    return -1;
-  }
-
-  int needs_comma = 0;
-  for (size_t index = 0; index < state->process_count; index++) {
-    if (needs_comma && pm_buffer_append_char(payload, ',') != 0) {
-      return -1;
-    }
-    if (pm_append_process_json(payload, &state->processes[index]) != 0) {
-      return -1;
-    }
-    needs_comma = 1;
-  }
-
-  for (size_t index = 0; index < listeners.count; index++) {
-    char detected_id[PM_TEXT];
-    if (pm_listener_is_tracked(state, &listeners.items[index])) {
-      continue;
-    }
-    snprintf(detected_id, sizeof(detected_id), "detected:%s", listeners.items[index].id);
-    if (pm_string_array_contains(state->suppressed_detected_ids, state->suppressed_count, detected_id)) {
-      continue;
-    }
-    if (needs_comma && pm_buffer_append_char(payload, ',') != 0) {
-      return -1;
-    }
-    if (pm_append_detected_process_json(payload, &listeners.items[index]) != 0) {
-      return -1;
-    }
-    needs_comma = 1;
-  }
-
-  if (pm_buffer_append(payload, "],\"listeners\":[") != 0) {
-    return -1;
-  }
-  for (size_t index = 0; index < listeners.count; index++) {
-    if (index > 0 && pm_buffer_append_char(payload, ',') != 0) {
-      return -1;
-    }
-    if (pm_append_listener_json(payload, &listeners.items[index]) != 0) {
-      return -1;
-    }
-  }
-
-  if (pm_buffer_append(payload, "],\"routes\":") != 0 ||
-      pm_append_routes_json(payload, routes.items, routes.count) != 0 ||
-      pm_buffer_append(payload, ",\"updatedAt\":") != 0 ||
-      pm_json_append_string(payload, updated_at) != 0 ||
-      pm_buffer_append_char(payload, '}') != 0) {
-    free(listeners.items);
-    free(routes.items);
-    return -1;
-  }
-
+  result = pm_append_snapshot_from_listeners(state, &listeners, updated_at, 1, payload);
   free(listeners.items);
-  free(routes.items);
-  return 0;
+  return result;
+}
+
+int pm_state_cached_snapshot(pm_agent_state *state, pm_buffer *payload) {
+  pm_listener_list listeners = {0};
+  char updated_at[PM_TIME];
+  int result;
+
+  /*
+   * UI events must never turn a registry mutation into a synchronous lsof scan.
+   * An expired cache is still a coherent observation, but an explicitly
+   * invalidated cache may contradict a just-completed stop/remove mutation.
+   * Preserve its raw listener diagnostics while suppressing detected-process
+   * synthesis until the normal poll publishes an authoritative follow-up.
+   */
+  if (pm_listener_list_copy(&listeners, state->listener_cache_items, state->listener_cache_count) != 0) {
+    return -1;
+  }
+
+  pm_iso_now(updated_at, sizeof(updated_at));
+  result = pm_append_snapshot_from_listeners(
+    state,
+    &listeners,
+    updated_at,
+    state->listener_cache_updated_at[0] != '\0',
+    payload);
+  free(listeners.items);
+  return result;
 }
 
 int pm_state_daemon_status(pm_agent_state *state, pm_buffer *payload) {

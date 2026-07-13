@@ -23,6 +23,19 @@
 #define PM_LISTEN_BACKLOG 16384
 #define PM_LISTENER_POLL_IDLE_GRACE_SECONDS 2
 #define PM_LISTENER_POLL_INTERVAL_SECONDS 300
+/* UI events coalesce a short mutation burst but cannot starve behind sustained hook traffic. */
+#define PM_SNAPSHOT_BROADCAST_IDLE_MS 40
+#define PM_SNAPSHOT_BROADCAST_MAX_DELAY_MS 250
+#define PM_EVENT_LOOP_DEFAULT_POLL_MS 1000
+#define PM_ACCEPT_BUDGET_PER_TURN 512
+#define PM_CLIENT_READ_BUDGET_PER_TURN 512
+#define PM_CLIENT_RESPONSE_WRITE_BUDGET_MS 100
+#define PM_CONTROL_WRITE_BUDGET_MS 100
+#define PM_SNAPSHOT_BROADCAST_WRITE_BUDGET_MS 100
+/* Sustained mutation storms get a fixed scheduling deadline; the separate
+ * socket budget bounds fan-out without forcing large snapshots at >4Hz. */
+#define PM_SNAPSHOT_BROADCAST_START_MAX_DELAY_MS \
+  PM_SNAPSHOT_BROADCAST_MAX_DELAY_MS
 
 typedef struct {
   int fd;
@@ -53,6 +66,9 @@ typedef struct {
 static pm_control_entry *pm_control_entries = NULL;
 static size_t pm_control_entry_count = 0;
 static size_t pm_control_entry_capacity = 0;
+
+static long long pm_monotonic_milliseconds(void);
+static void pm_disconnect_client(pm_client *client);
 
 static void pm_control_registry_set(int pid, int fd, const char *network_id) {
   for (size_t index = 0; index < pm_control_entry_count; index++) {
@@ -106,19 +122,36 @@ static int pm_control_registry_fd_for_pid(int pid, const char *want_network_id) 
  */
 static int pm_write_all_to_control(int fd, const char *data, size_t length) {
   size_t written = 0;
+  long long deadline_ms = pm_monotonic_milliseconds() + PM_CONTROL_WRITE_BUDGET_MS;
 
   while (written < length) {
+    if (written > 0 && pm_monotonic_milliseconds() >= deadline_ms) {
+      return -1;
+    }
     ssize_t count = write(fd, data + written, length - written);
     if (count > 0) {
       written += (size_t)count;
       continue;
     }
     if (count < 0 && errno == EINTR) {
+      if (pm_monotonic_milliseconds() >= deadline_ms) {
+        return -1;
+      }
       continue;
     }
     if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       struct pollfd writable = {.fd = fd, .events = POLLOUT, .revents = 0};
-      if (poll(&writable, 1, 5000) <= 0 || (writable.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+      long long remaining_ms = deadline_ms - pm_monotonic_milliseconds();
+      int ready;
+
+      if (remaining_ms <= 0) {
+        return -1;
+      }
+      ready = poll(&writable, 1, (int)remaining_ms);
+      if (ready < 0 && errno == EINTR) {
+        continue;
+      }
+      if (ready <= 0 || (writable.revents & (POLLERR | POLLHUP | POLLNVAL))) {
         return -1;
       }
       continue;
@@ -149,6 +182,17 @@ static int pm_running = 1;
 static void pm_handle_signal(int signal_number) {
   (void)signal_number;
   pm_running = 0;
+}
+
+/** Monotonic timing keeps UI fairness independent of wall-clock adjustments. */
+static long long pm_monotonic_milliseconds(void) {
+  struct timespec now;
+
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+    return (long long)time(NULL) * 1000LL;
+  }
+
+  return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000LL;
 }
 
 static int pm_set_nonblocking(int fd) {
@@ -235,36 +279,38 @@ static int pm_create_server(const char *socket_path) {
   return fd;
 }
 
-static int pm_write_all(int fd, const char *data, size_t length) {
+/** Shares one deadline across event subscribers so slow windows cannot each
+ * charge the singleton mutation loop a full socket-write timeout. */
+static int pm_write_all_until(int fd, const char *data, size_t length, long long deadline_ms) {
   size_t offset = 0;
 
   while (offset < length) {
+    if (offset > 0 && pm_monotonic_milliseconds() >= deadline_ms) {
+      return -1;
+    }
     ssize_t written = write(fd, data + offset, length - offset);
-    if (written < 0) {
-      if (errno == EINTR) {
-        continue;
+    if (written > 0) {
+      offset += (size_t)written;
+      continue;
+    }
+    if (written < 0 && errno == EINTR) {
+      if (pm_monotonic_milliseconds() >= deadline_ms) {
+        return -1;
       }
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        struct pollfd write_poll;
-        int ready;
+      continue;
+    }
+    if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      struct pollfd write_poll = {.fd = fd, .events = POLLOUT, .revents = 0};
+      long long remaining_ms = deadline_ms - pm_monotonic_milliseconds();
 
-        memset(&write_poll, 0, sizeof(write_poll));
-        write_poll.fd = fd;
-        write_poll.events = POLLOUT;
-        ready = poll(&write_poll, 1, 100);
-        if (ready < 0 && errno == EINTR) {
-          continue;
-        }
-        if (ready > 0 && (write_poll.revents & POLLOUT)) {
-          continue;
-        }
+      if (remaining_ms <= 0 ||
+          poll(&write_poll, 1, (int)remaining_ms) <= 0 ||
+          (write_poll.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        return -1;
       }
-      return -1;
+      continue;
     }
-    if (written == 0) {
-      return -1;
-    }
-    offset += (size_t)written;
+    return -1;
   }
 
   return 0;
@@ -294,7 +340,11 @@ static int pm_send_response(int fd, const pm_request *request, int ok, const cha
   }
 
   if (result == 0) {
-    result = pm_write_all(fd, message.data, message.length);
+    result = pm_write_all_until(
+      fd,
+      message.data,
+      message.length,
+      pm_monotonic_milliseconds() + PM_CLIENT_RESPONSE_WRITE_BUDGET_MS);
   }
 
   pm_buffer_free(&message);
@@ -306,7 +356,8 @@ static int pm_build_snapshot_event(pm_agent_state *state, pm_buffer *message) {
   int result;
 
   pm_buffer_init(&snapshot);
-  result = pm_state_snapshot(state, &snapshot);
+  /* Event fan-out must stay memory-only; explicit snapshot requests own scans. */
+  result = pm_state_cached_snapshot(state, &snapshot);
   if (result == 0) {
     result = pm_buffer_append(message, "{\"type\":\"snapshot\",\"payload\":") ||
              pm_buffer_append(message, snapshot.data) ||
@@ -316,23 +367,152 @@ static int pm_build_snapshot_event(pm_agent_state *state, pm_buffer *message) {
   return result;
 }
 
-static void pm_broadcast_snapshot(pm_client *clients, size_t client_count, pm_agent_state *state) {
+/** Advances one subscriber by at most one successful nonblocking write so all
+ * windows get a chance before any lagging window consumes the shared budget. */
+static int pm_write_event_progress(
+  pm_client *client,
+  const char *data,
+  size_t length,
+  size_t *offset,
+  long long deadline_ms) {
+  for (;;) {
+    ssize_t written;
+
+    if (pm_monotonic_milliseconds() >= deadline_ms) {
+      return 0;
+    }
+    written = write(client->fd, data + *offset, length - *offset);
+    if (written > 0) {
+      *offset += (size_t)written;
+      return *offset >= length ? 1 : 0;
+    }
+    if (written < 0 && errno == EINTR) {
+      continue;
+    }
+    if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      return 0;
+    }
+    return -1;
+  }
+}
+
+static int pm_broadcast_snapshot(pm_client *clients, size_t client_count, pm_agent_state *state) {
   pm_buffer message;
-  int built = 0;
+  struct pollfd *write_fds = NULL;
+  size_t *write_offsets = NULL;
+  long long write_deadline_ms;
+  size_t subscriber_count = 0;
+  size_t sole_subscriber_index = 0;
+  int result = -1;
 
   pm_buffer_init(&message);
   for (size_t index = 0; index < client_count; index++) {
     if (clients[index].fd >= 0 && clients[index].wants_events) {
-      if (!built) {
-        if (pm_build_snapshot_event(state, &message) != 0) {
-          break;
-        }
-        built = 1;
-      }
-      pm_write_all(clients[index].fd, message.data, message.length);
+      sole_subscriber_index = index;
+      subscriber_count++;
     }
   }
+  if (subscriber_count == 0) {
+    result = 0;
+    goto done;
+  }
+  if (pm_build_snapshot_event(state, &message) != 0) {
+    goto done;
+  }
+
+  write_deadline_ms = pm_monotonic_milliseconds() + PM_SNAPSHOT_BROADCAST_WRITE_BUDGET_MS;
+  if (subscriber_count == 1) {
+    if (pm_write_all_until(
+          clients[sole_subscriber_index].fd,
+          message.data,
+          message.length,
+          write_deadline_ms) != 0) {
+      pm_disconnect_client(&clients[sole_subscriber_index]);
+    }
+    result = 0;
+    goto done;
+  }
+
+  write_fds = (struct pollfd *)calloc(client_count, sizeof(struct pollfd));
+  write_offsets = (size_t *)calloc(client_count, sizeof(size_t));
+  if (write_fds == NULL || write_offsets == NULL) {
+    goto done;
+  }
+
+  for (size_t index = 0; index < client_count; index++) {
+    if (clients[index].fd >= 0 && clients[index].wants_events) {
+      int progress = pm_write_event_progress(
+        &clients[index], message.data, message.length, &write_offsets[index], write_deadline_ms);
+      if (progress < 0) {
+        pm_disconnect_client(&clients[index]);
+      }
+    }
+  }
+
+  for (;;) {
+    size_t pending_count = 0;
+    long long remaining_ms = write_deadline_ms - pm_monotonic_milliseconds();
+    int ready;
+
+    for (size_t index = 0; index < client_count; index++) {
+      write_fds[index].fd = -1;
+      write_fds[index].events = 0;
+      write_fds[index].revents = 0;
+      if (clients[index].fd >= 0 &&
+          clients[index].wants_events &&
+          write_offsets[index] < message.length) {
+        write_fds[index].fd = clients[index].fd;
+        write_fds[index].events = POLLOUT;
+        pending_count++;
+      }
+    }
+
+    if (pending_count == 0 || remaining_ms <= 0) {
+      break;
+    }
+
+    ready = poll(write_fds, (nfds_t)client_count, (int)remaining_ms);
+    if (ready < 0 && errno == EINTR) {
+      continue;
+    }
+    if (ready <= 0) {
+      break;
+    }
+
+    for (size_t index = 0; index < client_count; index++) {
+      if (write_fds[index].fd < 0) {
+        continue;
+      }
+      if (write_fds[index].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        pm_disconnect_client(&clients[index]);
+        continue;
+      }
+      if (write_fds[index].revents & POLLOUT) {
+        int progress = pm_write_event_progress(
+          &clients[index], message.data, message.length, &write_offsets[index], write_deadline_ms);
+        if (progress < 0) {
+          pm_disconnect_client(&clients[index]);
+        }
+      }
+    }
+  }
+
+  for (size_t index = 0; index < client_count; index++) {
+    if (clients[index].fd >= 0 &&
+        clients[index].wants_events &&
+        write_offsets[index] < message.length) {
+      /* A partial line can never share a stream with the next JSON event.
+       * Reconnect the lagging subscriber from a clean frame boundary. */
+      pm_disconnect_client(&clients[index]);
+    }
+  }
+  result = 0;
+
+done:
+  free(write_offsets);
+  free(write_fds);
   pm_buffer_free(&message);
+  return result;
 }
 
 static int pm_has_event_clients(pm_client *clients, size_t client_count) {
@@ -502,7 +682,7 @@ static int pm_dispatch(pm_agent_state *state, const pm_request *request, pm_buff
   return -1;
 }
 
-static void pm_handle_line(pm_client *client, pm_agent_state *state, const char *line, int *snapshot_dirty, int *route_tables_dirty) {
+static int pm_handle_line(pm_client *client, pm_agent_state *state, const char *line, int *snapshot_dirty, int *route_tables_dirty) {
   pm_request request;
   pm_buffer payload;
   char error[PM_TEXT] = "Port Manager native daemon request failed.";
@@ -513,13 +693,16 @@ static void pm_handle_line(pm_client *client, pm_agent_state *state, const char 
   pm_buffer_init(&payload);
   if (pm_parse_request(line, &request) != 0) {
     snprintf(request.id_raw, sizeof(request.id_raw), "\"unknown\"");
-    pm_send_response(client->fd, &request, 0, NULL, "Invalid Port Manager agent request message.");
+    int send_result = pm_send_response(client->fd, &request, 0, NULL, "Invalid Port Manager agent request message.");
     pm_buffer_free(&payload);
-    return;
+    return send_result;
   }
 
-  if (pm_request_wants_events(&request)) {
+  if (pm_request_wants_events(&request) && !client->wants_events) {
     client->wants_events = 1;
+    /* The first subscription receives current in-memory state without waiting
+     * for the five-minute listener poll or a later mutation. */
+    *snapshot_dirty = 1;
   }
 
   /*
@@ -537,9 +720,9 @@ static void pm_handle_line(pm_client *client, pm_agent_state *state, const char 
       client->control_pid = pid;
       pm_control_registry_set(pid, client->fd, network_id);
     }
-    pm_send_response(client->fd, &request, 1, NULL, NULL);
+    int send_result = pm_send_response(client->fd, &request, 1, NULL, NULL);
     pm_buffer_free(&payload);
-    return;
+    return send_result;
   }
 
   /*
@@ -590,21 +773,23 @@ static void pm_handle_line(pm_client *client, pm_agent_state *state, const char 
     }
 
     if (pushed) {
-      pm_send_response(client->fd, &request, 1, NULL, NULL);
+      int send_result = pm_send_response(client->fd, &request, 1, NULL, NULL);
+      pm_buffer_free(&payload);
+      return send_result;
     } else {
-      pm_send_response(client->fd, &request, 0, NULL, "No control channel for the requested parent pid.");
+      int send_result = pm_send_response(client->fd, &request, 0, NULL, "No control channel for the requested parent pid.");
+      pm_buffer_free(&payload);
+      return send_result;
     }
-    pm_buffer_free(&payload);
-    return;
   }
 
   if (pm_dispatch(state, &request, &payload, &state_changed, &shutdown_requested, error, sizeof(error)) != 0) {
-    pm_send_response(client->fd, &request, 0, NULL, error);
+    int send_result = pm_send_response(client->fd, &request, 0, NULL, error);
     pm_buffer_free(&payload);
-    return;
+    return send_result;
   }
 
-  pm_send_response(client->fd, &request, 1, payload.data, NULL);
+  int send_result = pm_send_response(client->fd, &request, 1, payload.data, NULL);
   if (state_changed) {
     /*
      * Route allocations can arrive in large bind/connect bursts. Mark the state
@@ -621,6 +806,7 @@ static void pm_handle_line(pm_client *client, pm_agent_state *state, const char 
   }
 
   pm_buffer_free(&payload);
+  return send_result;
 }
 
 static int pm_add_client(pm_client **clients, size_t *count, size_t *capacity, int fd) {
@@ -658,8 +844,64 @@ static void pm_remove_client(pm_client *clients, size_t *count, size_t index) {
   (*count)--;
 }
 
-static int pm_process_client_buffer(pm_client *client, pm_agent_state *state, int *snapshot_dirty, int *route_tables_dirty) {
-  for (;;) {
+/** Closes one client without shifting the poll-indexed array mid-turn. */
+static void pm_disconnect_client(pm_client *client) {
+  if (client->fd >= 0) {
+    pm_control_registry_remove_fd(client->fd);
+    close(client->fd);
+  }
+  client->fd = -1;
+  client->wants_events = 0;
+}
+
+/** Removes marked clients while keeping the round-robin cursor attached to
+ * the same next live fd instead of to an index shifted by memmove(). */
+static void pm_compact_clients_preserving_cursor(pm_client *clients, size_t *count, size_t *scan_cursor) {
+  int next_fd = -1;
+  size_t original_count = *count;
+
+  if (original_count > 0) {
+    size_t start = *scan_cursor % original_count;
+    for (size_t offset = 0; offset < original_count; offset++) {
+      size_t index = (start + offset) % original_count;
+      if (clients[index].fd >= 0) {
+        next_fd = clients[index].fd;
+        break;
+      }
+    }
+  }
+
+  for (size_t reverse = *count; reverse > 0;) {
+    size_t index = --reverse;
+    if (clients[index].fd < 0) {
+      pm_remove_client(clients, count, index);
+    }
+  }
+
+  *scan_cursor = 0;
+  if (next_fd >= 0) {
+    for (size_t index = 0; index < *count; index++) {
+      if (clients[index].fd == next_fd) {
+        *scan_cursor = index;
+        break;
+      }
+    }
+  }
+}
+
+static int pm_client_has_complete_frame(const pm_client *client) {
+  return client->length > 0 && memchr(client->buffer, '\n', client->length) != NULL;
+}
+
+static int pm_process_client_buffer(
+  pm_client *client,
+  pm_agent_state *state,
+  int *snapshot_dirty,
+  int *route_tables_dirty,
+  size_t max_frames) {
+  size_t processed_frames = 0;
+
+  while (processed_frames < max_frames) {
     char *newline = memchr(client->buffer, '\n', client->length);
     size_t line_length;
     char line[PM_CLIENT_BUFFER_MAX];
@@ -681,9 +923,12 @@ static int pm_process_client_buffer(pm_client *client, pm_agent_state *state, in
     memmove(client->buffer, newline + 1, client->length - line_length - 1);
     client->length -= line_length + 1;
     client->buffer[client->length] = '\0';
+    processed_frames++;
 
     if (line_length > 0) {
-      pm_handle_line(client, state, line, snapshot_dirty, route_tables_dirty);
+      if (pm_handle_line(client, state, line, snapshot_dirty, route_tables_dirty) != 0) {
+        return -1;
+      }
     }
   }
 
@@ -691,6 +936,10 @@ static int pm_process_client_buffer(pm_client *client, pm_agent_state *state, in
 }
 
 static int pm_read_client(pm_client *client, pm_agent_state *state, int *snapshot_dirty, int *route_tables_dirty) {
+  if (pm_client_has_complete_frame(client)) {
+    return pm_process_client_buffer(client, state, snapshot_dirty, route_tables_dirty, 1);
+  }
+
   for (;;) {
     ssize_t bytes_read;
     size_t target_capacity;
@@ -729,9 +978,9 @@ static int pm_read_client(pm_client *client, pm_agent_state *state, int *snapsho
 
     client->length += (size_t)bytes_read;
     client->buffer[client->length] = '\0';
-    if (pm_process_client_buffer(client, state, snapshot_dirty, route_tables_dirty) != 0) {
-      return -1;
-    }
+    /* poll() is level-triggered, so one bounded read per turn preserves
+     * throughput without letting a pipelined client monopolize the daemon. */
+    return pm_process_client_buffer(client, state, snapshot_dirty, route_tables_dirty, 1);
   }
 }
 
@@ -741,9 +990,12 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
   size_t client_count = 0;
   size_t client_capacity = 0;
   size_t poll_capacity = 0;
+  size_t client_scan_cursor = 0;
   pm_buffer last_listener_signature;
   time_t next_poll = time(NULL) + 3;
   time_t last_io_at = 0;
+  long long last_io_at_ms = 0;
+  long long snapshot_dirty_since_ms = 0;
   time_t route_table_flush_retry_after = 0;
   int snapshot_dirty = 0;
   int route_tables_dirty = 0;
@@ -755,6 +1007,26 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
     size_t polled_client_count = client_count;
     int ready;
     int handled_io = 0;
+    int poll_timeout_ms = PM_EVENT_LOOP_DEFAULT_POLL_MS;
+    size_t accepted_this_turn = 0;
+    size_t clients_read_this_turn = 0;
+
+    if (snapshot_dirty && snapshot_dirty_since_ms > 0) {
+      long long now_ms = pm_monotonic_milliseconds();
+      long long idle_due_at = last_io_at_ms > 0
+        ? last_io_at_ms + PM_SNAPSHOT_BROADCAST_IDLE_MS
+        : now_ms;
+      long long max_due_at = snapshot_dirty_since_ms + PM_SNAPSHOT_BROADCAST_START_MAX_DELAY_MS;
+      long long due_at = idle_due_at < max_due_at ? idle_due_at : max_due_at;
+      long long remaining_ms = due_at - now_ms;
+
+      if (remaining_ms < 0) {
+        remaining_ms = 0;
+      }
+      if (remaining_ms < poll_timeout_ms) {
+        poll_timeout_ms = (int)remaining_ms;
+      }
+    }
 
     if (poll_count > poll_capacity) {
       size_t next_capacity = poll_capacity == 0 ? 64 : poll_capacity;
@@ -778,9 +1050,15 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
     for (size_t index = 0; index < client_count; index++) {
       poll_fds[index + 1].fd = clients[index].fd;
       poll_fds[index + 1].events = POLLIN;
+      /* One read can contain several newline-delimited requests. Their
+       * remaining frames already live in userspace, so the kernel may no
+       * longer report POLLIN; drain them on zero-wait round-robin turns. */
+      if (pm_client_has_complete_frame(&clients[index])) {
+        poll_timeout_ms = 0;
+      }
     }
 
-    ready = poll(poll_fds, (nfds_t)poll_count, 1000);
+    ready = poll(poll_fds, (nfds_t)poll_count, poll_timeout_ms);
     if (ready < 0) {
       if (errno == EINTR) {
         continue;
@@ -796,6 +1074,11 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
 
     if (ready > 0 && (poll_fds[0].revents & POLLIN)) {
       for (;;) {
+        if (accepted_this_turn >= PM_ACCEPT_BUDGET_PER_TURN ||
+            (snapshot_dirty_since_ms > 0 &&
+             pm_monotonic_milliseconds() - snapshot_dirty_since_ms >= PM_SNAPSHOT_BROADCAST_START_MAX_DELAY_MS)) {
+          break;
+        }
         int client_fd = accept(server_fd, NULL, NULL);
         if (client_fd < 0) {
           if (errno == EINTR) {
@@ -803,6 +1086,7 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
           }
           break;
         }
+        accepted_this_turn++;
         handled_io = 1;
         if (pm_set_nonblocking(client_fd) != 0) {
           close(client_fd);
@@ -814,34 +1098,81 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
       }
     }
 
-    for (size_t reverse = polled_client_count; reverse > 0;) {
-      size_t index = --reverse;
-      short revents;
+    if (polled_client_count > 0) {
+      size_t scan_start = client_scan_cursor % polled_client_count;
+      size_t next_scan_cursor = scan_start;
 
-      if (index >= client_count) {
-        continue;
-      }
+      /* Keep poll-array indices stable for the whole turn. A disconnected
+       * client is marked first and compacted afterward; otherwise memmove
+       * would make revents belong to the wrong socket. The persistent cursor
+       * ensures a >512-client burst cannot starve older low-index clients. */
+      for (size_t offset = 0; offset < polled_client_count; offset++) {
+        size_t index = (scan_start + offset) % polled_client_count;
+        short revents = poll_fds[index + 1].revents;
+        int buffered_frame;
 
-      revents = poll_fds[index + 1].revents;
-      if (revents & POLLIN) {
-        handled_io = 1;
-        if (pm_read_client(&clients[index], state, &snapshot_dirty, &route_tables_dirty) != 0) {
-          pm_remove_client(clients, &client_count, index);
+        if (snapshot_dirty_since_ms > 0 &&
+            pm_monotonic_milliseconds() - snapshot_dirty_since_ms >= PM_SNAPSHOT_BROADCAST_START_MAX_DELAY_MS) {
+          break;
+        }
+
+        if (index >= client_count || clients[index].fd < 0) {
           continue;
         }
+
+        buffered_frame = pm_client_has_complete_frame(&clients[index]);
+        if ((revents & POLLIN) || buffered_frame) {
+          long long request_started_ms;
+
+          if (clients_read_this_turn >= PM_CLIENT_READ_BUDGET_PER_TURN) {
+            /* Preserve both queued data and a simultaneous HUP. Level-triggered
+             * polling (or the buffered-frame zero-wait path) resumes it next turn. */
+            continue;
+          }
+
+          clients_read_this_turn++;
+          handled_io = 1;
+          next_scan_cursor = (index + 1) % polled_client_count;
+          request_started_ms = pm_monotonic_milliseconds();
+          if (pm_read_client(&clients[index], state, &snapshot_dirty, &route_tables_dirty) != 0) {
+            /* Dispatch may have committed a mutation before its response write
+             * discovered a dead client, so preserve the original fairness age. */
+            if (snapshot_dirty && snapshot_dirty_since_ms == 0) {
+              snapshot_dirty_since_ms = request_started_ms;
+            }
+            pm_disconnect_client(&clients[index]);
+            continue;
+          }
+          if (snapshot_dirty) {
+            long long now_ms = pm_monotonic_milliseconds();
+            if (snapshot_dirty_since_ms == 0) {
+              /* Include parsing/dispatch/response time in the first mutation's
+               * fairness age; a slow response must not buy another full delay. */
+              snapshot_dirty_since_ms = request_started_ms;
+            }
+            if (now_ms - snapshot_dirty_since_ms >= PM_SNAPSHOT_BROADCAST_START_MAX_DELAY_MS) {
+              break;
+            }
+          }
+        }
+
+        /* Send-only hook registrations commonly report POLLIN and HUP
+         * together. Consume their queued frame first and defer the close one
+         * turn when needed, so an accepted registration is never discarded. */
+        if ((revents & (POLLERR | POLLHUP | POLLNVAL)) &&
+            !(revents & POLLIN) &&
+            !buffered_frame) {
+          pm_disconnect_client(&clients[index]);
+        }
       }
-      /*
-       * Send-only hook registrations close as soon as their complete request
-       * frame is written. poll may report POLLIN and POLLHUP together; consume
-       * the queued bytes first so close never discards an accepted registration.
-       */
-      if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
-        pm_remove_client(clients, &client_count, index);
-      }
+
+      client_scan_cursor = next_scan_cursor;
+      pm_compact_clients_preserving_cursor(clients, &client_count, &client_scan_cursor);
     }
 
     if (handled_io) {
       last_io_at = time(NULL);
+      last_io_at_ms = pm_monotonic_milliseconds();
     }
 
     if (pm_state_reap_children(state)) {
@@ -849,13 +1180,44 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
       route_tables_dirty = 1;
     }
 
-    /*
-     * Publish accepted route mutations before any listener reconciliation.
-     * Snapshot construction can block in an OS listener scan; route files are
-     * the hook/router fallback and must become visible independently of that
-     * diagnostic work. If reconciliation below changes ownership again, it
-     * leaves state->route_tables_dirty set for the next loop iteration.
-     */
+    if (snapshot_dirty && snapshot_dirty_since_ms == 0) {
+      snapshot_dirty_since_ms = pm_monotonic_milliseconds();
+    }
+
+    if (snapshot_dirty && state->listener_cache_updated_at[0] == '\0') {
+      time_t refresh_at = time(NULL) + 1;
+      /* A mutation-invalidated cache is omitted from the fast event. Schedule
+       * the accurate listener follow-up promptly once request traffic is idle. */
+      if (next_poll > refresh_at) {
+        next_poll = refresh_at;
+      }
+    }
+
+    if (snapshot_dirty && !pm_has_event_clients(clients, client_count)) {
+      snapshot_dirty = 0;
+      snapshot_dirty_since_ms = 0;
+    } else if (snapshot_dirty) {
+      long long now_ms = pm_monotonic_milliseconds();
+      int idle_due = last_io_at_ms == 0 || now_ms - last_io_at_ms >= PM_SNAPSHOT_BROADCAST_IDLE_MS;
+      int max_delay_due = now_ms - snapshot_dirty_since_ms >= PM_SNAPSHOT_BROADCAST_START_MAX_DELAY_MS;
+
+      /*
+       * A quiet burst is coalesced for a few milliseconds. Sustained hook I/O
+       * cannot postpone UI delivery past the fixed fairness deadline.
+       */
+      if (idle_due || max_delay_due) {
+        if (pm_broadcast_snapshot(clients, client_count, state) == 0) {
+          snapshot_dirty = 0;
+          snapshot_dirty_since_ms = 0;
+        }
+        pm_compact_clients_preserving_cursor(clients, &client_count, &client_scan_cursor);
+      }
+    }
+
+    /* UI state is memory-authoritative and latency-sensitive, so event fan-out
+     * gets the due turn before synchronous filesystem publication. Compact hook
+     * bursts still defer route files until idle/heartbeat without delaying
+     * request responses or the sidebar. */
     if (route_tables_dirty || state->route_tables_dirty || pm_state_route_table_heartbeat_due(state, time(NULL))) {
       time_t now = time(NULL);
       int heartbeat_due = pm_state_route_table_heartbeat_due(state, now);
@@ -891,20 +1253,8 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
       }
     }
 
-    if (snapshot_dirty && !pm_has_event_clients(clients, client_count)) {
-      snapshot_dirty = 0;
-    } else if (snapshot_dirty && client_count > 0) {
-      time_t now = time(NULL);
-      /*
-       * Full snapshots rescan OS listeners and can be relatively expensive.
-       * Keep short-lived hook requests ahead of UI refreshes while a burst is
-       * still active, then publish one reconciled snapshot once the socket loop
-       * has been idle for a short grace period.
-       */
-      if (!handled_io && (last_io_at == 0 || now - last_io_at >= PM_LISTENER_POLL_IDLE_GRACE_SECONDS)) {
-        pm_broadcast_snapshot(clients, client_count, state);
-        snapshot_dirty = 0;
-      }
+    if (snapshot_dirty && snapshot_dirty_since_ms == 0) {
+      snapshot_dirty_since_ms = pm_monotonic_milliseconds();
     }
 
   }

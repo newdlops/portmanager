@@ -200,10 +200,41 @@ test("sidebar shows current network and route destinations", () => {
   assert.equal(source.includes('"Current Routing"'), true);
   assert.equal(source.includes("class NetworkRoutingGroupTreeItem"), true);
   assert.equal(source.includes("class NetworkRouteConnectionTreeItem"), true);
-  assert.equal(source.includes("formatCurrentRoutingSummary(snapshot, agentSnapshot)"), true);
-  assert.equal(source.includes("buildNetworkRouteConnectionRows(network.id, snapshot, agentSnapshot).length"), true);
+  assert.equal(source.includes("formatCurrentRoutingSummary(snapshot, agentSnapshot, getRouteRows)"), true);
+  assert.equal(source.includes("getRouteRows(network.id).length"), true);
   assert.equal(source.includes("Current VS Code Terminal Network"), true);
   assert.equal(networkServiceSource.includes("getAgentSnapshot(): AgentSnapshot"), true);
+});
+
+test("tree refreshes share one render generation and defer platform diagnostics", () => {
+  const sourcePath = path.resolve(__dirname, "../../../src/ui/sidebar/port-manager-tree.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+
+  assert.equal(source.includes("const TREE_REFRESH_DEBOUNCE_MS = 16;"), true);
+  assert.equal(source.includes("interface TreeRenderGeneration"), true);
+  assert.equal(source.includes("private renderGeneration: TreeRenderGeneration | undefined;"), true);
+  assert.equal(source.includes("readonly routeRowsByNetworkId: Map<string, readonly NetworkRouteConnection[]>;"), true);
+  assert.equal(source.includes("generation.routeRowsByNetworkId.get(networkId)"), true);
+  assert.equal(source.includes("generation.routeRowsByNetworkId.set(networkId, rows)"), true);
+
+  const refreshStart = source.indexOf("refresh(): void {");
+  const refreshEnd = source.indexOf("private getRenderGeneration", refreshStart);
+  const refreshBody = source.slice(refreshStart, refreshEnd);
+  assert.equal(
+    refreshBody.indexOf("this.renderGeneration = undefined;") <
+      refreshBody.indexOf("if (this.refreshTimer !== undefined)"),
+    true,
+    "source changes must invalidate cached render inputs even while a repaint is already queued",
+  );
+
+  const childrenStart = source.indexOf("getChildren(element?: PortManagerTreeItem)");
+  const rootStart = source.indexOf("if (element === undefined)", childrenStart);
+  const childrenPreamble = source.slice(childrenStart, rootStart);
+  assert.equal(childrenPreamble.includes("getBrowserDnsResolverStatus"), false);
+
+  const daemonCaseStart = source.indexOf('case "daemon":', childrenStart);
+  const daemonCaseBody = source.slice(daemonCaseStart, source.indexOf("dispose(): void", daemonCaseStart));
+  assert.equal(daemonCaseBody.includes("this.getBrowserDnsStatus(generation)"), true);
 });
 
 test("network rows show state first and keep actions grouped", () => {

@@ -84,7 +84,9 @@ const AGENT_STARTUP_LOCK_WAIT_MS = 5_000;
 const AGENT_CONNECT_TIMEOUT_MS = 1_000;
 const AGENT_RESTART_EXIT_WAIT_MS = 2_000;
 const AGENT_RESTART_TERM_GRACE_MS = 500;
-const CLIENT_CHANGE_EVENT_DEBOUNCE_MS = 50;
+const CLIENT_CHANGE_EVENT_DEBOUNCE_MS = 16;
+const AGENT_EVENT_RECONNECT_INITIAL_DELAY_MS = 100;
+const AGENT_EVENT_RECONNECT_MAX_DELAY_MS = 5_000;
 
 /**
  * Agent-backed process service used by commands and the sidebar provider.
@@ -122,6 +124,27 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** In-flight connect promise shared by concurrent commands. */
   private connecting: Promise<void> | undefined;
 
+  /** Generation owning `connecting`; stop/dispose invalidates older startup work. */
+  private connectingGeneration = -1;
+
+  /** Lifecycle token prevents an async connect from attaching after stop/dispose. */
+  private connectionGeneration = 0;
+
+  /** Existing-daemon reconnect used when the agent drops a lagging event subscriber. */
+  private eventReconnectInFlight: Promise<void> | undefined;
+
+  /** Backoff timer keeps a stopped daemon cold while noticing a later external restart. */
+  private eventReconnectTimer: NodeJS.Timeout | undefined;
+
+  /** Current delay for existing-daemon reconnect attempts after an unexpected socket close. */
+  private eventReconnectDelayMs = AGENT_EVENT_RECONNECT_INITIAL_DELAY_MS;
+
+  /** True until a reconnected stream proves it can receive one complete snapshot frame. */
+  private eventReconnectAwaitingSnapshot = false;
+
+  /** Explicit stop/dispose operations suppress automatic event-stream resubscription. */
+  private automaticEventReconnectEnabled = true;
+
   /** Disposed clients should not reconnect after socket close. */
   private disposed = false;
 
@@ -129,6 +152,7 @@ export class LocalAgentClient implements PortManagerProcessService {
 
   /** Connects to the agent and loads the initial snapshot. */
   async start(): Promise<void> {
+    this.enableAutomaticEventReconnect();
     await this.ensureConnected();
     await this.loadDaemonStatusForStartup();
     /*
@@ -141,7 +165,10 @@ export class LocalAgentClient implements PortManagerProcessService {
 
   /** Stops the singleton local agent and resets the extension-side snapshot. */
   async stopDaemon(): Promise<void> {
+    this.disableAutomaticEventReconnect();
+    this.connectionGeneration += 1;
     const daemonPid = this.snapshot.daemon.pid;
+    const startingChild = this.childProcess;
 
     if (this.socket !== undefined && !this.socket.destroyed) {
       try {
@@ -163,6 +190,15 @@ export class LocalAgentClient implements PortManagerProcessService {
       }
     }
 
+    if (
+      startingChild !== undefined &&
+      startingChild.exitCode === null &&
+      !startingChild.killed &&
+      startingChild.pid !== daemonPid
+    ) {
+      startingChild.kill("SIGTERM");
+    }
+    this.rejectAllPending(new Error("Port Manager agent daemon stopped."));
     this.socket?.destroy();
     this.socket = undefined;
     this.childProcess = undefined;
@@ -174,12 +210,22 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Restarts the singleton daemon using this extension's compiled agent. */
   async restartDaemon(): Promise<void> {
     const previousPid = this.snapshot.daemon.pid;
+    /* stopDaemon increments synchronously before its first await. Retain that
+     * generation so a later explicit Stop wins instead of this older restart
+     * resuming after its shutdown grace period and resurrecting the daemon. */
+    const restartGeneration = this.connectionGeneration + 1;
 
     await this.stopDaemon();
+    this.assertConnectionGeneration(restartGeneration);
     await this.waitForPreviousDaemonExit(previousPid);
+    this.assertConnectionGeneration(restartGeneration);
     await this.terminateSiblingAgentProcesses(new Set([previousPid]));
+    this.assertConnectionGeneration(restartGeneration);
+    this.enableAutomaticEventReconnect();
     await this.ensureConnected();
+    this.assertConnectionGeneration(restartGeneration);
     await this.loadDaemonStatus();
+    this.assertConnectionGeneration(restartGeneration);
 
     if (this.snapshot.daemon.restartRequired) {
       throw new Error("Port Manager daemon restarted, but it still does not match the active extension build.");
@@ -316,7 +362,7 @@ export class LocalAgentClient implements PortManagerProcessService {
       virtualPortRangeStart: settings.virtualPortRangeStart,
       virtualPortRangeEnd: settings.virtualPortRangeEnd,
     });
-    await this.refresh();
+    this.upsertKnownProcess(process);
 
     return process;
   }
@@ -325,7 +371,6 @@ export class LocalAgentClient implements PortManagerProcessService {
   async registerExistingProcess(input: RegisteredProcessInput): Promise<ManagedProcess> {
     const process = await this.request<ManagedProcess>("registerExistingProcess", input);
     this.upsertKnownProcess(process);
-    this.refreshInBackground();
 
     return process;
   }
@@ -336,7 +381,11 @@ export class LocalAgentClient implements PortManagerProcessService {
       id,
       signal: settings.processKillSignal,
     });
-    await this.refresh();
+    if (process === undefined) {
+      this.removeKnownProcess(id);
+    } else {
+      this.upsertKnownProcess(process);
+    }
 
     return process;
   }
@@ -352,7 +401,11 @@ export class LocalAgentClient implements PortManagerProcessService {
       virtualPortRangeStart: settings.virtualPortRangeStart,
       virtualPortRangeEnd: settings.virtualPortRangeEnd,
     });
-    await this.refresh();
+    if (process === undefined) {
+      this.removeKnownProcess(id);
+    } else {
+      this.upsertKnownProcess(process);
+    }
 
     return process;
   }
@@ -360,7 +413,7 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Removes a process row from the shared agent state. */
   async removeProcess(id: string): Promise<ManagedProcess | undefined> {
     const process = await this.request<ManagedProcess | undefined>("removeProcess", { id });
-    await this.refresh();
+    this.removeKnownProcess(id);
 
     return process;
   }
@@ -368,6 +421,8 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Closes the socket and rejects pending requests. */
   dispose(): void {
     this.disposed = true;
+    this.disableAutomaticEventReconnect();
+    this.connectionGeneration += 1;
     if (this.changeEventTimer !== undefined) {
       clearTimeout(this.changeEventTimer);
       this.changeEventTimer = undefined;
@@ -383,28 +438,47 @@ export class LocalAgentClient implements PortManagerProcessService {
    * one and retries the connection for a short window.
    */
   private async ensureConnected(): Promise<void> {
+    if (this.disposed) {
+      throw new Error("Port Manager agent client is disposed.");
+    }
+
+    const generation = this.connectionGeneration;
     if (this.socket && !this.socket.destroyed) {
       return;
     }
 
-    if (this.connecting) {
+    if (this.eventReconnectInFlight !== undefined) {
+      await this.eventReconnectInFlight;
+      this.assertConnectionGeneration(generation);
+      if (this.socket && !this.socket.destroyed) {
+        return;
+      }
+    }
+
+    if (this.connecting && this.connectingGeneration === generation) {
       return this.connecting;
     }
 
-    this.connecting = this.connectWithAgentStartup().finally(() => {
-      this.connecting = undefined;
+    const attempt = this.connectWithAgentStartup(generation);
+    const trackedAttempt = attempt.finally(() => {
+      if (this.connecting === trackedAttempt) {
+        this.connecting = undefined;
+        this.connectingGeneration = -1;
+      }
     });
+    this.connecting = trackedAttempt;
+    this.connectingGeneration = generation;
 
-    return this.connecting;
+    return trackedAttempt;
   }
 
   /** Tries an existing socket first, then starts the agent and retries. */
-  private async connectWithAgentStartup(): Promise<void> {
+  private async connectWithAgentStartup(generation: number): Promise<void> {
     let initialError: unknown;
 
     try {
-      this.socket = await this.openSocket();
-      this.attachSocketHandlers(this.socket);
+      const socket = await this.openSocket();
+      this.attachConnectedSocket(socket, generation);
       return;
     } catch (error) {
       initialError = error;
@@ -412,28 +486,30 @@ export class LocalAgentClient implements PortManagerProcessService {
       // be racing to create the singleton daemon.
     }
 
-    const releaseStartupLock = await this.acquireAgentStartupLock();
+    const releaseStartupLock = await this.acquireAgentStartupLock(generation);
     try {
+      this.assertConnectionGeneration(generation);
       if (this.socket && !this.socket.destroyed) {
         return;
       }
 
       try {
-        this.socket = await this.openSocket();
-        this.attachSocketHandlers(this.socket);
+        const socket = await this.openSocket();
+        this.attachConnectedSocket(socket, generation);
         return;
       } catch (error) {
+        this.assertConnectionGeneration(generation);
         if (isSocketConnectTimeoutError(error) || isSocketConnectTimeoutError(initialError)) {
           /*
            * A timeout means the socket path existed but the current daemon did
            * not accept quickly enough. Treating that as stale would unlink a
            * live socket and let another extension host create a second daemon.
            */
-          await this.waitForExistingAgent();
+          await this.waitForExistingAgent(generation);
           return;
         }
 
-        this.startAgentProcess();
+        this.startAgentProcess(generation);
       }
 
       const deadline = Date.now() + 5000;
@@ -441,10 +517,11 @@ export class LocalAgentClient implements PortManagerProcessService {
 
       while (Date.now() < deadline) {
         await delay(150);
+        this.assertConnectionGeneration(generation);
 
         try {
-          this.socket = await this.openSocket();
-          this.attachSocketHandlers(this.socket);
+          const socket = await this.openSocket();
+          this.attachConnectedSocket(socket, generation);
           return;
         } catch (error) {
           lastError = error;
@@ -458,16 +535,17 @@ export class LocalAgentClient implements PortManagerProcessService {
   }
 
   /** Waits for a slow existing daemon without removing its socket path. */
-  private async waitForExistingAgent(): Promise<void> {
+  private async waitForExistingAgent(generation: number): Promise<void> {
     const deadline = Date.now() + AGENT_STARTUP_LOCK_WAIT_MS;
     let lastError: unknown;
 
     while (Date.now() < deadline) {
       await delay(150);
+      this.assertConnectionGeneration(generation);
 
       try {
-        this.socket = await this.openSocket();
-        this.attachSocketHandlers(this.socket);
+        const socket = await this.openSocket();
+        this.attachConnectedSocket(socket, generation);
         return;
       } catch (error) {
         lastError = error;
@@ -478,11 +556,12 @@ export class LocalAgentClient implements PortManagerProcessService {
   }
 
   /** Serializes daemon startup across extension hosts in different VS Code windows. */
-  private async acquireAgentStartupLock(): Promise<() => void> {
+  private async acquireAgentStartupLock(generation: number): Promise<() => void> {
     const lockPath = getAgentStartupLockPath();
     const deadline = Date.now() + AGENT_STARTUP_LOCK_WAIT_MS;
 
     for (;;) {
+      this.assertConnectionGeneration(generation);
       try {
         const fd = fs.openSync(lockPath, "wx");
         fs.writeFileSync(fd, `${process.pid}\n${new Date().toISOString()}\n`, "utf8");
@@ -503,7 +582,8 @@ export class LocalAgentClient implements PortManagerProcessService {
           throw error instanceof Error ? error : new Error(String(error));
         }
 
-        await this.connectIfSocketAppeared().catch(() => undefined);
+        await this.connectIfSocketAppeared(generation).catch(() => undefined);
+        this.assertConnectionGeneration(generation);
         if (this.socket && !this.socket.destroyed) {
           return () => undefined;
         }
@@ -519,13 +599,38 @@ export class LocalAgentClient implements PortManagerProcessService {
   }
 
   /** Connects to a daemon that another VS Code window may have just started. */
-  private async connectIfSocketAppeared(): Promise<void> {
+  private async connectIfSocketAppeared(generation: number): Promise<void> {
+    this.assertConnectionGeneration(generation);
     if (this.socket && !this.socket.destroyed) {
       return;
     }
 
-    this.socket = await this.openSocket();
-    this.attachSocketHandlers(this.socket);
+    const socket = await this.openSocket();
+    this.attachConnectedSocket(socket, generation);
+  }
+
+  /** Rejects startup work superseded by an explicit stop/dispose lifecycle. */
+  private assertConnectionGeneration(generation: number): void {
+    if (this.disposed || generation !== this.connectionGeneration) {
+      throw new Error("Port Manager agent connection attempt was cancelled.");
+    }
+  }
+
+  /** Installs a connected socket only while its originating lifecycle is live. */
+  private attachConnectedSocket(socket: net.Socket, generation: number): void {
+    try {
+      this.assertConnectionGeneration(generation);
+    } catch (error) {
+      socket.destroy();
+      throw error;
+    }
+
+    if (this.socket !== undefined && !this.socket.destroyed) {
+      socket.destroy();
+      return;
+    }
+    this.socket = socket;
+    this.attachSocketHandlers(socket);
   }
 
   /** Opens the OS-specific local socket used by the singleton agent. */
@@ -557,7 +662,8 @@ export class LocalAgentClient implements PortManagerProcessService {
    * Node daemon remains the fallback for unsupported platforms or development
    * builds that have not produced the native binary yet.
    */
-  private startAgentProcess(): void {
+  private startAgentProcess(generation: number): void {
+    this.assertConnectionGeneration(generation);
     const agentMainPath = this.getAgentMainPath();
 
     if (!fs.existsSync(agentMainPath)) {
@@ -581,17 +687,20 @@ export class LocalAgentClient implements PortManagerProcessService {
         },
       );
       this.childProcess.once("error", () => {
-        this.startNodeAgentProcess(agentMainPath, socketPath);
+        if (!this.disposed && generation === this.connectionGeneration) {
+          this.startNodeAgentProcess(agentMainPath, socketPath, generation);
+        }
       });
       this.childProcess.unref();
       return;
     }
 
-    this.startNodeAgentProcess(agentMainPath, socketPath);
+    this.startNodeAgentProcess(agentMainPath, socketPath, generation);
   }
 
   /** Starts the previous Node daemon implementation as a compatibility fallback. */
-  private startNodeAgentProcess(agentMainPath: string, socketPath: string): void {
+  private startNodeAgentProcess(agentMainPath: string, socketPath: string, generation: number): void {
+    this.assertConnectionGeneration(generation);
     this.childProcess = spawn(process.execPath, [agentMainPath, "--socket", socketPath, "--route-table", getDefaultRouteTablePath()], {
       detached: true,
       env: this.buildAgentEnvironment(),
@@ -659,18 +768,161 @@ export class LocalAgentClient implements PortManagerProcessService {
 
   /** Wires line-delimited JSON handling for one socket connection. */
   private attachSocketHandlers(socket: net.Socket): void {
+    // A lagging event subscriber can be disconnected after a partial frame.
+    // Every replacement stream therefore starts with a clean frame boundary.
+    this.incomingBuffer = "";
     socket.setEncoding("utf8");
-    socket.on("data", (chunk) => this.handleData(String(chunk)));
+    socket.on("data", (chunk) => {
+      if (this.socket === socket) {
+        this.handleData(String(chunk));
+      }
+    });
     socket.on("close", () => {
       if (this.socket === socket) {
         this.socket = undefined;
+        this.incomingBuffer = "";
+        if (this.eventReconnectAwaitingSnapshot) {
+          this.eventReconnectAwaitingSnapshot = false;
+          this.eventReconnectDelayMs = Math.min(
+            this.eventReconnectDelayMs * 2,
+            AGENT_EVENT_RECONNECT_MAX_DELAY_MS,
+          );
+        }
+        this.rejectAllPending(new Error("Port Manager agent connection closed."));
+        this.scheduleEventReconnect();
       }
-
-      this.rejectAllPending(new Error("Port Manager agent connection closed."));
     });
     socket.on("error", (error) => {
-      this.rejectAllPending(error instanceof Error ? error : new Error(String(error)));
+      if (this.socket === socket) {
+        this.rejectAllPending(error instanceof Error ? error : new Error(String(error)));
+      }
     });
+  }
+
+  /** Enables live-event resubscription after an explicit start or request. */
+  private enableAutomaticEventReconnect(): void {
+    if (!this.automaticEventReconnectEnabled) {
+      this.automaticEventReconnectEnabled = true;
+      this.eventReconnectDelayMs = AGENT_EVENT_RECONNECT_INITIAL_DELAY_MS;
+    }
+  }
+
+  /** Cancels reconnect work so stop/dispose cannot resurrect the singleton daemon. */
+  private disableAutomaticEventReconnect(): void {
+    this.automaticEventReconnectEnabled = false;
+    this.eventReconnectAwaitingSnapshot = false;
+    if (this.eventReconnectTimer !== undefined) {
+      clearTimeout(this.eventReconnectTimer);
+      this.eventReconnectTimer = undefined;
+    }
+  }
+
+  /** Schedules a bounded existing-socket reconnect without starting a stopped daemon. */
+  private scheduleEventReconnect(): void {
+    if (
+      this.disposed ||
+      !this.automaticEventReconnectEnabled ||
+      this.eventReconnectTimer !== undefined ||
+      (this.socket !== undefined && !this.socket.destroyed)
+    ) {
+      return;
+    }
+
+    this.eventReconnectTimer = setTimeout(() => {
+      this.eventReconnectTimer = undefined;
+      void this.reconnectEventStreamToExistingAgent();
+    }, this.eventReconnectDelayMs);
+    this.eventReconnectTimer.unref();
+  }
+
+  /** Reopens only a live daemon socket and re-subscribes through daemonStatus. */
+  private async reconnectEventStreamToExistingAgent(): Promise<void> {
+    if (
+      this.disposed ||
+      !this.automaticEventReconnectEnabled ||
+      (this.socket !== undefined && !this.socket.destroyed)
+    ) {
+      return;
+    }
+    if (this.eventReconnectInFlight !== undefined) {
+      return this.eventReconnectInFlight;
+    }
+
+    const generation = this.connectionGeneration;
+    let candidateSocket: net.Socket | undefined;
+    const reconnect = (async () => {
+      if (this.connecting !== undefined) {
+        await this.connecting.catch(() => undefined);
+        if (generation !== this.connectionGeneration) {
+          return;
+        }
+        if (this.socket !== undefined && !this.socket.destroyed) {
+          return;
+        }
+      }
+
+      const socket = await this.openSocket();
+      candidateSocket = socket;
+      if (
+        this.disposed ||
+        !this.automaticEventReconnectEnabled ||
+        generation !== this.connectionGeneration
+      ) {
+        socket.destroy();
+        return;
+      }
+      if (this.socket !== undefined && !this.socket.destroyed) {
+        socket.destroy();
+        return;
+      }
+
+      this.socket = socket;
+      this.attachSocketHandlers(socket);
+      this.eventReconnectAwaitingSnapshot = true;
+      try {
+        await this.loadDaemonStatus();
+      } catch (error) {
+        if (isUnsupportedDaemonStatusError(error) && this.socket === socket && !socket.destroyed) {
+          this.applyDaemonStatusError(
+            new Error("Connected daemon does not expose daemonStatus metadata; use Restart Daemon after active terminals are stable."),
+          );
+          return;
+        }
+        throw error;
+      }
+      if (this.socket !== socket || socket.destroyed) {
+        throw new Error("Port Manager agent event stream closed during resubscription.");
+      }
+    })()
+      .catch((error: unknown) => {
+        let shouldAdvanceBackoff = candidateSocket === undefined;
+        if (candidateSocket !== undefined && this.socket === candidateSocket) {
+          this.rejectAllPending(error instanceof Error ? error : new Error(String(error)));
+          this.socket = undefined;
+          this.incomingBuffer = "";
+          this.eventReconnectAwaitingSnapshot = false;
+          candidateSocket.destroy();
+          shouldAdvanceBackoff = true;
+        }
+        /* A close observed while loadDaemonStatus was pending already advanced
+         * the delay in attachSocketHandlers. Do not count that same failed
+         * stream twice and jump through the backoff ladder too aggressively. */
+        if (shouldAdvanceBackoff) {
+          this.eventReconnectDelayMs = Math.min(
+            this.eventReconnectDelayMs * 2,
+            AGENT_EVENT_RECONNECT_MAX_DELAY_MS,
+          );
+        }
+      })
+      .finally(() => {
+        if (this.eventReconnectInFlight === reconnect) {
+          this.eventReconnectInFlight = undefined;
+        }
+        this.scheduleEventReconnect();
+      });
+
+    this.eventReconnectInFlight = reconnect;
+    return reconnect;
   }
 
   /** Accumulates socket data until complete newline-delimited messages arrive. */
@@ -694,7 +946,13 @@ export class LocalAgentClient implements PortManagerProcessService {
 
   /** Dispatches one agent response or event. Malformed messages are ignored. */
   private handleMessage(line: string): void {
-    const message = JSON.parse(line) as Partial<AgentResponse> & Partial<AgentEvent>;
+    let message: Partial<AgentResponse> & Partial<AgentEvent>;
+    try {
+      message = JSON.parse(line) as Partial<AgentResponse> & Partial<AgentEvent>;
+    } catch {
+      // A failed or superseded stream must not take down the extension host.
+      return;
+    }
 
     if (message.type === "response" && typeof message.id === "string") {
       this.handleResponse(message as AgentResponse);
@@ -702,6 +960,10 @@ export class LocalAgentClient implements PortManagerProcessService {
     }
 
     if (message.type === "snapshot" && message.payload) {
+      if (this.eventReconnectAwaitingSnapshot) {
+        this.eventReconnectAwaitingSnapshot = false;
+        this.eventReconnectDelayMs = AGENT_EVENT_RECONNECT_INITIAL_DELAY_MS;
+      }
       this.applySnapshot(message.payload);
     }
   }
@@ -738,7 +1000,13 @@ export class LocalAgentClient implements PortManagerProcessService {
 
   /** Sends one request and waits for the correlated response. */
   private async request<T>(method: AgentMethod, params?: unknown): Promise<T> {
-    await this.ensureConnected();
+    if (this.disposed) {
+      throw new Error("Port Manager agent client is disposed.");
+    }
+    if (method !== "shutdownDaemon") {
+      this.enableAutomaticEventReconnect();
+      await this.ensureConnected();
+    }
 
     const socket = this.socket;
     if (!socket || socket.destroyed) {
@@ -794,22 +1062,42 @@ export class LocalAgentClient implements PortManagerProcessService {
     const processes = upsertManagedProcess(this.snapshot.processes, process);
     const routes = upsertLogicalRouteForProcess(this.snapshot.routes, process);
 
-    this.snapshot = annotateDaemonCompatibility(
-      normalizeAgentSnapshot({
-        ...this.snapshot,
-        processes,
-        routes,
+    this.applyOptimisticProcessSnapshot(processes, routes, updatedAt);
+  }
+
+  /**
+   * Removes a daemon-confirmed process and every route it owned without waiting
+   * for an OS listener rescan. Raw listener rows remain unchanged until the
+   * agent's next broadcast because the mutation response cannot authoritatively
+   * say whether the operating-system socket has disappeared yet.
+   */
+  private removeKnownProcess(processId: string): void {
+    const processes = this.snapshot.processes.filter((process) => process.id !== processId);
+    const routes = this.snapshot.routes.filter((route) => route.processId !== processId);
+    if (processes.length === this.snapshot.processes.length && routes.length === this.snapshot.routes.length) {
+      return;
+    }
+
+    this.applyOptimisticProcessSnapshot(processes, routes, new Date().toISOString());
+  }
+
+  /** Commits optimistic process rows while keeping daemon route metadata coherent. */
+  private applyOptimisticProcessSnapshot(
+    processes: readonly ManagedProcess[],
+    routes: readonly LogicalPortRoute[],
+    updatedAt: string,
+  ): void {
+    this.applySnapshot({
+      ...this.snapshot,
+      processes,
+      routes,
+      updatedAt,
+      daemon: {
+        ...this.snapshot.daemon,
+        routeCount: routes.length,
         updatedAt,
-        daemon: {
-          ...this.snapshot.daemon,
-          routeCount: routes.length,
-          updatedAt,
-        },
-      }),
-      this.getAgentMainPath(),
-    );
-    this.snapshotSignature = buildClientSnapshotSignature(this.snapshot);
-    this.queueChangeEvent();
+      },
+    });
   }
 
   /** Notifies subscribers once for a burst of snapshot updates. */

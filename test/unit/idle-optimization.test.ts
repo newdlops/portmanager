@@ -149,6 +149,10 @@ test("loopback alias checks share one cached ifconfig read with failure backoff"
   assert.equal(source.includes("function invalidateLoopbackAliasCache"), true);
   assert.equal(source.includes("async function isLoopbackAddressAliasConfiguredAsync"), true);
   assert.equal(source.includes("loopbackAliasSetupBackoffUntilMsByAddress"), true);
+  assert.equal(source.includes('execFileSync("ifconfig"'), false);
+  assert.equal(source.includes("function readCachedLoopbackAliasAddresses"), true);
+  assert.equal(source.includes("private browserDnsAliasStatusRefreshInFlight: Promise<void> | undefined;"), true);
+  assert.equal(source.includes("private warmBrowserDnsAliasStatus(): void"), true);
 
   // Activation-path alias checks must not block the event loop.
   const ensureStart = source.indexOf("async function ensureLoopbackAddressRoutingHostReady");
@@ -159,6 +163,14 @@ test("loopback alias checks share one cached ifconfig read with failure backoff"
   // Tree-render status reads reuse stat-validated system config caches.
   assert.equal(source.includes("function readTextFileWithStatCache"), true);
   assert.equal(source.includes("readTextFileWithStatCache(\"/etc/hosts\")"), true);
+
+  const statusStart = source.indexOf("getBrowserDnsResolverStatus(): BrowserDnsResolverStatus");
+  const statusEnd = source.indexOf("/** Installs macOS resolver rows", statusStart);
+  const statusBody = source.slice(statusStart, statusEnd);
+  assert.equal(statusBody.includes("this.warmBrowserDnsAliasStatus();"), true);
+  assert.equal(statusBody.includes("if (this.browserDnsAliasStatusRefreshInFlight !== undefined)"), true);
+  assert.equal(statusBody.includes("this.localChangeEvents.emit();"), true);
+  assert.equal(statusBody.includes("execFileSync"), false);
 });
 
 test("shell hook assets skip rebuilds when their inputs are unchanged", () => {
