@@ -74,6 +74,16 @@ test("VS Code sends only activation variables through shell integration", () => 
     true,
   );
   assert.equal(
+    source.includes('collection.replace("PORT_MANAGER_RUNTIME_SHIM_READY", "1", TERMINAL_ACTIVATION_MUTATOR_OPTIONS);'),
+    true,
+    "profile suspension must be cleared together with the delayed runtime-shim PATH activation",
+  );
+  assert.equal(
+    source.includes('collection.replace("PORT_MANAGER_RUNTIME_SHIM_READY", "1", TERMINAL_CONTEXT_MUTATOR_OPTIONS);'),
+    false,
+    "process-creation-only readiness is lost when the managed profile prelude resets it",
+  );
+  assert.equal(
     source.includes('collection.replace("PORT_MANAGER_EXPECTED_VERSION", packageVersion, TERMINAL_CONTEXT_MUTATOR_OPTIONS);'),
     true,
   );
@@ -184,6 +194,10 @@ test("terminal hook preload entries are normalized across multiple VS Code windo
   assert.equal(terminalHookEnvironmentSource.includes('collection.replace(\n      "PATH"'), false);
   assert.equal(
     terminalHookEnvironmentSource.includes('collection.prepend("PATH", `${launcherDirectory}${path.delimiter}`, TERMINAL_ACTIVATION_MUTATOR_OPTIONS);'),
+    true,
+  );
+  assert.equal(
+    terminalHookEnvironmentSource.includes('collection.replace("PORT_MANAGER_RUNTIME_SHIM_READY", "1", TERMINAL_ACTIVATION_MUTATOR_OPTIONS);'),
     true,
   );
   assert.equal(terminalHookEnvironmentSource.includes('process.platform === "darwin" ? "PORT_MANAGER_DYLD_INSERT_LIBRARIES" : "PORT_MANAGER_LD_PRELOAD"'), true);
@@ -725,7 +739,7 @@ test("external pm shell function exposes doctor routes and detach diagnostics", 
   assert.equal(commandSource.includes("shellRemovePathListEntry"), true);
 });
 
-test("extension auto-refreshes shell hook assets without auto-mutating profiles", () => {
+test("extension auto-refresh migrates only profiles with an existing PM install", () => {
   const activatePath = path.resolve(__dirname, "../../../src/extension/activate.ts");
   const commandSourcePath = path.resolve(__dirname, "../../../src/extension/commands.ts");
   const activateSource = fs.readFileSync(activatePath, "utf8");
@@ -739,13 +753,15 @@ test("extension auto-refreshes shell hook assets without auto-mutating profiles"
   assert.equal(activateSource.includes("void commandController.ensureShellHookAssets(context).catch(() => undefined);"), true);
   assert.equal(commandSource.includes("private async writeShellHookAssets"), true);
   assert.equal(ensureBody.includes("await this.writeShellHookAssets(context);"), true);
-  assert.equal(ensureBody.includes("appendLineOnce"), false);
-  assert.equal(installBody.includes("appendLineOnce"), true);
+  assert.equal(ensureBody.includes("migrateExistingManagedShellProfiles"), true);
+  assert.equal(installBody.includes("upsertManagedShellProfile"), true);
 });
 
 test("profile shell hook lazy-loads heavy pm command implementation", () => {
   const commandSourcePath = path.resolve(__dirname, "../../../src/extension/commands.ts");
+  const shellProfileSourcePath = path.resolve(__dirname, "../../../src/platform/process/shell-profile.ts");
   const commandSource = fs.readFileSync(commandSourcePath, "utf8");
+  const shellProfileSource = fs.readFileSync(shellProfileSourcePath, "utf8");
   const startupStart = commandSource.indexOf("function buildShellHookStartupScript");
   const commandLibraryStart = commandSource.indexOf("function buildShellHookScript", startupStart);
   const startupSource = commandSource.slice(startupStart, commandLibraryStart);
@@ -757,8 +773,13 @@ test("profile shell hook lazy-loads heavy pm command implementation", () => {
   assert.equal(commandSource.includes("const hookScriptContents = buildShellHookStartupScript({"), true);
   assert.equal(commandSource.includes("existingCommandScript !== commandScriptContents"), true);
   assert.equal(commandSource.includes("await fs.chmod(hookCommandLibraryPath, 0o700)"), true);
-  assert.equal(commandSource.includes('return [path.join(os.homedir(), ".zshrc")];'), true);
-  assert.equal(commandSource.includes('path.join(os.homedir(), ".zprofile"), path.join(os.homedir(), ".zshrc")'), false);
+  assert.equal(shellProfileSource.includes('{ filePath: path.join(homeDirectory, ".zprofile") }'), true);
+  assert.equal(shellProfileSource.includes('{ filePath: path.join(homeDirectory, ".zshrc") }'), true);
+  assert.equal(commandSource.includes('path.join(hookDirectory, "portmanager-profile-pre.sh")'), true);
+  assert.equal(commandSource.includes('path.join(hookDirectory, "portmanager-profile-post.sh")'), true);
+  assert.equal(shellProfileSource.includes("buildShellProfilePreludeScript"), true);
+  assert.equal(shellProfileSource.includes("buildShellProfilePostludeScript"), true);
+  assert.equal(shellProfileSource.includes("Shell builtins only"), true);
   assert.equal(startupSource.includes("# Port Manager shell startup"), true);
   assert.equal(startupSource.includes('pm() {'), true);
   assert.equal(startupSource.includes('. "${escapedCommandLibraryPath}" || return $?'), true);

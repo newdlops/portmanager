@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8227",
+  "version": "0.0.8231",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -88,6 +88,7 @@
     "onCommand:portManager.openRoutedUrl",
     "onCommand:portManager.removeProcess",
     "onCommand:portManager.installShellHook",
+    "onCommand:portManager.restoreShellProfiles",
     "onCommand:portManager.installExternalCli",
     "onCommand:portManager.renewBrowserTlsCertificate",
     "onCommand:portManager.openOwnerUi",
@@ -418,6 +419,12 @@
         "title": "Port Manager: Install Shell Hook",
         "category": "Port Manager",
         "icon": "$(plug)"
+      },
+      {
+        "command": "portManager.restoreShellProfiles",
+        "title": "Port Manager: Restore Shell Profiles",
+        "category": "Port Manager",
+        "icon": "$(discard)"
       },
       {
         "command": "portManager.renewBrowserTlsCertificate",

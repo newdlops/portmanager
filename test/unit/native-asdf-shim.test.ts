@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
+
+import { loopbackAddressForNetwork } from "../../src/core/networks/loopback-address";
 
 /**
  * Regression checks for the native runtime launcher source.
@@ -15,6 +19,9 @@ import test from "node:test";
  */
 
 const sourcePath = path.resolve(__dirname, "../../../native/asdf-shim/portmanager_asdf_shim.c");
+const projectRoot = path.resolve(__dirname, "../../..");
+const launcherPath = path.join(projectRoot, "media/native/portmanager_asdf_shim");
+const hookPath = path.join(projectRoot, "media/native/libportmanager_hook.dylib");
 
 test("runtime launcher resolves the real runtime as the next PATH entry, manager agnostic", () => {
   const source = fs.readFileSync(sourcePath, "utf8");
@@ -68,4 +75,61 @@ test("runtime launcher guards against a resolution loop", () => {
   assert.equal(source.includes("PM_RUNTIME_SHIM_DEPTH_ENV"), true);
   assert.equal(source.includes("depth >= PM_RUNTIME_SHIM_DEPTH_LIMIT"), true);
   assert.equal(source.includes("runtime resolution loop"), true);
+});
+
+test("runtime launcher preserves a complete long network scope across the hooked exec boundary", (t) => {
+  if (process.platform !== "darwin" || !fs.existsSync(launcherPath) || !fs.existsSync(hookPath)) {
+    t.skip("native macOS runtime launcher is unavailable");
+    return;
+  }
+
+  const networkId = "network-12345678-1234-1234-1234-123456789abc";
+  const scopeVariables = [
+    "PORT_MANAGER_NETWORK_ID",
+    "PORT_MANAGER_ROUTE_TABLE_NETWORK_ID",
+    "PORT_MANAGER_BORROWED_NETWORK_ID",
+    "NEWDLOPS_PM_NETWORK_ID",
+    "NEWDLOPS_PM_BORROWED_NETWORK_ID",
+  ] as const;
+  const probe = [
+    'const os = require("node:os");',
+    `const keys = ${JSON.stringify(scopeVariables)};`,
+    "process.stdout.write(JSON.stringify({ hostname: os.hostname(), scope: keys.map((key) => process.env[key]) }));",
+  ].join("\n");
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-runtime-scope-"));
+
+  try {
+    const result = spawnSync(launcherPath, ["-e", probe], {
+      cwd,
+      encoding: "utf8",
+      timeout: 10_000,
+      env: {
+        HOME: cwd,
+        PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`,
+        PORT_MANAGER_ASDF_TOOL_NAME: "node",
+        PORT_MANAGER_RUNTIME_SHIM_DIR: path.dirname(launcherPath),
+        PORT_MANAGER_HOOK: "1",
+        PORT_MANAGER_PRELOAD_REPAIR: "1",
+        PORT_MANAGER_DYLD_INSERT_LIBRARIES: hookPath,
+        DYLD_INSERT_LIBRARIES: hookPath,
+        PORT_MANAGER_NETWORK_ID: networkId,
+        PORT_MANAGER_ROUTE_TABLE_NETWORK_ID: networkId,
+        PORT_MANAGER_BORROWED_NETWORK_ID: networkId,
+        NEWDLOPS_PM_NETWORK_ID: networkId,
+        NEWDLOPS_PM_BORROWED_NETWORK_ID: networkId,
+        PORT_MANAGER_ACTUAL_LOOPBACK_HOST: loopbackAddressForNetwork(networkId),
+        PORT_MANAGER_NETWORK_LOOPBACK_HOST: loopbackAddressForNetwork(networkId),
+        PORT_MANAGER_AGENT_REQUIRED: "0",
+      },
+    });
+
+    assert.equal(result.signal, null, result.stderr || `runtime launcher terminated with ${result.signal}`);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout) as unknown, {
+      hostname: loopbackAddressForNetwork(networkId),
+      scope: scopeVariables.map(() => networkId),
+    });
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
 });

@@ -823,15 +823,20 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
       }
 
       revents = poll_fds[index + 1].revents;
-      if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
-        pm_remove_client(clients, &client_count, index);
-        continue;
-      }
       if (revents & POLLIN) {
         handled_io = 1;
         if (pm_read_client(&clients[index], state, &snapshot_dirty, &route_tables_dirty) != 0) {
           pm_remove_client(clients, &client_count, index);
+          continue;
         }
+      }
+      /*
+       * Send-only hook registrations close as soon as their complete request
+       * frame is written. poll may report POLLIN and POLLHUP together; consume
+       * the queued bytes first so close never discards an accepted registration.
+       */
+      if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        pm_remove_client(clients, &client_count, index);
       }
     }
 
@@ -842,6 +847,28 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
     if (pm_state_reap_children(state)) {
       snapshot_dirty = 1;
       route_tables_dirty = 1;
+    }
+
+    /*
+     * Publish accepted route mutations before any listener reconciliation.
+     * Snapshot construction can block in an OS listener scan; route files are
+     * the hook/router fallback and must become visible independently of that
+     * diagnostic work. If reconciliation below changes ownership again, it
+     * leaves state->route_tables_dirty set for the next loop iteration.
+     */
+    if (route_tables_dirty || state->route_tables_dirty || pm_state_route_table_heartbeat_due(state, time(NULL))) {
+      time_t now = time(NULL);
+      int heartbeat_due = pm_state_route_table_heartbeat_due(state, now);
+
+      if (now >= route_table_flush_retry_after &&
+          (heartbeat_due || (!handled_io && (last_io_at == 0 || now - last_io_at >= PM_LISTENER_POLL_IDLE_GRACE_SECONDS)))) {
+        if (pm_state_flush_route_tables(state) == 0) {
+          route_tables_dirty = 0;
+          route_table_flush_retry_after = 0;
+        } else {
+          route_table_flush_retry_after = now + 1;
+        }
+      }
     }
 
     if (time(NULL) >= next_poll) {
@@ -880,20 +907,6 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
       }
     }
 
-    if (route_tables_dirty || state->route_tables_dirty || pm_state_route_table_heartbeat_due(state, time(NULL))) {
-      time_t now = time(NULL);
-      int heartbeat_due = pm_state_route_table_heartbeat_due(state, now);
-
-      if (now >= route_table_flush_retry_after &&
-          (heartbeat_due || (!handled_io && (last_io_at == 0 || now - last_io_at >= PM_LISTENER_POLL_IDLE_GRACE_SECONDS)))) {
-        if (pm_state_flush_route_tables(state) == 0) {
-          route_tables_dirty = 0;
-          route_table_flush_retry_after = 0;
-        } else {
-          route_table_flush_retry_after = now + 1;
-        }
-      }
-    }
   }
 
   for (size_t index = 0; index < client_count; index++) {

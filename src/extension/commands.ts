@@ -40,6 +40,18 @@ import {
 import type { PortManagerNetworkService } from "./network-service";
 import type { PortManagerProcessService } from "./process-service";
 import {
+  buildShellProfilePostludeScript,
+  buildShellProfilePreludeScript,
+  buildShellProfileSourceLine,
+  getKnownManagedShellProfilePlans,
+  getManagedShellProfilePlans,
+  migrateExistingManagedShellProfiles,
+  restoreManagedShellProfile,
+  upsertManagedShellProfile,
+  type ManagedShellProfileOptions,
+  type ShellProfilePlan,
+} from "../platform/process/shell-profile";
+import {
   DOCKER_SHIM_PATH_ENV,
   ESCAPED_SERVER_RESPAWN_ENV,
   EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV,
@@ -225,18 +237,20 @@ export class PortManagerCommandController implements DisposableLike {
       this.repairBrowserDnsRecord(argument),
     ownerCommand);
     this.registerCommand(context, "portManager.installShellHook", () => this.installShellHook(context));
+    this.registerCommand(context, "portManager.restoreShellProfiles", () => this.restoreShellProfiles(context));
     this.registerCommand(context, "portManager.installExternalCli", () => this.installExternalCli(context));
     this.registerCommand(context, "portManager.openOwnerUi", () => this.switchControlOwnerToThisWindow());
     this.registerCommand(context, "portManager.openSettings", () => openPortManagerSettings());
   }
 
-  /** Refreshes generated shell hook assets without mutating user profile files. */
+  /** Refreshes hook assets and narrowly migrates profiles that PM already owns. */
   async ensureShellHookAssets(context: vscode.ExtensionContext): Promise<void> {
     if (process.platform === "win32") {
       return;
     }
 
-    await this.writeShellHookAssets(context);
+    const assets = await this.writeShellHookAssets(context);
+    await migrateExistingManagedShellProfiles(assets.shellProfilePlans, assets.profileOptions);
   }
 
   /** Creates a logical network row backed by the selected runtime adapter. */
@@ -1656,19 +1670,47 @@ export class PortManagerCommandController implements DisposableLike {
     // unchanged-signature fast paths used by background refreshes.
     const assets = await this.writeShellHookAssets(context, { force: true });
 
-    for (const shellProfilePath of assets.shellProfilePaths) {
-      await appendLineOnce(shellProfilePath, assets.sourceLine);
+    for (const plan of assets.shellProfilePlans) {
+      await upsertManagedShellProfile(plan.filePath, assets.profileOptions);
     }
 
     const message =
-      assets.shellProfilePaths.length === 0
+      assets.shellProfilePlans.length === 0
         ? `Installed Port Manager shell hook: ${assets.hookScriptPath}`
-        : `Installed Port Manager shell hook and updated ${assets.shellProfilePaths.join(", ")}`;
-    const selection = await vscode.window.showInformationMessage(message, "Copy Source Line");
+        : `Installed optimized Port Manager shell bootstrap in ${assets.shellProfilePlans.map((plan) => plan.filePath).join(", ")}`;
+    const selection = await vscode.window.showInformationMessage(message, "Copy Setup Lines");
 
-    if (selection === "Copy Source Line") {
-      await vscode.env.clipboard.writeText(assets.sourceLine);
+    if (selection === "Copy Setup Lines") {
+      await vscode.env.clipboard.writeText(
+        `Add this at the beginning of the profile:\n${assets.profileOptions.preludeLine}\n\nAdd this at the end:\n${assets.profileOptions.postludeLine}`,
+      );
     }
+  }
+
+  /** Removes only profile records written by Port Manager. */
+  private async restoreShellProfiles(context: vscode.ExtensionContext): Promise<void> {
+    const confirmation = await vscode.window.showWarningMessage(
+      "Remove Port Manager-managed shell profile entries? New shells will no longer load the PM hook automatically.",
+      { modal: true },
+      "Restore Profiles",
+    );
+    if (confirmation !== "Restore Profiles") {
+      return;
+    }
+
+    const assets = await this.writeShellHookAssets(context);
+    const restored: string[] = [];
+    for (const plan of getKnownManagedShellProfilePlans(os.homedir())) {
+      if (await restoreManagedShellProfile(plan.filePath, assets.profileOptions)) {
+        restored.push(plan.filePath);
+      }
+    }
+
+    await vscode.window.showInformationMessage(
+      restored.length === 0
+        ? "Port Manager found no managed shell profile entries to restore."
+        : `Restored shell profiles: ${restored.join(", ")}. Existing terminals are unchanged.`,
+    );
   }
 
   /** Writes the generated shell hook that external terminals source on startup. */
@@ -1686,13 +1728,20 @@ export class PortManagerCommandController implements DisposableLike {
     const hookDirectory = path.join(os.homedir(), ".portmanager");
     const hookScriptPath = path.join(hookDirectory, "portmanager-hook.sh");
     const hookCommandLibraryPath = path.join(hookDirectory, "portmanager-commands.sh");
+    const profilePreludeScriptPath = path.join(hookDirectory, "portmanager-profile-pre.sh");
+    const profilePostludeScriptPath = path.join(hookDirectory, "portmanager-profile-post.sh");
     const terminalNetworkSelectionFilePath = path.join(
       context.globalStorageUri.fsPath,
       TERMINAL_NETWORK_SELECTION_FILE_NAME,
     );
     const packageVersion = readPortManagerPackageVersion() ?? "unknown";
-    const shellProfilePaths = getShellProfilePaths();
-    const sourceLine = `. "${hookScriptPath}"`;
+    const shellProfilePlans = getManagedShellProfilePlans(process.env.SHELL, os.homedir());
+    const legacySourceLine = `. "${hookScriptPath}"`;
+    const profileOptions: ManagedShellProfileOptions = {
+      preludeLine: buildShellProfileSourceLine(profilePreludeScriptPath),
+      postludeLine: buildShellProfileSourceLine(profilePostludeScriptPath),
+      legacyLines: [legacySourceLine, buildShellProfileSourceLine(hookScriptPath)],
+    };
 
     await fs.mkdir(hookDirectory, { recursive: true });
     const runtimeShimDirectory = prepareRuntimeShimLauncherDirectory(
@@ -1748,6 +1797,12 @@ export class PortManagerCommandController implements DisposableLike {
       ...shellHookOptions,
       commandLibraryPath: hookCommandLibraryPath,
     });
+    const profilePreludeContents = buildShellProfilePreludeScript({
+      hookLibraryPath,
+      runtimeShimDirectory,
+      shellEnvRestorePath,
+    });
+    const profilePostludeContents = buildShellProfilePostludeScript(hookScriptPath);
 
     // Every window regenerates these assets at activation; identical content
     // means the shared-file write (and last-writer churn across windows) can
@@ -1760,16 +1815,26 @@ export class PortManagerCommandController implements DisposableLike {
     if (existingHookScript !== hookScriptContents) {
       await fs.writeFile(hookScriptPath, hookScriptContents, "utf8");
     }
+    const existingProfilePrelude = await fs.readFile(profilePreludeScriptPath, "utf8").catch(() => undefined);
+    if (existingProfilePrelude !== profilePreludeContents) {
+      await fs.writeFile(profilePreludeScriptPath, profilePreludeContents, "utf8");
+    }
+    const existingProfilePostlude = await fs.readFile(profilePostludeScriptPath, "utf8").catch(() => undefined);
+    if (existingProfilePostlude !== profilePostludeContents) {
+      await fs.writeFile(profilePostludeScriptPath, profilePostludeContents, "utf8");
+    }
 
     if (process.platform !== "win32") {
       await fs.chmod(hookCommandLibraryPath, 0o700).catch(() => undefined);
       await fs.chmod(hookScriptPath, 0o700).catch(() => undefined);
+      await fs.chmod(profilePreludeScriptPath, 0o700).catch(() => undefined);
+      await fs.chmod(profilePostludeScriptPath, 0o700).catch(() => undefined);
     }
 
     return {
       hookScriptPath,
-      sourceLine,
-      shellProfilePaths,
+      profileOptions,
+      shellProfilePlans,
     };
   }
 
@@ -3152,35 +3217,6 @@ function getRuntimeCommandShimRelativePath(): string {
   return path.join("media", "native", "portmanager_docker_shim");
 }
 
-/**
- * Chooses startup files for interactive POSIX shells. Zsh reads `.zshrc` for
- * both login and non-login interactive shells, so installing there once avoids
- * running the hook twice. Bash needs both files because login shells do not
- * automatically read `.bashrc`.
- */
-function getShellProfilePaths(): readonly string[] {
-  const shellName = path.basename(process.env.SHELL ?? "");
-
-  if (shellName === "zsh") {
-    return [path.join(os.homedir(), ".zshrc")];
-  }
-
-  if (shellName === "bash") {
-    return uniquePaths([path.join(os.homedir(), ".bash_profile"), path.join(os.homedir(), ".bashrc")]);
-  }
-
-  if (shellName === "sh") {
-    return [path.join(os.homedir(), ".profile")];
-  }
-
-  return [];
-}
-
-/** Removes duplicate profile paths while preserving the intended source order. */
-function uniquePaths(paths: readonly string[]): readonly string[] {
-  return [...new Set(paths)];
-}
-
 function uniqueStrings(values: readonly string[]): readonly string[] {
   return [...new Set(values.filter((value) => value.length > 0))];
 }
@@ -3226,10 +3262,10 @@ interface ShellHookStartupScriptOptions extends ShellHookScriptOptions {
 interface ShellHookAssets {
   /** Generated hook script that profile files source. */
   readonly hookScriptPath: string;
-  /** One-line profile entry users can add when automatic profile mutation is not desired. */
-  readonly sourceLine: string;
-  /** Candidate shell startup files for the current user shell. */
-  readonly shellProfilePaths: readonly string[];
+  /** Exact managed lines used for safe install, migration, and restore. */
+  readonly profileOptions: ManagedShellProfileOptions;
+  /** Startup files bracketed around user runtime-manager initialization. */
+  readonly shellProfilePlans: readonly ShellProfilePlan[];
 }
 
 interface StatusMenuSummary {
@@ -4433,24 +4469,6 @@ function buildExistingShellScopeRouteSelectionScript(options: {
     "  fi",
     "  unset __pm_existing_network_id",
   ].join("\n");
-}
-
-/** Appends one line to a shell profile if it is not already present. */
-async function appendLineOnce(filePath: string, line: string): Promise<void> {
-  let existingContent = "";
-
-  try {
-    existingContent = await fs.readFile(filePath, "utf8");
-  } catch {
-    // Missing shell profiles are created on first install.
-  }
-
-  if (existingContent.split(/\r?\n/).includes(line)) {
-    return;
-  }
-
-  const prefix = existingContent.length > 0 && !existingContent.endsWith("\n") ? "\n" : "";
-  await fs.writeFile(filePath, `${existingContent}${prefix}${line}\n`, "utf8");
 }
 
 /** Escapes a string for safe use inside POSIX double quotes. */

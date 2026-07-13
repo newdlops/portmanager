@@ -10,6 +10,7 @@ import {
   getRouteTablePathForComposeClaimPort,
   getRouteTablePathForLogicalPort,
 } from "../../src/agent/route-table";
+import { buildNodeRuntimeEnvironment } from "../../src/platform/process/node-runtime";
 
 /**
  * Black-box concurrency coverage for the native daemon.
@@ -35,6 +36,9 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   const allocationStart = source.indexOf("int pm_state_allocate_route");
   const allocationEnd = source.indexOf("static void pm_remove_pending_allocation", allocationStart);
   const allocationBody = source.slice(allocationStart, allocationEnd);
+  const registrationStart = source.indexOf("int pm_state_register_process");
+  const registrationEnd = source.indexOf("int pm_state_release_allocation", registrationStart);
+  const registrationBody = source.slice(registrationStart, registrationEnd);
 
   assert.equal(header.includes("PM_LISTENER_SCAN_CACHE_SECONDS 300"), true);
   assert.equal(header.includes("PORTMANAGER_PACKAGE_VERSION"), true);
@@ -94,6 +98,9 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(allocationBody.includes("listener_scan_fresh &&"), false);
   assert.equal(allocationBody.includes("pm_scan_lsof(&listeners"), false);
   assert.equal(allocationBody.includes("strcmp(input->route_direction, \"send\") == 0 && network_id[0] == '\\0'"), true);
+  assert.notEqual(registrationStart, -1);
+  assert.equal(registrationBody.includes("pm_listener_cache_invalidate(state)"), false);
+  assert.equal(registrationBody.includes("Registration describes a listener already present"), true);
   assert.equal(source.includes("static int pm_scan_lsof_for_port"), true);
   assert.equal(source.includes("lsof -nP -iTCP:%d -sTCP:LISTEN -Fpcn"), true);
   assert.equal(source.includes("pm_scan_lsof_for_port(port, &listeners"), true);
@@ -161,10 +168,22 @@ test("native agent recovers restarted hook routes from process environment", () 
   const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
   const header = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.h"), "utf8");
   const tsAgent = fs.readFileSync(path.join(projectRoot, "src", "agent", "port-manager-agent.ts"), "utf8");
+  const inspectStart = source.indexOf("static int pm_inspect_hook_recovery_process");
+  const inspectEnd = source.indexOf("static int pm_recover_untracked_hooked_listener", inspectStart);
+  const inspectBody = source.slice(inspectStart, inspectEnd);
+  const recoveryStart = source.indexOf("static int pm_recover_untracked_hooked_listeners");
+  const recoveryEnd = source.indexOf("static int pm_reconcile_external_processes_with_listeners", recoveryStart);
+  const recoveryBody = source.slice(recoveryStart, recoveryEnd);
 
   assert.equal(source.includes("pm_recover_untracked_hooked_listeners"), true);
   assert.equal(source.includes("pm_read_process_environment_text"), true);
   assert.equal(source.includes("pm_read_process_command_text"), true);
+  assert.notEqual(inspectStart, -1);
+  assert.equal(inspectBody.match(/pm_read_process_environment_text/g)?.length, 1);
+  assert.equal(inspectBody.match(/pm_read_process_command_text/g)?.length, 1);
+  assert.equal(recoveryBody.includes("inspection.pid != listeners->items[index].pid"), true);
+  assert.equal(recoveryBody.includes("memset(&inspection, 0, sizeof(inspection))"), true);
+  assert.equal(recoveryBody.includes("expensive environment/command lookup for every port in that group"), true);
   assert.equal(source.includes("VITE_CLIENT_PORT"), true);
   assert.equal(source.includes("PORT_MANAGER_NETWORK_ID"), true);
   assert.equal(source.includes("NEWDLOPS_PM_NETWORK_ID"), true);
@@ -193,6 +212,118 @@ if (!fs.existsSync(nativeAgentPath)) {
 
     assert.equal(daemon.version, packageJson.version);
     assert.equal(typeof daemon.pid, "number");
+  });
+
+  test("native agent inspects process metadata once for all listeners owned by one PID", async (context) => {
+    const shimDirectory = path.join(
+      projectRoot,
+      ".tmp",
+      "native-agent-tests",
+      `process-inspection-${process.pid}-${Date.now().toString(36)}`,
+    );
+    const lsofLogPath = path.join(shimDirectory, "lsof.log");
+    const psLogPath = path.join(shimDirectory, "ps.log");
+    fs.mkdirSync(shimDirectory, { recursive: true });
+    fs.writeFileSync(lsofLogPath, "");
+    fs.writeFileSync(psLogPath, "");
+    fs.writeFileSync(path.join(shimDirectory, "lsof"), [
+      "#!/bin/sh",
+      "printf '%s\\n' \"$*\" >> \"$PM_TEST_LSOF_LOG\"",
+      `printf 'p${process.pid}\\ncnode\\nn127.0.0.1:48311\\nn127.0.0.1:48312\\n'`,
+    ].join("\n"), { mode: 0o755 });
+    fs.writeFileSync(path.join(shimDirectory, "ps"), [
+      "#!/bin/sh",
+      "printf '%s\\n' \"$*\" >> \"$PM_TEST_PS_LOG\"",
+      "if [ \"$1\" = eww ]; then",
+      "  printf 'node PORT_MANAGER_HOOK=1 PORT_MANAGER_NETWORK_ID=network-recovery-cache PWD=/tmp PORT=48310\\n'",
+      "else",
+      "  printf '/usr/bin/node server.js --port 48310\\n'",
+      "fi",
+    ].join("\n"), { mode: 0o755 });
+    context.after(async () => {
+      await fs.promises.rm(shimDirectory, { recursive: true, force: true }).catch(() => undefined);
+    });
+
+    const fixture = await startNativeAgent(context, {
+      PATH: `${shimDirectory}${path.delimiter}${process.env.PATH ?? ""}`,
+      PM_TEST_LSOF_LOG: lsofLogPath,
+      PM_TEST_PS_LOG: psLogPath,
+      PORT_MANAGER_AGENT_DISABLE_HOOK_RECOVERY: "0",
+    });
+    if (fixture === undefined) {
+      return;
+    }
+
+    const snapshot = await requestOnce<{
+      readonly processes: readonly {
+        readonly actualPort: number;
+        readonly pid: number;
+        readonly source: string;
+      }[];
+    }>(fixture.socketPath, {
+      id: `extension-${process.pid}-pid-inspection-cache`,
+      method: "listSnapshot",
+    });
+    const recoveredPorts = snapshot.processes
+      .filter((candidate) => candidate.pid === process.pid && candidate.source === "hooked")
+      .map((candidate) => candidate.actualPort)
+      .sort((left, right) => left - right);
+    const lsofCalls = fs.readFileSync(lsofLogPath, "utf8");
+    const psCalls = fs.readFileSync(psLogPath, "utf8").trim().split("\n");
+
+    assert.deepEqual(recoveredPorts, [48311, 48312]);
+    assert.notEqual(lsofCalls, "");
+    assert.deepEqual(psCalls, [
+      `eww -p ${process.pid}`,
+      `-o command= -p ${process.pid}`,
+    ]);
+  });
+
+  test("native agent applies a complete registration after the client closes without reading", async (context) => {
+    const fixture = await startNativeAgent(context);
+    if (fixture === undefined) {
+      return;
+    }
+
+    const logicalPort = 8317;
+    const actualPort = await reserveUnusedTcpPort();
+    const networkId = `network-send-only-${process.pid}`;
+    const routeEntryPath = getRouteTablePathForLogicalPort(logicalPort, networkId, fixture.routeTablePath);
+    const socket = await connectSocket(fixture.socketPath);
+
+    // Let the daemon accept this idle client first. Its next poll then observes
+    // the complete frame and peer close together, matching the hook's send-only
+    // registration lifecycle.
+    await delay(100);
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error): void => reject(error);
+      socket.once("error", onError);
+      socket.write(`${JSON.stringify({
+        id: `hook-${process.pid}-send-only-register`,
+        method: "registerExistingProcess",
+        payload: {
+          pid: process.pid,
+          name: "send-only-fixture",
+          command: "send-only-fixture",
+          cwd: projectRoot,
+          requestedPort: logicalPort,
+          actualPort,
+          host: "127.0.0.1",
+          networkId,
+          source: "hooked",
+        },
+      })}\n`, () => {
+        socket.off("error", onError);
+        socket.destroy();
+        resolve();
+      });
+    });
+
+    const table = await waitForRouteTable(routeEntryPath, (candidate) => {
+      const route = candidate.routes[0] as { readonly logicalPort?: number; readonly actualPort?: number } | undefined;
+      return route?.logicalPort === logicalPort && route.actualPort === actualPort;
+    });
+    assert.equal(table.routes.length, 1);
   });
 
   test("native agent probes daemon readiness without a Node helper", async (context) => {
@@ -862,7 +993,10 @@ interface AgentResponse<T> {
   readonly error?: string;
 }
 
-async function startNativeAgent(context: TestContext): Promise<NativeAgentFixture | undefined> {
+async function startNativeAgent(
+  context: TestContext,
+  extraEnvironment: Readonly<NodeJS.ProcessEnv> = {},
+): Promise<NativeAgentFixture | undefined> {
   const baseDirectory = path.join(projectRoot, ".tmp", "native-agent-tests");
   const testDirectory = path.join(
     baseDirectory,
@@ -880,11 +1014,12 @@ async function startNativeAgent(context: TestContext): Promise<NativeAgentFixtur
     "--agent-main",
     path.join(projectRoot, "out", "src", "agent", "agent-main.js"),
   ], {
-    env: {
+    env: buildNodeRuntimeEnvironment({
       ...process.env,
       PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS: "",
       PORT_MANAGER_AGENT_DISABLE_HOOK_RECOVERY: "1",
-    },
+      ...extraEnvironment,
+    }),
     stdio: ["ignore", "ignore", "pipe"],
   });
   agent.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));

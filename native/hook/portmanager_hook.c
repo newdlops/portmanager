@@ -56,6 +56,8 @@
 #define PM_DEFAULT_VIRTUAL_END 59999
 #define PM_DEFAULT_FIXED_PROTOCOL_PORTS "22,25,53,80,110,143,389,443,465,587,993,995,1433,1521,15432,1883,3306,33060,4222,5432,5671,5672,6379,8883,9092,9200,9300,11211,15672,27017,50051"
 #define PM_AGENT_ROUNDTRIP_TIMEOUT_MS 60000
+#define PM_AGENT_SEND_TIMEOUT_MS 250
+#define PM_AGENT_SEND_TIMEOUT_ENV "PORT_MANAGER_AGENT_SEND_TIMEOUT_MS"
 #define PM_BIND_ALLOCATION_ATTEMPTS 4
 #define PM_COMPOSE_ROUTE_WAIT_MS 10000
 #define PM_CONNECT_ROUTE_WAIT_MS 1000
@@ -863,10 +865,12 @@ static int pm_find_network_env_file(const char *network, char *path, size_t size
 static void pm_apply_network_env_file(void) {
   const char *network;
   const char *already_applied;
+  char stable_network[PM_MAX_TEXT];
   char path[PM_MAX_PATH];
   FILE *file;
   char line[4096];
   int applied_count = 0;
+  size_t network_length;
 
   if (!pm_hook_enabled() || pm_network_scope_is_global()) {
     return;
@@ -879,14 +883,26 @@ static void pm_apply_network_env_file(void) {
     return;
   }
 
-  /* Once per process tree: children inherit both the values and this marker. */
-  already_applied = getenv(PM_NETWORK_ENV_APPLIED_ENV);
-  if (already_applied != NULL && strcmp(already_applied, network) == 0) {
+  /*
+   * `network` points into environ. Adding the once-per-tree marker can grow and
+   * relocate that storage; continuing to read the borrowed pointer corrupted
+   * long terminal network ids at the runtime-shim -> server exec boundary.
+   */
+  network_length = strnlen(network, sizeof(stable_network));
+  if (network_length == 0 || network_length >= sizeof(stable_network)) {
     return;
   }
-  setenv(PM_NETWORK_ENV_APPLIED_ENV, network, 1);
+  memcpy(stable_network, network, network_length);
+  stable_network[network_length] = '\0';
 
-  if (pm_find_network_env_file(network, path, sizeof(path)) != 0) {
+  /* Once per process tree: children inherit both the values and this marker. */
+  already_applied = getenv(PM_NETWORK_ENV_APPLIED_ENV);
+  if (already_applied != NULL && strcmp(already_applied, stable_network) == 0) {
+    return;
+  }
+  setenv(PM_NETWORK_ENV_APPLIED_ENV, stable_network, 1);
+
+  if (pm_find_network_env_file(stable_network, path, sizeof(path)) != 0) {
     return;
   }
   file = fopen(path, "r");
@@ -1581,6 +1597,17 @@ static void pm_agent_roundtrip_timeout(struct timeval *timeout) {
   timeout->tv_usec = (timeout_ms % 1000) * 1000;
 }
 
+static void pm_agent_send_timeout(struct timeval *timeout) {
+  int timeout_ms = pm_parse_int_env(PM_AGENT_SEND_TIMEOUT_ENV, PM_AGENT_SEND_TIMEOUT_MS);
+
+  if (timeout_ms < 10) {
+    timeout_ms = 10;
+  }
+
+  timeout->tv_sec = timeout_ms / 1000;
+  timeout->tv_usec = (timeout_ms % 1000) * 1000;
+}
+
 static int pm_is_response_frame(const char *line) {
   return strstr(line, "\"type\":\"response\"") != NULL || strstr(line, "\"type\": \"response\"") != NULL;
 }
@@ -2213,7 +2240,11 @@ static int pm_agent_connect_error_retryable(int error_code) {
          error_code == ECONNRESET;
 }
 
-static int pm_agent_roundtrip(const char *request, char *response, size_t response_size) {
+static int pm_agent_request(
+  const char *request,
+  char *response,
+  size_t response_size,
+  int wait_for_response) {
   char socket_path[PM_MAX_PATH];
   struct sockaddr_un server_addr;
   int fd = -1;
@@ -2234,9 +2265,11 @@ static int pm_agent_roundtrip(const char *request, char *response, size_t respon
   server_addr.sun_family = AF_UNIX;
   snprintf(server_addr.sun_path, sizeof(server_addr.sun_path), "%s", socket_path);
 
-  timeout_ms = pm_parse_int_env("PORT_MANAGER_AGENT_ROUNDTRIP_TIMEOUT_MS", PM_AGENT_ROUNDTRIP_TIMEOUT_MS);
-  if (timeout_ms < 100) {
-    timeout_ms = 100;
+  timeout_ms = wait_for_response
+    ? pm_parse_int_env("PORT_MANAGER_AGENT_ROUNDTRIP_TIMEOUT_MS", PM_AGENT_ROUNDTRIP_TIMEOUT_MS)
+    : pm_parse_int_env(PM_AGENT_SEND_TIMEOUT_ENV, PM_AGENT_SEND_TIMEOUT_MS);
+  if (timeout_ms < (wait_for_response ? 100 : 10)) {
+    timeout_ms = wait_for_response ? 100 : 10;
   }
   deadline_ms = pm_now_milliseconds() + timeout_ms;
   for (;;) {
@@ -2248,7 +2281,11 @@ static int pm_agent_roundtrip(const char *request, char *response, size_t respon
       return -1;
     }
 
-    pm_agent_roundtrip_timeout(&timeout);
+    if (wait_for_response) {
+      pm_agent_roundtrip_timeout(&timeout);
+    } else {
+      pm_agent_send_timeout(&timeout);
+    }
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
@@ -2281,6 +2318,21 @@ static int pm_agent_roundtrip(const char *request, char *response, size_t respon
 
     request += written;
     request_len -= (size_t)written;
+  }
+
+  if (!wait_for_response) {
+    /*
+     * A successful full-frame write hands the newline-delimited request to the
+     * Unix socket before close. Registration is intentionally send-only: the
+     * agent may be busy in a listener scan, but it must still consume queued
+     * bytes after POLLHUP and apply the request without holding up bind().
+     * Allocation-backed routes already proved agent availability through their
+     * preceding roundtrip, while loopback-address-only mode permits
+     * AGENT_REQUIRED=0; its short send budget therefore also keeps an absent
+     * optional agent from turning a successful kernel bind into a 60s stall.
+     */
+    close(fd);
+    return 0;
   }
 
   while (total + 1 < response_size) {
@@ -2336,6 +2388,14 @@ static int pm_agent_roundtrip(const char *request, char *response, size_t respon
     pm_debug("agent returned no response frame socket=%s partial=%.160s", socket_path, response);
   }
   return -1;
+}
+
+static int pm_agent_roundtrip(const char *request, char *response, size_t response_size) {
+  return pm_agent_request(request, response, response_size, 1);
+}
+
+static int pm_agent_send_only(const char *request) {
+  return pm_agent_request(request, NULL, 0, 0);
 }
 
 static const char *pm_find_json_key(const char *json, const char *key) {
@@ -3505,6 +3565,27 @@ static int pm_send_simple_payload(const char *method, const char *payload) {
   return 0;
 }
 
+static int pm_send_simple_payload_only(const char *method, const char *payload) {
+  char request[PM_MAX_REQUEST];
+  unsigned long sequence = __sync_fetch_and_add(&pm_request_sequence, 1);
+
+  snprintf(
+    request,
+    sizeof(request),
+    "{\"id\":\"hook-%ld-%lu\",\"method\":\"%s\",\"payload\":%s}\n",
+    (long)getpid(),
+    sequence,
+    method,
+    payload);
+  if (pm_agent_send_only(request) != 0) {
+    pm_debug("%s send-only failed", method);
+    return -1;
+  }
+
+  pm_debug("%s queued", method);
+  return 0;
+}
+
 static void pm_register_process(int logical_port, int actual_port, const char *host, const char *allocation_id) {
   char cwd[PM_MAX_TEXT];
   char command[PM_MAX_TEXT];
@@ -3540,7 +3621,7 @@ static void pm_register_process(int logical_port, int actual_port, const char *h
     terminal_scope_payload,
     allocation_json);
   pm_debug("registering hooked process logical=%d actual=%d host=%s allocation=%s", logical_port, actual_port, host, allocation_id);
-  (void)pm_send_simple_payload("registerExistingProcess", payload);
+  (void)pm_send_simple_payload_only("registerExistingProcess", payload);
 }
 
 static void pm_release_allocation(const char *allocation_id) {

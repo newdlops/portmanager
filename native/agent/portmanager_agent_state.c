@@ -39,6 +39,18 @@ typedef struct {
   size_t capacity;
 } pm_listener_list;
 
+/**
+ * Process metadata shared by every listener emitted for one lsof PID group.
+ * The inspection is lazy so already-tracked processes never pay for ps.
+ */
+typedef struct {
+  pid_t pid;
+  int inspected;
+  int has_hook_environment;
+  char environment[PM_PROCESS_INSPECT_TEXT];
+  char command[PM_TEXT];
+} pm_hook_recovery_process_inspection;
+
 typedef struct {
   int actual_port;
   const pm_route *route;
@@ -2044,13 +2056,37 @@ static int pm_hook_recovery_disabled(void) {
   return value != NULL && strcmp(value, "1") == 0;
 }
 
-static int pm_recover_untracked_hooked_listener(pm_agent_state *state, const pm_listener *listener, const char *updated_at) {
+static int pm_inspect_hook_recovery_process(pm_hook_recovery_process_inspection *inspection) {
   static const char *const hook_markers[] = {
     "PORT_MANAGER_HOOK",
     "PORT_MANAGER_DYLD_INSERT_LIBRARIES",
     "PORT_MANAGER_AGENT_SOCKET",
     "PORT_MANAGER_ROUTES_FILE",
   };
+
+  if (inspection == NULL || inspection->pid <= 0) {
+    return 0;
+  }
+  if (inspection->inspected) {
+    return inspection->has_hook_environment;
+  }
+
+  inspection->inspected = 1;
+  if (!pm_read_process_environment_text(inspection->pid, inspection->environment, sizeof(inspection->environment)) ||
+      !pm_process_text_has_any_value(inspection->environment, hook_markers, sizeof(hook_markers) / sizeof(hook_markers[0]))) {
+    return 0;
+  }
+
+  inspection->has_hook_environment = 1;
+  (void)pm_read_process_command_text(inspection->pid, inspection->command, sizeof(inspection->command));
+  return 1;
+}
+
+static int pm_recover_untracked_hooked_listener(
+  pm_agent_state *state,
+  const pm_listener *listener,
+  const char *updated_at,
+  pm_hook_recovery_process_inspection *inspection) {
   static const char *const network_variables[] = {
     "PORT_MANAGER_NETWORK_ID",
     "PORT_MANAGER_BORROWED_NETWORK_ID",
@@ -2067,7 +2103,6 @@ static int pm_recover_untracked_hooked_listener(pm_agent_state *state, const pm_
   static const char *const terminal_group_variables[] = {
     "PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID",
   };
-  char environment[PM_PROCESS_INSPECT_TEXT];
   char command[PM_TEXT];
   char network_id[PM_SMALL];
   char cwd[PM_TEXT];
@@ -2088,33 +2123,34 @@ static int pm_recover_untracked_hooked_listener(pm_agent_state *state, const pm_
     return 0;
   }
 
-  if (!pm_read_process_environment_text(listener->pid, environment, sizeof(environment)) ||
-      !pm_process_text_has_any_value(environment, hook_markers, sizeof(hook_markers) / sizeof(hook_markers[0]))) {
+  if (inspection == NULL || inspection->pid != listener->pid || !pm_inspect_hook_recovery_process(inspection)) {
     return 0;
   }
   network_id[0] = '\0';
-  (void)pm_process_text_first_value(environment, network_variables, sizeof(network_variables) / sizeof(network_variables[0]), network_id, sizeof(network_id));
+  (void)pm_process_text_first_value(inspection->environment, network_variables, sizeof(network_variables) / sizeof(network_variables[0]), network_id, sizeof(network_id));
   experimental_route_ownership_mode[0] = '\0';
   terminal_session_id[0] = '\0';
   terminal_group_id[0] = '\0';
-  (void)pm_process_text_first_value(environment, (const char *const[]){"PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE"}, 1, experimental_route_ownership_mode, sizeof(experimental_route_ownership_mode));
+  (void)pm_process_text_first_value(inspection->environment, (const char *const[]){"PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE"}, 1, experimental_route_ownership_mode, sizeof(experimental_route_ownership_mode));
   if (pm_scoped_route_ownership_mode(experimental_route_ownership_mode)) {
-    (void)pm_process_text_first_value(environment, terminal_session_variables, sizeof(terminal_session_variables) / sizeof(terminal_session_variables[0]), terminal_session_id, sizeof(terminal_session_id));
-    (void)pm_process_text_first_value(environment, terminal_group_variables, sizeof(terminal_group_variables) / sizeof(terminal_group_variables[0]), terminal_group_id, sizeof(terminal_group_id));
+    (void)pm_process_text_first_value(inspection->environment, terminal_session_variables, sizeof(terminal_session_variables) / sizeof(terminal_session_variables[0]), terminal_session_id, sizeof(terminal_session_id));
+    (void)pm_process_text_first_value(inspection->environment, terminal_group_variables, sizeof(terminal_group_variables) / sizeof(terminal_group_variables[0]), terminal_group_id, sizeof(terminal_group_id));
   }
 
-  if (!pm_read_process_command_text(listener->pid, command, sizeof(command))) {
+  if (inspection->command[0] != '\0') {
+    pm_copy(command, sizeof(command), inspection->command);
+  } else {
     pm_copy(command, sizeof(command), listener->command[0] ? listener->command : listener->process_name);
   }
   if (pm_is_hook_recovery_helper_text(command)) {
     return 0;
   }
 
-  requested_port = pm_infer_requested_port_from_environment(environment, listener->port);
+  requested_port = pm_infer_requested_port_from_environment(inspection->environment, listener->port);
   if (requested_port <= 0) {
     requested_port = pm_infer_requested_port_from_command(command, listener->port);
   }
-  if (!pm_process_text_first_value(environment, cwd_variables, sizeof(cwd_variables) / sizeof(cwd_variables[0]), cwd, sizeof(cwd))) {
+  if (!pm_process_text_first_value(inspection->environment, cwd_variables, sizeof(cwd_variables) / sizeof(cwd_variables[0]), cwd, sizeof(cwd))) {
     pm_copy(cwd, sizeof(cwd), ".");
   }
   if (network_id[0] == '\0' ||
@@ -2162,6 +2198,7 @@ static int pm_recover_untracked_hooked_listeners(
   pm_agent_state *state,
   const pm_listener_list *listeners,
   const char *updated_at) {
+  pm_hook_recovery_process_inspection inspection = {0};
   int changed = 0;
 
   if (pm_hook_recovery_disabled()) {
@@ -2169,12 +2206,21 @@ static int pm_recover_untracked_hooked_listeners(
   }
 
   for (size_t index = 0; listeners != NULL && index < listeners->count; index++) {
+    if (inspection.pid != listeners->items[index].pid) {
+      /*
+       * lsof -F emits all n records beneath their p record, so listeners for a
+       * process are contiguous. Reset only at a PID boundary and reuse the
+       * expensive environment/command lookup for every port in that group.
+       */
+      memset(&inspection, 0, sizeof(inspection));
+      inspection.pid = listeners->items[index].pid;
+    }
     /*
      * Daemon restarts erase in-memory hook registrations, but the server keeps
      * the Port Manager environment. Rehydrate only listeners that still carry
      * that environment and expose an explicit logical-port hint.
      */
-    if (pm_recover_untracked_hooked_listener(state, &listeners->items[index], updated_at)) {
+    if (pm_recover_untracked_hooked_listener(state, &listeners->items[index], updated_at, &inspection)) {
       changed = 1;
     }
   }
@@ -3538,12 +3584,16 @@ int pm_state_register_process(pm_agent_state *state, const pm_register_input *in
   pm_clear_missing_listener_state(process);
 
   pm_remove_pending_endpoint(state, process->requested_port, network_id);
-  pm_listener_cache_invalidate(state);
   /*
-   * Registrations can arrive in the same bind/connect burst as allocation
-   * requests. The event loop already marks route tables dirty after this method
-   * returns; defer every registration source to the coalesced flush so one
-   * cluster cannot keep the single control loop in filesystem writes.
+   * Registration describes a listener already present in the current OS
+   * topology; it does not mutate that topology. Invalidating the global lsof
+   * cache here turns a bind burst into a synchronous full scan during the idle
+   * snapshot broadcast. External discovery and dead-listener reconciliation
+   * continue on genuine fresh scans (cache expiry and grace follow-up).
+   *
+   * The event loop already marks route tables dirty after this method returns;
+   * defer every registration source to the coalesced flush so one cluster cannot
+   * keep the single control loop in filesystem writes.
    */
   return pm_append_process_json(payload, process);
 }

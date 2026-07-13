@@ -199,7 +199,8 @@ static char *pm_without_portmanager_preloads(const char *current_value) {
 static void pm_restore_dyld(void) {
   const char *hook = getenv(PM_PRELOAD_HINT_ENV);
   const char *current = getenv(PM_PRELOAD_ENV);
-  char *merged;
+  char *merged = NULL;
+  int preload_is_normalized;
 
   if (hook == NULL || hook[0] == '\0') {
     return;
@@ -226,6 +227,12 @@ static void pm_restore_dyld(void) {
     return;
   }
 
+  /* Compute from borrowed getenv() values before setenv can relocate environ. */
+  preload_is_normalized = pm_preload_value_is_normalized(current, hook);
+  if (!preload_is_normalized) {
+    merged = pm_make_preload_value(hook, current);
+  }
+
   /*
    * The native hook only repairs stripped preload variables for processes that
    * crossed an extension-owned runtime boundary. This keeps package-manager
@@ -234,11 +241,10 @@ static void pm_restore_dyld(void) {
    */
   setenv("PORT_MANAGER_PRELOAD_REPAIR", "1", 1);
 
-  if (pm_preload_value_is_normalized(current, hook)) {
+  if (preload_is_normalized) {
     return;
   }
 
-  merged = pm_make_preload_value(hook, current);
   if (merged == NULL) {
     return;
   }
@@ -379,14 +385,30 @@ static const char *pm_network_id_from_compose_routing_file(void) {
 }
 
 static void pm_export_network_scope(const char *network_id) {
+  char stable_network_id[PM_MAX_TEXT];
+  size_t network_id_length;
+
   if (network_id == NULL || network_id[0] == '\0') {
     return;
   }
 
-  setenv("PORT_MANAGER_NETWORK_ID", network_id, 1);
-  setenv("PORT_MANAGER_BORROWED_NETWORK_ID", network_id, 1);
-  setenv("NEWDLOPS_PM_NETWORK_ID", network_id, 1);
-  setenv("NEWDLOPS_PM_BORROWED_NETWORK_ID", network_id, 1);
+  /*
+   * The selected value commonly points directly into `environ` via getenv().
+   * Replacing the first alias may free or move that storage, so feeding the same
+   * pointer into later setenv() calls is undefined and corrupted long network
+   * ids at the runtime-shim boundary. Copy once before mutating any alias.
+   */
+  network_id_length = strnlen(network_id, sizeof(stable_network_id));
+  if (network_id_length == 0 || network_id_length >= sizeof(stable_network_id)) {
+    return;
+  }
+  memcpy(stable_network_id, network_id, network_id_length);
+  stable_network_id[network_id_length] = '\0';
+
+  setenv("PORT_MANAGER_NETWORK_ID", stable_network_id, 1);
+  setenv("PORT_MANAGER_BORROWED_NETWORK_ID", stable_network_id, 1);
+  setenv("NEWDLOPS_PM_NETWORK_ID", stable_network_id, 1);
+  setenv("NEWDLOPS_PM_BORROWED_NETWORK_ID", stable_network_id, 1);
 }
 
 static void pm_restore_network_scope(void) {
@@ -394,6 +416,16 @@ static void pm_restore_network_scope(void) {
   const char *borrowed_network_id = getenv("PORT_MANAGER_BORROWED_NETWORK_ID");
   const char *alias_network_id = getenv("NEWDLOPS_PM_NETWORK_ID");
   const char *alias_borrowed_network_id = getenv("NEWDLOPS_PM_BORROWED_NETWORK_ID");
+
+  /* The extension normally supplies the complete scope. Avoid rewriting a
+   * correct environ at every runtime launch; fallback repair below is only for
+   * protected or third-party boundaries that dropped one of the aliases. */
+  if (network_id != NULL && network_id[0] != '\0' &&
+      borrowed_network_id != NULL && strcmp(borrowed_network_id, network_id) == 0 &&
+      alias_network_id != NULL && strcmp(alias_network_id, network_id) == 0 &&
+      alias_borrowed_network_id != NULL && strcmp(alias_borrowed_network_id, network_id) == 0) {
+    return;
+  }
 
   if (network_id == NULL || network_id[0] == '\0') {
     network_id = borrowed_network_id;

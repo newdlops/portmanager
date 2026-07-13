@@ -18,6 +18,7 @@
 
 ## 주요 진입점
 
+- `shell-profile.ts`: PM이 소유한 shell profile 경계의 설치·마이그레이션·복구
 - `node-process-launcher.ts`
 - `node-runtime.ts`
 - `node-process-table.ts`

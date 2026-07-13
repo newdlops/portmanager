@@ -79,7 +79,7 @@ By default, Port Manager uses hashed logical routing: a requested port such as `
 
 For new VS Code terminals, Port Manager injects the native socket hook while the daemon is running. When a terminal-launched process calls `bind()` on a port that is not in `portManager.fixedProtocolPorts`, the hook asks the daemon for an actual port before the OS bind happens, then registers the logical route. The explicit `Rerun Routed` prompt and listen-failure monitor remain fallback paths for terminals that were already open or are not running with the hook environment.
 
-For terminals outside VS Code, run `Port Manager: Install Shell Hook` once from the Command Palette, then open a new shell. The hook is sourced from your shell profile and injects the native socket hook into descendant development processes.
+For terminals outside VS Code, run `Port Manager: Install Shell Hook` once from the Command Palette, then open a new shell. Port Manager brackets the user profile with a builtin-only prelude and a deferred activation step, so runtime managers initialize without inherited PM preload/PATH shims while prompt commands keep the same routing behavior. `Port Manager: Restore Shell Profiles` removes only PM-owned profile blocks and historical source lines if you want to return to manual activation.
 
 ```sh
 daphne -b 127.0.0.1 -p 8000 myapp.asgi:application

@@ -910,12 +910,17 @@ function applyRuntimeShimLauncherPath(
 
   if (launcherDirectory !== undefined) {
     collection.replace(RUNTIME_SHIM_DIRECTORY_ENV, launcherDirectory, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
-    collection.replace("PORT_MANAGER_RUNTIME_SHIM_READY", "1", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
     /*
+     * The managed profile prelude deliberately resets readiness while runtime
+     * managers initialize. Restore it in the same shell-integration phase that
+     * prepends the verified shim directory; leaving it in process-creation
+     * context would strand the ready prompt at 0 after the prelude runs.
+     *
      * Preserve the terminal shell's real PATH. Replacing PATH from the extension
      * host environment can hide Docker/Compose/runtime entries and bypass the
      * lifecycle-signal shims; attach and BASH_ENV scripts normalize duplicates.
      */
+    collection.replace("PORT_MANAGER_RUNTIME_SHIM_READY", "1", TERMINAL_ACTIVATION_MUTATOR_OPTIONS);
     collection.prepend("PATH", `${launcherDirectory}${path.delimiter}`, TERMINAL_ACTIVATION_MUTATOR_OPTIONS);
   }
 }
