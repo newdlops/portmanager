@@ -163,6 +163,16 @@ typedef struct {
   const char *payload;
 } pm_request;
 
+/** Parsed native-agent CLI mode and paths. */
+typedef struct {
+  char socket_path[PM_TEXT];
+  char route_table_path[PM_TEXT];
+  char agent_main_path[PM_TEXT];
+  char stale_lock_path[PM_TEXT];
+  int probe_only;
+  int lock_stale_mode;
+} pm_agent_arguments;
+
 typedef struct {
   char name[PM_SMALL];
   char command[PM_TEXT];
@@ -260,5 +270,10 @@ int pm_parse_allocate_input(const char *payload, pm_allocate_input *input);
 int pm_parse_register_input(const char *payload, pm_register_input *input);
 int pm_parse_start_input(const char *payload, pm_start_input *input);
 int pm_parse_release_process_input(const char *payload, pm_release_process_input *input);
+
+/** Lightweight shell-startup helpers implemented without a Node runtime. */
+int pm_parse_agent_arguments(int argc, char **argv, pm_agent_arguments *arguments);
+int pm_probe_daemon(const char *socket_path, const char *expected_agent_main_path);
+int pm_lock_is_stale(const char *lock_path);
 
 #endif

@@ -26,6 +26,7 @@ const nativeAgentPath = path.join(projectRoot, "media", "native", "portmanager_a
 test("native agent caches listener scans for concurrent snapshot readers", () => {
   const header = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.h"), "utf8");
   const agentSource = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.c"), "utf8");
+  const probeSource = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_probe.c"), "utf8");
   const hookSource = fs.readFileSync(path.join(projectRoot, "native", "hook", "portmanager_hook.c"), "utf8");
   const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
   const snapshotStart = source.indexOf("int pm_state_snapshot");
@@ -44,6 +45,14 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(agentSource.includes("PM_LISTEN_BACKLOG 16384"), true);
   assert.equal(agentSource.includes("static int pm_socket_has_live_server"), true);
   assert.equal(agentSource.includes("Port Manager agent is already listening"), true);
+  assert.equal(probeSource.includes("int pm_probe_daemon"), true);
+  assert.equal(probeSource.includes("int pm_lock_is_stale"), true);
+  assert.equal(probeSource.includes("CLOCK_MONOTONIC"), true);
+  assert.equal(probeSource.includes('strcmp(argv[index], "--probe")'), true);
+  assert.equal(probeSource.includes("int saw_newline = 0"), true);
+  assert.equal(probeSource.includes("pm_json_get_string(payload, \"agentMainPath\""), true);
+  assert.equal(probeSource.includes("pm_stat_mtime_is_newer_than_milliseconds(&expected_stat, started_at_ms + 1000)"), true);
+  assert.equal(probeSource.includes("(size_t)written >= out_size"), true);
   assert.equal(agentSource.includes("Only unlink after"), true);
   assert.equal(agentSource.includes("bind_errno != EADDRINUSE || pm_socket_has_live_server"), true);
   assert.equal(agentSource.includes("PM_CLIENT_BUFFER_INITIAL 2048"), true);
@@ -184,6 +193,184 @@ if (!fs.existsSync(nativeAgentPath)) {
 
     assert.equal(daemon.version, packageJson.version);
     assert.equal(typeof daemon.pid, "number");
+  });
+
+  test("native agent probes daemon readiness without a Node helper", async (context) => {
+    const fixture = await startNativeAgent(context);
+    if (fixture === undefined) {
+      return;
+    }
+    const agentMainPath = path.join(projectRoot, "out", "src", "agent", "agent-main.js");
+    const probeEnvironment = {
+      ...process.env,
+      PORT_MANAGER_HOOK_DISABLED: "1",
+      PORT_MANAGER_HOOK: "0",
+      DYLD_INSERT_LIBRARIES: "",
+      LD_PRELOAD: "",
+    };
+
+    const matchingProbe = spawn(nativeAgentPath, [
+      "--probe",
+      "--socket",
+      fixture.socketPath,
+      "--agent-main",
+      agentMainPath,
+    ], { env: probeEnvironment, stdio: "ignore" });
+    assert.equal(await waitForProcessExit(matchingProbe, 2_000), 0);
+
+    const mismatchedProbe = spawn(nativeAgentPath, [
+      "--probe",
+      "--socket",
+      fixture.socketPath,
+      "--agent-main",
+      `${agentMainPath}.stale`,
+    ], { env: probeEnvironment, stdio: "ignore" });
+    assert.notEqual(await waitForProcessExit(mismatchedProbe, 2_000), 0);
+  });
+
+  test("native agent checks stale startup locks without a Node helper", async () => {
+    const lockPath = path.join(projectRoot, ".tmp", `native-agent-lock-${process.pid}-${Date.now()}`);
+    fs.mkdirSync(lockPath, { recursive: true });
+    try {
+      const freshCheck = spawn(nativeAgentPath, ["--lock-stale", lockPath], { stdio: "ignore" });
+      assert.notEqual(await waitForProcessExit(freshCheck, 2_000), 0);
+
+      const staleTime = new Date(Date.now() - 20_000);
+      fs.utimesSync(lockPath, staleTime, staleTime);
+      const staleCheck = spawn(nativeAgentPath, ["--lock-stale", lockPath], { stdio: "ignore" });
+      assert.equal(await waitForProcessExit(staleCheck, 2_000), 0);
+    } finally {
+      fs.rmSync(lockPath, { recursive: true, force: true });
+    }
+  });
+
+  test("native agent rejects truncated CLI identity paths", async () => {
+    const overlongPath = `/${"a".repeat(1_100)}`;
+    const probe = spawn(nativeAgentPath, [
+      "--probe",
+      "--socket",
+      "/tmp/pm-unused.sock",
+      "--agent-main",
+      overlongPath,
+    ], { stdio: "ignore" });
+    assert.notEqual(await waitForProcessExit(probe, 2_000), 0);
+  });
+
+  test("native agent bounds an unresponsive daemon probe", async (context) => {
+    const socketPath = path.join(
+      projectRoot,
+      ".tmp",
+      `native-agent-unresponsive-${process.pid}-${Date.now()}.sock`,
+    );
+    fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+    const acceptedSockets = new Set<net.Socket>();
+    const server = net.createServer((socket) => {
+      acceptedSockets.add(socket);
+      socket.on("close", () => acceptedSockets.delete(socket));
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(socketPath, resolve);
+      });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") {
+        context.skip("Unix sockets are not available in this sandbox");
+        fs.rmSync(socketPath, { force: true });
+        return;
+      }
+      throw error;
+    }
+
+    try {
+      const startedAt = Date.now();
+      const probe = spawn(nativeAgentPath, [
+        "--probe",
+        "--socket",
+        socketPath,
+        "--agent-main",
+        path.join(projectRoot, "out", "src", "agent", "agent-main.js"),
+      ], { stdio: "ignore" });
+      assert.notEqual(await waitForProcessExit(probe, 2_000), 0);
+      assert.ok(Date.now() - startedAt < 1_000, "native probe must retain the original 350ms total budget");
+    } finally {
+      for (const socket of acceptedSockets) {
+        socket.destroy();
+      }
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      fs.rmSync(socketPath, { force: true });
+    }
+  });
+
+  test("native agent validates the first daemon frame and millisecond freshness", async (context) => {
+    const testDirectory = path.join(projectRoot, ".tmp", `native-agent-probe-frame-${process.pid}-${Date.now()}`);
+    const socketPath = path.join(testDirectory, "agent.sock");
+    const agentMainPath = path.join(testDirectory, "agent-main.js");
+    fs.mkdirSync(testDirectory, { recursive: true });
+    fs.writeFileSync(agentMainPath, "// probe fixture\n", "utf8");
+    const startedAt = "2026-01-02T03:04:05.500Z";
+    fs.utimesSync(agentMainPath, new Date("2026-01-02T03:04:05.000Z"), new Date("2026-01-02T03:04:05.000Z"));
+    const healthyFrame = `${JSON.stringify({
+      type: "response",
+      id: "native-probe",
+      method: "daemonStatus",
+      ok: true,
+      payload: { agentMainPath, startedAt },
+    })}\n`;
+    let response = healthyFrame;
+    const server = net.createServer((socket) => {
+      socket.once("data", () => socket.end(response));
+    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(socketPath, resolve);
+      });
+    } catch (error) {
+      fs.rmSync(testDirectory, { recursive: true, force: true });
+      if ((error as NodeJS.ErrnoException).code === "EPERM") {
+        context.skip("Unix sockets are not available in this sandbox");
+        return;
+      }
+      throw error;
+    }
+
+    try {
+      const healthyProbe = spawn(nativeAgentPath, [
+        "--probe",
+        "--socket",
+        socketPath,
+        "--agent-main",
+        agentMainPath,
+      ], { stdio: "ignore" });
+      assert.equal(await waitForProcessExit(healthyProbe, 2_000), 0);
+
+      response = `{"type":"response","ok":false}\n${healthyFrame}`;
+      const trailingFrameProbe = spawn(nativeAgentPath, [
+        "--probe",
+        "--socket",
+        socketPath,
+        "--agent-main",
+        agentMainPath,
+      ], { stdio: "ignore" });
+      assert.notEqual(await waitForProcessExit(trailingFrameProbe, 2_000), 0);
+
+      response = healthyFrame;
+      const newerMtime = new Date(Date.parse(startedAt) + 1_001);
+      fs.utimesSync(agentMainPath, newerMtime, newerMtime);
+      const staleProbe = spawn(nativeAgentPath, [
+        "--probe",
+        "--socket",
+        socketPath,
+        "--agent-main",
+        agentMainPath,
+      ], { stdio: "ignore" });
+      assert.notEqual(await waitForProcessExit(staleProbe, 2_000), 0);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      fs.rmSync(testDirectory, { recursive: true, force: true });
+    }
   });
 
   test("native agent refuses to replace a live socket owner", async (context) => {

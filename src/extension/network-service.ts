@@ -11800,12 +11800,20 @@ function buildAgentDaemonEnsureShell(nodeExecutablePath: string): string {
     'const lock=process.argv[1];',
     'try{const age=Date.now()-fs.statSync(lock).mtimeMs;process.exit(age>15000?0:1);}catch{process.exit(1);}',
   ].join("");
-  const probeCommand = daemonRuntimeCommand(`${shellQuote(nodeExecutablePath)} -e ${shellQuote(
+  const nodeProbeCommand = daemonRuntimeCommand(`${shellQuote(nodeExecutablePath)} -e ${shellQuote(
     nodeProbeScript,
   )} "$PORT_MANAGER_AGENT_SOCKET" "$PORT_MANAGER_AGENT_MAIN"`);
-  const staleLockCommand = daemonRuntimeCommand(`${shellQuote(nodeExecutablePath)} -e ${shellQuote(
+  const nativeProbeCommand = daemonRuntimeCommand(
+    '"$PORT_MANAGER_AGENT_EXECUTABLE" --probe --socket "$PORT_MANAGER_AGENT_SOCKET" --agent-main "$PORT_MANAGER_AGENT_MAIN"',
+  );
+  const probeCommand = `if [ -x "$PORT_MANAGER_AGENT_EXECUTABLE" ]; then ${nativeProbeCommand} || ${nodeProbeCommand}; else ${nodeProbeCommand}; fi`;
+  const nodeStaleLockCommand = daemonRuntimeCommand(`${shellQuote(nodeExecutablePath)} -e ${shellQuote(
     staleLockScript,
   )} "$__pm_agent_lock"`);
+  const nativeStaleLockCommand = daemonRuntimeCommand(
+    '"$PORT_MANAGER_AGENT_EXECUTABLE" --lock-stale "$__pm_agent_lock"',
+  );
+  const staleLockCommand = `if [ -x "$PORT_MANAGER_AGENT_EXECUTABLE" ]; then ${nativeStaleLockCommand} || ${nodeStaleLockCommand}; else ${nodeStaleLockCommand}; fi`;
   const nativeAgentLaunchCommand = daemonLaunchCommand(
     `"$PORT_MANAGER_AGENT_EXECUTABLE" --socket "$PORT_MANAGER_AGENT_SOCKET" --route-table "$PORT_MANAGER_GLOBAL_ROUTES_FILE" --agent-main "$PORT_MANAGER_AGENT_MAIN"`,
   );

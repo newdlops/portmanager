@@ -144,21 +144,11 @@ static void pm_control_registry_remove_fd(int fd) {
   }
 }
 
-typedef struct {
-  char socket_path[PM_TEXT];
-  char route_table_path[PM_TEXT];
-  char agent_main_path[PM_TEXT];
-} pm_arguments;
-
 static int pm_running = 1;
 
 static void pm_handle_signal(int signal_number) {
   (void)signal_number;
   pm_running = 0;
-}
-
-static void pm_usage(void) {
-  fprintf(stderr, "Usage: portmanager_agent --socket <path> [--route-table <path>] [--agent-main <path>]\n");
 }
 
 static int pm_set_nonblocking(int fd) {
@@ -168,34 +158,6 @@ static int pm_set_nonblocking(int fd) {
   }
 
   return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-static int pm_parse_arguments(int argc, char **argv, pm_arguments *arguments) {
-  memset(arguments, 0, sizeof(*arguments));
-
-  for (int index = 1; index < argc; index++) {
-    if (strcmp(argv[index], "--socket") == 0 && index + 1 < argc) {
-      snprintf(arguments->socket_path, sizeof(arguments->socket_path), "%s", argv[++index]);
-      continue;
-    }
-    if (strcmp(argv[index], "--route-table") == 0 && index + 1 < argc) {
-      snprintf(arguments->route_table_path, sizeof(arguments->route_table_path), "%s", argv[++index]);
-      continue;
-    }
-    if (strcmp(argv[index], "--agent-main") == 0 && index + 1 < argc) {
-      snprintf(arguments->agent_main_path, sizeof(arguments->agent_main_path), "%s", argv[++index]);
-      continue;
-    }
-    pm_usage();
-    return -1;
-  }
-
-  if (arguments->socket_path[0] == '\0') {
-    pm_usage();
-    return -1;
-  }
-
-  return 0;
 }
 
 static int pm_socket_has_live_server(const struct sockaddr_un *address) {
@@ -944,7 +906,7 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
 }
 
 int main(int argc, char **argv) {
-  pm_arguments arguments;
+  pm_agent_arguments arguments;
   pm_agent_state state;
   int server_fd;
 
@@ -960,8 +922,15 @@ int main(int argc, char **argv) {
    */
   signal(SIGPIPE, SIG_IGN);
 
-  if (pm_parse_arguments(argc, argv, &arguments) != 0) {
+  if (pm_parse_agent_arguments(argc, argv, &arguments) != 0) {
     return 1;
+  }
+
+  if (arguments.lock_stale_mode) {
+    return pm_lock_is_stale(arguments.stale_lock_path) ? 0 : 1;
+  }
+  if (arguments.probe_only) {
+    return pm_probe_daemon(arguments.socket_path, arguments.agent_main_path) == 0 ? 0 : 1;
   }
 
   server_fd = pm_create_server(arguments.socket_path);

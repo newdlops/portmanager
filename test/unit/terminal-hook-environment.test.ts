@@ -763,6 +763,20 @@ test("profile shell hook lazy-loads heavy pm command implementation", () => {
   assert.equal(startupSource.includes('pm() {'), true);
   assert.equal(startupSource.includes('. "${escapedCommandLibraryPath}" || return $?'), true);
   assert.equal(startupSource.includes('if [ "\\${${AGENT_REQUIRED_ENV}:-${agentRequired ? "1" : "0"}}" = "1" ]; then'), true);
+  assert.equal(startupSource.includes('"$PORT_MANAGER_AGENT_EXECUTABLE" --probe --socket'), true);
+  assert.equal(startupSource.includes("export PORT_MANAGER_HOOK_DAEMON_STARTED=1"), true);
+  assert.equal(startupSource.includes("__pm_startup_shims_ready"), true);
+  assert.equal(startupSource.includes('if [ ! -f "${escapedHookLibraryPath}" ]; then'), true);
+  assert.equal(startupSource.includes('for __pm_startup_shim_name in ${TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES.join(" ")}'), true);
+  assert.equal(
+    startupSource.indexOf('if [ "$__pm_startup_shims_ready" = "1" ]; then') <
+      startupSource.indexOf('${nativeHookPreloadScript', startupSource.indexOf("__pm_startup_shims_ready")),
+    true,
+  );
+  assert.equal(
+    startupSource.includes('# Cold/stale daemon recovery retains the serialized startup behavior.'),
+    true,
+  );
   assert.equal(startupSource.includes("routePrintScript"), false);
   assert.equal(startupSource.includes("doctorRoutingScript"), false);
   assert.equal(startupSource.includes("workerEnvScript"), false);
@@ -773,6 +787,8 @@ test("profile shell hook lazy-loads heavy pm command implementation", () => {
   assert.equal(startupSource.includes("return 0 2>/dev/null || true"), true);
   assert.equal(commandSource.includes('__pm_path_remaining="\\${${name}:-}"'), true);
   assert.equal(commandSource.includes('while [ -n "$__pm_path_remaining" ]; do'), true);
+  assert.equal(commandSource.includes('`case ":\\${${name}:-}:" in`'), true);
+  assert.equal(commandSource.includes("Most VS Code profile starts have no preload entry yet"), true);
 });
 
 test("agent client startup avoids blocking on full listener refresh", () => {
@@ -1050,6 +1066,11 @@ test("terminal daemon ensure serializes agent startup and preserves slow live so
     assert.equal(source.includes("function shutdownStale"), false);
     assert.equal(source.includes('const staleLockScript = ['), true);
     assert.equal(source.includes("age>15000?0:1"), true);
+    assert.equal(source.includes('--probe --socket "$PORT_MANAGER_AGENT_SOCKET"'), true);
+    assert.equal(source.includes('--lock-stale "$__pm_agent_lock"'), true);
+    assert.equal(source.includes('if [ -x "$PORT_MANAGER_AGENT_EXECUTABLE" ]; then'), true);
+    assert.equal(source.includes("nativeProbeCommand} || ${nodeProbeCommand}"), true);
+    assert.equal(source.includes("nativeStaleLockCommand} || ${nodeStaleLockCommand}"), true);
     assert.equal(source.includes('timer=setTimeout(()=>finish(1,false),350);'), true);
     assert.equal(source.includes('socket.once("error",()=>finish(1,false));'), true);
     assert.equal(

@@ -15,6 +15,7 @@ Port Manager의 단일 로컬 daemon을 저수준 POSIX 프로세스로 제공�
 ## 주요 진입점
 
 - `portmanager_agent.c`: Unix-domain socket server와 protocol dispatch
+- `portmanager_agent_probe.c`: 터미널 시작용 daemon readiness와 stale-lock 검사
 - `portmanager_agent_state.c`: route, process, snapshot, child lifecycle 상태
 - `portmanager_agent_json.c`: protocol payload 파싱과 JSON 응답 작성
 
