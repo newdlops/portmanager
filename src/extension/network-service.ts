@@ -5009,6 +5009,29 @@ export class PortManagerNetworkService implements DisposableLike {
     logicalPort: number,
   ): Promise<LogicalPortRouterTarget | undefined> {
     const globalLoopbackHost = loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID);
+
+    /*
+     * The gateway listener for this port is opened from the global route row
+     * the hook registers at bind time, so the row is already visible whenever
+     * the router accepts a dial here. Listener snapshots lag freshly bound
+     * servers by many seconds, which a one-shot client (an OAuth loopback
+     * redirect) cannot survive — answer from the route row first and keep the
+     * snapshot lookup as the fallback for expired rows.
+     */
+    const globalRoute = await this.findNetworkRouteForRouter(GLOBAL_LOGICAL_NETWORK_ID, logicalPort, []);
+    if (
+      globalRoute !== undefined &&
+      normalizeEndpointHostKey(globalRoute.host) === normalizeEndpointHostKey(globalLoopbackHost)
+    ) {
+      if (devLogEnabled()) {
+        devLog(
+          "ts-router",
+          `global-default logical_port=${logicalPort} -> route ${globalRoute.host}:${globalRoute.actualPort}`,
+        );
+      }
+      return { host: globalRoute.host, port: globalRoute.actualPort };
+    }
+
     const listener = await this.findNetworkScopedListener(GLOBAL_LOGICAL_NETWORK_ID, logicalPort, globalLoopbackHost);
     if (listener === undefined) {
       if (devLogEnabled()) {

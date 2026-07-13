@@ -209,3 +209,42 @@ test("idle agent daemon skips periodic listener scans with no clients or state",
   assert.equal(skipBody.includes("this.pendingRouteAllocations.size === 0"), true);
   assert.equal(skipBody.includes("this.reservedListeningEndpoints.length === 0"), true);
 });
+
+test("register-triggered broadcasts publish from cached listeners before fresh scans", () => {
+  const source = readSource("src/agent/port-manager-agent.ts");
+
+  // Route rows gate the logical port gateway open, so the register-triggered
+  // broadcast must not wait for an lsof-scale scan: fast pass from any-age
+  // cached listeners first, then a fresh-scan rebuild reconciles in the same
+  // flush. Without this, a one-shot client (an OAuth loopback redirect) dials
+  // localhost seconds before the gateway exists and is refused.
+  const flushStart = source.indexOf("private async flushQueuedSnapshotBroadcast");
+  const flushEnd = source.indexOf("private hasEventClients", flushStart);
+  const flushBody = source.slice(flushStart, flushEnd);
+  assert.equal(flushBody.includes("allowStaleListenerCache: hasCachedListeners"), true);
+  assert.equal(
+    flushBody.indexOf("allowStaleListenerCache: hasCachedListeners") <
+      flushBody.indexOf("const freshSnapshot = await this.buildSnapshot({ allowRecentListenerCache: true })"),
+    true,
+    "the cached-listener fast pass must broadcast before the fresh-scan rebuild",
+  );
+
+  // The stale branch answers before both the recency check and the in-flight
+  // scan join, so the fast pass can never block behind a running scan.
+  const scanStart = source.indexOf("private async scanListeningPorts(");
+  const scanEnd = source.indexOf("private async scanListeningPortsForPort", scanStart);
+  const scanBody = source.slice(scanStart, scanEnd);
+  const staleBranchAt = scanBody.indexOf("options.allowStaleCache === true");
+  assert.equal(staleBranchAt >= 0, true);
+  assert.equal(staleBranchAt < scanBody.indexOf("options.allowRecentCache === true"), true);
+  assert.equal(staleBranchAt < scanBody.indexOf("this.listenerScanPromise !== undefined"), true);
+
+  // The fast pass also defers the established-connection lsof pass to the
+  // fresh rebuild.
+  assert.equal(
+    source.includes(
+      "options.allowStaleListenerCache !== true && (await this.refreshEstablishedRouteObservations(snapshot.routes))",
+    ),
+    true,
+  );
+});

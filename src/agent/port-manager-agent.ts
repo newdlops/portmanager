@@ -191,6 +191,14 @@ interface BuildSnapshotRuntimeOptions {
    * listener table. Route allocation still asks for a fresh scan.
    */
   readonly allowRecentListenerCache?: boolean;
+  /**
+   * Publishes from the cached listener table regardless of age and defers the
+   * established-connection observation pass. Register-triggered broadcasts use
+   * this so new route rows reach clients — and the logical port gateway can
+   * open — without waiting for seconds-long OS scans; the follow-up fresh-scan
+   * rebuild reconciles listener state right after.
+   */
+  readonly allowStaleListenerCache?: boolean;
 }
 
 interface ListenerScanCache {
@@ -1231,8 +1239,24 @@ export class PortManagerAgent implements DisposableLike {
     this.snapshotBroadcastInFlight = true;
 
     try {
-      const snapshot = await this.buildSnapshot({ allowRecentListenerCache: true });
+      /*
+       * Fast pass: registry/route changes must reach clients before the
+       * logical port gateway can open the port, and fresh lsof-scale scans
+       * cost seconds. Publish immediately from the cached listener table,
+       * then rebuild with a fresh scan so stale listener state never
+       * outlives this flush.
+       */
+      const hasCachedListeners = this.listenerScanCacheTtlMs > 0 && this.listenerScanCache !== undefined;
+      const snapshot = await this.buildSnapshot({
+        allowRecentListenerCache: true,
+        allowStaleListenerCache: hasCachedListeners,
+      });
       this.broadcastSnapshotIfChanged(snapshot);
+
+      if (hasCachedListeners) {
+        const freshSnapshot = await this.buildSnapshot({ allowRecentListenerCache: true });
+        this.broadcastSnapshotIfChanged(freshSnapshot);
+      }
     } catch (error: unknown) {
       this.serverErrors.emit(error instanceof Error ? error : new Error(String(error)));
     } finally {
@@ -1431,6 +1455,7 @@ export class PortManagerAgent implements DisposableLike {
   private async buildSnapshot(options: BuildSnapshotRuntimeOptions = {}): Promise<AgentSnapshot> {
     const listeners = await this.scanListeningPorts({
       allowRecentCache: options.allowRecentListenerCache === true && this.hasEventClients(),
+      allowStaleCache: options.allowStaleListenerCache === true && this.hasEventClients(),
     });
     let routeStateChanged = false;
 
@@ -1458,7 +1483,7 @@ export class PortManagerAgent implements DisposableLike {
       defaultCwd: this.defaultCwd,
     });
 
-    if (await this.refreshEstablishedRouteObservations(snapshot.routes)) {
+    if (options.allowStaleListenerCache !== true && (await this.refreshEstablishedRouteObservations(snapshot.routes))) {
       this.publishRouteTableBestEffort(snapshot.routes);
     }
     return snapshot;
@@ -1774,13 +1799,21 @@ export class PortManagerAgent implements DisposableLike {
    * allocation and lifecycle decisions.
    */
   private async scanListeningPorts(
-    options: { readonly allowRecentCache?: boolean } = {},
+    options: { readonly allowRecentCache?: boolean; readonly allowStaleCache?: boolean } = {},
   ): Promise<readonly ListeningPort[]> {
-    if (options.allowRecentCache === true && this.listenerScanCacheTtlMs > 0 && this.listenerScanCache !== undefined) {
-      const cacheAgeMs = Date.now() - this.listenerScanCache.scannedAtMs;
-
-      if (cacheAgeMs >= 0 && cacheAgeMs <= this.listenerScanCacheTtlMs) {
+    if (this.listenerScanCacheTtlMs > 0 && this.listenerScanCache !== undefined) {
+      // The stale branch answers before the in-flight scan join below so a
+      // fast-pass broadcast can never block behind a seconds-long scan.
+      if (options.allowStaleCache === true) {
         return this.listenerScanCache.listeners;
+      }
+
+      if (options.allowRecentCache === true) {
+        const cacheAgeMs = Date.now() - this.listenerScanCache.scannedAtMs;
+
+        if (cacheAgeMs >= 0 && cacheAgeMs <= this.listenerScanCacheTtlMs) {
+          return this.listenerScanCache.listeners;
+        }
       }
     }
 

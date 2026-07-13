@@ -2313,6 +2313,33 @@ test("logical router classifies clients by process tree label before hook enviro
   assert.equal(source.includes("private async resolveGlobalSamePortClientTarget("), true);
   assert.equal(source.includes("loopbackAddressForNetwork(GLOBAL_LOGICAL_NETWORK_ID)"), true);
   assert.equal(source.includes("this.findNetworkScopedListener(GLOBAL_LOGICAL_NETWORK_ID, logicalPort, globalLoopbackHost)"), true);
+
+  // A freshly bound global listener is visible in the route table immediately
+  // (the gateway listener itself is opened from that row), while listener
+  // snapshots lag it by seconds — fatal for one-shot clients such as OAuth
+  // loopback redirects. The route row must answer before the snapshot lookup,
+  // and only for the deterministic global loopback host.
+  const globalSamePortStart = source.indexOf("private async resolveGlobalSamePortClientTarget");
+  const globalSamePortEnd = source.indexOf("private resolveHostDefaultGatewayClientTarget", globalSamePortStart);
+  const resolveGlobalSamePortClientTarget = source.slice(globalSamePortStart, globalSamePortEnd);
+  assert.equal(
+    resolveGlobalSamePortClientTarget.includes(
+      "this.findNetworkRouteForRouter(GLOBAL_LOGICAL_NETWORK_ID, logicalPort, [])",
+    ),
+    true,
+  );
+  assert.equal(
+    resolveGlobalSamePortClientTarget.indexOf("this.findNetworkRouteForRouter(") <
+      resolveGlobalSamePortClientTarget.indexOf("this.findNetworkScopedListener("),
+    true,
+    "the route row answers before the lagging listener-snapshot lookup",
+  );
+  assert.equal(
+    resolveGlobalSamePortClientTarget.includes(
+      "normalizeEndpointHostKey(globalRoute.host) === normalizeEndpointHostKey(globalLoopbackHost)",
+    ),
+    true,
+  );
   assert.equal(findNetworkScopedListener.includes("targetHost?: string"), true);
   assert.equal(findNetworkScopedListener.includes("normalizeEndpointHostKey(listener.localAddress) !== normalizedTargetHost"), true);
   assert.equal(source.includes("global-default logical_port=${logicalPort}"), true);
