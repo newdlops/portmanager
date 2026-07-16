@@ -95,6 +95,11 @@ test("recognizes external route allocation request methods", () => {
   assert.equal(isAgentRequestMessage(daemonStatusMessage), true);
 });
 
+test("recognizes the explicit routing repair request", () => {
+  assert.equal(isAgentRequestMessage({ id: "repair-1", method: "repairRoutingState" }), true);
+  assert.equal(isAgentRequestMessage({ id: "flush-1", method: "flushRouteTables" }), true);
+});
+
 test("snapshot merge keeps managed route context and adds external listeners", () => {
   const managedProcess = createManagedProcess({
     id: "managed-1",

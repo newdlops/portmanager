@@ -663,11 +663,18 @@ test("recovers hooked routes from live listeners after daemon restart", async (c
     }),
   ];
   let recoverCalls = 0;
+  let establishedScans = 0;
   const agent = new PortManagerAgent({
     processLauncher: createFakeLauncher(),
     portAvailabilityProvider: createAvailablePortProvider(),
     listeningPortProvider: {
       list: async () => listeners,
+    },
+    establishedConnectionProvider: {
+      list: async () => {
+        establishedScans += 1;
+        return [];
+      },
     },
     hookRouteRecoveryProvider: {
       recoverHookRoute: async (listener) => {
@@ -715,6 +722,132 @@ test("recovers hooked routes from live listeners after daemon restart", async (c
   ]);
   assert.deepEqual(networkRouteTable.routes, snapshot.routes);
   assert.deepEqual(routeEntryTable.routes, snapshot.routes);
+
+  // Explicit repair must recreate consumer-facing files before resolving even
+  // when the recovered route is already present in daemon memory.
+  fs.rmSync(getNetworkRouteTablePath("network-a", routeTablePath), { force: true });
+  fs.rmSync(getRouteTablePathForLogicalPort(8004, "network-a", routeTablePath), { force: true });
+  const repairedSnapshot = await agent.repairRoutingState();
+
+  assert.deepEqual(
+    readRouteTable(getNetworkRouteTablePath("network-a", routeTablePath)).routes,
+    repairedSnapshot.routes,
+  );
+  assert.deepEqual(
+    readRouteTable(getRouteTablePathForLogicalPort(8004, "network-a", routeTablePath)).routes,
+    repairedSnapshot.routes,
+  );
+
+  // A fresh-looking but corrupt file must not be trusted merely because the
+  // daemon still remembers the signature it wrote before corruption.
+  const corruptTable = `${JSON.stringify({
+    updatedAt: "2026-06-21T10:00:00.000Z",
+    expiresAt: "2026-06-21T10:05:00.000Z",
+    expiresAtMs: Date.parse("2026-06-21T10:05:00.000Z"),
+    ttlMs: 300_000,
+    routes: [],
+  })}\n`;
+  fs.writeFileSync(getNetworkRouteTablePath("network-a", routeTablePath), corruptTable);
+  fs.writeFileSync(getRouteTablePathForLogicalPort(8004, "network-a", routeTablePath), corruptTable);
+  const repairedCorruptSnapshot = await agent.repairRoutingState();
+
+  assert.deepEqual(
+    readRouteTable(getNetworkRouteTablePath("network-a", routeTablePath)).routes,
+    repairedCorruptSnapshot.routes,
+  );
+  assert.deepEqual(
+    readRouteTable(getRouteTablePathForLogicalPort(8004, "network-a", routeTablePath)).routes,
+    repairedCorruptSnapshot.routes,
+  );
+  assert.equal(establishedScans, 1, "explicit repair must not launch a second global established scan");
+});
+
+test("repair retries hook recovery misses instead of waiting for the negative cache", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  const listener = createListener({
+    id: "tcp:127.93.164.7:3004:64256",
+    localAddress: "127.93.164.7",
+    port: 3004,
+    pid: 64256,
+    processName: "node",
+    command: "node",
+  });
+  let metadataReadable = false;
+  let recoverCalls = 0;
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: { list: async () => [listener] },
+    hookRouteRecoveryProvider: {
+      recoverHookRoute: async () => {
+        recoverCalls += 1;
+        return metadataReadable
+          ? {
+              pid: 64256,
+              name: "node",
+              command: "node server.js",
+              cwd: "/workspace/app",
+              requestedPort: 3004,
+              actualPort: 3004,
+              host: "127.93.164.7",
+              networkId: "network-a",
+              experimentalRouteOwnershipMode: "loopback-address-only",
+              source: "hooked",
+            }
+          : undefined;
+      },
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  assert.equal((await agent.refreshSnapshot()).routes.length, 0);
+  metadataReadable = true;
+
+  const repairedSnapshot = await agent.repairRoutingState();
+
+  assert.equal(recoverCalls, 2);
+  assert.equal(repairedSnapshot.routes[0]?.logicalPort, 3004);
+  assert.equal(repairedSnapshot.routes[0]?.networkId, "network-a");
+});
+
+test("flushRouteTables republishes daemon state without scanning listeners", async (context) => {
+  const routeTablePath = createRouteTablePath(context);
+  let listenerScans = 0;
+  const agent = new PortManagerAgent({
+    processLauncher: createFakeLauncher(),
+    portAvailabilityProvider: createAvailablePortProvider(),
+    listeningPortProvider: {
+      list: async () => {
+        listenerScans += 1;
+        return [];
+      },
+    },
+    agentPid: 777,
+    now: fixedNow,
+    routeTablePath,
+  });
+  context.after(() => agent.dispose());
+
+  await agent.registerExistingProcess({
+    pid: 64257,
+    name: "compose-service",
+    command: "docker compose",
+    cwd: "/workspace/app",
+    requestedPort: 8000,
+    actualPort: 58000,
+    host: "127.0.0.1",
+    networkId: "network-a",
+    source: "compose",
+  });
+  const networkRoutePath = getNetworkRouteTablePath("network-a", routeTablePath);
+  fs.rmSync(networkRoutePath, { force: true });
+
+  assert.equal(agent.flushRouteTables(), true);
+  assert.equal(listenerScans, 0);
+  assert.equal((readRouteTable(networkRoutePath).routes[0] as { readonly logicalPort?: number })?.logicalPort, 8000);
 });
 
 test("releases hooked process routes and removes endpoint files when the owner exits", async (context) => {

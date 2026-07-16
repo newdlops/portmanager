@@ -199,6 +199,11 @@ interface BuildSnapshotRuntimeOptions {
    * rebuild reconciles listener state right after.
    */
   readonly allowStaleListenerCache?: boolean;
+  /**
+   * Explicit route repair needs listener ownership, not connection-TTL
+   * bookkeeping. Skipping this avoids a second full lsof pass on the user path.
+   */
+  readonly skipEstablishedRouteObservations?: boolean;
 }
 
 interface ListenerScanCache {
@@ -1011,6 +1016,37 @@ export class PortManagerAgent implements DisposableLike {
     return snapshot;
   }
 
+  /**
+   * Forces a fresh listener observation and materializes route files before
+   * replying. User-triggered stale-routing repair cannot reuse the ordinary
+   * listener cache: a restarted daemon must rediscover surviving hooked
+   * servers, and consumers may read the generated files as soon as this call
+   * resolves.
+   */
+  async repairRoutingState(): Promise<AgentSnapshot> {
+    // A previous background scan may have memoized a transient permission or
+    // process-startup miss. Explicit repair is a freshness boundary for both
+    // the listener table and per-listener recovery evidence.
+    this.hookRouteRecoveryMissesByListenerKey.clear();
+    const snapshot = await this.buildSnapshot({ skipEstablishedRouteObservations: true });
+    /*
+     * Repair is also a disk-integrity boundary. A file may still exist with a
+     * fresh mtime after an external writer truncated or replaced its routes;
+     * forgetting only the content cache forces current shards to be rewritten
+     * while the newer-daemon generation guard remains in force.
+     */
+    this.routeTableSignaturesByPath.clear();
+    this.publishRouteTableBestEffort(snapshot.routes);
+    this.broadcastSnapshotIfChanged(snapshot);
+    return snapshot;
+  }
+
+  /** Publishes the current registry without performing another listener scan. */
+  flushRouteTables(): boolean {
+    this.publishRouteTableBestEffort();
+    return !this.routeTableDirty;
+  }
+
   /** Releases sockets, event subscriptions, and server resources. */
   dispose(): void {
     for (const client of [...this.clients]) {
@@ -1154,6 +1190,10 @@ export class PortManagerAgent implements DisposableLike {
       }
       case "refreshSnapshot":
         return this.refreshSnapshot();
+      case "repairRoutingState":
+        return this.repairRoutingState();
+      case "flushRouteTables":
+        return this.flushRouteTables();
     }
   }
 
@@ -1483,7 +1523,11 @@ export class PortManagerAgent implements DisposableLike {
       defaultCwd: this.defaultCwd,
     });
 
-    if (options.allowStaleListenerCache !== true && (await this.refreshEstablishedRouteObservations(snapshot.routes))) {
+    if (
+      options.allowStaleListenerCache !== true &&
+      options.skipEstablishedRouteObservations !== true &&
+      (await this.refreshEstablishedRouteObservations(snapshot.routes))
+    ) {
       this.publishRouteTableBestEffort(snapshot.routes);
     }
     return snapshot;

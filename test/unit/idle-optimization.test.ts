@@ -255,7 +255,7 @@ test("register-triggered broadcasts publish from cached listeners before fresh s
   // fresh rebuild.
   assert.equal(
     source.includes(
-      "options.allowStaleListenerCache !== true && (await this.refreshEstablishedRouteObservations(snapshot.routes))",
+      "options.skipEstablishedRouteObservations !== true &&\n      (await this.refreshEstablishedRouteObservations(snapshot.routes))",
     ),
     true,
   );

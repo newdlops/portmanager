@@ -33,7 +33,9 @@ export type AgentRequestMethod =
   | "stopProcess"
   | "restartProcess"
   | "removeProcess"
-  | "refreshSnapshot";
+  | "refreshSnapshot"
+  | "repairRoutingState"
+  | "flushRouteTables";
 
 export type AgentRequestId = string | number;
 
@@ -151,6 +153,8 @@ export type AgentRequestPayloadByMethod = {
   readonly restartProcess: RestartProcessPayload;
   readonly removeProcess: RemoveProcessPayload;
   readonly refreshSnapshot: undefined;
+  readonly repairRoutingState: undefined;
+  readonly flushRouteTables: undefined;
 };
 
 export type AgentResponsePayloadByMethod = {
@@ -166,6 +170,8 @@ export type AgentResponsePayloadByMethod = {
   readonly restartProcess: ManagedProcess | undefined;
   readonly removeProcess: ManagedProcess | undefined;
   readonly refreshSnapshot: AgentSnapshot;
+  readonly repairRoutingState: AgentSnapshot;
+  readonly flushRouteTables: boolean;
 };
 
 /**
@@ -278,7 +284,9 @@ function isAgentRequestMethod(value: unknown): value is AgentRequestMethod {
     value === "stopProcess" ||
     value === "restartProcess" ||
     value === "removeProcess" ||
-    value === "refreshSnapshot"
+    value === "refreshSnapshot" ||
+    value === "repairRoutingState" ||
+    value === "flushRouteTables"
   );
 }
 
