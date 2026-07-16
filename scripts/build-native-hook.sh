@@ -18,7 +18,7 @@ HOST_EXPOSURE_PROXY_SOURCE_FILE="$ROOT_DIR/native/host-exposure/portmanager_host
 PROCESS_LOOKUP_SOURCE_FILE="$ROOT_DIR/native/process-lookup/portmanager_process_lookup.c"
 CONTAINER_MAP_SOURCE_FILE="$ROOT_DIR/native/container-mutation/portmanager_container_map.c"
 DOCKER_SHIM_SOURCE_FILE="$ROOT_DIR/native/docker-shim/portmanager_docker_shim.c"
-AGENT_SOURCE_FILES="$ROOT_DIR/native/agent/portmanager_agent.c $ROOT_DIR/native/agent/portmanager_agent_probe.c $ROOT_DIR/native/agent/portmanager_agent_state.c $ROOT_DIR/native/agent/portmanager_agent_json.c"
+AGENT_SOURCE_FILES="$ROOT_DIR/native/agent/portmanager_agent.c $ROOT_DIR/native/agent/portmanager_agent_probe.c $ROOT_DIR/native/agent/portmanager_agent_state.c $ROOT_DIR/native/agent/portmanager_agent_json.c $PEER_PROCESS_SOURCE_FILE"
 OUTPUT_DIR="$ROOT_DIR/media/native"
 PACKAGE_VERSION="unknown"
 if command -v node >/dev/null 2>&1; then

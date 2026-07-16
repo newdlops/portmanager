@@ -126,7 +126,8 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(source.includes("pm_state_needs_external_listener_fresh_scan(state)"), true);
   assert.equal(source.includes("pm_listener_cache_invalidate(state);"), true);
   assert.equal(snapshotBody.includes("listener_scan_fresh &&"), true);
-  assert.equal(snapshotBody.includes("pm_scan_lsof_cached(state, &listeners"), true);
+  assert.equal(snapshotBody.includes("listener_scan_result = pm_scan_lsof_cached("), true);
+  assert.equal(snapshotBody.includes("&listeners,"), true);
   assert.notEqual(cachedSnapshotStart, -1);
   assert.equal(cachedSnapshotBody.includes("pm_listener_list_copy(&listeners, state->listener_cache_items"), true);
   assert.equal(cachedSnapshotBody.includes("pm_append_snapshot_from_listeners"), true);
@@ -222,13 +223,24 @@ test("native agent route tables carry TTL and refresh unchanged files", () => {
 test("native agent recovers restarted hook routes from process environment", () => {
   const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
   const header = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.h"), "utf8");
+  const peerSource = fs.readFileSync(path.join(projectRoot, "native", "shared", "pm_peer_process.c"), "utf8");
+  const peerHeader = fs.readFileSync(path.join(projectRoot, "native", "shared", "pm_peer_process.h"), "utf8");
+  const buildScript = fs.readFileSync(path.join(projectRoot, "scripts", "build-native-hook.sh"), "utf8");
   const tsAgent = fs.readFileSync(path.join(projectRoot, "src", "agent", "port-manager-agent.ts"), "utf8");
   const inspectStart = source.indexOf("static int pm_inspect_hook_recovery_process");
   const inspectEnd = source.indexOf("static int pm_recover_untracked_hooked_listener", inspectStart);
   const inspectBody = source.slice(inspectStart, inspectEnd);
+  const environmentInspectEnd = source.indexOf("static int pm_inspect_hook_recovery_command", inspectStart);
+  const environmentInspectBody = source.slice(inspectStart, environmentInspectEnd);
+  const activeEnvironmentStart = source.indexOf("static int pm_hook_recovery_has_active_environment");
+  const activeEnvironmentEnd = source.indexOf("static int pm_process_text_first_value", activeEnvironmentStart);
+  const activeEnvironmentBody = source.slice(activeEnvironmentStart, activeEnvironmentEnd);
   const recoveryStart = source.indexOf("static int pm_recover_untracked_hooked_listeners");
   const recoveryEnd = source.indexOf("static int pm_reconcile_external_processes_with_listeners", recoveryStart);
   const recoveryBody = source.slice(recoveryStart, recoveryEnd);
+  const listenerRecoveryStart = source.indexOf("static int pm_recover_untracked_hooked_listener");
+  const listenerRecoveryEnd = source.indexOf("static int pm_recover_untracked_hooked_listeners", listenerRecoveryStart);
+  const listenerRecoveryBody = source.slice(listenerRecoveryStart, listenerRecoveryEnd);
 
   assert.equal(source.includes("pm_recover_untracked_hooked_listeners"), true);
   assert.equal(source.includes("pm_read_process_environment_text"), true);
@@ -236,6 +248,21 @@ test("native agent recovers restarted hook routes from process environment", () 
   assert.notEqual(inspectStart, -1);
   assert.equal(inspectBody.match(/pm_read_process_environment_text/g)?.length, 1);
   assert.equal(inspectBody.match(/pm_read_process_command_text/g)?.length, 1);
+  assert.equal(environmentInspectBody.includes("pm_read_process_command_text"), false);
+  assert.equal(environmentInspectBody.includes("pm_hook_recovery_has_active_environment"), true);
+  assert.equal(environmentInspectBody.includes("never for an unrelated PID"), true);
+  assert.equal(activeEnvironmentBody.includes('"PORT_MANAGER_HOOK_DISABLED"'), true);
+  assert.equal(activeEnvironmentBody.includes('"PORT_MANAGER_LD_PRELOAD"'), true);
+  assert.equal(activeEnvironmentBody.includes('strstr(value, "portmanager_hook")'), true);
+  assert.equal(source.includes("pm_read_process_environment_via_ps"), true);
+  assert.equal(peerHeader.includes("int pm_peer_read_environment_text"), true);
+  assert.equal(peerHeader.includes("PM_PEER_ENVIRONMENT_ENTRY_SEPARATOR"), true);
+  assert.equal(peerSource.includes("KERN_PROCARGS2 prefixes the environment"), true);
+  assert.equal(peerSource.includes("int pm_peer_read_environment_text"), true);
+  assert.equal(peerSource.includes("A leading separator identifies the exact-entry format"), true);
+  assert.equal(source.includes("has_exact_entry_boundaries"), true);
+  assert.equal(source.includes('"PORT_MANAGER_HOOK_DISABLED"'), true);
+  assert.equal(buildScript.includes("$PEER_PROCESS_SOURCE_FILE\""), true);
   assert.equal(recoveryBody.includes("inspection.pid != listeners->items[index].pid"), true);
   assert.equal(recoveryBody.includes("memset(&inspection, 0, sizeof(inspection))"), true);
   assert.equal(recoveryBody.includes("expensive environment/command lookup for every port in that group"), true);
@@ -243,9 +270,49 @@ test("native agent recovers restarted hook routes from process environment", () 
   assert.equal(source.includes("PORT_MANAGER_NETWORK_ID"), true);
   assert.equal(source.includes("NEWDLOPS_PM_NETWORK_ID"), true);
   assert.equal(source.includes("requested_port == listener->port"), true);
+  assert.equal(source.includes("pm_hook_recovery_listener_matches_exported_loopback"), true);
+  assert.equal(source.includes('"PORT_MANAGER_NETWORK_LOOPBACK_HOST"'), true);
+  assert.equal(source.includes('"PORT_MANAGER_ACTUAL_LOOPBACK_HOST"'), true);
+  assert.equal(source.includes("IN6_IS_ADDR_V4MAPPED(&ipv6)"), true);
+  assert.equal(listenerRecoveryBody.includes("pm_hook_recovery_listener_matches_exported_loopback"), true);
+  assert.equal(source.includes("pm_is_non_default_loopback_host(normalized_exported_host)"), true);
+  assert.equal(source.includes("requested_port == listener->port && !same_port_recovery"), true);
+  assert.equal(listenerRecoveryBody.includes("if (pm_inspect_hook_recovery_command(inspection))"), true);
+  assert.equal(listenerRecoveryBody.includes("pm_is_hook_recovery_helper_text(command)"), true);
+  assert.ok(
+    listenerRecoveryBody.indexOf("pm_inspect_hook_recovery_command(inspection)") <
+      listenerRecoveryBody.indexOf("pm_infer_requested_port_from_environment"),
+  );
   assert.equal(source.includes("pm_remove_pending_endpoint(state, process->requested_port, network_id)"), true);
   assert.equal(header.includes("#define PM_ROUTE_TTL_SECONDS 300"), true);
   assert.equal(tsAgent.includes("const ROUTE_ALLOCATION_TTL_MS = 300_000;"), true);
+});
+
+test("native agent repair routing forces recovery and synchronous publication", () => {
+  const header = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.h"), "utf8");
+  const agentSource = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.c"), "utf8");
+  const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
+  const repairStart = source.indexOf("int pm_state_repair_routing");
+  const repairEnd = source.indexOf("int pm_state_reap_children", repairStart);
+  const repairBody = source.slice(repairStart, repairEnd);
+  const snapshotIndex = repairBody.indexOf("pm_state_snapshot_internal(state, payload, 1)");
+  const clearSignaturesIndex = repairBody.indexOf("pm_route_table_signatures_clear(state)");
+  const flushIndex = repairBody.indexOf("pm_state_flush_route_tables(state)");
+
+  assert.notEqual(repairStart, -1);
+  assert.equal(header.includes("int pm_state_repair_routing"), true);
+  assert.equal(agentSource.includes('strcmp(request->method, "repairRoutingState") == 0'), true);
+  assert.equal(agentSource.includes('strcmp(request->method, "flushRouteTables") == 0'), true);
+  assert.equal(agentSource.includes('strcmp(request.method, "repairRoutingState") != 0'), true);
+  assert.equal(agentSource.includes("*route_tables_dirty = 0;"), true);
+  assert.ok(snapshotIndex >= 0);
+  assert.equal(repairBody.includes("pm_refresh_established_route_observations(state)"), false);
+  assert.ok(clearSignaturesIndex > snapshotIndex);
+  assert.ok(flushIndex > snapshotIndex);
+  assert.ok(flushIndex > clearSignaturesIndex);
+  assert.equal(source.includes("listener_scan_result != 0 && force_fresh_listener_scan"), true);
+  assert.equal(source.includes("WIFEXITED(close_status)"), true);
+  assert.equal(source.includes("WEXITSTATUS(close_status) != 1"), true);
 });
 
 if (!fs.existsSync(nativeAgentPath)) {
@@ -356,6 +423,35 @@ if (!fs.existsSync(nativeAgentPath)) {
 
     assert.ok(elapsedMs < 750, `cached subscription event took ${elapsedMs}ms`);
     assert.equal(fs.readFileSync(lsofLogPath, "utf8"), "");
+  });
+
+  test("native agent reports explicit repair failure when a fresh lsof scan cannot run", async (context) => {
+    const shimDirectory = path.join(
+      projectRoot,
+      ".tmp",
+      "native-agent-tests",
+      `failed-repair-scan-${process.pid}-${Date.now().toString(36)}`,
+    );
+    fs.mkdirSync(shimDirectory, { recursive: true });
+    fs.writeFileSync(path.join(shimDirectory, "lsof"), ["#!/bin/sh", "exit 127"].join("\n"), { mode: 0o755 });
+    context.after(async () => {
+      await fs.promises.rm(shimDirectory, { recursive: true, force: true }).catch(() => undefined);
+    });
+
+    const fixture = await startNativeAgent(context, {
+      PATH: `${shimDirectory}${path.delimiter}${process.env.PATH ?? ""}`,
+    });
+    if (fixture === undefined) {
+      return;
+    }
+
+    await assert.rejects(
+      requestOnce(fixture.socketPath, {
+        id: `extension-${process.pid}-failed-repair-scan`,
+        method: "repairRoutingState",
+      }),
+      /fresh listener scan/,
+    );
   });
 
   test("native agent bounds event delivery during sustained hook traffic", async (context) => {
@@ -513,6 +609,9 @@ if (!fs.existsSync(nativeAgentPath)) {
   });
 
   test("native agent inspects process metadata once for all listeners owned by one PID", async (context) => {
+    // A deliberately nonexistent pid makes the direct OS reader fail so this
+    // fixture continues to cover the retained ps fallback deterministically.
+    const inspectedPid = 2_000_000_000;
     const shimDirectory = path.join(
       projectRoot,
       ".tmp",
@@ -527,13 +626,13 @@ if (!fs.existsSync(nativeAgentPath)) {
     fs.writeFileSync(path.join(shimDirectory, "lsof"), [
       "#!/bin/sh",
       "printf '%s\\n' \"$*\" >> \"$PM_TEST_LSOF_LOG\"",
-      `printf 'p${process.pid}\\ncnode\\nn127.0.0.1:48311\\nn127.0.0.1:48312\\n'`,
+      `printf 'p${inspectedPid}\\ncnode\\nn127.0.0.1:48311\\nn127.0.0.1:48312\\nn[::ffff:127.93.164.7]:48313\\n'`,
     ].join("\n"), { mode: 0o755 });
     fs.writeFileSync(path.join(shimDirectory, "ps"), [
       "#!/bin/sh",
       "printf '%s\\n' \"$*\" >> \"$PM_TEST_PS_LOG\"",
       "if [ \"$1\" = eww ]; then",
-      "  printf 'node PORT_MANAGER_HOOK=1 PORT_MANAGER_NETWORK_ID=network-recovery-cache PWD=/tmp PORT=48310\\n'",
+      "  printf 'node PORT_MANAGER_HOOK=1 PORT_MANAGER_NETWORK_ID=network-recovery-cache PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE=loopback-address-only PORT_MANAGER_NETWORK_LOOPBACK_HOST=127.93.164.7 PWD=/tmp PORT=48310\\n'",
       "else",
       "  printf '/usr/bin/node server.js --port 48310\\n'",
       "fi",
@@ -563,17 +662,17 @@ if (!fs.existsSync(nativeAgentPath)) {
       method: "listSnapshot",
     });
     const recoveredPorts = snapshot.processes
-      .filter((candidate) => candidate.pid === process.pid && candidate.source === "hooked")
+      .filter((candidate) => candidate.pid === inspectedPid && candidate.source === "hooked")
       .map((candidate) => candidate.actualPort)
       .sort((left, right) => left - right);
     const lsofCalls = fs.readFileSync(lsofLogPath, "utf8");
     const psCalls = fs.readFileSync(psLogPath, "utf8").trim().split("\n");
 
-    assert.deepEqual(recoveredPorts, [48311, 48312]);
+    assert.deepEqual(recoveredPorts, [48311, 48312, 48313]);
     assert.notEqual(lsofCalls, "");
     assert.deepEqual(psCalls, [
-      `eww -p ${process.pid}`,
-      `-o command= -p ${process.pid}`,
+      `eww -p ${inspectedPid}`,
+      `-o command= -p ${inspectedPid}`,
     ]);
   });
 

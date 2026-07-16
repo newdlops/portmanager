@@ -593,6 +593,21 @@ static int pm_dispatch(pm_agent_state *state, const pm_request *request, pm_buff
   if (strcmp(request->method, "refreshSnapshot") == 0) {
     return pm_state_refresh_snapshot(state, payload);
   }
+  if (strcmp(request->method, "repairRoutingState") == 0) {
+    *state_changed = 1;
+    if (pm_state_repair_routing(state, payload) != 0) {
+      snprintf(error, error_size, "Failed to repair routing from a fresh listener scan.");
+      return -1;
+    }
+    return 0;
+  }
+  if (strcmp(request->method, "flushRouteTables") == 0) {
+    if (pm_state_flush_route_tables(state) != 0) {
+      snprintf(error, error_size, "Failed to publish Port Manager route tables.");
+      return -1;
+    }
+    return pm_buffer_append(payload, "true");
+  }
   if (strcmp(request->method, "allocateRoute") == 0) {
     pm_allocate_input input;
     if (pm_parse_allocate_input(request->payload, &input) != 0) {
@@ -798,8 +813,16 @@ static int pm_handle_line(pm_client *client, pm_agent_state *state, const char *
      * have received their response frames.
      */
     *snapshot_dirty = 1;
-    state->route_tables_dirty = 1;
-    *route_tables_dirty = 1;
+    if (strcmp(request.method, "repairRoutingState") != 0) {
+      /* repairRoutingState has already completed its synchronous publish. */
+      state->route_tables_dirty = 1;
+      *route_tables_dirty = 1;
+    } else {
+      /* The synchronous repair includes every mutation processed earlier on
+       * this single-threaded loop, so an older queued dirty flag is satisfied. */
+      state->route_tables_dirty = 0;
+      *route_tables_dirty = 0;
+    }
   }
   if (shutdown_requested) {
     pm_running = 0;

@@ -275,6 +275,8 @@ int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload);
 /** Builds an event snapshot from in-memory state and the last listener cache only. */
 int pm_state_cached_snapshot(pm_agent_state *state, pm_buffer *payload);
 int pm_state_refresh_snapshot(pm_agent_state *state, pm_buffer *payload);
+/** Forces listener rediscovery/recovery and publishes route tables before returning. */
+int pm_state_repair_routing(pm_agent_state *state, pm_buffer *payload);
 int pm_state_reap_children(pm_agent_state *state);
 int pm_state_listener_signature(pm_agent_state *state, pm_buffer *signature);
 int pm_state_flush_route_tables(pm_agent_state *state);

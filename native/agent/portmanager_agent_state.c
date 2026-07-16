@@ -1,4 +1,5 @@
 #include "portmanager_agent.h"
+#include "../shared/pm_peer_process.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -48,6 +49,7 @@ typedef struct {
   pid_t pid;
   int inspected;
   int has_hook_environment;
+  int command_inspected;
   char environment[PM_PROCESS_INSPECT_TEXT];
   char command[PM_TEXT];
 } pm_hook_recovery_process_inspection;
@@ -1433,6 +1435,7 @@ static int pm_process_is_external_listener_owned(const pm_process *process) {
 static void pm_normalize_endpoint_host_key(const char *host, char *out, size_t out_size) {
   const char *start = host == NULL ? "" : host;
   const char *end;
+  struct in6_addr ipv6;
   size_t length;
 
   while (*start != '\0' && isspace((unsigned char)*start)) {
@@ -1472,6 +1475,17 @@ static void pm_normalize_endpoint_host_key(const char *host, char *out, size_t o
     out[index] = (char)tolower((unsigned char)start[index]);
   }
   out[length] = '\0';
+
+  /* bind(AF_INET6) is rewritten to an IPv4-mapped network loopback by the
+   * hook. Collapse that spelling so lsof's ::ffff:127.x listener matches the
+   * exported plain IPv4 loopback identity during restart recovery. */
+  if (inet_pton(AF_INET6, out, &ipv6) == 1 && IN6_IS_ADDR_V4MAPPED(&ipv6)) {
+    struct in_addr ipv4;
+    memcpy(&ipv4, &ipv6.s6_addr[12], sizeof(ipv4));
+    if (inet_ntop(AF_INET, &ipv4, out, (socklen_t)out_size) == NULL) {
+      out[0] = '\0';
+    }
+  }
 }
 
 static int pm_is_non_default_loopback_host(const char *host) {
@@ -1853,6 +1867,41 @@ static int pm_read_process_text(pid_t pid, const char *command_template, char *o
 }
 
 static int pm_read_process_environment_text(pid_t pid, char *out, size_t out_size) {
+  static const char *const recovery_variables[] = {
+    "PORT_MANAGER_HOOK_DISABLED",
+    "PORT_MANAGER_HOOK",
+    "PORT_MANAGER_DYLD_INSERT_LIBRARIES",
+    "PORT_MANAGER_LD_PRELOAD",
+    "DYLD_INSERT_LIBRARIES",
+    "LD_PRELOAD",
+    "PORT_MANAGER_NETWORK_ID",
+    "PORT_MANAGER_ROUTE_TABLE_NETWORK_ID",
+    "PORT_MANAGER_BORROWED_NETWORK_ID",
+    "NEWDLOPS_PM_NETWORK_ID",
+    "NEWDLOPS_PM_BORROWED_NETWORK_ID",
+    "PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE",
+    "PORT_MANAGER_TERMINAL_SESSION_ID",
+    "PORT_MANAGER_TERMINAL_PROCESS_GROUP_ID",
+    "PORT_MANAGER_NETWORK_LOOPBACK_HOST",
+    "PORT_MANAGER_ACTUAL_LOOPBACK_HOST",
+    "VITE_CLIENT_PORT",
+    "PORT",
+    "SERVER_PORT",
+    "DEV_SERVER_PORT",
+    "HTTP_PORT",
+    "PWD",
+    "INIT_CWD",
+  };
+
+  return pm_peer_read_environment_text(
+    (int)pid,
+    recovery_variables,
+    sizeof(recovery_variables) / sizeof(recovery_variables[0]),
+    out,
+    out_size) == 0;
+}
+
+static int pm_read_process_environment_via_ps(pid_t pid, char *out, size_t out_size) {
   return pm_read_process_text(pid, "ps eww -p %ld 2>/dev/null", out, out_size);
 }
 
@@ -1863,22 +1912,33 @@ static int pm_read_process_command_text(pid_t pid, char *out, size_t out_size) {
 static int pm_process_text_value(const char *text, const char *name, char *out, size_t out_size) {
   size_t name_length;
   const char *cursor;
+  int has_exact_entry_boundaries;
 
   if (text == NULL || name == NULL || out == NULL || out_size == 0) {
     return 0;
   }
 
   name_length = strlen(name);
+  has_exact_entry_boundaries = text[0] == PM_PEER_ENVIRONMENT_ENTRY_SEPARATOR;
   cursor = text;
   while ((cursor = strstr(cursor, name)) != NULL) {
     const char *value_start;
     const char *value_end;
     size_t value_length;
 
-    if ((cursor == text || isspace((unsigned char)*(cursor - 1))) && cursor[name_length] == '=') {
+    if (
+      (cursor == text ||
+       (has_exact_entry_boundaries
+          ? *(cursor - 1) == PM_PEER_ENVIRONMENT_ENTRY_SEPARATOR
+          : isspace((unsigned char)*(cursor - 1)))) &&
+      cursor[name_length] == '=') {
       value_start = cursor + name_length + 1;
       value_end = value_start;
-      while (*value_end != '\0' && !isspace((unsigned char)*value_end)) {
+      while (
+        *value_end != '\0' &&
+        (has_exact_entry_boundaries
+          ? *value_end != PM_PEER_ENVIRONMENT_ENTRY_SEPARATOR
+          : !isspace((unsigned char)*value_end))) {
         value_end++;
       }
 
@@ -1904,6 +1964,51 @@ static int pm_process_text_has_any_value(const char *text, const char *const *na
 
   for (size_t index = 0; index < count; index++) {
     if (pm_process_text_value(text, names[index], value, sizeof(value))) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+/**
+ * Confirms that the listener owner actually ran with the Port Manager hook.
+ * Socket/route-file metadata alone is inherited by network-less shells, so it
+ * is not sufficient evidence for reconstructing a route after daemon restart.
+ */
+static int pm_hook_recovery_has_active_environment(const char *environment) {
+  static const char *const preload_hint_variables[] = {
+    "PORT_MANAGER_DYLD_INSERT_LIBRARIES",
+    "PORT_MANAGER_LD_PRELOAD",
+  };
+  static const char *const preload_variables[] = {
+    "DYLD_INSERT_LIBRARIES",
+    "LD_PRELOAD",
+  };
+  char value[PM_TEXT];
+
+  if (pm_process_text_value(environment, "PORT_MANAGER_HOOK_DISABLED", value, sizeof(value)) &&
+      strcmp(value, "1") == 0) {
+    return 0;
+  }
+  if (pm_process_text_value(environment, "PORT_MANAGER_HOOK", value, sizeof(value))) {
+    if (strcmp(value, "0") == 0) {
+      return 0;
+    }
+    if (strcmp(value, "1") == 0) {
+      return 1;
+    }
+  }
+
+  if (pm_process_text_has_any_value(
+        environment,
+        preload_hint_variables,
+        sizeof(preload_hint_variables) / sizeof(preload_hint_variables[0]))) {
+    return 1;
+  }
+  for (size_t index = 0; index < sizeof(preload_variables) / sizeof(preload_variables[0]); index++) {
+    if (pm_process_text_value(environment, preload_variables[index], value, sizeof(value)) &&
+        strstr(value, "portmanager_hook") != NULL) {
       return 1;
     }
   }
@@ -2126,14 +2231,45 @@ static int pm_hook_recovery_disabled(void) {
   return value != NULL && strcmp(value, "1") == 0;
 }
 
-static int pm_inspect_hook_recovery_process(pm_hook_recovery_process_inspection *inspection) {
-  static const char *const hook_markers[] = {
-    "PORT_MANAGER_HOOK",
-    "PORT_MANAGER_DYLD_INSERT_LIBRARIES",
-    "PORT_MANAGER_AGENT_SOCKET",
-    "PORT_MANAGER_ROUTES_FILE",
+/*
+ * Same-port recovery is unique to loopback-address-only routing. A wildcard or
+ * machine-wide listener is not enough evidence: its address must equal a
+ * loopback host exported by the hooked process itself.
+ */
+static int pm_hook_recovery_listener_matches_exported_loopback(
+  const pm_listener *listener,
+  const char *environment) {
+  static const char *const host_variables[] = {
+    "PORT_MANAGER_NETWORK_LOOPBACK_HOST",
+    "PORT_MANAGER_ACTUAL_LOOPBACK_HOST",
   };
+  char listener_host[PM_SMALL];
+  char exported_host[PM_SMALL];
+  char normalized_exported_host[PM_SMALL];
 
+  if (listener == NULL) {
+    return 0;
+  }
+  pm_normalize_endpoint_host_key(listener->local_address, listener_host, sizeof(listener_host));
+
+  for (size_t index = 0; index < sizeof(host_variables) / sizeof(host_variables[0]); index++) {
+    if (!pm_process_text_value(environment, host_variables[index], exported_host, sizeof(exported_host))) {
+      continue;
+    }
+    pm_normalize_endpoint_host_key(exported_host, normalized_exported_host, sizeof(normalized_exported_host));
+    /* The bind hook only virtualizes non-default IPv4 aliases. Default
+     * localhost/::1 can be inherited by an unhooked child and is not unique
+     * enough to prove per-network ownership after restart. */
+    if (pm_is_non_default_loopback_host(normalized_exported_host) &&
+        strcmp(listener_host, normalized_exported_host) == 0) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int pm_inspect_hook_recovery_process(pm_hook_recovery_process_inspection *inspection) {
   if (inspection == NULL || inspection->pid <= 0) {
     return 0;
   }
@@ -2142,14 +2278,30 @@ static int pm_inspect_hook_recovery_process(pm_hook_recovery_process_inspection 
   }
 
   inspection->inspected = 1;
-  if (!pm_read_process_environment_text(inspection->pid, inspection->environment, sizeof(inspection->environment)) ||
-      !pm_process_text_has_any_value(inspection->environment, hook_markers, sizeof(hook_markers) / sizeof(hook_markers[0]))) {
+  if (!pm_read_process_environment_text(inspection->pid, inspection->environment, sizeof(inspection->environment))) {
+    /* Hardened/foreign processes may deny direct inspection; retain the
+     * command fallback only for that failure, never for an unrelated PID. */
+    if (!pm_read_process_environment_via_ps(inspection->pid, inspection->environment, sizeof(inspection->environment))) {
+      return 0;
+    }
+  }
+  if (!pm_hook_recovery_has_active_environment(inspection->environment)) {
     return 0;
   }
 
   inspection->has_hook_environment = 1;
-  (void)pm_read_process_command_text(inspection->pid, inspection->command, sizeof(inspection->command));
   return 1;
+}
+
+static int pm_inspect_hook_recovery_command(pm_hook_recovery_process_inspection *inspection) {
+  if (inspection == NULL || inspection->pid <= 0) {
+    return 0;
+  }
+  if (!inspection->command_inspected) {
+    inspection->command_inspected = 1;
+    (void)pm_read_process_command_text(inspection->pid, inspection->command, sizeof(inspection->command));
+  }
+  return inspection->command[0] != '\0';
 }
 
 static int pm_recover_untracked_hooked_listener(
@@ -2159,6 +2311,7 @@ static int pm_recover_untracked_hooked_listener(
   pm_hook_recovery_process_inspection *inspection) {
   static const char *const network_variables[] = {
     "PORT_MANAGER_NETWORK_ID",
+    "PORT_MANAGER_ROUTE_TABLE_NETWORK_ID",
     "PORT_MANAGER_BORROWED_NETWORK_ID",
     "NEWDLOPS_PM_NETWORK_ID",
     "NEWDLOPS_PM_BORROWED_NETWORK_ID",
@@ -2183,6 +2336,7 @@ static int pm_recover_untracked_hooked_listener(
   char name[PM_SMALL];
   pm_process *process;
   int requested_port;
+  int same_port_recovery;
 
   if (listener == NULL ||
       listener->pid <= 0 ||
@@ -2207,25 +2361,34 @@ static int pm_recover_untracked_hooked_listener(
     (void)pm_process_text_first_value(inspection->environment, terminal_group_variables, sizeof(terminal_group_variables) / sizeof(terminal_group_variables[0]), terminal_group_id, sizeof(terminal_group_id));
   }
 
-  if (inspection->command[0] != '\0') {
+  if (network_id[0] == '\0') {
+    return 0;
+  }
+
+  pm_copy(command, sizeof(command), listener->command[0] ? listener->command : listener->process_name);
+  if (pm_inspect_hook_recovery_command(inspection)) {
+    /* One full argv read per confirmed hooked PID preserves helper/debugger
+     * exclusion and supplies port hints without probing unrelated listeners. */
     pm_copy(command, sizeof(command), inspection->command);
-  } else {
-    pm_copy(command, sizeof(command), listener->command[0] ? listener->command : listener->process_name);
   }
   if (pm_is_hook_recovery_helper_text(command)) {
     return 0;
   }
 
-  requested_port = pm_infer_requested_port_from_environment(inspection->environment, listener->port);
+  same_port_recovery =
+    pm_loopback_address_only_mode(experimental_route_ownership_mode) &&
+    pm_hook_recovery_listener_matches_exported_loopback(listener, inspection->environment);
+  requested_port = same_port_recovery
+    ? listener->port
+    : pm_infer_requested_port_from_environment(inspection->environment, listener->port);
   if (requested_port <= 0) {
     requested_port = pm_infer_requested_port_from_command(command, listener->port);
   }
   if (!pm_process_text_first_value(inspection->environment, cwd_variables, sizeof(cwd_variables) / sizeof(cwd_variables[0]), cwd, sizeof(cwd))) {
     pm_copy(cwd, sizeof(cwd), ".");
   }
-  if (network_id[0] == '\0' ||
-      requested_port <= 0 ||
-      (requested_port == listener->port && !pm_loopback_address_only_mode(experimental_route_ownership_mode)) ||
+  if (requested_port <= 0 ||
+      (requested_port == listener->port && !same_port_recovery) ||
       pm_recovered_hook_route_exists(state, listener->pid, requested_port, listener->port, network_id)) {
     return 0;
   }
@@ -3735,6 +3898,7 @@ static int pm_scan_lsof_command(const char *command, pm_listener_list *listeners
   char line[2048];
   pid_t current_pid = 0;
   char current_name[PM_SMALL] = "";
+  size_t initial_count = listeners->count;
 
   if (pipe == NULL) {
     return -1;
@@ -3805,6 +3969,7 @@ static int pm_scan_lsof_command(const char *command, pm_listener_list *listeners
 
     if (pm_reserve_listeners(listeners, listeners->count + 1) != 0) {
       pclose(pipe);
+      listeners->count = initial_count;
       return -1;
     }
 
@@ -3820,7 +3985,19 @@ static int pm_scan_lsof_command(const char *command, pm_listener_list *listeners
     snprintf(listener->id, sizeof(listener->id), "tcp:%s:%d:%ld", listener->local_address, listener->port, (long)listener->pid);
   }
 
-  pclose(pipe);
+  int close_status = pclose(pipe);
+
+  /*
+   * lsof returns 1 when a valid query has no matches. Shell execution errors
+   * (126/127), signals, and pclose failures must not masquerade as a fresh
+   * empty topology: explicit repair would otherwise erase the only usable
+   * listener observation and report success without recovering live routes.
+   */
+  if (close_status == -1 || !WIFEXITED(close_status) ||
+      (WEXITSTATUS(close_status) != 0 && WEXITSTATUS(close_status) != 1)) {
+    listeners->count = initial_count;
+    return -1;
+  }
   return 0;
 }
 
@@ -4510,21 +4687,48 @@ cleanup:
   return result;
 }
 
-int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload) {
+/** Builds a snapshot, optionally requiring a new listener observation. */
+static int pm_state_snapshot_internal(pm_agent_state *state, pm_buffer *payload, int force_fresh_listener_scan) {
   pm_listener_list listeners = {0};
   char updated_at[PM_TIME];
   int listener_scan_fresh = 0;
+  int listener_scan_result;
   int result;
 
   pm_iso_now(updated_at, sizeof(updated_at));
   if (pm_cleanup_pending(state)) {
     pm_mark_route_tables_dirty(state);
   }
-  if (pm_state_needs_external_listener_fresh_scan(state)) {
+  if (!force_fresh_listener_scan && pm_state_needs_external_listener_fresh_scan(state)) {
     pm_listener_cache_invalidate(state);
   }
-  if (pm_scan_lsof_cached(state, &listeners, updated_at, sizeof(updated_at), &listener_scan_fresh) == 0 &&
-      listener_scan_fresh &&
+
+  if (force_fresh_listener_scan) {
+    /*
+     * Scan into an independent list and replace the cache only after success.
+     * This preserves the last good observation if lsof is temporarily missing,
+     * denied, or interrupted while a user-triggered repair is in progress.
+     */
+    pm_iso_now(updated_at, sizeof(updated_at));
+    listener_scan_result = pm_scan_lsof(&listeners, updated_at);
+    if (listener_scan_result == 0) {
+      (void)pm_listener_cache_store(state, &listeners, updated_at, time(NULL));
+      listener_scan_fresh = 1;
+    }
+  } else {
+    listener_scan_result = pm_scan_lsof_cached(
+      state,
+      &listeners,
+      updated_at,
+      sizeof(updated_at),
+      &listener_scan_fresh);
+  }
+
+  if (listener_scan_result != 0 && force_fresh_listener_scan) {
+    free(listeners.items);
+    return -1;
+  }
+  if (listener_scan_result == 0 && listener_scan_fresh &&
       pm_reconcile_external_processes_with_listeners(state, &listeners, updated_at)) {
     pm_mark_route_tables_dirty(state);
   }
@@ -4532,6 +4736,10 @@ int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload) {
   result = pm_append_snapshot_from_listeners(state, &listeners, updated_at, 1, payload);
   free(listeners.items);
   return result;
+}
+
+int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload) {
+  return pm_state_snapshot_internal(state, payload, 0);
 }
 
 int pm_state_cached_snapshot(pm_agent_state *state, pm_buffer *payload) {
@@ -4599,6 +4807,24 @@ int pm_state_refresh_snapshot(pm_agent_state *state, pm_buffer *payload) {
   pm_refresh_established_route_observations(state);
   pm_mark_route_tables_dirty(state);
   return pm_state_snapshot(state, payload);
+}
+
+int pm_state_repair_routing(pm_agent_state *state, pm_buffer *payload) {
+  /*
+   * A repair request is an explicit freshness boundary. Listener ownership is
+   * the evidence needed to rebuild route shards; the separate ESTABLISHED scan
+   * only refreshes handshake TTL bookkeeping and would double lsof latency.
+   */
+  pm_mark_route_tables_dirty(state);
+  if (pm_state_snapshot_internal(state, payload, 1) != 0) {
+    return -1;
+  }
+  /* Route consumers may read the regenerated shards immediately after the RPC
+   * response. Forget content signatures so fresh-looking files that were
+   * truncated or externally replaced are also rewritten; generation guards
+   * still prevent this daemon from overwriting a newer writer. */
+  pm_route_table_signatures_clear(state);
+  return pm_state_flush_route_tables(state);
 }
 
 int pm_state_reap_children(pm_agent_state *state) {
