@@ -6,7 +6,7 @@ All notable changes to Port Manager are documented in this file.
 
 - Fixed terminal-launched servers stalling inside `bind()` while the native agent was refreshing listeners. Hook registrations now queue a complete frame without waiting for the response, the agent consumes queued data before peer-close events, and logical route-table publication is kept ahead of expensive UI snapshots.
 
-- Coalesce native hook-recovery process inspection by listener PID and keep the valid listener cache across explicit hook registrations. A process exposing many ports no longer triggers repeated `ps eww`/command probes or a new full listener scan for every bind.
+- Fixed **Stale Routing** recovery after VS Code or the shared daemon restarts while existing terminals and hooked servers remain alive. Repair now restores same-port per-network loopback listeners, scans each PID once, performs one authoritative LISTEN pass before slower Docker reconciliation, restores persisted terminal attachments, and synchronously rewrites missing or corrupt route shards without trusting a failed `lsof` scan.
 
 - Fixed runtime launchers rewriting an already-complete network scope and retaining borrowed `getenv()` pointers across `setenv()`. Long network ids no longer corrupt the hooked runtime boundary or terminate the first server command.
 
