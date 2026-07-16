@@ -8,6 +8,7 @@
 
 - 루프백 연결의 4-tuple로부터 클라이언트 프로세스 pid와 시작 시각(pid 재사용 가드)을 해석한다.
 - 해당 프로세스의 환경에서 Port Manager 네트워크 스코프 변수를 읽는다. 프로세스 자신에 스코프가 없으면 조상 프로세스를 얕게 거슬러 올라간다.
+- agent 복구가 요청한 환경 변수만 직접 읽어 exact-entry separator가 붙은 텍스트로 제공한다. 큰 비관련 환경값과 `ps` 문자열 경계 오인식을 피한다.
 - 모든 함수는 best-effort다. 실패는 음수/실패 반환으로 표현하며, 호출자는 상위 조회로 fallback한다(오귀속하지 않는다).
 - `PORT_MANAGER_DEV_LOG`가 명시된 경우 공용 진단 파일에 append하되 64 MiB에서 기록을 중단한다.
 
@@ -15,6 +16,7 @@
 
 - `pm_peer_resolve_client_pid(...)`: 클라이언트 로컬/외부 엔드포인트 → pid(+시작 시각).
 - `pm_peer_read_network_id(pid, ...)`: 프로세스(및 조상)의 환경에서 네트워크 스코프 조회.
+- `pm_peer_read_environment_text(pid, names, ...)`: 한 프로세스에서 선택한 환경 항목만 exact-entry 형식으로 조회.
 - `pm_dev_log(...)`: opt-in 공용 진단 로그 기록.
 
 ## 외부 의존성

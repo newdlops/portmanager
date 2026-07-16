@@ -38,6 +38,26 @@ int pm_peer_resolve_client_pid(
     int client_foreign_port,
     long *out_start_time_seconds);
 
+/* Marks exact environment-entry boundaries in pm_peer_read_environment_text. */
+#define PM_PEER_ENVIRONMENT_ENTRY_SEPARATOR '\x1e'
+
+/*
+ * Reads selected values from one process' environment without launching a
+ * command. Each exact NAME=value entry is prefixed by
+ * PM_PEER_ENVIRONMENT_ENTRY_SEPARATOR; whitespace inside a value is preserved.
+ * The function does not inspect ancestors.
+ *
+ * Returns 0 and fills buffer on success (a marker-only buffer means no selected
+ * variable exists); returns -1 when the process is not readable or the caller
+ * buffer would truncate a selected value.
+ */
+int pm_peer_read_environment_text(
+    int pid,
+    const char *const *names,
+    size_t name_count,
+    char *buffer,
+    size_t size);
+
 /*
  * Reads the first Port Manager network id set in the environment of the given
  * process. When the process itself carries no scope, the process' ancestors are

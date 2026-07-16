@@ -76,20 +76,29 @@ static int pm_scan_environment_for_network_id(
 #if defined(__APPLE__)
 
 static int pm_peer_read_environment_buffer(int pid, char **output, size_t *output_size) {
-  int mib[3] = {CTL_KERN, KERN_PROCARGS2, pid};
-  size_t size = 0;
+  int argmax_mib[2] = {CTL_KERN, KERN_ARGMAX};
+  int process_mib[3] = {CTL_KERN, KERN_PROCARGS2, pid};
+  int argmax = 0;
+  size_t argmax_size = sizeof(argmax);
+  size_t size;
   char *buffer;
 
-  if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0 || size == 0) {
+  /*
+   * Allocate the kernel argument ceiling rather than querying this process'
+   * current byte count first. The target may exec between two sysctl calls;
+   * KERN_ARGMAX keeps the second read from returning a truncated argv/env tail.
+   */
+  if (sysctl(argmax_mib, 2, &argmax, &argmax_size, NULL, 0) != 0 || argmax <= 0) {
     return -1;
   }
 
+  size = (size_t)argmax;
   buffer = malloc(size);
   if (buffer == NULL) {
     return -1;
   }
 
-  if (sysctl(mib, 3, buffer, &size, NULL, 0) != 0) {
+  if (sysctl(process_mib, 3, buffer, &size, NULL, 0) != 0 || size == 0) {
     free(buffer);
     return -1;
   }
@@ -576,17 +585,159 @@ int pm_peer_resolve_client_pid(
 
 #endif
 
+/*
+ * KERN_PROCARGS2 prefixes the environment with argc, the executable path, and
+ * argv. Linux /proc already exposes only environment entries. Keeping this
+ * boundary here lets every caller use the same NUL-delimited entry view.
+ */
+static int pm_peer_environment_entries(
+    const char *buffer,
+    size_t buffer_size,
+    const char **environment,
+    size_t *environment_size) {
+  size_t offset = 0;
+
+  if (buffer == NULL || environment == NULL || environment_size == NULL) {
+    return -1;
+  }
+
+#if defined(__APPLE__)
+  int argument_count;
+
+  if (buffer_size < sizeof(argument_count)) {
+    return -1;
+  }
+  memcpy(&argument_count, buffer, sizeof(argument_count));
+  if (argument_count < 0) {
+    return -1;
+  }
+  offset = sizeof(argument_count);
+
+  /* Skip executable path and the padding between it and argv[0]. */
+  while (offset < buffer_size && buffer[offset] != '\0') {
+    offset++;
+  }
+  while (offset < buffer_size && buffer[offset] == '\0') {
+    offset++;
+  }
+
+  for (int index = 0; index < argument_count; index++) {
+    size_t remaining;
+    size_t length;
+
+    if (offset >= buffer_size) {
+      return -1;
+    }
+    remaining = buffer_size - offset;
+    length = strnlen(buffer + offset, remaining);
+    if (length == remaining) {
+      return -1;
+    }
+    offset += length + 1;
+  }
+#endif
+
+  if (offset > buffer_size) {
+    return -1;
+  }
+  *environment = buffer + offset;
+  *environment_size = buffer_size - offset;
+  return 0;
+}
+
+int pm_peer_read_environment_text(
+    int pid,
+    const char *const *names,
+    size_t name_count,
+    char *buffer,
+    size_t size) {
+  char *process_buffer = NULL;
+  size_t process_buffer_size = 0;
+  const char *environment = NULL;
+  size_t environment_size = 0;
+  size_t offset = 0;
+  size_t used = 0;
+
+  if (names == NULL || name_count == 0 || buffer == NULL || size == 0 || pid <= 0) {
+    return -1;
+  }
+  buffer[0] = '\0';
+
+  if (pm_peer_read_environment_buffer(pid, &process_buffer, &process_buffer_size) != 0 ||
+      pm_peer_environment_entries(process_buffer, process_buffer_size, &environment, &environment_size) != 0) {
+    free(process_buffer);
+    return -1;
+  }
+  /* A leading separator identifies the exact-entry format even when none of
+   * the selected variables exist. That successful empty selection must not
+   * fall back to ps for an unrelated, directly readable process. */
+  if (size < 2) {
+    free(process_buffer);
+    return -1;
+  }
+  buffer[used++] = PM_PEER_ENVIRONMENT_ENTRY_SEPARATOR;
+  buffer[used] = '\0';
+
+  while (offset < environment_size) {
+    const char *entry = environment + offset;
+    size_t remaining = environment_size - offset;
+    size_t entry_length = strnlen(entry, remaining);
+    int selected = 0;
+
+    if (entry_length == remaining) {
+      buffer[0] = '\0';
+      free(process_buffer);
+      return -1;
+    }
+    for (size_t name_index = 0; name_index < name_count && !selected; name_index++) {
+      size_t name_length = strlen(names[name_index]);
+      selected = entry_length > name_length && entry[name_length] == '=' &&
+        strncmp(entry, names[name_index], name_length) == 0;
+    }
+    if (selected) {
+      size_t separator_length = used > 1 ? 1 : 0;
+      if (used + separator_length + entry_length + 1 > size) {
+        buffer[0] = '\0';
+        free(process_buffer);
+        return -1;
+      }
+      if (separator_length != 0) {
+        buffer[used++] = PM_PEER_ENVIRONMENT_ENTRY_SEPARATOR;
+      }
+      for (size_t entry_index = 0; entry_index < entry_length; entry_index++) {
+        /* Reserve the separator byte for framing; it has no meaningful role
+         * in Port Manager's selected routing values. */
+        buffer[used++] = entry[entry_index] == PM_PEER_ENVIRONMENT_ENTRY_SEPARATOR
+          ? '?'
+          : entry[entry_index];
+      }
+      buffer[used] = '\0';
+    }
+    offset += entry_length + 1;
+  }
+
+  free(process_buffer);
+  return 0;
+}
+
 /* Reads the network scope from one process' environment, ancestors excluded. */
 static int pm_peer_read_network_id_self(int pid, char *buffer, size_t size) {
   char *environment = NULL;
   size_t environment_size = 0;
+  const char *entries = NULL;
+  size_t entries_size = 0;
   int result;
 
   if (pm_peer_read_environment_buffer(pid, &environment, &environment_size) != 0) {
     return -1;
   }
 
-  result = pm_scan_environment_for_network_id(environment, environment_size, buffer, size);
+  if (pm_peer_environment_entries(environment, environment_size, &entries, &entries_size) != 0) {
+    free(environment);
+    return -1;
+  }
+
+  result = pm_scan_environment_for_network_id(entries, entries_size, buffer, size);
   free(environment);
   return result;
 }
