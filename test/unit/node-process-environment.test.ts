@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -176,6 +178,190 @@ test("recovers wrapper-launched Vite routes from environment port metadata", asy
   assert.equal(recovered?.requestedPort, 3004);
   assert.equal(recovered?.actualPort, 53743);
   assert.equal(recovered?.command, "node /workspace/node_modules/.bin/vite --host");
+});
+
+test("recovers same-port loopback-only routes when the listener owns the declared network address", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  for (const loopbackVariable of ["PORT_MANAGER_NETWORK_LOOPBACK_HOST", "PORT_MANAGER_ACTUAL_LOOPBACK_HOST"]) {
+    const listener = createListener({
+      port: 3004,
+      pid: 71925,
+      processName: "node",
+      command: "node",
+      localAddress: "127.93.164.7",
+    });
+    const provider = new NodeProcessEnvironmentProvider({
+      commandRunner: async (_file, args) => {
+        if (args.includes("eww")) {
+          return {
+            stdout:
+              `71925 s005 node server.js PORT_MANAGER_HOOK=1 PORT_MANAGER_NETWORK_ID=network-a ` +
+              `PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE=loopback-address-only ` +
+              `${loopbackVariable}=127.93.164.7 PORT=3999 PWD=/workspace/client`,
+          };
+        }
+
+        return { stdout: "node server.js\n" };
+      },
+    });
+
+    assert.deepEqual(await provider.recoverHookRoute(listener), {
+      pid: 71925,
+      name: "node",
+      command: "node server.js",
+      cwd: "/workspace/client",
+      requestedPort: 3004,
+      actualPort: 3004,
+      host: "127.93.164.7",
+      networkId: "network-a",
+      experimentalRouteOwnershipMode: "loopback-address-only",
+      source: "hooked",
+    });
+  }
+});
+
+test("does not adopt same-port listeners without matching loopback-only ownership metadata", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  const cases = [
+    {
+      name: "legacy ownership mode",
+      mode: "terminal-scope-listener",
+      listenerAddress: "127.93.164.7",
+      environmentAddress: "127.93.164.7",
+    },
+    {
+      name: "different virtual loopback",
+      mode: "loopback-address-only",
+      listenerAddress: "127.93.164.8",
+      environmentAddress: "127.93.164.7",
+    },
+    {
+      name: "wildcard listener",
+      mode: "loopback-address-only",
+      listenerAddress: "0.0.0.0",
+      environmentAddress: "0.0.0.0",
+    },
+    {
+      name: "default IPv4 localhost",
+      mode: "loopback-address-only",
+      listenerAddress: "127.0.0.1",
+      environmentAddress: "127.0.0.1",
+    },
+    {
+      name: "default IPv6 localhost",
+      mode: "loopback-address-only",
+      listenerAddress: "::1",
+      environmentAddress: "::1",
+    },
+  ];
+
+  for (const current of cases) {
+    const provider = new NodeProcessEnvironmentProvider({
+      commandRunner: async (_file, args) => {
+        if (args.includes("eww")) {
+          return {
+            stdout:
+              `71926 s005 node server.js PORT_MANAGER_HOOK=1 PORT_MANAGER_NETWORK_ID=network-a ` +
+              `PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE=${current.mode} ` +
+              `PORT_MANAGER_NETWORK_LOOPBACK_HOST=${current.environmentAddress} PORT=3004`,
+          };
+        }
+
+        return { stdout: "node server.js --port 3004\n" };
+      },
+    });
+    const listener = createListener({
+      port: 3004,
+      pid: 71926,
+      localAddress: current.listenerAddress,
+      processName: "node",
+    });
+
+    assert.equal(await provider.recoverHookRoute(listener), undefined, current.name);
+  }
+});
+
+test("uses one native capture for every listener owned by the same hook process", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  let captureCalls = 0;
+  let inspectCalls = 0;
+  let commandCalls = 0;
+  const provider = new NodeProcessEnvironmentProvider({
+    nativeLookupProvider: {
+      captureProcess: async () => {
+        captureCalls += 1;
+        return {
+          ancestorPids: [],
+          cwd: "/workspace/client",
+          networkId: "network-a",
+          argv: ["node", "server.js", "--port", "3004"],
+          env: ["PORT_MANAGER_HOOK=1", "PORT_MANAGER_NETWORK_ID=network-a", "PORT=3004"],
+        };
+      },
+      inspectProcess: async () => {
+        inspectCalls += 1;
+        return undefined;
+      },
+    },
+    commandRunner: async () => {
+      commandCalls += 1;
+      throw new Error("ps fallback should not run");
+    },
+  });
+
+  const recovered = await provider.recoverHookRoute(
+    createListener({ port: 53743, pid: 71927, processName: "node", command: "node" }),
+  );
+  const secondRecovered = await provider.recoverHookRoute(
+    createListener({ port: 53744, pid: 71927, processName: "node", command: "node" }),
+  );
+
+  assert.equal(recovered?.requestedPort, 3004);
+  assert.equal(recovered?.command, "node server.js --port 3004");
+  assert.equal(secondRecovered?.actualPort, 53744);
+  assert.equal(captureCalls, 1);
+  assert.equal(inspectCalls, 0);
+  assert.equal(commandCalls, 0);
+});
+
+test("native process capture reads Linux argv and environment from their distinct proc files", () => {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "../../../native/process-lookup/portmanager_process_lookup.c"),
+    "utf8",
+  );
+  const linuxCaptureStart = source.indexOf("#if defined(__linux__)\n  char *argv_buffer");
+  const linuxCaptureEnd = source.indexOf("#else", linuxCaptureStart);
+  const linuxCaptureBody = source.slice(linuxCaptureStart, linuxCaptureEnd);
+
+  assert.notEqual(linuxCaptureStart, -1);
+  assert.equal(source.includes('pm_linux_read_nul_file(pid, "cmdline"'), true);
+  assert.equal(source.includes('pm_linux_read_nul_file(pid, "environ"'), true);
+  assert.equal(linuxCaptureBody.includes('pm_print_nul_json_array("argv", argv_buffer'), true);
+  assert.equal(linuxCaptureBody.includes('pm_print_nul_json_array("env", environment_buffer'), true);
+});
+
+test("macOS process environment capture allocates KERN_ARGMAX to survive exec races", () => {
+  const lookupSource = fs.readFileSync(
+    path.resolve(__dirname, "../../../native/process-lookup/portmanager_process_lookup.c"),
+    "utf8",
+  );
+  const sharedSource = fs.readFileSync(
+    path.resolve(__dirname, "../../../native/shared/pm_peer_process.c"),
+    "utf8",
+  );
+
+  assert.equal(lookupSource.includes("KERN_ARGMAX"), true);
+  assert.equal(sharedSource.includes("KERN_ARGMAX"), true);
+  assert.equal(sharedSource.includes("target may exec between two sysctl calls"), true);
 });
 
 test("does not recover no-network or disabled hook marker environments as app routes", async () => {

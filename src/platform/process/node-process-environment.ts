@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { ExperimentalRouteOwnershipMode, ListeningPort, RegisteredProcessInput } from "../../shared/types";
-import { NativeProcessLookupProvider } from "./native-process-lookup";
+import { NativeProcessLookupProvider, type NativeProcessLookupDetails } from "./native-process-lookup";
 
 const execFileAsync = promisify(execFile);
 const PROCESS_ENVIRONMENT_CACHE_TTL_MS = 5000;
@@ -23,7 +23,8 @@ interface CommandResult {
 }
 
 type CommandRunner = (file: string, args: readonly string[]) => Promise<CommandResult>;
-type NativeProcessInspector = Pick<NativeProcessLookupProvider, "inspectProcess">;
+type NativeProcessInspector = Pick<NativeProcessLookupProvider, "inspectProcess"> &
+  Partial<Pick<NativeProcessLookupProvider, "captureProcess">>;
 
 interface NodeProcessEnvironmentProviderOptions {
   /** Injectable command boundary so tests can parse fixed process output. */
@@ -36,6 +37,17 @@ interface NodeProcessEnvironmentProviderOptions {
 
 interface ProcessEnvironmentSnapshot {
   readonly networkId?: string;
+  readonly expiresAtMs: number;
+}
+
+interface HookRecoveryProcessMetadata {
+  /** Native inspection result shared by every listener owned by this PID. */
+  readonly nativeDetails?: NativeProcessLookupDetails;
+  /** Full process environment, used to prove that the native hook owns the listener. */
+  readonly environmentOutput?: string;
+  /** Full argv text, used only after hook ownership has been established. */
+  readonly commandOutput?: string;
+  /** Short lifetime keeps PID reuse from carrying metadata into a later process. */
   readonly expiresAtMs: number;
 }
 
@@ -55,6 +67,12 @@ export class NodeProcessEnvironmentProvider {
 
   /** In-flight per-PID environment reads so duplicate router connections share one ps call. */
   private readonly requestsByPid = new Map<number, Promise<string | undefined>>();
+
+  /** One capture per PID is reused when a server owns several listening ports. */
+  private readonly hookRecoveryMetadataByPid = new Map<number, HookRecoveryProcessMetadata>();
+
+  /** Concurrent listener recovery joins the same native capture/ps fallback. */
+  private readonly hookRecoveryMetadataRequestsByPid = new Map<number, Promise<HookRecoveryProcessMetadata>>();
 
   constructor(options: NodeProcessEnvironmentProviderOptions = {}) {
     this.runCommand = options.commandRunner ?? runExecFile;
@@ -127,11 +145,7 @@ export class NodeProcessEnvironmentProvider {
       return undefined;
     }
 
-    const [nativeDetails, environmentOutput, commandOutput] = await Promise.all([
-      this.nativeLookupProvider?.inspectProcess(pid).catch(() => undefined),
-      this.readProcessEnvironmentText(pid).catch(() => undefined),
-      this.readProcessCommandText(pid).catch(() => undefined),
-    ]);
+    const { nativeDetails, environmentOutput, commandOutput } = await this.readHookRecoveryProcessMetadata(pid);
 
     if (environmentOutput === undefined || !hasPortManagerHookEnvironment(environmentOutput)) {
       return undefined;
@@ -142,10 +156,21 @@ export class NodeProcessEnvironmentProvider {
       return undefined;
     }
 
-    const requestedPort =
-      inferRequestedPortFromProcessEnvironment(environmentOutput, listener.port) ??
-      inferRequestedPortFromCommand(command, listener.port);
-    if (requestedPort === undefined || requestedPort === listener.port) {
+    const terminalScope = parseExperimentalTerminalScopeFromProcessEnvironment(environmentOutput);
+    const samePortLoopbackRoute = canRecoverSamePortLoopbackRoute(listener, environmentOutput, terminalScope);
+
+    /*
+     * A loopback-address-only route intentionally keeps logical and actual
+     * ports equal. Recover it only when the process metadata names the exact
+     * loopback address that owns this listener; otherwise an unrelated local
+     * listener could be adopted after an extension restart.
+     */
+    const requestedPort = samePortLoopbackRoute
+      ? listener.port
+      : inferRequestedPortFromProcessEnvironment(environmentOutput, listener.port) ??
+        inferRequestedPortFromCommand(command, listener.port);
+
+    if (requestedPort === undefined) {
       return undefined;
     }
 
@@ -154,7 +179,6 @@ export class NodeProcessEnvironmentProvider {
       parseProcessEnvironmentValue(environmentOutput, ["PWD", "INIT_CWD"]) ??
       "";
     const networkId = nativeDetails?.networkId ?? parseRoutingNetworkIdFromProcessEnvironment(environmentOutput);
-    const terminalScope = parseExperimentalTerminalScopeFromProcessEnvironment(environmentOutput);
 
     return {
       pid,
@@ -191,6 +215,125 @@ export class NodeProcessEnvironmentProvider {
     const { stdout } = await this.runCommand("ps", ["-o", "command=", "-p", String(pid)]);
     return toText(stdout);
   }
+
+  /**
+   * Captures immutable startup metadata once for a burst of listeners owned by
+   * one process. A server commonly binds an app port plus debugger/health ports;
+   * rereading its complete environment for each row dominates restart repair.
+   */
+  private async readHookRecoveryProcessMetadata(pid: number): Promise<HookRecoveryProcessMetadata> {
+    const now = Date.now();
+    const cached = this.hookRecoveryMetadataByPid.get(pid);
+    if (cached !== undefined) {
+      if (cached.expiresAtMs > now) {
+        return cached;
+      }
+      this.hookRecoveryMetadataByPid.delete(pid);
+    }
+
+    const currentRequest = this.hookRecoveryMetadataRequestsByPid.get(pid);
+    if (currentRequest !== undefined) {
+      return currentRequest;
+    }
+
+    let request: Promise<HookRecoveryProcessMetadata>;
+    request = this.captureHookRecoveryProcessMetadata(pid)
+      .then((metadata) => {
+        /*
+         * Cache only a completed environment read. A transient permission or
+         * process-startup miss must remain retryable by an explicit repair.
+         */
+        if (metadata.environmentOutput !== undefined) {
+          this.hookRecoveryMetadataByPid.set(pid, metadata);
+        }
+        return metadata;
+      })
+      .finally(() => {
+        if (this.hookRecoveryMetadataRequestsByPid.get(pid) === request) {
+          this.hookRecoveryMetadataRequestsByPid.delete(pid);
+        }
+      });
+
+    this.hookRecoveryMetadataRequestsByPid.set(pid, request);
+    return request;
+  }
+
+  /** Reads argv/environment together and retains the two-command compatibility fallback. */
+  private async captureHookRecoveryProcessMetadata(pid: number): Promise<HookRecoveryProcessMetadata> {
+    const capturedDetails = await this.nativeLookupProvider?.captureProcess?.(pid).catch(() => undefined);
+    const [inspectedDetails, environmentOutput, commandOutput] = await Promise.all([
+      capturedDetails === undefined
+        ? this.nativeLookupProvider?.inspectProcess(pid).catch(() => undefined)
+        : Promise.resolve(undefined),
+      capturedDetails?.env === undefined || capturedDetails.env.length === 0
+        ? this.readProcessEnvironmentText(pid).catch(() => undefined)
+        : Promise.resolve(capturedDetails.env.join("\n")),
+      capturedDetails?.argv === undefined || capturedDetails.argv.length === 0
+        ? this.readProcessCommandText(pid).catch(() => undefined)
+        : Promise.resolve(capturedDetails.argv.join(" ")),
+    ]);
+
+    return {
+      nativeDetails: capturedDetails ?? inspectedDetails,
+      environmentOutput,
+      commandOutput,
+      expiresAtMs: Date.now() + PROCESS_ENVIRONMENT_CACHE_TTL_MS,
+    };
+  }
+}
+
+/** Confirms that a same-port listener belongs to the process's virtual loopback. */
+function canRecoverSamePortLoopbackRoute(
+  listener: ListeningPort,
+  environmentOutput: string,
+  terminalScope: Pick<
+    RegisteredProcessInput,
+    "experimentalRouteOwnershipMode" | "terminalSessionId" | "processGroupId"
+  >,
+): boolean {
+  if (terminalScope.experimentalRouteOwnershipMode !== "loopback-address-only") {
+    return false;
+  }
+
+  const listenerAddress = normalizeLoopbackAddress(listener.localAddress);
+  if (listenerAddress === undefined) {
+    return false;
+  }
+
+  return ["PORT_MANAGER_NETWORK_LOOPBACK_HOST", "PORT_MANAGER_ACTUAL_LOOPBACK_HOST"].some((name) => {
+    const environmentAddress = normalizeLoopbackAddress(parseProcessEnvironmentValue(environmentOutput, [name]));
+    return environmentAddress === listenerAddress;
+  });
+}
+
+/** Normalizes supported loopback spellings while rejecting wildcard/non-loopback listeners. */
+function normalizeLoopbackAddress(value: string | undefined): string | undefined {
+  let normalized = value?.trim().toLowerCase();
+  if (normalized === undefined || normalized.length === 0) {
+    return undefined;
+  }
+
+  if (normalized.startsWith("[") && normalized.endsWith("]")) {
+    normalized = normalized.slice(1, -1);
+  }
+
+  if (normalized.startsWith("::ffff:")) {
+    normalized = normalized.slice("::ffff:".length);
+  }
+
+  const octets = normalized.split(".");
+  if (
+    octets.length !== 4 ||
+    octets[0] !== "127" ||
+    octets.some((octet) => !/^\d{1,3}$/.test(octet) || Number(octet) > 255)
+  ) {
+    return undefined;
+  }
+
+  const ipv4 = octets.map((octet) => String(Number(octet))).join(".");
+  // The hook's bind virtualization deliberately excludes default localhost;
+  // only a non-default 127/8 alias is a unique per-network ownership proof.
+  return ipv4 === "127.0.0.1" ? undefined : ipv4;
 }
 
 /** Reads optional terminal-scope ownership metadata left by the experimental hook path. */
