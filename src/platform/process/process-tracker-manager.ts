@@ -39,6 +39,15 @@ export class ProcessTrackerManager implements DisposableLike {
     if (this.options.trackerPath === undefined) {
       return;
     }
+    /*
+     * Constructor-restored state is synchronized before any router query. An
+     * empty initial set has nothing to declare and must not eagerly leave a
+     * native helper running in every VS Code window. Existing children still
+     * receive the empty set below so previously tracked networks are removed.
+     */
+    if (roots.size === 0 && this.child === undefined && this.trackedRoots.size === 0) {
+      return;
+    }
     const child = this.ensureChild();
     if (child === undefined) {
       return;
