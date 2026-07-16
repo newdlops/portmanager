@@ -331,6 +331,8 @@ interface BackgroundRefreshOptions {
   readonly sharedRefreshAcquired?: boolean;
   /** Internal flag for marker bursts; keeps the first forced scan immediate but drops rapid repeats. */
   readonly coalesceForce?: boolean;
+  /** Reuses a fresh daemon snapshot already obtained by the enclosing repair generation. */
+  readonly skipProcessSnapshotRefresh?: boolean;
 }
 
 interface ComposeProjectRoutingWriteOptions {
@@ -409,6 +411,13 @@ interface FileCleanupSummary {
   readonly removedFileCount: number;
   /** Files that could not be removed because the filesystem rejected cleanup. */
   readonly failedFileCount: number;
+}
+
+interface RoutingFileRehydrateOptions {
+  /** Global-storage cleanup may remove generated Compose override artifacts. */
+  readonly forceComposeOverrideRefresh?: boolean;
+  /** A checked fresh scan already succeeded before route JSON cleanup began. */
+  readonly daemonRoutingAlreadyRepaired?: boolean;
 }
 
 export interface VscodeWindowTerminalAttachSummary {
@@ -599,6 +608,12 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Guards daemon and routing-file convergence so refresh events cannot recurse. */
   private daemonConvergenceInFlight: Promise<void> | undefined;
+
+  /** Serializes explicit stale-routing repair commands in this extension host. */
+  private staleRoutingRepairInFlight: Promise<StaleRoutingRepairSummary> | undefined;
+
+  /** Prevents repair-driven registry events from racing generated-file cleanup. */
+  private suppressRoutingRepairSideEffects = false;
 
   /** Guards localhost router reconciliation so owner handoffs do not overlap in one host. */
   private logicalRouterSyncInFlight: Promise<void> | undefined;
@@ -862,7 +877,9 @@ export class PortManagerNetworkService implements DisposableLike {
           this.syncComposeRoutingFreshnessHeartbeat();
           this.syncContainerEventsWatcher();
         }
-        void this.runControlPlaneRegistrySideEffects();
+        if (!this.suppressRoutingRepairSideEffects) {
+          void this.runControlPlaneRegistrySideEffects();
+        }
         this.reconcileVscodeWindowTerminalBinding();
       }),
     );
@@ -870,7 +887,7 @@ export class PortManagerNetworkService implements DisposableLike {
       this.disposables.push(
         this.processService.onDidChange(() => {
           this.notifyRoutingActivity();
-          if (this.ownsControlPlaneLease) {
+          if (this.ownsControlPlaneLease && !this.suppressRoutingRepairSideEffects) {
             void this.syncLogicalPortRouters();
             void this.syncBrowserNetworkProxies();
             void this.writeTerminalNetworkSelectionFile();
@@ -923,6 +940,10 @@ export class PortManagerNetworkService implements DisposableLike {
     );
 
     await this.reloadSharedNetworkState();
+    // Constructor-loaded attachments do not emit a registry change. Seed the
+    // new tracker process explicitly so terminals that survived an extension
+    // host restart retain network attribution immediately.
+    this.syncProcessTrackerRoots();
     await this.refreshRuntimeDescriptors({ includeContainerRuntime: false });
     this.reconcileVscodeWindowTerminalBinding();
     await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
@@ -1006,6 +1027,14 @@ export class PortManagerNetworkService implements DisposableLike {
     this.startRoutingSignalRefreshLoop();
     this.startTerminalAttachmentMarkerPolling();
 
+    /*
+     * Persisted terminal rows are durable but the discovered terminal-window
+     * view is not. Recover surviving shells before slower Compose work so a
+     * dead generation lock or unavailable container runtime cannot prevent
+     * terminal routing from being restored after a VS Code restart.
+     */
+    await this.refreshTerminals({ background: true }).catch(() => []);
+
     await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
     await this.reopenPersistedExposures();
     await this.writeHostAccessBindingsFile();
@@ -1015,13 +1044,10 @@ export class PortManagerNetworkService implements DisposableLike {
     await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });
     await this.writeTerminalNetworkSelectionFile();
     /*
-     * Terminal and container discovery only feed the sidebar and live
-     * attachments, so cold start defers them: the consumer gates skip the
-     * scans entirely in an untouched workspace, and the container-runtime
-     * probe waits out the activation burst that a cold VS Code launch already
-     * spends on other extensions.
+     * Container discovery only feeds the sidebar and live attachments, so the
+     * runtime probe waits out the activation burst. Terminal discovery already
+     * ran through its consumer gate above to recover persisted live shells.
      */
-    await this.refreshTerminals({ background: true });
     await this.syncLogicalPortRouters();
     await this.syncBrowserNetworkProxies();
     this.syncComposeRoutingFreshnessHeartbeat();
@@ -2246,6 +2272,7 @@ export class PortManagerNetworkService implements DisposableLike {
     terminalWindowId: string,
     networkId: string,
     settings: PortManagerSettings,
+    knownProcessRows?: readonly ProcessTableRow[],
   ): Promise<TerminalRoutingInjectionResult> {
     if (!this.ownsControlPlaneLease && !(await this.startControlPlaneOwnerIfAvailable())) {
       return { injected: false, reason: "Another Port Manager window owns terminal routing control." };
@@ -2274,7 +2301,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const network = requireNetwork(this.registry.getNetwork(networkId), networkId);
     const script = this.buildTerminalRoutingScript(network, settings);
-    const processRows = await this.listProcessRowsForTerminalControl();
+    const processRows = knownProcessRows ?? (await this.listProcessRowsForTerminalControl());
     if (await sendRoutingScriptToVscodeTerminal(terminalWindow, script, processRows)) {
       return { injected: true };
     }
@@ -2937,12 +2964,20 @@ export class PortManagerNetworkService implements DisposableLike {
    */
   async clearRoutingFiles(): Promise<RoutingFileCleanupSummary> {
     const cleanupPaths = await this.collectRoutingFileCleanupPaths();
-    const summary = await removeRoutingFilePaths(cleanupPaths);
     const attachments = this.registry
       .getSnapshot()
       .composeAttachments.filter(isRestorableComposeAttachment);
 
-    return this.rehydrateRoutingFiles(summary, attachments);
+    /*
+     * Prove that live listener state can be recovered before deleting the last
+     * usable route shards. A missing/denied lsof now aborts here and leaves all
+     * existing files untouched instead of turning a stale route into an outage.
+     */
+    await this.ensureCurrentProcessDaemon({ refreshAfterRestart: false });
+    await this.ensureDaemonRouteTablesMaterialized({ force: true });
+
+    const summary = await removeRoutingFilePaths(cleanupPaths);
+    return this.rehydrateRoutingFiles(summary, attachments, { daemonRoutingAlreadyRepaired: true });
   }
 
   /**
@@ -2964,7 +2999,7 @@ export class PortManagerNetworkService implements DisposableLike {
     await fs.mkdir(this.getTerminalAttachmentMarkerDirectoryPath(), { recursive: true }).catch(() => undefined);
     this.saveState({ force: true });
 
-    return this.rehydrateRoutingFiles(summary, attachments);
+    return this.rehydrateRoutingFiles(summary, attachments, { forceComposeOverrideRefresh: true });
   }
 
   /**
@@ -3005,31 +3040,58 @@ export class PortManagerNetworkService implements DisposableLike {
    * files and daemon rows are rebuilt from the current registry snapshot.
    */
   async fixStaleRouting(): Promise<StaleRoutingRepairSummary> {
-    const beforeDaemon = this.getDaemonStatus();
-    const markerCountBefore = await this.countManualTerminalAttachmentMarkerFiles();
-    const cleanupSummary = await this.clearRoutingFiles();
-    const terminalWindows = await this.refreshTerminals().catch(() => []);
-    const markerCountAfter = await this.countManualTerminalAttachmentMarkerFiles();
+    if (this.staleRoutingRepairInFlight !== undefined) {
+      return this.staleRoutingRepairInFlight;
+    }
 
-    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
-    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
-    await this.convergeDaemonAndRoutingState();
-    await this.processService?.refresh().catch(() => undefined);
+    this.staleRoutingRepairInFlight = this.fixStaleRoutingExclusive().finally(() => {
+      this.staleRoutingRepairInFlight = undefined;
+    });
+    return this.staleRoutingRepairInFlight;
+  }
 
-    const afterDaemon = this.getDaemonStatus();
-    const daemonRestarted =
-      beforeDaemon.restartRequired === true &&
-      afterDaemon.restartRequired !== true &&
-      (beforeDaemon.pid <= 0 || afterDaemon.pid !== beforeDaemon.pid || afterDaemon.versionStatus === "current");
+  /** Runs one repair generation without event-driven writers racing cleanup. */
+  private async fixStaleRoutingExclusive(): Promise<StaleRoutingRepairSummary> {
+    this.suppressRoutingRepairSideEffects = true;
+    try {
+      const beforeDaemon = this.getDaemonStatus();
+      /*
+       * Do not probe or write into live terminals on this route-file repair
+       * path. Surviving shells retain their hook environment, while a foreground
+       * app may interpret injected shell syntax as application input.
+       */
+      const terminalCount = this.registry.getSnapshot().terminalWindows.length;
+      /* A writer triggered just before repair suppression may still be draining.
+       * Let its serialized generation finish before deleting the same files. */
+      await Promise.all([
+        this.composeProjectRoutingWriteInFlight?.catch(() => undefined) ?? Promise.resolve(),
+        this.terminalNetworkSelectionWriteInFlight?.catch(() => undefined) ?? Promise.resolve(),
+      ]);
+      /*
+       * clearRoutingFiles performs one complete repair pass. Keeping the command
+       * on that single path avoids repeating Docker discovery, Compose override
+       * generation, daemon scans, proxy sync, and terminal injection.
+       */
+      const cleanupSummary = await this.clearRoutingFiles();
 
-    return {
-      ...cleanupSummary,
-      staleDaemonDetected: beforeDaemon.restartRequired === true,
-      daemonRestarted,
-      removedMarkerCount: Math.max(0, markerCountBefore - markerCountAfter),
-      terminalCount: terminalWindows.length,
-      routeCount: this.getAgentSnapshot().routes.length,
-    };
+      const afterDaemon = this.getDaemonStatus();
+      const daemonRestarted =
+        afterDaemon.restartRequired !== true &&
+        ((beforeDaemon.pid > 0 && afterDaemon.pid > 0 && afterDaemon.pid !== beforeDaemon.pid) ||
+          (beforeDaemon.restartRequired === true &&
+            (beforeDaemon.pid <= 0 || afterDaemon.versionStatus === "current")));
+
+      return {
+        ...cleanupSummary,
+        staleDaemonDetected: beforeDaemon.restartRequired === true,
+        daemonRestarted,
+        removedMarkerCount: 0,
+        terminalCount,
+        routeCount: this.getAgentSnapshot().routes.length,
+      };
+    } finally {
+      this.suppressRoutingRepairSideEffects = false;
+    }
   }
 
   /** Releases listeners and event subscriptions. */
@@ -3838,7 +3900,9 @@ export class PortManagerNetworkService implements DisposableLike {
     return settings.logicalPortGateway && shouldInjectTerminalHook(settings);
   }
 
-  private async ensureCurrentProcessDaemon(): Promise<void> {
+  private async ensureCurrentProcessDaemon(
+    options: { readonly refreshAfterRestart?: boolean } = {},
+  ): Promise<void> {
     if (this.processService === undefined) {
       return;
     }
@@ -3864,7 +3928,7 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     this.daemonRestartBackoffUntilMs = nowMs + DAEMON_RESTART_BACKOFF_MS;
-    await this.processService.restartDaemon();
+    await this.processService.restartDaemon({ refreshSnapshot: options.refreshAfterRestart !== false });
     this.daemonRestartBackoffUntilMs = 0;
     this.localChangeEvents.emit();
   }
@@ -3897,29 +3961,50 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
-    const targetNetworkIds = options.networkIds ?? this.registry.getSnapshot().networks.map((network) => network.id);
-    const routeTablePaths = [...new Set(targetNetworkIds.map((networkId) => getRouteTablePathForNetwork(networkId)))];
-    if (routeTablePaths.length === 0) {
-      return;
-    }
+    if (options.force !== true) {
+      /*
+       * A network without an active route intentionally has no scoped JSON.
+       * Treating every durable network as a required file made normal
+       * convergence launch a fresh listener scan forever in idle workspaces.
+       */
+      const targetNetworkIds =
+        options.networkIds ??
+        [
+          ...new Set(
+            this.processService
+              .getSnapshot()
+              .routes.map((route) => route.networkId)
+              .filter((networkId): networkId is string => networkId !== undefined && networkId.length > 0),
+          ),
+        ];
+      const routeTablePaths = [
+        ...new Set(targetNetworkIds.map((networkId) => getRouteTablePathForNetwork(networkId))),
+      ];
+      if (routeTablePaths.length === 0) {
+        return;
+      }
 
-    const routeTableTtlMs = readPortManagerSettings().routeTableTtlSeconds * 1000;
-    if (
-      options.force !== true &&
-      (await Promise.all(routeTablePaths.map((routeTablePath) => routeTableFileIsFresh(routeTablePath, routeTableTtlMs)))).every(Boolean)
-    ) {
-      return;
+      const routeTableTtlMs = readPortManagerSettings().routeTableTtlSeconds * 1000;
+      if (
+        (await Promise.all(routeTablePaths.map((routeTablePath) => routeTableFileIsFresh(routeTablePath, routeTableTtlMs)))).every(Boolean)
+      ) {
+        return;
+      }
     }
 
     await this.processService.start();
-    await this.processService.refresh();
+    // Ordinary refreshes may reuse a listener cache and native route writes are
+    // normally coalesced. Missing/cleaned files require the stronger contract:
+    // one fresh listener scan plus completed publication before returning.
+    await this.processService.repairRoutingState();
   }
 
   /**
-   * Re-sources native routing into already attached terminals after globalStorage
-   * cleanup. This intentionally avoids refreshTerminals first: missing marker
-   * files would otherwise delete manual attachments before the script can
-   * recreate their marker and shim paths.
+   * Re-sources routing only during explicit attachment mutations.
+   *
+   * Generated-file repair deliberately does not call this method: a surviving
+   * terminal may currently have Vite, Django, a REPL, or another foreground
+   * process reading stdin, so injecting shell syntax would corrupt that task.
    */
   private async reapplyRoutingToAttachedTerminalWindows(): Promise<number> {
     const settings = readPortManagerSettings();
@@ -3928,31 +4013,52 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     const snapshot = this.registry.getSnapshot();
-    const terminalWindowIds = new Set(snapshot.terminalWindows.map((terminalWindow) => terminalWindow.id));
-    const attachmentByTerminalWindowId = new Map<string, TerminalAttachment>();
+    const attachmentByTerminalWindowId = new Map(
+      snapshot.attachments
+        .filter(
+          (attachment): attachment is TerminalAttachment & { readonly terminalWindowId: string } =>
+            attachment.status === "attached" && attachment.terminalWindowId !== undefined,
+        )
+        .map((attachment) => [attachment.terminalWindowId, attachment]),
+    );
+    const windowBinding = this.vscodeWindowTerminalBinding;
+    const boundNetwork =
+      windowBinding?.status === "attached" ? this.registry.getNetwork(windowBinding.networkId) : undefined;
+    const targetNetworkByTerminalWindowId = new Map<string, string>();
 
-    for (const attachment of snapshot.attachments) {
-      const terminalWindowId = attachment.terminalWindowId;
-      const network = this.registry.getNetwork(attachment.networkId);
-
-      if (
-        attachment.status !== "attached" ||
-        terminalWindowId === undefined ||
-        network?.runtimeKind !== "nativeHelper" ||
-        !terminalWindowIds.has(terminalWindowId)
-      ) {
+    /*
+     * Window environment collections affect only terminals created after the
+     * extension host reload. For existing terminals, a per-terminal attachment
+     * takes precedence over the window default; applying the default blindly
+     * would move explicitly isolated terminals into the wrong network.
+     */
+    for (const terminalWindow of snapshot.terminalWindows) {
+      const attachment = attachmentByTerminalWindowId.get(terminalWindow.id);
+      if (attachment !== undefined) {
+        const network = this.registry.getNetwork(attachment.networkId);
+        if (network?.runtimeKind === "nativeHelper") {
+          targetNetworkByTerminalWindowId.set(terminalWindow.id, network.id);
+        }
+        // A container or otherwise non-native explicit attachment must also
+        // block the VS Code window default from overwriting that terminal.
         continue;
       }
-
-      attachmentByTerminalWindowId.set(terminalWindowId, attachment);
+      if (terminalWindow.source === "vscode" && boundNetwork?.runtimeKind === "nativeHelper") {
+        targetNetworkByTerminalWindowId.set(terminalWindow.id, boundNetwork.id);
+      }
     }
 
+    // Terminal matching needs the process table, but every injection in this
+    // repair generation can share the same immutable observation.
+    const processRows =
+      targetNetworkByTerminalWindowId.size === 0 ? [] : await this.listProcessRowsForTerminalControl();
     let injectedCount = 0;
-    for (const attachment of attachmentByTerminalWindowId.values()) {
+    for (const [terminalWindowId, networkId] of targetNetworkByTerminalWindowId) {
       const result = await this.injectRoutingIntoTerminalWindow(
-        attachment.terminalWindowId!,
-        attachment.networkId,
+        terminalWindowId,
+        networkId,
         settings,
+        processRows,
       ).catch(() => undefined);
       if (result?.injected === true) {
         injectedCount++;
@@ -4340,7 +4446,9 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
-    await this.refreshComposeRouteProcessSnapshot();
+    if (options.skipProcessSnapshotRefresh !== true) {
+      await this.refreshComposeRouteProcessSnapshot();
+    }
     await this.removeOrphanComposeRouteProcesses(attachments);
     const targetAttachments = filterComposeAttachmentsByNetworkIds(attachments, options.networkIds);
 
@@ -6573,30 +6681,57 @@ export class PortManagerNetworkService implements DisposableLike {
   private async rehydrateRoutingFiles(
     summary: FileCleanupSummary,
     attachments: readonly ComposeAttachment[],
+    options: RoutingFileRehydrateOptions = {},
   ): Promise<RoutingFileCleanupSummary> {
     const attachmentIds = new Set(attachments.map((attachment) => attachment.id));
     this.ensureSharedNetworkStateFileMaterialized();
 
     /*
-     * Existing attached shells keep the runtime shim directory at the front of
-     * PATH. Recreate those shell-facing files before slower Docker/daemon
-     * reconciliation so package-manager commands do not hit a deleted shim
-     * path while globalStorage recovery is still in progress.
+     * Replace a stale daemon before rebuilding its files. Rehydrating through
+     * the old generation and restarting afterwards discards the just-recovered
+     * in-memory routes, which is exactly the failure mode seen when VS Code
+     * restarts while application servers keep listening.
      */
-    await this.rehydrateTerminalHookFiles().catch(() => undefined);
+    if (options.daemonRoutingAlreadyRepaired === true) {
+      /* Cleanup removed the freshly validated files, not daemon memory. Put
+       * app routes back immediately without another listener scan. */
+      await this.processService?.flushRouteTables();
+    } else {
+      await this.ensureCurrentProcessDaemon({ refreshAfterRestart: false });
+      /*
+       * App servers can outlive both VS Code and the daemon. Restore their
+       * listener-derived route shards before any Docker/Compose probing so a
+       * slow or unavailable container runtime cannot extend the outage.
+       */
+      await this.ensureDaemonRouteTablesMaterialized({ force: true });
+    }
 
-    const restoredComposeOverrideCount = await this.reconcileComposeOverrideFiles(attachments, { force: true });
+    /*
+     * Stale-routing cleanup removes JSON/TSV control files, not project
+     * overrides. Reuse readable YAML so Fix does not run docker compose config
+     * once per attachment; only full global-storage recovery forces regeneration.
+     */
+    const restoredComposeOverrideCount = await this.reconcileComposeOverrideFiles(attachments, {
+      force: options.forceComposeOverrideRefresh === true,
+    });
     await this.writeHostAccessBindingsFile().catch(() => undefined);
-    await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
-    await this.ensureDaemonRouteTablesMaterialized({
+    await this.reconcileComposeAttachmentPublishedPorts({
       force: true,
-      networkIds: attachments.map((attachment) => attachment.networkId),
+      skipProcessSnapshotRefresh: true,
     }).catch(() => undefined);
-    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
-    await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
+    if (!usesLoopbackAddressOnlyRouting(readPortManagerSettings())) {
+      /* High-port Compose recovery may have just re-registered daemon rows.
+       * Publish those mutations without repeating the listener scan above. */
+      await this.processService?.flushRouteTables();
+    }
+    // Overrides were already reconciled above. Publishing without a force pass
+    // avoids rerunning docker compose config for the same attachment.
+    await this.writeComposeProjectRoutingFile().catch(() => undefined);
     await this.rehydrateBrowserDnsAndProxies().catch(() => undefined);
-    await this.refreshVscodeWindowTerminalEnvironment({ interactive: false }).catch(() => undefined);
     await this.syncLogicalPortRouters();
+    // Rebuild shell-facing files and future-terminal environment only after
+    // daemon JSON and Compose TSV files are ready; live PTY input is untouched.
+    await this.rehydrateTerminalHookFiles();
     const restoredComposeRouteCount = this.registry
       .getSnapshot()
       .composeAttachments.filter((attachment) => attachmentIds.has(attachment.id))
@@ -6614,11 +6749,12 @@ export class PortManagerNetworkService implements DisposableLike {
    * Restores the files and PATH shims read directly by already-open shells.
    * This is intentionally separate from Compose route convergence because it
    * protects command lookup immediately after generated globalStorage is wiped.
+   * Existing shells retain their environment and hook; do not feed a script to
+   * their unknown foreground process during passive repair.
    */
   private async rehydrateTerminalHookFiles(): Promise<void> {
     await this.writeTerminalNetworkSelectionFile();
     await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
-    await this.reapplyRoutingToAttachedTerminalWindows();
   }
 
   /**
@@ -8506,6 +8642,17 @@ async function acquireSharedFileGenerationLock(lockPath: string): Promise<() => 
 
 function removeStaleSharedFileGenerationLock(lockPath: string): void {
   try {
+    const ownerText = syncFs.readFileSync(lockPath, "utf8").split(/\r?\n/, 1)[0]?.trim();
+    const ownerPid = ownerText === undefined ? undefined : Number.parseInt(ownerText, 10);
+
+    // A crashed/restarted VS Code extension host leaves a very young lock
+    // behind. Its PID is authoritative evidence that waiting for the mtime
+    // threshold cannot make progress, so reclaim it immediately.
+    if (ownerPid !== undefined && Number.isInteger(ownerPid) && ownerPid > 0 && !isProcessAlive(ownerPid)) {
+      syncFs.rmSync(lockPath, { force: true });
+      return;
+    }
+
     const stats = syncFs.statSync(lockPath);
     if (Date.now() - stats.mtimeMs >= COMPOSE_PROJECT_ROUTING_WRITE_LOCK_STALE_MS) {
       syncFs.rmSync(lockPath, { force: true });

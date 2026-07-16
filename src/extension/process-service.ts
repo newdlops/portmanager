@@ -20,7 +20,7 @@ export interface PortManagerProcessService {
   /** Stops the local daemon without stopping already running application processes. */
   stopDaemon(): Promise<void>;
   /** Replaces the local daemon with the active extension build. */
-  restartDaemon(): Promise<void>;
+  restartDaemon(options?: { readonly refreshSnapshot?: boolean }): Promise<void>;
   /** Returns the latest complete daemon snapshot known to the extension. */
   getSnapshot(): AgentSnapshot;
   /** Returns the latest agent snapshot rows in sidebar display order. */
@@ -29,8 +29,16 @@ export interface PortManagerProcessService {
   get(id: string): ManagedProcess | undefined;
   /** Notifies UI and commands when the agent publishes a new snapshot. */
   onDidChange(listener: () => void): DisposableLike;
-  /** Forces the agent to rescan the OS listening-port table. */
+  /** Requests the current snapshot; normal daemon refreshes may reuse a recent listener observation. */
   refresh(): Promise<void>;
+  /**
+   * Forces a fresh listener scan and synchronously republishes generated route
+   * files. Reserved for explicit recovery because it intentionally bypasses
+   * the daemon's listener cache and route-table write coalescing.
+   */
+  repairRoutingState(): Promise<void>;
+  /** Waits for the daemon's current in-memory routes to reach generated files without rescanning listeners. */
+  flushRouteTables(): Promise<void>;
   /** Starts a managed process through the agent so routing state is centralized. */
   startManagedProcess(input: ManagedProcessStartInput, settings: PortManagerSettings): Promise<ManagedProcess>;
   /** Registers an already running process with the shared agent state. */

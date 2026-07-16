@@ -33,6 +33,8 @@ type AgentMethod =
   | "daemonStatus"
   | "listSnapshot"
   | "refreshSnapshot"
+  | "repairRoutingState"
+  | "flushRouteTables"
   | "shutdownDaemon"
   | "startManagedProcess"
   | "registerExistingProcess"
@@ -208,7 +210,7 @@ export class LocalAgentClient implements PortManagerProcessService {
   }
 
   /** Restarts the singleton daemon using this extension's compiled agent. */
-  async restartDaemon(): Promise<void> {
+  async restartDaemon(options: { readonly refreshSnapshot?: boolean } = {}): Promise<void> {
     const previousPid = this.snapshot.daemon.pid;
     /* stopDaemon increments synchronously before its first await. Retain that
      * generation so a later explicit Stop wins instead of this older restart
@@ -231,7 +233,9 @@ export class LocalAgentClient implements PortManagerProcessService {
       throw new Error("Port Manager daemon restarted, but it still does not match the active extension build.");
     }
 
-    this.refreshInBackground();
+    if (options.refreshSnapshot !== false) {
+      this.refreshInBackground();
+    }
   }
 
   /**
@@ -309,6 +313,54 @@ export class LocalAgentClient implements PortManagerProcessService {
   async refresh(): Promise<void> {
     const snapshot = await this.request<AgentSnapshot>("refreshSnapshot");
     this.applySnapshot(snapshot);
+  }
+
+  /** Forces live hook-route rediscovery and waits for route files to be republished. */
+  async repairRoutingState(): Promise<void> {
+    try {
+      const snapshot = await this.request<AgentSnapshot>("repairRoutingState");
+      this.applySnapshot(snapshot);
+    } catch (error) {
+      if (!isUnsupportedRepairRoutingStateError(error)) {
+        throw error;
+      }
+      if (isAgentConnectionClosedError(error)) {
+        /*
+         * An older Node daemon closes the client because its protocol validator
+         * cannot parse this method. A transient close/crash looks identical,
+         * so reconnect and retry once before deciding to replace a live daemon.
+         */
+        try {
+          const snapshot = await this.request<AgentSnapshot>("repairRoutingState");
+          this.applySnapshot(snapshot);
+          return;
+        } catch (retryError) {
+          if (!isUnsupportedRepairRoutingStateError(retryError)) {
+            throw retryError;
+          }
+        }
+      }
+      /*
+       * A daemon that predates this repair RPC can share the package version
+       * during extension-development reloads and will close the socket for the
+       * unknown method. Explicit repair is allowed to replace only that daemon
+       * (application processes remain alive), then retry against this build.
+       */
+      // The repair RPC itself performs the authoritative fresh scan. Starting
+      // an ordinary background refresh here would make an old-daemon upgrade
+      // pay for the same listener table twice.
+      await this.restartDaemon({ refreshSnapshot: false });
+      const snapshot = await this.request<AgentSnapshot>("repairRoutingState");
+      this.applySnapshot(snapshot);
+    }
+  }
+
+  /** Publishes daemon-memory routes without paying for another OS listener scan. */
+  async flushRouteTables(): Promise<void> {
+    const published = await this.request<boolean>("flushRouteTables");
+    if (!published) {
+      throw new Error("Port Manager daemon could not publish its current route tables.");
+    }
   }
 
   /**
@@ -1490,6 +1542,21 @@ function appendDaemonWarning(existingMessage: string | undefined, warning: strin
 function isUnsupportedDaemonStatusError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /\bUnknown\b/.test(message) && message.includes("daemonStatus");
+}
+
+/** Restarts only for a daemon generation that cannot parse the new repair RPC. */
+function isUnsupportedRepairRoutingStateError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    (/\bUnknown\b/.test(message) && message.includes("repairRoutingState")) ||
+    message.includes("Invalid Port Manager agent request message") ||
+    isAgentConnectionClosedError(error)
+  );
+}
+
+function isAgentConnectionClosedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message === "Port Manager agent connection closed.";
 }
 
 function isFileExistsError(error: unknown): boolean {
