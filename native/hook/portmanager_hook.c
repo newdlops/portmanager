@@ -1197,6 +1197,21 @@ static int pm_file_substitution_relative_is_state(const char *relative) {
   /* dot-directory anywhere in the relative path (basename handled below) */
   for (const char *cursor = relative; *cursor != '\0'; cursor++) {
     if (cursor[0] == '.' && (cursor == relative || cursor[-1] == '/') && strchr(cursor, '/') != NULL) {
+      /*
+       * Only a genuine dot-directory (".celery", ".cache") is process-private
+       * state. The "." and ".." path segments are NOT — they appear when a
+       * tool writes through a "./"-relative path (e.g. `stubgen -o .` emits
+       * ./zuzu/app/pages_stub.pyi). Treating those as a dot-directory
+       * misclassifies generated SOURCE as state, mirroring it and leaving a
+       * symlink window at the tracked original — which then gets committed and
+       * breaks on machines without .portmanager (CI). Skip the "."/".." cases.
+       */
+      if (cursor[1] == '/' || cursor[1] == '\0') {
+        continue;
+      }
+      if (cursor[1] == '.' && (cursor[2] == '/' || cursor[2] == '\0')) {
+        continue;
+      }
       return 1;
     }
   }

@@ -2693,6 +2693,29 @@ test("native hook substitutes per-network files exclusively at open", () => {
   assert.equal(hook.includes('strstr(absolute, "/.portmanager/")'), true);
 });
 
+test("native hook does not misclassify a leading ./ path segment as a dot-directory state file", () => {
+  const hook = fs.readFileSync(
+    path.resolve(__dirname, "../../../native/hook/portmanager_hook.c"),
+    "utf8",
+  );
+  // Regression: `stubgen -o .` (and other codegen/tools) write generated source
+  // through a "./"-relative path, e.g. ./zuzu/app/pages_stub.pyi. The
+  // dot-directory scan must treat the "." and ".." segments as NORMAL path
+  // components — never as a process-private dot-directory. Otherwise generated
+  // SOURCE is mirrored into .portmanager and a symlink window is left at the
+  // tracked original, which then gets committed and breaks on machines without
+  // .portmanager (CI stubgen/mypy: broken symlink -> FileNotFoundError/E902).
+  const start = hook.indexOf("static int pm_file_substitution_relative_is_state(");
+  const end = hook.indexOf("static int pm_file_substitution_relative_is_dotenv(", start);
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const body = hook.slice(start, end);
+  // Bare "." segment ("./…") is skipped, not classified as state.
+  assert.equal(body.includes("if (cursor[1] == '/' || cursor[1] == '\\0') {"), true);
+  // ".." segment ("../…") is skipped too.
+  assert.equal(body.includes("if (cursor[1] == '.' && (cursor[2] == '/' || cursor[2] == '\\0')) {"), true);
+});
+
 test("native hook rewrites state argv paths using the child network environment", () => {
   const hook = fs.readFileSync(
     path.resolve(__dirname, "../../../native/hook/portmanager_hook.c"),
