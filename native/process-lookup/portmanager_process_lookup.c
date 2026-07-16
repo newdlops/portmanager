@@ -265,7 +265,7 @@ static int pm_read_cwd(int pid, char *buffer, size_t size) {
   return 0;
 }
 
-static int pm_read_environment_buffer(int pid, char **output, size_t *output_size) {
+static int pm_linux_read_nul_file(int pid, const char *name, char **output, size_t *output_size) {
   char path[PATH_MAX];
   int fd;
   size_t capacity = PM_TEXT_SIZE;
@@ -276,7 +276,7 @@ static int pm_read_environment_buffer(int pid, char **output, size_t *output_siz
     return -1;
   }
 
-  snprintf(path, sizeof(path), "/proc/%d/environ", pid);
+  snprintf(path, sizeof(path), "/proc/%d/%s", pid, name);
   fd = open(path, O_RDONLY);
   if (fd < 0) {
     free(buffer);
@@ -316,6 +316,14 @@ static int pm_read_environment_buffer(int pid, char **output, size_t *output_siz
   *output = buffer;
   *output_size = length;
   return 0;
+}
+
+static int pm_read_environment_buffer(int pid, char **output, size_t *output_size) {
+  return pm_linux_read_nul_file(pid, "environ", output, output_size);
+}
+
+static int pm_read_command_buffer(int pid, char **output, size_t *output_size) {
+  return pm_linux_read_nul_file(pid, "cmdline", output, output_size);
 }
 #elif defined(__APPLE__)
 static int pm_read_process_table(pm_process_table *table) {
@@ -385,20 +393,24 @@ static int pm_read_cwd(int pid, char *buffer, size_t size) {
 }
 
 static int pm_read_environment_buffer(int pid, char **output, size_t *output_size) {
-  int mib[3] = {CTL_KERN, KERN_PROCARGS2, pid};
-  size_t size = 0;
+  int argmax_mib[2] = {CTL_KERN, KERN_ARGMAX};
+  int process_mib[3] = {CTL_KERN, KERN_PROCARGS2, pid};
+  int argmax = 0;
+  size_t argmax_size = sizeof(argmax);
+  size_t size;
   char *buffer;
 
-  if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0 || size == 0) {
+  if (sysctl(argmax_mib, 2, &argmax, &argmax_size, NULL, 0) != 0 || argmax <= 0) {
     return -1;
   }
 
+  size = (size_t)argmax;
   buffer = malloc(size);
   if (buffer == NULL) {
     return -1;
   }
 
-  if (sysctl(mib, 3, buffer, &size, NULL, 0) != 0) {
+  if (sysctl(process_mib, 3, buffer, &size, NULL, 0) != 0 || size == 0) {
     free(buffer);
     return -1;
   }
@@ -460,12 +472,51 @@ static int pm_read_network_id(int pid, char *buffer, size_t size) {
   return -1;
 }
 
+/** Emits one NUL-delimited Linux proc file as a JSON string array. */
+#if defined(__linux__)
+static void pm_print_nul_json_array(const char *name, const char *buffer, size_t size) {
+  size_t offset = 0;
+  int printed = 0;
+
+  printf(",\"%s\":[", name);
+  while (buffer != NULL && offset < size) {
+    const char *entry = buffer + offset;
+    size_t remaining = size - offset;
+    size_t length = strnlen(entry, remaining);
+    if (length == remaining) {
+      break;
+    }
+    if (length > 0) {
+      if (printed++ > 0) {
+        putchar(',');
+      }
+      pm_json_string(entry);
+    }
+    offset += length + 1;
+  }
+  putchar(']');
+}
+#endif
+
 /*
- * Emits ,"argv":[...],"env":[...] parsed from KERN_PROCARGS2 for one pid, used
- * by the escaped-server detector to compose an exact respawn. Layout:
- *   [int argc][exec_path \0][\0 padding][argv0 \0]..[argvN \0][env0 \0]..
+ * Emits ,"argv":[...],"env":[...] for one pid, used by recovery/respawn
+ * callers that need one coherent native capture. macOS KERN_PROCARGS2 embeds
+ * both arrays; Linux exposes cmdline and environ as separate NUL files.
  */
 static void pm_print_argv_env(int pid) {
+#if defined(__linux__)
+  char *argv_buffer = NULL;
+  char *environment_buffer = NULL;
+  size_t argv_size = 0;
+  size_t environment_size = 0;
+
+  (void)pm_read_command_buffer(pid, &argv_buffer, &argv_size);
+  (void)pm_read_environment_buffer(pid, &environment_buffer, &environment_size);
+  pm_print_nul_json_array("argv", argv_buffer, argv_size);
+  pm_print_nul_json_array("env", environment_buffer, environment_size);
+  free(argv_buffer);
+  free(environment_buffer);
+#else
   char *buffer = NULL;
   size_t size = 0;
   size_t offset;
@@ -526,6 +577,7 @@ static void pm_print_argv_env(int pid) {
   fputs("]", stdout);
 
   free(buffer);
+#endif
 }
 
 static void pm_print_table(pm_process_table *table) {
