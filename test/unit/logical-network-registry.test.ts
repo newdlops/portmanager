@@ -224,6 +224,38 @@ test("does not emit when transient discovery results are unchanged", () => {
   assert.equal(eventCount, 2);
 });
 
+test("does not emit or invalidate snapshots for unchanged compose attachment updates", () => {
+  const registry = new LogicalNetworkRegistry([runtime]);
+  registry.addNetwork(createNetwork());
+  const attachment = createComposeAttachment({
+    status: "error",
+    errorMessage: "Generated Compose override recovery failed: loopback alias unavailable.",
+    mutation: createComposeMutation(),
+  });
+  registry.addComposeAttachment(attachment);
+
+  const snapshotBeforeUpdate = registry.getSnapshot();
+  let eventCount = 0;
+  registry.onDidChange(() => {
+    eventCount += 1;
+  });
+
+  const unchanged = registry.updateComposeAttachment({ ...attachment });
+
+  assert.strictEqual(unchanged, attachment);
+  assert.equal(eventCount, 0);
+  assert.strictEqual(registry.getSnapshot(), snapshotBeforeUpdate);
+
+  const changed = registry.updateComposeAttachment({
+    ...attachment,
+    errorMessage: "Generated Compose override recovery failed: Docker daemon unavailable.",
+  });
+
+  assert.notStrictEqual(changed, attachment);
+  assert.equal(eventCount, 1);
+  assert.notStrictEqual(registry.getSnapshot(), snapshotBeforeUpdate);
+});
+
 test("reuses one snapshot until a mutation invalidates it before notifying listeners", () => {
   const registry = new LogicalNetworkRegistry([runtime]);
   const initialSnapshot = registry.getSnapshot();

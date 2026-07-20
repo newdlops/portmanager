@@ -374,12 +374,21 @@ export class LogicalNetworkRegistry implements DisposableLike {
 
   /** Updates a compose attachment after endpoint route rows change. */
   updateComposeAttachment(attachment: ComposeAttachment): ComposeAttachment {
-    if (!this.composeAttachments.has(attachment.id)) {
+    const currentAttachment = this.composeAttachments.get(attachment.id);
+    if (currentAttachment === undefined) {
       throw new Error(`Unknown compose attachment: ${attachment.id}`);
     }
 
     this.ensureNoComposePortConflict(attachment);
     this.ensureNoComposeRuntimeOwnerConflict(attachment);
+
+    // Recovery paths may rediscover the same durable error while publishing
+    // generated files. Treating that no-op as a mutation would recursively
+    // schedule another publish through registry change listeners.
+    if (sameJsonValue(currentAttachment, attachment)) {
+      return currentAttachment;
+    }
+
     this.composeAttachments.set(attachment.id, attachment);
     this.emitChange();
     return attachment;
@@ -576,7 +585,12 @@ function dedupeContainerServiceCandidates(
 }
 
 function sameJsonList<T>(left: readonly T[], right: readonly T[]): boolean {
-  return left.length === right.length && JSON.stringify(left) === JSON.stringify(right);
+  return left.length === right.length && sameJsonValue(left, right);
+}
+
+/** Compares persisted domain values without turning reference-only copies into changes. */
+function sameJsonValue<T>(left: T, right: T): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 /**
