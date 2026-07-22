@@ -2249,6 +2249,8 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   assert.equal(ephemeralHelperBody.includes("pm_register_process(actual_port, actual_port, loopback_host, \"\");"), true);
   assert.equal(source.includes("errno = EADDRNOTAVAIL;\n      return -1;"), true);
   assert.equal(source.includes("bind global raw fallback"), false);
+  assert.equal(source.includes('pm_bind_localhost_relocation(sockfd, addr, addrlen, logical_port, "global-alias-unavailable")'), true);
+  assert.equal(source.includes("bind global alias unavailable logical=%d alias=%s error=%s; relocating"), true);
   assert.equal(source.includes("connect global raw fallback"), false);
   assert.equal(source.includes("connect global raw passthrough logical=%d"), false);
   assert.equal(source.includes("connect global raw passthrough unmanaged logical=%d"), true);

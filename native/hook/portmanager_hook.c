@@ -4237,15 +4237,21 @@ static int pm_default_local_connect_is_gateway_dead_end(const struct sockaddr *a
 }
 
 /*
- * Relocates a scope-less server off a gateway-owned port.
+ * Relocates a localhost server to a daemon-allocated high port on 127.0.0.1.
  *
- * The bind is moved to a daemon-allocated high port on 127.0.0.1 and registered
- * as a network-less listen route, which is exactly the coordinate the gateway
- * forwards a non-network client to. Returns 0 on success (and completes the
- * bind), or -1 to let the caller fall back to a normal passthrough bind (e.g.
- * the daemon is unavailable or the socket cannot bind the loopback address).
+ * Scope-less callers use this when the gateway already owns the logical port.
+ * The global network also uses it when macOS lost its non-persistent 127.1.0.1
+ * lo0 alias: keeping the real listener on a high port preserves the daemon-owned
+ * localhost ingress coordinate without making an ordinary dev server fail at
+ * bind time. pm_register_process carries whichever network scope the caller
+ * currently owns, so the same low-level mechanism is safe for both policies.
  */
-static int pm_bind_gateway_relocation(int sockfd, const struct sockaddr *addr, socklen_t addrlen, int logical_port) {
+static int pm_bind_localhost_relocation(
+  int sockfd,
+  const struct sockaddr *addr,
+  socklen_t addrlen,
+  int logical_port,
+  const char *reason) {
   struct sockaddr_storage rewritten;
   char allocation_id[PM_MAX_TEXT];
   const char *relocate_host = "127.0.0.1";
@@ -4280,7 +4286,7 @@ static int pm_bind_gateway_relocation(int sockfd, const struct sockaddr *addr, s
     setenv("PORT_MANAGER_LOGICAL_PORT", logical_text, 1);
     setenv("PORT_MANAGER_ACTUAL_PORT", actual_text, 1);
     pm_register_process(logical_port, actual_port, relocate_host, allocation_id);
-    pm_debug("bind gateway relocation logical=%d actual=%d", logical_port, actual_port);
+    pm_debug("bind localhost relocation reason=%s logical=%d actual=%d", reason, logical_port, actual_port);
   }
 
   return 0;
@@ -4321,7 +4327,7 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
       !pm_is_fixed_protocol_port(logical_port) &&
       pm_sockaddr_is_local(addr) &&
       pm_gateway_claim_fresh(logical_port) &&
-      pm_bind_gateway_relocation(sockfd, addr, addrlen, logical_port) == 0
+      pm_bind_localhost_relocation(sockfd, addr, addrlen, logical_port, "gateway-owned") == 0
     ) {
       return 0;
     }
@@ -4377,6 +4383,32 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
     pm_set_sockaddr_port((struct sockaddr *)&rewritten, logical_port);
 
     result = pm_real_bind(sockfd, (struct sockaddr *)&rewritten, addrlen);
+    if (
+      result != 0 &&
+      pm_network_scope_is_global() &&
+      (errno == EADDRNOTAVAIL || errno == EAFNOSUPPORT || errno == EACCES)
+    ) {
+      int alias_bind_errno = errno;
+
+      /*
+       * macOS removes lo0 aliases at reboot. Startup restoration is deliberately
+       * non-interactive, so it can fail when no sudo credential is cached even
+       * though a terminal already inherited the global-network environment.
+       * Allocate a host-local high port instead of falling back to the logical
+       * localhost coordinate; the latter belongs to the gateway and would undo
+       * global-network isolation. IPv6 callers receive an IPv4-mapped localhost
+       * address on the same socket family, which Node/Vite accepts transparently.
+       */
+      pm_debug(
+        "bind global alias unavailable logical=%d alias=%s error=%s; relocating",
+        logical_port,
+        loopback_host,
+        strerror(alias_bind_errno));
+      if (pm_bind_localhost_relocation(sockfd, addr, addrlen, logical_port, "global-alias-unavailable") == 0) {
+        return 0;
+      }
+      errno = alias_bind_errno;
+    }
     if (result == 0) {
       char logical_text[16];
 

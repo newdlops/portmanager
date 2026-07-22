@@ -39,7 +39,9 @@ test("native registration is send-only while allocation and release remain round
   assert.notEqual(clientLoopStart, -1);
   assert.equal(clientLoop.indexOf("if (revents & POLLIN)") < clientLoop.indexOf("POLLERR | POLLHUP | POLLNVAL"), true);
   assert.notEqual(eventLoopStart, -1);
-  assert.equal(eventLoop.indexOf("pm_state_flush_route_tables(state)") < eventLoop.indexOf("pm_broadcast_snapshot("), true);
+  // UI fan-out is memory-authoritative and intentionally precedes deferred
+  // route-file publication during hook I/O bursts.
+  assert.equal(eventLoop.indexOf("pm_broadcast_snapshot(") < eventLoop.indexOf("pm_state_flush_route_tables(state)"), true);
 });
 
 if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
@@ -134,9 +136,124 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.ok(ready.elapsedMs < 1_000, `missing optional agent blocked bind for ${ready.elapsedMs}ms`);
     assert.equal(ready.address.port, logicalPort);
   });
+
+  test(
+    "global network relocates when its macOS loopback alias is unavailable",
+    { skip: process.platform !== "darwin" ? "macOS lo0 aliases are explicit addresses" : false },
+    async (context) => {
+      const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-hook-global-alias-"));
+      const socketPath = path.join(tempDirectory, "agent.sock");
+      const routeTablePath = path.join(tempDirectory, "routes.json");
+      const openAgentSockets = new Set<net.Socket>();
+      const actualPort = await reserveUnusedTcpPort();
+      let logicalPort = await reserveUnusedTcpPort();
+      while (logicalPort === actualPort) {
+        logicalPort = await reserveUnusedTcpPort();
+      }
+
+      let resolveRegistration: ((request: AgentRequest) => void) | undefined;
+      const registration = new Promise<AgentRequest>((resolve) => {
+        resolveRegistration = resolve;
+      });
+      const allocationRequests: AgentRequest[] = [];
+      const fakeAgent = net.createServer((socket) => {
+        openAgentSockets.add(socket);
+        socket.on("close", () => openAgentSockets.delete(socket));
+        socket.setEncoding("utf8");
+        let buffer = "";
+        socket.on("data", (chunk: string) => {
+          buffer += chunk;
+          for (;;) {
+            const newline = buffer.indexOf("\n");
+            if (newline < 0) {
+              return;
+            }
+
+            const request = JSON.parse(buffer.slice(0, newline)) as AgentRequest;
+            buffer = buffer.slice(newline + 1);
+            if (request.method === "allocateRoute") {
+              allocationRequests.push(request);
+              socket.end(
+                `${JSON.stringify({
+                  type: "response",
+                  id: request.id,
+                  ok: true,
+                  payload: {
+                    allocationId: "allocation-global-alias-fallback",
+                    requestedPort: logicalPort,
+                    actualPort,
+                    host: "127.0.0.1",
+                    routed: true,
+                    logicalRoutesFile: routeTablePath,
+                    expiresAt: "2026-07-22T23:59:59Z",
+                  },
+                })}\n`,
+              );
+              continue;
+            }
+
+            if (request.method === "registerExistingProcess") {
+              resolveRegistration?.(request);
+              resolveRegistration = undefined;
+              socket.end();
+            }
+          }
+        });
+      });
+      await listenOnUnixSocket(fakeAgent, socketPath);
+
+      let child: ChildProcess | undefined;
+      context.after(async () => {
+        if (child !== undefined && child.exitCode === null) {
+          child.kill("SIGKILL");
+        }
+        for (const socket of openAgentSockets) {
+          socket.destroy();
+        }
+        await closeServer(fakeAgent);
+        await fs.promises.rm(tempDirectory, { recursive: true, force: true });
+      });
+
+      child = spawnHookedBinder({
+        hookPath: hookLibraryPath,
+        host: "::1",
+        logicalPort,
+        socketPath,
+        routeTablePath,
+        env: {
+          PORT_MANAGER_NETWORK_ID: "network-global",
+          PORT_MANAGER_NETWORK_ENV_APPLIED: "network-global",
+          PORT_MANAGER_NETWORK_LOOPBACK_HOST: "127.254.253.252",
+          PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "127.254.253.252",
+          PORT_MANAGER_PRESERVE_LISTEN_PORTS: "",
+          PORT_MANAGER_ROUTING_MODE: "hashed",
+        },
+      });
+
+      const ready = await waitForReadyLine(child, 2_500);
+      const request = await withTimeout(registration, 2_500, "Timed out waiting for relocated bind registration.");
+      const allocationPayload = allocationRequests[0]?.payload as {
+        readonly host: string;
+        readonly requestedPort: number;
+        readonly routeDirection: string;
+      };
+      const registrationPayload = request.payload as RegistrationPayload;
+
+      assert.equal(ready.address.address, "::ffff:127.0.0.1");
+      assert.equal(ready.address.port, logicalPort, "getsockname must preserve the requested Vite port");
+      assert.equal(allocationRequests.length, 1);
+      assert.equal(allocationPayload.host, "127.0.0.1");
+      assert.equal(allocationPayload.requestedPort, logicalPort);
+      assert.equal(allocationPayload.routeDirection, "listen");
+      assert.equal(registrationPayload.actualPort, actualPort);
+      assert.equal(registrationPayload.host, "127.0.0.1");
+      assert.equal(registrationPayload.networkId, "network-global");
+    },
+  );
 }
 
 interface AgentRequest {
+  readonly id: string;
   readonly method: string;
   readonly payload?: unknown;
 }
@@ -158,10 +275,12 @@ interface ReadyMessage {
 
 interface HookedBinderOptions {
   readonly hookPath: string;
+  readonly host?: string;
   readonly logicalPort: number;
   readonly socketPath: string;
   readonly routeTablePath: string;
   readonly sendTimeoutMs?: number;
+  readonly env?: NodeJS.ProcessEnv;
 }
 
 function getNativeHookLibraryPath(): string | undefined {
@@ -181,7 +300,7 @@ function spawnHookedBinder(options: HookedBinderOptions): ChildProcess {
     'const net = require("node:net");',
     "const startedAt = Date.now();",
     "const server = net.createServer();",
-    `server.listen({ host: "127.0.0.1", port: ${options.logicalPort} }, () => {`,
+    `server.listen({ host: ${JSON.stringify(options.host ?? "127.0.0.1")}, port: ${options.logicalPort} }, () => {`,
     "  const address = server.address();",
     '  fs.writeSync(1, `${JSON.stringify({ elapsedMs: Date.now() - startedAt, address })}\\n`);',
     "});",
@@ -214,6 +333,7 @@ function spawnHookedBinder(options: HookedBinderOptions): ChildProcess {
       PORT_MANAGER_ROUTES_FILE: options.routeTablePath,
       PORT_MANAGER_GLOBAL_ROUTES_FILE: options.routeTablePath,
       BASH_ENV: "",
+      ...options.env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
