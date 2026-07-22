@@ -1334,6 +1334,8 @@ export class PortManagerNetworkService implements DisposableLike {
   async installBrowserDnsResolvers(
     options: {
       readonly forceTlsRenewal?: boolean;
+      /** Reapply resolver, hosts, and loopback setup even when cached diagnostics look healthy. */
+      readonly forceResolverSetup?: boolean;
       readonly triggerDescription?: string;
     } = {},
   ): Promise<BrowserDnsResolverStatus> {
@@ -1347,6 +1349,25 @@ export class PortManagerNetworkService implements DisposableLike {
     } finally {
       this.browserDnsResolverInstallInFlight = undefined;
     }
+  }
+
+  /**
+   * Rebuilds the complete host-side Local DNS path after reboot or resolver drift.
+   *
+   * Unlike first-time installation, recovery deliberately bypasses the status
+   * shortcut: `/etc/resolver` may look correct while macOS has lost its lo0
+   * aliases or resolver cache. The setup script is idempotent, so reapplying it
+   * safely restores resolver rows, hosts entries, terminal/browser aliases, and
+   * refreshes the browser proxy data plane in one user-authorized operation.
+   */
+  async repairLocalDns(): Promise<BrowserDnsResolverStatus> {
+    await this.startBrowserDnsServer();
+    this.syncBrowserDnsRecords();
+
+    return this.installBrowserDnsResolvers({
+      forceResolverSetup: true,
+      triggerDescription: "Local DNS recovery was requested",
+    });
   }
 
   /**
@@ -1483,6 +1504,7 @@ export class PortManagerNetworkService implements DisposableLike {
   private async installBrowserDnsResolversExclusive(
     options: {
       readonly forceTlsRenewal?: boolean;
+      readonly forceResolverSetup?: boolean;
       readonly triggerDescription?: string;
     },
   ): Promise<BrowserDnsResolverStatus> {
@@ -1490,10 +1512,14 @@ export class PortManagerNetworkService implements DisposableLike {
     if (!status.supported || status.records.length === 0) {
       return status;
     }
-    // Forced TLS renewal must run even when every alias currently reports
-    // configured: renewal exists precisely for certificates that still work
-    // but are inside the renewal window.
-    if (status.missingCount === 0 && options.forceTlsRenewal !== true) {
+    // Explicit renewal and recovery must run even when every alias currently
+    // reports configured. Resolver state and non-persistent lo0 aliases can
+    // drift underneath otherwise healthy-looking files and cached diagnostics.
+    if (
+      status.missingCount === 0 &&
+      options.forceTlsRenewal !== true &&
+      options.forceResolverSetup !== true
+    ) {
       this.clearBrowserDnsInstallOfferSignature();
       return status;
     }
@@ -1522,6 +1548,11 @@ export class PortManagerNetworkService implements DisposableLike {
         includesBrowserDnsSetup: true,
       }),
     );
+    // The privileged script may have recreated aliases that disappeared at
+    // reboot. Refresh before returning so the UI reports the repair result,
+    // rather than the cache state that triggered it.
+    invalidateLoopbackAliasCache();
+    await readLoopbackAliasAddresses().catch(() => undefined);
     await trustBrowserTlsCertificateForCurrentUser();
     this.localChangeEvents.emit();
     this.browserNetworkProxy.retryFailedEndpointsNow();

@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8239",
+  "version": "0.0.8240",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -90,6 +90,7 @@
     "onCommand:portManager.installShellHook",
     "onCommand:portManager.restoreShellProfiles",
     "onCommand:portManager.installExternalCli",
+    "onCommand:portManager.repairLocalDns",
     "onCommand:portManager.renewBrowserTlsCertificate",
     "onCommand:portManager.openOwnerUi",
     "onCommand:portManager.openSettings"
@@ -319,6 +320,12 @@
         "title": "Port Manager: Fix Stale Routing",
         "category": "Port Manager",
         "icon": "$(debug-rerun)"
+      },
+      {
+        "command": "portManager.repairLocalDns",
+        "title": "Port Manager: Repair Local DNS",
+        "category": "Port Manager",
+        "icon": "$(tools)"
       },
       {
         "command": "portManager.clearRoutingFiles",
@@ -711,14 +718,19 @@
           "group": "daemon@4"
         },
         {
+          "command": "portManager.repairLocalDns",
+          "when": "view == portManager.processes && (viewItem == section.daemon || viewItem == daemonStatus)",
+          "group": "daemon@5"
+        },
+        {
           "command": "portManager.clearRoutingFiles",
           "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == section.daemon || viewItem == daemonStatus)",
-          "group": "daemon@5"
+          "group": "daemon@6"
         },
         {
           "command": "portManager.clearGlobalStorageFiles",
           "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == section.daemon || viewItem == daemonStatus)",
-          "group": "daemon@6"
+          "group": "daemon@7"
         },
         {
           "command": "portManager.openRoutedUrl",

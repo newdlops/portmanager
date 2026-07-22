@@ -1292,6 +1292,16 @@ function buildBrowserDnsDiagnosticRows(
 
   return [
     new DaemonStatusTreeItem("Browser DNS", `${description}, port ${browserDns.dnsPort}`, icon),
+    new ActionTreeItem(
+      "Repair Local DNS",
+      "portManager.repairLocalDns",
+      "tools",
+      browserDns.missingCount > 0
+        ? `Reapply ${browserDns.missingCount} incomplete alias${browserDns.missingCount === 1 ? "" : "es"}`
+        : "Reapply resolver, loopback aliases, and hosts",
+      undefined,
+      ownerAction,
+    ),
     ...browserDns.records.flatMap((record) => buildBrowserDnsRecordRows(record, ownerAction)),
     new ActionTreeItem(
       "Install Browser DNS",

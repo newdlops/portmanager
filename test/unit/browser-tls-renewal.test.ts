@@ -58,7 +58,8 @@ test("install script renews expiring certificates and supports forced renewal", 
   // Forced renewal bypasses the everything-configured early return.
   const exclusiveStart = source.indexOf("private async installBrowserDnsResolversExclusive");
   const exclusiveBody = source.slice(exclusiveStart, exclusiveStart + 1800);
-  assert.equal(exclusiveBody.includes("status.missingCount === 0 && options.forceTlsRenewal !== true"), true);
+  assert.equal(exclusiveBody.includes("options.forceTlsRenewal !== true"), true);
+  assert.equal(exclusiveBody.includes("options.forceResolverSetup !== true"), true);
   assert.equal(exclusiveBody.includes("forceTlsRenewal: options.forceTlsRenewal === true,"), true);
 
   assert.equal(source.includes("async renewBrowserTlsCertificate(): Promise<BrowserDnsResolverStatus>"), true);

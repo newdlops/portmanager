@@ -43,6 +43,7 @@ test("diagnostics exposes stale routing repair and recent activity", () => {
   assert.equal(commandsSource.includes('"portManager.clearGlobalStorageFiles"'), true);
   assert.equal(commandsSource.includes("this.dependencies.networkService.clearGlobalStorageFiles()"), true);
   assert.equal(source.includes('"Fix Stale Routing"'), true);
+  assert.equal(source.includes('"Repair Local DNS"'), true);
   assert.equal(source.includes('"Clear Global Storage Files"'), true);
   assert.equal(source.includes("class RoutingTimelineGroupTreeItem"), true);
   assert.equal(source.includes('"Recent Routing Activity"'), true);
@@ -56,11 +57,19 @@ test("diagnostics exposes stale routing repair and recent activity", () => {
     true,
   );
   assert.equal(
+    manifest.contributes?.commands?.some((item) => item.command === "portManager.repairLocalDns"),
+    true,
+  );
+  assert.equal(
     manifest.contributes?.commands?.some((item) => item.command === "portManager.clearGlobalStorageFiles"),
     true,
   );
   assert.equal(
     menuItems.some((item) => item.command === "portManager.fixStaleRouting" && item.when?.includes("section.daemon")),
+    true,
+  );
+  assert.equal(
+    menuItems.some((item) => item.command === "portManager.repairLocalDns" && item.when?.includes("section.daemon")),
     true,
   );
   assert.equal(

@@ -227,6 +227,7 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.installBrowserDnsResolvers", () =>
       this.installBrowserDnsResolvers(),
     ownerCommand);
+    this.registerCommand(context, "portManager.repairLocalDns", () => this.repairLocalDns(), ownerCommand);
     this.registerCommand(context, "portManager.cleanupBrowserDnsResolvers", () =>
       this.cleanupBrowserDnsResolvers(),
     ownerCommand);
@@ -1550,6 +1551,47 @@ export class PortManagerCommandController implements DisposableLike {
       );
     } catch (error) {
       await vscode.window.showWarningMessage(`Browser DNS install failed: ${toErrorMessage(error)}`);
+    }
+  }
+
+  /** Force-reapplies the complete macOS Local DNS path after alias or resolver drift. */
+  private async repairLocalDns(): Promise<void> {
+    try {
+      const status = await this.dependencies.networkService.repairLocalDns();
+      this.dependencies.treeProvider.refresh();
+
+      if (!status.supported) {
+        await vscode.window.showInformationMessage("Local DNS recovery is only supported on macOS.");
+        return;
+      }
+      if (status.records.length === 0) {
+        await vscode.window.showInformationMessage(
+          "No logical network aliases exist yet, so there is no Local DNS configuration to repair.",
+        );
+        return;
+      }
+
+      const remaining = status.records.filter((record) => !record.configured || record.tlsStale);
+      if (!status.dnsRunning) {
+        await vscode.window.showWarningMessage(
+          "Local DNS configuration was reapplied, but this window could not confirm that the DNS responder is running.",
+        );
+        return;
+      }
+      if (remaining.length > 0) {
+        await vscode.window.showWarningMessage(
+          `Local DNS was reapplied, but ${remaining.length} alias${remaining.length === 1 ? "" : "es"} still need attention: ${remaining
+            .map((record) => record.hostname)
+            .join(", ")}.`,
+        );
+        return;
+      }
+
+      await vscode.window.showInformationMessage(
+        `Local DNS repaired: ${status.installedCount}/${status.records.length} aliases are ready.`,
+      );
+    } catch (error) {
+      await vscode.window.showWarningMessage(`Local DNS repair failed: ${toErrorMessage(error)}`);
     }
   }
 

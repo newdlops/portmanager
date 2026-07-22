@@ -289,6 +289,58 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   );
 });
 
+test("Local DNS repair is a forced, user-visible recovery path", () => {
+  const root = path.resolve(__dirname, "../../..");
+  const networkServiceSource = fs.readFileSync(path.join(root, "src/extension/network-service.ts"), "utf8");
+  const commandSource = fs.readFileSync(path.join(root, "src/extension/commands.ts"), "utf8");
+  const treeSource = fs.readFileSync(path.join(root, "src/ui/sidebar/port-manager-tree.ts"), "utf8");
+  const specSource = fs.readFileSync(path.join(root, "SPEC.MD"), "utf8");
+  const packageJson = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")) as {
+    activationEvents?: string[];
+    contributes?: {
+      commands?: Array<{ command: string; title: string }>;
+      menus?: { "view/item/context"?: Array<{ command: string; when?: string }> };
+    };
+  };
+
+  const repairStart = networkServiceSource.indexOf("async repairLocalDns(): Promise<BrowserDnsResolverStatus>");
+  const repairEnd = networkServiceSource.indexOf("async renewBrowserTlsCertificate", repairStart);
+  const repairBody = networkServiceSource.slice(repairStart, repairEnd);
+  assert.notEqual(repairStart, -1);
+  assert.equal(repairBody.includes("await this.startBrowserDnsServer();"), true);
+  assert.equal(repairBody.includes("this.syncBrowserDnsRecords();"), true);
+  assert.equal(repairBody.includes("forceResolverSetup: true"), true);
+
+  const exclusiveStart = networkServiceSource.indexOf("private async installBrowserDnsResolversExclusive");
+  const exclusiveEnd = networkServiceSource.indexOf("private maybeOfferBrowserDnsResolverInstall", exclusiveStart);
+  const exclusiveBody = networkServiceSource.slice(exclusiveStart, exclusiveEnd);
+  assert.equal(exclusiveBody.includes("options.forceResolverSetup !== true"), true);
+  assert.equal(exclusiveBody.includes("invalidateLoopbackAliasCache();"), true);
+  assert.equal(exclusiveBody.includes("await readLoopbackAliasAddresses().catch(() => undefined);"), true);
+  assert.equal(networkServiceSource.includes("dscacheutil -flushcache"), true);
+  assert.equal(networkServiceSource.includes("killall -HUP mDNSResponder"), true);
+
+  assert.equal(commandSource.includes('"portManager.repairLocalDns"'), true);
+  assert.equal(commandSource.includes("this.dependencies.networkService.repairLocalDns()"), true);
+  assert.equal(treeSource.includes('"Repair Local DNS"'), true);
+  assert.equal(treeSource.includes('"portManager.repairLocalDns"'), true);
+  assert.equal(specSource.includes("Diagnostics UI는 **Repair Local DNS** 작업을 제공해야 한다."), true);
+
+  assert.equal(packageJson.activationEvents?.includes("onCommand:portManager.repairLocalDns"), true);
+  assert.equal(
+    packageJson.contributes?.commands?.some(
+      (command) => command.command === "portManager.repairLocalDns" && command.title === "Port Manager: Repair Local DNS",
+    ),
+    true,
+  );
+  const repairMenu = packageJson.contributes?.menus?.["view/item/context"]?.find(
+    (item) => item.command === "portManager.repairLocalDns",
+  );
+  assert.equal(repairMenu?.when?.includes("section.daemon"), true);
+  // The command wrapper acquires ownership, so worker windows must still see it.
+  assert.equal(repairMenu?.when?.includes("portManager.isControlPlaneOwner"), false);
+});
+
 function buildQuery(hostname: string): Buffer {
   const labels = hostname.split(".");
   const questionLength = labels.reduce((sum, label) => sum + 1 + label.length, 1) + 4;
