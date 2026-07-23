@@ -347,6 +347,32 @@ static int pm_preload_value_is_normalized(const char *value, const char *hook_pa
   return saw_hook;
 }
 
+static int pm_preload_value_contains_path(const char *value, const char *hook_path) {
+  size_t hook_length;
+  const char *cursor;
+
+  if (value == NULL || value[0] == '\0' || hook_path == NULL || hook_path[0] == '\0') {
+    return 0;
+  }
+
+  hook_length = strlen(hook_path);
+  cursor = value;
+  while (*cursor != '\0') {
+    const char *end = strchr(cursor, ':');
+    size_t segment_length = end == NULL ? strlen(cursor) : (size_t)(end - cursor);
+
+    if (segment_length == hook_length && strncmp(cursor, hook_path, segment_length) == 0) {
+      return 1;
+    }
+    if (end == NULL) {
+      break;
+    }
+    cursor = end + 1;
+  }
+
+  return 0;
+}
+
 static char *pm_make_preload_assignment(const char *hook_path, const char *current_value) {
   char *assignment;
   size_t size;
@@ -3826,6 +3852,37 @@ static int pm_memory_actual_for_logical(int logical_port, char *target_host, siz
   return actual_port;
 }
 
+/*
+ * Exec hooks can run in a post-fork child of a multithreaded process. Never
+ * block there on a route mutex that another vanished thread may have owned;
+ * failing open merely leaves the original child URL for the normal router path.
+ */
+static int pm_memory_actual_for_logical_at_exec(int logical_port, char *target_host, size_t target_host_size) {
+  const char *network_id = pm_current_network_id();
+  const char *route_network_id = network_id == NULL ? "" : network_id;
+  int actual_port = 0;
+  long now_ms = pm_now_milliseconds();
+
+  if (pthread_mutex_trylock(&pm_route_mutex) != 0) {
+    return 0;
+  }
+  for (size_t index = 0; index < pm_route_count; index++) {
+    if (pm_memory_route_expired(&pm_routes[index], now_ms)) {
+      continue;
+    }
+    if (pm_routes[index].logical_port == logical_port &&
+        strcmp(pm_routes[index].network_id, route_network_id) == 0) {
+      actual_port = pm_routes[index].actual_port;
+      if (target_host != NULL && target_host_size > 0) {
+        snprintf(target_host, target_host_size, "%s", pm_routes[index].host);
+      }
+      break;
+    }
+  }
+  pthread_mutex_unlock(&pm_route_mutex);
+  return actual_port;
+}
+
 static int pm_memory_logical_for_actual(int actual_port) {
   const char *network_id = pm_current_network_id();
   const char *route_network_id = network_id == NULL ? "" : network_id;
@@ -5663,6 +5720,13 @@ static void pm_free_rewritten_argv(char **rewritten, char *const original[]) {
  * to reach the machine-global service. See docs/per-network-hostname.md.
  */
 #define PM_ARGV_LOCALHOST_REWRITE_ENV "PORT_MANAGER_ARGV_LOCALHOST_REWRITE"
+#define PM_CHILD_LOOPBACK_URL_REWRITE_ENV "PORT_MANAGER_CHILD_LOOPBACK_URL_REWRITE"
+
+typedef struct {
+  char **envp;
+  char **owned_assignments;
+  size_t owned_assignment_count;
+} pm_route_child_environment;
 
 static int pm_is_hostname_label_char(unsigned char ch) {
   return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
@@ -5730,6 +5794,291 @@ static const char *pm_envp_network_loopback_host(char *const envp[]) {
     host = pm_validated_non_default_loopback_host(pm_envp_value(envp, PM_ACTUAL_LOOPBACK_HOST_ENV));
   }
   return host;
+}
+
+/*
+ * A dev-server launcher can bind its logical port and immediately spawn a
+ * protected/hookless GUI child. The route is already authoritative in this
+ * process, but the localhost compatibility router is published
+ * asynchronously, so handing the logical URL to that child creates a startup
+ * race. Rewrite only absolute loopback URLs whose logical port is present in
+ * this process's route cache; unrelated environment values and host services
+ * remain untouched. Opt-out: PORT_MANAGER_CHILD_LOOPBACK_URL_REWRITE=0.
+ */
+static int pm_child_environment_matches_current_network(char *const envp[]) {
+  const char *current_network = pm_current_network_id();
+  const char *child_network = pm_envp_network_id(envp);
+
+  return current_network != NULL && current_network[0] != '\0' &&
+    child_network != NULL && strcmp(current_network, child_network) == 0;
+}
+
+static const char *pm_loopback_url_port_start(const char *authority) {
+  static const char *const hosts[] = {"localhost:", "127.0.0.1:", "[::1]:", NULL};
+
+  for (size_t index = 0; hosts[index] != NULL; index++) {
+    size_t length = strlen(hosts[index]);
+    if (strncmp(authority, hosts[index], length) == 0) {
+      return authority + length;
+    }
+  }
+  return NULL;
+}
+
+static int pm_loopback_url_port_terminator(unsigned char ch) {
+  return ch == '\0' || ch == '/' || ch == '?' || ch == '#' || ch == ',' ||
+    ch == ';' || ch == ')' || isspace(ch);
+}
+
+static int pm_append_route_rewrite_text(
+  char **buffer,
+  size_t *length,
+  size_t *capacity,
+  const char *text,
+  size_t text_length) {
+  size_t required;
+  size_t next_capacity;
+  char *resized;
+
+  if (text_length > SIZE_MAX - *length - 1) {
+    return -1;
+  }
+  required = *length + text_length + 1;
+  if (required > *capacity) {
+    next_capacity = *capacity;
+    while (next_capacity < required) {
+      if (next_capacity > SIZE_MAX / 2) {
+        next_capacity = required;
+        break;
+      }
+      next_capacity *= 2;
+    }
+    resized = realloc(*buffer, next_capacity);
+    if (resized == NULL) {
+      return -1;
+    }
+    *buffer = resized;
+    *capacity = next_capacity;
+  }
+
+  memcpy(*buffer + *length, text, text_length);
+  *length += text_length;
+  (*buffer)[*length] = '\0';
+  return 0;
+}
+
+/* malloc'd rewrite of one NAME=value assignment, or NULL when no route matches. */
+static char *pm_rewrite_route_backed_loopback_urls(const char *assignment, int allow_port_rewrite) {
+  const char *equals = strchr(assignment, '=');
+  const char *search;
+  const char *copy_cursor = assignment;
+  char *output = NULL;
+  size_t output_length = 0;
+  size_t output_capacity = strlen(assignment) + 1;
+
+  if (equals == NULL || equals[1] == '\0') {
+    return NULL;
+  }
+
+  search = equals + 1;
+  for (;;) {
+    const char *scheme = strstr(search, "://");
+    const char *authority;
+    const char *port_start;
+    const char *port_end;
+    char target_host[128];
+    char target_endpoint[192];
+    int logical_port = 0;
+    int actual_port;
+    int endpoint_length;
+
+    if (scheme == NULL) {
+      break;
+    }
+    authority = scheme + 3;
+    port_start = pm_loopback_url_port_start(authority);
+    if (port_start == NULL) {
+      search = authority;
+      continue;
+    }
+
+    port_end = port_start;
+    while (*port_end >= '0' && *port_end <= '9') {
+      if (logical_port <= 65535) {
+        logical_port = logical_port * 10 + (*port_end - '0');
+      }
+      port_end++;
+    }
+    if (port_end == port_start || logical_port <= 0 || logical_port > 65535 ||
+        !pm_loopback_url_port_terminator((unsigned char)*port_end)) {
+      search = port_end == port_start ? port_start + 1 : port_end;
+      continue;
+    }
+
+    target_host[0] = '\0';
+    actual_port = pm_memory_actual_for_logical_at_exec(logical_port, target_host, sizeof(target_host));
+    if (actual_port <= 0) {
+      search = port_end;
+      continue;
+    }
+    /*
+     * A same-port alias URL is safe whether the child keeps the hook or loses
+     * it: hooked connects pass/rewrite to that same network endpoint. A
+     * relocated port is handed out only when the child environment no longer
+     * carries this hook; otherwise a hooked child could interpret the actual
+     * port as a new logical port and route it twice.
+     */
+    if (actual_port != logical_port && !allow_port_rewrite) {
+      search = port_end;
+      continue;
+    }
+    if (target_host[0] == '\0' || pm_route_host_is_wildcard_text(target_host)) {
+      snprintf(target_host, sizeof(target_host), "%s", "127.0.0.1");
+    }
+    if (strchr(target_host, ':') != NULL && target_host[0] != '[') {
+      endpoint_length = snprintf(target_endpoint, sizeof(target_endpoint), "[%s]:%d", target_host, actual_port);
+    } else {
+      endpoint_length = snprintf(target_endpoint, sizeof(target_endpoint), "%s:%d", target_host, actual_port);
+    }
+    if (endpoint_length <= 0 || (size_t)endpoint_length >= sizeof(target_endpoint)) {
+      search = port_end;
+      continue;
+    }
+    if ((size_t)endpoint_length == (size_t)(port_end - authority) &&
+        strncmp(authority, target_endpoint, (size_t)endpoint_length) == 0) {
+      search = port_end;
+      continue;
+    }
+
+    if (output == NULL) {
+      output = malloc(output_capacity);
+      if (output == NULL) {
+        return NULL;
+      }
+      output[0] = '\0';
+    }
+    if (pm_append_route_rewrite_text(
+          &output,
+          &output_length,
+          &output_capacity,
+          copy_cursor,
+          (size_t)(authority - copy_cursor)) != 0 ||
+        pm_append_route_rewrite_text(
+          &output,
+          &output_length,
+          &output_capacity,
+          target_endpoint,
+          (size_t)endpoint_length) != 0) {
+      free(output);
+      return NULL;
+    }
+
+    copy_cursor = port_end;
+    search = port_end;
+    pm_debug(
+      "child-url-route logical=%d actual=%d host=%s",
+      logical_port,
+      actual_port,
+      target_host);
+  }
+
+  if (output == NULL) {
+    return NULL;
+  }
+  if (pm_append_route_rewrite_text(
+        &output,
+        &output_length,
+        &output_capacity,
+        copy_cursor,
+        strlen(copy_cursor)) != 0) {
+    free(output);
+    return NULL;
+  }
+  return output;
+}
+
+/*
+ * Clones the environment only when at least one assignment contains a
+ * route-backed loopback URL. The base preload-repair environment remains owned
+ * by pm_child_environment and is released after this overlay.
+ */
+static pm_route_child_environment pm_rewrite_route_backed_child_environment(char *const envp[]) {
+  pm_route_child_environment rewritten = {(char **)envp, NULL, 0};
+  char **updated_envp;
+  char **owned_assignments;
+  const char *hook_path;
+  const char *preload_value;
+  size_t count = 0;
+  int has_candidate = 0;
+  int allow_port_rewrite;
+
+  if (!pm_hook_enabled() || pm_hook_depth > 0 || envp == NULL ||
+      pm_envp_value_is(envp, "PORT_MANAGER_HOOK_DISABLED", "1") ||
+      pm_envp_value_is(envp, "PORT_MANAGER_HOOK", "0") ||
+      pm_envp_value_is(envp, PM_CHILD_LOOPBACK_URL_REWRITE_ENV, "0") ||
+      !pm_child_environment_matches_current_network(envp)) {
+    return rewritten;
+  }
+
+  hook_path = pm_envp_value(envp, PM_PRELOAD_HINT_ENV);
+  preload_value = pm_envp_value(envp, PM_PRELOAD_ENV);
+  allow_port_rewrite =
+    hook_path == NULL || hook_path[0] == '\0' ||
+    !pm_preload_value_contains_path(preload_value, hook_path);
+
+  while (envp[count] != NULL) {
+    if (strstr(envp[count], "://localhost:") != NULL ||
+        strstr(envp[count], "://127.0.0.1:") != NULL ||
+        strstr(envp[count], "://[::1]:") != NULL) {
+      has_candidate = 1;
+    }
+    count++;
+  }
+  if (!has_candidate) {
+    return rewritten;
+  }
+
+  updated_envp = malloc((count + 1) * sizeof(char *));
+  owned_assignments = malloc(count * sizeof(char *));
+  if (updated_envp == NULL || owned_assignments == NULL) {
+    free(updated_envp);
+    free(owned_assignments);
+    return rewritten;
+  }
+
+  for (size_t index = 0; index < count; index++) {
+    char *replacement = pm_rewrite_route_backed_loopback_urls(envp[index], allow_port_rewrite);
+
+    updated_envp[index] = replacement != NULL ? replacement : envp[index];
+    if (replacement != NULL) {
+      owned_assignments[rewritten.owned_assignment_count++] = replacement;
+    }
+  }
+  updated_envp[count] = NULL;
+  if (rewritten.owned_assignment_count == 0) {
+    free(updated_envp);
+    free(owned_assignments);
+    return rewritten;
+  }
+
+  rewritten.envp = updated_envp;
+  rewritten.owned_assignments = owned_assignments;
+  return rewritten;
+}
+
+static void pm_release_route_child_environment(pm_route_child_environment *rewritten) {
+  if (rewritten == NULL || rewritten->owned_assignments == NULL) {
+    return;
+  }
+
+  for (size_t index = 0; index < rewritten->owned_assignment_count; index++) {
+    free(rewritten->owned_assignments[index]);
+  }
+  free(rewritten->owned_assignments);
+  free(rewritten->envp);
+  rewritten->envp = NULL;
+  rewritten->owned_assignments = NULL;
+  rewritten->owned_assignment_count = 0;
 }
 
 /*
@@ -5918,6 +6267,7 @@ static int pm_exec_with_prepared_child(
   const char *exec_target;
   char resolved_target[PM_MAX_PATH];
   pm_child_environment child_environment;
+  pm_route_child_environment route_environment;
   int result;
   int saved_errno;
 
@@ -5945,25 +6295,27 @@ static int pm_exec_with_prepared_child(
    * execvp searches PATH before execve. Resolve it here so the repaired child
    * environment is used for the exec.
    */
+  route_environment = pm_rewrite_route_backed_child_environment(child_environment.envp);
   if (allow_path_lookup && target != NULL && strchr(target, '/') == NULL) {
-    if (pm_resolve_exec_path(target, child_environment.envp, 1, resolved_target, sizeof(resolved_target)) == 0) {
+    if (pm_resolve_exec_path(target, route_environment.envp, 1, resolved_target, sizeof(resolved_target)) == 0) {
       exec_target = resolved_target;
     }
   }
 
   {
-    char **rewritten_argv = pm_rewrite_shell_c_argv(exec_target, argv, child_environment.envp);
+    char **rewritten_argv = pm_rewrite_shell_c_argv(exec_target, argv, route_environment.envp);
     char *const *base_argv = rewritten_argv != NULL ? rewritten_argv : argv;
-    char **localhost_argv = pm_rewrite_localhost_argv(base_argv, child_environment.envp);
+    char **localhost_argv = pm_rewrite_localhost_argv(base_argv, route_environment.envp);
     char *const *scoped_base = localhost_argv != NULL ? localhost_argv : base_argv;
-    char **state_argv = pm_rewrite_state_path_argv(scoped_base, child_environment.envp);
+    char **state_argv = pm_rewrite_state_path_argv(scoped_base, route_environment.envp);
     result = pm_real_execve(
-      exec_target, state_argv != NULL ? state_argv : scoped_base, child_environment.envp);
+      exec_target, state_argv != NULL ? state_argv : scoped_base, route_environment.envp);
     saved_errno = errno;
     pm_free_rewritten_argv(state_argv, scoped_base);
     pm_free_rewritten_argv(localhost_argv, base_argv);
     pm_free_rewritten_argv(rewritten_argv, argv);
   }
+  pm_release_route_child_environment(&route_environment);
   pm_release_child_environment(&child_environment);
   errno = saved_errno;
   return result;
@@ -5990,6 +6342,7 @@ static int pm_posix_spawn_hook(
   char *const envp[]) {
   const char *target;
   pm_child_environment child_environment;
+  pm_route_child_environment route_environment;
   int result;
 
   pm_ensure_symbols();
@@ -6007,19 +6360,21 @@ static int pm_posix_spawn_hook(
   }
 
   child_environment = pm_prepare_child_environment(envp);
+  route_environment = pm_rewrite_route_backed_child_environment(child_environment.envp);
   {
-    char **rewritten_argv = pm_rewrite_shell_c_argv(target, argv, child_environment.envp);
+    char **rewritten_argv = pm_rewrite_shell_c_argv(target, argv, route_environment.envp);
     char *const *base_argv = rewritten_argv != NULL ? rewritten_argv : argv;
-    char **localhost_argv = pm_rewrite_localhost_argv(base_argv, child_environment.envp);
+    char **localhost_argv = pm_rewrite_localhost_argv(base_argv, route_environment.envp);
     char *const *scoped_base = localhost_argv != NULL ? localhost_argv : base_argv;
-    char **state_argv = pm_rewrite_state_path_argv(scoped_base, child_environment.envp);
+    char **state_argv = pm_rewrite_state_path_argv(scoped_base, route_environment.envp);
     result = pm_real_posix_spawn(
       pid, target, file_actions, attrp, state_argv != NULL ? state_argv : scoped_base,
-      child_environment.envp);
+      route_environment.envp);
     pm_free_rewritten_argv(state_argv, scoped_base);
     pm_free_rewritten_argv(localhost_argv, base_argv);
     pm_free_rewritten_argv(rewritten_argv, argv);
   }
+  pm_release_route_child_environment(&route_environment);
   pm_release_child_environment(&child_environment);
   return result;
 }
@@ -6033,6 +6388,7 @@ static int pm_posix_spawnp_hook(
   char *const envp[]) {
   const char *target;
   pm_child_environment child_environment;
+  pm_route_child_environment route_environment;
   int result;
 
   pm_ensure_symbols();
@@ -6046,13 +6402,14 @@ static int pm_posix_spawnp_hook(
 
   target = pm_runtime_exec_target(file, argv);
   child_environment = pm_prepare_child_environment(envp);
+  route_environment = pm_rewrite_route_backed_child_environment(child_environment.envp);
 
   {
-    char **rewritten_argv = pm_rewrite_shell_c_argv(target != file ? target : file, argv, child_environment.envp);
+    char **rewritten_argv = pm_rewrite_shell_c_argv(target != file ? target : file, argv, route_environment.envp);
     char *const *base_argv = rewritten_argv != NULL ? rewritten_argv : argv;
-    char **localhost_argv = pm_rewrite_localhost_argv(base_argv, child_environment.envp);
+    char **localhost_argv = pm_rewrite_localhost_argv(base_argv, route_environment.envp);
     char *const *scoped_base = localhost_argv != NULL ? localhost_argv : base_argv;
-    char **state_argv = pm_rewrite_state_path_argv(scoped_base, child_environment.envp);
+    char **state_argv = pm_rewrite_state_path_argv(scoped_base, route_environment.envp);
     char *const *effective_argv = state_argv != NULL ? state_argv : scoped_base;
     if (target != file) {
       /*
@@ -6060,15 +6417,16 @@ static int pm_posix_spawnp_hook(
        * directly instead of letting posix_spawnp re-search PATH.
        */
       pm_debug("runtime posix_spawnp rewrite file=%s target=%s", file != NULL ? file : "(null)", target);
-      result = pm_real_posix_spawn(pid, target, file_actions, attrp, effective_argv, child_environment.envp);
+      result = pm_real_posix_spawn(pid, target, file_actions, attrp, effective_argv, route_environment.envp);
     } else {
-      result = pm_real_posix_spawnp(pid, file, file_actions, attrp, effective_argv, child_environment.envp);
+      result = pm_real_posix_spawnp(pid, file, file_actions, attrp, effective_argv, route_environment.envp);
     }
     pm_free_rewritten_argv(state_argv, scoped_base);
     pm_free_rewritten_argv(localhost_argv, base_argv);
     pm_free_rewritten_argv(rewritten_argv, argv);
   }
 
+  pm_release_route_child_environment(&route_environment);
   pm_release_child_environment(&child_environment);
   return result;
 }

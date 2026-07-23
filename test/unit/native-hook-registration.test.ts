@@ -193,6 +193,99 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.equal(payload.networkId, "network-ephemeral");
   });
 
+  test("fixed-port servers hand resolved loopback URLs to immediately spawned hookless children", async (context) => {
+    const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-hook-child-url-"));
+    const socketPath = path.join(tempDirectory, "agent.sock");
+    const routeTablePath = path.join(tempDirectory, "routes.json");
+    const openAgentSockets = new Set<net.Socket>();
+    const actualPort = await reserveUnusedTcpPort();
+    let logicalPort = await reserveUnusedTcpPort();
+    while (logicalPort === actualPort) {
+      logicalPort = await reserveUnusedTcpPort();
+    }
+    let allocationRequest: AgentRequest | undefined;
+
+    const fakeAgent = net.createServer((socket) => {
+      openAgentSockets.add(socket);
+      socket.on("close", () => openAgentSockets.delete(socket));
+      socket.setEncoding("utf8");
+      let buffer = "";
+      socket.on("data", (chunk: string) => {
+        buffer += chunk;
+        for (;;) {
+          const newline = buffer.indexOf("\n");
+          if (newline < 0) {
+            return;
+          }
+
+          const request = JSON.parse(buffer.slice(0, newline)) as AgentRequest;
+          buffer = buffer.slice(newline + 1);
+          if (request.method === "allocateRoute") {
+            allocationRequest = request;
+            socket.end(
+              `${JSON.stringify({
+                type: "response",
+                id: request.id,
+                ok: true,
+                payload: {
+                  allocationId: "allocation-child-url",
+                  requestedPort: logicalPort,
+                  actualPort,
+                  host: "127.0.0.1",
+                  routed: true,
+                  logicalRoutesFile: routeTablePath,
+                  expiresAt: new Date(Date.now() + 60_000).toISOString(),
+                },
+              })}\n`,
+            );
+          }
+        }
+      });
+    });
+    await listenOnUnixSocket(fakeAgent, socketPath);
+
+    const child = spawnHookedBinder({
+      hookPath: hookLibraryPath,
+      logicalPort,
+      socketPath,
+      routeTablePath,
+      probeChildLoopbackUrl: true,
+      env: {
+        // Force the regular allocation path without relying on a machine-wide
+        // lo0 alias. The parent still remembers the authoritative endpoint
+        // synchronously before its listen callback launches the child.
+        PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE: "",
+        PORT_MANAGER_NETWORK_LOOPBACK_HOST: "",
+        PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "",
+        PORT_MANAGER_PRESERVE_LISTEN_PORTS: "",
+      },
+    });
+
+    context.after(async () => {
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+      }
+      for (const socket of openAgentSockets) {
+        socket.destroy();
+      }
+      await closeServer(fakeAgent);
+      await fs.promises.rm(tempDirectory, { recursive: true, force: true });
+    });
+
+    const ready = await waitForReadyLine(child, 2_500);
+    const allocationPayload = allocationRequest?.payload as {
+      readonly requestedPort: number;
+      readonly routeDirection: string;
+    };
+
+    assert.equal(allocationPayload.requestedPort, logicalPort);
+    assert.equal(allocationPayload.routeDirection, "listen");
+    assert.equal(ready.address.port, logicalPort, "the hooked parent keeps seeing its logical port");
+    assert.equal(ready.childExitCode, 0);
+    assert.equal(ready.childStderr, "");
+    assert.equal(ready.childUrl, `http://127.0.0.1:${actualPort}/renderer`);
+  });
+
   test("native hook bounds send-only registration when the optional agent is absent", async (context) => {
     const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-hook-register-missing-"));
     const logicalPort = await reserveUnusedTcpPort();
@@ -350,6 +443,9 @@ interface ReadyMessage {
     readonly address: string;
     readonly port: number;
   };
+  readonly childUrl?: string;
+  readonly childExitCode?: number | null;
+  readonly childStderr?: string;
 }
 
 interface HookedBinderOptions {
@@ -359,6 +455,7 @@ interface HookedBinderOptions {
   readonly socketPath: string;
   readonly routeTablePath: string;
   readonly sendTimeoutMs?: number;
+  readonly probeChildLoopbackUrl?: boolean;
   readonly env?: NodeJS.ProcessEnv;
 }
 
@@ -374,6 +471,25 @@ function getNativeHookLibraryPath(): string | undefined {
 
 function spawnHookedBinder(options: HookedBinderOptions): ChildProcess {
   const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
+  const childProbeLines = options.probeChildLoopbackUrl === true
+    ? [
+        "  const childEnvironment = { ...process.env };",
+        '  delete childEnvironment.DYLD_INSERT_LIBRARIES;',
+        '  delete childEnvironment.LD_PRELOAD;',
+        '  childEnvironment.PORT_MANAGER_PRELOAD_REPAIR = "0";',
+        `  childEnvironment.PORT_MANAGER_TEST_CHILD_URL = ${JSON.stringify(`http://localhost:${options.logicalPort}/renderer`)};`,
+        `  const childProbe = require("node:child_process").spawnSync(process.execPath, ["-e", ${JSON.stringify(
+          'process.stdout.write(process.env.PORT_MANAGER_TEST_CHILD_URL || "");',
+        )}], { env: childEnvironment, encoding: "utf8" });`,
+        "  const childUrl = childProbe.stdout;",
+        "  const childExitCode = childProbe.status;",
+        "  const childStderr = childProbe.stderr;",
+      ]
+    : [
+        "  const childUrl = undefined;",
+        "  const childExitCode = undefined;",
+        "  const childStderr = undefined;",
+      ];
   const script = [
     'const fs = require("node:fs");',
     'const net = require("node:net");',
@@ -381,7 +497,8 @@ function spawnHookedBinder(options: HookedBinderOptions): ChildProcess {
     "const server = net.createServer();",
     `server.listen({ host: ${JSON.stringify(options.host ?? "127.0.0.1")}, port: ${options.logicalPort} }, () => {`,
     "  const address = server.address();",
-    '  fs.writeSync(1, `${JSON.stringify({ elapsedMs: Date.now() - startedAt, address })}\\n`);',
+    ...childProbeLines,
+    '  fs.writeSync(1, `${JSON.stringify({ elapsedMs: Date.now() - startedAt, address, childUrl, childExitCode, childStderr })}\\n`);',
     "});",
     "setTimeout(() => process.exit(91), 10000);",
   ].join("\n");

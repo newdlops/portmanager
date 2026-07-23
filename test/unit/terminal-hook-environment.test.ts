@@ -2699,7 +2699,39 @@ test("native hook rewrites host-positioned localhost argv at the exec boundary",
     true,
   );
   // Wired into all three exec boundaries (execve family, posix_spawn, posix_spawnp).
-  const wired = hook.split("pm_rewrite_localhost_argv(base_argv, child_environment.envp)").length - 1;
+  const wired = hook.split("pm_rewrite_localhost_argv(base_argv, route_environment.envp)").length - 1;
+  assert.equal(wired, 3);
+});
+
+test("native hook hands route-backed loopback URLs to hookless children synchronously", () => {
+  const hook = fs.readFileSync(
+    path.resolve(__dirname, "../../../native/hook/portmanager_hook.c"),
+    "utf8",
+  );
+  const rewriteStart = hook.indexOf("static int pm_child_environment_matches_current_network");
+  const rewriteEnd = hook.indexOf("static void pm_release_route_child_environment", rewriteStart);
+  const rewriteBody = hook.slice(rewriteStart, rewriteEnd);
+
+  assert.notEqual(rewriteStart, -1);
+  assert.equal(hook.includes("static int pm_memory_actual_for_logical_at_exec("), true);
+  assert.equal(rewriteBody.includes("pm_memory_actual_for_logical_at_exec(logical_port"), true);
+  assert.equal(hook.includes("pthread_mutex_trylock(&pm_route_mutex)"), true);
+  assert.equal(rewriteBody.includes("pm_child_environment_matches_current_network(envp)"), true);
+  assert.equal(rewriteBody.includes('strstr(envp[count], "://localhost:")'), true);
+  assert.equal(rewriteBody.includes('strstr(envp[count], "://127.0.0.1:")'), true);
+  assert.equal(rewriteBody.includes('strstr(envp[count], "://[::1]:")'), true);
+  assert.equal(rewriteBody.includes("pm_envp_network_scope_is_global(envp)"), false);
+  assert.equal(rewriteBody.includes("actual_port != logical_port && !allow_port_rewrite"), true);
+  assert.equal(rewriteBody.includes("!pm_preload_value_contains_path(preload_value, hook_path)"), true);
+  assert.equal(
+    hook.includes('#define PM_CHILD_LOOPBACK_URL_REWRITE_ENV "PORT_MANAGER_CHILD_LOOPBACK_URL_REWRITE"'),
+    true,
+  );
+  // All exec boundaries use the rewritten environment for both the child
+  // environment itself and the existing argv/path rewrite stages.
+  const wired = hook.split(
+    "route_environment = pm_rewrite_route_backed_child_environment(child_environment.envp)",
+  ).length - 1;
   assert.equal(wired, 3);
 });
 
@@ -2777,7 +2809,7 @@ test("native hook substitutes per-network files exclusively at open", () => {
   // own namespace instead of the shared original/window.
   assert.equal(hook.includes("static char **pm_rewrite_state_path_argv("), true);
   assert.equal(hook.includes("static char *pm_rewrite_state_path_token("), true);
-  const stateArgvWired = hook.split("pm_rewrite_state_path_argv(scoped_base, child_environment.envp)").length - 1;
+  const stateArgvWired = hook.split("pm_rewrite_state_path_argv(scoped_base, route_environment.envp)").length - 1;
   assert.equal(stateArgvWired, 3);
 
   const hookEnvironmentSource = fs.readFileSync(

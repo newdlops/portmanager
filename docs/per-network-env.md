@@ -73,6 +73,27 @@ virtualization involved.
   (SIP shells themselves, escaped trees) don't receive the values — the usual
   hook coverage boundary.
 
+## Hookless child URL handoff
+
+A separate exec-boundary safeguard covers a common environment handoff race.
+A launcher can bind a fixed-port dev server on its network loopback and then
+immediately start a protected or deliberately unhooked child with an inherited
+URL such as `http://localhost:5173`. The localhost compatibility router is
+published asynchronously, so that child's first request can otherwise fail
+before the router listener appears.
+
+Before `execve`/`posix_spawn`/`posix_spawnp`, the parent hook rewrites absolute
+loopback URLs in the child environment to the actual host and port, but **only**
+when the parent already owns an in-memory route for that logical port and the
+child keeps the same network id. This is synchronous with the successful bind,
+requires no application or port names, and leaves unrelated host URLs alone.
+It recognizes `localhost`, `127.0.0.1`, and `[::1]` URL authorities. Disable
+only this handoff with `PORT_MANAGER_CHILD_LOOPBACK_URL_REWRITE=0`.
+Same-port alias routes are safe whether the child retains the hook or the OS
+strips it. A route that also changes the port is handed off only when the child
+environment has no Port Manager preload; otherwise the hooked child could
+interpret that actual port as a second logical port and route twice.
+
 ## Verifying
 
 ```sh
@@ -88,5 +109,6 @@ Or enable the dev-log ([dev-logging.md](dev-logging.md)) and look for
 | Concern | Location |
 |---------|----------|
 | Injection (constructor) | `native/hook/portmanager_hook.c` (`pm_apply_network_env_file`, `pm_network_env_apply_line`, `pm_find_network_env_file`; called from `pm_hook_loaded`) |
+| Hookless child URL handoff | `native/hook/portmanager_hook.c` (`pm_rewrite_route_backed_child_environment`, wired into execve/posix_spawn/posix_spawnp) |
 | Network name delivery | `src/extension/terminal-hook-environment.ts` (`PORT_MANAGER_NETWORK_NAME`) |
 | Related | [per-network-hostname.md](per-network-hostname.md) — per-network *identity*; this doc — per-network *values* (overlay); [per-network-files.md](per-network-files.md) — whole-file *replacement* |
