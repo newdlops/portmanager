@@ -465,6 +465,96 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.equal(scoped.stdout, "");
   });
 
+  test("native hook address-only mode honors explicit Host Access before the network alias", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-host-access-"));
+    const server = net.createServer((socket) => {
+      socket.end("host-access\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-host-access";
+    const logicalPort = await chooseUnusedTcpPort(address.port);
+    const routeTablePath = path.join(tempDir, `newdlops-portmanager-routes-${networkId}.json`);
+    const hostAccessPath = path.join(tempDir, "host-access.json");
+    fs.writeFileSync(routeTablePath, JSON.stringify({ updatedAt: new Date().toISOString(), routes: [] }), "utf8");
+    fs.writeFileSync(
+      hostAccessPath,
+      JSON.stringify({
+        updatedAt: new Date().toISOString(),
+        bindings: [
+          {
+            id: "host-access-test",
+            networkId,
+            protocol: "tcp",
+            logicalPort,
+            hostAddress: "127.0.0.1",
+            hostPort: address.port,
+            status: "active",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const result = await runHookedNodeClient(logicalPort, routeTablePath, networkId, {
+      env: {
+        PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE: "loopback-address-only",
+        PORT_MANAGER_NETWORK_LOOPBACK_HOST: "127.254.253.252",
+        PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "127.254.253.252",
+        PORT_MANAGER_HOST_ACCESS_FILE: hostAccessPath,
+      },
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "host-access\n");
+    assert.equal(result.stderr, "");
+  });
+
+  test("native hook preserved rendezvous ports keep both sides on raw localhost", async (context) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-preserved-localhost-"));
+    const server = net.createServer((socket) => {
+      socket.end("preserved\n");
+    });
+
+    context.after(async () => {
+      await closeServer(server);
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    });
+
+    await listen(server);
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Failed to inspect test TCP server address.");
+    }
+
+    const networkId = "network-preserved-localhost";
+    const routeTablePath = path.join(tempDir, `newdlops-portmanager-routes-${networkId}.json`);
+    fs.writeFileSync(routeTablePath, JSON.stringify({ updatedAt: new Date().toISOString(), routes: [] }), "utf8");
+
+    const result = await runHookedNodeClient(address.port, routeTablePath, networkId, {
+      env: {
+        PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE: "loopback-address-only",
+        PORT_MANAGER_NETWORK_LOOPBACK_HOST: "127.254.253.252",
+        PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "127.254.253.252",
+        PORT_MANAGER_PRESERVE_LISTEN_PORTS: String(address.port),
+      },
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "preserved\n");
+    assert.equal(result.stderr, "");
+  });
+
   test("native hook global scope rewrites managed localhost connects through route rows", async (context) => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-hook-global-managed-"));
     const server = net.createServer((socket) => {
@@ -1362,11 +1452,16 @@ async function runHookedNodeClient(
       PORT_MANAGER_BORROWED_NETWORK_ID: "",
       NEWDLOPS_PM_NETWORK_ID: "",
       NEWDLOPS_PM_BORROWED_NETWORK_ID: "",
+      // Test runners launched from an attached global terminal must not turn
+      // an explicitly supplied user-network id into the host-real scope.
+      PORT_MANAGER_NETWORK_IS_GLOBAL: "",
       PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE: "",
       PORT_MANAGER_ROUTING_MODE: "",
       PORT_MANAGER_NETWORK_LOOPBACK_HOST: "",
       PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "",
       PORT_MANAGER_FIXED_PROTOCOL_PORTS: "",
+      PORT_MANAGER_PRESERVE_LISTEN_PORTS: "",
+      PORT_MANAGER_HOST_ACCESS_FILE: `${routeTablePath}.missing-host-access`,
       ...options.env,
     },
     stdio: ["ignore", "pipe", "pipe"],

@@ -2155,18 +2155,26 @@ test("terminal attach does not require durable compose routes before reporting a
   );
 });
 
-test("native hook preserves listener ports only for explicit overrides", () => {
+test("native hook preserves only explicit host-local rendezvous ports", () => {
   const sourcePath = path.resolve(__dirname, "../../../native/hook/portmanager_hook.c");
   const source = fs.readFileSync(sourcePath, "utf8");
   const defaultPorts = source
     .match(/#define PM_DEFAULT_FIXED_PROTOCOL_PORTS "([^"]+)"/)?.[1]
     ?.split(",")
     .map((value) => Number(value));
+  const defaultPreservedPorts = source
+    .match(/#define PM_DEFAULT_PRESERVED_LISTEN_PORTS "([^"]*)"/)?.[1]
+    ?.split(",")
+    .filter((value) => value.length > 0)
+    .map((value) => Number(value));
   const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../../../package.json"), "utf8")) as {
     contributes?: {
       configuration?: {
         properties?: {
           "portManager.fixedProtocolPorts"?: {
+            default?: readonly number[];
+          };
+          "portManager.preservedListenPorts"?: {
             default?: readonly number[];
           };
         };
@@ -2182,6 +2190,12 @@ test("native hook preserves listener ports only for explicit overrides", () => {
     manifest.contributes?.configuration?.properties?.["portManager.fixedProtocolPorts"]?.default,
     DEFAULT_PORT_MANAGER_SETTINGS.fixedProtocolPorts,
   );
+  assert.deepEqual(defaultPreservedPorts, DEFAULT_PORT_MANAGER_SETTINGS.preservedListenPorts);
+  assert.deepEqual(
+    manifest.contributes?.configuration?.properties?.["portManager.preservedListenPorts"]?.default,
+    DEFAULT_PORT_MANAGER_SETTINGS.preservedListenPorts,
+  );
+  assert.deepEqual(DEFAULT_PORT_MANAGER_SETTINGS.preservedListenPorts, [5037]);
 });
 
 test("native hook binds high-port routes on dedicated actual loopback hosts", () => {
@@ -2199,12 +2213,23 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   const connectEnd = source.indexOf("static int pm_getsockname_hook", connectStart);
   const connectBody = source.slice(connectStart, connectEnd);
   const ephemeralHelperStart = source.indexOf("static int pm_bind_ephemeral_local_port");
-  const ephemeralHelperEnd = source.indexOf("static int pm_bind_hook", ephemeralHelperStart);
+  const ephemeralHelperEnd = source.indexOf(
+    "\n}\n\n/*\n * True when the logical port gateway",
+    ephemeralHelperStart,
+  ) + 2;
   const ephemeralHelperBody = source.slice(ephemeralHelperStart, ephemeralHelperEnd);
   const addressOnlyBindStart = source.indexOf("if (pm_loopback_address_only_mode())", bindStart);
   const ephemeralBindStart = source.indexOf("if (logical_port == 0)", bindStart);
+  const preservedBindStart = source.indexOf(
+    "if (pm_is_host_local_rendezvous_port(logical_port) && pm_sockaddr_is_default_local(addr))",
+    ephemeralBindStart,
+  );
   const addressOnlyConnectStart = connectBody.indexOf("if (pm_loopback_address_only_mode())");
-  const addressOnlyConnectEnd = connectBody.indexOf("target_host[0] = '\\0';", addressOnlyConnectStart);
+  const preservedConnectStart = connectBody.indexOf(
+    "if (pm_is_host_local_rendezvous_port(logical_port) && pm_sockaddr_is_default_local(addr))",
+  );
+  const addressOnlyResolvedStart = connectBody.indexOf("connect address-only resolved logical=%d");
+  const addressOnlyConnectEnd = connectBody.indexOf("\n  target_host[0] = '\\0';", addressOnlyResolvedStart);
   const addressOnlyConnectBlock = connectBody.slice(addressOnlyConnectStart, addressOnlyConnectEnd);
 
   assert.notEqual(loopbackStart, -1);
@@ -2214,8 +2239,11 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   assert.notEqual(connectStart, -1);
   assert.notEqual(ephemeralHelperStart, -1);
   assert.notEqual(ephemeralBindStart, -1);
+  assert.notEqual(preservedBindStart, -1);
   assert.notEqual(addressOnlyBindStart, -1);
   assert.notEqual(addressOnlyConnectStart, -1);
+  assert.notEqual(preservedConnectStart, -1);
+  assert.notEqual(addressOnlyResolvedStart, -1);
   assert.equal(
     matchLevelBody.includes(
       "return route->has_network_id ? 0 : 2;",
@@ -2242,11 +2270,13 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   assert.equal(connectBody.includes("loopback_connect_errno != ECONNREFUSED"), true);
   assert.equal(source.includes('PM_LOOPBACK_ADDRESS_ONLY_MODE "loopback-address-only"'), true);
   assert.equal(source.includes("pm_bind_ephemeral_local_port"), true);
-  assert.equal(source.includes("uses an ephemeral loopback coordination port must stay inside the attached"), true);
-  assert.equal(source.includes("Hookless host clients attached by PID still dial localhost"), true);
+  assert.equal(source.includes("A kernel-selected port is already globally collision-free"), true);
+  assert.equal(source.includes("similar hookless companions use the exact endpoint"), true);
   assert.equal(ephemeralHelperBody.includes("pm_real_getsockname(sockfd"), true);
-  assert.equal(ephemeralHelperBody.includes("pm_remember_route(actual_port, actual_port, loopback_host, \"\", 0);"), true);
-  assert.equal(ephemeralHelperBody.includes("pm_register_process(actual_port, actual_port, loopback_host, \"\");"), true);
+  assert.equal(ephemeralHelperBody.includes("result = pm_real_bind(sockfd, addr, addrlen);"), true);
+  assert.equal(ephemeralHelperBody.includes("pm_set_sockaddr_host"), false);
+  assert.equal(ephemeralHelperBody.includes("pm_remember_route(actual_port, actual_port, route_host, \"\", 0);"), true);
+  assert.equal(ephemeralHelperBody.includes("pm_register_process(actual_port, actual_port, route_host, \"\");"), true);
   assert.equal(source.includes("errno = EADDRNOTAVAIL;\n      return -1;"), true);
   assert.equal(source.includes("bind global raw fallback"), false);
   assert.equal(source.includes('pm_bind_localhost_relocation(sockfd, addr, addrlen, logical_port, "global-alias-unavailable")'), true);
@@ -2257,10 +2287,18 @@ test("native hook binds high-port routes on dedicated actual loopback hosts", ()
   assert.equal(source.includes("connect global gateway passthrough logical=%d"), true);
   assert.equal(source.includes("connect global address-only logical=%d host=%s"), false);
   assert.equal(ephemeralBindStart < addressOnlyBindStart, true);
+  assert.equal(ephemeralBindStart < preservedBindStart && preservedBindStart < addressOnlyBindStart, true);
+  assert.equal(preservedConnectStart < addressOnlyConnectStart, true);
   assert.equal(source.includes("bind address-only logical=%d host=%s"), true);
   assert.equal(addressOnlyBindStart < allocationStart, true);
   assert.equal(addressOnlyConnectBlock.includes("pm_allocate_route("), false);
   assert.equal(addressOnlyConnectBlock.includes("pm_set_sockaddr_host((struct sockaddr *)&rewritten, loopback_host);"), true);
+  assert.equal(addressOnlyResolvedStart < connectBody.indexOf("connect address-only logical=%d host=%s"), true);
+  assert.equal(
+    connectBody.indexOf("pm_host_access_lookup(logical_port", addressOnlyConnectStart) <
+      connectBody.indexOf("connect address-only logical=%d host=%s", addressOnlyConnectStart),
+    true,
+  );
 });
 
 test("native agent adopts previous route files before first startup write", () => {

@@ -114,6 +114,85 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     assert.equal(payload.networkId, "network-send-only-regression");
   });
 
+  test("user-network ephemeral listeners remain reachable on raw localhost", async (context) => {
+    const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-hook-ephemeral-"));
+    const socketPath = path.join(tempDirectory, "agent.sock");
+    const openAgentSockets = new Set<net.Socket>();
+    const observedMethods: string[] = [];
+    let resolveRegistration: ((request: AgentRequest) => void) | undefined;
+    const registration = new Promise<AgentRequest>((resolve) => {
+      resolveRegistration = resolve;
+    });
+    const fakeAgent = net.createServer((socket) => {
+      openAgentSockets.add(socket);
+      socket.on("close", () => openAgentSockets.delete(socket));
+      socket.setEncoding("utf8");
+      let buffer = "";
+      socket.on("data", (chunk: string) => {
+        buffer += chunk;
+        for (;;) {
+          const newline = buffer.indexOf("\n");
+          if (newline < 0) {
+            return;
+          }
+
+          const request = JSON.parse(buffer.slice(0, newline)) as AgentRequest;
+          buffer = buffer.slice(newline + 1);
+          observedMethods.push(request.method);
+          if (request.method === "registerExistingProcess") {
+            resolveRegistration?.(request);
+            resolveRegistration = undefined;
+          }
+        }
+      });
+    });
+    await listenOnUnixSocket(fakeAgent, socketPath);
+
+    let child: ChildProcess | undefined;
+    context.after(async () => {
+      if (child !== undefined && child.exitCode === null) {
+        child.kill("SIGKILL");
+      }
+      for (const socket of openAgentSockets) {
+        socket.destroy();
+      }
+      await closeServer(fakeAgent);
+      await fs.promises.rm(tempDirectory, { recursive: true, force: true });
+    });
+
+    child = spawnHookedBinder({
+      hookPath: hookLibraryPath,
+      logicalPort: 0,
+      socketPath,
+      routeTablePath: path.join(tempDirectory, "routes.json"),
+      env: {
+        PORT_MANAGER_NETWORK_ID: "network-ephemeral",
+        PORT_MANAGER_NETWORK_NAME: "ephemeral",
+        PORT_MANAGER_NETWORK_IS_GLOBAL: "",
+        PORT_MANAGER_NETWORK_ENV_APPLIED: "network-ephemeral",
+        PORT_MANAGER_NETWORK_LOOPBACK_HOST: "127.77.88.99",
+        PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "127.77.88.99",
+        PORT_MANAGER_PRESERVE_LISTEN_PORTS: "",
+      },
+    });
+
+    const ready = await waitForReadyLine(child, 2_500);
+    assert.equal(ready.address.address, "127.0.0.1");
+    assert.ok(ready.address.port > 0);
+
+    // Electron helpers and other hookless companions receive this endpoint over
+    // IPC, so the raw host coordinate itself—not only a hooked route—must work.
+    await connectToRawLocalhost(ready.address.port);
+
+    const request = await withTimeout(registration, 2_500, "Timed out waiting for ephemeral bind registration.");
+    const payload = request.payload as RegistrationPayload;
+    assert.deepEqual(observedMethods, ["registerExistingProcess"]);
+    assert.equal(payload.requestedPort, ready.address.port);
+    assert.equal(payload.actualPort, ready.address.port);
+    assert.equal(payload.host, "127.0.0.1");
+    assert.equal(payload.networkId, "network-ephemeral");
+  });
+
   test("native hook bounds send-only registration when the optional agent is absent", async (context) => {
     const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-hook-register-missing-"));
     const logicalPort = await reserveUnusedTcpPort();
@@ -352,6 +431,17 @@ async function closeServer(server: net.Server): Promise<void> {
   }
   await new Promise<void>((resolve, reject) => {
     server.close((error) => error === undefined ? resolve() : reject(error));
+  });
+}
+
+async function connectToRawLocalhost(port: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    socket.once("connect", () => {
+      socket.destroy();
+      resolve();
+    });
+    socket.once("error", reject);
   });
 }
 

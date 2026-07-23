@@ -49,7 +49,8 @@ export const DEFAULT_PORT_MANAGER_SETTINGS: PortManagerSettings = {
     27017,
     50051,
   ],
-  preservedListenPorts: [],
+  // ADB's host daemon is a singleton localhost rendezvous, not a clone-local app server.
+  preservedListenPorts: [5037],
   routeTableTtlSeconds: 15,
   autoOpenBrowser: false,
   showConflictNotification: true,

@@ -55,6 +55,7 @@
 #define PM_DEFAULT_VIRTUAL_START 53000
 #define PM_DEFAULT_VIRTUAL_END 59999
 #define PM_DEFAULT_FIXED_PROTOCOL_PORTS "22,25,53,80,110,143,389,443,465,587,993,995,1433,1521,15432,1883,3306,33060,4222,5432,5671,5672,6379,8883,9092,9200,9300,11211,15672,27017,50051"
+#define PM_DEFAULT_PRESERVED_LISTEN_PORTS "5037"
 #define PM_AGENT_ROUNDTRIP_TIMEOUT_MS 60000
 #define PM_AGENT_SEND_TIMEOUT_MS 250
 #define PM_AGENT_SEND_TIMEOUT_ENV "PORT_MANAGER_AGENT_SEND_TIMEOUT_MS"
@@ -1679,7 +1680,8 @@ static int pm_is_compose_logical_port(int port) {
 }
 
 static int pm_is_preserved_listen_port(int port) {
-  const char *ports = getenv("PORT_MANAGER_PRESERVE_LISTEN_PORTS");
+  const char *configured_ports = getenv("PORT_MANAGER_PRESERVE_LISTEN_PORTS");
+  const char *ports = configured_ports != NULL ? configured_ports : PM_DEFAULT_PRESERVED_LISTEN_PORTS;
 
   if (ports == NULL || ports[0] == '\0') {
     return 0;
@@ -1688,12 +1690,14 @@ static int pm_is_preserved_listen_port(int port) {
   return pm_port_list_contains(ports, port);
 }
 
-static int pm_should_preserve_listen_bind(int logical_port) {
+static int pm_is_host_local_rendezvous_port(int logical_port) {
   /*
-   * Preserving a bind means the kernel sees the original host/port. That is
-   * only safe for explicit user overrides; auto-preserving Vite/Next-style dev
-   * servers lets their own conflict detector increment ports before Port
-   * Manager can present a stable browser alias.
+   * Preserved ports are host-local rendezvous coordinates: both bind() and
+   * connect() must see the original localhost endpoint so a hookless companion
+   * process or singleton host daemon can participate. Keep this list explicit;
+   * auto-preserving Vite/Next-style dev servers would sacrifice clone isolation
+   * and let their own conflict detector increment ports before Port Manager can
+   * present a stable browser alias.
    */
   return pm_is_preserved_listen_port(logical_port);
 }
@@ -4123,8 +4127,7 @@ static int pm_wait_for_compose_route(
 
 static int pm_bind_ephemeral_local_port(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   struct sockaddr_storage actual_addr;
-  struct sockaddr_storage rewritten;
-  const char *loopback_host;
+  char route_host[128];
   socklen_t actual_addrlen;
   int actual_port;
   int result;
@@ -4137,27 +4140,19 @@ static int pm_bind_ephemeral_local_port(int sockfd, const struct sockaddr *addr,
     return pm_real_bind(sockfd, addr, addrlen);
   }
 
-  loopback_host = pm_network_loopback_host();
-  if (loopback_host == NULL) {
-    loopback_host = pm_actual_loopback_host();
-  }
-  if (loopback_host == NULL) {
-    if (pm_loopback_address_only_mode()) {
-      errno = EADDRNOTAVAIL;
-      return -1;
-    }
-    return pm_real_bind(sockfd, addr, addrlen);
-  }
-
   /*
-   * bind(..., port 0) is still a network-owned listener. Any framework that
-   * uses an ephemeral loopback coordination port must stay inside the attached
-   * logical network instead of escaping to host 127.0.0.1.
+   * A kernel-selected port is already globally collision-free, so moving it to
+   * a per-network address buys no port reuse. Keeping this host-local rendezvous
+   * on raw localhost lets Electron helpers, debuggers, OAuth callbacks, and
+   * similar hookless companions use the exact endpoint handed to them over IPC.
+   * The scoped route below still lets hooked siblings resolve the same endpoint.
    */
-  memcpy(&rewritten, addr, addrlen);
-  pm_set_sockaddr_host((struct sockaddr *)&rewritten, loopback_host);
-  pm_debug("bind ephemeral loopback host=%s", loopback_host);
-  result = pm_real_bind(sockfd, (struct sockaddr *)&rewritten, addrlen);
+  pm_sockaddr_host(addr, route_host, sizeof(route_host));
+  if (pm_route_host_is_wildcard_text(route_host)) {
+    snprintf(route_host, sizeof(route_host), "%s", addr->sa_family == AF_INET6 ? "::1" : "127.0.0.1");
+  }
+  pm_debug("bind ephemeral host-local host=%s", route_host);
+  result = pm_real_bind(sockfd, addr, addrlen);
   if (result != 0 || pm_real_getsockname == NULL) {
     return result;
   }
@@ -4168,16 +4163,12 @@ static int pm_bind_ephemeral_local_port(int sockfd, const struct sockaddr *addr,
     if (actual_port > 0) {
       char actual_text[16];
 
-      /*
-       * Hookless host clients attached by PID still dial localhost. Publishing
-       * the kernel's ephemeral port lets the compatibility router expose
-       * 127.0.0.1:port while the real listener stays on the network loopback.
-       */
-      pm_remember_route(actual_port, actual_port, loopback_host, "", 0);
+      /* The route is network-scoped even though its collision-free endpoint is host-local. */
+      pm_remember_route(actual_port, actual_port, route_host, "", 0);
       snprintf(actual_text, sizeof(actual_text), "%d", actual_port);
       setenv("PORT_MANAGER_LOGICAL_PORT", actual_text, 1);
       setenv("PORT_MANAGER_ACTUAL_PORT", actual_text, 1);
-      pm_register_process(actual_port, actual_port, loopback_host, "");
+      pm_register_process(actual_port, actual_port, route_host, "");
     }
   }
 
@@ -4346,6 +4337,26 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
     return pm_bind_ephemeral_local_port(sockfd, addr, addrlen);
   }
 
+  if (pm_is_host_local_rendezvous_port(logical_port) && pm_sockaddr_is_default_local(addr)) {
+    /*
+     * A configured host-local rendezvous must bypass address isolation in every
+     * network scope. Its clients take the matching raw-connect branch below.
+     */
+    pm_sockaddr_host(addr, host, sizeof(host));
+    result = pm_real_bind(sockfd, addr, addrlen);
+    if (result == 0) {
+      char logical_text[16];
+
+      pm_remember_route(logical_port, logical_port, host, "", 0);
+      snprintf(logical_text, sizeof(logical_text), "%d", logical_port);
+      setenv("PORT_MANAGER_LOGICAL_PORT", logical_text, 1);
+      setenv("PORT_MANAGER_ACTUAL_PORT", logical_text, 1);
+      pm_register_process(logical_port, logical_port, host, "");
+      pm_debug("bind host-local preserved logical=%d host=%s", logical_port, host);
+    }
+    return result;
+  }
+
   if (pm_loopback_address_only_mode()) {
     if (pm_network_scope_is_global()) {
       if (!pm_sockaddr_is_default_local(addr)) {
@@ -4353,21 +4364,6 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
            deliberate coordinate, not a default-localhost rendezvous. */
         pm_debug("bind global raw passthrough logical=%d", logical_port);
         return pm_real_bind(sockfd, addr, addrlen);
-      }
-      if (pm_should_preserve_listen_bind(logical_port)) {
-        pm_sockaddr_host(addr, host, sizeof(host));
-        result = pm_real_bind(sockfd, addr, addrlen);
-        if (result == 0) {
-          char logical_text[16];
-
-          pm_remember_route(logical_port, logical_port, host, "", 0);
-          snprintf(logical_text, sizeof(logical_text), "%d", logical_port);
-          setenv("PORT_MANAGER_LOGICAL_PORT", logical_text, 1);
-          setenv("PORT_MANAGER_ACTUAL_PORT", logical_text, 1);
-          pm_register_process(logical_port, logical_port, host, "");
-          pm_debug("bind global preserved logical=%d host=%s", logical_port, host);
-        }
-        return result;
       }
     }
 
@@ -4434,21 +4430,6 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
   }
 
   pm_sockaddr_host(addr, host, sizeof(host));
-  if (pm_should_preserve_listen_bind(logical_port)) {
-    result = pm_real_bind(sockfd, addr, addrlen);
-    if (result == 0) {
-      char logical_text[16];
-
-      pm_remember_route(logical_port, logical_port, host, "", 0);
-      snprintf(logical_text, sizeof(logical_text), "%d", logical_port);
-      setenv("PORT_MANAGER_LOGICAL_PORT", logical_text, 1);
-      setenv("PORT_MANAGER_ACTUAL_PORT", logical_text, 1);
-      pm_register_process(logical_port, logical_port, host, "");
-      pm_debug("preserving browser-visible bind logical=%d host=%s", logical_port, host);
-    }
-    return result;
-  }
-
   loopback_host = pm_network_loopback_host();
   if (loopback_host != NULL) {
     int saved_errno;
@@ -4613,6 +4594,11 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
     return pm_real_connect(sockfd, addr, addrlen);
   }
 
+  if (pm_is_host_local_rendezvous_port(logical_port) && pm_sockaddr_is_default_local(addr)) {
+    pm_debug("connect host-local preserved logical=%d", logical_port);
+    return pm_real_connect(sockfd, addr, addrlen);
+  }
+
   if (pm_loopback_address_only_mode()) {
     if (pm_network_scope_is_global()) {
       char global_host[128];
@@ -4690,6 +4676,34 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
         strerror(alias_errno));
       errno = alias_errno;
       return alias_result;
+    }
+
+    /*
+     * Address-only routing still honors explicit network routes and Host Access
+     * before synthesizing the per-network alias. This is required for host
+     * daemons such as ADB and for collision-free port=0 rendezvous routes.
+     */
+    if (pm_sockaddr_is_default_local(addr)) {
+      target_host[0] = '\0';
+      route_is_compose = 0;
+      actual_port = pm_memory_actual_for_logical(logical_port, target_host, sizeof(target_host));
+      if (actual_port == 0) {
+        actual_port = pm_connect_route_table_lookup(logical_port, target_host, sizeof(target_host), &route_is_compose);
+      }
+      if (actual_port == 0) {
+        actual_port = pm_host_access_lookup(logical_port, target_host, sizeof(target_host));
+      }
+      if (actual_port > 0) {
+        if (target_host[0] == '\0' || pm_route_host_is_wildcard_text(target_host)) {
+          loopback_host = pm_network_loopback_host();
+          snprintf(target_host, sizeof(target_host), "%s", loopback_host != NULL ? loopback_host : "127.0.0.1");
+        }
+        memcpy(&rewritten, addr, addrlen);
+        pm_set_sockaddr_port((struct sockaddr *)&rewritten, actual_port);
+        pm_set_sockaddr_host((struct sockaddr *)&rewritten, target_host);
+        pm_debug("connect address-only resolved logical=%d actual=%d host=%s", logical_port, actual_port, target_host);
+        return pm_real_connect(sockfd, (struct sockaddr *)&rewritten, addrlen);
+      }
     }
 
     loopback_host = pm_network_loopback_host();

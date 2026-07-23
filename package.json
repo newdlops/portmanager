@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8240",
+  "version": "0.0.8241",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -910,11 +910,13 @@
         },
         "portManager.preservedListenPorts": {
           "type": "array",
-          "default": [],
+          "default": [
+            5037
+          ],
           "items": {
             "type": "number"
           },
-          "description": "Host-visible listener ports that terminal hooks should keep on the requested port. Leave browser dev servers out so Port Manager can provide stable network aliases."
+          "description": "Host-local coordination ports whose bind and connect calls must stay on raw localhost. The default preserves the singleton ADB server; leave browser dev servers out so Port Manager can isolate clones on stable network aliases."
         },
         "portManager.routeTableTtlSeconds": {
           "type": "number",

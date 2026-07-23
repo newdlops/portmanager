@@ -512,7 +512,7 @@ export interface PortManagerSettings {
   readonly preferredPorts: readonly number[];
   /** Ports whose protocol identity should not be auto-remapped by terminal hooks. */
   readonly fixedProtocolPorts: readonly number[];
-  /** Host-visible listener ports that should stay bound to their logical port. */
+  /** Host-local rendezvous ports whose bind/connect coordinates must remain on raw localhost. */
   readonly preservedListenPorts: readonly number[];
   /** Seconds before generated routing cache files are considered stale by native readers. */
   readonly routeTableTtlSeconds: number;
