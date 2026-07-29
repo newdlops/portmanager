@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8242",
+  "version": "0.0.8244",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -559,8 +559,8 @@
         },
         {
           "command": "portManager.attachActiveTerminalToNetwork",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
-          "group": "network@6"
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "inline@1"
         },
         {
           "command": "portManager.attachProcessToNetwork",

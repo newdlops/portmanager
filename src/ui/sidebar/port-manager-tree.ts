@@ -95,10 +95,12 @@ interface RoutingTimelineEntry {
 }
 
 interface ActionAvailability {
-  /** False renders the row as owner-scoped while the command wrapper acquires ownership. */
+  /** Owner-scoped commands stay actionable because their command wrapper acquires ownership. */
   readonly enabled: boolean;
-  /** Short reason appended to disabled action rows. */
-  readonly disabledReason?: string;
+  /** Short ownership-transfer guidance shown once on the primary Connect group. */
+  readonly ownerTransferNote?: string;
+  /** Full ownership source detail for native hover help; never permits command links. */
+  readonly ownerTransferTooltip?: vscode.MarkdownString;
 }
 
 /**
@@ -310,16 +312,25 @@ export class PortManagerTreeProvider
     const { snapshot, agentSnapshot, daemon, ownerAction } = generation;
     const getRouteRows: NetworkRouteRowsResolver = (networkId) =>
       this.getNetworkRouteRows(generation, networkId);
+    const getCurrentRouteRows: NetworkRouteRowsResolver = (networkId) =>
+      buildNetworkRouteConnectionRows(networkId, snapshot, agentSnapshot, "current");
 
     if (element === undefined) {
       return [
         new TreeSectionItem(
           "current",
           "Current Routing",
-          formatCurrentRoutingSummary(snapshot, agentSnapshot, getRouteRows),
+          formatCurrentRoutingSummary(snapshot, agentSnapshot, getCurrentRouteRows),
           "target",
+          vscode.TreeItemCollapsibleState.Collapsed,
         ),
-        new TreeSectionItem("networks", "Logical Networks", `${snapshot.networks.length} networks`, "vm"),
+        new TreeSectionItem(
+          "networks",
+          "Logical Networks",
+          `${snapshot.networks.length} networks`,
+          "vm",
+          vscode.TreeItemCollapsibleState.Expanded,
+        ),
         new TreeSectionItem(
           "containers",
           "Discovered Services",
@@ -368,8 +379,15 @@ export class PortManagerTreeProvider
       ];
 
       return [
-        ...(stateRows.length > 0 ? stateRows : [new EmptyTreeItem("No bindings or terminal windows", "Use Quick Actions")]),
-        new NetworkActionGroupTreeItem(element.network, "quick", "Quick Actions", "Attach terminals and services", "zap"),
+        ...(stateRows.length > 0 ? stateRows : [new EmptyTreeItem("Ready to connect", "Choose an action below")]),
+        new NetworkActionGroupTreeItem(
+          element.network,
+          "quick",
+          "Connect",
+          "Attach terminals, services, or scripts",
+          "plug",
+          ownerAction,
+        ),
         new NetworkActionGroupTreeItem(element.network, "advanced", "Advanced", "Bindings, presets, cache", "tools"),
       ];
     }
@@ -548,7 +566,7 @@ export class PortManagerTreeProvider
 
     switch (element.kind) {
       case "current":
-        return buildCurrentRoutingGroupItems(snapshot, agentSnapshot, getRouteRows);
+        return buildCurrentRoutingGroupItems(snapshot, agentSnapshot, getCurrentRouteRows);
       case "networks":
         return [
           ...(snapshot.networks.length > 0
@@ -563,7 +581,14 @@ export class PortManagerTreeProvider
                   snapshot.vscodeWindowTerminalBinding?.networkId === network.id,
                 ),
               )
-            : [new EmptyTreeItem("No logical networks", "Create one from the toolbar")]),
+            : [
+                new ActionTreeItem(
+                  "Create Network",
+                  "portManager.createLogicalNetwork",
+                  "add",
+                  "Create a logical network to start routing",
+                ),
+              ]),
         ];
       case "containers":
         return [
@@ -624,13 +649,8 @@ class ActionTreeItem extends vscode.TreeItem {
   ) {
     super(label, vscode.TreeItemCollapsibleState.None);
     this.contextValue = availability.enabled ? "action" : "action.disabled";
-    this.description = availability.enabled
-      ? description
-      : [description, availability.disabledReason ?? "Owner window only"].filter(Boolean).join(" - ");
-    this.iconPath = new vscode.ThemeIcon(
-      availability.enabled ? icon : "circle-slash",
-      availability.enabled ? undefined : new vscode.ThemeColor("disabledForeground"),
-    );
+    this.description = description;
+    this.iconPath = new vscode.ThemeIcon(icon);
 
     this.command = {
       command,
@@ -711,10 +731,15 @@ class NetworkActionGroupTreeItem extends vscode.TreeItem {
     label: string,
     description: string,
     icon: string,
+    availability: ActionAvailability = { enabled: true },
   ) {
-    super(label, vscode.TreeItemCollapsibleState.Collapsed);
+    super(
+      label,
+      kind === "quick" ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed,
+    );
     this.id = `network-action:${network.id}:${kind}`;
-    this.description = description;
+    this.description = [description, availability.ownerTransferNote].filter(Boolean).join(" - ");
+    this.tooltip = availability.ownerTransferTooltip;
     this.iconPath = new vscode.ThemeIcon(icon);
   }
 }
@@ -766,9 +791,7 @@ export class LogicalNetworkTreeItem extends vscode.TreeItem {
     const composeCount = composeAttachments.filter((attachment) => attachment.networkId === network.id).length;
     super(
       network.name,
-      attachmentCount > 0 || exposureCount > 0 || hostAccessCount > 0 || composeCount > 0 || routeCount > 0
-        ? vscode.TreeItemCollapsibleState.Collapsed
-        : vscode.TreeItemCollapsibleState.None,
+      vscode.TreeItemCollapsibleState.Collapsed,
     );
     this.id = network.id;
     this.description = buildNetworkDescription(
@@ -860,14 +883,9 @@ export class ComposeProjectCandidateTreeItem extends vscode.TreeItem {
     this.aggregateCandidate = buildAggregateComposeProjectCandidate(projectName, runtime, candidates);
     this.id = this.aggregateCandidate.id;
     this.contextValue = availability.enabled ? "composeProjectCandidate" : "composeProjectCandidate.disabled";
-    this.description = availability.enabled
-      ? formatComposeProjectCandidateDescription(this.aggregateCandidate, candidates.length, ports.length)
-      : `${formatComposeProjectCandidateDescription(this.aggregateCandidate, candidates.length, ports.length)} - ${availability.disabledReason ?? "Owner window only"}`;
+    this.description = formatComposeProjectCandidateDescription(this.aggregateCandidate, candidates.length, ports.length);
     this.tooltip = buildComposeProjectCandidateTooltip(projectName, runtime, candidates);
-    this.iconPath = new vscode.ThemeIcon(
-      availability.enabled ? "server-environment" : "circle-slash",
-      availability.enabled ? undefined : new vscode.ThemeColor("disabledForeground"),
-    );
+    this.iconPath = new vscode.ThemeIcon("server-environment");
     this.command = {
       command: "portManager.attachContainerToNetwork",
       title: "Attach Compose Project to Network",
@@ -884,14 +902,9 @@ export class ContainerServiceCandidateTreeItem extends vscode.TreeItem {
     super(formatContainerServiceTreeLabel(candidate), vscode.TreeItemCollapsibleState.Collapsed);
     this.id = candidate.id;
     this.contextValue = availability.enabled ? "containerServiceCandidate" : "containerServiceCandidate.disabled";
-    this.description = availability.enabled
-      ? formatContainerServiceCandidateDescription(candidate)
-      : `${formatContainerServiceCandidateDescription(candidate)} - ${availability.disabledReason ?? "Owner window only"}`;
+    this.description = formatContainerServiceCandidateDescription(candidate);
     this.tooltip = buildContainerServiceTooltip(candidate);
-    this.iconPath = new vscode.ThemeIcon(
-      availability.enabled ? (candidate.composeProject ? "server-environment" : "server-process") : "circle-slash",
-      availability.enabled ? undefined : new vscode.ThemeColor("disabledForeground"),
-    );
+    this.iconPath = new vscode.ThemeIcon(candidate.composeProject ? "server-environment" : "server-process");
     this.command = {
       command: "portManager.attachContainerToNetwork",
       title: "Attach Service to Network",
@@ -1005,17 +1018,11 @@ export class VscodeWindowTerminalBindingTreeItem extends vscode.TreeItem {
     super("VS Code Window Terminals", vscode.TreeItemCollapsibleState.None);
     this.id = binding.id;
     this.contextValue = availability.enabled ? "vscodeWindowTerminalBinding" : "vscodeWindowTerminalBinding.disabled";
-    this.description = availability.enabled
-      ? (network?.name ?? binding.networkId)
-      : `${network?.name ?? binding.networkId} - ${availability.disabledReason ?? "Owner window only"}`;
+    this.description = network?.name ?? binding.networkId;
     this.tooltip = buildVscodeWindowTerminalBindingTooltip(binding, network);
     this.iconPath = new vscode.ThemeIcon(
-      availability.enabled ? (binding.status === "attached" ? "terminal" : "warning") : "circle-slash",
-      availability.enabled
-        ? binding.status === "error"
-          ? new vscode.ThemeColor("testing.iconFailed")
-          : undefined
-        : new vscode.ThemeColor("disabledForeground"),
+      binding.status === "attached" ? "terminal" : "warning",
+      binding.status === "error" ? new vscode.ThemeColor("testing.iconFailed") : undefined,
     );
     if (availability.enabled) {
       this.command = {
@@ -1579,7 +1586,26 @@ function isControlPlaneOwner(controlPlane: ControlPlaneStatus | undefined): bool
 function buildOwnerActionAvailability(controlPlane: ControlPlaneStatus | undefined): ActionAvailability {
   return isControlPlaneOwner(controlPlane)
     ? { enabled: true }
-    : { enabled: false, disabledReason: formatOwnerOnlyActionReason(controlPlane) };
+    : {
+        enabled: true,
+        ownerTransferNote: formatOwnerTransferGuidance(controlPlane),
+        ownerTransferTooltip: buildOwnerTransferTooltip(controlPlane),
+      };
+}
+
+/** Explains that selecting an owner-scoped command transfers control to this window. */
+function formatOwnerTransferGuidance(controlPlane: ControlPlaneStatus | undefined): string {
+  return "takes ownership in this window";
+}
+
+/** Keeps the source-window detail available on hover without making the tooltip trusted. */
+function buildOwnerTransferTooltip(controlPlane: ControlPlaneStatus | undefined): vscode.MarkdownString {
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.isTrusted = false;
+  tooltip.appendMarkdown("**Connect** transfers control to this window before continuing.\n\n");
+  tooltip.appendMarkdown(`Current owner: \`${escapeMarkdown(formatOwnerWindowTitle(controlPlane))}\`\n`);
+  tooltip.appendMarkdown(`Owner PID: \`${controlPlane?.ownerPid ?? "unknown"}\``);
+  return tooltip;
 }
 
 function formatOwnerOnlyActionReason(controlPlane: ControlPlaneStatus | undefined): string {
@@ -1617,24 +1643,29 @@ function formatDiagnosticsSummary(daemon: AgentDaemonStatus, snapshot: NetworkSn
 }
 
 /** One-line current routing summary for the root section. */
-function formatCurrentRoutingSummary(
+export function formatCurrentRoutingSummary(
   snapshot: NetworkSnapshot,
   agentSnapshot: AgentSnapshot,
   getRouteRows: NetworkRouteRowsResolver,
 ): string {
+  const projection = projectCurrentRouting(snapshot, agentSnapshot);
   const currentNetwork = snapshot.networks.find((network) => network.id === snapshot.vscodeWindowTerminalBinding?.networkId);
-  const attachedTerminalCount = snapshot.attachments.filter((attachment) => attachment.status === "attached").length;
-  const routeCount = countAllNetworkRouteConnections(snapshot, agentSnapshot, getRouteRows);
+  const routeCount = countAllNetworkRouteConnections(projection.networkIds, getRouteRows);
 
   if (currentNetwork !== undefined) {
     return `VS Code -> ${currentNetwork.name}, ${routeCount} routes`;
   }
 
-  if (attachedTerminalCount > 0) {
-    return `${attachedTerminalCount} terminals, ${routeCount} routes`;
+  if (projection.attachedTerminalCount > 0 && projection.networkIds.length === 1) {
+    const terminalNetwork = snapshot.networks.find((network) => network.id === projection.networkIds[0]);
+    return `Terminal -> ${terminalNetwork?.name ?? projection.networkIds[0]}, ${routeCount} routes`;
   }
 
-  return routeCount > 0 ? `${routeCount} routes, no VS Code default` : "no current network";
+  if (projection.networkIds.length > 0) {
+    return `${projection.networkIds.length} networks, ${projection.attachedTerminalCount} terminals, ${routeCount} routes`;
+  }
+
+  return "no current network";
 }
 
 /** Builds the root current-routing groups, including stale route scopes. */
@@ -1643,9 +1674,10 @@ function buildCurrentRoutingGroupItems(
   agentSnapshot: AgentSnapshot,
   getRouteRows: NetworkRouteRowsResolver,
 ): PortManagerTreeItem[] {
-  const networkIds = collectRoutingNetworkIds(snapshot, agentSnapshot);
+  const networkIds = projectCurrentRouting(snapshot, agentSnapshot).networkIds;
 
-  const knownNetworks = snapshot.networks.filter((network) => networkIds.has(network.id));
+  const currentNetworkIds = new Set(networkIds);
+  const knownNetworks = snapshot.networks.filter((network) => currentNetworkIds.has(network.id));
   const knownNetworkIds = new Set(knownNetworks.map((network) => network.id));
   const staleNetworkScopes = [...networkIds]
     .filter((networkId) => !knownNetworkIds.has(networkId))
@@ -1664,25 +1696,23 @@ function buildCurrentRoutingGroupItems(
   return groups.length > 0 ? groups : [new EmptyTreeItem("No current network", "Attach a terminal or choose VS Code default")];
 }
 
-/** Counts all displayed network-scoped route connections. */
+/** Counts only route rows included by the caller's display projection. */
 function countAllNetworkRouteConnections(
-  snapshot: NetworkSnapshot,
-  agentSnapshot: AgentSnapshot,
+  networkIds: readonly string[],
   getRouteRows: NetworkRouteRowsResolver,
 ): number {
-  return [...collectRoutingNetworkIds(snapshot, agentSnapshot)].reduce(
+  return networkIds.reduce(
     (total, networkId) => total + getRouteRows(networkId).length,
     0,
   );
 }
 
-/** Collects every known or stale network id that can affect current routing. */
-function collectRoutingNetworkIds(snapshot: NetworkSnapshot, agentSnapshot: AgentSnapshot): Set<string> {
+/** Compact active/current context projection shared by root routing rows and their summary. */
+export function projectCurrentRouting(
+  snapshot: NetworkSnapshot,
+  agentSnapshot: AgentSnapshot,
+): { readonly networkIds: readonly string[]; readonly attachedTerminalCount: number } {
   const networkIds = new Set<string>();
-
-  for (const network of snapshot.networks) {
-    networkIds.add(network.id);
-  }
 
   if (snapshot.vscodeWindowTerminalBinding !== undefined) {
     networkIds.add(snapshot.vscodeWindowTerminalBinding.networkId);
@@ -1695,24 +1725,33 @@ function collectRoutingNetworkIds(snapshot: NetworkSnapshot, agentSnapshot: Agen
   }
 
   for (const route of agentSnapshot.routes) {
-    if (route.networkId !== undefined) {
+    if (route.networkId !== undefined && route.status === "running") {
       networkIds.add(route.networkId);
     }
   }
 
   for (const binding of snapshot.hostAccessBindings) {
-    networkIds.add(binding.networkId);
+    if (binding.status === "active") {
+      networkIds.add(binding.networkId);
+    }
   }
 
   for (const exposure of snapshot.exposures) {
-    networkIds.add(exposure.networkId);
+    if (exposure.status === "active") {
+      networkIds.add(exposure.networkId);
+    }
   }
 
   for (const attachment of snapshot.composeAttachments) {
-    networkIds.add(attachment.networkId);
+    if (attachment.status === "attached") {
+      networkIds.add(attachment.networkId);
+    }
   }
 
-  return networkIds;
+  return {
+    networkIds: [...networkIds],
+    attachedTerminalCount: snapshot.attachments.filter((attachment) => attachment.status === "attached").length,
+  };
 }
 
 /** Describes a route group using current context before raw route count. */
@@ -1737,14 +1776,19 @@ function buildNetworkRouteConnectionRows(
   networkId: string,
   snapshot: NetworkSnapshot,
   agentSnapshot: AgentSnapshot,
+  scope: "network" | "current" = "network",
 ): readonly NetworkRouteConnection[] {
-  const daemonRoutes = agentSnapshot.routes.filter((route) => route.networkId === networkId);
+  const daemonRoutes = agentSnapshot.routes.filter(
+    (route) => route.networkId === networkId && (scope === "network" || route.status === "running"),
+  );
   const daemonProcessIds = new Set(
     daemonRoutes.map((route) => route.processId).filter((processId): processId is string => processId !== undefined),
   );
   const rows: NetworkRouteConnection[] = daemonRoutes.map(buildDaemonRouteConnection);
 
-  for (const attachment of snapshot.composeAttachments.filter((item) => item.networkId === networkId)) {
+  for (const attachment of snapshot.composeAttachments.filter(
+    (item) => item.networkId === networkId && (scope === "network" || item.status === "attached"),
+  )) {
     for (const port of attachment.ports) {
       if (
         (port.processId !== undefined && daemonProcessIds.has(port.processId)) ||
@@ -1762,11 +1806,15 @@ function buildNetworkRouteConnectionRows(
     }
   }
 
-  for (const binding of snapshot.hostAccessBindings.filter((item) => item.networkId === networkId)) {
+  for (const binding of snapshot.hostAccessBindings.filter(
+    (item) => item.networkId === networkId && (scope === "network" || item.status === "active"),
+  )) {
     rows.push(buildHostAccessRouteConnection(binding));
   }
 
-  for (const exposure of snapshot.exposures.filter((item) => item.networkId === networkId)) {
+  for (const exposure of snapshot.exposures.filter(
+    (item) => item.networkId === networkId && (scope === "network" || item.status === "active"),
+  )) {
     rows.push(buildHostExposureRouteConnection(exposure));
   }
 
@@ -2023,16 +2071,17 @@ function buildNetworkDescription(
   routeCount: number,
   isCurrentWindowNetwork: boolean,
 ): string {
+  const state = network.status === "error" ? "Error" : isCurrentWindowNetwork ? "Current" : network.status === "running" ? "Ready" : "Stopped";
   const details = [
-    isCurrentWindowNetwork ? "current" : undefined,
-    routeCount > 0 ? `${routeCount} routes` : undefined,
-    attachmentCount > 0 ? `${attachmentCount} terminals` : undefined,
-    exposureCount > 0 ? `${exposureCount} bindings` : undefined,
+    state,
+    routeCount > 0 ? `${routeCount} ${routeCount === 1 ? "route" : "routes"}` : undefined,
+    attachmentCount > 0 ? `${attachmentCount} ${attachmentCount === 1 ? "terminal" : "terminals"}` : undefined,
+    exposureCount > 0 ? `${exposureCount} ${exposureCount === 1 ? "binding" : "bindings"}` : undefined,
     hostAccessCount > 0 ? `${hostAccessCount} host access` : undefined,
     composeCount > 0 ? `${composeCount} compose` : undefined,
   ].filter((item): item is string => item !== undefined);
 
-  return `${network.runtimeKind} ${network.status}${details.length > 0 ? `, ${details.join(", ")}` : ""}`;
+  return details.join(", ");
 }
 
 /** Builds tooltip details for one logical network. */

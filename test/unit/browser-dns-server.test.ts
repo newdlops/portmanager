@@ -116,6 +116,8 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(networkServiceSource.includes("isBrowserDnsLoopbackAliasConfigured"), true);
   assert.equal(networkServiceSource.includes("ensureBrowserDnsLoopbackAliasesReady"), true);
   assert.equal(networkServiceSource.includes("loopbackAliasConfigured"), true);
+  assert.equal(networkServiceSource.includes("responseRewriteLoopbackHost: loopbackAddressForNetwork(process.networkId)"), true);
+  assert.equal(networkServiceSource.includes("responseRewriteLoopbackHost: loopbackAddressForNetwork(networkId)"), true);
   assert.equal(networkServiceSource.includes("secureHostname"), true);
   assert.equal(networkServiceSource.includes("${hostname}.localhost"), false);
   const publicHostStart = networkServiceSource.indexOf("function browserPublicHostForNetwork");

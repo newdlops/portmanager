@@ -142,7 +142,7 @@ test("keeps Vite-facing requests on localhost while rewriting localhost response
   }
 });
 
-test("rewrites the network loopback IP the dev server binds to into the public alias", () => {
+test("rewrites the routed network loopback IP into the public alias without using the browser listener address", () => {
   // The hook rewrites the server's bind to the network loopback (127.96.x), so
   // apps that self-reference their bound socket (Vite HMR, server.address())
   // emit that IP. The localhost-only patterns miss it; it must map to the alias.
@@ -150,7 +150,8 @@ test("rewrites the network loopback IP the dev server binds to into the public a
     id: browserNetworkProxyEndpointId("network-a5c1b2c6", 3004),
     networkId: "network-a5c1b2c6",
     logicalPort: 3004,
-    listenHost: "127.96.185.16",
+    listenHost: "127.112.185.16",
+    responseRewriteLoopbackHost: "127.96.185.16",
     listenPorts: [3004],
     listenPort: 3004,
     publicHost: "production1",
@@ -160,6 +161,7 @@ test("rewrites the network loopback IP the dev server binds to into the public a
     '<a href="http://127.96.185.16:3004/dashboard">dashboard</a>',
     '  const socket = "ws://127.96.185.16:3004/@vite/client";',
     '  const asset = "//127.96.185.16:3004/src/main.ts";',
+    '<a href="http://127.96.185.17:3004/other-network">other network</a>',
     '<a href="http://localhost:3004/login">login</a>', // localhost still rewritten (regression)
   ].join("\n");
 
@@ -170,6 +172,60 @@ test("rewrites the network loopback IP the dev server binds to into the public a
   assert.match(rewritten, /\/\/production1:3004\/src\/main\.ts/);
   assert.match(rewritten, /https:\/\/production1:3004\/login/);
   assert.doesNotMatch(rewritten, /127\.96\.185\.16/);
+  assert.match(rewritten, /http:\/\/127\.96\.185\.17:3004\/other-network/);
+});
+
+test("rewrites portless localhost and routed-loopback redirect locations to the active DNS public origin", async () => {
+  let requestCount = 0;
+  const upstream = http.createServer((_request, response) => {
+    requestCount += 1;
+    response.writeHead(302, {
+      location:
+        requestCount === 1
+          ? "http://localhost/oauth/callback"
+          : "http://127.96.185.16:3004/oauth/complete",
+    });
+    response.end("redirect");
+  });
+  await listen(upstream, 0, "127.0.0.1");
+
+  const proxyPort = await getAvailablePort();
+  const proxy = new BrowserNetworkProxyManager({
+    resolve: () => ({ host: "127.0.0.1", port: getServerPort(upstream) }),
+  });
+
+  try {
+    const activeEndpoint = await proxy.ensure(
+      createEndpoint({
+        // Unit tests bind a real local listener; the routed address remains
+        // separate response metadata and is not used for the listener.
+        listenHost: "127.0.0.1",
+        responseRewriteLoopbackHost: "127.96.185.16",
+        publicHost: "alpha1",
+        publicProtocol: "https",
+        listenPorts: [proxyPort],
+      }),
+    );
+    assert.ok(activeEndpoint);
+
+    const publicOrigin = `https://alpha1:${activeEndpoint.listenPort}`;
+    const portlessRedirect = await requestHttp({
+      host: "127.0.0.1",
+      port: activeEndpoint.listenPort,
+      path: "/login",
+    });
+    const routedRedirect = await requestHttp({
+      host: "127.0.0.1",
+      port: activeEndpoint.listenPort,
+      path: "/complete",
+    });
+
+    assert.equal(portlessRedirect.headers.location, `${publicOrigin}/oauth/callback`);
+    assert.equal(routedRedirect.headers.location, `${publicOrigin}/oauth/complete`);
+  } finally {
+    await proxy.dispose();
+    await closeServer(upstream);
+  }
 });
 
 test("uses a fallback browser port when the logical port is already occupied", async () => {

@@ -2,6 +2,40 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import test from "node:test";
+import type { AgentSnapshot, LogicalNetwork, NetworkSnapshot } from "../../src/shared/types";
+
+/** Loads the compiled tree with the minimal VS Code item primitives needed for fixture-level UI output tests. */
+function loadSidebarTreeForFixtureTests(): typeof import("../../src/ui/sidebar/port-manager-tree") {
+  const moduleLoader = require("node:module") as {
+    _load(request: string, parent: NodeModule | undefined, isMain: boolean): unknown;
+  };
+  const originalLoad = moduleLoader._load;
+  class TreeItem {
+    constructor(readonly label: string, readonly collapsibleState: number) {}
+  }
+  class MarkdownString {
+    isTrusted: boolean | undefined;
+    appendMarkdown(_value: string): void {}
+  }
+
+  moduleLoader._load = (request, parent, isMain) =>
+    request === "vscode"
+      ? {
+          TreeItem,
+          MarkdownString,
+          ThemeIcon: class ThemeIcon {},
+          ThemeColor: class ThemeColor {},
+          TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
+          EventEmitter: class EventEmitter {},
+        }
+      : originalLoad(request, parent, isMain);
+
+  try {
+    return require(path.resolve(__dirname, "../../src/ui/sidebar/port-manager-tree.js")) as typeof import("../../src/ui/sidebar/port-manager-tree");
+  } finally {
+    moduleLoader._load = originalLoad;
+  }
+}
 
 test("sidebar root stays focused on networks, services, and diagnostics", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/ui/sidebar/port-manager-tree.ts");
@@ -78,7 +112,7 @@ test("diagnostics exposes stale routing repair and recent activity", () => {
   );
 });
 
-test("non-owner windows show owner status and disable owner actions", () => {
+test("non-owner windows show ownership transfer guidance while keeping actions actionable", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/ui/sidebar/port-manager-tree.ts");
   const activatePath = path.resolve(__dirname, "../../../src/extension/activate.ts");
   const commandsPath = path.resolve(__dirname, "../../../src/extension/commands.ts");
@@ -134,8 +168,8 @@ test("non-owner windows show owner status and disable owner actions", () => {
   assert.equal(activateSource.includes('snapshot.controlPlane?.role === "owner"'), true);
   assert.equal(source.includes("buildOwnerActionAvailability(snapshot.controlPlane)"), true);
   assert.equal(source.includes('this.contextValue = availability.enabled ? "action" : "action.disabled";'), true);
-  assert.equal(source.includes("availability.enabled ? undefined : new vscode.ThemeColor(\"disabledForeground\")"), true);
-  assert.equal(source.includes("False renders the row as owner-scoped while the command wrapper acquires ownership."), true);
+  assert.equal(source.includes('this.description = [description, availability.ownerTransferNote].filter(Boolean).join(" - ");'), true);
+  assert.equal(source.includes("Owner-scoped commands stay actionable because their command wrapper acquires ownership."), true);
   assert.equal(source.includes("function buildOwnerTakeoverCommand"), false);
   assert.equal(source.includes("formatOwnerOnlyActionReason(controlPlane)"), true);
   assert.equal(source.includes("buildOwnerUiActionRows(snapshot.controlPlane)"), true);
@@ -209,10 +243,97 @@ test("sidebar shows current network and route destinations", () => {
   assert.equal(source.includes('"Current Routing"'), true);
   assert.equal(source.includes("class NetworkRoutingGroupTreeItem"), true);
   assert.equal(source.includes("class NetworkRouteConnectionTreeItem"), true);
-  assert.equal(source.includes("formatCurrentRoutingSummary(snapshot, agentSnapshot, getRouteRows)"), true);
+  assert.equal(source.includes("formatCurrentRoutingSummary(snapshot, agentSnapshot, getCurrentRouteRows)"), true);
   assert.equal(source.includes("getRouteRows(network.id).length"), true);
+  assert.equal(source.includes("Compact active/current context projection"), true);
   assert.equal(source.includes("Current VS Code Terminal Network"), true);
   assert.equal(networkServiceSource.includes("getAgentSnapshot(): AgentSnapshot"), true);
+});
+
+test("current routing projection excludes inactive lifecycle rows and summarizes active terminal routing", () => {
+  const sidebar = loadSidebarTreeForFixtureTests();
+  const networks = [
+    { id: "terminal", name: "Terminal network", status: "running", runtimeKind: "proxy", createdAt: "2026-07-29T00:00:00.000Z" },
+    { id: "route", name: "Route network", status: "running", runtimeKind: "proxy", createdAt: "2026-07-29T00:00:00.000Z" },
+    { id: "host", name: "Host network", status: "running", runtimeKind: "proxy", createdAt: "2026-07-29T00:00:00.000Z" },
+    { id: "exposure", name: "Exposure network", status: "running", runtimeKind: "proxy", createdAt: "2026-07-29T00:00:00.000Z" },
+    { id: "compose", name: "Compose network", status: "running", runtimeKind: "proxy", createdAt: "2026-07-29T00:00:00.000Z" },
+  ] as const satisfies readonly LogicalNetwork[];
+  const snapshot = {
+    networks,
+    attachments: [
+      { id: "attached", networkId: "terminal", status: "attached" },
+      { id: "detached", networkId: "inactive-terminal", status: "detached" },
+      { id: "failed", networkId: "inactive-terminal-error", status: "error" },
+    ],
+    hostAccessBindings: [
+      { id: "active-host", networkId: "host", status: "active" },
+      { id: "failed-host", networkId: "inactive-host-error", status: "error" },
+    ],
+    exposures: [
+      { id: "active-exposure", networkId: "exposure", status: "active" },
+      { id: "stopped-exposure", networkId: "inactive-exposure", status: "stopped" },
+      { id: "failed-exposure", networkId: "inactive-exposure-error", status: "error" },
+    ],
+    composeAttachments: [
+      { id: "attached-compose", networkId: "compose", status: "attached" },
+      { id: "detached-compose", networkId: "inactive-compose", status: "detached" },
+      { id: "failed-compose", networkId: "inactive-compose-error", status: "error" },
+    ],
+  } as unknown as NetworkSnapshot;
+  const agentSnapshot = {
+    routes: [
+      { networkId: "route", status: "running" },
+      { networkId: "inactive-route", status: "stopped" },
+      { networkId: "inactive-route-error", status: "error" },
+    ],
+  } as unknown as AgentSnapshot;
+  const projection = sidebar.projectCurrentRouting(snapshot, agentSnapshot);
+
+  assert.deepEqual(projection.networkIds, ["terminal", "route", "host", "exposure", "compose"]);
+  assert.equal(projection.attachedTerminalCount, 1);
+  assert.equal(
+    sidebar.formatCurrentRoutingSummary(snapshot, agentSnapshot, (networkId) =>
+      networkId === "terminal" ? ([{ id: "route" }] as never) : [],
+    ),
+    "5 networks, 1 terminals, 1 routes",
+  );
+
+  const terminalOnlySnapshot = {
+    ...snapshot,
+    hostAccessBindings: [],
+    exposures: [],
+    composeAttachments: [],
+  } as NetworkSnapshot;
+  const terminalOnlyAgent = { ...agentSnapshot, routes: [] } as AgentSnapshot;
+  assert.equal(
+    sidebar.formatCurrentRoutingSummary(terminalOnlySnapshot, terminalOnlyAgent, (networkId) =>
+      networkId === "terminal" ? ([{ id: "route" }] as never) : [],
+    ),
+    "Terminal -> Terminal network, 1 routes",
+  );
+});
+
+test("network descriptions lead with state and preserve singular counts", () => {
+  const sidebar = loadSidebarTreeForFixtureTests();
+  const network = {
+    id: "ready-network",
+    name: "Ready network",
+    status: "running",
+    runtimeKind: "proxy",
+    createdAt: "2026-07-29T00:00:00.000Z",
+  } as LogicalNetwork;
+  const item = new sidebar.LogicalNetworkTreeItem(
+    network,
+    [{ networkId: network.id }] as never,
+    [{ networkId: network.id }] as never,
+    [],
+    [],
+    1,
+  );
+
+  assert.equal(item.description, "Ready, 1 route, 1 terminal, 1 binding");
+  assert.equal(item.description?.includes("running"), false);
 });
 
 test("tree refreshes share one render generation and defer platform diagnostics", () => {
@@ -246,16 +367,19 @@ test("tree refreshes share one render generation and defer platform diagnostics"
   assert.equal(daemonCaseBody.includes("this.getBrowserDnsStatus(generation)"), true);
 });
 
-test("network rows show state first and keep actions grouped", () => {
+test("network rows show state first and keep the primary connect flow expanded", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/ui/sidebar/port-manager-tree.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
 
   assert.equal(source.includes("class NetworkActionGroupTreeItem"), true);
-  assert.equal(source.includes('"Quick Actions"'), true);
+  assert.equal(source.includes('"Connect"'), true);
   assert.equal(source.includes('"Advanced"'), true);
   assert.equal(source.includes('"Attach Active Terminal"'), true);
   assert.equal(source.includes('"Attach Terminal"'), true);
-  assert.equal(source.includes('"Use Quick Actions"'), true);
+  assert.equal(source.includes('"Ready to connect"'), true);
+  assert.equal(source.includes('"Create Network"'), true);
+  assert.equal(source.includes('kind === "quick" ? vscode.TreeItemCollapsibleState.Expanded'), true);
+  assert.equal(source.includes('vscode.TreeItemCollapsibleState.Collapsed,'), true);
 });
 
 test("tree action arguments resolve wrapped logical networks", () => {
@@ -381,6 +505,27 @@ test("view title toolbar exposes only primary actions", () => {
         item.command === "portManager.openOwnerUi" && item.when?.includes("!portManager.isControlPlaneOwner"),
     ),
     true,
+  );
+});
+
+test("network menu exposes only attach-active as the inline action", () => {
+  const packagePath = path.resolve(__dirname, "../../../package.json");
+  const manifest = JSON.parse(fs.readFileSync(packagePath, "utf8")) as {
+    contributes?: { menus?: { "view/item/context"?: Array<{ command: string; when?: string; group?: string }> } };
+  };
+  const networkItems = (manifest.contributes?.menus?.["view/item/context"] ?? []).filter((item) =>
+    item.when?.includes("viewItem == logicalNetwork"),
+  );
+
+  assert.deepEqual(
+    networkItems.filter((item) => item.group?.startsWith("inline")),
+    [
+      {
+        command: "portManager.attachActiveTerminalToNetwork",
+        when: "view == portManager.processes && viewItem == logicalNetwork",
+        group: "inline@1",
+      },
+    ],
   );
 });
 

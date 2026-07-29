@@ -9765,7 +9765,13 @@ function buildBrowserProxyEndpoint(
     networkId: process.networkId,
     logicalPort: process.requestedPort,
     listenHost: browserLoopbackAddressForNetwork(process.networkId),
-    ...(publicHost === undefined ? {} : { publicHost }),
+    ...(publicHost === undefined
+      ? {}
+      : {
+          publicHost,
+          // Browser DNS aliases and hooked server binds occupy separate loopback bands.
+          responseRewriteLoopbackHost: loopbackAddressForNetwork(process.networkId),
+        }),
     publicProtocol,
     listenPorts,
   };
@@ -9796,7 +9802,13 @@ function buildBrowserProxyEndpointFor(
     networkId,
     logicalPort,
     listenHost: browserLoopbackAddressForNetwork(networkId),
-    ...(publicHost === undefined ? {} : { publicHost }),
+    ...(publicHost === undefined
+      ? {}
+      : {
+          publicHost,
+          // Preserve the routed alias explicitly; it must not be inferred from listenHost.
+          responseRewriteLoopbackHost: loopbackAddressForNetwork(networkId),
+        }),
     publicProtocol,
     listenPorts,
   };

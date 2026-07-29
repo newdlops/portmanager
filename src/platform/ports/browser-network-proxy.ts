@@ -15,6 +15,12 @@ export interface BrowserNetworkProxyEndpoint {
   readonly listenHost: string;
   /** Browser-facing hostname that resolves to listenHost when local DNS is configured. */
   readonly publicHost?: string;
+  /**
+   * Routed network loopback whose self-referential response URLs must return to
+   * this endpoint's browser DNS alias. This intentionally differs from
+   * listenHost: browser and routed loopback aliases use separate address bands.
+   */
+  readonly responseRewriteLoopbackHost?: string;
   /** Browser-facing protocol. HTTPS is used when the extension owns a trusted dev certificate. */
   readonly publicProtocol?: "http" | "https";
   /** Ports tried in order; the logical port is preferred when it is not already occupied. */
@@ -160,9 +166,9 @@ const RESPONSE_ORIGIN_REWRITE_HEADER_NAMES = new Set([
   "content-security-policy-report-only",
 ]);
 const ABSOLUTE_LOCALHOST_ORIGIN_PATTERN =
-  /\b(https?|wss?):\/\/(localhost|127\.0\.0\.1|\[::1\]):(\d{1,5})(?=\/|[?#"'`\s<);]|$)/gi;
+  /\b(https?|wss?):\/\/(localhost|127\.0\.0\.1|\[::1\])(?::(\d{1,5}))?(?=\/|[?#"'`\s<);]|$)/gi;
 const PROTOCOL_RELATIVE_LOCALHOST_ORIGIN_PATTERN =
-  /(^|[^:])\/\/(localhost|127\.0\.0\.1|\[::1\]):(\d{1,5})(?=\/|[?#"'`\s<);]|$)/gi;
+  /(^|[^:])\/\/(localhost|127\.0\.0\.1|\[::1\])(?::(\d{1,5}))?(?=\/|[?#"'`\s<);]|$)/gi;
 
 /**
  * Development-only browser isolation proxy.
@@ -657,6 +663,7 @@ function isEndpointCurrent(
     activeEndpoint.logicalPort === desiredEndpoint.logicalPort &&
     activeEndpoint.listenHost === desiredEndpoint.listenHost &&
     activeEndpoint.publicHost === desiredEndpoint.publicHost &&
+    activeEndpoint.responseRewriteLoopbackHost === desiredEndpoint.responseRewriteLoopbackHost &&
     (activeEndpoint.publicProtocol ?? "http") === (desiredEndpoint.publicProtocol ?? "http") &&
     desiredEndpoint.listenPorts.includes(activeEndpoint.listenPort)
   );
@@ -810,13 +817,13 @@ function rewriteLocalhostOrigins(value: string, metadata: BrowserNetworkProxyEnd
 
   const absoluteRewritten = value.replace(
     ABSOLUTE_LOCALHOST_ORIGIN_PATTERN,
-    (_match, protocol: string, _host: string, portText: string) =>
+    (_match, protocol: string, _host: string, portText: string | undefined) =>
       `${publicProtocolForLocalhostRewrite(protocol, metadata)}://${metadata.publicHost}:${publicPortForLocalhostRewrite(portText, metadata)}`,
   );
 
   const protocolRewritten = absoluteRewritten.replace(
     PROTOCOL_RELATIVE_LOCALHOST_ORIGIN_PATTERN,
-    (match, prefix: string, _host: string, portText: string) => {
+    (match, prefix: string, _host: string, portText: string | undefined) => {
       const separator = match.startsWith("//") ? "" : prefix;
       return `${separator}//${metadata.publicHost}:${publicPortForLocalhostRewrite(portText, metadata)}`;
     },
@@ -839,16 +846,16 @@ function rewriteUpstreamLoopbackOrigins(value: string, metadata: BrowserNetworkP
 
   const escaped = escapeRegExpLiteral(host);
   const boundary = `(?=/|[?#"'\`\\s<);]|$)`;
-  const absolute = new RegExp(`\\b(https?|wss?):\\/\\/${escaped}:(\\d{1,5})${boundary}`, "gi");
-  const protocolRelative = new RegExp(`(^|[^:])\\/\\/${escaped}:(\\d{1,5})${boundary}`, "gi");
+  const absolute = new RegExp(`\\b(https?|wss?):\\/\\/${escaped}(?::(\\d{1,5}))?${boundary}`, "gi");
+  const protocolRelative = new RegExp(`(^|[^:])\\/\\/${escaped}(?::(\\d{1,5}))?${boundary}`, "gi");
 
   const absoluteRewritten = value.replace(
     absolute,
-    (_match, protocol: string, portText: string) =>
+    (_match, protocol: string, portText: string | undefined) =>
       `${publicProtocolForLocalhostRewrite(protocol, metadata)}://${metadata.publicHost}:${publicPortForLocalhostRewrite(portText, metadata)}`,
   );
 
-  return absoluteRewritten.replace(protocolRelative, (match, prefix: string, portText: string) => {
+  return absoluteRewritten.replace(protocolRelative, (match, prefix: string, portText: string | undefined) => {
     const separator = match.startsWith("//") ? "" : prefix;
     return `${separator}//${metadata.publicHost}:${publicPortForLocalhostRewrite(portText, metadata)}`;
   });
@@ -870,7 +877,10 @@ function publicProtocolForLocalhostRewrite(
   return metadata.publicProtocol;
 }
 
-function publicPortForLocalhostRewrite(portText: string, metadata: BrowserNetworkProxyEndpointMetadata): number {
+function publicPortForLocalhostRewrite(portText: string | undefined, metadata: BrowserNetworkProxyEndpointMetadata): number {
+  if (portText === undefined) {
+    return metadata.publicPort;
+  }
   const port = Number(portText);
   return port === metadata.logicalPort ? metadata.publicPort : port;
 }
@@ -923,7 +933,7 @@ function buildEndpointMetadata(endpoint: ActiveBrowserNetworkProxyEndpoint): Bro
   const publicOrigin = `${publicProtocol}://${publicHost}:${endpoint.listenPort}`;
   const upstreamHostHeader = `${LOCALHOST_UPSTREAM_HOST}:${endpoint.logicalPort}`;
   const upstreamOrigin = `http://${upstreamHostHeader}`;
-  const upstreamLoopbackHost = normalizeUpstreamLoopbackHost(endpoint.listenHost);
+  const upstreamLoopbackHost = normalizeUpstreamLoopbackHost(endpoint.responseRewriteLoopbackHost);
 
   return {
     publicOrigin,
@@ -982,8 +992,8 @@ function buildUpstreamOrigins(logicalPort: number, loopbackHost?: string): reado
  * distinct address, not a plain localhost variant already handled by the
  * localhost rewrite patterns. Returned undefined for localhost/127.0.0.1/::1.
  */
-function normalizeUpstreamLoopbackHost(listenHost: string | undefined): string | undefined {
-  const host = (listenHost ?? "").trim();
+function normalizeUpstreamLoopbackHost(responseRewriteLoopbackHost: string | undefined): string | undefined {
+  const host = (responseRewriteLoopbackHost ?? "").trim();
   if (host === "" || host === LOCALHOST_UPSTREAM_HOST || host === "127.0.0.1" || host === "::1" || host === "[::1]") {
     return undefined;
   }
