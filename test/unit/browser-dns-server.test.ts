@@ -51,6 +51,23 @@ test("replaces stale A records when browser aliases are synced again", async () 
   }
 });
 
+test("shares concurrent startup and preserves records after a closed socket restarts", async () => {
+  const server = new BrowserDnsServer({ port: 0 });
+  await Promise.all([server.start(), server.start()]);
+  server.sync([{ hostname: "alpha1", address: "127.112.19.42" }]);
+  server.dispose();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(server.isRunning(), false);
+
+  await server.start();
+  try {
+    const response = await queryDns(server.getPort(), buildQuery("alpha1"));
+    assert.deepEqual([...response.subarray(response.length - 4)], [127, 112, 19, 42]);
+  } finally {
+    server.dispose();
+  }
+});
+
 test("returns NXDOMAIN for unknown browser aliases", async () => {
   const server = new BrowserDnsServer({ port: 0 });
   await server.start();

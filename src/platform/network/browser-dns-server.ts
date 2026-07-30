@@ -44,6 +44,9 @@ export class BrowserDnsServer {
   /** UDP socket that answers local resolver queries. */
   private socket: dgram.Socket | undefined;
 
+  /** Shares one bind attempt so concurrent reconciliation cannot race sockets. */
+  private startInFlight: Promise<void> | undefined;
+
   /** Current hostname-to-loopback table, normalized to lower case. */
   private readonly records = new Map<string, string>();
 
@@ -58,6 +61,22 @@ export class BrowserDnsServer {
       return;
     }
 
+    if (this.startInFlight !== undefined) {
+      return this.startInFlight;
+    }
+
+    this.startInFlight = this.startExclusive().finally(() => {
+      this.startInFlight = undefined;
+    });
+    return this.startInFlight;
+  }
+
+  /** Owns a single socket lifecycle; records deliberately survive restarts. */
+  private async startExclusive(): Promise<void> {
+    if (this.socket !== undefined) {
+      return;
+    }
+
     const socket = dgram.createSocket("udp4");
     socket.on("message", (message, remote) => {
       const response = this.buildResponse(message);
@@ -67,6 +86,13 @@ export class BrowserDnsServer {
     });
     socket.on("error", (error) => {
       this.lastError = error;
+    });
+    socket.on("close", () => {
+      // Runtime errors do not necessarily close UDP sockets. Only close means
+      // future owner reconciliation must bind a replacement listener.
+      if (this.socket === socket) {
+        this.socket = undefined;
+      }
     });
 
     try {
@@ -97,7 +123,7 @@ export class BrowserDnsServer {
 
   /** Returns true only when the UDP DNS server is accepting queries. */
   isRunning(): boolean {
-    return this.socket !== undefined && this.lastError === undefined;
+    return this.socket !== undefined;
   }
 
   /** Local UDP port used by generated resolver configuration. */
