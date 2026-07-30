@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { formatSidebarSummary } from "./sidebar-presentation";
 import type {
   AgentDaemonStatus,
   AgentSnapshot,
@@ -53,8 +54,16 @@ export interface PortManagerNetworkTreeSource {
   onDidChange(listener: () => void): DisposableLike;
 }
 
-type TreeSectionKind = "current" | "networks" | "containers" | "daemon";
+type TreeSectionKind = "overview" | "networks" | "services" | "system";
 type NetworkActionGroupKind = "quick" | "advanced";
+type SidebarGroupKind =
+  | "network.connections"
+  | "network.portMappings"
+  | "system.health"
+  | "system.browserDns"
+  | "system.runtime"
+  | "system.activity"
+  | "system.maintenance";
 const TERMINAL_WINDOW_MIME = "application/vnd.newdlops.portmanager.terminal-window";
 const TREE_REFRESH_DEBOUNCE_MS = 16;
 
@@ -127,9 +136,9 @@ type PortManagerTreeItem =
   | TreeSectionItem
   | NetworkRoutingGroupTreeItem
   | NetworkRouteConnectionTreeItem
-  | RoutingTimelineGroupTreeItem
   | RoutingTimelineTreeItem
   | NetworkActionGroupTreeItem
+  | SidebarGroupTreeItem
   | ActionTreeItem
   | PlannedFeatureTreeItem
   | LogicalNetworkTreeItem
@@ -318,29 +327,31 @@ export class PortManagerTreeProvider
     if (element === undefined) {
       return [
         new TreeSectionItem(
-          "current",
-          "Current Routing",
+          "overview",
+          "Overview",
           formatCurrentRoutingSummary(snapshot, agentSnapshot, getCurrentRouteRows),
           "target",
           vscode.TreeItemCollapsibleState.Collapsed,
         ),
         new TreeSectionItem(
           "networks",
-          "Logical Networks",
-          `${snapshot.networks.length} networks`,
+          "Networks",
+          snapshot.networks.length === 0
+            ? "No networks"
+            : formatSidebarSummary("Available", [{ count: snapshot.networks.length, singular: "network" }]),
           "vm",
           vscode.TreeItemCollapsibleState.Expanded,
         ),
         new TreeSectionItem(
-          "containers",
-          "Discovered Services",
+          "services",
+          "Services",
           formatContainerSectionDescription(snapshot.containerServiceCandidates),
           "server-environment",
           vscode.TreeItemCollapsibleState.Collapsed,
         ),
         new TreeSectionItem(
-          "daemon",
-          "Diagnostics",
+          "system",
+          "System",
           formatDiagnosticsSummary(daemon, snapshot),
           daemon.restartRequired ? "warning" : "pulse",
           vscode.TreeItemCollapsibleState.Collapsed,
@@ -357,38 +368,61 @@ export class PortManagerTreeProvider
         ? snapshot.vscodeWindowTerminalBinding
         : undefined;
       const routeRows = getRouteRows(element.network.id);
-      const stateRows = [
-        ...(routeRows.length > 0
-          ? [
-              new NetworkRoutingGroupTreeItem(
-                element.network,
-                "Routes",
-                formatNetworkRouteGroupDescription(routeRows, attachments, windowTerminalBinding),
-                routeRows,
-                "network",
-              ),
-            ]
-          : []),
+      const connectionRows: PortManagerTreeItem[] = [
         ...(windowTerminalBinding !== undefined
           ? [new VscodeWindowTerminalBindingTreeItem(windowTerminalBinding, element.network)]
           : []),
         ...attachments.map((attachment) => new TerminalAttachmentTreeItem(attachment)),
         ...composeAttachments.map((attachment) => new ComposeAttachmentTreeItem(attachment)),
+      ];
+      const portMappingRows: PortManagerTreeItem[] = [
         ...exposures.map((exposure) => new HostPortExposureTreeItem(exposure, [element.network])),
         ...hostAccessBindings.map((binding) => new HostAccessBindingTreeItem(binding)),
       ];
 
       return [
-        ...(stateRows.length > 0 ? stateRows : [new EmptyTreeItem("Ready to connect", "Choose an action below")]),
+        new NetworkRoutingGroupTreeItem(
+          element.network,
+          "Routes",
+          formatNetworkRouteGroupDescription(routeRows, attachments, windowTerminalBinding),
+          routeRows,
+          "network",
+        ),
+        new SidebarGroupTreeItem(
+          "network.connections",
+          "Connections",
+          connectionRows.length === 0
+            ? "No connections"
+            : formatSidebarSummary("Connected", [{ count: connectionRows.length, singular: "connection" }]),
+          "plug",
+          connectionRows.length > 0 ? connectionRows : [new EmptyTreeItem("No connections", "Attach a terminal or service")],
+          element.network.id,
+        ),
+        new SidebarGroupTreeItem(
+          "network.portMappings",
+          "Port mappings",
+          portMappingRows.length === 0
+            ? "No mappings"
+            : formatSidebarSummary("Mapped", [{ count: portMappingRows.length, singular: "mapping" }]),
+          "references",
+          portMappingRows.length > 0 ? portMappingRows : [new EmptyTreeItem("No port mappings", "Add a host binding or host access")],
+          element.network.id,
+        ),
         new NetworkActionGroupTreeItem(
           element.network,
           "quick",
-          "Connect",
-          "Attach terminals, services, or scripts",
+          "Connect actions",
+          formatSidebarSummary("Available", [{ count: 5, singular: "action" }]),
           "plug",
           ownerAction,
         ),
-        new NetworkActionGroupTreeItem(element.network, "advanced", "Advanced", "Bindings, presets, cache", "tools"),
+        new NetworkActionGroupTreeItem(
+          element.network,
+          "advanced",
+          "Manage actions",
+          formatSidebarSummary("Available"),
+          "tools",
+        ),
       ];
     }
 
@@ -522,10 +556,8 @@ export class PortManagerTreeProvider
         : [new EmptyTreeItem("No active routes", "Start or attach a service")];
     }
 
-    if (element instanceof RoutingTimelineGroupTreeItem) {
-      return element.rows.length > 0
-        ? element.rows.map((row) => new RoutingTimelineTreeItem(row))
-        : [new EmptyTreeItem("No recent routing activity", "Attach a terminal or service")];
+    if (element instanceof SidebarGroupTreeItem) {
+      return [...element.children];
     }
 
     if (element instanceof TerminalWindowTreeItem) {
@@ -565,7 +597,7 @@ export class PortManagerTreeProvider
     }
 
     switch (element.kind) {
-      case "current":
+      case "overview":
         return buildCurrentRoutingGroupItems(snapshot, agentSnapshot, getCurrentRouteRows);
       case "networks":
         return [
@@ -590,35 +622,17 @@ export class PortManagerTreeProvider
                 ),
               ]),
         ];
-      case "containers":
+      case "services":
         return [
           ...(snapshot.containerServiceCandidates.length > 0
             ? buildContainerServiceTreeItems(snapshot.containerServiceCandidates, ownerAction)
             : [new EmptyTreeItem("No published services", "Start compose services")]),
         ];
-      case "daemon":
+      case "system":
         const browserDns = this.getBrowserDnsStatus(generation);
+        const systemGroups = buildSystemGroupItems(daemon, snapshot, agentSnapshot, browserDns, ownerAction);
         return [
-          ...(snapshot.vscodeWindowTerminalBinding !== undefined
-            ? [
-                new VscodeWindowTerminalBindingTreeItem(
-                  snapshot.vscodeWindowTerminalBinding,
-                  snapshot.networks.find((network) => network.id === snapshot.vscodeWindowTerminalBinding?.networkId),
-                ),
-              ]
-            : []),
-          ...snapshot.terminalWindows.map((window) => new TerminalWindowTreeItem(window)),
-          ...(snapshot.runtimes.some(isContainerLevelRuntime)
-            ? []
-            : [
-                new PlannedFeatureTreeItem(
-                  "No terminal isolation runtime",
-                  "Local proxy cannot attach terminal ports",
-                  "warning",
-                ),
-              ]),
-          ...snapshot.runtimes.map((runtime) => new RuntimeAdapterTreeItem(runtime)),
-          ...buildDaemonChildren(daemon, snapshot, agentSnapshot, browserDns, ownerAction),
+          ...systemGroups,
         ];
     }
   }
@@ -657,6 +671,7 @@ class ActionTreeItem extends vscode.TreeItem {
       title: label,
       arguments: argument === undefined ? [] : [argument],
     };
+    this.tooltip = new vscode.MarkdownString(description === undefined ? label : `${label}\n\n${description}`);
   }
 }
 
@@ -693,21 +708,6 @@ class NetworkRouteConnectionTreeItem extends vscode.TreeItem {
   }
 }
 
-/** Collapsible recent routing event group shown in Diagnostics. */
-class RoutingTimelineGroupTreeItem extends vscode.TreeItem {
-  readonly contextValue = "routingTimelineGroup";
-
-  constructor(readonly rows: readonly RoutingTimelineEntry[]) {
-    super("Recent Routing Activity", vscode.TreeItemCollapsibleState.Collapsed);
-    this.id = "routing-timeline";
-    this.description =
-      rows.length > 0
-        ? `${rows.length} recent change${rows.length === 1 ? "" : "s"}`
-        : "no recent changes";
-    this.iconPath = new vscode.ThemeIcon("history");
-  }
-}
-
 /** One recent network attach, binding, compose, or daemon route refresh row. */
 class RoutingTimelineTreeItem extends vscode.TreeItem {
   readonly contextValue = "routingTimeline";
@@ -733,13 +733,36 @@ class NetworkActionGroupTreeItem extends vscode.TreeItem {
     icon: string,
     availability: ActionAvailability = { enabled: true },
   ) {
-    super(
-      label,
-      kind === "quick" ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed,
-    );
+    super(label, vscode.TreeItemCollapsibleState.Collapsed);
     this.id = `network-action:${network.id}:${kind}`;
-    this.description = [description, availability.ownerTransferNote].filter(Boolean).join(" - ");
-    this.tooltip = availability.ownerTransferTooltip;
+    this.description = description;
+    this.tooltip = availability.ownerTransferTooltip ?? new vscode.MarkdownString(`${label}\n\n${description}`);
+    this.iconPath = new vscode.ThemeIcon(icon);
+  }
+}
+
+/**
+ * Inert category wrapper that keeps dense native tree branches scannable.
+ * Its children are prebuilt leaf items so commands, context values, and drag
+ * identity stay exactly with their original leaf implementations.
+ */
+class SidebarGroupTreeItem extends vscode.TreeItem {
+  readonly contextValue: string;
+
+  constructor(
+    readonly kind: SidebarGroupKind,
+    label: string,
+    description: string,
+    icon: string,
+    readonly children: readonly PortManagerTreeItem[],
+    networkId?: string,
+  ) {
+    super(label, vscode.TreeItemCollapsibleState.Collapsed);
+    // Network categories repeat per logical network, unlike the single System branch.
+    this.id = networkId === undefined ? `sidebar-group:${kind}` : `sidebar-group:${kind}:${networkId}`;
+    this.contextValue = `sidebarGroup.${kind}`;
+    this.description = description;
+    this.tooltip = new vscode.MarkdownString(`${label}\n\n${description}`);
     this.iconPath = new vscode.ThemeIcon(icon);
   }
 }
@@ -754,9 +777,18 @@ class TreeSectionItem extends vscode.TreeItem {
     collapsibleState: vscode.TreeItemCollapsibleState = vscode.TreeItemCollapsibleState.Expanded,
   ) {
     super(label, collapsibleState);
-    this.id = `section:${kind}`;
-    this.contextValue = `section.${kind}`;
+    // Labels/kinds evolved for scanability, but menu `when` clauses and saved
+    // expansion state still key off these long-lived section identities.
+    const legacyIdentity: Record<TreeSectionKind, "current" | "networks" | "containers" | "daemon"> = {
+      overview: "current",
+      networks: "networks",
+      services: "containers",
+      system: "daemon",
+    };
+    this.id = `section:${legacyIdentity[kind]}`;
+    this.contextValue = `section.${legacyIdentity[kind]}`;
     this.description = description;
+    this.tooltip = new vscode.MarkdownString(`${label}\n\n${description}`);
     this.iconPath = new vscode.ThemeIcon(icon);
   }
 }
@@ -768,6 +800,7 @@ class PlannedFeatureTreeItem extends vscode.TreeItem {
   constructor(label: string, description: string, icon: string) {
     super(label, vscode.TreeItemCollapsibleState.None);
     this.description = description;
+    this.tooltip = new vscode.MarkdownString(`${label}\n\n${description}`);
     this.iconPath = new vscode.ThemeIcon(icon);
   }
 }
@@ -1115,7 +1148,7 @@ class DaemonStatusTreeItem extends vscode.TreeItem {
     super(label, vscode.TreeItemCollapsibleState.None);
     this.description = description;
     this.iconPath = new vscode.ThemeIcon(icon);
-    this.tooltip = tooltip;
+    this.tooltip = tooltip ?? new vscode.MarkdownString(`${label}\n\n${description}`);
     this.command = command;
   }
 }
@@ -1172,37 +1205,20 @@ class EmptyTreeItem extends vscode.TreeItem {
   constructor(label: string, description: string) {
     super(label, vscode.TreeItemCollapsibleState.None);
     this.description = description;
+    this.tooltip = new vscode.MarkdownString(`${label}\n\n${description}`);
     this.iconPath = new vscode.ThemeIcon("debug-start");
   }
 }
 
-/** Builds child rows for the daemon accordion section. */
-function buildDaemonChildren(
+/** Builds the collapsed, presentation-only System categories without changing diagnostic leaves. */
+function buildSystemGroupItems(
   daemon: AgentDaemonStatus,
   snapshot: NetworkSnapshot,
   agentSnapshot: AgentSnapshot,
   browserDns: BrowserDnsResolverStatus,
   ownerAction: ActionAvailability,
 ): PortManagerTreeItem[] {
-  const children: PortManagerTreeItem[] = [
-    new ActionTreeItem(
-      "Fix Stale Routing",
-      "portManager.fixStaleRouting",
-      "debug-rerun",
-      "Converge daemon and routes",
-      undefined,
-      ownerAction,
-    ),
-    new ActionTreeItem(
-      "Clear Global Storage Files",
-      "portManager.clearGlobalStorageFiles",
-      "clear-all",
-      "Remove extension storage files",
-      undefined,
-      ownerAction,
-    ),
-    new RoutingTimelineGroupTreeItem(buildRoutingTimelineRows(snapshot, agentSnapshot)),
-    ...buildBrowserDnsDiagnosticRows(browserDns, ownerAction),
+  const healthRows: PortManagerTreeItem[] = [
     new DaemonStatusTreeItem(
       "Control Owner",
       formatControlPlaneRoleDescription(snapshot.controlPlane),
@@ -1231,10 +1247,61 @@ function buildDaemonChildren(
   ];
 
   if (daemon.errorMessage) {
-    children.push(new DaemonStatusTreeItem("Warning", daemon.errorMessage, "warning"));
+    healthRows.push(new DaemonStatusTreeItem("Warning", daemon.errorMessage, "warning"));
   }
 
-  return children;
+  const runtimeRows: PortManagerTreeItem[] = [
+    ...(snapshot.vscodeWindowTerminalBinding !== undefined
+      ? [
+          new VscodeWindowTerminalBindingTreeItem(
+            snapshot.vscodeWindowTerminalBinding,
+            snapshot.networks.find((network) => network.id === snapshot.vscodeWindowTerminalBinding?.networkId),
+          ),
+        ]
+      : []),
+    ...snapshot.terminalWindows.map((window) => new TerminalWindowTreeItem(window)),
+    ...(snapshot.runtimes.some(isContainerLevelRuntime)
+      ? []
+      : [
+          new PlannedFeatureTreeItem(
+            "No terminal isolation runtime",
+            "Local proxy cannot attach terminal ports",
+            "warning",
+          ),
+        ]),
+    ...snapshot.runtimes.map((runtime) => new RuntimeAdapterTreeItem(runtime)),
+  ];
+  const browserRows = buildBrowserDnsDiagnosticRows(browserDns, ownerAction);
+  const activityEntries = buildRoutingTimelineRows(snapshot, agentSnapshot);
+  const activityRows: PortManagerTreeItem[] = activityEntries.length > 0
+    ? activityEntries.map((row) => new RoutingTimelineTreeItem(row))
+    : [new EmptyTreeItem("No activity", "Attach a terminal or service")];
+  const maintenanceRows: PortManagerTreeItem[] = [
+    new ActionTreeItem(
+      "Fix Stale Routing",
+      "portManager.fixStaleRouting",
+      "debug-rerun",
+      "Converge daemon and routes",
+      undefined,
+      ownerAction,
+    ),
+    new ActionTreeItem(
+      "Clear Global Storage Files",
+      "portManager.clearGlobalStorageFiles",
+      "clear-all",
+      "Remove extension storage files",
+      undefined,
+      ownerAction,
+    ),
+  ];
+
+  return [
+    new SidebarGroupTreeItem("system.health", "Health", formatSidebarSummary(capitalizeForSidebar(daemon.status), [{ count: healthRows.length, singular: "detail" }]), "pulse", healthRows),
+    new SidebarGroupTreeItem("system.browserDns", "Browser access & DNS", formatBrowserDnsSummary(browserDns), "globe", browserRows),
+    new SidebarGroupTreeItem("system.runtime", "Runtime & terminal discovery", formatRuntimeDiscoverySummary(snapshot), "terminal", runtimeRows),
+    new SidebarGroupTreeItem("system.activity", "Recent activity", activityEntries.length === 0 ? "No activity" : formatSidebarSummary("Available", [{ count: activityEntries.length, singular: "event" }]), "history", activityRows),
+    new SidebarGroupTreeItem("system.maintenance", "Maintenance", formatSidebarSummary("Available", [{ count: maintenanceRows.length, singular: "action" }]), "tools", maintenanceRows),
+  ];
 }
 
 function buildOwnerUiActionRows(controlPlane: ControlPlaneStatus | undefined): PortManagerTreeItem[] {
@@ -1638,8 +1705,67 @@ function formatControlPlaneRoleDescription(controlPlane: ControlPlaneStatus | un
 
 /** One-line compact summary for the collapsed diagnostics section. */
 function formatDiagnosticsSummary(daemon: AgentDaemonStatus, snapshot: NetworkSnapshot): string {
-  const daemonSummary = daemon.restartRequired ? "daemon stale" : daemon.status;
-  return `${formatControlPlaneRoleDescription(snapshot.controlPlane)}, ${daemonSummary}, ${snapshot.terminalWindows.length} terminals, ${snapshot.runtimes.length} runtimes`;
+  const daemonSummary = daemon.restartRequired ? "Daemon stale" : capitalizeForSidebar(daemon.status);
+  return formatSidebarSummary(`${formatSystemControlPlaneSummary(snapshot.controlPlane)} · ${daemonSummary}`, [
+    { count: snapshot.terminalWindows.length, singular: "terminal" },
+    { count: snapshot.runtimes.length, singular: "runtime" },
+  ]);
+}
+
+/** Compact root-only control-plane wording avoids commas while detail rows retain full context. */
+function formatSystemControlPlaneSummary(controlPlane: ControlPlaneStatus | undefined): string {
+  if (controlPlane?.role === "owner") {
+    return `Owner pid ${controlPlane.currentPid}`;
+  }
+
+  if (controlPlane?.role === "worker") {
+    return `Worker · owner pid ${controlPlane.ownerPid ?? "unknown"}`;
+  }
+
+  if (controlPlane?.role === "unowned") {
+    return "No owner";
+  }
+
+  return "Owner unknown";
+}
+
+/** Uses text, rather than icon color, to make sidebar state legible at a glance. */
+function capitalizeForSidebar(value: string): string {
+  return value.length === 0 ? value : `${value[0].toUpperCase()}${value.slice(1)}`;
+}
+
+/** Summarizes DNS readiness with meaningful resolver, alias, and certificate state. */
+function formatBrowserDnsSummary(browserDns: BrowserDnsResolverStatus): string {
+  if (!browserDns.supported) {
+    return "Unsupported";
+  }
+
+  const state = browserDns.records.length === 0
+    ? "No aliases"
+    : browserDns.missingCount > 0
+      ? "Needs repair"
+      : browserDns.tlsStaleCount > 0
+        ? "TLS stale"
+        : browserDns.dnsRunning
+          ? "Ready"
+          : "DNS stopped";
+  return formatSidebarSummary(state, [
+    { count: browserDns.records.length, singular: "alias" },
+    { count: browserDns.missingCount, singular: "missing alias" },
+    { count: browserDns.tlsStaleCount, singular: "TLS stale alias" },
+  ]);
+}
+
+/** Summarizes actual terminal/runtime discovery rather than presentation placeholders. */
+function formatRuntimeDiscoverySummary(snapshot: NetworkSnapshot): string {
+  if (snapshot.terminalWindows.length === 0 && snapshot.runtimes.length === 0) {
+    return "No terminals or runtimes";
+  }
+
+  return formatSidebarSummary("Discovered", [
+    { count: snapshot.terminalWindows.length, singular: "terminal" },
+    { count: snapshot.runtimes.length, singular: "runtime" },
+  ]);
 }
 
 /** One-line current routing summary for the root section. */
@@ -1653,19 +1779,22 @@ export function formatCurrentRoutingSummary(
   const routeCount = countAllNetworkRouteConnections(projection.networkIds, getRouteRows);
 
   if (currentNetwork !== undefined) {
-    return `VS Code -> ${currentNetwork.name}, ${routeCount} routes`;
+    return formatSidebarSummary("VS Code routing", [{ count: routeCount, singular: "route" }]);
   }
 
   if (projection.attachedTerminalCount > 0 && projection.networkIds.length === 1) {
-    const terminalNetwork = snapshot.networks.find((network) => network.id === projection.networkIds[0]);
-    return `Terminal -> ${terminalNetwork?.name ?? projection.networkIds[0]}, ${routeCount} routes`;
+    return formatSidebarSummary("Terminal routing", [{ count: routeCount, singular: "route" }]);
   }
 
   if (projection.networkIds.length > 0) {
-    return `${projection.networkIds.length} networks, ${projection.attachedTerminalCount} terminals, ${routeCount} routes`;
+    return formatSidebarSummary("Active", [
+      { count: projection.networkIds.length, singular: "network" },
+      { count: projection.attachedTerminalCount, singular: "terminal" },
+      { count: routeCount, singular: "route" },
+    ]);
   }
 
-  return "no current network";
+  return formatSidebarSummary("No current network");
 }
 
 /** Builds the root current-routing groups, including stale route scopes. */
@@ -1760,15 +1889,14 @@ function formatNetworkRouteGroupDescription(
   attachments: readonly TerminalAttachment[],
   binding: VscodeWindowTerminalBinding | undefined,
 ): string {
-  const details = [
-    binding !== undefined ? "VS Code default" : undefined,
-    attachments.filter((attachment) => attachment.status === "attached").length > 0
-      ? `${attachments.filter((attachment) => attachment.status === "attached").length} terminals`
-      : undefined,
-    `${routeRows.length} route${routeRows.length === 1 ? "" : "s"}`,
-  ].filter((item): item is string => item !== undefined);
+  if (routeRows.length === 0 && binding === undefined) {
+    return "No routes";
+  }
 
-  return details.join(", ");
+  return formatSidebarSummary(binding !== undefined ? "VS Code default" : "Available", [
+    { count: attachments.filter((attachment) => attachment.status === "attached").length, singular: "terminal" },
+    { count: routeRows.length, singular: "route" },
+  ]);
 }
 
 /** Normalizes every route source for one network into display rows. */
@@ -2072,16 +2200,13 @@ function buildNetworkDescription(
   isCurrentWindowNetwork: boolean,
 ): string {
   const state = network.status === "error" ? "Error" : isCurrentWindowNetwork ? "Current" : network.status === "running" ? "Ready" : "Stopped";
-  const details = [
-    state,
-    routeCount > 0 ? `${routeCount} ${routeCount === 1 ? "route" : "routes"}` : undefined,
-    attachmentCount > 0 ? `${attachmentCount} ${attachmentCount === 1 ? "terminal" : "terminals"}` : undefined,
-    exposureCount > 0 ? `${exposureCount} ${exposureCount === 1 ? "binding" : "bindings"}` : undefined,
-    hostAccessCount > 0 ? `${hostAccessCount} host access` : undefined,
-    composeCount > 0 ? `${composeCount} compose` : undefined,
-  ].filter((item): item is string => item !== undefined);
-
-  return details.join(", ");
+  return formatSidebarSummary(state, [
+    { count: routeCount, singular: "route" },
+    { count: attachmentCount, singular: "terminal" },
+    { count: exposureCount, singular: "binding" },
+    { count: hostAccessCount, singular: "host access" },
+    { count: composeCount, singular: "compose attachment" },
+  ]);
 }
 
 /** Builds tooltip details for one logical network. */
@@ -2739,12 +2864,10 @@ function formatContainerSectionDescription(candidates: readonly ContainerService
       ),
   ).size;
   const rawContainerCount = candidates.filter((candidate) => candidate.composeProject === undefined).length;
-  const details = [
-    composeProjectCount > 0 ? `${composeProjectCount} compose` : undefined,
-    rawContainerCount > 0 ? `${rawContainerCount} containers` : undefined,
-  ].filter((item): item is string => item !== undefined);
-
-  return details.length === 0 ? "0 services" : details.join(", ");
+  return candidates.length === 0 ? "No services" : formatSidebarSummary("Available", [
+    { count: composeProjectCount, singular: "compose project" },
+    { count: rawContainerCount, singular: "container" },
+  ]);
 }
 
 /** Builds tooltip details for one runtime adapter. */

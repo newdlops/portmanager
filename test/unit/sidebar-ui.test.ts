@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import test from "node:test";
+import { formatSidebarSummary } from "../../src/ui/sidebar/sidebar-presentation";
 import type { AgentSnapshot, LogicalNetwork, NetworkSnapshot } from "../../src/shared/types";
 
 /** Loads the compiled tree with the minimal VS Code item primitives needed for fixture-level UI output tests. */
@@ -15,7 +16,13 @@ function loadSidebarTreeForFixtureTests(): typeof import("../../src/ui/sidebar/p
   }
   class MarkdownString {
     isTrusted: boolean | undefined;
-    appendMarkdown(_value: string): void {}
+    value: string;
+    constructor(value: string = "") {
+      this.value = value;
+    }
+    appendMarkdown(value: string): void {
+      this.value += value;
+    }
   }
 
   moduleLoader._load = (request, parent, isMain) =>
@@ -25,8 +32,15 @@ function loadSidebarTreeForFixtureTests(): typeof import("../../src/ui/sidebar/p
           MarkdownString,
           ThemeIcon: class ThemeIcon {},
           ThemeColor: class ThemeColor {},
+          DataTransferItem: class DataTransferItem {
+            constructor(readonly value: unknown) {}
+          },
           TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
-          EventEmitter: class EventEmitter {},
+          EventEmitter: class EventEmitter {
+            readonly event = () => undefined;
+            fire(): void {}
+            dispose(): void {}
+          },
         }
       : originalLoad(request, parent, isMain);
 
@@ -37,20 +51,40 @@ function loadSidebarTreeForFixtureTests(): typeof import("../../src/ui/sidebar/p
   }
 }
 
-test("sidebar root stays focused on networks, services, and diagnostics", () => {
+test("sidebar compact summaries use deterministic singular and plural grammar", () => {
+  assert.equal(formatSidebarSummary("Ready"), "Ready");
+  assert.equal(formatSidebarSummary("Ready", [{ count: 0, singular: "route" }]), "Ready");
+  assert.equal(formatSidebarSummary("Ready", [{ count: 1, singular: "route" }]), "Ready · 1 route");
+  assert.equal(
+    formatSidebarSummary("Ready", [
+      { count: 2, singular: "route" },
+      { count: 3, singular: "host access", plural: "host access entries" },
+    ]),
+    "Ready · 2 routes · 3 host access entries",
+  );
+});
+
+test("sidebar root has the required stable scan order", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/ui/sidebar/port-manager-tree.ts");
+  const packagePath = path.resolve(__dirname, "../../../package.json");
   const source = fs.readFileSync(sourcePath, "utf8");
+  const manifest = JSON.parse(fs.readFileSync(packagePath, "utf8")) as {
+    contributes?: { menus?: { "view/item/context"?: Array<{ when?: string }> } };
+  };
   const rootStart = source.indexOf("if (element === undefined) {");
   const rootEnd = source.indexOf("if (element instanceof LogicalNetworkTreeItem)", rootStart);
   const rootBody = source.slice(rootStart, rootEnd);
 
-  assert.equal(rootBody.includes('"Current Routing"'), true);
-  assert.equal(rootBody.includes('"Logical Networks"'), true);
-  assert.equal(rootBody.includes('"Discovered Services"'), true);
-  assert.equal(rootBody.includes('"Diagnostics"'), true);
+  assert.equal(rootBody.indexOf('"Overview"') < rootBody.indexOf('"Networks"'), true);
+  assert.equal(rootBody.indexOf('"Networks"') < rootBody.indexOf('"Services"'), true);
+  assert.equal(rootBody.indexOf('"Services"') < rootBody.indexOf('"System"'), true);
   assert.equal(rootBody.includes('"Terminal Windows"'), false);
   assert.equal(rootBody.includes('"Host Port Exposures"'), false);
   assert.equal(rootBody.includes('"Runtime Adapter"'), false);
+  const menuWhen = (manifest.contributes?.menus?.["view/item/context"] ?? []).map((item) => item.when ?? "").join("\n");
+  assert.equal(menuWhen.includes("viewItem == section.networks"), true);
+  assert.equal(menuWhen.includes("viewItem == section.containers"), true);
+  assert.equal(menuWhen.includes("viewItem == section.daemon"), true);
 });
 
 test("diagnostics exposes stale routing repair and recent activity", () => {
@@ -79,8 +113,8 @@ test("diagnostics exposes stale routing repair and recent activity", () => {
   assert.equal(source.includes('"Fix Stale Routing"'), true);
   assert.equal(source.includes('"Repair Local DNS"'), true);
   assert.equal(source.includes('"Clear Global Storage Files"'), true);
-  assert.equal(source.includes("class RoutingTimelineGroupTreeItem"), true);
-  assert.equal(source.includes('"Recent Routing Activity"'), true);
+  assert.equal(source.includes("class RoutingTimelineGroupTreeItem"), false);
+  assert.equal(source.includes('"No activity"'), true);
   assert.equal(source.includes("buildRoutingTimelineRows(snapshot, agentSnapshot)"), true);
   assert.equal(source.includes('"Control Owner"'), true);
   assert.equal(source.includes("buildControlPlaneTooltip(snapshot.controlPlane)"), true);
@@ -168,7 +202,7 @@ test("non-owner windows show ownership transfer guidance while keeping actions a
   assert.equal(activateSource.includes('snapshot.controlPlane?.role === "owner"'), true);
   assert.equal(source.includes("buildOwnerActionAvailability(snapshot.controlPlane)"), true);
   assert.equal(source.includes('this.contextValue = availability.enabled ? "action" : "action.disabled";'), true);
-  assert.equal(source.includes('this.description = [description, availability.ownerTransferNote].filter(Boolean).join(" - ");'), true);
+  assert.equal(source.includes('this.description = description;'), true);
   assert.equal(source.includes("Owner-scoped commands stay actionable because their command wrapper acquires ownership."), true);
   assert.equal(source.includes("function buildOwnerTakeoverCommand"), false);
   assert.equal(source.includes("formatOwnerOnlyActionReason(controlPlane)"), true);
@@ -240,7 +274,7 @@ test("sidebar shows current network and route destinations", () => {
   const source = fs.readFileSync(sourcePath, "utf8");
   const networkServiceSource = fs.readFileSync(networkServicePath, "utf8");
 
-  assert.equal(source.includes('"Current Routing"'), true);
+  assert.equal(source.includes('"Overview"'), true);
   assert.equal(source.includes("class NetworkRoutingGroupTreeItem"), true);
   assert.equal(source.includes("class NetworkRouteConnectionTreeItem"), true);
   assert.equal(source.includes("formatCurrentRoutingSummary(snapshot, agentSnapshot, getCurrentRouteRows)"), true);
@@ -296,7 +330,7 @@ test("current routing projection excludes inactive lifecycle rows and summarizes
     sidebar.formatCurrentRoutingSummary(snapshot, agentSnapshot, (networkId) =>
       networkId === "terminal" ? ([{ id: "route" }] as never) : [],
     ),
-    "5 networks, 1 terminals, 1 routes",
+    "Active · 5 networks · 1 terminal · 1 route",
   );
 
   const terminalOnlySnapshot = {
@@ -310,7 +344,7 @@ test("current routing projection excludes inactive lifecycle rows and summarizes
     sidebar.formatCurrentRoutingSummary(terminalOnlySnapshot, terminalOnlyAgent, (networkId) =>
       networkId === "terminal" ? ([{ id: "route" }] as never) : [],
     ),
-    "Terminal -> Terminal network, 1 routes",
+    "Terminal routing · 1 route",
   );
 });
 
@@ -332,7 +366,7 @@ test("network descriptions lead with state and preserve singular counts", () => 
     1,
   );
 
-  assert.equal(item.description, "Ready, 1 route, 1 terminal, 1 binding");
+  assert.equal(item.description, "Ready · 1 route · 1 terminal · 1 binding");
   assert.equal(item.description?.includes("running"), false);
 });
 
@@ -362,24 +396,349 @@ test("tree refreshes share one render generation and defer platform diagnostics"
   const childrenPreamble = source.slice(childrenStart, rootStart);
   assert.equal(childrenPreamble.includes("getBrowserDnsResolverStatus"), false);
 
-  const daemonCaseStart = source.indexOf('case "daemon":', childrenStart);
+  const daemonCaseStart = source.indexOf('case "system":', childrenStart);
   const daemonCaseBody = source.slice(daemonCaseStart, source.indexOf("dispose(): void", daemonCaseStart));
   assert.equal(daemonCaseBody.includes("this.getBrowserDnsStatus(generation)"), true);
 });
 
-test("network rows show state first and keep the primary connect flow expanded", () => {
+test("network and system categories are collapsed presentation-only groups", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/ui/sidebar/port-manager-tree.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
 
   assert.equal(source.includes("class NetworkActionGroupTreeItem"), true);
-  assert.equal(source.includes('"Connect"'), true);
-  assert.equal(source.includes('"Advanced"'), true);
+  assert.equal(source.includes('"Routes"'), true);
+  assert.equal(source.includes('"Connections"'), true);
+  assert.equal(source.includes('"Port mappings"'), true);
+  assert.equal(source.includes('"Connect actions"'), true);
+  assert.equal(source.includes('"Manage actions"'), true);
+  assert.equal(source.includes('"Health"'), true);
+  assert.equal(source.includes('"Browser access & DNS"'), true);
+  assert.equal(source.includes('"Runtime & terminal discovery"'), true);
+  assert.equal(source.includes('"Recent activity"'), true);
+  assert.equal(source.includes('"Maintenance"'), true);
   assert.equal(source.includes('"Attach Active Terminal"'), true);
   assert.equal(source.includes('"Attach Terminal"'), true);
-  assert.equal(source.includes('"Ready to connect"'), true);
+  assert.equal(source.includes('"No connections"'), true);
   assert.equal(source.includes('"Create Network"'), true);
-  assert.equal(source.includes('kind === "quick" ? vscode.TreeItemCollapsibleState.Expanded'), true);
-  assert.equal(source.includes('vscode.TreeItemCollapsibleState.Collapsed,'), true);
+  assert.equal(source.includes('super(label, vscode.TreeItemCollapsibleState.Collapsed);'), true);
+  const groupStart = source.indexOf("class SidebarGroupTreeItem");
+  const groupEnd = source.indexOf("/** Collapsible root row", groupStart);
+  const groupSource = source.slice(groupStart, groupEnd);
+  assert.equal(groupSource.includes('this.contextValue = `sidebarGroup.${kind}`;'), true);
+  assert.equal(groupSource.includes("this.command"), false);
+  assert.equal(groupSource.includes("handleDrag"), false);
+});
+
+test("grouping preserves action metadata and keeps presentation groups out of drag and drop", async () => {
+  const sidebar = loadSidebarTreeForFixtureTests();
+  const network = {
+    id: "network-a",
+    name: "Network A",
+    status: "running",
+    runtimeKind: "proxy",
+    createdAt: "2026-07-30T00:00:00.000Z",
+  } as LogicalNetwork;
+  const networkB = { ...network, id: "network-b", name: "Network B" };
+  const provider = new sidebar.PortManagerTreeProvider({
+    getSnapshot: () => ({
+      networks: [network, networkB],
+      attachments: [],
+      exposures: [],
+      hostAccessBindings: [],
+      composeAttachments: [],
+      terminalWindows: [],
+      terminalCandidates: [],
+      containerServiceCandidates: [],
+      runtimes: [],
+      controlPlane: { role: "owner", currentPid: 7 },
+    }) as unknown as NetworkSnapshot,
+    getDaemonStatus: () => ({ status: "running", pid: 0, listenerCount: 0, routeCount: 0, updatedAt: "now" }) as never,
+    getAgentSnapshot: () => ({ routes: [] }) as unknown as AgentSnapshot,
+    getBrowserDnsResolverStatus: () => ({ supported: false, records: [] }) as never,
+    onDidChange: () => ({ dispose(): void {} }),
+  });
+  const roots = provider.getChildren() as Array<{ id: string; label: string; description: string; contextValue: string; collapsibleState: number; tooltip: { value: string } }>;
+  assert.deepEqual(roots.map((item) => item.label), ["Overview", "Networks", "Services", "System"]);
+  assert.deepEqual(roots.map((item) => item.id), ["section:current", "section:networks", "section:containers", "section:daemon"]);
+  assert.deepEqual(roots.map((item) => item.contextValue), ["section.current", "section.networks", "section.containers", "section.daemon"]);
+  assert.equal(roots[1].collapsibleState, 2);
+  assert.equal(roots[1].description, "Available · 2 networks");
+  assert.equal(roots[0].tooltip.value, "Overview\n\nNo current network");
+
+  const systemGroups = provider.getChildren(roots[3] as never) as Array<{ label: string; collapsibleState: number }>;
+  assert.deepEqual(systemGroups.map((item) => item.label), [
+    "Health",
+    "Browser access & DNS",
+    "Runtime & terminal discovery",
+    "Recent activity",
+    "Maintenance",
+  ]);
+  assert.equal(systemGroups.every((item) => item.collapsibleState === 1), true);
+  const activityRows = provider.getChildren(systemGroups[3] as never) as Array<{ label: string }>;
+  assert.deepEqual(activityRows.map((item) => item.label), ["No activity"]);
+
+  const networkItems = provider.getChildren(roots[1] as never) as Array<{ id: string }>;
+  const networkItem = networkItems[0] as never;
+  const groups = provider.getChildren(networkItem) as Array<{ label: string; description: string; contextValue: string; collapsibleState: number }>;
+  assert.deepEqual(groups.map((item) => item.label), ["Routes", "Connections", "Port mappings", "Connect actions", "Manage actions"]);
+  assert.equal(groups.every((item) => item.collapsibleState === 1), true);
+  assert.equal(groups.every((item) => item.contextValue !== "action" && !item.contextValue.includes("logicalNetwork")), true);
+  assert.deepEqual(groups.slice(0, 3).map((item) => item.description), ["No routes", "No connections", "No mappings"]);
+  assert.equal((groups[3] as unknown as { tooltip: { value: string } }).tooltip.value, "Connect actions\n\nAvailable · 5 actions");
+
+  const secondNetworkGroups = provider.getChildren(networkItems[1] as never) as Array<{ id: string }>;
+  assert.notEqual((groups[1] as unknown as { id: string }).id, secondNetworkGroups[1].id);
+  assert.notEqual((groups[2] as unknown as { id: string }).id, secondNetworkGroups[2].id);
+  assert.equal(
+    (provider.getChildren(networkItem)[1] as unknown as { id: string }).id,
+    (groups[1] as unknown as { id: string }).id,
+  );
+
+  const connectLeaves = provider.getChildren(groups[3] as never) as Array<{
+    command: { command: string; arguments: unknown[] };
+    contextValue: string;
+  }>;
+  assert.deepEqual(
+    connectLeaves.map((item) => item.command.command),
+    [
+      "portManager.attachActiveTerminalToNetwork",
+      "portManager.attachTerminalToNetwork",
+      "portManager.attachVscodeWindowTerminalsToNetwork",
+      "portManager.attachContainerToNetwork",
+      "portManager.copyTerminalRoutingScript",
+    ],
+  );
+  assert.deepEqual(
+    connectLeaves.map((item) => item.command.arguments),
+    [[network], [network], [network], [{ network }], [network]],
+  );
+  assert.equal(connectLeaves.every((item) => item.contextValue === "action"), true);
+  assert.equal((connectLeaves[0] as unknown as { tooltip: { value: string } }).tooltip.value, "Attach Active Terminal\n\nUse current VS Code terminal");
+  assert.equal(new Set(connectLeaves.map((item) => item.command.command)).size, connectLeaves.length);
+
+  const manageLeaves = provider.getChildren(groups[4] as never) as Array<{
+    command: { command: string; arguments: unknown[] };
+    contextValue: string;
+  }>;
+  assert.deepEqual(
+    manageLeaves.map((item) => item.command.command),
+    [
+      "portManager.addHostPortExposure",
+      "portManager.addHostAccessBinding",
+      "portManager.addComposePublishedPort",
+      "portManager.attachProcessToNetwork",
+      "portManager.saveBindingPreset",
+      "portManager.applyBindingPreset",
+      "portManager.clearNetworkCache",
+    ],
+  );
+  assert.deepEqual(manageLeaves.map((item) => item.command.arguments), manageLeaves.map(() => [network]));
+  assert.equal(manageLeaves.every((item) => item.contextValue === "action"), true);
+
+  const transferred = new Map<string, { value: unknown }>();
+  const dragTransfer = {
+    set(type: string, item: { value: unknown }): void {
+      transferred.set(type, item);
+    },
+  };
+  provider.handleDrag([groups[1] as never], dragTransfer as never, {} as never);
+  assert.equal(transferred.size, 0);
+
+  const terminalWindow = {
+    id: "terminal-window-a",
+    title: "Terminal A",
+    source: "vscode",
+    rootPid: 123,
+    candidatePids: [123],
+    candidateCount: 1,
+  } as const;
+  provider.handleDrag(
+    [new sidebar.TerminalWindowTreeItem(terminalWindow)],
+    dragTransfer as never,
+    {} as never,
+  );
+  assert.equal(
+    transferred.get("application/vnd.newdlops.portmanager.terminal-window")?.value,
+    terminalWindow.id,
+  );
+
+  await provider.handleDrop(
+    groups[1] as never,
+    {
+      get(): never {
+        throw new Error("presentation-only groups must not read a drop payload");
+      },
+    } as never,
+    {} as never,
+  );
+});
+
+test("conditional network actions and recent activity retain every underlying leaf", () => {
+  const sidebar = loadSidebarTreeForFixtureTests();
+  const network = {
+    id: "network-with-connections",
+    name: "Connected network",
+    status: "running",
+    runtimeKind: "proxy",
+    createdAt: "2026-07-30T00:00:00.000Z",
+  } as LogicalNetwork;
+  const terminalAttachment = {
+    id: "terminal-attachment-a",
+    networkId: network.id,
+    rootPid: 321,
+    terminalTitle: "Attached terminal",
+    mode: "isolated",
+    status: "attached",
+    attachedAt: "2026-07-30T01:00:00.000Z",
+  } as const;
+  const composeAttachment = {
+    id: "compose-attachment-a",
+    networkId: network.id,
+    projectName: "attached-project",
+    composeFiles: [],
+    ports: [],
+    status: "attached",
+    attachedAt: "2026-07-30T02:00:00.000Z",
+  } as const;
+  const provider = new sidebar.PortManagerTreeProvider({
+    getSnapshot: () => ({
+      networks: [network],
+      attachments: [terminalAttachment],
+      exposures: [],
+      hostAccessBindings: [],
+      composeAttachments: [composeAttachment],
+      terminalWindows: [],
+      terminalCandidates: [],
+      containerServiceCandidates: [],
+      runtimes: [],
+      controlPlane: { role: "owner", currentPid: 7, ownerActive: true },
+      updatedAt: "2026-07-30T02:00:00.000Z",
+    }) as unknown as NetworkSnapshot,
+    getDaemonStatus: () => ({ status: "running", pid: 0, listenerCount: 0, routeCount: 0, updatedAt: "now" }) as never,
+    getAgentSnapshot: () => ({ routes: [] }) as unknown as AgentSnapshot,
+    getBrowserDnsResolverStatus: () => ({ supported: false, records: [] }) as never,
+    onDidChange: () => ({ dispose(): void {} }),
+  });
+  const roots = provider.getChildren();
+  const networkItem = provider.getChildren(roots[1])[0];
+  const networkGroups = provider.getChildren(networkItem);
+  const manageLeaves = provider.getChildren(networkGroups[4]) as Array<{
+    command: { command: string; arguments: unknown[] };
+    contextValue: string;
+  }>;
+  assert.deepEqual(
+    manageLeaves.map((item) => item.command.command),
+    [
+      "portManager.addHostPortExposure",
+      "portManager.addHostAccessBinding",
+      "portManager.addComposePublishedPort",
+      "portManager.copyComposeAttachment",
+      "portManager.attachProcessToNetwork",
+      "portManager.saveBindingPreset",
+      "portManager.applyBindingPreset",
+      "portManager.clearNetworkCache",
+      "portManager.detachTerminalFromNetwork",
+    ],
+  );
+  assert.deepEqual(
+    manageLeaves.map((item) => item.command.arguments),
+    [[network], [network], [network], [network], [network], [network], [network], [network], []],
+  );
+  assert.equal(manageLeaves.every((item) => item.contextValue === "action"), true);
+
+  const systemGroups = provider.getChildren(roots[3]);
+  const activityRows = provider.getChildren(systemGroups[3]) as Array<{ label: string }>;
+  assert.deepEqual(activityRows.map((item) => item.label), ["attached-project", "Attached terminal"]);
+});
+
+test("sidebar empty summaries and daemon fallback tooltips remain explicit", () => {
+  const sidebar = loadSidebarTreeForFixtureTests();
+  const snapshot = {
+    networks: [], attachments: [], exposures: [], hostAccessBindings: [], composeAttachments: [],
+    terminalWindows: [], terminalCandidates: [], containerServiceCandidates: [], runtimes: [],
+    controlPlane: { role: "worker", ownerPid: 42, currentPid: 7 },
+  } as unknown as NetworkSnapshot;
+  const daemon = { status: "running", pid: 0, listenerCount: 0, routeCount: 0, updatedAt: "now" };
+  const agentSnapshot = { routes: [] } as unknown as AgentSnapshot;
+  const createProvider = (browserDns: unknown) => new sidebar.PortManagerTreeProvider({
+    getSnapshot: () => snapshot,
+    getDaemonStatus: () => daemon as never,
+    getAgentSnapshot: () => agentSnapshot,
+    getBrowserDnsResolverStatus: () => browserDns as never,
+    onDidChange: () => ({ dispose(): void {} }),
+  });
+  const provider = createProvider({ supported: false, records: [] });
+  const roots = provider.getChildren() as Array<{ description: string; collapsibleState: number }>;
+  assert.equal(roots[1].description, "No networks");
+  assert.equal(roots[1].collapsibleState, 2);
+  assert.equal(roots[2].description, "No services");
+  assert.equal(roots[3].description, "Worker · owner pid 42 · Running");
+
+  const systemGroups = provider.getChildren(roots[3] as never) as Array<{ label: string; description: string }>;
+  assert.deepEqual(
+    systemGroups.slice(1, 4).map((item) => item.description),
+    ["Unsupported", "No terminals or runtimes", "No activity"],
+  );
+  const healthRows = provider.getChildren(systemGroups[0] as never) as Array<{ label: string; tooltip: { value: string } }>;
+  assert.deepEqual(
+    healthRows.map((item) => item.label),
+    [
+      "Control Owner",
+      "Make This Window Owner",
+      "This Window PID",
+      "Status",
+      "Version",
+      "PID",
+      "Listeners",
+      "Routes",
+      "Agent Main",
+      "Expected Agent",
+      "Route Table File",
+      "Updated",
+    ],
+  );
+  const status = healthRows.find((item) => item.label === "Status");
+  assert.equal(status?.tooltip.value, "Status\n\nrunning");
+  const browserRows = provider.getChildren(systemGroups[1] as never) as Array<{ label: string }>;
+  assert.deepEqual(browserRows.map((item) => item.label), ["Browser DNS"]);
+  const activityRows = provider.getChildren(systemGroups[3] as never) as Array<{ tooltip: { value: string } }>;
+  assert.equal(activityRows[0].tooltip.value, "No activity\n\nAttach a terminal or service");
+  const runtimeRows = provider.getChildren(systemGroups[2] as never) as Array<{ tooltip: { value: string } }>;
+  assert.equal(runtimeRows[0].tooltip.value, "No terminal isolation runtime\n\nLocal proxy cannot attach terminal ports");
+  const maintenanceRows = provider.getChildren(systemGroups[4] as never) as Array<{ command: { command: string } }>;
+  assert.deepEqual(
+    maintenanceRows.map((item) => item.command.command),
+    ["portManager.fixStaleRouting", "portManager.clearGlobalStorageFiles"],
+  );
+
+  const supportedProvider = createProvider({
+    supported: true,
+    dnsRunning: true,
+    dnsPort: 53153,
+    records: [],
+    installedCount: 0,
+    missingCount: 0,
+    tlsStaleCount: 0,
+  });
+  const supportedRoots = supportedProvider.getChildren();
+  const supportedSystemGroups = supportedProvider.getChildren(supportedRoots[3]);
+  const supportedBrowserRows = supportedProvider.getChildren(supportedSystemGroups[1]) as Array<{
+    label: string;
+    command?: { command: string };
+  }>;
+  assert.deepEqual(
+    supportedBrowserRows.map((item) => item.label),
+    ["Browser DNS", "Repair Local DNS", "Install Browser DNS", "Clean Browser DNS"],
+  );
+  assert.deepEqual(
+    supportedBrowserRows.map((item) => item.command?.command),
+    [
+      undefined,
+      "portManager.repairLocalDns",
+      "portManager.installBrowserDnsResolvers",
+      "portManager.cleanupBrowserDnsResolvers",
+    ],
+  );
 });
 
 test("tree action arguments resolve wrapped logical networks", () => {
