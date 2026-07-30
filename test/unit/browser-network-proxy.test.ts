@@ -25,7 +25,7 @@ test("rewrites browser alias HTTP requests as localhost upstream requests", asyn
     });
     response.end("redirect");
   });
-  await listen(upstream, 0, "127.0.0.1");
+  await listenNet(upstream, 0, "127.0.0.1");
 
   const proxyPort = await getAvailablePort();
   const proxy = new BrowserNetworkProxyManager({
@@ -317,6 +317,57 @@ test("opens sniffing endpoints without TLS credentials, still proxying plain HTT
     await proxy.dispose();
     await closeServer(upstream);
   }
+});
+
+test("installs a TLS terminator in place when credentials arrive after the listener", async () => {
+  const upstream = http.createServer((_request, response) => response.end("upstream"));
+  await listen(upstream, 0, "127.0.0.1");
+  const proxyPort = await getAvailablePort();
+  let credentials: { key: string; cert: string } | undefined;
+  const proxy = new BrowserNetworkProxyManager(
+    { resolve: () => ({ host: "127.0.0.1", port: getServerPort(upstream) }) },
+    { tlsCredentials: { getCredentials: () => credentials } },
+  );
+  const endpoint = createEndpoint({ publicHost: "alpha1", listenPorts: [proxyPort] });
+
+  try {
+    const active = await proxy.ensure(endpoint);
+    assert.ok(active);
+    credentials = { key: TEST_TLS_KEY, cert: TEST_TLS_CERTIFICATE };
+    await proxy.sync([{ ...endpoint, publicProtocol: "https" }]);
+
+    const response = await requestHttps({ host: "127.0.0.1", port: proxyPort, path: "/" });
+    assert.equal(response.body, "upstream");
+    assert.equal(proxy.get("network-1", 3004)?.listenPort, proxyPort);
+  } finally {
+    await proxy.dispose();
+    await closeServer(upstream);
+  }
+});
+
+test("keeps the prior HTTPS identity when certificate rotation cannot be installed", async () => {
+  const proxyPort = await getAvailablePort();
+  let credentials = { key: TEST_TLS_KEY, cert: TEST_TLS_CERTIFICATE };
+  const proxy = new BrowserNetworkProxyManager(
+    { resolve: () => ({ host: "127.0.0.1", port: 1 }) },
+    { tlsCredentials: { getCredentials: () => credentials } },
+  );
+  const endpoint = createEndpoint({ publicHost: "alpha1", publicProtocol: "https", listenPorts: [proxyPort] });
+  try {
+    assert.ok(await proxy.ensure(endpoint));
+    credentials = { key: "not a private key", cert: "not a certificate" };
+    await proxy.sync([{ ...endpoint, publicHost: "alpha2" }]);
+    assert.equal(proxy.get("network-1", 3004)?.publicHost, "alpha1");
+    assert.equal(proxy.get("network-1", 3004)?.publicProtocol, "https");
+  } finally {
+    await proxy.dispose();
+  }
+});
+
+test("dispose prevents a later ensure from recreating a listener", async () => {
+  const proxy = new BrowserNetworkProxyManager({ resolve: () => ({ host: "127.0.0.1", port: 1 }) });
+  await proxy.dispose();
+  assert.equal(await proxy.ensure(createEndpoint({ listenPorts: [await getAvailablePort()] })), undefined);
 });
 
 test("terminates HTTPS browser proxy requests and returns upstream responses", async () => {
@@ -838,6 +889,66 @@ test("keeps in-flight browser proxy sockets across transient missing endpoint sy
   }
 });
 
+test("keeps live HTTP, WebSocket, and raw streams through alias and certificate reconciliation", async () => {
+  let streamSocket: net.Socket | undefined;
+  const upstream = net.createServer((socket) => {
+    socket.once("data", (chunk) => {
+      const text = chunk.toString("latin1");
+      if (text.startsWith("GET /stream ")) {
+        streamSocket = socket;
+        socket.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n");
+        return;
+      }
+      if (text.startsWith("GET /ws ")) {
+        socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+        socket.on("data", (data) => socket.write(data));
+        return;
+      }
+      if (text.startsWith("GET ")) {
+        socket.end("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nnew");
+        return;
+      }
+      socket.on("data", (data) => socket.write(data));
+      socket.write(chunk);
+    });
+  });
+  await listenNet(upstream, 0, "127.0.0.1");
+  const proxyPort = await getAvailablePort();
+  let credentials = { key: TEST_TLS_KEY, cert: TEST_TLS_CERTIFICATE };
+  const proxy = new BrowserNetworkProxyManager(
+    { resolve: () => ({ host: "127.0.0.1", port: getNetServerPort(upstream) }) },
+    { tlsCredentials: { getCredentials: () => credentials } },
+  );
+  const endpoint = createEndpoint({ publicHost: "alpha1", publicProtocol: "https", listenPorts: [proxyPort] });
+  let httpClient: net.Socket | undefined;
+  let wsClient: net.Socket | undefined;
+  let rawClient: net.Socket | undefined;
+  try {
+    assert.ok(await proxy.ensure(endpoint));
+    httpClient = net.createConnection({ host: "127.0.0.1", port: proxyPort });
+    wsClient = net.createConnection({ host: "127.0.0.1", port: proxyPort });
+    rawClient = net.createConnection({ host: "127.0.0.1", port: proxyPort });
+    const initialTraffic = [waitForSocketText(httpClient, "first"), waitForSocketText(wsClient, "101 Switching"), waitForSocketText(rawClient, "raw-before")];
+    httpClient.write("GET /stream HTTP/1.1\r\nHost: alpha1\r\n\r\n");
+    wsClient.write("GET /ws HTTP/1.1\r\nHost: alpha1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+    rawClient.write("raw-before");
+    await Promise.all(initialTraffic);
+
+    credentials = { key: ROTATED_TEST_TLS_KEY, cert: ROTATED_TEST_TLS_CERTIFICATE };
+    await proxy.sync([{ ...endpoint, publicHost: "alpha2" }]);
+    const continuedTraffic = [waitForSocketText(httpClient, "second"), waitForSocketText(wsClient, "ws-after"), waitForSocketText(rawClient, "raw-after")];
+    streamSocket?.write("6\r\nsecond\r\n");
+    wsClient.write("ws-after");
+    rawClient.write("raw-after");
+    await Promise.all(continuedTraffic);
+    assert.equal((await requestHttps({ host: "127.0.0.1", port: proxyPort, path: "/new" })).body, "new");
+  } finally {
+    httpClient?.destroy(); wsClient?.destroy(); rawClient?.destroy();
+    await proxy.dispose();
+    await closeNetServer(upstream);
+  }
+});
+
 function createEndpoint(overrides: Partial<BrowserNetworkProxyEndpoint> = {}): BrowserNetworkProxyEndpoint {
   return {
     id: browserNetworkProxyEndpointId("network-1", 3004),
@@ -994,6 +1105,45 @@ function getServerPort(server: http.Server): number {
   }
 
   return address.port;
+}
+
+function getNetServerPort(server: net.Server): number {
+  const address = server.address();
+  if (typeof address !== "object" || address === null) {
+    throw new Error("Server did not expose an address.");
+  }
+  return address.port;
+}
+
+function listenNet(server: net.Server, port: number, host: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+}
+
+function closeNetServer(server: net.Server): Promise<void> {
+  return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+}
+
+function waitForSocketText(socket: net.Socket, expected: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let received = "";
+    const onData = (chunk: Buffer) => {
+      received += chunk.toString("latin1");
+      if (received.includes(expected)) {
+        cleanup();
+        resolve();
+      }
+    };
+    const onError = (error: Error) => { cleanup(); reject(error); };
+    const cleanup = () => { socket.off("data", onData); socket.off("error", onError); };
+    socket.on("data", onData);
+    socket.once("error", onError);
+  });
 }
 
 async function getAvailablePort(): Promise<number> {

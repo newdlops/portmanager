@@ -10,13 +10,16 @@ import type { PortManagerNetworkService } from "./network-service";
  */
 
 class SecureLocalTerminalLink extends vscode.TerminalLink {
-  constructor(candidate: SecureLocalTerminalBrowserUrl) {
+  constructor(candidate: SecureLocalTerminalBrowserUrl, fallbackNetworkId?: string) {
     super(candidate.startIndex, candidate.length, "Open through Port Manager browser routing");
     this.url = candidate.url;
+    this.fallbackNetworkId = fallbackNetworkId;
   }
 
   /** Original terminal URL to pass to Port Manager browser routing. */
   readonly url: string;
+  /** Attached-terminal attribution used only for localhost forms. */
+  readonly fallbackNetworkId: string | undefined;
 }
 
 export class PortManagerTerminalSecureBrowserLinkProvider
@@ -29,19 +32,22 @@ export class PortManagerTerminalSecureBrowserLinkProvider
     this.registration = vscode.window.registerTerminalLinkProvider(this);
   }
 
-  provideTerminalLinks(
+  async provideTerminalLinks(
     context: vscode.TerminalLinkContext,
     token: vscode.CancellationToken,
-  ): vscode.ProviderResult<SecureLocalTerminalLink[]> {
+  ): Promise<SecureLocalTerminalLink[]> {
     if (token.isCancellationRequested) {
       return [];
     }
 
-    return findSecureLocalTerminalBrowserUrls(context.line).map((candidate) => new SecureLocalTerminalLink(candidate));
+    const fallbackNetworkId = await this.networkService.getTerminalBrowserFallbackNetworkId(context.terminal);
+    return findSecureLocalTerminalBrowserUrls(context.line).map(
+      (candidate) => new SecureLocalTerminalLink(candidate, fallbackNetworkId),
+    );
   }
 
   async handleTerminalLink(link: SecureLocalTerminalLink): Promise<void> {
-    await this.networkService.openBrowserUrl(link.url);
+    await this.networkService.openBrowserUrl(link.url, link.fallbackNetworkId);
   }
 
   dispose(): void {

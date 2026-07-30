@@ -94,6 +94,7 @@ import {
 import { NodeTcpConnectionProcessResolver } from "../platform/ports/tcp-connection-process-resolver";
 import { ProcessTrackerManager } from "../platform/process/process-tracker-manager";
 import { devLog, devLogEnabled } from "../platform/dev-log";
+import { resolveNetworkBrowserTargetUrl, selectTerminalNetworkFallback, type NetworkBrowserTarget } from "../platform/browser-terminal-links";
 import {
   buildProcessTreeContext,
   NodeProcessTableProvider,
@@ -373,6 +374,17 @@ interface LogicalRouterOwnerDocument {
   readonly workspaceUri?: string;
   /** Lease renewal time; stale leases can be stolen by another active window. */
   readonly updatedAt: string;
+  /** Owner-published browser origins for worker windows; ignored unless lease is live. */
+  readonly browserProxyEndpoints?: readonly BrowserProxyOwnerEndpoint[];
+}
+
+interface BrowserProxyOwnerEndpoint {
+  readonly id: string;
+  readonly networkId: string;
+  readonly logicalPort: number;
+  readonly listenPort: number;
+  readonly publicHost?: string;
+  readonly publicProtocol: "http" | "https";
 }
 
 export interface RoutingFileCleanupSummary {
@@ -1252,23 +1264,83 @@ export class PortManagerNetworkService implements DisposableLike {
    * proxy can normalize Host/Origin headers before Vite or similar dev servers
    * see the request.
    */
-  async getBrowserIsolatedUrl(process: ManagedProcess): Promise<string | undefined> {
+  async getBrowserIsolatedUrl(managedProcess: ManagedProcess): Promise<string | undefined> {
     const networks = this.registry.getSnapshot().networks;
     this.syncBrowserDnsRecordsForNetworks(networks);
 
-    if (!isBrowserProxyProcess(process, networks)) {
+    if (!isBrowserProxyProcess(managedProcess, networks)) {
       return undefined;
     }
 
-    const endpoint = await this.browserNetworkProxy.ensure(
-      buildBrowserProxyEndpoint(process, networks, this.browserDnsServer.isRunning()),
-    );
+    const desiredEndpoint = buildBrowserProxyEndpoint(managedProcess, networks, true);
+    const owner = readBrowserNetworkProxyOwner();
+    const published = findPublishedBrowserProxyEndpoint(owner, desiredEndpoint);
+    if (isActiveBrowserNetworkProxyOwner(owner, Date.now()) && owner?.pid !== globalThis.process.pid) {
+      if (published === undefined) {
+        return undefined;
+      }
+      return formatBrowserNetworkProxyUrl({ ...desiredEndpoint, ...published, listenPort: published.listenPort });
+    }
+    const endpoint = await this.browserNetworkProxy.ensure(desiredEndpoint);
     return endpoint === undefined ? undefined : formatBrowserNetworkProxyUrl(endpoint);
   }
 
   /** Opens Port Manager browser URLs through the platform default browser. */
-  async openBrowserUrl(url: string): Promise<void> {
-    await vscode.env.openExternal(vscode.Uri.parse(url));
+  async openBrowserUrl(url: string, fallbackNetworkId?: string): Promise<void> {
+    await vscode.env.openExternal(vscode.Uri.parse(this.resolveBrowserTargetUrl(url, fallbackNetworkId)));
+  }
+
+  /** Resolves localhost only for the terminal that supplied an unambiguous attachment. */
+  async getTerminalBrowserFallbackNetworkId(terminal: vscode.Terminal): Promise<string | undefined> {
+    const windowNetworkId = this.vscodeWindowTerminalBinding?.status === "attached"
+      ? this.vscodeWindowTerminalBinding.networkId
+      : undefined;
+    try {
+      const terminalPid = await terminal.processId;
+      const candidates = this.registry.getSnapshot().attachments.filter((candidate) => candidate.status === "attached");
+      return selectTerminalNetworkFallback(terminalPid, candidates, windowNetworkId);
+    } catch {
+      return windowNetworkId;
+    }
+  }
+
+  /** Canonicalizes a self-identifying routed browser URL without changing public links. */
+  private resolveBrowserTargetUrl(url: string, fallbackNetworkId?: string): string {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return url;
+    }
+    const logicalPort = Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
+    if (!isTcpPort(logicalPort)) {
+      return url;
+    }
+    const networks = this.registry.getSnapshot().networks;
+    const protocol = browserProxyPublicProtocol(networks, true);
+    const owner = readBrowserNetworkProxyOwner();
+    const foreignOwner = isActiveBrowserNetworkProxyOwner(owner, Date.now()) && owner?.pid !== globalThis.process.pid;
+    const targets: NetworkBrowserTarget[] = buildBrowserDnsRecords(networks).flatMap((record) => {
+      const desiredEndpoint = buildBrowserProxyEndpointFor(record.networkId, logicalPort, networks, true);
+      const published = findPublishedBrowserProxyEndpoint(owner, desiredEndpoint);
+      if (foreignOwner && published === undefined) {
+        return [];
+      }
+      const active = this.browserNetworkProxy.get(record.networkId, logicalPort);
+      return [{
+        networkId: record.networkId,
+        routedLoopbackHost: loopbackAddressForNetwork(record.networkId),
+        browserLoopbackHost: record.address,
+        publicHost: published?.publicHost ?? record.secureHostname,
+        publicProtocol: published?.publicProtocol ?? protocol ?? "http",
+        logicalPort,
+        sourceHosts: [record.hostname, record.secureHostname, ...(published?.publicHost === undefined ? [] : [published.publicHost])],
+        ...(published === undefined && active === undefined
+          ? {}
+          : { publicPort: published?.listenPort ?? active?.listenPort }),
+      }];
+    });
+    return resolveNetworkBrowserTargetUrl(url, targets, fallbackNetworkId);
   }
 
   /** Builds a sudo shell script that points macOS single-label resolvers at Port Manager DNS. */
@@ -5730,7 +5802,6 @@ export class PortManagerNetworkService implements DisposableLike {
     const registrySnapshot = this.registry.getSnapshot();
     const networks = registrySnapshot.networks;
     const dnsRecords = this.syncBrowserDnsRecordsForNetworks(networks);
-    const dnsRunning = this.browserDnsServer.isRunning();
 
     if (!tryAcquireBrowserNetworkProxyOwnerLease()) {
       if (this.ownsBrowserNetworkProxyLease) {
@@ -5742,7 +5813,14 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     this.ownsBrowserNetworkProxyLease = true;
-    if (dnsRunning) {
+    // A closed DNS socket is recoverable during ordinary owner convergence.
+    // Record availability, not a transient bind result, keeps published aliases
+    // stable while the next reconciliation retries startup.
+    await this.startBrowserDnsServer();
+    this.syncBrowserDnsRecordsForNetworks(networks);
+    const dnsRunning = this.browserDnsServer.isRunning();
+    const useDnsAlias = dnsRunning || dnsRecords.length > 0;
+    if (useDnsAlias) {
       await ensureBrowserDnsLoopbackAliasesReady(dnsRecords).catch(() => undefined);
     }
 
@@ -5754,7 +5832,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const processEndpoints = collectBrowserProxyEndpoints(
       snapshot?.processes ?? [],
       networks,
-      dnsRunning,
+      useDnsAlias,
       processCommandTextByPid,
     );
     const routeHintTextByEndpointId = await this.readBrowserProxyRouteHintTexts(routes);
@@ -5796,9 +5874,9 @@ export class PortManagerNetworkService implements DisposableLike {
       mergeBrowserProxyEndpoints(
         processEndpoints,
         mergeBrowserProxyEndpoints(
-          collectBrowserProxyRouteEndpoints(routes, networks, dnsRunning, routeHintTextByEndpointId, processEndpoints),
+          collectBrowserProxyRouteEndpoints(routes, networks, useDnsAlias, routeHintTextByEndpointId, processEndpoints),
           mergeBrowserProxyEndpoints(
-            collectBrowserProxyComposeEndpoints(registrySnapshot.composeAttachments, networks, dnsRunning),
+            collectBrowserProxyComposeEndpoints(registrySnapshot.composeAttachments, networks, useDnsAlias),
             collectHostLocalGatewayRedirectEndpoints(hostLocalGatewayRedirects),
           ),
         ),
@@ -5827,6 +5905,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
     await this.releaseHostGatewayPortsForBrowserEndpoints(endpoints).catch(() => undefined);
     await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);
+    // Workers consume the elected owner's concrete port instead of attempting
+    // a local bind when their DNS responder has not been started.
+    publishBrowserNetworkProxyOwnerEndpoints(this.browserNetworkProxy, endpoints);
     await this.syncHostGatewayProxies(hostGatewayExposures).catch(() => undefined);
     // Keep privileged reconciliation inside the outer coalescer. Explicit
     // state changes that arrive while macOS authorization is open are queued
@@ -12529,7 +12610,44 @@ function readOwnerDocument(filePath: string): LogicalRouterOwnerDocument | undef
       ? { workspaceUri: owner.workspaceUri.trim() }
       : {}),
     updatedAt: owner.updatedAt,
+    ...(Array.isArray(owner.browserProxyEndpoints)
+      ? { browserProxyEndpoints: owner.browserProxyEndpoints.filter(isBrowserProxyOwnerEndpoint) }
+      : {}),
   };
+}
+
+function isBrowserProxyOwnerEndpoint(value: unknown): value is BrowserProxyOwnerEndpoint {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const endpoint = value as Partial<BrowserProxyOwnerEndpoint>;
+  return (
+    typeof endpoint.id === "string" &&
+    typeof endpoint.networkId === "string" &&
+    isTcpPort(endpoint.logicalPort ?? 0) &&
+    isTcpPort(endpoint.listenPort ?? 0) &&
+    (endpoint.publicHost === undefined || typeof endpoint.publicHost === "string") &&
+    (endpoint.publicProtocol === "http" || endpoint.publicProtocol === "https")
+  );
+}
+
+/** Reads only owner metadata that still names this exact browser endpoint. */
+function findPublishedBrowserProxyEndpoint(
+  owner: LogicalRouterOwnerDocument | undefined,
+  desired: BrowserNetworkProxyEndpoint,
+): BrowserProxyOwnerEndpoint | undefined {
+  if (!isActiveBrowserNetworkProxyOwner(owner, Date.now())) {
+    return undefined;
+  }
+  return owner?.browserProxyEndpoints?.find(
+    (endpoint) =>
+      endpoint.id === desired.id &&
+      endpoint.networkId === desired.networkId &&
+      endpoint.logicalPort === desired.logicalPort &&
+      endpoint.publicHost === desired.publicHost &&
+      endpoint.publicProtocol === (desired.publicProtocol ?? "http") &&
+      desired.listenPorts.includes(endpoint.listenPort),
+  );
 }
 
 function buildCurrentVsCodeWindowTitle(): string {
@@ -12553,12 +12671,51 @@ function writeBrowserNetworkProxyOwnerLease(nowMs: number): boolean {
     ensureBrowserNetworkProxyOwnerControlDirectory();
     syncFs.writeFileSync(
       BROWSER_NETWORK_PROXY_OWNER_PATH,
-      `${JSON.stringify({ pid: process.pid, updatedAt: new Date(nowMs).toISOString() })}\n`,
+      `${JSON.stringify({
+        pid: process.pid,
+        updatedAt: new Date(nowMs).toISOString(),
+        ...(readBrowserNetworkProxyOwner()?.pid === process.pid
+          ? { browserProxyEndpoints: readBrowserNetworkProxyOwner()?.browserProxyEndpoints ?? [] }
+          : {}),
+      })}\n`,
       "utf8",
     );
     return true;
   } catch {
     return false;
+  }
+}
+
+function publishBrowserNetworkProxyOwnerEndpoints(
+  browserNetworkProxy: BrowserNetworkProxyManager,
+  endpoints: readonly BrowserNetworkProxyEndpoint[],
+): void {
+  const owner = readBrowserNetworkProxyOwner();
+  if (owner?.pid !== process.pid) {
+    return;
+  }
+  const activeEndpoints = endpoints.flatMap((endpoint) => {
+    const active = browserNetworkProxy.get(endpoint.networkId, endpoint.logicalPort);
+    if (active === undefined) {
+      return [];
+    }
+    return [{
+      id: active.id,
+      networkId: active.networkId,
+      logicalPort: active.logicalPort,
+      listenPort: active.listenPort,
+      ...(active.publicHost === undefined ? {} : { publicHost: active.publicHost }),
+      publicProtocol: active.publicProtocol ?? "http",
+    }];
+  });
+  try {
+    syncFs.writeFileSync(
+      BROWSER_NETWORK_PROXY_OWNER_PATH,
+      `${JSON.stringify({ pid: process.pid, updatedAt: new Date().toISOString(), browserProxyEndpoints: activeEndpoints })}\n`,
+      "utf8",
+    );
+  } catch {
+    // A later reconciliation refreshes this advisory worker-read metadata.
   }
 }
 

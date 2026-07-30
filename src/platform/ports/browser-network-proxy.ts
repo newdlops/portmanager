@@ -75,13 +75,17 @@ export interface BrowserNetworkProxyTlsCredentialsProvider {
 
 interface BrowserNetworkProxyListener {
   /** Active endpoint including the concrete listen port. */
-  readonly endpoint: ActiveBrowserNetworkProxyEndpoint;
+  endpoint: ActiveBrowserNetworkProxyEndpoint;
   /** Precomputed host/origin strings reused by every request on this endpoint. */
-  readonly metadata: BrowserNetworkProxyEndpointMetadata;
+  metadata: BrowserNetworkProxyEndpointMetadata;
   /** TLS-sniffing listener that owns the browser-facing socket. */
   readonly server: BrowserNetworkProxyServer;
   /** Inner HTTPS terminator for connections sniffed as TLS; absent without credentials. */
-  readonly tlsServer?: https.Server;
+  tlsServer?: https.Server;
+  /** Mutable TLS dispatch used by the sniffer for newly accepted ClientHellos. */
+  readonly tlsDispatch: BrowserNetworkProxyTlsDispatch;
+  /** Creates a TLS terminator after credentials become available post-bind. */
+  readonly installTls: (credentials: BrowserNetworkProxyTlsCredentials) => https.Server;
   /** Upstream HTTP connection pool scoped to this browser-facing endpoint. */
   readonly httpAgent: http.Agent;
   /** Upstream HTTPS connection pool scoped to this browser-facing endpoint. */
@@ -89,7 +93,7 @@ interface BrowserNetworkProxyListener {
   /** Client and upstream sockets closed together during reconciliation. */
   readonly sockets: Set<net.Socket>;
   /** Fingerprint of the TLS identity loaded when this HTTPS listener opened. */
-  readonly tlsCredentialsFingerprint?: string;
+  tlsCredentialsFingerprint?: string;
 }
 
 type BrowserNetworkProxyServer = net.Server;
@@ -121,7 +125,13 @@ interface BrowserNetworkProxyServerBuild {
   readonly server: net.Server;
   /** Inner HTTPS terminator, fed sniffed TLS connections; absent without credentials. */
   readonly tlsServer?: https.Server;
+  readonly tlsDispatch: BrowserNetworkProxyTlsDispatch;
+  readonly installTls: (credentials: BrowserNetworkProxyTlsCredentials) => https.Server;
   readonly tlsCredentialsFingerprint?: string;
+}
+
+interface BrowserNetworkProxyTlsDispatch {
+  server?: https.Server;
 }
 
 interface BrowserNetworkProxyEndpointMetadata {
@@ -187,6 +197,12 @@ export class BrowserNetworkProxyManager {
   /** Delayed closes for endpoints that vanished during a transient routing refresh. */
   private readonly retireTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+  /** Serializes refreshes so an older sync cannot retire a newer listener. */
+  private mutationTail: Promise<void> = Promise.resolve();
+
+  /** Once disposed, queued work must not resurrect a listener. */
+  private disposed = false;
+
   constructor(
     private readonly targetResolver: BrowserNetworkProxyTargetResolver,
     private readonly options: BrowserNetworkProxyOptions = {},
@@ -194,6 +210,13 @@ export class BrowserNetworkProxyManager {
 
   /** Reconciles active browser proxies with the latest running web processes. */
   async sync(endpoints: Iterable<BrowserNetworkProxyEndpoint>): Promise<void> {
+    return this.serialize(() => this.syncExclusive(endpoints));
+  }
+
+  private async syncExclusive(endpoints: Iterable<BrowserNetworkProxyEndpoint>): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     const desired = new Map<string, BrowserNetworkProxyEndpoint>();
     for (const endpoint of endpoints) {
       if (isTcpPort(endpoint.logicalPort) && endpoint.listenPorts.some(isTcpPort)) {
@@ -209,8 +232,10 @@ export class BrowserNetworkProxyManager {
       }
 
       this.cancelRetire(id);
-      if (!isEndpointCurrent(listener.endpoint, endpoint) || !this.isTlsCredentialsCurrent(listener, endpoint)) {
+      if (!isEndpointBindCurrent(listener.endpoint, endpoint)) {
         await this.close(id);
+      } else {
+        this.reconcileListener(listener, endpoint);
       }
     }
 
@@ -233,14 +258,18 @@ export class BrowserNetworkProxyManager {
 
   /** Opens or returns one endpoint immediately, ignoring background retry backoff. */
   async ensure(endpoint: BrowserNetworkProxyEndpoint): Promise<ActiveBrowserNetworkProxyEndpoint | undefined> {
+    return this.serialize(() => this.ensureExclusive(endpoint));
+  }
+
+  private async ensureExclusive(endpoint: BrowserNetworkProxyEndpoint): Promise<ActiveBrowserNetworkProxyEndpoint | undefined> {
+    if (this.disposed) {
+      return undefined;
+    }
     const normalizedEndpoint = normalizeEndpoint(endpoint);
     const listener = this.listeners.get(normalizedEndpoint.id);
-    if (
-      listener !== undefined &&
-      isEndpointCurrent(listener.endpoint, normalizedEndpoint) &&
-      this.isTlsCredentialsCurrent(listener, normalizedEndpoint)
-    ) {
+    if (listener !== undefined && isEndpointBindCurrent(listener.endpoint, normalizedEndpoint)) {
       this.cancelRetire(normalizedEndpoint.id);
+      this.reconcileListener(listener, normalizedEndpoint);
       return listener.endpoint;
     }
 
@@ -296,12 +325,30 @@ export class BrowserNetworkProxyManager {
 
   /** Closes every browser proxy endpoint during extension shutdown. */
   async dispose(): Promise<void> {
-    const ids = [...this.listeners.keys()];
-    for (const id of [...this.retireTimers.keys()]) {
-      this.cancelRetire(id);
+    this.disposed = true;
+    await this.serialize(async () => {
+      const ids = [...this.listeners.keys()];
+      for (const id of [...this.retireTimers.keys()]) {
+        this.cancelRetire(id);
+      }
+      await Promise.all(ids.map((id) => this.close(id)));
+      this.retryAfterById.clear();
+    });
+  }
+
+  /** Queues public mutations without holding a lock across request handling. */
+  private async serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.mutationTail;
+    let release: (() => void) | undefined;
+    this.mutationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release?.();
     }
-    await Promise.all(ids.map((id) => this.close(id)));
-    this.retryAfterById.clear();
   }
 
   /** Defers destructive close so short-lived route-table holes do not kill WebSocket streams. */
@@ -330,6 +377,9 @@ export class BrowserNetworkProxyManager {
 
   /** Opens one endpoint on the first available preferred public port. */
   private async open(endpoint: BrowserNetworkProxyEndpoint): Promise<ActiveBrowserNetworkProxyEndpoint> {
+    if (this.disposed) {
+      throw new Error("Browser proxy manager is disposed.");
+    }
     const errors: Error[] = [];
 
     for (const listenPort of endpoint.listenPorts) {
@@ -351,17 +401,23 @@ export class BrowserNetworkProxyManager {
       });
       const sockets = new Set<net.Socket>();
       let serverBuild: BrowserNetworkProxyServerBuild;
+      let listener: BrowserNetworkProxyListener | undefined;
       try {
         serverBuild = this.createServer(
-          activeEndpoint,
           (request, response) => {
-            void this.forwardHttp(activeEndpoint, metadata, httpAgent, httpsAgent, request, response);
+            if (listener !== undefined) {
+              void this.forwardHttp(listener.endpoint, listener.metadata, listener.httpAgent, listener.httpsAgent, request, response);
+            }
           },
           (request, socket, head) => {
-            void this.forwardUpgrade(activeEndpoint, metadata, request, socket as net.Socket, head, sockets);
+            if (listener !== undefined) {
+              void this.forwardUpgrade(listener.endpoint, listener.metadata, request, socket as net.Socket, head, listener.sockets);
+            }
           },
           (socket) => {
-            void this.rawForward(activeEndpoint, socket, sockets);
+            if (listener !== undefined) {
+              void this.rawForward(listener.endpoint, socket, listener.sockets);
+            }
           },
         );
       } catch (error) {
@@ -371,24 +427,28 @@ export class BrowserNetworkProxyManager {
         continue;
       }
 
-      const { server, tlsServer, tlsCredentialsFingerprint } = serverBuild;
+      const { server, tlsServer, tlsDispatch, installTls, tlsCredentialsFingerprint } = serverBuild;
       server.on("connection", (socket) => {
         sockets.add(socket);
         socket.once("close", () => sockets.delete(socket));
       });
 
       try {
+        await assertPortAvailable(endpoint.listenHost, listenPort);
         await listen(server, listenPort, endpoint.listenHost);
-        this.listeners.set(endpoint.id, {
+        listener = {
           endpoint: activeEndpoint,
           metadata,
           server,
           ...(tlsServer === undefined ? {} : { tlsServer }),
+          tlsDispatch,
+          installTls,
           httpAgent,
           httpsAgent,
           sockets,
           tlsCredentialsFingerprint,
-        });
+        };
+        this.listeners.set(endpoint.id, listener);
         return activeEndpoint;
       } catch (error) {
         httpAgent.destroy();
@@ -546,7 +606,6 @@ export class BrowserNetworkProxyManager {
    * HTTPS handshake with ERR_SSL_PROTOCOL_ERROR.
    */
   private createServer(
-    endpoint: ActiveBrowserNetworkProxyEndpoint,
     handler: http.RequestListener,
     onUpgrade: (request: http.IncomingMessage, socket: net.Socket, head: Buffer) => void,
     onRawConnection: (socket: net.Socket) => void,
@@ -555,11 +614,17 @@ export class BrowserNetworkProxyManager {
     const httpServer = http.createServer(handler);
     httpServer.on("upgrade", (request, socket, head) => onUpgrade(request, socket as net.Socket, head));
 
+    const tlsDispatch: BrowserNetworkProxyTlsDispatch = {};
+    const installTls = (credentials: BrowserNetworkProxyTlsCredentials): https.Server => {
+      const tlsServer = https.createServer(credentials, handler);
+      tlsServer.on("upgrade", (request, socket, head) => onUpgrade(request, socket as net.Socket, head));
+      tlsDispatch.server = tlsServer;
+      return tlsServer;
+    };
     let tlsServer: https.Server | undefined;
     let tlsCredentialsFingerprint: string | undefined;
     if (credentials !== undefined) {
-      tlsServer = https.createServer(credentials, handler);
-      tlsServer.on("upgrade", (request, socket, head) => onUpgrade(request, socket as net.Socket, head));
+      tlsServer = installTls(credentials);
       tlsCredentialsFingerprint = fingerprintTlsCredentials(credentials);
     }
 
@@ -573,8 +638,8 @@ export class BrowserNetworkProxyManager {
         }
 
         socket.unshift(chunk);
-        if (chunk[0] === TLS_HANDSHAKE_RECORD_TYPE && tlsServer !== undefined) {
-          tlsServer.emit("connection", socket);
+        if (chunk[0] === TLS_HANDSHAKE_RECORD_TYPE && tlsDispatch.server !== undefined) {
+          tlsDispatch.server.emit("connection", socket);
         } else if (looksLikeHttpRequestLine(chunk)) {
           httpServer.emit("connection", socket);
         } else {
@@ -588,34 +653,44 @@ export class BrowserNetworkProxyManager {
     // sniffer and kept alive by its connection-listener closure.
     return {
       server,
+      tlsDispatch,
+      installTls,
       ...(tlsServer === undefined ? {} : { tlsServer }),
       ...(tlsCredentialsFingerprint === undefined ? {} : { tlsCredentialsFingerprint }),
     };
   }
 
-  /**
-   * Browser certificates are regenerated when DNS aliases change. Existing
-   * HTTPS servers keep their SecureContext, so reconciliation must reopen them
-   * once the certificate files contain a different identity.
-   */
-  private isTlsCredentialsCurrent(
-    listener: BrowserNetworkProxyListener,
-    _desiredEndpoint: BrowserNetworkProxyEndpoint,
-  ): boolean {
+  /** Updates aliases and certificates without taking down established sockets. */
+  private reconcileListener(listener: BrowserNetworkProxyListener, desiredEndpoint: BrowserNetworkProxyEndpoint): void {
     const credentials = this.options.tlsCredentials?.getCredentials();
-    if (credentials === undefined) {
+    const needsTls = (desiredEndpoint.publicProtocol ?? "http") === "https";
+    if (needsTls && credentials === undefined) {
       /*
        * Certificate renewal writes multiple files. Keep the old listener alive
        * during transient read gaps and rotate on the next successful read. The
        * sniffing listener still forwards raw TCP without credentials.
        */
-      return true;
+      return;
     }
-
-    // The sniffing listener terminates TLS whenever credentials exist, so a
-    // listener opened before the identity changed (or before any cert existed)
-    // must reopen to pick up the new certificate.
-    return fingerprintTlsCredentials(credentials) === listener.tlsCredentialsFingerprint;
+    try {
+      if (credentials !== undefined) {
+        const fingerprint = fingerprintTlsCredentials(credentials);
+        if (listener.tlsServer === undefined) {
+          // Install before publishing HTTPS metadata so a failed certificate
+          // parse cannot turn a working HTTP endpoint into unusable HTTPS.
+          listener.tlsServer = listener.installTls(credentials);
+          listener.tlsCredentialsFingerprint = fingerprint;
+        } else if (fingerprint !== listener.tlsCredentialsFingerprint) {
+          listener.tlsServer.setSecureContext(credentials);
+          listener.tlsCredentialsFingerprint = fingerprint;
+        }
+      }
+    } catch {
+      // Keep the previous TLS context and public origin during file rotation.
+      return;
+    }
+    listener.endpoint = { ...desiredEndpoint, listenPort: listener.endpoint.listenPort };
+    listener.metadata = buildEndpointMetadata(listener.endpoint);
   }
 }
 
@@ -649,22 +724,18 @@ function normalizeEndpoint(endpoint: BrowserNetworkProxyEndpoint): BrowserNetwor
   };
 }
 
-function isEndpointCurrent(
+function isEndpointBindCurrent(
   activeEndpoint: ActiveBrowserNetworkProxyEndpoint,
   desiredEndpoint: BrowserNetworkProxyEndpoint,
 ): boolean {
   /*
-   * Request handlers capture the active endpoint when the socket opens. Rebind
-   * whenever DNS-facing metadata changes so browser aliases do not keep stale
-   * hosts or loopback addresses after a network rename or DNS startup.
+   * The outer listener coordinate is immutable. Alias and rewrite metadata is
+   * read at request time, so its refresh must not close live HTTP or TCP flows.
    */
   return (
     activeEndpoint.networkId === desiredEndpoint.networkId &&
     activeEndpoint.logicalPort === desiredEndpoint.logicalPort &&
     activeEndpoint.listenHost === desiredEndpoint.listenHost &&
-    activeEndpoint.publicHost === desiredEndpoint.publicHost &&
-    activeEndpoint.responseRewriteLoopbackHost === desiredEndpoint.responseRewriteLoopbackHost &&
-    (activeEndpoint.publicProtocol ?? "http") === (desiredEndpoint.publicProtocol ?? "http") &&
     desiredEndpoint.listenPorts.includes(activeEndpoint.listenPort)
   );
 }
@@ -1127,6 +1198,25 @@ function listen(server: BrowserNetworkProxyServer, port: number, host: string): 
     server.once("error", onError);
     server.once("listening", onListening);
     server.listen(port, host);
+  });
+}
+
+/** Detects an already-owned listener even on runtimes that permit a shared bind. */
+function assertPortAvailable(host: string, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const probe = net.createConnection({ host, port });
+    probe.once("connect", () => {
+      probe.destroy();
+      reject(new Error(`Browser proxy bind is already occupied: ${host}:${port}`));
+    });
+    probe.once("error", (error: NodeJS.ErrnoException) => {
+      probe.destroy();
+      if (error.code === "ECONNREFUSED" || error.code === "EHOSTUNREACH" || error.code === "ENETUNREACH") {
+        resolve();
+        return;
+      }
+      reject(error);
+    });
   });
 }
 
