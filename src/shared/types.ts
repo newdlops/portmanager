@@ -828,8 +828,23 @@ export interface AgentDaemonStatus {
   readonly routeCount: number;
   /** Whether the daemon is scanning the OS listening table, not only managed rows. */
   readonly monitoringAllListeners: boolean;
+  /** True when the daemon-owned browser DNS responder is bound. Absent on older daemons. */
+  readonly browserDnsRunning?: boolean;
+  /** UDP port of the daemon-owned browser DNS responder. */
+  readonly browserDnsPort?: number;
+  /** Last browser DNS bind/socket error reported by the daemon. */
+  readonly browserDnsError?: string;
   /** Last daemon or connection error if known. */
   readonly errorMessage?: string;
+}
+
+export interface AgentBrowserDnsSyncResult {
+  /** True when the daemon-owned browser DNS responder is bound after the sync. */
+  readonly running: boolean;
+  /** UDP port the responder is bound to (or configured to bind). */
+  readonly port: number;
+  /** Bind/socket error preventing the responder from running, if any. */
+  readonly error?: string;
 }
 
 export interface ProcessLaunchRequest {

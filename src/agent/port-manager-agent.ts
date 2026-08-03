@@ -19,6 +19,7 @@ import {
 } from "./route-table";
 import type {
   AgentAllocateRouteRequest,
+  AgentBrowserDnsSyncResult,
   AgentSnapshot,
   AgentStartManagedProcessRequest,
   DisposableLike,
@@ -49,7 +50,9 @@ import {
   type RestartProcessPayload,
   type ReleaseRouteAllocationPayload,
   type StopProcessPayload,
+  type SyncBrowserDnsPayload,
 } from "./protocol";
+import { BrowserDnsServer } from "../platform/network/browser-dns-server";
 
 /**
  * Local Port Manager agent server.
@@ -119,6 +122,12 @@ export interface PortManagerAgentOptions {
   readonly routeTableWriterStartedAtMs?: number;
   /** Test-only override for deterministic route table generation metadata. */
   readonly routeTableWriterId?: string;
+  /**
+   * UDP port for the daemon-owned browser DNS responder; undefined disables
+   * it. The Node daemon is a fallback for hosts without the native agent, so
+   * responder parity keeps browser aliases working there too.
+   */
+  readonly browserDnsPort?: number;
 }
 
 export interface BuildAgentSnapshotOptions {
@@ -142,6 +151,12 @@ export interface BuildAgentSnapshotOptions {
   readonly agentVersion?: string;
   /** Detected listener row ids hidden by removeProcess. */
   readonly suppressedDetectedProcessIds?: ReadonlySet<string>;
+  /** True when the daemon-owned browser DNS responder is bound. */
+  readonly browserDnsRunning?: boolean;
+  /** UDP port of the daemon-owned browser DNS responder. */
+  readonly browserDnsPort?: number;
+  /** Last browser DNS bind/socket error, when the responder is down. */
+  readonly browserDnsError?: string;
   /** Host used when a listener address is not user-friendly for HTTP URLs. */
   readonly defaultHost?: string;
   /** CWD placeholder for detected rows, which usually cannot expose cwd. */
@@ -402,6 +417,9 @@ export class PortManagerAgent implements DisposableLike {
   /** Node net server once listen() has been called. */
   private server: Server | undefined;
 
+  /** Daemon-owned browser DNS responder; undefined when disabled by options. */
+  private readonly browserDnsServer: BrowserDnsServer | undefined;
+
   constructor(options: PortManagerAgentOptions) {
     this.registry =
       options.registry ??
@@ -457,6 +475,8 @@ export class PortManagerAgent implements DisposableLike {
     this.externalListenerMissingScanThreshold = normalizeExternalListenerMissingScanThreshold(
       options.externalListenerMissingScanThreshold,
     );
+    this.browserDnsServer =
+      options.browserDnsPort === undefined ? undefined : new BrowserDnsServer({ port: options.browserDnsPort });
 
     this.subscriptions.push(
       this.registry.onDidChange(() => {
@@ -507,6 +527,9 @@ export class PortManagerAgent implements DisposableLike {
 
     this.startListenerPolling();
     this.startRouteTableHeartbeat();
+    /* A failed UDP bind (e.g. an older extension host still holds the port)
+     * must not fail daemon startup; syncBrowserDns retries the bind. */
+    await this.browserDnsServer?.start().catch(() => undefined);
   }
 
   /** Allows agent-main to exit if the underlying socket server fails. */
@@ -536,7 +559,46 @@ export class PortManagerAgent implements DisposableLike {
       version: this.agentVersion,
       listenerCount: this.listenerScanCache?.listeners.length ?? 0,
       routeCount: routes.length,
+      ...this.buildBrowserDnsStatusFields(),
     });
+  }
+
+  /**
+   * Replaces the full browser DNS record table. Records arrive as one
+   * comma-joined `hostname=ipv4` string because the native daemon's JSON
+   * parser reads scalars only; this daemon accepts the same wire format.
+   */
+  async syncBrowserDns(records: string): Promise<AgentBrowserDnsSyncResult> {
+    if (this.browserDnsServer === undefined) {
+      return { running: false, port: 0, error: "Browser DNS is disabled for this daemon." };
+    }
+
+    this.browserDnsServer.sync(parseBrowserDnsRecordPairs(records));
+    await this.browserDnsServer.start().catch(() => undefined);
+    const error = this.browserDnsServer.isRunning() ? undefined : this.browserDnsServer.getLastError()?.message;
+
+    return {
+      running: this.browserDnsServer.isRunning(),
+      port: this.browserDnsServer.getPort(),
+      ...(error === undefined ? {} : { error }),
+    };
+  }
+
+  private buildBrowserDnsStatusFields(): {
+    readonly browserDnsRunning?: boolean;
+    readonly browserDnsPort?: number;
+    readonly browserDnsError?: string;
+  } {
+    if (this.browserDnsServer === undefined) {
+      return {};
+    }
+
+    const error = this.browserDnsServer.isRunning() ? undefined : this.browserDnsServer.getLastError()?.message;
+    return {
+      browserDnsRunning: this.browserDnsServer.isRunning(),
+      browserDnsPort: this.browserDnsServer.getPort(),
+      ...(error === undefined ? {} : { browserDnsError: error }),
+    };
   }
 
   /**
@@ -1054,6 +1116,8 @@ export class PortManagerAgent implements DisposableLike {
     }
     this.clients.clear();
 
+    this.browserDnsServer?.dispose();
+
     if (this.server !== undefined) {
       this.server.close();
       this.server = undefined;
@@ -1194,6 +1258,15 @@ export class PortManagerAgent implements DisposableLike {
         return this.repairRoutingState();
       case "flushRouteTables":
         return this.flushRouteTables();
+      case "syncBrowserDns": {
+        const records = (request.payload as SyncBrowserDnsPayload | undefined)?.records;
+        // A payload missing the records string is malformed; only an explicit
+        // empty string may wipe the table (matches the native daemon).
+        if (typeof records !== "string") {
+          throw new Error("Invalid syncBrowserDns payload.");
+        }
+        return this.syncBrowserDns(records);
+      }
     }
   }
 
@@ -1521,6 +1594,7 @@ export class PortManagerAgent implements DisposableLike {
       suppressedDetectedProcessIds: this.suppressedDetectedProcessIds,
       defaultHost: this.defaultHost,
       defaultCwd: this.defaultCwd,
+      ...this.buildBrowserDnsStatusFields(),
     });
 
     if (
@@ -2451,6 +2525,9 @@ export function buildAgentSnapshot(options: BuildAgentSnapshotOptions): AgentSna
     version: options.agentVersion,
     listenerCount: normalizedListeners.length,
     routeCount: routes.length,
+    browserDnsRunning: options.browserDnsRunning,
+    browserDnsPort: options.browserDnsPort,
+    browserDnsError: options.browserDnsError,
   });
 
   return {
@@ -2473,6 +2550,9 @@ function buildDaemonStatus(options: {
   readonly version?: string;
   readonly listenerCount: number;
   readonly routeCount: number;
+  readonly browserDnsRunning?: boolean;
+  readonly browserDnsPort?: number;
+  readonly browserDnsError?: string;
 }): AgentDaemonStatus {
   return {
     status: "running",
@@ -2485,7 +2565,21 @@ function buildDaemonStatus(options: {
     listenerCount: options.listenerCount,
     routeCount: options.routeCount,
     monitoringAllListeners: true,
+    ...(options.browserDnsRunning === undefined ? {} : { browserDnsRunning: options.browserDnsRunning }),
+    ...(options.browserDnsPort === undefined ? {} : { browserDnsPort: options.browserDnsPort }),
+    ...(options.browserDnsError === undefined ? {} : { browserDnsError: options.browserDnsError }),
   };
+}
+
+/** Splits the comma-joined `hostname=ipv4` wire format used by syncBrowserDns. */
+function parseBrowserDnsRecordPairs(records: string): readonly { hostname: string; address: string }[] {
+  return records.split(",").flatMap((pair) => {
+    const separator = pair.indexOf("=");
+    if (separator <= 0) {
+      return [];
+    }
+    return [{ hostname: pair.slice(0, separator), address: pair.slice(separator + 1) }];
+  });
 }
 
 /**

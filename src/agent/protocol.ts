@@ -1,5 +1,6 @@
 import type {
   AgentAllocateRouteRequest,
+  AgentBrowserDnsSyncResult,
   AgentDaemonStatus,
   AgentSnapshot,
   AgentStartManagedProcessRequest,
@@ -35,7 +36,8 @@ export type AgentRequestMethod =
   | "removeProcess"
   | "refreshSnapshot"
   | "repairRoutingState"
-  | "flushRouteTables";
+  | "flushRouteTables"
+  | "syncBrowserDns";
 
 export type AgentRequestId = string | number;
 
@@ -121,6 +123,16 @@ export interface ReleaseRouteAllocationPayload {
   readonly allocationId: string;
 }
 
+export interface SyncBrowserDnsPayload {
+  /**
+   * Full browser DNS record replacement as `hostname=ipv4` pairs joined by
+   * commas. The native daemon's JSON parser reads scalars only, so records
+   * ride one delimited string instead of an array (same precedent as
+   * respawnChild's comma-joined pid list).
+   */
+  readonly records: string;
+}
+
 export interface ReleaseProcessRoutePayload {
   /** PID of the hooked or registered process that owned the route. */
   readonly pid: number;
@@ -155,6 +167,7 @@ export type AgentRequestPayloadByMethod = {
   readonly refreshSnapshot: undefined;
   readonly repairRoutingState: undefined;
   readonly flushRouteTables: undefined;
+  readonly syncBrowserDns: SyncBrowserDnsPayload;
 };
 
 export type AgentResponsePayloadByMethod = {
@@ -172,6 +185,7 @@ export type AgentResponsePayloadByMethod = {
   readonly refreshSnapshot: AgentSnapshot;
   readonly repairRoutingState: AgentSnapshot;
   readonly flushRouteTables: boolean;
+  readonly syncBrowserDns: AgentBrowserDnsSyncResult;
 };
 
 /**
@@ -286,7 +300,8 @@ function isAgentRequestMethod(value: unknown): value is AgentRequestMethod {
     value === "removeProcess" ||
     value === "refreshSnapshot" ||
     value === "repairRoutingState" ||
-    value === "flushRouteTables"
+    value === "flushRouteTables" ||
+    value === "syncBrowserDns"
   );
 }
 
