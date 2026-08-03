@@ -1142,7 +1142,7 @@ test("browser proxy target resolution uses a snapshot route index before refresh
   assert.equal(source.includes("private browserProxyRouteTargetByEndpointId = new Map<string, BrowserNetworkProxyTarget>();"), true);
   assert.equal(source.includes("private browserProxyGeneratedRouteTargetByEndpointId = new Map<string, BrowserNetworkProxyTarget>();"), true);
   assert.equal(source.includes("private async readGeneratedRouteTableRoutesForNetworks"), true);
-  assert.equal(source.includes("collectBrowserProxyRouteEndpoints(routes, networks, dnsRunning, routeHintTextByEndpointId, processEndpoints)"), true);
+  assert.equal(source.includes("collectBrowserProxyRouteEndpoints(routes, networks, useDnsAlias, routeHintTextByEndpointId, processEndpoints)"), true);
   assert.equal(source.includes("mergeLogicalPortRoutes("), true);
   assert.equal(
     resolveBody.indexOf("const indexedTarget = this.findBrowserProxyRouteTarget(endpoint.networkId, endpoint.logicalPort);") <
@@ -1305,7 +1305,9 @@ test("global storage cleanup rehydrates generated routing from live attachment s
     true,
   );
   assert.equal(source.includes("private async rehydrateBrowserDnsAndProxies(): Promise<void>"), true);
-  assert.equal(source.includes("await this.startBrowserDnsServer().catch(() => undefined);"), true);
+  // Rehydration must force one awaited daemon record push: the daemon may have
+  // just been replaced and its responder needs the current table immediately.
+  assert.equal(source.includes("await this.flushBrowserDnsDaemonSync().catch(() => undefined);"), true);
   assert.equal(source.includes("this.syncBrowserDnsRecords();"), true);
   assert.equal(source.includes("this.maybeOfferBrowserDnsResolverInstall();"), true);
   assert.equal(source.includes("await this.syncBrowserNetworkProxies().catch(() => undefined);"), true);

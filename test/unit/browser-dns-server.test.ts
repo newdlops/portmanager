@@ -178,7 +178,7 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   const ownerStartupStart = networkServiceSource.indexOf("private async startControlPlaneOwnerServices");
   const ownerStartupEnd = networkServiceSource.indexOf("  /** Runs registry side effects only", ownerStartupStart);
   const ownerStartupSource = networkServiceSource.slice(ownerStartupStart, ownerStartupEnd);
-  const ownerDnsStartIndex = ownerStartupSource.indexOf("await this.startBrowserDnsServer();");
+  const ownerDnsStartIndex = ownerStartupSource.indexOf("this.syncBrowserDnsRecords();");
   const ownerConvergeIndex = ownerStartupSource.indexOf("await this.convergeDaemonAndRoutingState();");
   const ownerComposeRepairIndex = ownerStartupSource.indexOf("await this.repairPersistedPortManagerCloneComposeAttachments();");
   const reloadTerminalSelectionIndex = reloadSharedStateSource.indexOf("await this.writeTerminalNetworkSelectionFile();");
@@ -200,7 +200,10 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(ownerConvergeIndex > ownerDnsStartIndex, true);
   assert.equal(ownerComposeRepairIndex > ownerDnsStartIndex, true);
   assert.equal(browserProxySyncSource.includes("this.syncBrowserDnsRecordsForNetworks(networks)"), true);
-  assert.equal(browserProxySyncSource.includes("const dnsRunning = this.browserDnsServer.isRunning();"), true);
+  // Responder state now lives in the daemon; the owner path must consult the
+  // daemon-backed view instead of an extension-host socket.
+  assert.equal(browserProxySyncSource.includes("const dnsRunning = this.getBrowserDnsRuntimeState().running;"), true);
+  assert.equal(browserProxySyncSource.includes("this.browserDnsServer"), false);
   assert.equal(browserProxyLeaseIndex >= 0, true);
   assert.equal(browserAliasReadyIndex > browserProxyLeaseIndex, true);
   assert.equal(browserProxyApplyIndex > browserAliasReadyIndex, true);
@@ -326,8 +329,9 @@ test("Local DNS repair is a forced, user-visible recovery path", () => {
   const repairEnd = networkServiceSource.indexOf("async renewBrowserTlsCertificate", repairStart);
   const repairBody = networkServiceSource.slice(repairStart, repairEnd);
   assert.notEqual(repairStart, -1);
-  assert.equal(repairBody.includes("await this.startBrowserDnsServer();"), true);
-  assert.equal(repairBody.includes("this.syncBrowserDnsRecords();"), true);
+  // Repair must force a fresh, awaited daemon record push so its status report
+  // reflects the responder the daemon actually runs.
+  assert.equal(repairBody.includes("await this.flushBrowserDnsDaemonSync();"), true);
   assert.equal(repairBody.includes("forceResolverSetup: true"), true);
 
   const exclusiveStart = networkServiceSource.indexOf("private async installBrowserDnsResolversExclusive");

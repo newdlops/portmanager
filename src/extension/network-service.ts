@@ -52,7 +52,7 @@ import {
   type ContainerRuntimeTarget,
   runContainerCommand,
 } from "../platform/network/container-runtime";
-import { BrowserDnsServer, browserDnsPort, normalizeBrowserDnsHostname } from "../platform/network/browser-dns-server";
+import { browserDnsPort, normalizeBrowserDnsHostname } from "../platform/network/browser-dns-server";
 import {
   CONTAINER_ALIAS_SERVICE_PREFIX,
   mergeComposeContainerMappingLineage,
@@ -105,6 +105,7 @@ import { NodeProcessEnvironmentProvider } from "../platform/process/node-process
 import { NodeTerminalCandidateProvider } from "../platform/process/node-terminal-candidate-provider";
 import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
 import type {
+  AgentBrowserDnsSyncResult,
   AgentDaemonStatus,
   AgentSnapshot,
   BrowserDnsResolverStatus,
@@ -573,8 +574,25 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Reads inherited Port Manager routing scope from local client processes. */
   private readonly processEnvironmentProvider: NodeProcessEnvironmentProvider;
 
-  /** Local DNS responder that maps browser hostnames to per-network loopback addresses. */
-  private readonly browserDnsServer: BrowserDnsServer;
+  /**
+   * Browser DNS records live in the daemon (it outlives VS Code windows), so
+   * the extension only tracks its last push outcome. The signature dedupes
+   * repeat pushes; the pid detects daemon replacement; the result feeds
+   * diagnostics until the next daemon status heartbeat.
+   */
+  private lastBrowserDnsSyncResult: { readonly result: AgentBrowserDnsSyncResult; readonly atMs: number } | undefined;
+
+  /** Wire-format signature of the last records accepted by the daemon. */
+  private lastBrowserDnsPushSignature: string | undefined;
+
+  /** Daemon pid that accepted the last push, so a replaced daemon is re-synced. */
+  private lastBrowserDnsPushDaemonPid: number | undefined;
+
+  /** Latest queued wire-format records while a push is already running. */
+  private browserDnsSyncQueuedSignature: string | undefined;
+
+  /** Single-flight guard for daemon DNS pushes. */
+  private browserDnsSyncInFlight: Promise<void> | undefined;
 
   /** Container runtime adapter that provides actual same-port isolation. */
   private readonly containerRuntime: ContainerNetworkRuntimeAdapter;
@@ -820,7 +838,6 @@ export class PortManagerNetworkService implements DisposableLike {
       storageDirectory: this.context.globalStorageUri.fsPath,
     });
     this.terminalCandidateProvider = new NodeTerminalCandidateProvider();
-    this.browserDnsServer = new BrowserDnsServer();
     this.containerRuntime = new ContainerNetworkRuntimeAdapter();
     this.containerServiceDiscovery = new ContainerServiceDiscoveryAdapter();
     this.composePublishMutator = new ComposePublishMutator({
@@ -885,6 +902,14 @@ export class PortManagerNetworkService implements DisposableLike {
         this.notifyRoutingActivity();
         this.invalidateRouterVerdictsOnAttachmentChange();
         this.syncProcessTrackerRoots();
+        /*
+         * Every window pushes DNS records, not just the control-plane owner.
+         * Records derive from shared state, the daemon applies a full replace,
+         * and the push is signature-deduped, so replays from many windows
+         * converge; gating this on the owner lease is what used to freeze the
+         * resolver when ownership moved between windows.
+         */
+        this.syncBrowserDnsRecords();
         if (this.ownsControlPlaneLease) {
           this.syncComposeRoutingFreshnessHeartbeat();
           this.syncContainerEventsWatcher();
@@ -956,6 +981,9 @@ export class PortManagerNetworkService implements DisposableLike {
     // new tracker process explicitly so terminals that survived an extension
     // host restart retain network attribution immediately.
     this.syncProcessTrackerRoots();
+    // Same reason for browser DNS: an unchanged shared state emits no registry
+    // change, but a freshly replaced daemon may still need the current records.
+    this.syncBrowserDnsRecords();
     await this.refreshRuntimeDescriptors({ includeContainerRuntime: false });
     this.reconcileVscodeWindowTerminalBinding();
     await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
@@ -1031,7 +1059,6 @@ export class PortManagerNetworkService implements DisposableLike {
      * and Compose repair work so a cold VS Code launch can route immediately
      * instead of waiting for the slower control-plane reconciliation path.
      */
-    await this.startBrowserDnsServer();
     this.syncBrowserDnsRecords();
     void this.maybeOfferBrowserDnsResolverInstall();
     await this.convergeDaemonAndRoutingState();
@@ -1347,7 +1374,7 @@ export class PortManagerNetworkService implements DisposableLike {
   createBrowserDnsResolverSetupScript(): string {
     return buildBrowserDnsResolverSetupScript(
       this.buildBrowserDnsRecordsForCurrentSettings(this.registry.getSnapshot().networks),
-      this.browserDnsServer.getPort(),
+      this.getBrowserDnsRuntimeState().port,
     );
   }
 
@@ -1361,10 +1388,11 @@ export class PortManagerNetworkService implements DisposableLike {
       this.warmBrowserDnsAliasStatus();
     }
 
+    const browserDnsState = this.getBrowserDnsRuntimeState();
     return buildBrowserDnsResolverStatus(
       records,
-      this.browserDnsServer.getPort(),
-      this.browserDnsServer.isRunning(),
+      browserDnsState.port,
+      browserDnsState.running,
       agentSnapshot.processes,
       agentSnapshot.routes,
       networkSnapshot.networks,
@@ -1433,8 +1461,7 @@ export class PortManagerNetworkService implements DisposableLike {
    * refreshes the browser proxy data plane in one user-authorized operation.
    */
   async repairLocalDns(): Promise<BrowserDnsResolverStatus> {
-    await this.startBrowserDnsServer();
-    this.syncBrowserDnsRecords();
+    await this.flushBrowserDnsDaemonSync();
 
     return this.installBrowserDnsResolvers({
       forceResolverSetup: true,
@@ -1522,7 +1549,7 @@ export class PortManagerNetworkService implements DisposableLike {
       const terminalAddresses = this.collectTerminalLoopbackAddresses();
       const script =
         records.length > 0
-          ? buildBrowserDnsResolverSetupScript(records, this.browserDnsServer.getPort(), {
+          ? buildBrowserDnsResolverSetupScript(records, this.getBrowserDnsRuntimeState().port, {
               additionalLoopbackAddresses: terminalAddresses,
             })
           : buildLoopbackAliasSetupScript(terminalAddresses.length > 0 ? terminalAddresses : [address]);
@@ -1710,12 +1737,7 @@ export class PortManagerNetworkService implements DisposableLike {
     void this.context.globalState.update(BROWSER_DNS_INSTALL_OFFER_SIGNATURE_KEY, undefined);
   }
 
-  /** Starts the local DNS responder used for single-label browser aliases. */
-  private async startBrowserDnsServer(): Promise<void> {
-    await this.browserDnsServer.start().catch(() => undefined);
-  }
-
-  /** Publishes current network-name aliases to the local browser DNS responder. */
+  /** Publishes current network-name aliases to the daemon-owned DNS responder. */
   private syncBrowserDnsRecords(): void {
     this.syncBrowserDnsRecordsForNetworks(this.registry.getSnapshot().networks);
   }
@@ -1725,13 +1747,90 @@ export class PortManagerNetworkService implements DisposableLike {
     networks: readonly LogicalNetwork[],
   ): readonly NetworkDnsRecord[] {
     const records = buildBrowserDnsRecords(networks);
-    this.browserDnsServer.sync(expandBrowserDnsServerRecords(records));
+    this.queueBrowserDnsDaemonSync(encodeBrowserDnsSyncRecords(records));
     if (process.platform === "darwin" && records.length > 0) {
       // Warm the shared lo0 alias cache off the event loop so synchronous
       // status reads (tree renders) almost never pay the ifconfig spawn.
       void readLoopbackAliasAddresses();
     }
     return records;
+  }
+
+  /**
+   * Queues one daemon push of the full record set. Pushes are single-flight
+   * and skipped while the daemon already holds identical records, so bursty
+   * registry events from any number of windows collapse into one request.
+   */
+  private queueBrowserDnsDaemonSync(encodedRecords: string): void {
+    if (this.processService === undefined) {
+      return;
+    }
+
+    const daemonPid = this.getDaemonStatus().pid;
+    if (
+      encodedRecords === this.lastBrowserDnsPushSignature &&
+      daemonPid === this.lastBrowserDnsPushDaemonPid &&
+      this.lastBrowserDnsSyncResult?.result.running === true
+    ) {
+      return;
+    }
+
+    this.browserDnsSyncQueuedSignature = encodedRecords;
+    if (this.browserDnsSyncInFlight !== undefined) {
+      return;
+    }
+
+    this.browserDnsSyncInFlight = this.runBrowserDnsDaemonSyncQueue().finally(() => {
+      this.browserDnsSyncInFlight = undefined;
+    });
+  }
+
+  private async runBrowserDnsDaemonSyncQueue(): Promise<void> {
+    while (this.browserDnsSyncQueuedSignature !== undefined) {
+      const encodedRecords = this.browserDnsSyncQueuedSignature;
+      this.browserDnsSyncQueuedSignature = undefined;
+
+      try {
+        const result = await this.processService!.syncBrowserDns(encodedRecords);
+        const previousRunning = this.lastBrowserDnsSyncResult?.result.running;
+        this.lastBrowserDnsPushSignature = encodedRecords;
+        this.lastBrowserDnsPushDaemonPid = this.getDaemonStatus().pid;
+        this.lastBrowserDnsSyncResult = { result, atMs: Date.now() };
+        if (previousRunning !== result.running) {
+          this.localChangeEvents.emit();
+        }
+      } catch {
+        /*
+         * A daemon predating syncBrowserDns rejects the method; version
+         * convergence replaces it and the cleared signature retries then.
+         * Connection failures retry the same way on the next routing signal.
+         */
+        this.lastBrowserDnsPushSignature = undefined;
+      }
+    }
+  }
+
+  /** Awaits a fresh daemon push, for repair flows that must report truthfully. */
+  private async flushBrowserDnsDaemonSync(): Promise<void> {
+    this.lastBrowserDnsPushSignature = undefined;
+    this.syncBrowserDnsRecords();
+    await this.browserDnsSyncInFlight;
+  }
+
+  /**
+   * Best current view of the daemon-owned responder. The last push response is
+   * authoritative until the daemon's own status heartbeat overtakes it.
+   */
+  private getBrowserDnsRuntimeState(): { readonly running: boolean; readonly port: number } {
+    const daemon = this.getDaemonStatus();
+    const daemonUpdatedAtMs = Date.parse(daemon.updatedAt);
+    const lastSync = this.lastBrowserDnsSyncResult;
+    const preferSyncResult =
+      lastSync !== undefined && (Number.isNaN(daemonUpdatedAtMs) || lastSync.atMs >= daemonUpdatedAtMs);
+
+    const running = preferSyncResult ? lastSync.result.running : daemon.browserDnsRunning === true;
+    const port = (preferSyncResult ? lastSync.result.port : daemon.browserDnsPort) || browserDnsPort();
+    return { running, port };
   }
 
   private buildBrowserDnsRecordsForCurrentSettings(networks: readonly LogicalNetwork[]): readonly NetworkDnsRecord[] {
@@ -3230,7 +3329,6 @@ export class PortManagerNetworkService implements DisposableLike {
     void this.proxyManager.dispose();
     void this.hostGatewayProxy.dispose();
     void this.browserNetworkProxy.dispose();
-    this.browserDnsServer.dispose();
     this.logicalPortRouter.dispose();
     this.processTracker.dispose();
     releaseControlPlaneOwnerLease();
@@ -5813,12 +5911,11 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     this.ownsBrowserNetworkProxyLease = true;
-    // A closed DNS socket is recoverable during ordinary owner convergence.
-    // Record availability, not a transient bind result, keeps published aliases
-    // stable while the next reconciliation retries startup.
-    await this.startBrowserDnsServer();
-    this.syncBrowserDnsRecordsForNetworks(networks);
-    const dnsRunning = this.browserDnsServer.isRunning();
+    // A closed daemon DNS socket is recoverable during ordinary owner
+    // convergence. Record availability, not a transient bind result, keeps
+    // published aliases stable while the daemon's bind retry recovers it.
+    await this.browserDnsSyncInFlight?.catch(() => undefined);
+    const dnsRunning = this.getBrowserDnsRuntimeState().running;
     const useDnsAlias = dnsRunning || dnsRecords.length > 0;
     if (useDnsAlias) {
       await ensureBrowserDnsLoopbackAliasesReady(dnsRecords).catch(() => undefined);
@@ -6872,13 +6969,13 @@ export class PortManagerNetworkService implements DisposableLike {
   /**
    * Restores browser-facing DNS/proxy state after generated state is rebuilt.
    *
-   * Resolver files live outside globalStorage, but DNS records and browser proxy
-   * listeners are in-memory data plane state. Re-sync them here so browser aliases
-   * recover with the same command that rebuilds route tables and terminal shims.
+   * Resolver files live outside globalStorage, but browser proxy listeners are
+   * in-memory data plane state and the daemon may have just been replaced.
+   * Force one fresh record push so browser aliases recover with the same
+   * command that rebuilds route tables and terminal shims.
    */
   private async rehydrateBrowserDnsAndProxies(): Promise<void> {
-    await this.startBrowserDnsServer().catch(() => undefined);
-    this.syncBrowserDnsRecords();
+    await this.flushBrowserDnsDaemonSync().catch(() => undefined);
     this.maybeOfferBrowserDnsResolverInstall();
     await this.syncBrowserNetworkProxies().catch(() => undefined);
   }
@@ -10067,6 +10164,13 @@ function expandBrowserDnsServerRecords(records: readonly NetworkDnsRecord[]): re
     { hostname: record.hostname, address: record.address },
     { hostname: record.secureHostname, address: record.address },
   ]);
+}
+
+/** Encodes records in the daemon's syncBrowserDns wire format (comma-joined `hostname=ipv4`). */
+function encodeBrowserDnsSyncRecords(records: readonly NetworkDnsRecord[]): string {
+  return expandBrowserDnsServerRecords(records)
+    .map((record) => `${record.hostname}=${record.address}`)
+    .join(",");
 }
 
 function browserPublicHostForNetwork(networkId: string, networks: readonly LogicalNetwork[]): string | undefined {

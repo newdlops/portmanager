@@ -10,6 +10,7 @@ import { buildNodeRuntimeEnvironment } from "../platform/process/node-runtime";
 import { SimpleEventEmitter } from "../shared/events";
 import { isKnownPortManagerPackageVersion, readPortManagerPackageVersion } from "../shared/package-version";
 import type {
+  AgentBrowserDnsSyncResult,
   AgentDaemonStatus,
   AgentSnapshot,
   DisposableLike,
@@ -35,6 +36,7 @@ type AgentMethod =
   | "refreshSnapshot"
   | "repairRoutingState"
   | "flushRouteTables"
+  | "syncBrowserDns"
   | "shutdownDaemon"
   | "startManagedProcess"
   | "registerExistingProcess"
@@ -1048,6 +1050,16 @@ export class LocalAgentClient implements PortManagerProcessService {
    */
   async requestRespawnChild(parentPids: readonly number[], networkId: string, line: string): Promise<void> {
     await this.request<null>("respawnChild", { parentPids: parentPids.join(","), networkId, line });
+  }
+
+  /**
+   * Replaces the daemon-owned browser DNS table with the full current record
+   * set (comma-joined `hostname=ipv4` pairs). Any window may call this — the
+   * records derive from shared network state, so replays converge — which is
+   * what keeps the resolver fresh independent of cross-window owner leases.
+   */
+  async syncBrowserDns(records: string): Promise<AgentBrowserDnsSyncResult> {
+    return this.request<AgentBrowserDnsSyncResult>("syncBrowserDns", { records });
   }
 
   /** Sends one request and waits for the correlated response. */

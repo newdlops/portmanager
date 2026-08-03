@@ -1,5 +1,6 @@
 import type {
   DisposableLike,
+  AgentBrowserDnsSyncResult,
   AgentSnapshot,
   ManagedProcess,
   ManagedProcessStartInput,
@@ -56,6 +57,13 @@ export interface PortManagerProcessService {
    * hooked yet (the daemon reports it and the detector retries).
    */
   requestRespawnChild(parentPids: readonly number[], networkId: string, line: string): Promise<void>;
+  /**
+   * Replaces the daemon-owned browser DNS record table with the full current
+   * set, encoded as comma-joined `hostname=ipv4` pairs. Safe to call from any
+   * VS Code window: the payload is derived state and the daemon applies it as
+   * an idempotent full replace.
+   */
+  syncBrowserDns(records: string): Promise<AgentBrowserDnsSyncResult>;
   /** Releases sockets or event subscriptions during extension deactivation. */
   dispose(): void;
 }
