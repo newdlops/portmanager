@@ -105,6 +105,12 @@ typedef struct {
 } pm_listener;
 
 typedef struct {
+  /* Full browser-facing DNS name (max 253 chars), lowercase, no trailing dot. */
+  char hostname[254];
+  unsigned char address[4];
+} pm_browser_dns_record;
+
+typedef struct {
   pm_process *processes;
   size_t process_count;
   size_t process_capacity;
@@ -167,6 +173,20 @@ typedef struct {
   unsigned long next_process_id;
   unsigned long next_allocation_id;
   pid_t agent_pid;
+  /*
+   * Browser DNS responder owned by the daemon (see portmanager_agent_dns.c).
+   * fd is -1 while unbound; bound_port is 0 until a bind succeeds so
+   * memset-initialized state never reports a live responder.
+   */
+  int browser_dns_fd;
+  int browser_dns_requested_port;
+  int browser_dns_bound_port;
+  time_t browser_dns_bind_retry_after;
+  char browser_dns_error[PM_SMALL];
+  char browser_dns_state_path[PM_TEXT];
+  pm_browser_dns_record *browser_dns_items;
+  size_t browser_dns_count;
+  size_t browser_dns_capacity;
 } pm_agent_state;
 
 typedef struct {
@@ -183,6 +203,8 @@ typedef struct {
   char stale_lock_path[PM_TEXT];
   int probe_only;
   int lock_stale_mode;
+  /* Browser DNS UDP port override; -1 selects the default, 0 an ephemeral port for tests. */
+  int dns_port;
 } pm_agent_arguments;
 
 typedef struct {
@@ -281,6 +303,16 @@ int pm_state_reap_children(pm_agent_state *state);
 int pm_state_listener_signature(pm_agent_state *state, pm_buffer *signature);
 int pm_state_flush_route_tables(pm_agent_state *state);
 int pm_state_route_table_heartbeat_due(const pm_agent_state *state, time_t now);
+/** Writes text through a temp file and rename so readers never observe partial content. */
+int pm_write_atomic(const char *file_path, const char *text);
+
+/** Browser DNS responder (portmanager_agent_dns.c). */
+void pm_dns_init(pm_agent_state *state, int requested_port);
+void pm_dns_dispose(pm_agent_state *state);
+int pm_dns_maybe_rebind(pm_agent_state *state, time_t now);
+int pm_dns_handle_readable(pm_agent_state *state);
+int pm_dns_sync(pm_agent_state *state, const char *payload_json, pm_buffer *response);
+int pm_dns_append_status_fields(const pm_agent_state *state, pm_buffer *payload);
 
 int pm_parse_allocate_input(const char *payload, pm_allocate_input *input);
 int pm_parse_register_input(const char *payload, pm_register_input *input);

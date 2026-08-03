@@ -17,7 +17,7 @@
 
 static void pm_agent_usage(void) {
   fprintf(stderr,
-          "Usage: portmanager_agent --socket <path> [--route-table <path>] [--agent-main <path>]\n"
+          "Usage: portmanager_agent --socket <path> [--route-table <path>] [--agent-main <path>] [--dns-port <port>]\n"
           "       portmanager_agent --probe --socket <path> --agent-main <path>\n"
           "       portmanager_agent --lock-stale <path>\n");
 }
@@ -30,6 +30,7 @@ static int pm_copy_cli_path(char *out, size_t out_size, const char *value) {
 
 int pm_parse_agent_arguments(int argc, char **argv, pm_agent_arguments *arguments) {
   memset(arguments, 0, sizeof(*arguments));
+  arguments->dns_port = -1;
 
   for (int index = 1; index < argc; index++) {
     char *value;
@@ -67,17 +68,29 @@ int pm_parse_agent_arguments(int argc, char **argv, pm_agent_arguments *argument
       }
       continue;
     }
+    if (strcmp(argv[index - 1], "--dns-port") == 0) {
+      char *end = NULL;
+      long port = strtol(value, &end, 10);
+
+      if (end == value || *end != '\0' || port < 0 || port > 65535) {
+        pm_agent_usage();
+        return -1;
+      }
+      arguments->dns_port = (int)port;
+      continue;
+    }
     pm_agent_usage();
     return -1;
   }
 
   if (arguments->lock_stale_mode) {
     return arguments->stale_lock_path[0] == '\0' || arguments->probe_only || arguments->socket_path[0] != '\0' ||
-      arguments->route_table_path[0] != '\0' || arguments->agent_main_path[0] != '\0' ? -1 : 0;
+      arguments->route_table_path[0] != '\0' || arguments->agent_main_path[0] != '\0' ||
+      arguments->dns_port != -1 ? -1 : 0;
   }
   if (arguments->probe_only) {
     return arguments->socket_path[0] == '\0' || arguments->agent_main_path[0] == '\0' ||
-      arguments->route_table_path[0] != '\0' ? -1 : 0;
+      arguments->route_table_path[0] != '\0' || arguments->dns_port != -1 ? -1 : 0;
   }
   if (arguments->socket_path[0] == '\0') {
     pm_agent_usage();

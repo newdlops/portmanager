@@ -608,6 +608,13 @@ static int pm_dispatch(pm_agent_state *state, const pm_request *request, pm_buff
     }
     return pm_buffer_append(payload, "true");
   }
+  if (strcmp(request->method, "syncBrowserDns") == 0) {
+    if (pm_dns_sync(state, request->payload, payload) != 0) {
+      snprintf(error, error_size, "Failed to apply Port Manager browser DNS records.");
+      return -1;
+    }
+    return 0;
+  }
   if (strcmp(request->method, "allocateRoute") == 0) {
     pm_allocate_input input;
     if (pm_parse_allocate_input(request->payload, &input) != 0) {
@@ -1028,11 +1035,20 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
   while (pm_running) {
     size_t poll_count = client_count + 1;
     size_t polled_client_count = client_count;
+    size_t dns_poll_index = 0;
     int ready;
     int handled_io = 0;
     int poll_timeout_ms = PM_EVENT_LOOP_DEFAULT_POLL_MS;
     size_t accepted_this_turn = 0;
     size_t clients_read_this_turn = 0;
+
+    /* Rebind attempts are time-gated internally, so this stays cheap. The DNS
+     * fd rides the tail poll slot; client slots keep their index + 1 layout. */
+    pm_dns_maybe_rebind(state, time(NULL));
+    if (state->browser_dns_fd >= 0) {
+      dns_poll_index = poll_count;
+      poll_count++;
+    }
 
     if (snapshot_dirty && snapshot_dirty_since_ms > 0) {
       long long now_ms = pm_monotonic_milliseconds();
@@ -1080,6 +1096,10 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
         poll_timeout_ms = 0;
       }
     }
+    if (dns_poll_index > 0) {
+      poll_fds[dns_poll_index].fd = state->browser_dns_fd;
+      poll_fds[dns_poll_index].events = POLLIN;
+    }
 
     ready = poll(poll_fds, (nfds_t)poll_count, poll_timeout_ms);
     if (ready < 0) {
@@ -1093,6 +1113,15 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
     if (ready > 0 && (poll_fds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
       fprintf(stderr, "Port Manager native agent socket failed: revents=%hd\n", poll_fds[0].revents);
       break;
+    }
+
+    /* Browser lookups are data-plane traffic: answer them without marking the
+     * turn as request I/O, so resolver polling cannot defer listener scans or
+     * snapshot pacing. Error revents route through the same handler, which
+     * drops a broken socket and lets the bind retry replace it. */
+    if (ready > 0 && dns_poll_index > 0 &&
+        (poll_fds[dns_poll_index].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL))) {
+      pm_dns_handle_readable(state);
     }
 
     if (ready > 0 && (poll_fds[0].revents & POLLIN)) {
@@ -1325,7 +1354,9 @@ int main(int argc, char **argv) {
   }
 
   pm_state_init(&state, arguments.route_table_path, arguments.agent_main_path);
+  pm_dns_init(&state, arguments.dns_port);
   pm_event_loop(server_fd, &state);
+  pm_dns_dispose(&state);
   pm_state_dispose(&state);
   close(server_fd);
   unlink(arguments.socket_path);

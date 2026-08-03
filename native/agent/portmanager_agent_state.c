@@ -685,6 +685,9 @@ static void pm_adopt_previous_generation_route_files(pm_agent_state *state) {
 
 void pm_state_init(pm_agent_state *state, const char *route_table_path, const char *agent_main_path) {
   memset(state, 0, sizeof(*state));
+  /* fd 0 is a real descriptor; never let zeroed state look like a bound responder. */
+  state->browser_dns_fd = -1;
+  state->browser_dns_requested_port = -1;
   /*
    * Hints are an optional accelerator, never registry state. If either
    * allocation fails, its lookup path retains the original linear scan.
@@ -2852,7 +2855,7 @@ static char *pm_build_atomic_temp_path(const char *file_path) {
   return temp_path;
 }
 
-static int pm_write_atomic(const char *file_path, const char *text) {
+int pm_write_atomic(const char *file_path, const char *text) {
   char *temp_path;
   int fd;
   size_t length = strlen(text);
@@ -4623,7 +4626,9 @@ static int pm_append_snapshot_from_listeners(
       pm_json_append_string(payload, state->agent_main_path) != 0 ||
       pm_buffer_append(payload, ",\"version\":") != 0 ||
       pm_json_append_string(payload, state->version) != 0 ||
-      pm_buffer_appendf(payload, ",\"listenerCount\":%zu,\"routeCount\":%zu,\"monitoringAllListeners\":true},\"processes\":[", listeners->count, routes.count) != 0) {
+      pm_buffer_appendf(payload, ",\"listenerCount\":%zu,\"routeCount\":%zu,\"monitoringAllListeners\":true", listeners->count, routes.count) != 0 ||
+      pm_dns_append_status_fields(state, payload) != 0 ||
+      pm_buffer_append(payload, "},\"processes\":[") != 0) {
     goto cleanup;
   }
 
@@ -4791,7 +4796,9 @@ int pm_state_daemon_status(pm_agent_state *state, pm_buffer *payload) {
       pm_json_append_string(payload, state->agent_main_path) != 0 ||
       pm_buffer_append(payload, ",\"version\":") != 0 ||
       pm_json_append_string(payload, state->version) != 0 ||
-      pm_buffer_appendf(payload, ",\"listenerCount\":%zu,\"routeCount\":%zu,\"monitoringAllListeners\":true}", state->listener_cache_count, routes.count) != 0) {
+      pm_buffer_appendf(payload, ",\"listenerCount\":%zu,\"routeCount\":%zu,\"monitoringAllListeners\":true", state->listener_cache_count, routes.count) != 0 ||
+      pm_dns_append_status_fields(state, payload) != 0 ||
+      pm_buffer_append_char(payload, '}') != 0) {
     free(routes.items);
     return -1;
   }

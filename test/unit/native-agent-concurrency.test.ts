@@ -1464,6 +1464,9 @@ async function startNativeAgent(
     routeTablePath,
     "--agent-main",
     path.join(projectRoot, "out", "src", "agent", "agent-main.js"),
+    // An ephemeral DNS port keeps test daemons off the real responder port.
+    "--dns-port",
+    "0",
   ], {
     env: buildNodeRuntimeEnvironment({
       ...process.env,
