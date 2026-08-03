@@ -68,6 +68,7 @@ corrupting each other, and no descriptor leaks into a hooked child across
 | `router` (`portmanager_tcp_router`) | `attribute logical_port=… pid=… net=…` (source attribution per accepted connection), `route … -> host:port (forwarding)`, `resolve … -> REFUSE (no route)`, `… CONNECT FAILED`. This is the ground truth for "did the gateway demux this connection to the right per-network backend?" |
 | `hook` (`libportmanager_hook`) | Every existing `pm_debug` line is tee'd here — `connect address-only …`, `connect loopback-network …`, `connect blocked by … compose …`, `bind loopback-network …`, `child-url-route logical=… actual=… host=…`, route allocation, agent IPC, etc. |
 | `agent` (`portmanager_agent`) | `dispatch method=…` for every request except the high-frequency read-only polls (`listSnapshot`/`daemonStatus`/`refreshSnapshot`). |
+| `agent-dns` (`portmanager_agent`) | Daemon-owned browser DNS responder: `bound udp 127.0.0.1:<port> records=…` (bind succeeded, possibly after retrying while an older extension host held the port), `sync records=… running=…` per `syncBrowserDns`, `loaded … persisted records` at startup, `recvfrom failed`/`persist failed` on socket or disk errors. |
 | `ts-router` (extension host) | `resolve logical_port=… clientPid=… clientNet=… verdictNet=… composeForNet=… composePorts=…` — the TypeScript resolver's verdict, emitted **only when it is actually consulted** (if this line is missing while `router …` lines appear, the router's control channel is bound to a different window's extension host). |
 
 ## Reading it
