@@ -609,6 +609,86 @@ test("clears bind retry backoff when an owner handoff frees the browser proxy po
   }
 });
 
+test("releases browser proxy ports immediately during an owner handoff and remains reusable", async () => {
+  const upstream = http.createServer((_request, response) => {
+    response.end("target");
+  });
+  await listen(upstream, 0, "127.0.0.1");
+
+  const proxyPort = await getAvailablePort();
+  const proxy = new BrowserNetworkProxyManager({
+    resolve: () => ({ host: "127.0.0.1", port: getServerPort(upstream) }),
+  });
+  const endpoint = createEndpoint({ listenPorts: [proxyPort] });
+  const replacementOwner = http.createServer((_request, response) => {
+    response.end("replacement");
+  });
+  let replacementOwnerOpen = false;
+
+  try {
+    await proxy.sync([endpoint]);
+    assert.equal(proxy.get("network-1", 3004)?.listenPort, proxyPort);
+
+    await proxy.sync([]);
+    await proxy.releaseAll();
+    assert.equal(proxy.get("network-1", 3004), undefined);
+    await listen(replacementOwner, proxyPort, "127.0.0.1");
+    replacementOwnerOpen = true;
+
+    await closeServer(replacementOwner);
+    replacementOwnerOpen = false;
+    await proxy.sync([endpoint]);
+    assert.equal(proxy.get("network-1", 3004)?.listenPort, proxyPort);
+  } finally {
+    await proxy.dispose();
+    if (replacementOwnerOpen) {
+      await closeServer(replacementOwner).catch(() => undefined);
+    }
+    await closeServer(upstream);
+  }
+});
+
+test("closes a browser proxy opened by a sync superseded during owner handoff", async () => {
+  const proxyPort = await getAvailablePort();
+  const proxy = new BrowserNetworkProxyManager({
+    resolve: () => ({ host: "127.0.0.1", port: 1 }),
+  });
+  const endpoint = createEndpoint({ listenPorts: [proxyPort] });
+  const replacementOwner = http.createServer();
+  const mutableProxy = proxy as unknown as {
+    open(endpointToOpen: BrowserNetworkProxyEndpoint): Promise<ActiveBrowserNetworkProxyEndpoint>;
+  };
+  const originalOpen = mutableProxy.open.bind(proxy);
+  let markOpenStarted!: () => void;
+  let allowOpen!: () => void;
+  const openStarted = new Promise<void>((resolve) => {
+    markOpenStarted = resolve;
+  });
+  const openGate = new Promise<void>((resolve) => {
+    allowOpen = resolve;
+  });
+
+  mutableProxy.open = async (endpointToOpen) => {
+    markOpenStarted();
+    await openGate;
+    return originalOpen(endpointToOpen);
+  };
+
+  try {
+    const staleSync = proxy.sync([endpoint]);
+    await openStarted;
+    await proxy.releaseAll();
+    allowOpen();
+    await staleSync;
+
+    assert.equal(proxy.get("network-1", 3004), undefined);
+    await listen(replacementOwner, proxyPort, "127.0.0.1");
+  } finally {
+    await proxy.dispose();
+    await closeServer(replacementOwner).catch(() => undefined);
+  }
+});
+
 test("reuses upstream HTTP connections for repeated browser proxy requests", async () => {
   let upstreamConnectionCount = 0;
   const upstream = http.createServer((request, response) => {

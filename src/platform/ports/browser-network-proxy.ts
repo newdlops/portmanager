@@ -203,6 +203,13 @@ export class BrowserNetworkProxyManager {
   /** Once disposed, queued work must not resurrect a listener. */
   private disposed = false;
 
+  /**
+   * Cross-window owner handoff fence. A long endpoint reconciliation may still
+   * be awaiting process or socket work when its lease is revoked; the fence
+   * makes that stale operation close any listener it opened after revocation.
+   */
+  private ownershipGeneration = 0;
+
   constructor(
     private readonly targetResolver: BrowserNetworkProxyTargetResolver,
     private readonly options: BrowserNetworkProxyOptions = {},
@@ -210,11 +217,15 @@ export class BrowserNetworkProxyManager {
 
   /** Reconciles active browser proxies with the latest running web processes. */
   async sync(endpoints: Iterable<BrowserNetworkProxyEndpoint>): Promise<void> {
-    return this.serialize(() => this.syncExclusive(endpoints));
+    const ownershipGeneration = this.ownershipGeneration;
+    return this.serialize(() => this.syncExclusive(endpoints, ownershipGeneration));
   }
 
-  private async syncExclusive(endpoints: Iterable<BrowserNetworkProxyEndpoint>): Promise<void> {
-    if (this.disposed) {
+  private async syncExclusive(
+    endpoints: Iterable<BrowserNetworkProxyEndpoint>,
+    ownershipGeneration: number,
+  ): Promise<void> {
+    if (this.disposed || ownershipGeneration !== this.ownershipGeneration) {
       return;
     }
     const desired = new Map<string, BrowserNetworkProxyEndpoint>();
@@ -225,6 +236,10 @@ export class BrowserNetworkProxyManager {
     }
 
     for (const [id, listener] of [...this.listeners]) {
+      if (ownershipGeneration !== this.ownershipGeneration) {
+        return;
+      }
+
       const endpoint = desired.get(id);
       if (endpoint === undefined) {
         this.scheduleRetire(id);
@@ -240,6 +255,10 @@ export class BrowserNetworkProxyManager {
     }
 
     for (const endpoint of desired.values()) {
+      if (ownershipGeneration !== this.ownershipGeneration) {
+        return;
+      }
+
       this.cancelRetire(endpoint.id);
       if (this.listeners.has(endpoint.id)) {
         continue;
@@ -250,19 +269,34 @@ export class BrowserNetworkProxyManager {
         continue;
       }
 
-      await this.open(endpoint).catch(() => {
-        this.retryAfterById.set(endpoint.id, Date.now() + (this.options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS));
-      });
+      try {
+        await this.open(endpoint);
+        if (ownershipGeneration !== this.ownershipGeneration) {
+          await this.close(endpoint.id);
+          return;
+        }
+      } catch {
+        if (ownershipGeneration === this.ownershipGeneration) {
+          this.retryAfterById.set(
+            endpoint.id,
+            Date.now() + (this.options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS),
+          );
+        }
+      }
     }
   }
 
   /** Opens or returns one endpoint immediately, ignoring background retry backoff. */
   async ensure(endpoint: BrowserNetworkProxyEndpoint): Promise<ActiveBrowserNetworkProxyEndpoint | undefined> {
-    return this.serialize(() => this.ensureExclusive(endpoint));
+    const ownershipGeneration = this.ownershipGeneration;
+    return this.serialize(() => this.ensureExclusive(endpoint, ownershipGeneration));
   }
 
-  private async ensureExclusive(endpoint: BrowserNetworkProxyEndpoint): Promise<ActiveBrowserNetworkProxyEndpoint | undefined> {
-    if (this.disposed) {
+  private async ensureExclusive(
+    endpoint: BrowserNetworkProxyEndpoint,
+    ownershipGeneration: number,
+  ): Promise<ActiveBrowserNetworkProxyEndpoint | undefined> {
+    if (this.disposed || ownershipGeneration !== this.ownershipGeneration) {
       return undefined;
     }
     const normalizedEndpoint = normalizeEndpoint(endpoint);
@@ -277,12 +311,19 @@ export class BrowserNetworkProxyManager {
     await this.close(normalizedEndpoint.id);
 
     try {
-      return await this.open(normalizedEndpoint);
+      const activeEndpoint = await this.open(normalizedEndpoint);
+      if (ownershipGeneration !== this.ownershipGeneration) {
+        await this.close(normalizedEndpoint.id);
+        return undefined;
+      }
+      return activeEndpoint;
     } catch {
-      this.retryAfterById.set(
-        normalizedEndpoint.id,
-        Date.now() + (this.options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS),
-      );
+      if (ownershipGeneration === this.ownershipGeneration) {
+        this.retryAfterById.set(
+          normalizedEndpoint.id,
+          Date.now() + (this.options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS),
+        );
+      }
       return undefined;
     }
   }
@@ -323,17 +364,30 @@ export class BrowserNetworkProxyManager {
     await closeServer(listener.server);
   }
 
+  /**
+   * Immediately frees every browser-facing bind without permanently disposing
+   * the manager. This is distinct from ordinary sync retirement: a new owner
+   * cannot take over while the old listener waits through the grace period.
+   */
+  async releaseAll(): Promise<void> {
+    this.ownershipGeneration += 1;
+    const ids = [...this.listeners.keys()];
+    for (const id of [...this.retireTimers.keys()]) {
+      this.cancelRetire(id);
+    }
+    await Promise.all(ids.map((id) => this.close(id)));
+    this.retryAfterById.clear();
+  }
+
   /** Closes every browser proxy endpoint during extension shutdown. */
   async dispose(): Promise<void> {
     this.disposed = true;
-    await this.serialize(async () => {
-      const ids = [...this.listeners.keys()];
-      for (const id of [...this.retireTimers.keys()]) {
-        this.cancelRetire(id);
-      }
-      await Promise.all(ids.map((id) => this.close(id)));
-      this.retryAfterById.clear();
-    });
+    const pendingMutations = this.mutationTail;
+    await this.releaseAll();
+    await pendingMutations;
+    // An open that was already inside the kernel bind may have completed after
+    // the first snapshot; the generation fence makes it visible for this pass.
+    await this.releaseAll();
   }
 
   /** Queues public mutations without holding a lock across request handling. */

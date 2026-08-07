@@ -97,6 +97,16 @@ export class LogicalPortRouterManager implements DisposableLike {
   /** Shared native data-plane process that can own many logical listener ports. */
   private nativeRouter: NativeLogicalPortRouterProcess | undefined;
 
+  /**
+   * Invalidates a reconciliation that was already opening ports when another
+   * VS Code window took ownership. Without this fence, a stale async `sync`
+   * could reopen listeners after the handoff cleanup had completed.
+   */
+  private ownershipGeneration = 0;
+
+  /** Extension shutdown is terminal, while owner handoff remains reusable. */
+  private disposed = false;
+
   /** Delayed closes for ports that vanish during transient route-table refreshes. */
   private readonly retireTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
@@ -107,9 +117,18 @@ export class LogicalPortRouterManager implements DisposableLike {
 
   /** Reconciles active localhost routers with the latest logical route table. */
   async sync(logicalPorts: Iterable<number>): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
+
+    const ownershipGeneration = this.ownershipGeneration;
     const desiredPorts = new Set([...logicalPorts].filter(isTcpPort));
 
     for (const [port, listener] of [...this.listeners]) {
+      if (ownershipGeneration !== this.ownershipGeneration) {
+        return;
+      }
+
       if (!listener.isActive()) {
         await this.close(port);
         continue;
@@ -123,9 +142,17 @@ export class LogicalPortRouterManager implements DisposableLike {
     }
 
     for (const port of desiredPorts) {
+      if (ownershipGeneration !== this.ownershipGeneration) {
+        return;
+      }
+
       this.cancelRetire(port);
       try {
         await this.open(port);
+        if (ownershipGeneration !== this.ownershipGeneration) {
+          await this.close(port);
+          return;
+        }
       } catch {
         /*
          * Another VS Code window can already own one logical router port.
@@ -183,15 +210,27 @@ export class LogicalPortRouterManager implements DisposableLike {
     await listenerSet.close();
   }
 
-  /** Closes every listener owned by this router. */
-  dispose(): void {
+  /**
+   * Immediately releases every listening port during a cross-window handoff.
+   * The native helper stays warm so accepted streams and a later reacquisition
+   * do not pay an unnecessary process restart; extension shutdown closes it.
+   */
+  async releaseAll(): Promise<void> {
+    this.ownershipGeneration += 1;
     const ports = [...this.listeners.keys()];
     for (const port of [...this.retireTimers.keys()]) {
       this.cancelRetire(port);
     }
-    void Promise.all(ports.map((port) => this.close(port)));
-    void this.nativeRouter?.close();
+    await Promise.all(ports.map((port) => this.close(port)));
+  }
+
+  /** Closes every listener owned by this router. */
+  dispose(): void {
+    this.disposed = true;
+    void this.releaseAll();
+    const nativeRouter = this.nativeRouter;
     this.nativeRouter = undefined;
+    void nativeRouter?.close();
   }
 
   /** Defers destructive close so refresh gaps do not tear down active TCP streams. */

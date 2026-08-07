@@ -296,6 +296,81 @@ test("keeps logical router TCP streams across transient route gaps", async () =>
   }
 });
 
+test("releases logical router ports immediately during an owner handoff and remains reusable", async () => {
+  const targetServer = net.createServer((socket) => {
+    socket.end("target");
+  });
+  await listenServer(targetServer, 0, "127.0.0.1");
+  const logicalPort = await findFreeLoopbackPort();
+  const manager = new LogicalPortRouterManager({
+    resolve: () => ({ host: "127.0.0.1", port: serverPort(targetServer) }),
+  });
+  const replacementOwner = net.createServer((socket) => {
+    socket.end("replacement");
+  });
+  let replacementOwnerOpen = false;
+
+  try {
+    await manager.sync([logicalPort]);
+    assert.equal(await readFromPort(logicalPort), "target");
+
+    // Ordinary route removal waits through the grace period; an owner handoff
+    // must bypass it so the elected window can bind the exact port immediately.
+    await manager.sync([]);
+    await manager.releaseAll();
+    await listenServer(replacementOwner, logicalPort, "127.0.0.1");
+    replacementOwnerOpen = true;
+    assert.equal(await readFromPort(logicalPort), "replacement");
+
+    await closeServer(replacementOwner);
+    replacementOwnerOpen = false;
+    await manager.sync([logicalPort]);
+    assert.equal(await readFromPort(logicalPort), "target");
+  } finally {
+    manager.dispose();
+    if (replacementOwnerOpen) {
+      await closeServer(replacementOwner).catch(() => undefined);
+    }
+    await closeServer(targetServer).catch(() => undefined);
+  }
+});
+
+test("closes a logical router opened by a sync superseded during owner handoff", async () => {
+  const logicalPort = await findFreeLoopbackPort();
+  const manager = new LogicalPortRouterManager({
+    resolve: () => ({ host: "127.0.0.1", port: 1 }),
+  });
+  const replacementOwner = net.createServer();
+  const originalOpen = manager.open.bind(manager);
+  let markOpenStarted!: () => void;
+  let allowOpen!: () => void;
+  const openStarted = new Promise<void>((resolve) => {
+    markOpenStarted = resolve;
+  });
+  const openGate = new Promise<void>((resolve) => {
+    allowOpen = resolve;
+  });
+
+  manager.open = async (port) => {
+    markOpenStarted();
+    await openGate;
+    await originalOpen(port);
+  };
+
+  try {
+    const staleSync = manager.sync([logicalPort]);
+    await openStarted;
+    await manager.releaseAll();
+    allowOpen();
+    await staleSync;
+
+    await listenServer(replacementOwner, logicalPort, "127.0.0.1");
+  } finally {
+    manager.dispose();
+    await closeServer(replacementOwner).catch(() => undefined);
+  }
+});
+
 test("native logical router tunnels TLS responses after handshake", async () => {
   const nativeRouterPath = path.resolve(__dirname, "../../../media/native/portmanager_tcp_router");
   if (!fs.existsSync(nativeRouterPath)) {
