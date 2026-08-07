@@ -109,7 +109,12 @@ test("owner lease renewals are throttled below the lease period", () => {
   const source = readSource("src/extension/network-service.ts");
 
   assert.equal(source.includes("OWNER_LEASE_RENEW_INTERVAL_MS = 25_000"), true);
+  assert.equal(source.includes("OWNER_LEASE_HEARTBEAT_INTERVAL_MS = 10_000"), true);
   assert.equal(source.includes("function isOwnOwnerLeaseRenewalCurrent"), true);
+  assert.equal(source.includes("private startOwnerLeaseHeartbeat(): void"), true);
+  assert.equal(source.includes("private refreshOwnedLeaseHeartbeats(): void"), true);
+  assert.equal(source.includes("this.syncGatewayClaimFiles([...this.gatewayClaimPorts])"), true);
+  assert.equal(source.includes("private gatewayClaimSyncTail: Promise<void> = Promise.resolve();"), true);
   assert.equal(
     source.includes("isOwnOwnerLeaseRenewalCurrent(owner, nowMs) || writeControlPlaneOwnerLease(nowMs)"),
     true,

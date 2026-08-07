@@ -1370,11 +1370,18 @@ test("logical port routers use a single cross-window owner lease", () => {
   const ownerSignalStart = source.indexOf("private refreshOwnerLeaseFromFileSignal");
   const ownerSignalEnd = source.indexOf("private startTerminalAttachmentMarkerPolling", ownerSignalStart);
   const ownerSignalBody = source.slice(ownerSignalStart, ownerSignalEnd);
+  const browserUrlStart = source.indexOf("async getBrowserIsolatedUrl(");
+  const browserUrlEnd = source.indexOf("  /** Opens Port Manager browser URLs", browserUrlStart);
+  const browserUrlBody = source.slice(browserUrlStart, browserUrlEnd);
 
   assert.equal(source.includes("Owner lease must outlive the routing refresh interval"), true);
   assert.equal(source.includes("LOGICAL_ROUTER_OWNER_LEASE_MS = 120_000"), true);
   assert.equal(source.includes("LOGICAL_ROUTER_OWNER_LOCK_STALE_MS = 30_000"), true);
   assert.equal(source.includes("OWNER_LEASE_HANDOFF_RETRY_DELAY_MS = 1_000"), true);
+  assert.equal(source.includes("OWNER_LEASE_HEARTBEAT_INTERVAL_MS = 10_000"), true);
+  assert.equal(source.includes("private startOwnerLeaseHeartbeat(): void"), true);
+  assert.equal(source.includes("private refreshOwnedLeaseHeartbeats(): void"), true);
+  assert.equal(source.includes("this.syncGatewayClaimFiles([...this.gatewayClaimPorts])"), true);
   assert.equal(source.includes('function buildLogicalRouterOwnerControlPath(kind: "owner" | "lock"): string'), true);
   assert.equal(source.includes("function tryAcquireLogicalRouterOwnerLease(): boolean"), true);
   assert.equal(source.includes("function isActiveLogicalRouterOwner"), true);
@@ -1387,6 +1394,8 @@ test("logical port routers use a single cross-window owner lease", () => {
   assert.equal(ownerWatchBody.includes("syncFs.watch(directoryPath"), true);
   assert.equal(ownerSignalBody.includes("!this.ownsLogicalRouterLease"), true);
   assert.equal(ownerSignalBody.includes("!isActiveLogicalRouterOwner(readLogicalRouterOwner(), Date.now())"), true);
+  assert.equal(ownerSignalBody.includes("void this.demoteLogicalRouterOwner();"), true);
+  assert.equal(ownerSignalBody.includes("void this.demoteBrowserNetworkProxyOwner();"), true);
   assert.equal(ownerSignalBody.includes("void this.syncLogicalPortRouters();"), true);
   assert.equal(ownerSignalBody.includes("this.scheduleOwnerLeaseHandoffRetry(shouldRefreshLogical, shouldRefreshBrowser);"), true);
   assert.equal(ownerSignalBody.includes("private scheduleOwnerLeaseHandoffRetry"), true);
@@ -1394,8 +1403,8 @@ test("logical port routers use a single cross-window owner lease", () => {
   assert.equal(syncBody.includes("this.logicalRouterSyncInFlight !== undefined"), true);
   assert.equal(syncBody.includes("this.logicalRouterSyncQueued = true;"), true);
   assert.equal(syncBody.includes("if (!tryAcquireLogicalRouterOwnerLease())"), true);
-  assert.equal(syncBody.includes("if (this.ownsLogicalRouterLease)"), true);
-  assert.equal(syncBody.includes("this.ownsLogicalRouterLease = false;"), true);
+  assert.equal(syncBody.includes("await this.demoteLogicalRouterOwner();"), true);
+  assert.equal(syncBody.includes("this.retainsLogicalRouterOwnership(ownershipGeneration)"), true);
   assert.equal(syncBody.includes("this.ownsLogicalRouterLease = true;"), true);
   assert.equal(syncBody.includes("await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);"), true);
   assert.equal(source.includes("releaseLogicalRouterOwnerLease();"), true);
@@ -1408,10 +1417,15 @@ test("logical port routers use a single cross-window owner lease", () => {
   assert.equal(ownerSignalBody.includes("this.browserNetworkProxy.retryFailedEndpointsNow();"), true);
   assert.equal(ownerSignalBody.includes("void this.syncBrowserNetworkProxies();"), true);
   assert.equal(browserSyncBody.includes("if (!tryAcquireBrowserNetworkProxyOwnerLease())"), true);
-  assert.equal(browserSyncBody.includes("if (this.ownsBrowserNetworkProxyLease)"), true);
-  assert.equal(browserSyncBody.includes("this.ownsBrowserNetworkProxyLease = false;"), true);
+  assert.equal(browserSyncBody.includes("await this.demoteBrowserNetworkProxyOwner();"), true);
+  assert.equal(browserSyncBody.includes("this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)"), true);
   assert.equal(browserSyncBody.includes("this.ownsBrowserNetworkProxyLease = true;"), true);
   assert.equal(browserSyncBody.includes("await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);"), true);
+  assert.equal(browserUrlBody.includes("this.ensureBrowserNetworkProxyEndpointAsOwner(desiredEndpoint)"), true);
+  assert.equal(browserUrlBody.includes("if (!tryAcquireBrowserNetworkProxyOwnerLease())"), true);
+  assert.equal(browserUrlBody.includes("this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)"), true);
+  assert.equal(source.includes("this.ensureBrowserNetworkProxyEndpointAsOwner(browserEndpoint)"), true);
+  assert.equal(source.includes("const browserOwner = readBrowserNetworkProxyOwner();"), true);
   assert.equal(source.includes("BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS = 600_000"), true);
   assert.equal(source.includes("BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS = 15_000"), true);
   assert.equal(source.includes("browserProxyProcessCommandTextCache"), true);
@@ -1447,7 +1461,7 @@ test("automatic control plane side effects use a single cross-window owner lease
   const registrySideEffectEnd = source.indexOf("  /** Stops owner-only watchers", registrySideEffectStart);
   const registrySideEffectBody = source.slice(registrySideEffectStart, registrySideEffectEnd);
   const demoteStart = source.indexOf("private demoteControlPlaneOwner(): void");
-  const demoteEnd = source.indexOf("  /** Returns the latest logical network snapshot", demoteStart);
+  const demoteEnd = source.indexOf("  /** Releases fixed localhost ports", demoteStart);
   const demoteBody = source.slice(demoteStart, demoteEnd);
   const applyStart = source.indexOf("private applyVscodeWindowTerminalEnvironment(): void");
   const applyEnd = source.indexOf("  /**\n   * Prepares the loopback host", applyStart);
@@ -1504,7 +1518,13 @@ test("automatic control plane side effects use a single cross-window owner lease
   assert.equal(source.includes("void this.runControlPlaneRegistrySideEffects();"), true);
   assert.equal(
     source.includes(
-      "if (this.ownsControlPlaneLease && !this.suppressRoutingRepairSideEffects) {\n            void this.syncLogicalPortRouters();",
+      "if (this.ownsControlPlaneLease || this.ownsLogicalRouterLease) {\n              void this.syncLogicalPortRouters();",
+    ),
+    true,
+  );
+  assert.equal(
+    source.includes(
+      "if (this.ownsControlPlaneLease || this.ownsBrowserNetworkProxyLease) {\n              void this.syncBrowserNetworkProxies();",
     ),
     true,
   );

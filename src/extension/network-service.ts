@@ -81,6 +81,7 @@ import {
   browserNetworkProxyEndpointId,
   browserNetworkProxyFallbackPort,
   formatBrowserNetworkProxyUrl,
+  type ActiveBrowserNetworkProxyEndpoint,
   type BrowserNetworkProxyEndpoint,
   type BrowserNetworkProxyTarget,
   type BrowserNetworkProxyTlsCredentials,
@@ -226,6 +227,9 @@ const OWNER_LEASE_HANDOFF_RETRY_DELAY_MS = 1_000;
 // Rewriting them on every refresh tick makes every other VS Code window's
 // lease-file watcher fire, so renewals are throttled well below the lease TTL.
 const OWNER_LEASE_RENEW_INTERVAL_MS = 25_000;
+// Lease renewal cannot ride the heavy Docker/terminal reconciliation loop: one
+// slow pass can exceed the lease TTL and split listeners across VS Code windows.
+const OWNER_LEASE_HEARTBEAT_INTERVAL_MS = 10_000;
 const DAEMON_RESTART_BACKOFF_MS = 30_000;
 const TERMINAL_ATTACHMENT_MARKER_POLL_INTERVAL_MS = 500;
 // The marker poll is a fallback for missed file events. Outside a refresh
@@ -654,6 +658,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** True only after this extension host acquired the cross-window logical router owner lease. */
   private ownsLogicalRouterLease = false;
 
+  /** Invalidates logical-router work that started under a superseded owner lease. */
+  private logicalRouterOwnershipGeneration = 0;
+
   /** Delays one retry after owner release so sockets closing in the old window can settle. */
   private ownerLeaseHandoffRetryTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -675,8 +682,14 @@ export class PortManagerNetworkService implements DisposableLike {
   /** True only after this extension host acquired the cross-window browser proxy owner lease. */
   private ownsBrowserNetworkProxyLease = false;
 
+  /** Invalidates browser-proxy work that started under a superseded owner lease. */
+  private browserNetworkProxyOwnershipGeneration = 0;
+
   /** True only while this extension host owns automatic control-plane side effects. */
   private ownsControlPlaneLease = false;
+
+  /** Lightweight lease renewal independent of slow control-plane convergence. */
+  private ownerLeaseHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
   /** Disposables that must exist only in the current control-plane owner window. */
   private readonly controlPlaneOwnerDisposables: DisposableLike[] = [];
@@ -726,6 +739,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Logical ports for which a gateway bind-claim file is currently published. */
   private readonly gatewayClaimPorts = new Set<number>();
+
+  /** Serializes claim refresh and owner-loss cleanup so the cleanup always wins. */
+  private gatewayClaimSyncTail: Promise<void> = Promise.resolve();
 
   /** Short-lived PID command cache used by browser proxy sync classification. */
   private readonly browserProxyProcessCommandTextCache = new Map<number, BrowserProxyCommandTextCacheEntry>();
@@ -915,7 +931,19 @@ export class PortManagerNetworkService implements DisposableLike {
           this.syncContainerEventsWatcher();
         }
         if (!this.suppressRoutingRepairSideEffects) {
-          void this.runControlPlaneRegistrySideEffects();
+          if (this.ownsControlPlaneLease) {
+            void this.runControlPlaneRegistrySideEffects();
+          } else {
+            // Data-plane leases intentionally survive a control-plane handoff.
+            // Their owner must therefore consume shared registry changes even
+            // when another VS Code window runs Docker/terminal discovery.
+            if (this.ownsLogicalRouterLease) {
+              void this.syncLogicalPortRouters();
+            }
+            if (this.ownsBrowserNetworkProxyLease) {
+              void this.syncBrowserNetworkProxies();
+            }
+          }
         }
         this.reconcileVscodeWindowTerminalBinding();
       }),
@@ -924,11 +952,17 @@ export class PortManagerNetworkService implements DisposableLike {
       this.disposables.push(
         this.processService.onDidChange(() => {
           this.notifyRoutingActivity();
-          if (this.ownsControlPlaneLease && !this.suppressRoutingRepairSideEffects) {
-            void this.syncLogicalPortRouters();
-            void this.syncBrowserNetworkProxies();
-            void this.writeTerminalNetworkSelectionFile();
-            void this.detectAndRespawnEscapedServers();
+          if (!this.suppressRoutingRepairSideEffects) {
+            if (this.ownsControlPlaneLease || this.ownsLogicalRouterLease) {
+              void this.syncLogicalPortRouters();
+            }
+            if (this.ownsControlPlaneLease || this.ownsBrowserNetworkProxyLease) {
+              void this.syncBrowserNetworkProxies();
+            }
+            if (this.ownsControlPlaneLease) {
+              void this.writeTerminalNetworkSelectionFile();
+              void this.detectAndRespawnEscapedServers();
+            }
           }
           this.localChangeEvents.emit();
         }),
@@ -968,14 +1002,20 @@ export class PortManagerNetworkService implements DisposableLike {
         }
         if (event.affectsConfiguration("portManager")) {
           void this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
+          if (this.ownsControlPlaneLease || this.ownsLogicalRouterLease) {
+            void this.syncLogicalPortRouters();
+          }
+          if (this.ownsControlPlaneLease || this.ownsBrowserNetworkProxyLease) {
+            void this.syncBrowserNetworkProxies();
+          }
           if (this.ownsControlPlaneLease) {
             void this.writeTerminalNetworkSelectionFile();
-            void this.syncBrowserNetworkProxies();
           }
         }
       }),
     );
 
+    this.startOwnerLeaseHeartbeat();
     await this.reloadSharedNetworkState();
     // Constructor-loaded attachments do not emit a registry change. Seed the
     // new tracker process explicitly so terminals that survived an extension
@@ -988,6 +1028,48 @@ export class PortManagerNetworkService implements DisposableLike {
     this.reconcileVscodeWindowTerminalBinding();
     await this.refreshVscodeWindowTerminalEnvironment({ interactive: false });
     await this.startControlPlaneOwnerIfAvailable();
+  }
+
+  /**
+   * Keeps each lease this window actually owns fresh while heavier async work
+   * is still in flight. Non-owner windows wake on the same timer but do no I/O.
+   */
+  private startOwnerLeaseHeartbeat(): void {
+    if (this.ownerLeaseHeartbeatTimer !== undefined) {
+      return;
+    }
+
+    this.ownerLeaseHeartbeatTimer = setInterval(() => {
+      this.refreshOwnedLeaseHeartbeats();
+    }, OWNER_LEASE_HEARTBEAT_INTERVAL_MS);
+    this.ownerLeaseHeartbeatTimer.unref?.();
+  }
+
+  /** Renews owned leases and immediately relinquishes any lease another window replaced. */
+  private refreshOwnedLeaseHeartbeats(): void {
+    if (this.ownsControlPlaneLease && !tryAcquireControlPlaneOwnerLease()) {
+      this.demoteControlPlaneOwner();
+    }
+
+    if (this.ownsLogicalRouterLease) {
+      if (!this.retainsLogicalRouterOwnership(this.logicalRouterOwnershipGeneration)) {
+        void this.demoteLogicalRouterOwner();
+      } else if (this.gatewayClaimPorts.size > 0) {
+        /*
+         * Claims expire after the route-table TTL (15 seconds), while the heavy
+         * idle reconcile can back off to 60 seconds. Renew only the already-owned
+         * set here; discovering which ports are desired stays in reconciliation.
+         */
+        void this.syncGatewayClaimFiles([...this.gatewayClaimPorts]).catch(() => undefined);
+      }
+    }
+
+    if (
+      this.ownsBrowserNetworkProxyLease &&
+      !this.retainsBrowserNetworkProxyOwnership(this.browserNetworkProxyOwnershipGeneration)
+    ) {
+      void this.demoteBrowserNetworkProxyOwner();
+    }
   }
 
   /** Attempts to become the single automatic control-plane owner for this OS user. */
@@ -1187,6 +1269,58 @@ export class PortManagerNetworkService implements DisposableLike {
     }
   }
 
+  /** Releases fixed localhost ports as soon as this window loses router ownership. */
+  private async demoteLogicalRouterOwner(): Promise<void> {
+    this.ownsLogicalRouterLease = false;
+    this.logicalRouterOwnershipGeneration += 1;
+    /*
+     * Cleanup is deliberately idempotent. A stale sync can finish after the
+     * heartbeat's first demotion pass, so a second pass must close anything it
+     * managed to publish late instead of returning just because the flag is false.
+     */
+    await Promise.all([
+      this.logicalPortRouter.releaseAll().catch(() => undefined),
+      this.syncGatewayClaimFiles([]).catch(() => undefined),
+    ]);
+    // Publish availability only after fixed ports and their claim files are gone.
+    releaseLogicalRouterOwnerLease();
+  }
+
+  /** Releases browser alias listeners immediately instead of waiting through route-retire grace. */
+  private async demoteBrowserNetworkProxyOwner(): Promise<void> {
+    this.ownsBrowserNetworkProxyLease = false;
+    this.browserNetworkProxyOwnershipGeneration += 1;
+    // As with logical routers, repeat cleanup catches host gateways opened by an
+    // old reconciliation after its first asynchronous demotion pass began.
+    await Promise.all([
+      this.syncHostGatewayProxies([]).catch(() => undefined),
+      this.browserNetworkProxy.releaseAll().catch(() => undefined),
+    ]);
+    releaseBrowserNetworkProxyOwnerLease();
+  }
+
+  /** Fences logical-router writes against a lease document replaced by another window. */
+  private retainsLogicalRouterOwnership(generation: number): boolean {
+    const owner = readLogicalRouterOwner();
+    return (
+      this.ownsLogicalRouterLease &&
+      generation === this.logicalRouterOwnershipGeneration &&
+      owner?.pid === process.pid &&
+      tryAcquireLogicalRouterOwnerLease()
+    );
+  }
+
+  /** Fences browser-proxy writes against a lease document replaced by another window. */
+  private retainsBrowserNetworkProxyOwnership(generation: number): boolean {
+    const owner = readBrowserNetworkProxyOwner();
+    return (
+      this.ownsBrowserNetworkProxyLease &&
+      generation === this.browserNetworkProxyOwnershipGeneration &&
+      owner?.pid === process.pid &&
+      tryAcquireBrowserNetworkProxyOwnerLease()
+    );
+  }
+
   /** Returns the latest logical network snapshot for the sidebar. */
   getSnapshot(): NetworkSnapshot {
     return {
@@ -1308,8 +1442,44 @@ export class PortManagerNetworkService implements DisposableLike {
       }
       return formatBrowserNetworkProxyUrl({ ...desiredEndpoint, ...published, listenPort: published.listenPort });
     }
-    const endpoint = await this.browserNetworkProxy.ensure(desiredEndpoint);
-    return endpoint === undefined ? undefined : formatBrowserNetworkProxyUrl(endpoint);
+    const endpoint = await this.ensureBrowserNetworkProxyEndpointAsOwner(desiredEndpoint);
+    if (endpoint !== undefined) {
+      return formatBrowserNetworkProxyUrl(endpoint);
+    }
+
+    // Another window can win election between the first owner read and our
+    // acquire. Use its publication instead of opening a second alias listener.
+    const currentOwner = readBrowserNetworkProxyOwner();
+    const currentPublished = findPublishedBrowserProxyEndpoint(currentOwner, desiredEndpoint);
+    return currentPublished === undefined
+      ? undefined
+      : formatBrowserNetworkProxyUrl({
+          ...desiredEndpoint,
+          ...currentPublished,
+          listenPort: currentPublished.listenPort,
+        });
+  }
+
+  /** Opens an on-demand browser endpoint only after winning the shared data-plane lease. */
+  private async ensureBrowserNetworkProxyEndpointAsOwner(
+    endpoint: BrowserNetworkProxyEndpoint,
+  ): Promise<ActiveBrowserNetworkProxyEndpoint | undefined> {
+    if (!tryAcquireBrowserNetworkProxyOwnerLease()) {
+      if (this.ownsBrowserNetworkProxyLease) {
+        await this.demoteBrowserNetworkProxyOwner();
+      }
+      return undefined;
+    }
+
+    this.ownsBrowserNetworkProxyLease = true;
+    const ownershipGeneration = this.browserNetworkProxyOwnershipGeneration;
+    const activeEndpoint = await this.browserNetworkProxy.ensure(endpoint);
+    if (!this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)) {
+      await this.demoteBrowserNetworkProxyOwner();
+      return undefined;
+    }
+
+    return activeEndpoint;
   }
 
   /** Opens Port Manager browser URLs through the platform default browser. */
@@ -2574,8 +2744,18 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
+    const browserOwner = readBrowserNetworkProxyOwner();
+    if (browserOwner?.pid !== process.pid && isActiveBrowserNetworkProxyOwner(browserOwner, Date.now())) {
+      /*
+       * The exposure row is shared immediately after this method returns. Its
+       * elected browser data-plane owner consumes that registry change and opens
+       * the listener; opening it locally as well would split endpoint ownership.
+       */
+      return;
+    }
+
     this.browserProxyExposureByEndpointId.set(browserEndpoint.id, exposure);
-    const activeEndpoint = await this.browserNetworkProxy.ensure(browserEndpoint);
+    const activeEndpoint = await this.ensureBrowserNetworkProxyEndpointAsOwner(browserEndpoint);
     if (activeEndpoint === undefined) {
       this.browserProxyExposureByEndpointId.delete(browserEndpoint.id);
       throw new Error(`Could not listen on ${exposure.hostAddress}:${exposure.hostPort}. The port may be in use.`);
@@ -3298,6 +3478,10 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Releases listeners and event subscriptions. */
   dispose(): void {
+    if (this.ownerLeaseHeartbeatTimer !== undefined) {
+      clearInterval(this.ownerLeaseHeartbeatTimer);
+      this.ownerLeaseHeartbeatTimer = undefined;
+    }
     if (this.routingSignalRefreshTimer !== undefined) {
       clearTimeout(this.routingSignalRefreshTimer);
       this.routingSignalRefreshTimer = undefined;
@@ -3324,6 +3508,13 @@ export class PortManagerNetworkService implements DisposableLike {
       disposable.dispose();
     }
 
+    // Fence queued reconciliation before listener managers begin their terminal
+    // disposal. Lease release itself still checks the on-disk PID below.
+    this.ownsControlPlaneLease = false;
+    this.ownsLogicalRouterLease = false;
+    this.ownsBrowserNetworkProxyLease = false;
+    this.logicalRouterOwnershipGeneration += 1;
+    this.browserNetworkProxyOwnershipGeneration += 1;
     this.registry.dispose();
     this.localChangeEvents.clear();
     void this.proxyManager.dispose();
@@ -3334,9 +3525,6 @@ export class PortManagerNetworkService implements DisposableLike {
     releaseControlPlaneOwnerLease();
     releaseLogicalRouterOwnerLease();
     releaseBrowserNetworkProxyOwnerLease();
-    this.ownsControlPlaneLease = false;
-    this.ownsLogicalRouterLease = false;
-    this.ownsBrowserNetworkProxyLease = false;
   }
 
   /** Reads persisted logical network state from VS Code global storage. */
@@ -4341,6 +4529,10 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Attempts ownership handoff for lease files touched by another extension host. */
   private refreshOwnerLeaseFromFileSignal(changedName: string | undefined): void {
     const controlPlaneChanged = changedName === undefined || changedName === path.basename(CONTROL_PLANE_OWNER_PATH);
+    const logicalRouterChanged =
+      changedName === undefined || changedName === path.basename(LOGICAL_ROUTER_OWNER_PATH);
+    const browserNetworkProxyChanged =
+      changedName === undefined || changedName === path.basename(BROWSER_NETWORK_PROXY_OWNER_PATH);
     if (controlPlaneChanged) {
       invalidateControlPlaneOwnerDisplayCache();
     }
@@ -4355,8 +4547,24 @@ export class PortManagerNetworkService implements DisposableLike {
       const currentOwner = readControlPlaneOwner();
       if (currentOwner?.pid !== process.pid && isActiveControlPlaneOwner(currentOwner, Date.now())) {
         this.demoteControlPlaneOwner();
-        this.localChangeEvents.emit();
-        return;
+      }
+    }
+
+    /*
+     * Data-plane owners need the same watcher-driven demotion as the control
+     * plane. Merely preventing the next refresh leaves sockets from the previous
+     * owner alive and lets ports become permanently split across windows.
+     */
+    if (logicalRouterChanged && this.ownsLogicalRouterLease) {
+      const currentOwner = readLogicalRouterOwner();
+      if (currentOwner?.pid !== process.pid && isActiveLogicalRouterOwner(currentOwner, Date.now())) {
+        void this.demoteLogicalRouterOwner();
+      }
+    }
+    if (browserNetworkProxyChanged && this.ownsBrowserNetworkProxyLease) {
+      const currentOwner = readBrowserNetworkProxyOwner();
+      if (currentOwner?.pid !== process.pid && isActiveBrowserNetworkProxyOwner(currentOwner, Date.now())) {
+        void this.demoteBrowserNetworkProxyOwner();
       }
     }
 
@@ -4365,11 +4573,11 @@ export class PortManagerNetworkService implements DisposableLike {
       !this.ownsControlPlaneLease &&
       !isActiveControlPlaneOwner(readControlPlaneOwner(), Date.now());
     const shouldRefreshLogical =
-      (changedName === undefined || changedName === path.basename(LOGICAL_ROUTER_OWNER_PATH)) &&
+      logicalRouterChanged &&
       !this.ownsLogicalRouterLease &&
       !isActiveLogicalRouterOwner(readLogicalRouterOwner(), Date.now());
     const shouldRefreshBrowser =
-      (changedName === undefined || changedName === path.basename(BROWSER_NETWORK_PROXY_OWNER_PATH)) &&
+      browserNetworkProxyChanged &&
       !this.ownsBrowserNetworkProxyLease &&
       !isActiveBrowserNetworkProxyOwner(readBrowserNetworkProxyOwner(), Date.now());
 
@@ -5813,19 +6021,24 @@ export class PortManagerNetworkService implements DisposableLike {
     );
 
     if (!tryAcquireLogicalRouterOwnerLease()) {
-      if (this.ownsLogicalRouterLease) {
-        this.ownsLogicalRouterLease = false;
-        await this.logicalPortRouter.sync([]).catch(() => undefined);
-        await this.syncGatewayClaimFiles([]).catch(() => undefined);
-      }
+      await this.demoteLogicalRouterOwner();
       return;
     }
 
     this.ownsLogicalRouterLease = true;
+    const ownershipGeneration = this.logicalRouterOwnershipGeneration;
     // Publish claims before opening listeners so a scope-less server that races
     // the router relocates instead of losing the port.
     await this.syncGatewayClaimFiles(logicalPorts).catch(() => undefined);
+    if (!this.retainsLogicalRouterOwnership(ownershipGeneration)) {
+      await this.demoteLogicalRouterOwner();
+      return;
+    }
+
     await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);
+    if (!this.retainsLogicalRouterOwnership(ownershipGeneration)) {
+      await this.demoteLogicalRouterOwner();
+    }
   }
 
   /**
@@ -5836,7 +6049,15 @@ export class PortManagerNetworkService implements DisposableLike {
    * are rewritten each sync so their TTL acts as a heartbeat: if this window
    * dies, the claims expire and scope-less binds pass through normally again.
    */
-  private async syncGatewayClaimFiles(ports: readonly number[]): Promise<void> {
+  private syncGatewayClaimFiles(ports: readonly number[]): Promise<void> {
+    const desiredPorts = [...ports];
+    const operation = this.gatewayClaimSyncTail.then(() => this.syncGatewayClaimFilesExclusive(desiredPorts));
+    // A failed best-effort write must not poison later owner-loss cleanup.
+    this.gatewayClaimSyncTail = operation.catch(() => undefined);
+    return operation;
+  }
+
+  private async syncGatewayClaimFilesExclusive(ports: readonly number[]): Promise<void> {
     const desired = new Set(ports);
     const baseRouteTablePath = getDefaultRouteTablePath();
     const expiresAtMs = Date.now() + ROUTE_TABLE_TTL_MS;
@@ -5902,15 +6123,12 @@ export class PortManagerNetworkService implements DisposableLike {
     const dnsRecords = this.syncBrowserDnsRecordsForNetworks(networks);
 
     if (!tryAcquireBrowserNetworkProxyOwnerLease()) {
-      if (this.ownsBrowserNetworkProxyLease) {
-        this.ownsBrowserNetworkProxyLease = false;
-        await this.syncHostGatewayProxies([]).catch(() => undefined);
-        await this.browserNetworkProxy.sync([]).catch(() => undefined);
-      }
+      await this.demoteBrowserNetworkProxyOwner();
       return;
     }
 
     this.ownsBrowserNetworkProxyLease = true;
+    const ownershipGeneration = this.browserNetworkProxyOwnershipGeneration;
     // A closed daemon DNS socket is recoverable during ordinary owner
     // convergence. Record availability, not a transient bind result, keeps
     // published aliases stable while the daemon's bind retry recovers it.
@@ -5919,6 +6137,10 @@ export class PortManagerNetworkService implements DisposableLike {
     const useDnsAlias = dnsRunning || dnsRecords.length > 0;
     if (useDnsAlias) {
       await ensureBrowserDnsLoopbackAliasesReady(dnsRecords).catch(() => undefined);
+    }
+    if (!this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)) {
+      await this.demoteBrowserNetworkProxyOwner();
+      return;
     }
 
     const routes = mergeLogicalPortRoutes(
@@ -5933,6 +6155,10 @@ export class PortManagerNetworkService implements DisposableLike {
       processCommandTextByPid,
     );
     const routeHintTextByEndpointId = await this.readBrowserProxyRouteHintTexts(routes);
+    if (!this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)) {
+      await this.demoteBrowserNetworkProxyOwner();
+      return;
+    }
     /*
      * Active loopback host exposures ride the sniffing listener so browsers can
      * open https://localhost:<port>; they must stay in the desired endpoint set
@@ -5999,17 +6225,39 @@ export class PortManagerNetworkService implements DisposableLike {
         hostLocalGatewayRedirects.map((redirect) => ({ address: redirect.targetAddress })),
       ).catch(() => undefined);
     }
+    if (!this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)) {
+      await this.demoteBrowserNetworkProxyOwner();
+      return;
+    }
 
     await this.releaseHostGatewayPortsForBrowserEndpoints(endpoints).catch(() => undefined);
+    if (!this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)) {
+      await this.demoteBrowserNetworkProxyOwner();
+      return;
+    }
+
     await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);
+    if (!this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)) {
+      await this.demoteBrowserNetworkProxyOwner();
+      return;
+    }
+
     // Workers consume the elected owner's concrete port instead of attempting
     // a local bind when their DNS responder has not been started.
     publishBrowserNetworkProxyOwnerEndpoints(this.browserNetworkProxy, endpoints);
     await this.syncHostGatewayProxies(hostGatewayExposures).catch(() => undefined);
+    if (!this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)) {
+      await this.demoteBrowserNetworkProxyOwner();
+      return;
+    }
+
     // Keep privileged reconciliation inside the outer coalescer. Explicit
     // state changes that arrive while macOS authorization is open are queued
     // and replayed against the latest snapshot after the prompt completes.
     await this.syncHostLocalGatewayRedirects(hostLocalGatewayRedirects, options);
+    if (!this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)) {
+      await this.demoteBrowserNetworkProxyOwner();
+    }
   }
 
   /**
