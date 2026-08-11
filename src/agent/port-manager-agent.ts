@@ -128,6 +128,8 @@ export interface PortManagerAgentOptions {
    * responder parity keeps browser aliases working there too.
    */
   readonly browserDnsPort?: number;
+  /** Test-only responder injection; normal fallback construction still owns the default server. */
+  readonly browserDnsServer?: BrowserDnsServer;
 }
 
 export interface BuildAgentSnapshotOptions {
@@ -420,6 +422,10 @@ export class PortManagerAgent implements DisposableLike {
   /** Daemon-owned browser DNS responder; undefined when disabled by options. */
   private readonly browserDnsServer: BrowserDnsServer | undefined;
 
+  /** Sidecar persistence survives fallback-daemon restarts and carries the write fence. */
+  private readonly browserDnsStatePath: string;
+  private browserDnsRevision: string | undefined;
+
   constructor(options: PortManagerAgentOptions) {
     this.registry =
       options.registry ??
@@ -475,8 +481,10 @@ export class PortManagerAgent implements DisposableLike {
     this.externalListenerMissingScanThreshold = normalizeExternalListenerMissingScanThreshold(
       options.externalListenerMissingScanThreshold,
     );
-    this.browserDnsServer =
-      options.browserDnsPort === undefined ? undefined : new BrowserDnsServer({ port: options.browserDnsPort });
+    this.browserDnsServer = options.browserDnsServer ??
+      (options.browserDnsPort === undefined ? undefined : new BrowserDnsServer({ port: options.browserDnsPort }));
+    this.browserDnsStatePath = browserDnsStatePathForRouteTable(this.routeTablePath);
+    this.restoreBrowserDnsState();
 
     this.subscriptions.push(
       this.registry.onDidChange(() => {
@@ -568,16 +576,35 @@ export class PortManagerAgent implements DisposableLike {
    * comma-joined `hostname=ipv4` string because the native daemon's JSON
    * parser reads scalars only; this daemon accepts the same wire format.
    */
-  async syncBrowserDns(records: string): Promise<AgentBrowserDnsSyncResult> {
+  async syncBrowserDns(
+    records: string,
+    revision?: string,
+    sharedStatePath?: string,
+  ): Promise<AgentBrowserDnsSyncResult> {
     if (this.browserDnsServer === undefined) {
       return { running: false, port: 0, error: "Browser DNS is disabled for this daemon." };
     }
 
-    this.browserDnsServer.sync(parseBrowserDnsRecordPairs(records));
+    if (
+      (revision !== undefined && !sharedStateRevisionMatches(sharedStatePath, revision)) ||
+      (revision === undefined && this.browserDnsRevision !== undefined)
+    ) {
+      return { applied: false, running: this.browserDnsServer.isRunning(), port: this.browserDnsServer.getPort() };
+    }
+
+    const isReplay = revision !== undefined && revision === this.browserDnsRevision;
+    if (!isReplay && !this.persistBrowserDnsState(records, revision)) {
+      return { applied: false, running: this.browserDnsServer.isRunning(), port: this.browserDnsServer.getPort() };
+    }
+    if (!isReplay) {
+      this.browserDnsServer.sync(parseBrowserDnsRecordPairs(records));
+      this.browserDnsRevision = revision;
+    }
     await this.browserDnsServer.start().catch(() => undefined);
     const error = this.browserDnsServer.isRunning() ? undefined : this.browserDnsServer.getLastError()?.message;
 
     return {
+      applied: true,
       running: this.browserDnsServer.isRunning(),
       port: this.browserDnsServer.getPort(),
       ...(error === undefined ? {} : { error }),
@@ -1265,8 +1292,37 @@ export class PortManagerAgent implements DisposableLike {
         if (typeof records !== "string") {
           throw new Error("Invalid syncBrowserDns payload.");
         }
-        return this.syncBrowserDns(records);
+        const payload = request.payload as SyncBrowserDnsPayload;
+        return this.syncBrowserDns(records, payload.revision, payload.sharedStatePath);
       }
+    }
+  }
+
+  /** Restores the accepted table before binding so restart never reopens a stale writer window. */
+  private restoreBrowserDnsState(): void {
+    if (this.browserDnsServer === undefined) {
+      return;
+    }
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.browserDnsStatePath, "utf8")) as { revision?: unknown; records?: unknown };
+      if (typeof parsed.records === "string") {
+        this.browserDnsRevision = typeof parsed.revision === "string" ? parsed.revision : undefined;
+        this.browserDnsServer.sync(parseBrowserDnsRecordPairs(parsed.records));
+      }
+    } catch {
+      // A missing or corrupt sidecar is not authority to clear a live table.
+    }
+  }
+
+  private persistBrowserDnsState(records: string, revision: string | undefined): boolean {
+    try {
+      writeAtomicRouteTableFile(
+        this.browserDnsStatePath,
+        `${JSON.stringify({ ...(revision === undefined ? {} : { revision }), records })}\n`,
+      );
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -2580,6 +2636,35 @@ function parseBrowserDnsRecordPairs(records: string): readonly { hostname: strin
     }
     return [{ hostname: pair.slice(0, separator), address: pair.slice(separator + 1) }];
   });
+}
+
+function browserDnsStatePathForRouteTable(routeTablePath: string): string {
+  const parsed = path.parse(routeTablePath);
+  // Keep this sidecar outside route-table generation cleanup globs.
+  return path.join(parsed.dir, `.${parsed.name}-browser-dns.json`);
+}
+
+/** Missing or malformed authority is deliberately a rejection, never an empty table. */
+function sharedStateRevisionMatches(sharedStatePath: string | undefined, revision: string): boolean {
+  if (sharedStatePath === undefined || revision.length === 0) {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(sharedStatePath, "utf8")) as { version?: unknown; revision?: unknown; state?: unknown };
+    const isVersionedEnvelope = "version" in parsed || "revision" in parsed || "state" in parsed;
+    return (
+      (revision !== "legacy" && parsed.version === 1 && parsed.revision === revision && isSharedNetworkRegistryState(parsed.state)) ||
+      (revision === "legacy" && !isVersionedEnvelope && isSharedNetworkRegistryState(parsed))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isSharedNetworkRegistryState(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const state = value as { networks?: unknown; attachments?: unknown; exposures?: unknown };
+  return Array.isArray(state.networks) && Array.isArray(state.attachments) && Array.isArray(state.exposures);
 }
 
 /**
