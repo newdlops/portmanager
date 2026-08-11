@@ -839,6 +839,8 @@ export interface AgentDaemonStatus {
 }
 
 export interface AgentBrowserDnsSyncResult {
+  /** False means the daemon rejected a stale or unverifiable full replacement. */
+  readonly applied?: boolean;
   /** True when the daemon-owned browser DNS responder is bound after the sync. */
   readonly running: boolean;
   /** UDP port the responder is bound to (or configured to bind). */

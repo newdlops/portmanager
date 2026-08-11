@@ -63,7 +63,7 @@ export interface PortManagerProcessService {
    * VS Code window: the payload is derived state and the daemon applies it as
    * an idempotent full replace.
    */
-  syncBrowserDns(records: string): Promise<AgentBrowserDnsSyncResult>;
+  syncBrowserDns(records: string, revision?: string, sharedStatePath?: string): Promise<AgentBrowserDnsSyncResult>;
   /** Releases sockets or event subscriptions during extension deactivation. */
   dispose(): void;
 }

@@ -131,6 +131,10 @@ export interface SyncBrowserDnsPayload {
    * respawnChild's comma-joined pid list).
    */
   readonly records: string;
+  /** Revision of the durable shared network document that produced `records`. */
+  readonly revision?: string;
+  /** Absolute path of that document; daemons verify the revision before replacing. */
+  readonly sharedStatePath?: string;
 }
 
 export interface ReleaseProcessRoutePayload {

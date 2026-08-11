@@ -1058,8 +1058,16 @@ export class LocalAgentClient implements PortManagerProcessService {
    * records derive from shared network state, so replays converge — which is
    * what keeps the resolver fresh independent of cross-window owner leases.
    */
-  async syncBrowserDns(records: string): Promise<AgentBrowserDnsSyncResult> {
-    return this.request<AgentBrowserDnsSyncResult>("syncBrowserDns", { records });
+  async syncBrowserDns(
+    records: string,
+    revision?: string,
+    sharedStatePath?: string,
+  ): Promise<AgentBrowserDnsSyncResult> {
+    return this.request<AgentBrowserDnsSyncResult>("syncBrowserDns", {
+      records,
+      ...(revision === undefined ? {} : { revision }),
+      ...(sharedStatePath === undefined ? {} : { sharedStatePath }),
+    });
   }
 
   /** Sends one request and waits for the correlated response. */
