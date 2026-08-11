@@ -49,8 +49,11 @@ test("network service pushes browser DNS records from every window, not only the
   // The un-gated push is the multi-window fix: gating record sync on the
   // control-plane lease froze the resolver whenever ownership moved windows.
   assert.equal(registryHandler.includes("this.syncBrowserDnsRecords();"), true);
-  assert.equal(source.includes("private queueBrowserDnsDaemonSync("), true);
-  assert.equal(source.includes("syncBrowserDns(encodedRecords)"), true);
+  assert.equal(source.includes("BrowserDnsSyncCoordinator"), true);
+  assert.equal(source.includes("browserDnsSyncCoordinator?.enqueue"), true);
+  assert.equal(source.includes("syncBrowserDns(batch.records, batch.revision, batch.sharedStatePath)"), true);
+  assert.equal(source.includes("resolveRejectedBrowserDnsSync"), true);
+  assert.equal(source.includes("waitForCurrentDrain"), true);
   // The extension host must no longer own a responder socket of its own.
   assert.equal(source.includes("new BrowserDnsServer("), false);
   assert.equal(source.includes("encodeBrowserDnsSyncRecords"), true);
@@ -161,6 +164,128 @@ if (!fs.existsSync(nativeAgentPath)) {
     assert.equal(fs.readFileSync(persistedPath, "utf8").trim(), "");
   });
 
+  test("native agent fences delayed and unversioned DNS writers across restart", async (context) => {
+    const fixture = await startDnsAgent(context);
+    if (fixture === undefined) return;
+    const authorityPath = path.join(fixture.directory, "logical-network-state.v1.json");
+    const publish = async (revision: string, records: string) => {
+      fs.writeFileSync(authorityPath, JSON.stringify({ version: 1, revision, state: { networks: [], attachments: [], exposures: [] } }));
+      return requestOnce<{ readonly applied?: boolean }>(fixture.socketPath, {
+        id: `dns-${revision}`,
+        method: "syncBrowserDns",
+        payload: { records, revision, sharedStatePath: authorityPath },
+      });
+    };
+    const port = await readDnsPort(fixture.socketPath);
+    assert.equal((await publish("revision-b", "current=127.120.5.9")).applied, true);
+    const replay = await requestOnce<{ readonly applied?: boolean }>(fixture.socketPath, {
+      id: "dns-replay",
+      method: "syncBrowserDns",
+      payload: { records: "changed=127.120.5.10", revision: "revision-b", sharedStatePath: authorityPath },
+    });
+    assert.equal(replay.applied, true);
+    fs.writeFileSync(authorityPath, JSON.stringify({ version: 1, revision: "revision-b", state: { networks: [], attachments: [], exposures: [] } }));
+    const stale = await requestOnce<{ readonly applied?: boolean }>(fixture.socketPath, {
+      id: "dns-stale",
+      method: "syncBrowserDns",
+      payload: { records: "stale=127.120.5.10", revision: "revision-a", sharedStatePath: authorityPath },
+    });
+    assert.equal(stale.applied, false);
+    const legacy = await requestOnce<{ readonly applied?: boolean }>(fixture.socketPath, {
+      id: "dns-legacy",
+      method: "syncBrowserDns",
+      payload: { records: "legacy=127.120.5.11" },
+    });
+    assert.equal(legacy.applied, false);
+    assert.deepEqual(await dnsQuery(port!, "current"), { rcode: 0, answerCount: 1, address: "127.120.5.9" });
+    assert.equal((await dnsQuery(port!, "changed")).rcode, 3);
+    assert.equal((await dnsQuery(port!, "stale")).rcode, 3);
+    await requestOnce(fixture.socketPath, { id: "dns-shutdown-fenced", method: "shutdownDaemon" });
+    await waitForProcessExit(fixture.agent, 3_000);
+    const restarted = await startDnsAgent(context, fixture.directory);
+    if (restarted === undefined) return;
+    const restartedPort = await readDnsPort(restarted.socketPath);
+    assert.deepEqual(await dnsQuery(restartedPort!, "current"), { rcode: 0, answerCount: 1, address: "127.120.5.9" });
+  });
+
+  test("native agent accepts only direct complete authority documents", async (context) => {
+    const fixture = await startDnsAgent(context);
+    if (fixture === undefined) return;
+    const authorityPath = path.join(fixture.directory, "logical-network-state.v1.json");
+    const sync = (revision: string, records = "current=127.120.5.9") => requestOnce<{ readonly applied?: boolean }>(fixture.socketPath, {
+      id: `dns-authority-${revision}`, method: "syncBrowserDns",
+      payload: { records, revision, sharedStatePath: authorityPath },
+    });
+    const valid = { version: 1, revision: "revision-b", state: { networks: [], attachments: [], exposures: [] } };
+    fs.writeFileSync(authorityPath, JSON.stringify(valid));
+    assert.equal((await sync("revision-b")).applied, true);
+    for (const [invalid, candidate] of [
+      ["{", "malformed=127.120.5.10"],
+      [JSON.stringify({ version: 1, revision: "revision-b", state: { nested: { networks: [], attachments: [], exposures: [] } } }), "nested=127.120.5.11"],
+      [JSON.stringify({ version: 1, revision: "revision-b", state: { networks: "wrong", attachments: [], exposures: [] } }), "wrongtype=127.120.5.12"],
+    ] as const) {
+      fs.writeFileSync(authorityPath, invalid);
+      assert.equal((await sync("revision-b", candidate)).applied, false);
+    }
+    fs.writeFileSync(authorityPath, JSON.stringify(valid));
+    assert.equal((await sync("legacy")).applied, false);
+    assert.equal((await dnsQuery((await readDnsPort(fixture.socketPath))!, "current")).rcode, 0);
+    for (const candidate of ["malformed", "nested", "wrongtype"]) {
+      assert.equal((await dnsQuery((await readDnsPort(fixture.socketPath))!, candidate)).rcode, 3);
+    }
+  });
+
+  test("native agent accepts a complete raw legacy authority before a revision fence", async (context) => {
+    const fixture = await startDnsAgent(context);
+    if (fixture === undefined) return;
+    const authorityPath = path.join(fixture.directory, "legacy-network-state.json");
+    fs.writeFileSync(authorityPath, JSON.stringify({ networks: [], attachments: [], exposures: [] }));
+    const result = await requestOnce<{ readonly applied?: boolean }>(fixture.socketPath, {
+      id: "dns-raw-legacy", method: "syncBrowserDns",
+      payload: { records: "legacy=127.120.5.10", revision: "legacy", sharedStatePath: authorityPath },
+    });
+    assert.equal(result.applied, true);
+    assert.equal((await dnsQuery((await readDnsPort(fixture.socketPath))!, "legacy")).rcode, 0);
+  });
+
+  test("native agent retains live DNS records when sidecar persistence fails, then retries", async (context) => {
+    const fixture = await startDnsAgent(context);
+    if (fixture === undefined) return;
+    const authorityPath = path.join(fixture.directory, "logical-network-state.v1.json");
+    fs.writeFileSync(authorityPath, JSON.stringify({ version: 1, revision: "A", state: { networks: [], attachments: [], exposures: [] } }));
+    assert.equal((await requestOnce<{ readonly applied?: boolean }>(fixture.socketPath, { id: "dns-persist-old", method: "syncBrowserDns", payload: { records: "old=127.0.0.1", revision: "A", sharedStatePath: authorityPath } })).applied, true);
+    const sidecar = path.join(fixture.directory, "routes-browser-dns.tsv");
+    fs.rmSync(sidecar); fs.mkdirSync(sidecar);
+    fs.writeFileSync(authorityPath, JSON.stringify({ version: 1, revision: "B", state: { networks: [], attachments: [], exposures: [] } }));
+    assert.equal((await requestOnce<{ readonly applied?: boolean }>(fixture.socketPath, { id: "dns-persist-fail", method: "syncBrowserDns", payload: { records: "new=127.0.0.2", revision: "B", sharedStatePath: authorityPath } })).applied, false);
+    const port = await readDnsPort(fixture.socketPath);
+    assert.equal((await dnsQuery(port!, "old")).rcode, 0);
+    assert.equal((await dnsQuery(port!, "new")).rcode, 3);
+    fs.rmSync(sidecar, { recursive: true });
+    assert.equal((await requestOnce<{ readonly applied?: boolean }>(fixture.socketPath, { id: "dns-persist-retry", method: "syncBrowserDns", payload: { records: "new=127.0.0.2", revision: "B", sharedStatePath: authorityPath } })).applied, true);
+    assert.equal((await dnsQuery(port!, "new")).rcode, 0);
+  });
+
+  test("native agent same-revision replay recovers a blocked UDP bind without changing records", async (context) => {
+    const markerDirectory = fs.mkdtempSync(path.join(projectRoot, ".tmp", "dns-bind-block-"));
+    const markerPath = path.join(markerDirectory, "block");
+    fs.writeFileSync(markerPath, "block");
+    context.after(() => fs.rmSync(markerDirectory, { recursive: true, force: true }));
+    const fixture = await startDnsAgent(context, undefined, 0, markerPath);
+    if (fixture === undefined) return;
+    const authorityPath = path.join(fixture.directory, "logical-network-state.v1.json");
+    fs.writeFileSync(authorityPath, JSON.stringify({ version: 1, revision: "B", state: { networks: [], attachments: [], exposures: [] } }));
+    const first = await requestOnce<{ readonly applied?: boolean; readonly running?: boolean }>(fixture.socketPath, { id: "dns-bind-first", method: "syncBrowserDns", payload: { records: "original=127.0.0.3", revision: "B", sharedStatePath: authorityPath } });
+    assert.equal(first.applied, true); assert.equal(first.running, false);
+    fs.rmSync(markerPath);
+    const replay = await requestOnce<{ readonly applied?: boolean; readonly running?: boolean }>(fixture.socketPath, { id: "dns-bind-replay", method: "syncBrowserDns", payload: { records: "replacement=127.0.0.4", revision: "B", sharedStatePath: authorityPath } });
+    assert.equal(replay.applied, true); assert.equal(replay.running, true);
+    const reboundPort = await readDnsPort(fixture.socketPath);
+    assert.equal(reboundPort! > 0, true);
+    assert.equal((await dnsQuery(reboundPort!, "original")).rcode, 0);
+    assert.equal((await dnsQuery(reboundPort!, "replacement")).rcode, 3);
+  });
+
   test("native agent reports responder state in daemonStatus", async (context) => {
     const fixture = await startDnsAgent(context);
     if (fixture === undefined) {
@@ -188,7 +313,7 @@ if (!fs.existsSync(nativeAgentPath)) {
   });
 }
 
-async function startDnsAgent(context: TestContext, reuseDirectory?: string): Promise<DnsFixture | undefined> {
+async function startDnsAgent(context: TestContext, reuseDirectory?: string, dnsPort = 0, dnsBindBlockPath?: string): Promise<DnsFixture | undefined> {
   const directory =
     reuseDirectory ??
     path.join(
@@ -210,8 +335,8 @@ async function startDnsAgent(context: TestContext, reuseDirectory?: string): Pro
     "--agent-main",
     path.join(projectRoot, "out", "src", "agent", "agent-main.js"),
     "--dns-port",
-    "0",
-  ], { stdio: ["ignore", "ignore", "pipe"] });
+    String(dnsPort),
+  ], { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, ...(dnsBindBlockPath === undefined ? {} : { PORT_MANAGER_AGENT_TEST_DNS_BIND_BLOCK_PATH: dnsBindBlockPath }) } });
   agent.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
 
   context.after(async () => {

@@ -7,6 +7,11 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import * as vscode from "vscode";
+import {
+  BrowserDnsSyncCoordinator,
+  type BrowserDnsSyncBatch,
+  type RejectedResolution,
+} from "./browser-dns-sync-coordinator";
 import { getAgentSocketPath } from "../agent/agent-socket";
 import {
   getDefaultHostAccessBindingsPath,
@@ -586,17 +591,14 @@ export class PortManagerNetworkService implements DisposableLike {
    */
   private lastBrowserDnsSyncResult: { readonly result: AgentBrowserDnsSyncResult; readonly atMs: number } | undefined;
 
-  /** Wire-format signature of the last records accepted by the daemon. */
+  /** Revision-plus-record signature of the last replacement acknowledged by the daemon. */
   private lastBrowserDnsPushSignature: string | undefined;
 
   /** Daemon pid that accepted the last push, so a replaced daemon is re-synced. */
   private lastBrowserDnsPushDaemonPid: number | undefined;
 
-  /** Latest queued wire-format records while a push is already running. */
-  private browserDnsSyncQueuedSignature: string | undefined;
-
-  /** Single-flight guard for daemon DNS pushes. */
-  private browserDnsSyncInFlight: Promise<void> | undefined;
+  /** Sole latest-value queue for daemon DNS publication, independent of owner leases. */
+  private readonly browserDnsSyncCoordinator: BrowserDnsSyncCoordinator | undefined;
 
   /** Container runtime adapter that provides actual same-port isolation. */
   private readonly containerRuntime: ContainerNetworkRuntimeAdapter;
@@ -850,6 +852,16 @@ export class PortManagerNetworkService implements DisposableLike {
     private readonly context: vscode.ExtensionContext,
     private readonly processService?: PortManagerProcessService,
   ) {
+    if (this.processService !== undefined) {
+      this.browserDnsSyncCoordinator = new BrowserDnsSyncCoordinator({
+        send: (batch) => this.processService!.syncBrowserDns(batch.records, batch.revision, batch.sharedStatePath),
+        resolveRejected: (batch) => this.resolveRejectedBrowserDnsSync(batch),
+        onResult: (batch, result) => this.recordBrowserDnsSyncResult(batch, result),
+        onError: () => { this.lastBrowserDnsPushSignature = undefined; },
+        schedule: (delay, callback) => setTimeout(callback, delay),
+        cancel: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+      });
+    }
     this.sharedNetworkStateStore = new SharedLogicalNetworkStateStore({
       storageDirectory: this.context.globalStorageUri.fsPath,
     });
@@ -1909,15 +1921,22 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Publishes current network-name aliases to the daemon-owned DNS responder. */
   private syncBrowserDnsRecords(): void {
+    const document = this.sharedNetworkStateStore.load();
+    if (document !== undefined) {
+      this.syncBrowserDnsRecordsForNetworks(document.state.networks, document.revision, this.sharedNetworkStateStore.filePath);
+      return;
+    }
     this.syncBrowserDnsRecordsForNetworks(this.registry.getSnapshot().networks);
   }
 
   /** Publishes aliases from the same snapshot used by browser proxy reconciliation. */
   private syncBrowserDnsRecordsForNetworks(
     networks: readonly LogicalNetwork[],
+    revision?: string,
+    sharedStatePath?: string,
   ): readonly NetworkDnsRecord[] {
     const records = buildBrowserDnsRecords(networks);
-    this.queueBrowserDnsDaemonSync(encodeBrowserDnsSyncRecords(records));
+    this.queueBrowserDnsDaemonSync(encodeBrowserDnsSyncRecords(records), revision, sharedStatePath);
     if (process.platform === "darwin" && records.length > 0) {
       // Warm the shared lo0 alias cache off the event loop so synchronous
       // status reads (tree renders) almost never pay the ifconfig spawn.
@@ -1931,60 +1950,60 @@ export class PortManagerNetworkService implements DisposableLike {
    * and skipped while the daemon already holds identical records, so bursty
    * registry events from any number of windows collapse into one request.
    */
-  private queueBrowserDnsDaemonSync(encodedRecords: string): void {
+  private queueBrowserDnsDaemonSync(encodedRecords: string, revision?: string, sharedStatePath?: string): void {
     if (this.processService === undefined) {
       return;
     }
 
     const daemonPid = this.getDaemonStatus().pid;
     if (
-      encodedRecords === this.lastBrowserDnsPushSignature &&
+      browserDnsSyncSignature(encodedRecords, revision) === this.lastBrowserDnsPushSignature &&
       daemonPid === this.lastBrowserDnsPushDaemonPid &&
       this.lastBrowserDnsSyncResult?.result.running === true
     ) {
       return;
     }
 
-    this.browserDnsSyncQueuedSignature = encodedRecords;
-    if (this.browserDnsSyncInFlight !== undefined) {
-      return;
-    }
-
-    this.browserDnsSyncInFlight = this.runBrowserDnsDaemonSyncQueue().finally(() => {
-      this.browserDnsSyncInFlight = undefined;
+    this.browserDnsSyncCoordinator?.enqueue({
+      records: encodedRecords,
+      revision,
+      sharedStatePath,
+      signature: browserDnsSyncSignature(encodedRecords, revision),
     });
   }
 
-  private async runBrowserDnsDaemonSyncQueue(): Promise<void> {
-    while (this.browserDnsSyncQueuedSignature !== undefined) {
-      const encodedRecords = this.browserDnsSyncQueuedSignature;
-      this.browserDnsSyncQueuedSignature = undefined;
-
-      try {
-        const result = await this.processService!.syncBrowserDns(encodedRecords);
-        const previousRunning = this.lastBrowserDnsSyncResult?.result.running;
-        this.lastBrowserDnsPushSignature = encodedRecords;
-        this.lastBrowserDnsPushDaemonPid = this.getDaemonStatus().pid;
-        this.lastBrowserDnsSyncResult = { result, atMs: Date.now() };
-        if (previousRunning !== result.running) {
-          this.localChangeEvents.emit();
-        }
-      } catch {
-        /*
-         * A daemon predating syncBrowserDns rejects the method; version
-         * convergence replaces it and the cleared signature retries then.
-         * Connection failures retry the same way on the next routing signal.
-         */
-        this.lastBrowserDnsPushSignature = undefined;
-      }
+  /** Resolves a daemon fence rejection without rebuilding an unauthoritative registry snapshot. */
+  private resolveRejectedBrowserDnsSync(rejected: BrowserDnsSyncBatch): RejectedResolution {
+    const document = this.sharedNetworkStateStore.load();
+    if (document === undefined) {
+      return { kind: "drop" };
     }
+    const records = encodeBrowserDnsSyncRecords(buildBrowserDnsRecords(document.state.networks));
+    const signature = browserDnsSyncSignature(records, document.revision);
+    if (
+      signature === rejected.signature ||
+      signature === this.lastBrowserDnsPushSignature
+    ) {
+      return signature === rejected.signature ? { kind: "retry" } : { kind: "drop" };
+    }
+    return { kind: "replace", batch: { records, revision: document.revision, sharedStatePath: this.sharedNetworkStateStore.filePath, signature } };
+  }
+
+  private recordBrowserDnsSyncResult(batch: BrowserDnsSyncBatch, result: AgentBrowserDnsSyncResult): void {
+    const previousRunning = this.lastBrowserDnsSyncResult?.result.running;
+    if (result.applied !== false) {
+      this.lastBrowserDnsPushSignature = batch.signature;
+      this.lastBrowserDnsPushDaemonPid = this.getDaemonStatus().pid;
+    }
+    this.lastBrowserDnsSyncResult = { result, atMs: Date.now() };
+    if (previousRunning !== result.running) this.localChangeEvents.emit();
   }
 
   /** Awaits a fresh daemon push, for repair flows that must report truthfully. */
   private async flushBrowserDnsDaemonSync(): Promise<void> {
     this.lastBrowserDnsPushSignature = undefined;
     this.syncBrowserDnsRecords();
-    await this.browserDnsSyncInFlight;
+    await this.browserDnsSyncCoordinator?.waitForCurrentDrain();
   }
 
   /**
@@ -3478,6 +3497,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Releases listeners and event subscriptions. */
   dispose(): void {
+    this.browserDnsSyncCoordinator?.dispose();
     if (this.ownerLeaseHeartbeatTimer !== undefined) {
       clearInterval(this.ownerLeaseHeartbeatTimer);
       this.ownerLeaseHeartbeatTimer = undefined;
@@ -6132,7 +6152,7 @@ export class PortManagerNetworkService implements DisposableLike {
     // A closed daemon DNS socket is recoverable during ordinary owner
     // convergence. Record availability, not a transient bind result, keeps
     // published aliases stable while the daemon's bind retry recovers it.
-    await this.browserDnsSyncInFlight?.catch(() => undefined);
+    await this.browserDnsSyncCoordinator?.waitForCurrentDrain().catch(() => undefined);
     const dnsRunning = this.getBrowserDnsRuntimeState().running;
     const useDnsAlias = dnsRunning || dnsRecords.length > 0;
     if (useDnsAlias) {
@@ -10419,6 +10439,11 @@ function encodeBrowserDnsSyncRecords(records: readonly NetworkDnsRecord[]): stri
   return expandBrowserDnsServerRecords(records)
     .map((record) => `${record.hostname}=${record.address}`)
     .join(",");
+}
+
+/** A revision is part of DNS replacement identity: equal rows from an older document are not current. */
+function browserDnsSyncSignature(records: string, revision?: string): string {
+  return `${revision ?? "legacy"}\u0000${records}`;
 }
 
 function browserPublicHostForNetwork(networkId: string, networks: readonly LogicalNetwork[]): string | undefined {
