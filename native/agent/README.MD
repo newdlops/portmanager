@@ -13,6 +13,7 @@ Port Manager의 단일 로컬 daemon을 저수준 POSIX 프로세스로 제공�
 - lsof 기반 TCP listener snapshot 생성
 - VS Code/daemon 재시작 뒤 생존한 hook process의 route를 fresh listener scan으로 복구
 - `repairRoutingState`에서 route shard를 동기적으로 강제 재발행하고 scan 실패를 호출자에게 전달
+- browser DNS full-replace를 durable shared-state revision으로 fence하고 record table과 fence를 함께 영속화
 
 ## 주요 진입점
 

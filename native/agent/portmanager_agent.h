@@ -184,6 +184,8 @@ typedef struct {
   time_t browser_dns_bind_retry_after;
   char browser_dns_error[PM_SMALL];
   char browser_dns_state_path[PM_TEXT];
+  /* Durable shared-state revision that fenced the current DNS full replace. */
+  char browser_dns_revision[PM_SMALL];
   pm_browser_dns_record *browser_dns_items;
   size_t browser_dns_count;
   size_t browser_dns_capacity;
