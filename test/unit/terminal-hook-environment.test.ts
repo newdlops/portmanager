@@ -1202,14 +1202,16 @@ test("terminal daemon ensure serializes agent startup and preserves slow live so
 
 test("background routing refresh converges daemon version and generated route files", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/network-service.ts");
+  const daemonLifecyclePath = path.resolve(__dirname, "../../../src/extension/daemon-lifecycle.ts");
   const agentClientPath = path.resolve(__dirname, "../../../src/extension/local-agent-client.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
+  const daemonLifecycleSource = fs.readFileSync(daemonLifecyclePath, "utf8");
   const agentClientSource = fs.readFileSync(agentClientPath, "utf8");
   const convergeStart = source.indexOf("private async convergeDaemonAndRoutingStateExclusive");
   const convergeEnd = source.indexOf("private async ensureCurrentProcessDaemon", convergeStart);
   const convergeBody = source.slice(convergeStart, convergeEnd);
   const ensureStart = source.indexOf("private async ensureCurrentProcessDaemon");
-  const ensureEnd = source.indexOf("private watchTerminalAttachmentMarkers", ensureStart);
+  const ensureEnd = source.indexOf("private ensureSharedNetworkStateFileMaterialized", ensureStart);
   const ensureBody = source.slice(ensureStart, ensureEnd);
 
   assert.equal(source.includes("DAEMON_RESTART_BACKOFF_MS = 30_000"), true);
@@ -1226,19 +1228,22 @@ test("background routing refresh converges daemon version and generated route fi
   );
   assert.equal(convergeBody.includes("await this.processService.refresh().catch(() => undefined);"), false);
   assert.equal(convergeBody.includes("await this.syncLogicalPortRouters().catch(() => undefined);"), true);
-  assert.equal(ensureBody.includes('daemon.status !== "running"'), true);
+  assert.equal(source.includes("continueWhenDaemonLifecycleReady,"), true);
+  assert.equal(source.includes("convergeDaemonLifecycle,"), true);
+  assert.equal(ensureBody.includes("await convergeDaemonLifecycle(createDaemonLifecyclePort(this.processService), {"), true);
   assert.equal(
     ensureBody.includes("usesLoopbackAddressOnlyRouting(settings) && !this.shouldRunLogicalPortGatewayDaemon(settings)"),
     true,
   );
-  assert.equal(ensureBody.includes("await this.processService.start();"), true);
-  assert.equal(ensureBody.includes("daemon.restartRequired"), true);
+  assert.equal(ensureBody.includes("repairRoutingAfterTransition: options.refreshAfterRestart !== false"), true);
+  assert.equal(daemonLifecycleSource.includes("status = daemon.getDaemonStatus();"), true);
+  assert.equal(daemonLifecycleSource.includes("await daemon.start();"), true);
+  assert.equal(daemonLifecycleSource.includes("await daemon.restartDaemon({ refreshSnapshot: false });"), true);
   assert.equal(
-    ensureBody.includes(
-      "await this.processService.restartDaemon({ refreshSnapshot: options.refreshAfterRestart !== false });",
-    ),
+    daemonLifecycleSource.includes("if (transitioned && options.repairRoutingAfterTransition) {"),
     true,
   );
+  assert.equal(daemonLifecycleSource.includes("await daemon.repairRoutingState();"), true);
   assert.equal(agentClientSource.includes("const previousPid = this.snapshot.daemon.pid;"), true);
   assert.equal(agentClientSource.includes("await this.waitForPreviousDaemonExit(previousPid);"), true);
   assert.equal(agentClientSource.includes("await this.terminateSiblingAgentProcesses(new Set([previousPid]));"), true);

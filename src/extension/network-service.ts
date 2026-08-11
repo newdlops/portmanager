@@ -164,6 +164,12 @@ import {
   splitGeneratedComposeRoutingFiles,
   type ComposeProjectRoutingRow,
 } from "./compose-project-routing";
+import {
+  continueWhenDaemonLifecycleReady,
+  convergeDaemonLifecycle,
+  type DaemonLifecycleConvergenceResult,
+  type DaemonLifecyclePort,
+} from "./daemon-lifecycle";
 import type { PortManagerProcessService } from "./process-service";
 
 const NETWORK_STATE_KEY = "portManager.logicalNetworkState.v1";
@@ -4275,23 +4281,25 @@ export class PortManagerNetworkService implements DisposableLike {
 
   private async convergeDaemonAndRoutingStateExclusive(): Promise<void> {
     this.ensureSharedNetworkStateFileMaterialized();
-    await this.ensureCurrentProcessDaemon().catch(() => undefined);
-    await this.writeHostAccessBindingsFile().catch(() => undefined);
-    await this.writeComposeProjectRoutingFile().catch(() => undefined);
-    await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
-    await this.ensureComposeRouteProcessesForAttachments(
-      this.registry.getSnapshot().composeAttachments.filter(isRestorableComposeAttachment),
-    ).catch(() => undefined);
+    const daemonConvergence = await this.ensureCurrentProcessDaemon().catch(() => daemonNotReady());
+    await continueWhenDaemonLifecycleReady(daemonConvergence, async () => {
+      await this.writeHostAccessBindingsFile().catch(() => undefined);
+      await this.writeComposeProjectRoutingFile().catch(() => undefined);
+      await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
+      await this.ensureComposeRouteProcessesForAttachments(
+        this.registry.getSnapshot().composeAttachments.filter(isRestorableComposeAttachment),
+      ).catch(() => undefined);
 
-    /*
-     * The agent owns periodic OS listener polling. Background convergence should
-     * not force an additional full listener scan every minute. The only
-     * exception is a missing route-table file, which means generated storage was
-     * cleaned and the daemon must write its current snapshot back to disk.
-     */
-    await this.ensureDaemonRouteTablesMaterialized().catch(() => undefined);
-    await this.rehydrateBrowserDnsAndProxies().catch(() => undefined);
-    await this.syncLogicalPortRouters().catch(() => undefined);
+      /*
+       * The agent owns periodic OS listener polling. Background convergence should
+       * not force an additional full listener scan every minute. The only
+       * exception is a missing route-table file, which means generated storage was
+       * cleaned and the daemon must write its current snapshot back to disk.
+       */
+      await this.ensureDaemonRouteTablesMaterialized().catch(() => undefined);
+      await this.rehydrateBrowserDnsAndProxies().catch(() => undefined);
+      await this.syncLogicalPortRouters().catch(() => undefined);
+    });
   }
 
   /**
@@ -4311,35 +4319,33 @@ export class PortManagerNetworkService implements DisposableLike {
 
   private async ensureCurrentProcessDaemon(
     options: { readonly refreshAfterRestart?: boolean } = {},
-  ): Promise<void> {
+  ): Promise<DaemonLifecycleConvergenceResult> {
     if (this.processService === undefined) {
-      return;
+      return daemonReadyWithoutTransition();
     }
     const settings = readPortManagerSettings();
     if (usesLoopbackAddressOnlyRouting(settings) && !this.shouldRunLogicalPortGatewayDaemon(settings)) {
-      return;
+      return daemonReadyWithoutTransition();
     }
 
-    const daemon = this.processService.getSnapshot().daemon;
-    if (daemon.status !== "running") {
-      await this.processService.start();
-      this.localChangeEvents.emit();
-      return;
+    const restartBackoff = { untilMs: this.daemonRestartBackoffUntilMs };
+    try {
+      const result = await convergeDaemonLifecycle(createDaemonLifecyclePort(this.processService), {
+        restartBackoff,
+        restartBackoffMs: DAEMON_RESTART_BACKOFF_MS,
+        // Rehydration immediately forces its own repair after this method, so
+        // retain its deferred path and avoid two full listener scans.
+        repairRoutingAfterTransition: options.refreshAfterRestart !== false,
+      });
+      if (result.transitioned) {
+        this.localChangeEvents.emit();
+      }
+      return result;
+    } finally {
+      // A rejected replacement leaves the gate in place; successful restarts
+      // clear it inside the lifecycle helper.
+      this.daemonRestartBackoffUntilMs = restartBackoff.untilMs;
     }
-
-    if (!daemon.restartRequired) {
-      return;
-    }
-
-    const nowMs = Date.now();
-    if (nowMs < this.daemonRestartBackoffUntilMs) {
-      return;
-    }
-
-    this.daemonRestartBackoffUntilMs = nowMs + DAEMON_RESTART_BACKOFF_MS;
-    await this.processService.restartDaemon({ refreshSnapshot: options.refreshAfterRestart !== false });
-    this.daemonRestartBackoffUntilMs = 0;
-    this.localChangeEvents.emit();
   }
 
   /** Recreates the shared durable state document when globalStorage was cleaned under a live extension host. */
@@ -9253,6 +9259,26 @@ function createDisconnectedDaemonStatus(): AgentDaemonStatus {
     versionStatus: "unknown",
     restartRequired: false,
   };
+}
+
+/** Adapts the broad process service to the lifecycle contract used during owner convergence. */
+function createDaemonLifecyclePort(processService: PortManagerProcessService): DaemonLifecyclePort {
+  return {
+    getDaemonStatus: () => processService.getSnapshot().daemon,
+    start: () => processService.start(),
+    restartDaemon: (options) => processService.restartDaemon(options),
+    repairRoutingState: () => processService.repairRoutingState(),
+  };
+}
+
+/** Uses the common lifecycle result shape when this routing mode has no daemon dependency. */
+function daemonReadyWithoutTransition(): DaemonLifecycleConvergenceResult {
+  return { transitioned: false, ready: true };
+}
+
+/** Represents a failed or backoff-gated daemon pass without allowing stale route consumers to run. */
+function daemonNotReady(): DaemonLifecycleConvergenceResult {
+  return { transitioned: false, ready: false };
 }
 
 /** Builds a UI-safe agent snapshot when the process service is unavailable. */
