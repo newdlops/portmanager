@@ -332,6 +332,7 @@ test("Local DNS repair is a forced, user-visible recovery path", () => {
   // Repair must force a fresh, awaited daemon record push so its status report
   // reflects the responder the daemon actually runs.
   assert.equal(repairBody.includes("await this.flushBrowserDnsDaemonSync();"), true);
+  assert.equal(networkServiceSource.includes("await this.browserDnsSyncCoordinator?.flushPendingNow();"), true);
   assert.equal(repairBody.includes("forceResolverSetup: true"), true);
 
   const exclusiveStart = networkServiceSource.indexOf("private async installBrowserDnsResolversExclusive");

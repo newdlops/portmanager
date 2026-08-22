@@ -61,6 +61,73 @@ test("coordinator coalesces B then C while A is in flight", async () => {
   assert.deepEqual(sent, ["A", "C"]);
 });
 
+test("coordinator does not strand a batch queued at the drain settlement boundary", async () => {
+  const sent: string[] = [];
+  let coordinator!: BrowserDnsSyncCoordinator;
+  coordinator = new BrowserDnsSyncCoordinator({
+    send: async (value) => {
+      sent.push(value.signature);
+      return { running: true, port: 1 };
+    },
+    resolveRejected: () => ({ kind: "retry" }),
+    onResult: (value) => {
+      if (value.signature === "A") {
+        /*
+         * This microtask runs after drain() has observed an empty queue but
+         * before the outer active promise settles. It reproduced the DNS table
+         * remaining stale until Extension Host restart.
+         */
+        queueMicrotask(() => coordinator.enqueue(batch("B")));
+      }
+    },
+    onError: () => undefined,
+    schedule: (_delay, callback) => setTimeout(callback, 0),
+    cancel: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+  });
+
+  coordinator.enqueue(batch("A"));
+  await tick();
+  await tick();
+
+  assert.deepEqual(sent, ["A", "B"]);
+});
+
+test("coordinator retries an accepted table until the DNS responder is bound", async () => {
+  const sent: string[] = [];
+  const f = fixture(async (value) => {
+    sent.push(value.signature);
+    return sent.length === 1
+      ? { applied: true, running: false, port: 1 }
+      : { applied: true, running: true, port: 1 };
+  });
+
+  f.coordinator.enqueue(batch("A"));
+  await tick();
+  assert.equal(f.timers[0]?.delay, 100);
+
+  f.timers[0]!.callback();
+  await tick();
+
+  assert.deepEqual(sent, ["A", "A"]);
+});
+
+test("explicit flush bypasses an existing retry delay for the latest table", async () => {
+  const sent: string[] = [];
+  const f = fixture(async (value) => {
+    sent.push(value.signature);
+    throw new Error("transient");
+  });
+
+  f.coordinator.enqueue(batch("A"));
+  await tick();
+  assert.equal(f.timers[0]?.delay, 100);
+
+  f.coordinator.enqueue(batch("B"));
+  await f.coordinator.flushPendingNow();
+
+  assert.deepEqual(sent, ["A", "B"]);
+});
+
 test("coordinator applies production resolver retry, replace, and drop outcomes", async () => {
   const outcomes: readonly RejectedResolution[] = [
     { kind: "retry" },

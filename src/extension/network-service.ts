@@ -2009,7 +2009,7 @@ export class PortManagerNetworkService implements DisposableLike {
   private async flushBrowserDnsDaemonSync(): Promise<void> {
     this.lastBrowserDnsPushSignature = undefined;
     this.syncBrowserDnsRecords();
-    await this.browserDnsSyncCoordinator?.waitForCurrentDrain();
+    await this.browserDnsSyncCoordinator?.flushPendingNow();
   }
 
   /**
@@ -6123,21 +6123,29 @@ export class PortManagerNetworkService implements DisposableLike {
       return this.browserProxySyncInFlight;
     }
 
-    this.browserProxySyncInFlight = this.syncBrowserNetworkProxiesQueued().finally(() => {
-      this.browserProxySyncInFlight = undefined;
-    });
+    this.browserProxySyncInFlight = this.syncBrowserNetworkProxiesQueued();
 
     return this.browserProxySyncInFlight;
   }
 
   /** Runs browser proxy reconciliation until one queued refresh sees the latest snapshot. */
   private async syncBrowserNetworkProxiesQueued(): Promise<void> {
-    do {
-      const allowAdministratorPrompt = this.browserProxyAdministratorPromptQueued;
-      this.browserProxySyncQueued = false;
-      this.browserProxyAdministratorPromptQueued = false;
-      await this.syncBrowserNetworkProxiesExclusive({ allowAdministratorPrompt });
-    } while (this.browserProxySyncQueued || this.browserProxyAdministratorPromptQueued);
+    try {
+      do {
+        const allowAdministratorPrompt = this.browserProxyAdministratorPromptQueued;
+        this.browserProxySyncQueued = false;
+        this.browserProxyAdministratorPromptQueued = false;
+        await this.syncBrowserNetworkProxiesExclusive({ allowAdministratorPrompt });
+      } while (this.browserProxySyncQueued || this.browserProxyAdministratorPromptQueued);
+    } finally {
+      /*
+       * Clear the generation in the runner's own continuation. If an external
+       * sync arrives after the final queue check, JavaScript cannot interleave
+       * it before this assignment, so that caller observes no active runner and
+       * starts a fresh generation instead of waiting for Extension Host restart.
+       */
+      this.browserProxySyncInFlight = undefined;
+    }
   }
 
   private async syncBrowserNetworkProxiesExclusive(
