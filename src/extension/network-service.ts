@@ -153,6 +153,7 @@ import type {
   TerminalWindow,
   VscodeWindowTerminalBinding,
 } from "../shared/types";
+import type { WorkspacePathMapping } from "../shared/workspace-path";
 import {
   applyTerminalHookEnvironment,
   AGENT_REQUIRED_ENV,
@@ -444,6 +445,12 @@ export interface ComposeAttachmentCopyInput {
   readonly attachmentId: string;
   /** Destination logical network that should receive the copied endpoints. */
   readonly networkId: string;
+  /** Target-worktree working directory used by future Compose lifecycle commands. */
+  readonly workingDirectory?: string;
+  /** Target-worktree copies of the source Compose files. */
+  readonly composeFiles?: readonly string[];
+  /** Rebase repository-owned bind mounts into the target worktree. */
+  readonly workspacePathMapping?: WorkspacePathMapping;
 }
 
 interface FileCleanupSummary {
@@ -3018,6 +3025,8 @@ export class PortManagerNetworkService implements DisposableLike {
           workingDirectory: input.composeMutation.workingDirectory ?? input.cwd,
           composeFiles: input.composeMutation.composeFiles ?? input.composeFiles ?? [],
           sourceContainerMappings: input.composeMutation.sourceContainerMappings,
+          sourceClonedVolumes: input.composeMutation.sourceClonedVolumes,
+          workspacePathMapping: input.composeMutation.workspacePathMapping,
           copyStoppedServices: input.composeMutation.copyStoppedServices,
           ports: attachment.ports,
         });
@@ -3211,9 +3220,13 @@ export class PortManagerNetworkService implements DisposableLike {
       throw new Error(`"${composeRuntimeProjectName(source)}" is already attached to "${network.name}". Choose another logical network.`);
     }
 
-    const composeFiles = composeRouteCopyFiles(source);
+    const composeFiles = input.composeFiles ?? composeRouteCopyFiles(source);
     const runtime = source.runtime ?? source.mutation?.runtime;
-    const cwd = composeAttachmentWorkingDirectory(source) ?? composeWorkingDirectoryFromFiles(composeFiles) ?? process.cwd();
+    const cwd =
+      input.workingDirectory ??
+      composeAttachmentWorkingDirectory(source) ??
+      composeWorkingDirectoryFromFiles(composeFiles) ??
+      process.cwd();
     if (runtime !== undefined && composeFiles.length > 0) {
       return this.attachComposePublishedPorts({
         networkId: network.id,
@@ -3233,6 +3246,9 @@ export class PortManagerNetworkService implements DisposableLike {
             : {}),
           ...(source.mutation?.clonedVolumes !== undefined
             ? { sourceClonedVolumes: source.mutation.clonedVolumes }
+            : {}),
+          ...(input.workspacePathMapping !== undefined
+            ? { workspacePathMapping: input.workspacePathMapping }
             : {}),
         },
         ports: source.ports.map(dropComposeProcessId),
@@ -8018,6 +8034,8 @@ export interface ComposePublishMutationInput {
   readonly sourceContainerMappings?: readonly ComposeContainerMutationMapping[];
   /** Existing clone volumes that should seed a copied hidden Compose project. */
   readonly sourceClonedVolumes?: readonly ComposeVolumeMutationMapping[];
+  /** Rebase repository-owned bind mounts when copying into another worktree. */
+  readonly workspacePathMapping?: WorkspacePathMapping;
   /** Copy defined services that currently have no running published endpoint. */
   readonly copyStoppedServices?: boolean;
 }

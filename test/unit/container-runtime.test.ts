@@ -1489,6 +1489,106 @@ test("clone attach copies arbitrary directory bind mounts into isolated volumes"
   assert.match(overrideText, /name: 'pm-alpha-workspace-12345678-[a-f0-9]{12}-[a-f0-9]{8}'/);
 });
 
+test("worktree copy keeps non-stateful repository binds live in the target checkout", async (context) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-worktree-bind-"));
+  context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const sourceRoot = path.join(tempDir, "source");
+  const targetRoot = path.join(tempDir, "target");
+  const sourceAppDir = path.join(sourceRoot, "app");
+  const targetAppDir = path.join(targetRoot, "app");
+  fs.mkdirSync(sourceAppDir, { recursive: true });
+  fs.mkdirSync(targetAppDir, { recursive: true });
+  const composeFile = path.join(targetRoot, "compose.yaml");
+  fs.writeFileSync(composeFile, "services:\n  web:\n    image: app:latest\n", "utf8");
+
+  const calls: Array<{ readonly args: readonly string[] }> = [];
+  let containerListCount = 0;
+  const mutator = new ComposePublishMutator({
+    storageDirectory: tempDir,
+    runCommand: async (_executable, args) => {
+      calls.push({ args });
+      if (args[0] === "compose" && args.includes("config") && args.includes("--services")) {
+        return { stdout: "web\n", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "ls") {
+        containerListCount += 1;
+        return {
+          stdout: JSON.stringify(
+            containerListCount === 1
+              ? {
+                  ID: "web-source",
+                  Names: "workspace-web-1",
+                  Ports: "127.0.0.1:18081->8081/tcp",
+                  Labels: "com.docker.compose.project=workspace,com.docker.compose.service=web",
+                }
+              : {
+                  ID: "web-hidden",
+                  Names: "beta-workspace-12345678-web-1",
+                  Ports: "127.81.154.127:57081->8081/tcp",
+                  Labels: "com.docker.compose.project=beta-workspace-12345678,com.docker.compose.service=web",
+                },
+          ),
+          stderr: "",
+        };
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({
+              Id: id,
+              Config: { Labels: { "com.docker.compose.service": "web" } },
+              Mounts:
+                id === "web-source"
+                  ? [
+                      {
+                        Type: "bind",
+                        Source: sourceAppDir,
+                        Destination: "/workspace/app",
+                        RW: true,
+                      },
+                    ]
+                  : [],
+            })),
+          ),
+          stderr: "",
+        };
+      }
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  const result = await mutator.hidePublishedPorts({
+    mode: "copy",
+    runtime: "docker",
+    networkName: "Beta",
+    attachedProjectName: "beta-workspace-12345678",
+    hiddenHostAddress: "127.81.154.127",
+    originalProjectName: "workspace",
+    workingDirectory: targetRoot,
+    composeFiles: [composeFile],
+    copyStoppedServices: true,
+    workspacePathMapping: { sourceRoot, targetRoot },
+    ports: [
+      {
+        serviceName: "web",
+        logicalPort: 18081,
+        actualHostAddress: "127.0.0.1",
+        actualHostPort: 18081,
+        containerPort: 8081,
+        protocol: "tcp",
+        protocolName: "http",
+      },
+    ],
+  });
+
+  assert.equal(calls.some((call) => call.args[0] === "run"), false);
+  assert.equal(result.state.clonedVolumes?.length ?? 0, 0);
+  const overrideText = fs.readFileSync(result.state.overrideFile, "utf8");
+  assert.match(overrideText, /type: bind/);
+  assert.match(overrideText, new RegExp(targetAppDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(overrideText, new RegExp(sourceAppDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
 test("compose mutation writes dev-log diagnostics when hidden compose up fails", async (context) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-compose-dev-log-"));
   const previousDevLogPath = process.env[DEV_LOG_ENV];

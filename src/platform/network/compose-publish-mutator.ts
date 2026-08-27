@@ -10,6 +10,11 @@ import type {
   ComposeVolumeMutationMapping,
   ContainerServiceCandidate,
 } from "../../shared/types";
+import {
+  isPathInsideWorkspace,
+  remapWorkspacePath,
+  type WorkspacePathMapping,
+} from "../../shared/workspace-path";
 import { devLog, devLogEnabled } from "../dev-log";
 import type { ContainerCommandResult, ContainerCommandRunner } from "./container-runtime";
 import { mergeComposeContainerMappingLineage } from "./compose-container-mappings";
@@ -70,6 +75,8 @@ export interface ComposePublishMutationInput {
   readonly sourceContainerMappings?: readonly ComposeContainerMutationMapping[];
   /** Existing clone volumes that should be treated as the data source when copying a hidden project. */
   readonly sourceClonedVolumes?: readonly ComposeVolumeMutationMapping[];
+  /** Rebase repository-owned bind mounts when a clone targets another Git worktree. */
+  readonly workspacePathMapping?: WorkspacePathMapping;
   /** Copy every defined service into the hidden project, including stopped/no-port services. */
   readonly copyStoppedServices?: boolean;
   /** Published endpoints selected for attach. */
@@ -447,14 +454,17 @@ export class ComposePublishMutator {
       mode === "clone" && !copyStoppedServices
         ? overrideServices.filter((service) => !activeHiddenServices.includes(service))
         : [];
-    const originalServiceMounts = await this.resolveOriginalServiceMounts(
-      originalContext,
-      originalContainers,
-      originalContainerList.inspectedRows,
-      lifecycleServices,
-      {
-        sourceClonedVolumes: input.sourceClonedVolumes,
-      },
+    const originalServiceMounts = remapComposeBindMounts(
+      await this.resolveOriginalServiceMounts(
+        originalContext,
+        originalContainers,
+        originalContainerList.inspectedRows,
+        lifecycleServices,
+        {
+          sourceClonedVolumes: input.sourceClonedVolumes,
+        },
+      ),
+      input.workspacePathMapping,
     );
     const statefulCloneServices = findStatefulCloneServices(lifecycleServices, ports, originalServiceMounts);
     if (createsHiddenProject && statefulCloneServices.length > 0 && input.allowStatefulClone !== true) {
@@ -488,7 +498,13 @@ export class ComposePublishMutator {
           ));
     const volumeClonePlan =
       createsHiddenProject
-        ? await buildVolumeClonePlan(attachedProjectName, randomUUID().slice(0, 8), originalServiceMounts, statefulServiceNames)
+        ? await buildVolumeClonePlan(
+            attachedProjectName,
+            randomUUID().slice(0, 8),
+            originalServiceMounts,
+            statefulServiceNames,
+            input.workspacePathMapping,
+          )
         : { serviceMounts: originalServiceMounts, volumeClones: [], volumeMappings: [] };
     const occupiedContainerNames =
       createsHiddenProject
@@ -2757,6 +2773,33 @@ function mergeRestoredServiceMounts(
   return serviceMounts;
 }
 
+/**
+ * A Compose copy for another Git worktree must not keep source-code bind mounts
+ * pointed at the original checkout. Named volumes and machine-external bind
+ * paths stay unchanged; only paths owned by the source worktree are rebased.
+ */
+function remapComposeBindMounts(
+  serviceMounts: ReadonlyMap<string, readonly ComposeServiceMount[]>,
+  mapping: WorkspacePathMapping | undefined,
+): ReadonlyMap<string, readonly ComposeServiceMount[]> {
+  if (mapping === undefined) {
+    return serviceMounts;
+  }
+
+  const remapped = new Map<string, readonly ComposeServiceMount[]>();
+  for (const [serviceName, mounts] of serviceMounts) {
+    remapped.set(
+      serviceName,
+      mounts.map((mount) =>
+        mount.type === "bind"
+          ? { ...mount, source: remapWorkspacePath(mount.source, mapping) }
+          : mount,
+      ),
+    );
+  }
+  return remapped;
+}
+
 function buildCloneContainerNames(
   originalProjectName: string,
   attachedProjectName: string,
@@ -3174,6 +3217,7 @@ async function buildVolumeClonePlan(
   cloneRunId: string,
   serviceMounts: ReadonlyMap<string, readonly ComposeServiceMount[]>,
   statefulServiceNames: ReadonlySet<string>,
+  workspacePathMapping?: WorkspacePathMapping,
 ): Promise<{
   readonly serviceMounts: ReadonlyMap<string, readonly ComposeServiceMount[]>;
   readonly volumeClones: readonly VolumeClonePlan[];
@@ -3207,6 +3251,15 @@ async function buildVolumeClonePlan(
           }
 
           if (mount.type === "bind") {
+            const isTargetWorktreeBind =
+              workspacePathMapping !== undefined &&
+              isPathInsideWorkspace(mount.source, workspacePathMapping.targetRoot);
+            // Source/config binds need to follow edits in the new checkout.
+            // Writable mounts of stateful services remain point-in-time volume
+            // copies so two worktrees never write the same database directory.
+            if (isTargetWorktreeBind && (mount.readOnly || !statefulServiceNames.has(serviceName))) {
+              return { ...mount, sourceContainerId: undefined };
+            }
             const cloneableBindMount = await resolveCloneableBindMount(serviceName, mount, {
               failWhenUncloneable: shouldRejectUncloneableBindMounts,
             });
