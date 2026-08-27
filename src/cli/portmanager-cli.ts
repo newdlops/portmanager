@@ -13,6 +13,7 @@ import {
 } from "../agent/protocol";
 import { buildReroutableCommand } from "../core/terminal-conflict-parser";
 import { buildInjectedCommand, buildPortManagerEnvironment } from "../platform/process/port-injection";
+import { canRunNativeAgentBinary } from "../platform/process/native-executable";
 import { buildNodeRuntimeEnvironment } from "../platform/process/node-runtime";
 import { DEFAULT_PORT_MANAGER_SETTINGS } from "../shared/default-settings";
 import { isKnownPortManagerPackageVersion, readPortManagerPackageVersion } from "../shared/package-version";
@@ -322,7 +323,7 @@ class AgentCliClient {
     const socketPath = getAgentSocketPath();
     removeStaleSocketFile(socketPath);
 
-    if (canRunNativeAgent(this.nativeAgentPath)) {
+    if (canRunNativeAgentBinary(this.nativeAgentPath)) {
       const child = spawn(
         this.nativeAgentPath,
         ["--socket", socketPath, "--route-table", getDefaultRouteTablePath(), "--agent-main", this.agentMainPath],
@@ -624,19 +625,6 @@ function resolveAgentMainPath(): string {
 /** Finds the packaged native daemon binary relative to the compiled CLI file. */
 function resolveNativeAgentPath(): string {
   return path.resolve(__dirname, "..", "..", "..", "media", "native", "portmanager_agent");
-}
-
-function canRunNativeAgent(nativeAgentPath: string): boolean {
-  if (process.platform === "win32") {
-    return false;
-  }
-
-  try {
-    fs.accessSync(nativeAgentPath, fs.constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /** Returns the child PID after Node has emitted spawn. */

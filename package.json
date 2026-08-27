@@ -37,6 +37,7 @@
   "activationEvents": [
     "onStartupFinished",
     "onView:portManager.processes",
+    "onCommand:portManager.initializeWorktree",
     "onCommand:portManager.createLogicalNetwork",
     "onCommand:portManager.removeLogicalNetwork",
     "onCommand:portManager.refreshTerminals",
@@ -106,8 +107,13 @@
     "watch": "tsc -watch -p ./",
     "test": "npm run compile && node --test out/test/unit/*.test.js",
     "test:routing:stress": "npm run compile && npm run build:hook && node scripts/stress-routing.js 10000 100",
-    "package": "vsce package",
-    "publish": "vsce publish",
+    "package": "node scripts/package-native-target.js package",
+    "package:darwin-arm64": "node scripts/package-native-target.js package darwin-arm64",
+    "package:darwin-x64": "node scripts/package-native-target.js package darwin-x64",
+    "package:linux-arm64": "node scripts/package-native-target.js package linux-arm64",
+    "package:linux-x64": "node scripts/package-native-target.js package linux-x64",
+    "publish": "node scripts/package-native-target.js publish",
+    "verify:native": "node scripts/verify-native-artifacts.js",
     "publish:precheck": "npm test && npm run package"
   },
   "contributes": {
@@ -129,6 +135,12 @@
       ]
     },
     "commands": [
+      {
+        "command": "portManager.initializeWorktree",
+        "title": "Port Manager: Initialize This Worktree",
+        "category": "Port Manager",
+        "icon": "$(rocket)"
+      },
       {
         "command": "portManager.createLogicalNetwork",
         "title": "Port Manager: Create Logical Network",
@@ -423,7 +435,7 @@
       },
       {
         "command": "portManager.installShellHook",
-        "title": "Port Manager: Install Shell Hook",
+        "title": "Port Manager: Install or Repair pm Shell Integration",
         "category": "Port Manager",
         "icon": "$(plug)"
       },
@@ -516,10 +528,6 @@
         },
         {
           "command": "portManager.removeProcess",
-          "when": "false"
-        },
-        {
-          "command": "portManager.installShellHook",
           "when": "false"
         },
         {

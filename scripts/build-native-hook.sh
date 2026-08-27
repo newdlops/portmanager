@@ -1,8 +1,9 @@
 #!/bin/sh
 set -eu
 
-# Builds the optional native socket hook used by external OS terminals.
-# The VSIX includes the resulting library when a supported compiler exists.
+# Builds the native socket hook and helpers for one VS Code Marketplace target.
+# Native routing is a core product capability, so release builds fail closed
+# instead of silently packaging stale artifacts from a different machine.
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 HOOK_SOURCE_FILE="$ROOT_DIR/native/hook/portmanager_hook.c"
@@ -19,7 +20,7 @@ PROCESS_LOOKUP_SOURCE_FILE="$ROOT_DIR/native/process-lookup/portmanager_process_
 CONTAINER_MAP_SOURCE_FILE="$ROOT_DIR/native/container-mutation/portmanager_container_map.c"
 DOCKER_SHIM_SOURCE_FILE="$ROOT_DIR/native/docker-shim/portmanager_docker_shim.c"
 AGENT_SOURCE_FILES="$ROOT_DIR/native/agent/portmanager_agent.c $ROOT_DIR/native/agent/portmanager_agent_probe.c $ROOT_DIR/native/agent/portmanager_agent_state.c $ROOT_DIR/native/agent/portmanager_agent_json.c $ROOT_DIR/native/agent/portmanager_agent_dns.c $PEER_PROCESS_SOURCE_FILE"
-OUTPUT_DIR="$ROOT_DIR/media/native"
+OUTPUT_DIR="${PORT_MANAGER_NATIVE_OUTPUT_DIR:-$ROOT_DIR/media/native}"
 PACKAGE_VERSION="unknown"
 if command -v node >/dev/null 2>&1; then
   PACKAGE_VERSION="$(node -e 'process.stdout.write(require(process.argv[1]).version || "unknown")' "$ROOT_DIR/package.json" 2>/dev/null || printf 'unknown')"
@@ -29,23 +30,71 @@ AGENT_VERSION_DEFINE="-DPORTMANAGER_PACKAGE_VERSION=\"$PACKAGE_VERSION\""
 mkdir -p "$OUTPUT_DIR"
 
 if ! command -v cc >/dev/null 2>&1; then
-  echo "cc not found; skipping Port Manager native hook build"
-  exit 0
+  echo "cc not found; Port Manager native artifacts cannot be built" >&2
+  exit 1
 fi
 
-case "$(uname -s)" in
+if ! command -v node >/dev/null 2>&1; then
+  echo "node not found; Port Manager native artifacts cannot be verified" >&2
+  exit 1
+fi
+
+HOST_SYSTEM="$(uname -s)"
+HOST_MACHINE="$(uname -m)"
+case "$HOST_SYSTEM:$HOST_MACHINE" in
+  Darwin:arm64) DEFAULT_NATIVE_TARGET="darwin-arm64" ;;
+  Darwin:x86_64) DEFAULT_NATIVE_TARGET="darwin-x64" ;;
+  Linux:aarch64|Linux:arm64) DEFAULT_NATIVE_TARGET="linux-arm64" ;;
+  Linux:x86_64|Linux:amd64) DEFAULT_NATIVE_TARGET="linux-x64" ;;
+  *)
+    echo "Unsupported native build host: $HOST_SYSTEM $HOST_MACHINE" >&2
+    exit 1
+    ;;
+esac
+
+NATIVE_TARGET="${PORT_MANAGER_NATIVE_TARGET:-$DEFAULT_NATIVE_TARGET}"
+case "$NATIVE_TARGET" in
+  darwin-arm64) TARGET_SYSTEM="Darwin"; TARGET_ARCH="arm64" ;;
+  darwin-x64) TARGET_SYSTEM="Darwin"; TARGET_ARCH="x86_64" ;;
+  linux-arm64) TARGET_SYSTEM="Linux"; TARGET_ARCH="arm64" ;;
+  linux-x64) TARGET_SYSTEM="Linux"; TARGET_ARCH="x86_64" ;;
+  *)
+    echo "Unsupported Port Manager native target: $NATIVE_TARGET" >&2
+    exit 1
+    ;;
+esac
+
+if [ "$HOST_SYSTEM" != "$TARGET_SYSTEM" ]; then
+  echo "Native target $NATIVE_TARGET must be built on $TARGET_SYSTEM, not $HOST_SYSTEM" >&2
+  exit 1
+fi
+
+if [ "$TARGET_SYSTEM" = "Linux" ]; then
+  case "$HOST_MACHINE:$TARGET_ARCH" in
+    x86_64:x86_64|amd64:x86_64|aarch64:arm64|arm64:arm64) ;;
+    *)
+      echo "Linux native target $NATIVE_TARGET requires a matching build host architecture" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+case "$TARGET_SYSTEM" in
   Darwin)
-    cc -Wall -Wextra -O2 -dynamiclib "$HOOK_SOURCE_FILE" "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/libportmanager_hook.dylib"
-    cc -Wall -Wextra -O2 "$ASDF_SHIM_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_asdf_shim"
-    cc -Wall -Wextra -O2 "$PROCESS_SCOPE_SHIM_SOURCE_FILE" "$PEER_PROCESS_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_scope_shim"
-    cc -Wall -Wextra -O2 "$TTY_INPUT_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tty_input"
-    cc -Wall -Wextra -O2 -pthread "$TCP_ROUTER_SOURCE_FILE" "$PEER_PROCESS_SOURCE_FILE" "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tcp_router"
-    cc -Wall -Wextra -O2 -pthread "$HOST_EXPOSURE_PROXY_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_host_exposure_proxy"
-    cc -Wall -Wextra -O2 "$PROCESS_LOOKUP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_lookup"
-    cc -Wall -Wextra -O2 "$PROCESS_TRACKER_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_tracker"
-    cc -Wall -Wextra -O2 "$CONTAINER_MAP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_container_map"
-    cc -Wall -Wextra -O2 "$DOCKER_SHIM_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_docker_shim"
-    cc -Wall -Wextra -O2 "$AGENT_VERSION_DEFINE" $AGENT_SOURCE_FILES "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_agent"
+    MACOS_DEPLOYMENT_TARGET="${PORT_MANAGER_MACOS_DEPLOYMENT_TARGET:-11.0}"
+    DARWIN_TARGET_FLAGS="-arch $TARGET_ARCH -mmacosx-version-min=$MACOS_DEPLOYMENT_TARGET"
+    rm -f "$OUTPUT_DIR/libportmanager_hook.so"
+    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS -dynamiclib "$HOOK_SOURCE_FILE" "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/libportmanager_hook.dylib"
+    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$ASDF_SHIM_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_asdf_shim"
+    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$PROCESS_SCOPE_SHIM_SOURCE_FILE" "$PEER_PROCESS_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_scope_shim"
+    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$TTY_INPUT_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tty_input"
+    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS -pthread "$TCP_ROUTER_SOURCE_FILE" "$PEER_PROCESS_SOURCE_FILE" "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tcp_router"
+    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS -pthread "$HOST_EXPOSURE_PROXY_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_host_exposure_proxy"
+    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$PROCESS_LOOKUP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_lookup"
+    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$PROCESS_TRACKER_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_tracker"
+    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$CONTAINER_MAP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_container_map"
+    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$DOCKER_SHIM_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_docker_shim"
+    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$AGENT_VERSION_DEFINE" $AGENT_SOURCE_FILES "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_agent"
     if command -v codesign >/dev/null 2>&1; then
       # DYLD-injected helpers must survive macOS library validation paths.
       # Linker-signed output can be rejected by some runtimes, so sign the
@@ -64,6 +113,7 @@ case "$(uname -s)" in
     fi
     ;;
   Linux)
+    rm -f "$OUTPUT_DIR/libportmanager_hook.dylib" "$OUTPUT_DIR/portmanager_asdf_shim" "$OUTPUT_DIR/portmanager_process_scope_shim"
     cc -Wall -Wextra -O2 -fPIC -shared "$HOOK_SOURCE_FILE" "$DEV_LOG_SOURCE_FILE" -ldl -o "$OUTPUT_DIR/libportmanager_hook.so"
     cc -Wall -Wextra -O2 "$TTY_INPUT_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tty_input"
     cc -Wall -Wextra -O2 -pthread "$TCP_ROUTER_SOURCE_FILE" "$PEER_PROCESS_SOURCE_FILE" "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tcp_router"
@@ -74,7 +124,6 @@ case "$(uname -s)" in
     cc -Wall -Wextra -O2 "$DOCKER_SHIM_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_docker_shim"
     cc -Wall -Wextra -O2 "$AGENT_VERSION_DEFINE" $AGENT_SOURCE_FILES "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_agent"
     ;;
-  *)
-    echo "Unsupported native hook platform; skipping"
-    ;;
 esac
+
+node "$ROOT_DIR/scripts/verify-native-artifacts.js" "$NATIVE_TARGET"

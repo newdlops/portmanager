@@ -7,6 +7,7 @@ import { getAgentSocketPath, getAgentStartupLockPath, removeStaleSocketFile } fr
 import { getDefaultRouteTablePath, ROUTE_TABLE_TTL_SECONDS_ENV } from "../agent/route-table";
 import { readPortManagerSettings } from "../config/vscode-settings";
 import { buildNodeRuntimeEnvironment } from "../platform/process/node-runtime";
+import { canRunNativeAgentBinary } from "../platform/process/native-executable";
 import { SimpleEventEmitter } from "../shared/events";
 import { isKnownPortManagerPackageVersion, readPortManagerPackageVersion } from "../shared/package-version";
 import type {
@@ -729,7 +730,7 @@ export class LocalAgentClient implements PortManagerProcessService {
     removeStaleSocketFile(socketPath);
 
     const nativeAgentPath = this.getNativeAgentPath();
-    if (canRunNativeAgent(nativeAgentPath)) {
+    if (canRunNativeAgentBinary(nativeAgentPath)) {
       this.childProcess = spawn(
         nativeAgentPath,
         ["--socket", socketPath, "--route-table", getDefaultRouteTablePath(), "--agent-main", agentMainPath],
@@ -1722,19 +1723,6 @@ function isInteractiveShellStartupLockOwner(command: string): boolean {
 
   const executableName = path.basename(firstToken).replace(/^-/, "");
   return /^(?:bash|zsh|fish|sh|dash|ksh|tcsh|csh)$/.test(executableName);
-}
-
-function canRunNativeAgent(nativeAgentPath: string): boolean {
-  if (process.platform === "win32") {
-    return false;
-  }
-
-  try {
-    fs.accessSync(nativeAgentPath, fs.constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /** Small retry delay helper for agent startup polling. */
