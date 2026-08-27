@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
@@ -21,6 +22,8 @@ import {
 import { buildExistingCloneMutationFromCandidate } from "../platform/network/container-service-discovery";
 import { isValidComposeProjectName } from "../platform/network/compose-publish-mutator";
 import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
+import { canLoadNativeHookLibrary, canRunNativeAgentBinary } from "../platform/process/native-executable";
+import { verifyInstalledShellIntegration } from "../platform/process/shell-integration-verifier";
 import { readPortManagerPackageVersion } from "../shared/package-version";
 import type { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import {
@@ -62,6 +65,7 @@ import {
   TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES,
 } from "./terminal-hook-environment";
 import type {
+  BrowserDnsResolverStatus,
   ComposeAttachment,
   ContainerServiceCandidate,
   DisposableLike,
@@ -81,6 +85,20 @@ import type {
 } from "../shared/types";
 
 const TERMINAL_NETWORK_SELECTION_FILE_NAME = "terminal-networks.tsv";
+const WORKTREE_INITIALIZATION_STATE_KEY = "portManager.worktreeInitialization.v1";
+
+interface WorktreeInitializationState {
+  /** Schema version keeps workspaceState migrations explicit. */
+  readonly version: 1;
+  /** Folder URI prevents a copied workspaceState record from binding another worktree. */
+  readonly workspaceUri: string;
+  /** Global logical network reused when initialization is retried. */
+  readonly networkId: string;
+  /** Last user-facing name retained for diagnostics if the network is later removed. */
+  readonly networkName: string;
+  /** Successful completion time; absent while a retryable initialization is partial. */
+  readonly initializedAt?: string;
+}
 
 /**
  * Registers Port Manager commands and coordinates the MVP flow.
@@ -112,6 +130,9 @@ export class PortManagerCommandController implements DisposableLike {
   /** Disposables returned by VS Code command registration. */
   private readonly disposables: DisposableLike[] = [];
 
+  /** Coalesces double-clicks so one worktree cannot create duplicate default networks. */
+  private worktreeInitializationInFlight: Promise<void> | undefined;
+
   constructor(private readonly dependencies: PortManagerCommandDependencies) {}
 
   /**
@@ -122,6 +143,7 @@ export class PortManagerCommandController implements DisposableLike {
   register(context: vscode.ExtensionContext): void {
     const ownerCommand: CommandRegistrationOptions = { requiresControlPlaneOwner: true };
 
+    this.registerCommand(context, "portManager.initializeWorktree", () => this.initializeWorktree(context), ownerCommand);
     this.registerCommand(context, "portManager.createLogicalNetwork", () => this.createLogicalNetwork(), ownerCommand);
     this.registerCommand(context, "portManager.removeLogicalNetwork", (argument) =>
       this.removeLogicalNetwork(argument),
@@ -252,6 +274,136 @@ export class PortManagerCommandController implements DisposableLike {
 
     const assets = await this.writeShellHookAssets(context);
     await migrateExistingManagedShellProfiles(assets.shellProfilePlans, assets.profileOptions);
+  }
+
+  /**
+   * Initializes the primary Git worktree as the product's default one-network
+   * path. The explicit confirmation authorizes shell profile edits and the
+   * possible macOS administrator prompt performed by terminal attachment.
+   */
+  private async initializeWorktree(context: vscode.ExtensionContext): Promise<void> {
+    if (this.worktreeInitializationInFlight !== undefined) {
+      return this.worktreeInitializationInFlight;
+    }
+
+    const initialization = this.initializeWorktreeExclusive(context).finally(() => {
+      if (this.worktreeInitializationInFlight === initialization) {
+        this.worktreeInitializationInFlight = undefined;
+      }
+    });
+    this.worktreeInitializationInFlight = initialization;
+    return initialization;
+  }
+
+  private async initializeWorktreeExclusive(context: vscode.ExtensionContext): Promise<void> {
+    const workspaceFolder = getPrimaryWorkspaceFolder();
+    if (workspaceFolder === undefined) {
+      throw new Error("Open a Git worktree folder before initializing Port Manager.");
+    }
+
+    const confirmation = await vscode.window.showInformationMessage(
+      `Initialize Port Manager for worktree "${workspaceFolder.name}"? This creates one default logical network, installs the pm shell integration, and applies it to this VS Code window.`,
+      { modal: true },
+      "Initialize Worktree",
+    );
+    if (confirmation !== "Initialize Worktree") {
+      return;
+    }
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Initializing Port Manager for ${workspaceFolder.name}`,
+        cancellable: false,
+      },
+      async (progress) => {
+        progress.report({ message: "Checking the native runtime…" });
+        await this.dependencies.networkService.ensureContainerRuntimeDetected();
+        const initialSnapshot = this.dependencies.networkService.getSnapshot();
+        const nativeRuntime = initialSnapshot.runtimes.find(
+          (runtime) => runtime.kind === "nativeHelper" && isContainerLevelRuntime(runtime),
+        );
+        if (nativeRuntime === undefined) {
+          throw new Error(buildNoLogicalRuntimeMessage());
+        }
+        await assertPackagedShellRuntimeReadable(context);
+        assertAutomaticShellIntegrationSupported();
+
+        progress.report({ message: "Installing pm shell integration…" });
+        await this.installShellHook(context, { announce: false });
+
+        const workspaceUri = workspaceFolder.uri.toString();
+        const previousState = context.workspaceState.get<WorktreeInitializationState>(WORKTREE_INITIALIZATION_STATE_KEY);
+        let network =
+          findReusableWorktreeNetwork(previousState, workspaceUri, initialSnapshot) ??
+          findCurrentWindowDefaultNetwork(initialSnapshot);
+
+        if (network === undefined) {
+          progress.report({ message: "Creating the worktree network…" });
+          const networkName = buildUniqueWorktreeNetworkName(workspaceFolder.name, initialSnapshot.networks);
+          network = await this.dependencies.networkService.createNetwork(networkName, nativeRuntime.kind);
+          // Persist immediately. If privileged attachment is cancelled, the next
+          // explicit retry reuses this network instead of leaking duplicates.
+          await context.workspaceState.update(WORKTREE_INITIALIZATION_STATE_KEY, {
+            version: 1,
+            workspaceUri,
+            networkId: network.id,
+            networkName: network.name,
+          } satisfies WorktreeInitializationState);
+        }
+
+        progress.report({ message: "Applying the network to VS Code terminals…" });
+        await this.dependencies.networkService.attachVscodeWindowTerminalsToNetwork(network.id);
+
+        let browserAccess: BrowserDnsResolverStatus;
+        try {
+          progress.report({ message: "Completing Local DNS and TLS setup…" });
+          await this.dependencies.networkService.installBrowserDnsResolvers({
+            triggerDescription: `worktree "${workspaceFolder.name}" initialization was requested`,
+          });
+
+          progress.report({ message: "Verifying Local DNS and TLS trust…" });
+          browserAccess = await this.dependencies.networkService.verifyBrowserAccessReadiness();
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `The worktree network is attached, but browser DNS/TLS is not ready: ${detail} Open System → Browser access & DNS and run Repair Local DNS.`,
+            { cause: error },
+          );
+        }
+        if (browserAccess.supported && browserAccess.records.length > 0) {
+          if (!browserAccess.dnsRunning) {
+            throw new Error(
+              "The worktree network was attached, but the Local DNS responder is not running. Open System → Browser access & DNS and run Repair Local DNS.",
+            );
+          }
+          if (browserAccess.missingCount > 0) {
+            const details = browserAccess.tlsTrustState === "untrusted"
+              ? browserAccess.tlsTrustDetail ?? "macOS Keychain does not trust the Port Manager CA."
+              : `${browserAccess.missingCount} browser alias setup item${browserAccess.missingCount === 1 ? " is" : "s are"} incomplete.`;
+            throw new Error(`Browser DNS/TLS verification failed: ${details}`);
+          }
+        }
+
+        await context.workspaceState.update(WORKTREE_INITIALIZATION_STATE_KEY, {
+          version: 1,
+          workspaceUri,
+          networkId: network.id,
+          networkName: network.name,
+          initializedAt: new Date().toISOString(),
+        } satisfies WorktreeInitializationState);
+
+        this.dependencies.treeProvider.refresh();
+        const terminal = vscode.window.createTerminal({
+          name: `Port Manager: ${network.name}`,
+          cwd: workspaceFolder.uri,
+        });
+        terminal.show();
+        await vscode.window.showInformationMessage(
+          `Port Manager is ready for worktree "${workspaceFolder.name}". New VS Code terminals use logical network "${network.name}" automatically.`,
+        );
+      },
+    );
   }
 
   /** Creates a logical network row backed by the selected runtime adapter. */
@@ -1707,13 +1859,26 @@ export class PortManagerCommandController implements DisposableLike {
   }
 
   /** Installs the native socket hook into the user's shell startup file. */
-  private async installShellHook(context: vscode.ExtensionContext): Promise<void> {
+  private async installShellHook(
+    context: vscode.ExtensionContext,
+    options: { readonly announce?: boolean } = {},
+  ): Promise<void> {
     // The explicit install command repairs tampered assets, so it bypasses the
     // unchanged-signature fast paths used by background refreshes.
     const assets = await this.writeShellHookAssets(context, { force: true });
 
     for (const plan of assets.shellProfilePlans) {
       await upsertManagedShellProfile(plan.filePath, assets.profileOptions);
+    }
+    await verifyInstalledShellIntegration({
+      hookScriptPath: assets.hookScriptPath,
+      commandLibraryPath: assets.commandLibraryPath,
+      profilePaths: assets.shellProfilePlans.map((plan) => plan.filePath),
+      requiredProfileLines: [assets.profileOptions.preludeLine, assets.profileOptions.postludeLine],
+    });
+
+    if (options.announce === false) {
+      return;
     }
 
     const message =
@@ -1777,7 +1942,7 @@ export class PortManagerCommandController implements DisposableLike {
       TERMINAL_NETWORK_SELECTION_FILE_NAME,
     );
     const packageVersion = readPortManagerPackageVersion() ?? "unknown";
-    const shellProfilePlans = getManagedShellProfilePlans(process.env.SHELL, os.homedir());
+    const shellProfilePlans = getManagedShellProfilePlans(resolveCurrentUserShell(), os.homedir());
     const legacySourceLine = `. "${hookScriptPath}"`;
     const profileOptions: ManagedShellProfileOptions = {
       preludeLine: buildShellProfileSourceLine(profilePreludeScriptPath),
@@ -1875,6 +2040,7 @@ export class PortManagerCommandController implements DisposableLike {
 
     return {
       hookScriptPath,
+      commandLibraryPath: hookCommandLibraryPath,
       profileOptions,
       shellProfilePlans,
     };
@@ -2903,6 +3069,115 @@ function getDefaultWorkspaceFolder(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }
 
+/** Chooses the active file's worktree before falling back to the first file workspace. */
+function getPrimaryWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
+  const activeUri = vscode.window.activeTextEditor?.document.uri;
+  const activeFolder = activeUri === undefined ? undefined : vscode.workspace.getWorkspaceFolder(activeUri);
+  return activeFolder ?? (vscode.workspace.workspaceFolders ?? []).find((folder) => folder.uri.scheme === "file");
+}
+
+/** Reuses only a record written for this exact worktree folder. */
+function findReusableWorktreeNetwork(
+  state: WorktreeInitializationState | undefined,
+  workspaceUri: string,
+  snapshot: NetworkSnapshot,
+): LogicalNetwork | undefined {
+  if (state?.version !== 1 || state.workspaceUri !== workspaceUri) {
+    return undefined;
+  }
+  return snapshot.networks.find((network) => network.id === state.networkId);
+}
+
+/** Existing workspaceState bindings are already scoped to this VS Code worktree. */
+function findCurrentWindowDefaultNetwork(snapshot: NetworkSnapshot): LogicalNetwork | undefined {
+  const networkId = snapshot.vscodeWindowTerminalBinding?.networkId;
+  return networkId === undefined ? undefined : snapshot.networks.find((network) => network.id === networkId);
+}
+
+/** Produces a readable global network name without merging two worktrees. */
+function buildUniqueWorktreeNetworkName(
+  workspaceName: string,
+  networks: readonly Pick<LogicalNetwork, "name">[],
+): string {
+  const baseName = workspaceName.trim() || "worktree";
+  const existingNames = new Set(networks.map((network) => network.name.toLocaleLowerCase()));
+  if (!existingNames.has(baseName.toLocaleLowerCase())) {
+    return baseName;
+  }
+
+  for (let suffix = 2; suffix < 10_000; suffix++) {
+    const candidate = `${baseName} (${suffix})`;
+    if (!existingNames.has(candidate.toLocaleLowerCase())) {
+      return candidate;
+    }
+  }
+  throw new Error(`Could not allocate a unique logical network name for worktree "${baseName}".`);
+}
+
+/** Fails before profile mutation when a VSIX omitted the native shell runtime. */
+async function assertPackagedShellRuntimeReadable(context: vscode.ExtensionContext): Promise<void> {
+  const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
+  const requiredPaths = [
+    { filePath: hookLibraryPath, mode: fsConstants.R_OK },
+    {
+      filePath: context.asAbsolutePath(path.join("media", "native", "portmanager_tcp_router")),
+      mode: fsConstants.R_OK | fsConstants.X_OK,
+    },
+    {
+      filePath: context.asAbsolutePath(path.join("media", "native", "portmanager_tty_input")),
+      mode: fsConstants.R_OK | fsConstants.X_OK,
+    },
+  ];
+
+  for (const required of requiredPaths) {
+    try {
+      await fs.access(required.filePath, required.mode);
+    } catch (error) {
+      throw new Error(`Port Manager native runtime is missing or not executable: ${required.filePath}`, { cause: error });
+    }
+  }
+
+  const nativeAgentPath = context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
+  if (!canRunNativeAgentBinary(nativeAgentPath)) {
+    throw new Error(
+      `Port Manager native agent cannot run on this machine. Reinstall the VSIX for ${process.platform}-${process.arch}: ${nativeAgentPath}`,
+    );
+  }
+  if (!canLoadNativeHookLibrary(nativeAgentPath, hookLibraryPath)) {
+    throw new Error(
+      `Port Manager native hook cannot be loaded on this machine. Reinstall the VSIX for ${process.platform}-${process.arch}: ${hookLibraryPath}`,
+    );
+  }
+}
+
+/** Worktree initialization may claim pm readiness only for an installable shell profile. */
+function assertAutomaticShellIntegrationSupported(): void {
+  const shellPath = resolveCurrentUserShell();
+  if (getManagedShellProfilePlans(shellPath, os.homedir()).length > 0) {
+    return;
+  }
+
+  const shellName = path.basename(shellPath?.trim() || "unknown");
+  throw new Error(
+    `Automatic pm integration supports zsh, bash, and sh profiles. Current shell: ${shellName}.`,
+  );
+}
+
+/** Dock-launched VS Code may omit SHELL; passwd metadata remains authoritative. */
+function resolveCurrentUserShell(): string | undefined {
+  try {
+    const shellPath = os.userInfo().shell?.trim();
+    if (shellPath !== undefined && shellPath.length > 0) {
+      return shellPath;
+    }
+  } catch {
+    // Fall through to the inherited environment in minimal runtimes.
+  }
+
+  const environmentShell = process.env.SHELL?.trim();
+  return environmentShell === undefined || environmentShell.length === 0 ? undefined : environmentShell;
+}
+
 /** Builds the URL users open from a host exposure row. */
 function formatExposureUrl(exposure: HostPortExposure): string {
   const host =
@@ -3304,6 +3579,8 @@ interface ShellHookStartupScriptOptions extends ShellHookScriptOptions {
 interface ShellHookAssets {
   /** Generated hook script that profile files source. */
   readonly hookScriptPath: string;
+  /** Lazily sourced pm command implementation validated during installation. */
+  readonly commandLibraryPath: string;
   /** Exact managed lines used for safe install, migration, and restore. */
   readonly profileOptions: ManagedShellProfileOptions;
   /** Startup files bracketed around user runtime-manager initialization. */

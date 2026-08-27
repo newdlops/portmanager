@@ -601,26 +601,29 @@ export class PortManagerTreeProvider
         return buildCurrentRoutingGroupItems(snapshot, agentSnapshot, getCurrentRouteRows);
       case "networks":
         return [
-          ...(snapshot.networks.length > 0
-            ? snapshot.networks.map((network) =>
-                new LogicalNetworkTreeItem(
-                  network,
-                  snapshot.attachments,
-                  snapshot.exposures,
-                  snapshot.hostAccessBindings,
-                  snapshot.composeAttachments,
-                  getRouteRows(network.id).length,
-                  snapshot.vscodeWindowTerminalBinding?.networkId === network.id,
-                ),
-              )
-            : [
+          ...(snapshot.vscodeWindowTerminalBinding === undefined
+            ? [
                 new ActionTreeItem(
-                  "Create Network",
-                  "portManager.createLogicalNetwork",
-                  "add",
-                  "Create a logical network to start routing",
+                  "Initialize This Worktree",
+                  "portManager.initializeWorktree",
+                  "rocket",
+                  "Create and use one default network",
+                  undefined,
+                  ownerAction,
                 ),
-              ]),
+              ]
+            : []),
+          ...snapshot.networks.map((network) =>
+            new LogicalNetworkTreeItem(
+              network,
+              snapshot.attachments,
+              snapshot.exposures,
+              snapshot.hostAccessBindings,
+              snapshot.composeAttachments,
+              getRouteRows(network.id).length,
+              snapshot.vscodeWindowTerminalBinding?.networkId === network.id,
+            ),
+          ),
         ];
       case "services":
         return [
@@ -1127,7 +1130,14 @@ function buildActionChildren(ownerAction: ActionAvailability = { enabled: true }
     new ActionTreeItem("Start Managed Process", "portManager.startManagedProcess", "run", undefined, undefined, ownerAction),
     new ActionTreeItem("Add Existing Process", "portManager.addExistingProcess", "add", undefined, undefined, ownerAction),
     new ActionTreeItem("Refresh", "portManager.refresh", "refresh", undefined, undefined, ownerAction),
-    new ActionTreeItem("Install Shell Hook", "portManager.installShellHook", "plug", undefined, undefined, ownerAction),
+    new ActionTreeItem(
+      "Install or Repair pm Integration",
+      "portManager.installShellHook",
+      "terminal",
+      "Make pm available in new shells",
+      undefined,
+      ownerAction,
+    ),
     new ActionTreeItem("Install External CLI", "portManager.installExternalCli", "terminal", undefined, undefined, ownerAction),
     new ActionTreeItem("Stop All Processes", "portManager.stopAllProcesses", "debug-stop", undefined, undefined, ownerAction),
     new ActionTreeItem("Open Settings", "portManager.openSettings", "settings-gear"),
@@ -1278,6 +1288,12 @@ function buildSystemGroupItems(
     : [new EmptyTreeItem("No activity", "Attach a terminal or service")];
   const maintenanceRows: PortManagerTreeItem[] = [
     new ActionTreeItem(
+      "Install or Repair pm Integration",
+      "portManager.installShellHook",
+      "terminal",
+      "Make pm available in new shells",
+    ),
+    new ActionTreeItem(
       "Fix Stale Routing",
       "portManager.fixStaleRouting",
       "debug-rerun",
@@ -1366,6 +1382,18 @@ function buildBrowserDnsDiagnosticRows(
 
   return [
     new DaemonStatusTreeItem("Browser DNS", `${description}, port ${browserDns.dnsPort}`, icon),
+    new DaemonStatusTreeItem(
+      "TLS Trust",
+      browserDns.tlsTrustState,
+      browserDns.tlsTrustState === "trusted"
+        ? "verified"
+        : browserDns.tlsTrustState === "checking"
+          ? "loading~spin"
+          : "warning",
+      browserDns.tlsTrustDetail === undefined
+        ? undefined
+        : new vscode.MarkdownString(`TLS trust: ${browserDns.tlsTrustState}\n\n${browserDns.tlsTrustDetail}`),
+    ),
     new ActionTreeItem(
       "Repair Local DNS",
       "portManager.repairLocalDns",
@@ -1742,13 +1770,17 @@ function formatBrowserDnsSummary(browserDns: BrowserDnsResolverStatus): string {
 
   const state = browserDns.records.length === 0
     ? "No aliases"
-    : browserDns.missingCount > 0
-      ? "Needs repair"
-      : browserDns.tlsStaleCount > 0
-        ? "TLS stale"
-        : browserDns.dnsRunning
-          ? "Ready"
-          : "DNS stopped";
+    : !browserDns.dnsRunning
+      ? "DNS stopped"
+      : browserDns.tlsTrustState === "checking"
+        ? "Checking TLS"
+        : browserDns.tlsTrustState === "untrusted"
+          ? "TLS untrusted"
+          : browserDns.missingCount > 0
+            ? "Needs repair"
+            : browserDns.tlsStaleCount > 0
+              ? "TLS stale"
+              : "Ready";
   return formatSidebarSummary(state, [
     { count: browserDns.records.length, singular: "alias" },
     { count: browserDns.missingCount, singular: "missing alias" },

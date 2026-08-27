@@ -419,7 +419,7 @@ test("network and system categories are collapsed presentation-only groups", () 
   assert.equal(source.includes('"Attach Active Terminal"'), true);
   assert.equal(source.includes('"Attach Terminal"'), true);
   assert.equal(source.includes('"No connections"'), true);
-  assert.equal(source.includes('"Create Network"'), true);
+  assert.equal(source.includes('"Initialize This Worktree"'), true);
   assert.equal(source.includes('super(label, vscode.TreeItemCollapsibleState.Collapsed);'), true);
   const groupStart = source.indexOf("class SidebarGroupTreeItem");
   const groupEnd = source.indexOf("/** Collapsible root row", groupStart);
@@ -478,7 +478,7 @@ test("grouping preserves action metadata and keeps presentation groups out of dr
   assert.deepEqual(activityRows.map((item) => item.label), ["No activity"]);
 
   const networkItems = provider.getChildren(roots[1] as never) as Array<{ id: string }>;
-  const networkItem = networkItems[0] as never;
+  const networkItem = networkItems.find((item) => item.id === network.id) as never;
   const groups = provider.getChildren(networkItem) as Array<{ label: string; description: string; contextValue: string; collapsibleState: number }>;
   assert.deepEqual(groups.map((item) => item.label), ["Routes", "Connections", "Port mappings", "Connect actions", "Manage actions"]);
   assert.equal(groups.every((item) => item.collapsibleState === 1), true);
@@ -486,7 +486,8 @@ test("grouping preserves action metadata and keeps presentation groups out of dr
   assert.deepEqual(groups.slice(0, 3).map((item) => item.description), ["No routes", "No connections", "No mappings"]);
   assert.equal((groups[3] as unknown as { tooltip: { value: string } }).tooltip.value, "Connect actions\n\nAvailable · 5 actions");
 
-  const secondNetworkGroups = provider.getChildren(networkItems[1] as never) as Array<{ id: string }>;
+  const secondNetworkItem = networkItems.find((item) => item.id === networkB.id);
+  const secondNetworkGroups = provider.getChildren(secondNetworkItem as never) as Array<{ id: string }>;
   assert.notEqual((groups[1] as unknown as { id: string }).id, secondNetworkGroups[1].id);
   assert.notEqual((groups[2] as unknown as { id: string }).id, secondNetworkGroups[2].id);
   assert.equal(
@@ -620,7 +621,7 @@ test("conditional network actions and recent activity retain every underlying le
     onDidChange: () => ({ dispose(): void {} }),
   });
   const roots = provider.getChildren();
-  const networkItem = provider.getChildren(roots[1])[0];
+  const networkItem = provider.getChildren(roots[1]).find((item) => item.id === network.id);
   const networkGroups = provider.getChildren(networkItem);
   const manageLeaves = provider.getChildren(networkGroups[4]) as Array<{
     command: { command: string; arguments: unknown[] };
@@ -708,7 +709,7 @@ test("sidebar empty summaries and daemon fallback tooltips remain explicit", () 
   const maintenanceRows = provider.getChildren(systemGroups[4] as never) as Array<{ command: { command: string } }>;
   assert.deepEqual(
     maintenanceRows.map((item) => item.command.command),
-    ["portManager.fixStaleRouting", "portManager.clearGlobalStorageFiles"],
+    ["portManager.installShellHook", "portManager.fixStaleRouting", "portManager.clearGlobalStorageFiles"],
   );
 
   const supportedProvider = createProvider({
@@ -719,6 +720,8 @@ test("sidebar empty summaries and daemon fallback tooltips remain explicit", () 
     installedCount: 0,
     missingCount: 0,
     tlsStaleCount: 0,
+    tlsTrustState: "trusted",
+    tlsTrustDetail: "Trusted by macOS Keychain.",
   });
   const supportedRoots = supportedProvider.getChildren();
   const supportedSystemGroups = supportedProvider.getChildren(supportedRoots[3]);
@@ -728,11 +731,12 @@ test("sidebar empty summaries and daemon fallback tooltips remain explicit", () 
   }>;
   assert.deepEqual(
     supportedBrowserRows.map((item) => item.label),
-    ["Browser DNS", "Repair Local DNS", "Install Browser DNS", "Clean Browser DNS"],
+    ["Browser DNS", "TLS Trust", "Repair Local DNS", "Install Browser DNS", "Clean Browser DNS"],
   );
   assert.deepEqual(
     supportedBrowserRows.map((item) => item.command?.command),
     [
+      undefined,
       undefined,
       "portManager.repairLocalDns",
       "portManager.installBrowserDnsResolvers",
