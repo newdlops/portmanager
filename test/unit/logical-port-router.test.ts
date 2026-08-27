@@ -193,7 +193,11 @@ test("native logical router helper starts without inherited hook environment", a
     },
     {
       nativeRouterPath: routerPath,
-      nativeStartupTimeoutMs: 1000,
+      // The full suite launches hundreds of helpers concurrently. This test
+      // verifies environment sanitization, not the production startup budget,
+      // so leave enough headroom for a loaded CI runner to reach READY instead
+      // of silently exercising the Node fallback and missing env.json.
+      nativeStartupTimeoutMs: 10_000,
     },
   );
 
