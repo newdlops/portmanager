@@ -31,6 +31,9 @@ test("zsh profiles bracket both login and interactive startup files", () => {
     { filePath: "/home/user/.bash_profile" },
     { filePath: "/home/user/.bashrc" },
   ]);
+  assert.deepEqual(getManagedShellProfilePlans("/bin/sh", "/home/user"), [
+    { filePath: "/home/user/.profile" },
+  ]);
 
   const bashHome = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-bash-profile-"));
   fs.writeFileSync(path.join(bashHome, ".bash_login"), "export FROM_BASH_LOGIN=1\n");
@@ -113,6 +116,18 @@ test("invalid UTF-8 profile bytes are rejected without modification", async () =
   fs.writeFileSync(profile, invalid);
   await assert.rejects(() => upsertManagedShellProfile(profile, profileOptions));
   assert.deepEqual(fs.readFileSync(profile), invalid);
+});
+
+test("explicit installation creates fresh-machine shell profiles for pm", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-shell-new-machine-"));
+  const profiles = [path.join(root, ".zprofile"), path.join(root, ".zshrc")];
+
+  for (const profile of profiles) {
+    await upsertManagedShellProfile(profile, profileOptions);
+    const installed = fs.readFileSync(profile, "utf8");
+    assert.equal(installed.includes(profileOptions.preludeLine), true);
+    assert.equal(installed.includes(profileOptions.postludeLine), true);
+  }
 });
 
 test("background migration requires PM evidence and never creates missing profiles", async () => {

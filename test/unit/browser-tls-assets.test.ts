@@ -11,6 +11,10 @@ import {
   buildBrowserTlsRenewalShellScript,
   buildBrowserTlsRepairShellFunctions,
 } from "../../src/platform/network/browser-tls-assets";
+import {
+  browserTlsCertificateCoversHostname,
+  parseBrowserTlsCertificate,
+} from "../../src/platform/network/browser-tls-certificate";
 
 const hasPosixShell = process.platform !== "win32";
 const hasOpenssl = (() => {
@@ -69,6 +73,9 @@ test("standalone renewal script parses as POSIX shell", { skip: !hasPosixShell }
   assert.equal(script.includes("openssl x509 -checkend"), true);
   assert.equal(script.includes("PORTMANAGER_TLS_SERVER_CONF"), true);
   assert.equal(script.includes("security add-trusted-cert"), true);
+  assert.equal(script.includes('security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain'), true);
+  assert.equal(script.includes('security add-trusted-cert -r trustRoot -k "$__pm_tls_owner_keychain"'), true);
+  assert.equal(script.includes('security add-trusted-cert -d -r trustRoot -k "$__pm_tls_owner_keychain"'), false);
   // Renewal must never invent hostnames: SANs come from the marker file.
   assert.equal(script.includes('"$__pm_tls_hosts_file" >> "$__pm_tls_server_conf"'), true);
 });
@@ -100,6 +107,12 @@ test(
     assert.match(certText, /DNS:production1/);
     assert.match(certText, /DNS:production1\.pm/);
     assert.match(certText, /IP Address:127\.0\.0\.1/);
+
+    const parsedLeaf = parseBrowserTlsCertificate(fs.readFileSync(certPath, "utf8"));
+    assert.equal(browserTlsCertificateCoversHostname(parsedLeaf.certificate, "localhost"), true);
+    assert.equal(browserTlsCertificateCoversHostname(parsedLeaf.certificate, "production1"), true);
+    assert.equal(browserTlsCertificateCoversHostname(parsedLeaf.certificate, "production1.pm"), true);
+    assert.equal(browserTlsCertificateCoversHostname(parsedLeaf.certificate, "another-worktree.pm"), false);
 
     // A second run keeps the still-valid CA so existing trust stays intact.
     const caPath = path.join(sandbox.tlsDir, "portmanager-root-ca.crt");

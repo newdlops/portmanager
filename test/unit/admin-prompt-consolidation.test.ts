@@ -77,7 +77,7 @@ test("background DNS reconciliation cannot open administrator authorization", ()
   const offerEnd = source.indexOf("private rememberBrowserDnsInstallOfferSignature", offerStart);
   const offerBody = source.slice(offerStart, offerEnd);
   const selectionGuardIndex = offerBody.indexOf("if (selection !== installAction) {");
-  const privilegedInstallIndex = offerBody.indexOf("void this.installBrowserDnsResolvers({");
+  const privilegedInstallIndex = offerBody.indexOf("await this.installBrowserDnsResolvers({");
   const automaticBodies = [
     source.slice(
       source.indexOf("private async startControlPlaneOwnerServices"),
@@ -99,7 +99,7 @@ test("background DNS reconciliation cannot open administrator authorization", ()
 
   assert.notEqual(offerStart, -1);
   assert.notEqual(offerEnd, -1);
-  assert.equal(offerBody.includes("vscode.window\n      .showInformationMessage("), true);
+  assert.equal(offerBody.includes(".showInformationMessage("), true);
   assert.equal(selectionGuardIndex >= 0, true);
   assert.equal(selectionGuardIndex < privilegedInstallIndex, true);
   assert.doesNotMatch(source, /installBrowserDnsResolvers\(\{\s*automatic:\s*true/);

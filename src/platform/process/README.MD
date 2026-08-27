@@ -14,6 +14,9 @@
 - OS process table에서 PID, PPID, PGID, TTY 관계 조회
 - OS process environment에서 Port Manager logical network scope 조회
 - native helper를 통한 PID ancestry, cwd, routing network 조회와 기존 명령 기반 fallback 유지
+- Mach-O/ELF header와 native agent argument-parser probe로 현재 CPU/OS loader 호환성 검증
+- routing disabled 상태에서 hook dylib/so를 agent에 실제 preload해 동적 로더 호환성 검증
+- 설치된 shell script를 `sh -n`으로 검사하고 실제 source 후 `pm` 함수 및 profile marker 유지 검증
 - UI가 터미널 창/세션으로 그룹화할 수 있는 tty, process group, console 식별자 제공
 
 ## 주요 진입점
@@ -24,6 +27,8 @@
 - `node-process-table.ts`
 - `node-process-environment.ts`
 - `native-process-lookup.ts`
+- `native-executable.ts`
+- `shell-integration-verifier.ts`
 - `node-terminal-candidate-provider.ts`
 
 ## 외부 의존성

@@ -1216,7 +1216,13 @@ test("background routing refresh converges daemon version and generated route fi
 
   assert.equal(source.includes("DAEMON_RESTART_BACKOFF_MS = 30_000"), true);
   assert.equal(convergeBody.includes("this.ensureSharedNetworkStateFileMaterialized();"), true);
-  assert.equal(convergeBody.includes("await this.ensureCurrentProcessDaemon().catch(() => undefined);"), true);
+  assert.equal(
+    convergeBody.includes(
+      "const daemonConvergence = await this.ensureCurrentProcessDaemon().catch(() => daemonNotReady());",
+    ),
+    true,
+  );
+  assert.equal(convergeBody.includes("await continueWhenDaemonLifecycleReady(daemonConvergence, async () => {"), true);
   assert.equal(convergeBody.includes("await this.writeHostAccessBindingsFile().catch(() => undefined);"), true);
   assert.equal(convergeBody.includes("await this.writeComposeProjectRoutingFile().catch(() => undefined);"), true);
   assert.equal(convergeBody.includes("restorePersistedComposeRoutesIfMissing"), false);

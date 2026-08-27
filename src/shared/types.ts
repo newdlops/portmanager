@@ -1035,6 +1035,10 @@ export interface BrowserDnsResolverStatus {
   readonly missingCount: number;
   /** Number of aliases whose dev TLS certificate needs renewal. */
   readonly tlsStaleCount: number;
+  /** Actual macOS Keychain verification, not merely certificate file presence. */
+  readonly tlsTrustState: "checking" | "trusted" | "untrusted" | "unsupported";
+  /** Actionable Keychain verification detail when trust is pending or failed. */
+  readonly tlsTrustDetail?: string;
   /** Expiry instant of the current dev TLS leaf certificate, when readable. */
   readonly tlsValidTo?: string;
 }

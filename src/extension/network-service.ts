@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
-import { createHash, randomUUID, X509Certificate } from "node:crypto";
+import { createHash, randomUUID, type X509Certificate } from "node:crypto";
 import * as syncFs from "node:fs";
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
+import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import * as vscode from "vscode";
@@ -58,6 +59,7 @@ import {
   runContainerCommand,
 } from "../platform/network/container-runtime";
 import { browserDnsPort, normalizeBrowserDnsHostname } from "../platform/network/browser-dns-server";
+import { verifyBrowserDnsAliasesResolve } from "../platform/network/browser-dns-verifier";
 import {
   CONTAINER_ALIAS_SERVICE_PREFIX,
   mergeComposeContainerMappingLineage,
@@ -79,6 +81,16 @@ import {
   BROWSER_TLS_SERVER_KEY_PATH,
   BROWSER_TLS_SERVER_OPENSSL_CONFIG_HEADER_LINES,
 } from "../platform/network/browser-tls-assets";
+import {
+  browserTlsCertificateCoversHostname,
+  parseBrowserTlsCertificate,
+} from "../platform/network/browser-tls-certificate";
+import {
+  invalidateBrowserTlsTrustStatus,
+  readCachedBrowserTlsTrustStatus,
+  refreshBrowserTlsTrustStatus,
+  type BrowserTlsTrustStatus,
+} from "../platform/network/browser-tls-trust";
 import { ContainerEventsWatcher } from "../platform/network/container-events-watcher";
 import { SharedLogicalNetworkStateStore } from "../platform/network/shared-network-state-store";
 import {
@@ -1597,14 +1609,24 @@ export class PortManagerNetworkService implements DisposableLike {
    * spawning ifconfig on the extension-host render stack.
    */
   private warmBrowserDnsAliasStatus(): void {
-    if (process.platform !== "darwin" || loopbackAliasCacheIsFresh()) {
+    if (process.platform !== "darwin") {
+      return;
+    }
+    const trustStatus = readCachedBrowserTlsTrustStatus(BROWSER_TLS_CA_CERT_PATH, BROWSER_TLS_SERVER_CERT_PATH);
+    const aliasesFresh = loopbackAliasCacheIsFresh();
+    if (aliasesFresh && trustStatus.state !== "checking") {
       return;
     }
     if (this.browserDnsAliasStatusRefreshInFlight !== undefined) {
       return;
     }
 
-    const refresh = readLoopbackAliasAddresses()
+    const refresh = Promise.all([
+      aliasesFresh ? Promise.resolve(readCachedLoopbackAliasAddresses()) : readLoopbackAliasAddresses(),
+      trustStatus.state === "checking"
+        ? refreshBrowserTlsTrustStatus(BROWSER_TLS_CA_CERT_PATH, BROWSER_TLS_SERVER_CERT_PATH)
+        : Promise.resolve(trustStatus),
+    ])
       .then(() => {
         this.localChangeEvents.emit();
         this.maybeOfferBrowserDnsResolverInstall();
@@ -1688,6 +1710,42 @@ export class PortManagerNetworkService implements DisposableLike {
     });
   }
 
+  /**
+   * Refreshes every non-mutating browser-access signal used by clean-machine
+   * initialization. This verifies Keychain trust and the daemon DNS heartbeat
+   * instead of treating generated files as proof of a working setup.
+   */
+  async verifyBrowserAccessReadiness(): Promise<BrowserDnsResolverStatus> {
+    if (process.platform !== "darwin") {
+      return this.getBrowserDnsResolverStatus();
+    }
+
+    invalidateLoopbackAliasCache();
+    await readLoopbackAliasAddresses();
+    invalidateBrowserTlsTrustStatus();
+    await refreshBrowserTlsTrustStatus(BROWSER_TLS_CA_CERT_PATH, BROWSER_TLS_SERVER_CERT_PATH);
+    await this.flushBrowserDnsDaemonSync();
+    const status = this.getBrowserDnsResolverStatus();
+    if (status.records.length === 0) {
+      return status;
+    }
+    if (!status.dnsRunning) {
+      throw new Error("The Port Manager Local DNS responder did not report ready after synchronization.");
+    }
+    if (status.missingCount > 0) {
+      const trustFailure = status.tlsTrustState === "untrusted" ? status.tlsTrustDetail : undefined;
+      const incompleteAliases = status.records
+        .filter((record) => !record.configured)
+        .map((record) => record.hostname)
+        .join(", ");
+      throw new Error(
+        trustFailure ?? `Browser DNS/TLS setup is incomplete for: ${incompleteAliases || "unknown alias"}.`,
+      );
+    }
+    await verifyBrowserDnsAliasesResolve(status.records);
+    return status;
+  }
+
   /** Terminal-band loopback addresses for every network, for consolidated alias setup. */
   private collectTerminalLoopbackAddresses(): readonly string[] {
     // The global network's fixed aliases ride the same consolidated approval so
@@ -1752,7 +1810,7 @@ export class PortManagerNetworkService implements DisposableLike {
       );
       invalidateLoopbackAliasCache();
       if (records.length > 0) {
-        await trustBrowserTlsCertificateForCurrentUser().catch(() => undefined);
+        await ensureBrowserTlsCertificateTrustedForCurrentUser().catch(() => undefined);
         // The approval already covered the full browser DNS setup, so the
         // background path must not offer the same setup again.
         this.clearBrowserDnsInstallOfferSignature();
@@ -1807,8 +1865,15 @@ export class PortManagerNetworkService implements DisposableLike {
       options.forceTlsRenewal !== true &&
       options.forceResolverSetup !== true
     ) {
-      this.clearBrowserDnsInstallOfferSignature();
-      return status;
+      try {
+        const verifiedStatus = await this.verifyBrowserAccessReadiness();
+        this.clearBrowserDnsInstallOfferSignature();
+        return verifiedStatus;
+      } catch {
+        // Generated files can look healthy while macOS split DNS or the daemon
+        // is not. Fall through to the idempotent privileged repair and then
+        // repeat the real resolver check below.
+      }
     }
 
     const unconfiguredNames = status.records
@@ -1840,19 +1905,33 @@ export class PortManagerNetworkService implements DisposableLike {
     // rather than the cache state that triggered it.
     invalidateLoopbackAliasCache();
     await readLoopbackAliasAddresses().catch(() => undefined);
-    await trustBrowserTlsCertificateForCurrentUser();
+    await ensureBrowserTlsCertificateTrustedForCurrentUser();
     this.localChangeEvents.emit();
     this.browserNetworkProxy.retryFailedEndpointsNow();
     await this.syncBrowserNetworkProxies().catch(() => undefined);
 
     this.clearBrowserDnsInstallOfferSignature();
-    return this.getBrowserDnsResolverStatus();
+    // Do not accept generated files as proof. The final gate refreshes the
+    // daemon heartbeat, evaluates Keychain trust, and asks macOS getaddrinfo
+    // to resolve every public alias to its exact per-network loopback address.
+    const installedStatus = await this.verifyBrowserAccessReadiness();
+    if (!installedStatus.dnsRunning) {
+      throw new Error("Browser DNS files were installed, but the Port Manager DNS responder is not running.");
+    }
+    if (installedStatus.missingCount > 0) {
+      const missingAliases = installedStatus.records
+        .filter((record) => !record.configured)
+        .map((record) => record.hostname)
+        .join(", ");
+      throw new Error(`Browser DNS/TLS verification failed for: ${missingAliases || "unknown alias"}.`);
+    }
+    return installedStatus;
   }
 
   /** Offers one user-driven resolver repair for each distinct missing alias set. */
   private maybeOfferBrowserDnsResolverInstall(): void {
     const status = this.getBrowserDnsResolverStatus();
-    if (!status.supported || !status.dnsRunning || status.missingCount === 0) {
+    if (!status.supported || status.missingCount === 0) {
       if (status.supported && status.missingCount === 0) {
         this.clearBrowserDnsInstallOfferSignature();
       }
@@ -1882,23 +1961,40 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
-    this.rememberBrowserDnsInstallOfferSignature(signature);
+    // Session-local throttling prevents concurrent refreshes from stacking the
+    // same notification. Durable suppression is written only when the user
+    // explicitly dismisses it, never before an install that may fail.
+    this.browserDnsInstallOfferSignature = signature;
     const installAction = "Install Browser DNS";
     void vscode.window
       .showInformationMessage(
-        "Port Manager browser aliases need one-time macOS DNS and dev TLS setup.",
+        status.dnsRunning
+          ? "Port Manager browser aliases need one-time macOS DNS and dev TLS setup."
+          : "Port Manager browser aliases are not ready because Local DNS is stopped or setup is incomplete.",
         installAction,
       )
-      .then((selection) => {
+      .then(async (selection) => {
         if (selection !== installAction) {
+          this.rememberBrowserDnsInstallOfferSignature(signature);
           return;
         }
 
         // Only the notification action, sidebar command, or another explicit
         // user gesture may cross into the privileged installer.
-        void this.installBrowserDnsResolvers({
-          triggerDescription: "browser alias installation was requested from the Port Manager notification",
-        }).catch(() => undefined);
+        try {
+          await this.installBrowserDnsResolvers({
+            triggerDescription: "browser alias installation was requested from the Port Manager notification",
+          });
+        } catch (error) {
+          this.clearBrowserDnsInstallOfferSignature();
+          const retry = await vscode.window.showErrorMessage(
+            `Port Manager browser DNS/TLS setup failed: ${error instanceof Error ? error.message : String(error)}`,
+            "Retry Setup",
+          );
+          if (retry === "Retry Setup") {
+            void vscode.commands.executeCommand("portManager.installBrowserDnsResolvers");
+          }
+        }
       });
   }
 
@@ -10379,7 +10475,11 @@ function buildHostExposureBrowserEndpoint(exposure: HostPortExposure): BrowserNe
 /** HTTPS only when the current dev certificate actually covers the localhost name. */
 function localhostBrowserTlsProtocol(): "http" | "https" {
   const state = readBrowserTlsCertificateState();
-  return state.available && !state.expired && state.markerHostnames.has("localhost") ? "https" : "http";
+  const trusted =
+    readCachedBrowserTlsTrustStatus(BROWSER_TLS_CA_CERT_PATH, BROWSER_TLS_SERVER_CERT_PATH).state === "trusted";
+  return state.available && !state.expired && trusted && browserTlsStateCoversHostname(state, "localhost")
+    ? "https"
+    : "http";
 }
 
 /** Indexes compose published ports so the proxy can reach their docker-published host target. */
@@ -10847,14 +10947,23 @@ function readBrowserTlsCredentials(): BrowserNetworkProxyTlsCredentials | undefi
   }
 }
 
-async function trustBrowserTlsCertificateForCurrentUser(): Promise<void> {
+async function ensureBrowserTlsCertificateTrustedForCurrentUser(): Promise<void> {
   if (process.platform !== "darwin" || !syncFs.existsSync(BROWSER_TLS_CA_CERT_PATH)) {
     return;
   }
 
-  const homeDirectory = process.env.HOME?.trim();
-  if (homeDirectory === undefined || homeDirectory.length === 0) {
+  invalidateBrowserTlsTrustStatus();
+  let trustStatus = await refreshBrowserTlsTrustStatus(BROWSER_TLS_CA_CERT_PATH, BROWSER_TLS_SERVER_CERT_PATH);
+  // The privileged setup normally registers System.keychain trust. Avoid a
+  // redundant login-keychain mutation (and locked-keychain failure) when that
+  // system trust already validates the real leaf.
+  if (trustStatus.state === "trusted") {
     return;
+  }
+
+  const homeDirectory = resolveCurrentUserHomeDirectory();
+  if (homeDirectory === undefined) {
+    throw new Error(trustStatus.detail ?? "Cannot locate the current user's login keychain.");
   }
 
   const keychainPath = [
@@ -10862,13 +10971,15 @@ async function trustBrowserTlsCertificateForCurrentUser(): Promise<void> {
     path.join(homeDirectory, "Library/Keychains/login.keychain"),
   ].find((candidatePath) => syncFs.existsSync(candidatePath));
   if (keychainPath === undefined) {
-    return;
+    throw new Error(trustStatus.detail ?? "Cannot locate the current user's login keychain.");
   }
 
   try {
+    // login.keychain belongs to the user trust domain; `-d` would incorrectly
+    // target admin trust settings and is a common clean-machine failure.
     await execFileAsync(
-      "security",
-      ["add-trusted-cert", "-d", "-r", "trustRoot", "-k", keychainPath, BROWSER_TLS_CA_CERT_PATH],
+      "/usr/bin/security",
+      ["add-trusted-cert", "-r", "trustRoot", "-k", keychainPath, BROWSER_TLS_CA_CERT_PATH],
       { timeout: 30_000, maxBuffer: 256 * 1024 },
     );
   } catch (error) {
@@ -10876,6 +10987,12 @@ async function trustBrowserTlsCertificateForCurrentUser(): Promise<void> {
     if (!/already exists/i.test(output)) {
       throw new Error("Port Manager browser TLS CA trust registration failed.", { cause: error });
     }
+  }
+
+  invalidateBrowserTlsTrustStatus();
+  trustStatus = await refreshBrowserTlsTrustStatus(BROWSER_TLS_CA_CERT_PATH, BROWSER_TLS_SERVER_CERT_PATH);
+  if (trustStatus.state !== "trusted") {
+    throw new Error(trustStatus.detail ?? "Port Manager browser TLS CA is not trusted by macOS Keychain.");
   }
 }
 
@@ -10891,7 +11008,7 @@ function trustRegistrationErrorText(error: unknown): string {
 }
 
 export interface BrowserTlsCertificateState {
-  /** True when the leaf certificate, key, and hostname marker all exist. */
+  /** True when the leaf, readable private key, marker, and parsed expiry are valid. */
   readonly available: boolean;
   /** Hostnames covered by the current leaf certificate's marker file. */
   readonly markerHostnames: ReadonlySet<string>;
@@ -10901,26 +11018,34 @@ export interface BrowserTlsCertificateState {
   readonly expired: boolean;
   /** True when the leaf certificate expires inside the renewal window. */
   readonly expiresSoon: boolean;
+  /** Specific material failure used instead of the misleading generic "not installed" state. */
+  readonly errorDetail?: string;
+  /** Parsed leaf used to prove SAN/CN coverage instead of trusting the marker file. */
+  readonly certificate?: X509Certificate;
 }
 
-let parsedBrowserTlsLeafCache: { readonly pem: string; readonly validToMs: number | undefined } | undefined;
+interface ParsedBrowserTlsLeaf {
+  readonly pem: string;
+  readonly certificate?: X509Certificate;
+  readonly validToMs?: number;
+}
 
-/** Parses the leaf expiry once per certificate content; stat caching handles file churn. */
-function readBrowserTlsLeafValidToMs(pem: string): number | undefined {
+let parsedBrowserTlsLeafCache: ParsedBrowserTlsLeaf | undefined;
+
+/** Parses the real leaf once per content for expiry and hostname checks. */
+function readParsedBrowserTlsLeaf(pem: string): ParsedBrowserTlsLeaf {
   if (parsedBrowserTlsLeafCache?.pem === pem) {
-    return parsedBrowserTlsLeafCache.validToMs;
+    return parsedBrowserTlsLeafCache;
   }
 
-  let validToMs: number | undefined;
-  try {
-    const parsed = Date.parse(new X509Certificate(pem).validTo);
-    validToMs = Number.isNaN(parsed) ? undefined : parsed;
-  } catch {
-    validToMs = undefined;
-  }
+  const { certificate, validToMs } = parseBrowserTlsCertificate(pem);
 
-  parsedBrowserTlsLeafCache = { pem, validToMs };
-  return validToMs;
+  parsedBrowserTlsLeafCache = {
+    pem,
+    ...(certificate === undefined ? {} : { certificate }),
+    ...(validToMs === undefined ? {} : { validToMs }),
+  };
+  return parsedBrowserTlsLeafCache;
 }
 
 /**
@@ -10932,10 +11057,25 @@ function readBrowserTlsLeafValidToMs(pem: string): number | undefined {
 function readBrowserTlsCertificateState(nowMs = Date.now()): BrowserTlsCertificateState {
   const certPem = readTextFileWithStatCache(BROWSER_TLS_SERVER_CERT_PATH);
   const markerText = readTextFileWithStatCache(BROWSER_TLS_HOSTNAMES_MARKER_PATH);
-  const keyExists = syncFs.existsSync(BROWSER_TLS_SERVER_KEY_PATH);
+  let keyReadable = false;
+  try {
+    syncFs.readFileSync(BROWSER_TLS_SERVER_KEY_PATH);
+    keyReadable = true;
+  } catch {
+    keyReadable = false;
+  }
 
-  if (certPem === undefined || markerText === undefined || !keyExists) {
-    return { available: false, markerHostnames: new Set(), expired: false, expiresSoon: false };
+  if (certPem === undefined || markerText === undefined || !keyReadable) {
+    const keyExists = syncFs.existsSync(BROWSER_TLS_SERVER_KEY_PATH);
+    return {
+      available: false,
+      markerHostnames: new Set(),
+      expired: false,
+      expiresSoon: false,
+      errorDetail: keyExists && !keyReadable
+        ? "TLS private key exists but is not readable by this user."
+        : "TLS certificate material is not installed.",
+    };
   }
 
   const markerHostnames = new Set(
@@ -10944,17 +11084,35 @@ function readBrowserTlsCertificateState(nowMs = Date.now()): BrowserTlsCertifica
       .map((line) => normalizeBrowserTlsHostname(line))
       .filter((hostname): hostname is string => hostname !== undefined),
   );
-  const validToMs = readBrowserTlsLeafValidToMs(certPem);
-  const expired = validToMs !== undefined && nowMs >= validToMs;
-  const expiresSoon = validToMs !== undefined && !expired && validToMs - nowMs < BROWSER_TLS_RENEW_WINDOW_MS;
+  const parsedLeaf = readParsedBrowserTlsLeaf(certPem);
+  if (parsedLeaf.certificate === undefined || parsedLeaf.validToMs === undefined) {
+    return {
+      available: false,
+      markerHostnames,
+      expired: false,
+      expiresSoon: false,
+      errorDetail: "TLS certificate is unreadable or invalid.",
+    };
+  }
+  const expired = nowMs >= parsedLeaf.validToMs;
+  const expiresSoon = !expired && parsedLeaf.validToMs - nowMs < BROWSER_TLS_RENEW_WINDOW_MS;
 
   return {
     available: true,
     markerHostnames,
-    ...(validToMs === undefined ? {} : { validToMs }),
+    validToMs: parsedLeaf.validToMs,
     expired,
     expiresSoon,
+    certificate: parsedLeaf.certificate,
   };
+}
+
+/** Marker coverage is advisory; this checks the actual signed leaf hostname. */
+function browserTlsStateCoversHostname(state: BrowserTlsCertificateState, hostname: string): boolean {
+  if (!state.markerHostnames.has(hostname) || state.certificate === undefined) {
+    return false;
+  }
+  return browserTlsCertificateCoversHostname(state.certificate, hostname);
 }
 
 /** True when this record's alias hostnames are all covered by the leaf certificate. */
@@ -10968,7 +11126,7 @@ function browserTlsStateCoversRecord(
 
   for (const candidate of [record.hostname, record.secureHostname]) {
     const hostname = candidate === undefined ? undefined : normalizeBrowserTlsHostname(candidate);
-    if (hostname !== undefined && !state.markerHostnames.has(hostname)) {
+    if (hostname !== undefined && !browserTlsStateCoversHostname(state, hostname)) {
       return false;
     }
   }
@@ -10977,9 +11135,14 @@ function browserTlsStateCoversRecord(
 }
 
 /** Human-readable renewal detail shown next to per-network TLS status rows. */
-function buildBrowserTlsStatusDetail(state: BrowserTlsCertificateState, covered: boolean, nowMs = Date.now()): string {
+function buildBrowserTlsStatusDetail(
+  state: BrowserTlsCertificateState,
+  covered: boolean,
+  trust: BrowserTlsTrustStatus,
+  nowMs = Date.now(),
+): string {
   if (!state.available) {
-    return "TLS not installed";
+    return state.errorDetail ?? "TLS not installed";
   }
   if (!covered) {
     return "TLS certificate missing this alias";
@@ -10989,6 +11152,13 @@ function buildBrowserTlsStatusDetail(state: BrowserTlsCertificateState, covered:
   }
   if (state.expiresSoon) {
     return `TLS expires in ${formatWholeDays((state.validToMs ?? nowMs) - nowMs)}`;
+  }
+
+  if (trust.state === "checking") {
+    return "TLS trust checking";
+  }
+  if (trust.state === "untrusted") {
+    return trust.detail ?? "TLS CA is not trusted by macOS Keychain";
   }
 
   return "TLS ok";
@@ -11006,13 +11176,18 @@ function isBrowserTlsCertificateConfigured(
   if (!state.available || state.expired) {
     return false;
   }
+  if (
+    readCachedBrowserTlsTrustStatus(BROWSER_TLS_CA_CERT_PATH, BROWSER_TLS_SERVER_CERT_PATH).state !== "trusted"
+  ) {
+    return false;
+  }
 
   const expectedHostnames = buildBrowserTlsHostnames(records);
   if (expectedHostnames.length === 0) {
     return false;
   }
 
-  return expectedHostnames.every((hostname) => state.markerHostnames.has(hostname));
+  return expectedHostnames.every((hostname) => browserTlsStateCoversHostname(state, hostname));
 }
 
 function buildBrowserTlsHostnames(
@@ -11098,6 +11273,7 @@ function buildBrowserDnsResolverStatus(
   const supported = process.platform === "darwin";
   const nowMs = Date.now();
   const tlsState = readBrowserTlsCertificateState(nowMs);
+  const tlsTrust = readCachedBrowserTlsTrustStatus(BROWSER_TLS_CA_CERT_PATH, BROWSER_TLS_SERVER_CERT_PATH, nowMs);
   const recordStatuses = records.map((record) => {
     const resolverConfigured =
       supported &&
@@ -11114,8 +11290,11 @@ function buildBrowserDnsResolverStatus(
      * collapsing every network into one global boolean.
      */
     const tlsCoversRecord = supported && browserTlsStateCoversRecord(tlsState, record);
-    const tlsConfigured = tlsCoversRecord && !tlsState.expired;
-    const tlsStale = supported && tlsState.available && (tlsState.expired || tlsState.expiresSoon || !tlsCoversRecord);
+    const tlsConfigured = tlsCoversRecord && !tlsState.expired && tlsTrust.state === "trusted";
+    const tlsStale =
+      supported &&
+      ((tlsState.available && (tlsState.expired || tlsState.expiresSoon || !tlsCoversRecord)) ||
+        tlsTrust.state === "untrusted");
     const aliasRoutes = buildBrowserDnsAliasRouteStatus(record, processes, routes, networks, browserNetworkProxy);
 
     return {
@@ -11126,7 +11305,7 @@ function buildBrowserDnsResolverStatus(
       hostsConfigured,
       tlsConfigured,
       tlsStale,
-      ...(supported ? { tlsStatusDetail: buildBrowserTlsStatusDetail(tlsState, tlsCoversRecord, nowMs) } : {}),
+      ...(supported ? { tlsStatusDetail: buildBrowserTlsStatusDetail(tlsState, tlsCoversRecord, tlsTrust, nowMs) } : {}),
       routes: aliasRoutes,
     };
   });
@@ -11139,6 +11318,8 @@ function buildBrowserDnsResolverStatus(
     installedCount: recordStatuses.filter((record) => record.configured).length,
     missingCount: recordStatuses.filter((record) => !record.configured).length,
     tlsStaleCount: recordStatuses.filter((record) => record.tlsStale).length,
+    tlsTrustState: tlsTrust.state,
+    ...(tlsTrust.detail === undefined ? {} : { tlsTrustDetail: tlsTrust.detail }),
     ...(tlsState.validToMs === undefined ? {} : { tlsValidTo: new Date(tlsState.validToMs).toISOString() }),
   };
 }
@@ -11466,7 +11647,7 @@ function appendBrowserTlsCertificateInstallLines(
     return;
   }
 
-  const currentUser = process.env.USER?.trim();
+  const currentUser = resolveCurrentUserName();
   const sanLines = hostnames.map((hostname, index) => `DNS.${index + 1} = ${hostname}`);
   const serverConfig = [
     ...BROWSER_TLS_SERVER_OPENSSL_CONFIG_HEADER_LINES,
@@ -11555,7 +11736,8 @@ function appendBrowserTlsCertificateInstallLines(
     '      __pm_tls_owner_keychain="$__pm_tls_owner_home/Library/Keychains/login.keychain"',
     "    fi",
     '    if [ -f "$__pm_tls_owner_keychain" ]; then',
-    '      if sudo -u "$__pm_tls_owner_user" security add-trusted-cert -d -r trustRoot -k "$__pm_tls_owner_keychain" "$__pm_tls_ca_cert" 2>"$__pm_tls_trust_error"; then',
+    '      # login.keychain uses user trust settings; -d is only for the admin domain.',
+    '      if sudo -u "$__pm_tls_owner_user" security add-trusted-cert -r trustRoot -k "$__pm_tls_owner_keychain" "$__pm_tls_ca_cert" 2>"$__pm_tls_trust_error"; then',
     "        __pm_tls_trusted=1",
     "      elif grep -qi 'already exists' \"$__pm_tls_trust_error\"; then",
     "        __pm_tls_trusted=1",
@@ -11569,6 +11751,45 @@ function appendBrowserTlsCertificateInstallLines(
     'rm -f "$__pm_tls_trust_error"',
     "unset __pm_tls_dir __pm_tls_ca_cert __pm_tls_ca_key __pm_tls_server_cert __pm_tls_server_key __pm_tls_hosts_file __pm_tls_owner_user __pm_tls_trust_error __pm_tls_trusted __pm_tls_needs_leaf __pm_tls_ca_rotated __pm_tls_owner_home __pm_tls_owner_keychain",
   );
+}
+
+/** GUI-launched VS Code may not inherit USER; ask the OS before using environment fallback. */
+function resolveCurrentUserName(): string | undefined {
+  try {
+    const userName = os.userInfo().username.trim();
+    if (userName.length > 0) {
+      return userName;
+    }
+  } catch {
+    // Minimal container/sandbox environments may not expose passwd metadata.
+  }
+
+  const environmentUser = process.env.USER?.trim();
+  return environmentUser === undefined || environmentUser.length === 0 ? undefined : environmentUser;
+}
+
+/** Finds the login home even when a Dock-launched VS Code lacks HOME. */
+function resolveCurrentUserHomeDirectory(): string | undefined {
+  try {
+    const homeDirectory = os.userInfo().homedir.trim();
+    if (homeDirectory.length > 0) {
+      return homeDirectory;
+    }
+  } catch {
+    // Fall through to Node/environment lookup in minimal environments.
+  }
+
+  try {
+    const homeDirectory = os.homedir().trim();
+    if (homeDirectory.length > 0) {
+      return homeDirectory;
+    }
+  } catch {
+    // HOME remains the last-resort compatibility path.
+  }
+
+  const environmentHome = process.env.HOME?.trim();
+  return environmentHome === undefined || environmentHome.length === 0 ? undefined : environmentHome;
 }
 
 function appendBrowserDnsHostsCleanupLines(lines: string[]): void {

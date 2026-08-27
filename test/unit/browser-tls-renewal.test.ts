@@ -15,9 +15,12 @@ function readSource(relativePath: string): string {
 
 test("TLS staleness is expiry-aware and computed per alias", () => {
   const source = readSource("src/extension/network-service.ts");
+  const certificateSource = readSource("src/platform/network/browser-tls-certificate.ts");
 
   assert.equal(source.includes("function readBrowserTlsCertificateState"), true);
-  assert.equal(source.includes("new X509Certificate(pem)"), true);
+  assert.equal(certificateSource.includes("new X509Certificate(pem)"), true);
+  assert.equal(certificateSource.includes("certificate.checkHost(hostname)"), true);
+  assert.equal(source.includes("browserTlsCertificateCoversHostname(state.certificate, hostname)"), true);
   assert.equal(source.includes("BROWSER_TLS_RENEW_WINDOW_MS"), true);
   assert.equal(source.includes("function browserTlsStateCoversRecord"), true);
   assert.equal(source.includes("function buildBrowserTlsStatusDetail"), true);
@@ -32,13 +35,15 @@ test("TLS staleness is expiry-aware and computed per alias", () => {
 
   // The https-scheme choice must treat an expired certificate as unconfigured.
   const configuredStart = source.indexOf("function isBrowserTlsCertificateConfigured");
-  const configuredBody = source.slice(configuredStart, configuredStart + 600);
+  const configuredBody = source.slice(configuredStart, configuredStart + 900);
   assert.equal(configuredBody.includes("state.expired"), true);
+  assert.equal(configuredBody.includes('state !== "trusted"'), true);
 
   const typesSource = readSource("src/shared/types.ts");
   assert.equal(typesSource.includes("readonly tlsStale: boolean;"), true);
   assert.equal(typesSource.includes("readonly tlsStatusDetail?: string;"), true);
   assert.equal(typesSource.includes("readonly tlsStaleCount: number;"), true);
+  assert.equal(typesSource.includes('readonly tlsTrustState: "checking" | "trusted" | "untrusted" | "unsupported";'), true);
 });
 
 test("install script renews expiring certificates and supports forced renewal", () => {
@@ -57,7 +62,8 @@ test("install script renews expiring certificates and supports forced renewal", 
 
   // Forced renewal bypasses the everything-configured early return.
   const exclusiveStart = source.indexOf("private async installBrowserDnsResolversExclusive");
-  const exclusiveBody = source.slice(exclusiveStart, exclusiveStart + 1800);
+  const exclusiveEnd = source.indexOf("/** Offers one user-driven resolver repair", exclusiveStart);
+  const exclusiveBody = source.slice(exclusiveStart, exclusiveEnd);
   assert.equal(exclusiveBody.includes("options.forceTlsRenewal !== true"), true);
   assert.equal(exclusiveBody.includes("options.forceResolverSetup !== true"), true);
   assert.equal(exclusiveBody.includes("forceTlsRenewal: options.forceTlsRenewal === true,"), true);
