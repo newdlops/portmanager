@@ -34,6 +34,26 @@ B network
 
 하나의 앱, 워크스페이스, 클러스터, 또는 터미널 창/세션이 공유하는 독립 네트워크 컨텍스트다. 같은 Logical Network 안에서는 포트 `3004`, `8004` 같은 내부 포트가 그대로 유지된다.
 
+#### Worktree-first Initialization
+
+기본 사용자 모델은 **Git worktree 하나에 기본 Logical Network 하나**다. 한 worktree에
+여러 네트워크를 추가할 수 있지만, 최초 사용자는 네트워크 생성, VS Code 창 attach,
+셸 프로필 설치, Local DNS/TLS 설치를 각각 수행하지 않아야 한다. `Initialize This
+Worktree` 한 작업이 worktree 이름 기반 네트워크를 생성 또는 재사용하고, `pm` 셸
+통합을 설치하고, 현재 VS Code 창에 기본 네트워크를 적용하고, 브라우저 DNS/TLS를
+준비한 뒤 실제 DNS responder와 macOS Keychain trust를 검증해야 한다. 완료 후에는
+그 네트워크가 적용된 새 터미널을 열어야 한다.
+
+초기화 중 관리자 승인이 취소되거나 일부 단계가 실패해도 생성된 network id를
+worktree-scoped 상태에 즉시 보존해 재시도 시 중복 네트워크를 만들지 않아야 한다.
+성공은 설정 파일의 존재가 아니라 패키지된 native runtime 실행 가능성, DNS daemon
+heartbeat, resolver/loopback/hosts 상태, 읽을 수 있는 TLS key/certificate, 실제
+Keychain trust 검증을 모두 통과한 뒤에만 표시한다. 특히 resolver 파일이나 hostname
+marker만 신뢰하지 않고 macOS system resolver가 single-label/`.pm` hostname을 정확한
+per-network loopback으로 해석하는지, signed leaf가 실제 hostname을 포함하는지,
+Mach-O CPU가 현재 VS Code와 일치하고 hook dylib가 실제 preload되는지, 설치된 shell
+script가 파싱되고 `pm`을 정의하는지까지 확인한다.
+
 #### Terminal Attachment
 
 사용자가 선택한 터미널 창 또는 세션을 Logical Network에 연결하는 행위다. 내부 구현은 root PID, shell process group, tty 같은 low-level 식별자를 사용하지만, 사용자는 프로세스 목록이 아니라 터미널 창 title을 기준으로 창 단위 선택을 해야 한다.
@@ -141,6 +161,11 @@ Local DNS responder(UDP `127.0.0.1:53153`)는 VS Code 창이 아니라 **공유 
 
 Diagnostics UI는 **Repair Local DNS** 작업을 제공해야 한다. 이 작업은 파일 기반 상태가 정상으로 보여도 `/etc/resolver`, `/etc/hosts`, DNS 캐시와 per-network loopback alias를 관리자 승인 아래 멱등적으로 다시 적용하고, Local DNS responder의 현재 레코드 및 브라우저 proxy를 재동기화해야 한다. macOS 재부팅으로 비영속 `lo0` alias만 사라진 경우에도 최초 설치를 지우거나 네트워크별 작업을 반복하지 않고 한 번의 사용자 작업으로 복구되어야 한다.
 
+DNS/TLS 설치 알림은 실패 전에 영구적으로 억제 상태를 기록하면 안 된다. 설치 실패는
+실제 오류와 재시도 작업을 보여주고, 사용자가 알림을 명시적으로 닫은 경우에만 같은
+상태의 알림을 억제한다. Diagnostics는 인증서 파일 존재 여부와 별도로 실제 macOS
+Keychain trust 상태를 표시해야 한다.
+
 `localhost`/`127.0.0.1` 대상 Host Port Exposure도 같은 스니핑 리스너로 서빙한다. 개발 인증서의 SAN은 `localhost`와 `127.0.0.1`을 포함하므로 `https://localhost:<hostPort>`는 인증서로 종단되어 HTTP로 프록시되고, 평문 HTTP와 raw 프로토콜은 기존과 동일하게 동작한다. raw 네이티브 포워더만 쓰던 이전 구현에서는 브라우저의 TLS ClientHello가 평문 업스트림으로 그대로 전달되어 `ERR_SSL_PROTOCOL_ERROR`가 났고, Chrome의 HTTPS 자동 업그레이드 때문에 사용자가 `localhost:<port>`만 입력해도 이 경로를 밟았다. loopback이 아닌 호스트 주소의 exposure는 인증서가 그 이름을 커버하지 않으므로 raw 포워더를 유지한다.
 
 호스트 로컬 고정 프로토콜 리다이렉트(pf `rdr`)의 타깃은 브라우저 alias가 아니라 네트워크별 **히든 redirect 대역 alias(`127.144~175`)**다. macOS pf는 `rdr` 타깃 좌표로 향하는 모든 연결의 응답 패킷을 역변환하므로, 사용자가 직접 접속하는 리스너 좌표를 rdr 타깃으로 쓰면 그 좌표로의 직접 접속이 SYN_RCVD 상태로 영구히 멈춘다. 따라서 직접 접속 좌표(브라우저 alias)와 NAT 타깃 좌표(히든 alias)를 분리하고, 리다이렉트되는 각 고정 포트마다 히든 alias 위에 스니핑 리스너를 바인드한다. 히든 alias는 관리자 설치 스크립트가 생성하며, 재부팅 후에는 비대화식 alias 셋업이 best-effort로 복구한다.
@@ -151,6 +176,10 @@ VS Code 통합 터미널만이 아니라 macOS Terminal/iTerm2, Linux terminal e
 
 ### 0.3 기능 요구사항
 
+- 사용자는 worktree를 연 뒤 `Initialize This Worktree` 한 작업으로 기본 Logical
+  Network, 현재 VS Code 창 attach, `pm` 셸 통합, 브라우저 DNS/TLS 설정과 검증을
+  완료할 수 있어야 한다.
+- 한 worktree에 여러 Logical Network를 추가하는 고급 흐름은 계속 지원해야 한다.
 - 확장은 OS 전체 터미널 후보를 best-effort로 탐색하고 터미널 창/세션 단위로 그룹화해야 한다.
   - macOS/Linux: shell process, tty, process group, parent-child tree, terminal app process를 조합해 표시한다.
   - Windows: Windows Terminal, conhost, PowerShell, cmd, WSL 관련 process tree를 조합해 표시한다.

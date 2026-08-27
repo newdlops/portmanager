@@ -61,17 +61,39 @@ The previous managed-process routing, native hook, and rerun-on-failure implemen
 
 These commands and views are no longer the primary product surface. They remain available internally for migration and testing until the logical network runtime adapters replace them.
 
-## Usage
+## Quick Start: One Worktree, One Network
 
-1. Run `npm install`.
-2. Run `npm run compile`.
-3. Press `F5` in VS Code and choose `Run Port Manager Extension`.
-4. In the Extension Development Host, open the Port Manager activity bar view.
-5. Use the `Create Logical Network` row in the Logical Networks section.
-6. Use the `Add Host Port Exposure` row in the Host Port Exposures section.
-7. Use `Refresh Terminal Windows` in the Terminal Windows section.
+Port Manager assumes the normal unit of isolation is a Git worktree. A worktree
+can still have more than one logical network, but the default path needs only
+one action:
 
-The current runtime is `Local TCP Proxy`. It provides real host port exposure and records terminal-window attachments, but it does not isolate network namespaces. Same internal ports across A/B apps require a future container, namespace, native-helper, or VM-backed runtime adapter.
+1. Open the worktree folder in VS Code.
+2. Open the Port Manager activity bar view.
+3. Select **Initialize This Worktree** and confirm. On macOS, approve the one
+   operating-system prompt that installs loopback, Local DNS, and development
+   TLS trust.
+4. Use the `Port Manager: <network>` terminal that opens when verification
+   succeeds. New VS Code terminals in this window use the same logical network.
+
+Initialization creates or reuses one network named after the worktree, installs
+the `pm` shell integration, applies the network to this VS Code window, completes
+browser DNS/TLS setup, and verifies the actual DNS responder and macOS Keychain
+trust before reporting success. It also resolves both public aliases through
+the macOS system resolver, checks hostname coverage in the signed TLS leaf,
+preloads the native hook through the OS loader, and parses/sources the installed
+shell integration to prove `pm` exists. A cancelled or failed attempt is
+retryable and reuses the partially created network instead of creating
+duplicates.
+
+To add another network inside the same worktree, use **Port Manager: Create
+Logical Network**. The one-network worktree path remains the default; the
+advanced attach, Compose, exposure, and per-network controls remain available.
+
+If `pm` is missing in a separately opened terminal, run **Install or Repair pm
+Integration** under **System → Maintenance**, then start a new shell. If browser
+aliases fail after a reboot or machine migration, inspect **System → Browser
+access & DNS** and run **Repair Local DNS**; the same section reports Local DNS
+and TLS trust as separate, real runtime states.
 
 ## Legacy Routing
 
@@ -79,7 +101,14 @@ By default, Port Manager uses hashed logical routing: a requested port such as `
 
 For new VS Code terminals, Port Manager injects the native socket hook while the daemon is running. When a terminal-launched process calls `bind()` on a port that is not in `portManager.fixedProtocolPorts`, the hook asks the daemon for an actual port before the OS bind happens, then registers the logical route. The explicit `Rerun Routed` prompt and listen-failure monitor remain fallback paths for terminals that were already open or are not running with the hook environment.
 
-For terminals outside VS Code, run `Port Manager: Install Shell Hook` once from the Command Palette, then open a new shell. Port Manager brackets the user profile with a builtin-only prelude and a deferred activation step, so runtime managers initialize without inherited PM preload/PATH shims while prompt commands keep the same routing behavior. `Port Manager: Restore Shell Profiles` removes only PM-owned profile blocks and historical source lines if you want to return to manual activation.
+Worktree initialization installs external-shell support automatically. For a
+repair or a manual install, run `Port Manager: Install or Repair pm Shell
+Integration`, then open a new shell. Port Manager brackets the user profile with
+a builtin-only prelude and a deferred activation step, so runtime managers
+initialize without inherited PM preload/PATH shims while prompt commands keep
+the same routing behavior. `Port Manager: Restore Shell Profiles` removes only
+PM-owned profile blocks and historical source lines if you want to return to
+manual activation.
 
 ```sh
 daphne -b 127.0.0.1 -p 8000 myapp.asgi:application
@@ -133,6 +162,10 @@ Important limitation: the agent does not transparently create isolated per-proce
 
 ## Commands
 
+- `Port Manager: Initialize This Worktree`
+- `Port Manager: Create Logical Network`
+- `Port Manager: Install or Repair pm Shell Integration`
+- `Port Manager: Repair Local DNS`
 - `Port Manager: Start Daemon`
 - `Port Manager: Daemon Status`
 - `Port Manager: Start Managed Process`
