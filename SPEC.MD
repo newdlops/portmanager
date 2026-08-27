@@ -54,6 +54,32 @@ per-network loopback으로 해석하는지, signed leaf가 실제 hostname을 �
 Mach-O CPU가 현재 VS Code와 일치하고 hook dylib가 실제 preload되는지, 설치된 shell
 script가 파싱되고 `pm`을 정의하는지까지 확인한다.
 
+#### Isolated Worktree Creation
+
+이미 생성된 worktree만 초기화하는 흐름과 별도로, 사용자는 `Create Isolated
+Worktree` 한 작업에서 새 Git worktree/workspace, 전용 Logical Network, 현재
+worktree의 Docker Compose 복사, 새 VS Code 창 attach를 완료할 수 있어야 한다.
+기본 입력은 branch/worktree 이름 하나이며 대상 폴더는 현재 repository의 sibling으로
+제안한다. 현재 network의 durable Compose attachment와 현재 repository 안에서 발견된
+실행 중 Compose project를 복사 대상으로 자동 수집하며, Compose metadata가 없어서
+복사할 수 없는 project는 최종 확인에서 숨기지 않고 이유를 표시한다.
+
+Compose 복사는 원본 project를 유지하는 `copy` mode를 사용하고 stopped/no-port
+service도 새 hidden project에 포함한다. source worktree 안의 Compose file, working
+directory, bind mount는 target worktree의 대응 경로로 치환하며 repository 밖의
+machine-shared path는 그대로 둔다. Git이 복사하지 않는 표준 Compose `.env`는 source
+working directory에서 target 대응 경로로 최초 1회 복사하되 기존 target 파일은 절대
+덮지 않는다. persistent volume/bind data는 point-in-time copy일 수
+있음을 최종 modal에서 알린다. Git worktree가 복사하지 않는 uncommitted/untracked
+변경도 같은 modal에 명시한다.
+
+Git worktree가 생성된 뒤에는 target path와 network identity를 global retry state에
+즉시 보존한다. 이후 network 생성, Compose copy, DNS/TLS 검증, 새 창 열기 중 실패해도
+생성한 자원을 자동 삭제하지 않으며 동일 branch/path로 재실행하면 exact worktree와
+network를 재사용한다. 새 창은 shared state startup 뒤 pending handoff를 읽어 전용
+network를 현재 VS Code terminal default로 적용하고, 성공한 뒤에만 pending state를
+제거하고 routed terminal을 연다.
+
 #### Terminal Attachment
 
 사용자가 선택한 터미널 창 또는 세션을 Logical Network에 연결하는 행위다. 내부 구현은 root PID, shell process group, tty 같은 low-level 식별자를 사용하지만, 사용자는 프로세스 목록이 아니라 터미널 창 title을 기준으로 창 단위 선택을 해야 한다.
@@ -179,7 +205,14 @@ VS Code 통합 터미널만이 아니라 macOS Terminal/iTerm2, Linux terminal e
 - 사용자는 worktree를 연 뒤 `Initialize This Worktree` 한 작업으로 기본 Logical
   Network, 현재 VS Code 창 attach, `pm` 셸 통합, 브라우저 DNS/TLS 설정과 검증을
   완료할 수 있어야 한다.
+- 사용자는 기존 worktree에서 `Create Isolated Worktree` 한 작업으로 새 Git
+  worktree, 전용 Logical Network, 자동 발견 Compose project copy, 새 VS Code 창
+  attach를 완료할 수 있어야 한다. source worktree 내부의 Compose bind path는 target
+  worktree로 재지정되어야 한다.
 - 한 worktree에 여러 Logical Network를 추가하는 고급 흐름은 계속 지원해야 한다.
+- 사용자는 Logical Network 행에서 해당 네트워크 attach 스크립트가 자동 적용된 새
+  VS Code 통합 터미널을 즉시 열 수 있어야 한다. 이 동작은 현재 창의 기본 네트워크
+  바인딩을 바꾸지 않아야 한다.
 - 확장은 OS 전체 터미널 후보를 best-effort로 탐색하고 터미널 창/세션 단위로 그룹화해야 한다.
   - macOS/Linux: shell process, tty, process group, parent-child tree, terminal app process를 조합해 표시한다.
   - Windows: Windows Terminal, conhost, PowerShell, cmd, WSL 관련 process tree를 조합해 표시한다.

@@ -23,6 +23,7 @@ VS Code 확장의 활성화 지점과 명령 등록을 담당한다.
 - `terminal-hook-environment.ts`
 - `terminal-conflict-monitor.ts`
 - `terminal-secure-browser-link-provider.ts`
+- `isolated-worktree-setup.ts`: Git worktree, Logical Network, Compose copy, 새 창 handoff를 묶는 retryable onboarding
 
 ## 외부 의존성
 
@@ -38,6 +39,7 @@ VS Code 확장의 활성화 지점과 명령 등록을 담당한다.
 Logical Network 전환 기간에는 기존 라우팅 명령 구현을 유지하되 기본 UI와 Command Palette에서는 노출하지 않는다.
 기본 activation은 새 Logical Network service를 시작하며, 레거시 agent/hook/terminal failure monitor는 자동 시작하지 않는다.
 VS Code 새 터미널의 정적 라우팅 context는 process creation에서 복사하고, native preload·runtime shim PATH·BASH_ENV·활성화 플래그만 사용자 shell profile 이후 shell integration에서 주입한다. 외부 터미널용 profile 설치도 managed prelude/postlude로 사용자 NVM·asdf·pyenv 초기화 구간에서는 상속된 PM preload와 PATH shim을 builtin-only로 잠시 내리고, profile이 끝난 뒤 같은 네트워크 context로 복구한다. `Restore Shell Profiles`는 이 exact managed block과 legacy source 줄만 제거하며 사용자 profile 본문과 생성 자산은 보존한다. shell integration이 동작하지 않는 터미널은 자동 주입하지 않으며, 이 경우 명시적 terminal attach 스크립트를 사용한다. attach 스크립트는 Compose 함수 본문을 eager parse하지 않고 Docker/Podman PATH shim이 실제 runtime 호출 시 로드한다.
+`Open Network Terminal`은 선택한 네트워크의 동일 attach 스크립트를 새 VS Code 통합 터미널의 첫 입력으로 queue한다. 스크립트 생성과 runtime 검증을 터미널 생성보다 먼저 수행하며, window-wide 기본 네트워크 binding은 변경하지 않는다.
 `escapedServerRespawn`이 꺼진 기본 경로에서는 native hook의 control-channel thread/socket을 만들지 않는다. 이 채널은 destructive respawn 기능 전용이며, 일반 prompt helper의 spawn 경로에 들어가면 안 된다.
 Logical Network는 터미널 bind 포트를 호스트 namespace에서 직접 점유하지 않게 만드는 runtime이 있을 때만 생성/attach해야 한다. `Local TCP Proxy`는 host exposure 보조 기능일 뿐 터미널 포트 namespace를 분리하지 않는다.
 Linux Docker/Podman runtime이 감지되면 `src/platform/network` adapter가 전역 bridge network와 logical network별 namespace holder container를 관리한다. macOS에서는 Docker Desktop network namespace를 host 터미널에 직접 빌릴 수 없으므로 Native Socket Hook runtime을 Borrowed Network 구현으로 사용한다. Native Socket Hook은 컨테이너를 만들지 않고 선택된 shell에 hook 환경을 주입하므로, attach 이후 시작한 프로세스에만 적용된다.

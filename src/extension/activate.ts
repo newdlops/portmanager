@@ -183,6 +183,20 @@ export function activate(context: vscode.ExtensionContext): PortManagerExtension
     const message = error instanceof Error ? error.message : String(error);
     void vscode.window.showErrorMessage(`Port Manager network service failed to start: ${message}`);
   });
+  void startPromise.then(async () => {
+    try {
+      await commandController.resumePendingIsolatedWorktreeSetup();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const selection = await vscode.window.showErrorMessage(
+        `Port Manager could not finish isolated worktree setup: ${message}`,
+        "Retry Setup",
+      );
+      if (selection === "Retry Setup") {
+        await vscode.commands.executeCommand("portManager.finishIsolatedWorktreeSetup");
+      }
+    }
+  });
 
   return {
     listLogicalNetworks: () => networkService.getSnapshot().networks,

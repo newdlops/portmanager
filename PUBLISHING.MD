@@ -142,6 +142,14 @@ the release workstation:
 - The installed extension ID is `newdlops.portmanager`.
 - The Port Manager activity bar view appears.
 - `Initialize This Worktree` creates one default network and opens a routed terminal.
+- From a source repository with a running Compose project, `Create Isolated
+  Worktree` creates a sibling Git worktree, one dedicated network, a distinct
+  hidden Compose project, and a new VS Code window whose first terminal is
+  attached automatically. Confirm repository bind mounts resolve inside the
+  target worktree, not the source checkout.
+- Cancel or fail the isolated-worktree flow after Git creation and after network
+  creation, then retry the same branch. It must reuse the exact worktree/network
+  and must not duplicate Compose attachments.
 - A new terminal can run `pm status` without manual PATH or profile edits.
 - Test the default zsh profile and a bash profile. Both must expose `pm` in a
   newly opened shell after initialization.

@@ -83,23 +83,13 @@ import type {
   TerminalAttachment,
   TerminalWindow,
 } from "../shared/types";
+import {
+  IsolatedWorktreeSetupController,
+  WORKTREE_INITIALIZATION_STATE_KEY,
+  type WorktreeInitializationState,
+} from "./isolated-worktree-setup";
 
 const TERMINAL_NETWORK_SELECTION_FILE_NAME = "terminal-networks.tsv";
-const WORKTREE_INITIALIZATION_STATE_KEY = "portManager.worktreeInitialization.v1";
-
-interface WorktreeInitializationState {
-  /** Schema version keeps workspaceState migrations explicit. */
-  readonly version: 1;
-  /** Folder URI prevents a copied workspaceState record from binding another worktree. */
-  readonly workspaceUri: string;
-  /** Global logical network reused when initialization is retried. */
-  readonly networkId: string;
-  /** Last user-facing name retained for diagnostics if the network is later removed. */
-  readonly networkName: string;
-  /** Successful completion time; absent while a retryable initialization is partial. */
-  readonly initializedAt?: string;
-}
-
 /**
  * Registers Port Manager commands and coordinates the MVP flow.
  *
@@ -133,6 +123,9 @@ export class PortManagerCommandController implements DisposableLike {
   /** Coalesces double-clicks so one worktree cannot create duplicate default networks. */
   private worktreeInitializationInFlight: Promise<void> | undefined;
 
+  /** Guided Git worktree/network/Compose transaction, initialized when commands register. */
+  private isolatedWorktreeSetup: IsolatedWorktreeSetupController | undefined;
+
   constructor(private readonly dependencies: PortManagerCommandDependencies) {}
 
   /**
@@ -143,13 +136,41 @@ export class PortManagerCommandController implements DisposableLike {
   register(context: vscode.ExtensionContext): void {
     const ownerCommand: CommandRegistrationOptions = { requiresControlPlaneOwner: true };
 
+    this.isolatedWorktreeSetup = new IsolatedWorktreeSetupController({
+      context,
+      networkService: this.dependencies.networkService,
+      treeProvider: this.dependencies.treeProvider,
+      prepareRuntime: async () => {
+        await this.dependencies.networkService.ensureContainerRuntimeDetected();
+        const runtime = this.dependencies.networkService
+          .getSnapshot()
+          .runtimes.find((candidate) => candidate.kind === "nativeHelper" && isContainerLevelRuntime(candidate));
+        if (runtime === undefined) {
+          throw new Error(buildNoLogicalRuntimeMessage());
+        }
+        await assertPackagedShellRuntimeReadable(context);
+        assertAutomaticShellIntegrationSupported();
+        await this.installShellHook(context, { announce: false });
+        return runtime.kind;
+      },
+    });
+
     this.registerCommand(context, "portManager.initializeWorktree", () => this.initializeWorktree(context), ownerCommand);
+    this.registerCommand(context, "portManager.createIsolatedWorktree", (argument) =>
+      this.createIsolatedWorktree(argument),
+    ownerCommand);
+    this.registerCommand(context, "portManager.finishIsolatedWorktreeSetup", () =>
+      this.finishIsolatedWorktreeSetup(),
+    );
     this.registerCommand(context, "portManager.createLogicalNetwork", () => this.createLogicalNetwork(), ownerCommand);
     this.registerCommand(context, "portManager.removeLogicalNetwork", (argument) =>
       this.removeLogicalNetwork(argument),
     ownerCommand);
     this.registerCommand(context, "portManager.refreshTerminals", () => this.refreshTerminals(), ownerCommand);
     this.registerCommand(context, "portManager.refreshContainerServices", () => this.refreshContainerServices(), ownerCommand);
+    this.registerCommand(context, "portManager.openNetworkTerminal", (argument) =>
+      this.openNetworkTerminal(argument),
+    ownerCommand);
     this.registerCommand(context, "portManager.attachTerminalToNetwork", (argument) =>
       this.attachTerminalToNetwork(argument),
     ownerCommand);
@@ -274,6 +295,21 @@ export class PortManagerCommandController implements DisposableLike {
 
     const assets = await this.writeShellHookAssets(context);
     await migrateExistingManagedShellProfiles(assets.shellProfilePlans, assets.profileOptions);
+  }
+
+  /** Called after network-service startup so a newly opened worktree finishes its handoff. */
+  async resumePendingIsolatedWorktreeSetup(): Promise<void> {
+    await this.isolatedWorktreeSetup?.resumePending();
+  }
+
+  /** Starts the guided worktree + network + Compose copy transaction. */
+  private async createIsolatedWorktree(argument: unknown): Promise<void> {
+    await this.isolatedWorktreeSetup?.create(getComposeAttachmentFromCommandArgument(argument));
+  }
+
+  /** Explicit retry entry point retained when automatic target-window completion fails. */
+  private async finishIsolatedWorktreeSetup(): Promise<void> {
+    await this.isolatedWorktreeSetup?.resumePending();
   }
 
   /**
@@ -466,6 +502,35 @@ export class PortManagerCommandController implements DisposableLike {
     await this.dependencies.networkService.refreshNetworkRoutingState();
     this.dependencies.treeProvider.refresh();
     await vscode.window.showInformationMessage(`Discovered ${candidates.length} container services.`);
+  }
+
+  /**
+   * Opens a new integrated terminal and makes its first shell command attach to
+   * the selected network. Preparing the script first avoids leaving behind a
+   * terminal that looks connected when runtime or network validation failed.
+   */
+  private async openNetworkTerminal(argument: unknown): Promise<void> {
+    const network = await this.resolveNetworkArgument(argument, "Open Terminal in Logical Network");
+    if (network === undefined) {
+      return;
+    }
+
+    const script = await this.dependencies.networkService.createTerminalRoutingScript(network.id);
+    const workspaceFolder = getPrimaryWorkspaceFolder();
+    const terminal = vscode.window.createTerminal({
+      name: `Port Manager: ${network.name}`,
+      ...(workspaceFolder === undefined ? {} : { cwd: workspaceFolder.uri }),
+    });
+
+    try {
+      // VS Code queues terminal input during shell startup, so the normal user
+      // profile still loads before this one-line, shell-agnostic attach script.
+      terminal.sendText(script, true);
+      terminal.show();
+    } catch (error) {
+      terminal.dispose();
+      throw new Error(`Could not open a terminal for logical network "${network.name}".`, { cause: error });
+    }
   }
 
   /** Attaches a selected terminal window to a selected network when the runtime supports it. */

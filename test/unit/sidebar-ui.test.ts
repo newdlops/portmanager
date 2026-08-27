@@ -484,7 +484,7 @@ test("grouping preserves action metadata and keeps presentation groups out of dr
   assert.equal(groups.every((item) => item.collapsibleState === 1), true);
   assert.equal(groups.every((item) => item.contextValue !== "action" && !item.contextValue.includes("logicalNetwork")), true);
   assert.deepEqual(groups.slice(0, 3).map((item) => item.description), ["No routes", "No connections", "No mappings"]);
-  assert.equal((groups[3] as unknown as { tooltip: { value: string } }).tooltip.value, "Connect actions\n\nAvailable · 5 actions");
+  assert.equal((groups[3] as unknown as { tooltip: { value: string } }).tooltip.value, "Connect actions\n\nAvailable · 6 actions");
 
   const secondNetworkItem = networkItems.find((item) => item.id === networkB.id);
   const secondNetworkGroups = provider.getChildren(secondNetworkItem as never) as Array<{ id: string }>;
@@ -502,6 +502,7 @@ test("grouping preserves action metadata and keeps presentation groups out of dr
   assert.deepEqual(
     connectLeaves.map((item) => item.command.command),
     [
+      "portManager.openNetworkTerminal",
       "portManager.attachActiveTerminalToNetwork",
       "portManager.attachTerminalToNetwork",
       "portManager.attachVscodeWindowTerminalsToNetwork",
@@ -511,10 +512,10 @@ test("grouping preserves action metadata and keeps presentation groups out of dr
   );
   assert.deepEqual(
     connectLeaves.map((item) => item.command.arguments),
-    [[network], [network], [network], [{ network }], [network]],
+    [[network], [network], [network], [network], [{ network }], [network]],
   );
   assert.equal(connectLeaves.every((item) => item.contextValue === "action"), true);
-  assert.equal((connectLeaves[0] as unknown as { tooltip: { value: string } }).tooltip.value, "Attach Active Terminal\n\nUse current VS Code terminal");
+  assert.equal((connectLeaves[0] as unknown as { tooltip: { value: string } }).tooltip.value, "Open Network Terminal\n\nStart a new terminal in this network");
   assert.equal(new Set(connectLeaves.map((item) => item.command.command)).size, connectLeaves.length);
 
   const manageLeaves = provider.getChildren(groups[4] as never) as Array<{
@@ -857,7 +858,7 @@ test("view title toolbar exposes only primary actions", () => {
   const viewTitleCommands = viewTitleItems.map((item) => item.command);
 
   assert.deepEqual(viewTitleCommands, [
-    "portManager.createLogicalNetwork",
+    "portManager.createIsolatedWorktree",
     "portManager.refresh",
     "portManager.openOwnerUi",
     "portManager.openSettings",
@@ -871,7 +872,7 @@ test("view title toolbar exposes only primary actions", () => {
   );
 });
 
-test("network menu exposes only attach-active as the inline action", () => {
+test("network menu exposes open and attach-active terminal shortcuts", () => {
   const packagePath = path.resolve(__dirname, "../../../package.json");
   const manifest = JSON.parse(fs.readFileSync(packagePath, "utf8")) as {
     contributes?: { menus?: { "view/item/context"?: Array<{ command: string; when?: string; group?: string }> } };
@@ -884,9 +885,14 @@ test("network menu exposes only attach-active as the inline action", () => {
     networkItems.filter((item) => item.group?.startsWith("inline")),
     [
       {
-        command: "portManager.attachActiveTerminalToNetwork",
+        command: "portManager.openNetworkTerminal",
         when: "view == portManager.processes && viewItem == logicalNetwork",
         group: "inline@1",
+      },
+      {
+        command: "portManager.attachActiveTerminalToNetwork",
+        when: "view == portManager.processes && viewItem == logicalNetwork",
+        group: "inline@2",
       },
     ],
   );

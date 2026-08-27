@@ -64,8 +64,30 @@ These commands and views are no longer the primary product surface. They remain 
 ## Quick Start: One Worktree, One Network
 
 Port Manager assumes the normal unit of isolation is a Git worktree. A worktree
-can still have more than one logical network, but the default path needs only
-one action:
+can still have more than one logical network.
+
+To create a complete isolated workspace from the repository currently open in
+VS Code:
+
+1. Start the Docker Compose project you want to use as the source, if it is not
+   already represented by a Port Manager Compose attachment.
+2. Select **Create Isolated Worktree** in the Port Manager view.
+3. Enter the branch/worktree name and confirm the proposed sibling folder,
+   dedicated Logical Network, and automatically detected Compose projects.
+4. Continue in the new VS Code window. Port Manager applies the network and
+   opens a ready terminal automatically.
+
+That guided action creates or safely reuses the Git worktree, creates one
+network, copies Compose projects (including stopped services and isolated
+persistent data), rebases repository-owned bind mounts into the new worktree,
+seeds standard local Compose `.env` files without overwriting a target,
+verifies DNS/TLS, and hands setup to the new window. Git's normal worktree rule
+still applies: uncommitted and untracked changes in the source checkout are not
+copied. Partial progress is retained, so running the same action again resumes
+instead of creating duplicate worktrees, networks, or Compose attachments.
+
+To apply Port Manager to an already-created worktree, the default path also
+needs only one action:
 
 1. Open the worktree folder in VS Code.
 2. Open the Port Manager activity bar view.
@@ -88,6 +110,9 @@ duplicates.
 To add another network inside the same worktree, use **Port Manager: Create
 Logical Network**. The one-network worktree path remains the default; the
 advanced attach, Compose, exposure, and per-network controls remain available.
+Select the terminal-plus icon on any Logical Network, or expand **Connect
+actions → Open Network Terminal**, to open a new integrated terminal already
+attached to that specific network without changing the VS Code window default.
 
 If `pm` is missing in a separately opened terminal, run **Install or Repair pm
 Integration** under **System → Maintenance**, then start a new shell. If browser
@@ -163,7 +188,9 @@ Important limitation: the agent does not transparently create isolated per-proce
 ## Commands
 
 - `Port Manager: Initialize This Worktree`
+- `Port Manager: Create Isolated Worktree`
 - `Port Manager: Create Logical Network`
+- `Port Manager: Open Terminal in Logical Network`
 - `Port Manager: Install or Repair pm Shell Integration`
 - `Port Manager: Repair Local DNS`
 - `Port Manager: Start Daemon`

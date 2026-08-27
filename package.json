@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8251",
+  "version": "0.0.8252",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -38,10 +38,13 @@
     "onStartupFinished",
     "onView:portManager.processes",
     "onCommand:portManager.initializeWorktree",
+    "onCommand:portManager.createIsolatedWorktree",
+    "onCommand:portManager.finishIsolatedWorktreeSetup",
     "onCommand:portManager.createLogicalNetwork",
     "onCommand:portManager.removeLogicalNetwork",
     "onCommand:portManager.refreshTerminals",
     "onCommand:portManager.refreshContainerServices",
+    "onCommand:portManager.openNetworkTerminal",
     "onCommand:portManager.attachTerminalToNetwork",
     "onCommand:portManager.attachActiveTerminalToNetwork",
     "onCommand:portManager.revealTerminalWindow",
@@ -142,6 +145,18 @@
         "icon": "$(rocket)"
       },
       {
+        "command": "portManager.createIsolatedWorktree",
+        "title": "Port Manager: Create Isolated Worktree",
+        "category": "Port Manager",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "portManager.finishIsolatedWorktreeSetup",
+        "title": "Port Manager: Finish Isolated Worktree Setup",
+        "category": "Port Manager",
+        "icon": "$(debug-rerun)"
+      },
+      {
         "command": "portManager.createLogicalNetwork",
         "title": "Port Manager: Create Logical Network",
         "category": "Port Manager",
@@ -164,6 +179,12 @@
         "title": "Port Manager: Refresh Services",
         "category": "Port Manager",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "portManager.openNetworkTerminal",
+        "title": "Port Manager: Open Terminal in Logical Network",
+        "category": "Port Manager",
+        "icon": "$(terminal-new)"
       },
       {
         "command": "portManager.attachTerminalToNetwork",
@@ -461,7 +482,7 @@
     "menus": {
       "view/title": [
         {
-          "command": "portManager.createLogicalNetwork",
+          "command": "portManager.createIsolatedWorktree",
           "when": "view == portManager.processes",
           "group": "navigation@1"
         },
@@ -535,11 +556,20 @@
           "when": "false"
         },
         {
+          "command": "portManager.finishIsolatedWorktreeSetup",
+          "when": "false"
+        },
+        {
           "command": "portManager.openOwnerUi",
           "when": "false"
         }
       ],
       "view/item/context": [
+        {
+          "command": "portManager.createIsolatedWorktree",
+          "when": "view == portManager.processes && viewItem == section.networks",
+          "group": "network@0"
+        },
         {
           "command": "portManager.createLogicalNetwork",
           "when": "view == portManager.processes && viewItem == section.networks",
@@ -566,9 +596,14 @@
           "group": "network@5"
         },
         {
-          "command": "portManager.attachActiveTerminalToNetwork",
+          "command": "portManager.openNetworkTerminal",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "inline@1"
+        },
+        {
+          "command": "portManager.attachActiveTerminalToNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "inline@2"
         },
         {
           "command": "portManager.attachProcessToNetwork",
@@ -689,6 +724,11 @@
           "command": "portManager.copyComposeAttachment",
           "when": "view == portManager.processes && viewItem == composeAttachment",
           "group": "inline@1"
+        },
+        {
+          "command": "portManager.createIsolatedWorktree",
+          "when": "view == portManager.processes && viewItem == composeAttachment",
+          "group": "exposure@4"
         },
         {
           "command": "portManager.detachComposeAttachment",

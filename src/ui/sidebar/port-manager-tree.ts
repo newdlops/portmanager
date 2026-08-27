@@ -412,7 +412,7 @@ export class PortManagerTreeProvider
           element.network,
           "quick",
           "Connect actions",
-          formatSidebarSummary("Available", [{ count: 5, singular: "action" }]),
+          formatSidebarSummary("Available", [{ count: 6, singular: "action" }]),
           "plug",
           ownerAction,
         ),
@@ -429,6 +429,14 @@ export class PortManagerTreeProvider
     if (element instanceof NetworkActionGroupTreeItem) {
       if (element.kind === "quick") {
         return [
+          new ActionTreeItem(
+            "Open Network Terminal",
+            "portManager.openNetworkTerminal",
+            "terminal-new",
+            "Start a new terminal in this network",
+            element.network,
+            ownerAction,
+          ),
           new ActionTreeItem(
             "Attach Active Terminal",
             "portManager.attachActiveTerminalToNetwork",
@@ -613,6 +621,14 @@ export class PortManagerTreeProvider
                 ),
               ]
             : []),
+          new ActionTreeItem(
+            "Create Isolated Worktree",
+            "portManager.createIsolatedWorktree",
+            "new-folder",
+            "Worktree + network + Compose copy",
+            undefined,
+            ownerAction,
+          ),
           ...snapshot.networks.map((network) =>
             new LogicalNetworkTreeItem(
               network,
