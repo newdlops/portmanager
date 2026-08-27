@@ -14,6 +14,7 @@
 
 - `types.ts`
 - `events.ts`
+- `workspace-path.ts`: worktree 간 repository-owned 경로 판별과 치환
 
 ## 외부 의존성
 

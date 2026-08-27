@@ -10,6 +10,7 @@
 - 포트 점유 프로세스 조회
 - child process 실행과 종료
 - 플랫폼별 명령 차이 흡수
+- Git worktree 조회·생성 및 안전한 재사용
 - opt-in 개발 로그의 bounded file sink 제공
 
 ## 주요 진입점
@@ -17,6 +18,7 @@
 - `ports/node-port-scanner.ts`
 - `process/node-process-launcher.ts`
 - `network/container-runtime.ts`
+- `workspace/git-worktree.ts`
 - `dev-log.ts`
 
 ## 외부 의존성
