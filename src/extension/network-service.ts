@@ -92,7 +92,7 @@ import {
   refreshBrowserTlsTrustStatus,
   type BrowserTlsTrustStatus,
 } from "../platform/network/browser-tls-trust";
-import { ContainerEventsWatcher } from "../platform/network/container-events-watcher";
+import { ContainerEventsWatcher, type ContainerRuntimeChange } from "../platform/network/container-events-watcher";
 import { SharedLogicalNetworkStateStore } from "../platform/network/shared-network-state-store";
 import {
   BrowserNetworkProxyManager,
@@ -214,6 +214,8 @@ const ROUTING_SIGNAL_REFRESH_DEGRADED_MAX_INTERVAL_MS = 30_000;
 // heavy reconcile loop so idle backoff cannot expire live compose routing.
 const COMPOSE_ROUTING_FRESHNESS_INTERVAL_MS = 10_000;
 const BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS = 60_000;
+// Healthy lifecycle streams carry changes immediately; full scans only repair missed events.
+const EVENT_DRIVEN_CONTAINER_REFRESH_INTERVAL_MS = 300_000;
 const BACKGROUND_CONTAINER_REFRESH_LOCK_STALE_MS = 120_000;
 const BACKGROUND_CONTAINER_REFRESH_STAMP_PATH = buildBackgroundContainerRefreshControlPath("stamp");
 const BACKGROUND_CONTAINER_REFRESH_LOCK_PATH = buildBackgroundContainerRefreshControlPath("lock");
@@ -362,6 +364,8 @@ interface BackgroundRefreshOptions {
   readonly coalesceForce?: boolean;
   /** Reuses a fresh daemon snapshot already obtained by the enclosing repair generation. */
   readonly skipProcessSnapshotRefresh?: boolean;
+  /** One refresh generation shares runtime rows between candidates and Compose route projections. */
+  readonly discoverySessions?: Map<string, Promise<ContainerServiceDiscoverySession | undefined>>;
 }
 
 interface ComposeProjectRoutingWriteOptions {
@@ -657,6 +661,12 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Last compose endpoint reconciliation time; background refreshes reuse recent route rows. */
   private lastComposeAttachmentReconcileAtMs = 0;
+
+  /** Full scans have their own clock so activity in one project cannot starve missed-event repair elsewhere. */
+  private lastBackgroundContainerRefreshAtMs = 0;
+
+  /** Holds the shared refresh slot across candidate discovery and route reconciliation. */
+  private backgroundContainerRefreshInFlight: Promise<void> | undefined;
 
   /** Guards background signal refreshes so slow Docker/process-table reads do not overlap. */
   private routingSignalRefreshInFlight: Promise<void> | undefined;
@@ -1047,9 +1057,13 @@ export class PortManagerNetworkService implements DisposableLike {
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (
           event.affectsConfiguration("portManager.containerRuntime") ||
+          event.affectsConfiguration("portManager.containerEventsWatch") ||
           event.affectsConfiguration("portManager.enabled")
         ) {
           if (this.ownsControlPlaneLease) {
+            this.stopContainerEventsWatcher();
+            this.syncContainerEventsWatcher();
+            this.lastBackgroundContainerRefreshAtMs = 0;
             void this.refreshRuntimeDescriptors();
             void this.refreshContainerServices({ background: true });
           }
@@ -2346,7 +2360,7 @@ export class PortManagerNetworkService implements DisposableLike {
       options.background === true &&
       options.force !== true &&
       this.lastContainerServiceRefreshAtMs > 0 &&
-      Date.now() - this.lastContainerServiceRefreshAtMs < BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS
+      Date.now() - this.lastContainerServiceRefreshAtMs < this.backgroundContainerRefreshIntervalMs()
     ) {
       return this.registry.getSnapshot().containerServiceCandidates;
     }
@@ -2357,7 +2371,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const releaseSharedRefresh =
       options.background === true && options.force !== true && options.sharedRefreshAcquired !== true
-        ? tryAcquireSharedBackgroundContainerRefreshSlot()
+        ? tryAcquireSharedBackgroundContainerRefreshSlot(this.backgroundContainerRefreshIntervalMs())
         : undefined;
 
     if (
@@ -2400,9 +2414,13 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     this.sidebarVisible = visible;
+    if (this.ownsControlPlaneLease) {
+      this.syncContainerEventsWatcher();
+    }
     if (visible && this.ownsControlPlaneLease) {
       // Catch the UI up immediately after discovery was idled while hidden.
       this.lastContainerServiceRefreshAtMs = 0;
+      void this.refreshContainerServices({ force: true }).catch(() => []);
       this.notifyRoutingActivity({ refreshNow: true });
     }
   }
@@ -2420,13 +2438,86 @@ export class PortManagerNetworkService implements DisposableLike {
   private async refreshContainerServicesExclusive(
     options: BackgroundRefreshOptions,
   ): Promise<readonly ContainerServiceCandidate[]> {
-    const candidates = await this.containerServiceDiscovery
-      .list(readContainerRuntimeSettings())
-      .catch(() => []);
+    const session = await this.getContainerDiscoverySession(readContainerRuntimeSettings(), options.discoverySessions);
+    const candidates = session?.listCandidates() ?? [];
 
     this.lastContainerServiceRefreshAtMs = Date.now();
     this.registry.setContainerServiceCandidates(candidates);
     return this.registry.getSnapshot().containerServiceCandidates;
+  }
+
+  /** Shares auto/explicit runtime projections within one generation, never across runtime events. */
+  private async getContainerDiscoverySession(
+    settings: ReturnType<typeof readContainerRuntimeSettings>,
+    sessions = new Map<string, Promise<ContainerServiceDiscoverySession | undefined>>(),
+  ): Promise<ContainerServiceDiscoverySession | undefined> {
+    const key = settings.containerRuntime;
+    let pending = sessions.get(key);
+    if (pending === undefined) {
+      pending = this.containerServiceDiscovery.createSession(settings).catch(() => undefined);
+      sessions.set(key, pending);
+    }
+    const session = await pending;
+    if (session !== undefined && !sessions.has(session.getRuntime())) {
+      sessions.set(session.getRuntime(), pending);
+    }
+    return session;
+  }
+
+  /** Slow polling is safe only when the live stream covers every runtime this window consumes. */
+  private backgroundContainerRefreshIntervalMs(): number {
+    const runtime = this.containerEventsWatcher?.getRuntime();
+    if (runtime === undefined) {
+      return BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS;
+    }
+    const settings = readContainerRuntimeSettings();
+    const snapshot = this.registry.getSnapshot();
+    const coversPreference = settings.containerRuntime === "auto" || settings.containerRuntime === runtime;
+    const coversAttachments = snapshot.composeAttachments.filter(isRestorableComposeAttachment).every((attachment) => {
+      const preference = containerRuntimeSettingsForAttachment(settings, attachment).containerRuntime;
+      return preference === "auto" || preference === runtime;
+    });
+    const coversNamespaceHolders = !snapshot.networks.some((network) => network.runtimeKind === "container") ||
+      this.containerRuntime.getDescriptor()?.id === runtime;
+    return coversPreference && coversAttachments && coversNamespaceHolders
+      ? EVENT_DRIVEN_CONTAINER_REFRESH_INTERVAL_MS
+      : BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS;
+  }
+
+  /** One shared slot and snapshot cover a complete poll, so discovery cannot throttle out route repair. */
+  private async refreshBackgroundContainerState(): Promise<void> {
+    const discoverCandidates = this.hasBackgroundContainerDiscoveryConsumers();
+    const hasComposeRoutes = this.processService?.getSnapshot().processes.some((process) => process.source === "compose") === true;
+    if (!this.ownsControlPlaneLease || (!discoverCandidates && !hasComposeRoutes)) {
+      return;
+    }
+    if (this.backgroundContainerRefreshInFlight !== undefined) {
+      return this.backgroundContainerRefreshInFlight;
+    }
+    const intervalMs = this.backgroundContainerRefreshIntervalMs();
+    if (this.lastBackgroundContainerRefreshAtMs > 0 && Date.now() - this.lastBackgroundContainerRefreshAtMs < intervalMs) {
+      return;
+    }
+    const release = tryAcquireSharedBackgroundContainerRefreshSlot(intervalMs);
+    if (release === undefined) {
+      return;
+    }
+    const options: BackgroundRefreshOptions = {
+      background: true, force: true, sharedRefreshAcquired: true, discoverySessions: new Map(),
+    };
+    this.backgroundContainerRefreshInFlight = (async () => {
+      if (discoverCandidates) {
+        await this.refreshContainerServices(options).catch(() => []);
+      }
+      if (this.ownsControlPlaneLease) {
+        await this.reconcileComposeAttachmentPublishedPorts(options).catch(() => undefined);
+      }
+    })().finally(() => {
+      this.lastBackgroundContainerRefreshAtMs = Date.now();
+      this.backgroundContainerRefreshInFlight = undefined;
+      release();
+    });
+    return this.backgroundContainerRefreshInFlight;
   }
 
   /**
@@ -4172,7 +4263,7 @@ export class PortManagerNetworkService implements DisposableLike {
     this.syncContainerEventsWatcher();
     await Promise.all([
       this.refreshTerminals({ background: true }).catch(() => []),
-      this.refreshContainerServices({ background: true }).catch(() => []),
+      this.refreshBackgroundContainerState().catch(() => undefined),
     ]);
     /*
      * Keep the live runtime fallback for Docker events that were missed, but
@@ -4180,7 +4271,6 @@ export class PortManagerNetworkService implements DisposableLike {
      * below republishes routing files and recreates an override only when its
      * generated file is actually missing.
      */
-    await this.reconcileComposeAttachmentPublishedPorts({ background: true, force: true }).catch(() => undefined);
     await this.convergeDaemonAndRoutingState();
     await Promise.all([
       this.syncLogicalPortRouters().catch(() => undefined),
@@ -4239,7 +4329,7 @@ export class PortManagerNetworkService implements DisposableLike {
    */
   private syncContainerEventsWatcher(): void {
     const snapshot = this.registry.getSnapshot();
-    const containerFeaturesActive =
+    const containerFeaturesActive = this.sidebarVisible ||
       snapshot.composeAttachments.some(isRestorableComposeAttachment) ||
       snapshot.networks.some((network) => network.runtimeKind === "container");
 
@@ -4254,9 +4344,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     this.containerEventsWatcher = new ContainerEventsWatcher({
       readSettings: () => readContainerRuntimeSettings(),
-      onEvent: () => {
-        void this.handleContainerRuntimeEvent();
-      },
+      onEvent: (changes) => this.handleContainerRuntimeEvent(changes),
     });
     this.containerEventsWatcher.start();
   }
@@ -4271,16 +4359,32 @@ export class PortManagerNetworkService implements DisposableLike {
    * foreground-style pass: background gates (shared refresh stamp, interval
    * throttles) must not delay reconciliation the event already justified.
    */
-  private async handleContainerRuntimeEvent(): Promise<void> {
+  private async handleContainerRuntimeEvent(changes: readonly ContainerRuntimeChange[]): Promise<void> {
     if (!this.ownsControlPlaneLease) {
       return;
     }
 
+    // Wait out an older poll before taking the event's snapshot. Joining a
+    // read that started before the event could otherwise hide its final port.
+    await this.backgroundContainerRefreshInFlight?.catch(() => undefined);
+    await this.containerServiceRefreshInFlight?.catch(() => undefined);
+    await this.composeAttachmentReconcileInFlight?.catch(() => undefined);
+    if (!this.ownsControlPlaneLease) {
+      return;
+    }
+    const snapshot = this.registry.getSnapshot();
+    const networkIds = containerRuntimeChangeNetworkIds(changes, snapshot.composeAttachments, readContainerRuntimeSettings());
+    const hasNamespaceHolders = snapshot.networks.some((network) => network.runtimeKind === "container");
+    if (networkIds.length === 0 && !this.sidebarVisible && !hasNamespaceHolders) {
+      return;
+    }
     this.notifyRoutingActivity();
-    this.lastContainerServiceRefreshAtMs = 0;
-    await this.refreshContainerServices({ background: true, force: true }).catch(() => []);
-    await this.reconcileComposeAttachmentPublishedPorts({ force: true, coalesceForce: true }).catch(() => undefined);
-    await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true }).catch(() => undefined);
+    const options: BackgroundRefreshOptions = { force: true, networkIds, discoverySessions: new Map() };
+    await this.refreshContainerServices(options).catch(() => []);
+    if (networkIds.length > 0 && this.ownsControlPlaneLease) {
+      await this.reconcileComposeAttachmentPublishedPorts(options).catch(() => undefined);
+      await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true, networkIds }).catch(() => undefined);
+    }
   }
 
   /**
@@ -4948,7 +5052,7 @@ export class PortManagerNetworkService implements DisposableLike {
       options.background === true &&
       options.force !== true &&
       this.lastComposeAttachmentReconcileAtMs > 0 &&
-      Date.now() - this.lastComposeAttachmentReconcileAtMs < BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS
+      Date.now() - this.lastComposeAttachmentReconcileAtMs < this.backgroundContainerRefreshIntervalMs()
     ) {
       return;
     }
@@ -4968,7 +5072,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     const releaseSharedRefresh =
       options.background === true && options.sharedRefreshAcquired !== true
-        ? tryAcquireSharedBackgroundContainerRefreshSlot()
+        ? tryAcquireSharedBackgroundContainerRefreshSlot(this.backgroundContainerRefreshIntervalMs())
         : undefined;
 
     if (
@@ -5025,26 +5129,14 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     const settings = readContainerRuntimeSettings();
-    const discoverySessions = new Map<string, Promise<ContainerServiceDiscoverySession | undefined>>();
-    const getDiscoverySession = (
-      runtimeSettings: ReturnType<typeof readContainerRuntimeSettings>,
-    ): Promise<ContainerServiceDiscoverySession | undefined> => {
-      const key = `${runtimeSettings.containerRuntime}\0${runtimeSettings.containerImage}`;
-      let session = discoverySessions.get(key);
-      if (session === undefined) {
-        session = this.containerServiceDiscovery.createSession(runtimeSettings).catch(() => undefined);
-        discoverySessions.set(key, session);
-      }
-
-      return session;
-    };
+    const discoverySessions = options.discoverySessions ?? new Map<string, Promise<ContainerServiceDiscoverySession | undefined>>();
 
     for (const attachment of targetAttachments) {
       const shouldRefreshPorts = shouldRefreshComposePublishedPortsFromRuntime(attachment, options);
       const shouldRefreshMappings = shouldRefreshComposeContainerMappingsFromRuntime(attachment, options);
       const runtimeSettings = containerRuntimeSettingsForAttachment(settings, attachment);
       const discoverySession = shouldRefreshPorts || shouldRefreshMappings
-        ? await getDiscoverySession(runtimeSettings)
+        ? await this.getContainerDiscoverySession(runtimeSettings, discoverySessions)
         : undefined;
       let livePorts: readonly ComposePublishedPort[] | undefined;
       let liveDiscoveryError: string | undefined;
@@ -8426,14 +8518,51 @@ function containerRuntimeSettingsForAttachment(
   settings: ReturnType<typeof readContainerRuntimeSettings>,
   attachment: ComposeAttachment,
 ): ReturnType<typeof readContainerRuntimeSettings> {
-  if (attachment.runtime === undefined) {
+  const runtime = attachment.runtime ?? attachment.mutation?.runtime;
+  if (runtime === undefined) {
     return settings;
   }
 
   return {
     ...settings,
-    containerRuntime: attachment.runtime,
+    containerRuntime: runtime,
   };
+}
+
+/** Scope lifecycle repair by runtime and Compose identity; missing metadata conservatively covers that runtime. */
+function containerRuntimeChangeNetworkIds(
+  changes: readonly ContainerRuntimeChange[],
+  attachments: readonly ComposeAttachment[],
+  settings: ReturnType<typeof readContainerRuntimeSettings>,
+): readonly string[] {
+  const networkIds = new Set<string>();
+  const restorable = attachments.filter(isRestorableComposeAttachment);
+  for (const change of changes) {
+    let affected = restorable.filter((attachment) => {
+      const runtime = containerRuntimeSettingsForAttachment(settings, attachment).containerRuntime;
+      return runtime === "auto" || runtime === change.runtime;
+    });
+    if (change.composeProject !== undefined) {
+      affected = affected.filter((attachment) =>
+        [attachment.projectName, attachment.mutation?.originalProjectName, attachment.mutation?.attachedProjectName].includes(change.composeProject),
+      );
+    } else if (change.containerId !== undefined) {
+      const eventId = change.containerId;
+      const known = affected.filter((attachment) => attachment.mutation?.containerMappings?.some((mapping) =>
+        [mapping.originalContainerId, mapping.attachedContainerId].some((id) =>
+          id.length > 0 && (id.startsWith(eventId) || eventId.startsWith(id)),
+        ),
+      ));
+      // A new/unknown ID may belong to any attached project; only narrow when its ownership is known.
+      if (known.length > 0) {
+        affected = known;
+      }
+    }
+    for (const attachment of affected) {
+      networkIds.add(attachment.networkId);
+    }
+  }
+  return [...networkIds];
 }
 
 function composeWorkingDirectoryFromFiles(composeFiles: readonly string[]): string | undefined {
@@ -13298,8 +13427,8 @@ function isProcessAlive(pid: number): boolean {
  * Container inspection is expensive on Docker Desktop, so memory-only throttles
  * still let each extension host wake Docker independently.
  */
-function tryAcquireSharedBackgroundContainerRefreshSlot(): (() => void) | undefined {
-  if (isSharedBackgroundContainerRefreshRecent()) {
+function tryAcquireSharedBackgroundContainerRefreshSlot(intervalMs = BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS): (() => void) | undefined {
+  if (isSharedBackgroundContainerRefreshRecent(intervalMs)) {
     return undefined;
   }
 
@@ -13344,7 +13473,7 @@ function tryAcquireSharedBackgroundContainerRefreshSlot(): (() => void) | undefi
       }
     };
 
-    if (isSharedBackgroundContainerRefreshRecent()) {
+    if (isSharedBackgroundContainerRefreshRecent(intervalMs)) {
       release(false);
       return undefined;
     }
@@ -13355,10 +13484,10 @@ function tryAcquireSharedBackgroundContainerRefreshSlot(): (() => void) | undefi
   return undefined;
 }
 
-function isSharedBackgroundContainerRefreshRecent(): boolean {
+function isSharedBackgroundContainerRefreshRecent(intervalMs: number): boolean {
   try {
     const stats = syncFs.statSync(BACKGROUND_CONTAINER_REFRESH_STAMP_PATH);
-    return Date.now() - stats.mtimeMs < BACKGROUND_CONTAINER_REFRESH_INTERVAL_MS;
+    return Date.now() - stats.mtimeMs < intervalMs;
   } catch {
     return false;
   }

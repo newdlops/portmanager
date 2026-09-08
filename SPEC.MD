@@ -120,6 +120,8 @@ Compose attachment를 non-destructive detach한 뒤 같은 hidden clone을 다�
 
 Docker/Podman discovery나 `docker compose config`가 일시적으로 실패하면 해당 Compose attachment는 durable registry에 남아 다음 refresh에서 재시도되어야 한다. 단, 실패한 attachment의 missing/stale generated override 경로는 shell wrapper나 native shim이 읽는 routing TSV에 배포하지 않아야 하며, 다음 성공적인 refresh는 error 상태를 해제하고 override YAML, TSV, daemon route row를 함께 복구해야 한다.
 
+Docker CPU 부하를 줄이기 위해 자동 탐색은 lifecycle event를 우선 사용한다. 정상 이벤트 스트림이 사용하는 모든 runtime을 커버하면 전체 탐색은 5분 간격의 누락 복구용으로 수행하고, 스트림 장애나 runtime 혼용으로 커버가 불완전하면 기존 1분 탐색을 유지한다. 하나의 탐색 스냅샷을 후보 목록과 route reconciliation이 공유해야 한다. 이벤트 burst는 직렬 처리하되 처리 도중 발생한 마지막 변경을 빠뜨리지 않아야 하며, Compose label이나 알려진 container ID로 범위를 확인할 수 있으면 관련 네트워크만 override를 강제 검증한다. 정체성을 확인할 수 없으면 해당 runtime 전체를 검증한다. 재연결과 사용자의 명시적 새로고침은 주기 제한을 기다리지 않는다. startup, shared state reload, attach, stale routing repair의 기존 override 검증 보장은 유지한다.
+
 #### Network Runtime Adapter
 
 Logical Network를 실제 시스템에서 구현하는 어댑터다. VS Code 확장만으로 모든 플랫폼에서 임의 프로세스의 network namespace를 만들 수는 없으므로, 런타임 구현은 인터페이스 뒤에 둔다.

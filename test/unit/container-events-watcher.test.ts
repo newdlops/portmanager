@@ -6,6 +6,7 @@ import type { ChildProcess, spawn } from "node:child_process";
 import {
   ContainerEventsWatcher,
   chunkContainsRoutingRelevantEvent,
+  type ContainerRuntimeChange,
 } from "../../src/platform/network/container-events-watcher";
 import type { ContainerRuntimeSettings } from "../../src/shared/types";
 
@@ -79,6 +80,7 @@ test("routing-relevant event parsing accepts lifecycle actions and rejects noise
   assert.equal(chunkContainsRoutingRelevantEvent('{"Type":"network","Action":"connect"}\n'), true);
   assert.equal(chunkContainsRoutingRelevantEvent('{"type":"container","action":"stop"}\n'), true);
   assert.equal(chunkContainsRoutingRelevantEvent('{"Type":"container","status":"restart"}\n'), true);
+  assert.equal(chunkContainsRoutingRelevantEvent('{"Type":"container","Status":"died"}\n'), true);
 
   // Health checks and exec probes fire constantly on busy containers and must
   // not wake the reconcile loop.
@@ -89,7 +91,141 @@ test("routing-relevant event parsing accepts lifecycle actions and rejects noise
   assert.equal(chunkContainsRoutingRelevantEvent(""), false);
 });
 
-test("events watcher subscribes with json format and container/network filters", () => {
+/** Lets async watcher callbacks settle while timer progression remains deterministic. */
+async function settleNotifications(): Promise<void> {
+  for (let step = 0; step < 8; step++) {
+    await Promise.resolve();
+  }
+}
+
+test("slow event reconciliation gets one trailing batch with unique Compose projects", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const { spawnProcess, records } = createFakeSpawner();
+  const batches: (readonly ContainerRuntimeChange[])[] = [];
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  const watcher = new ContainerEventsWatcher({
+    readSettings: () => settings, spawnProcess,
+    onEvent: async (changes) => { batches.push(changes); if (batches.length === 1) { await pending; } },
+  });
+  context.after(() => watcher.dispose());
+  watcher.start();
+  const child = records[0].child;
+  const event = (project: string) => child.emitStdout(JSON.stringify({
+    Type: "container", Action: "start", Actor: { Attributes: { "com.docker.compose.project": project } },
+  }) + "\n");
+  event("alpha");
+  context.mock.timers.tick(500);
+  assert.equal(batches.length, 1);
+  for (let index = 0; index < 100; index++) { event("beta"); event("gamma"); }
+  context.mock.timers.tick(5000);
+  assert.equal(batches.length, 1, "a slow refresh must not start overlapping Docker work");
+  release();
+  await settleNotifications();
+  context.mock.timers.tick(500);
+  await settleNotifications();
+  assert.deepEqual(batches, [
+    [{ runtime: "docker", composeProject: "alpha" }],
+    [{ runtime: "docker", composeProject: "beta" }, { runtime: "docker", composeProject: "gamma" }],
+  ]);
+  assert.equal(watcher.getRuntime(), "docker");
+});
+
+test("failed callbacks preserve trailing events and dispose cancels pending work", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const { spawnProcess, records } = createFakeSpawner();
+  let calls = 0;
+  let fail!: (reason: Error) => void;
+  const pending = new Promise<void>((_resolve, reject) => { fail = reject; });
+  const watcher = new ContainerEventsWatcher({
+    readSettings: () => settings, spawnProcess,
+    onEvent: () => { calls++; return calls === 1 ? pending : undefined; },
+  });
+  context.after(() => watcher.dispose());
+  watcher.start();
+  const child = records[0].child;
+  child.emitStdout('{"Action":"start"}\n');
+  context.mock.timers.tick(500);
+  child.emitStdout('{"Action":"stop"}\n');
+  fail(new Error("daemon unavailable"));
+  await settleNotifications();
+  context.mock.timers.tick(500);
+  await settleNotifications();
+  assert.equal(calls, 2);
+  child.emitStdout('{"Action":"start"}\n');
+  watcher.dispose();
+  context.mock.timers.tick(5000);
+  assert.equal(calls, 2);
+  assert.equal(watcher.getRuntime(), undefined);
+});
+
+test("unlabelled events conservatively cover all projects and Podman project labels are retained", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const { spawnProcess, records } = createFakeSpawner();
+  const batches: (readonly ContainerRuntimeChange[])[] = [];
+  const watcher = new ContainerEventsWatcher({
+    readSettings: () => ({ ...settings, containerRuntime: "podman" }), spawnProcess,
+    onEvent: (changes) => { batches.push(changes); },
+  });
+  context.after(() => watcher.dispose());
+  watcher.start();
+  const child = records[0].child;
+  child.emitStdout('{"Status":"died","Attributes":{"io.podman.compose.project":"alpha"}}\n');
+  context.mock.timers.tick(500);
+  await settleNotifications();
+  assert.deepEqual(batches[0], [{ runtime: "podman", composeProject: "alpha" }]);
+  child.emitStdout('{"Status":"start","Attributes":{"io.podman.compose.project":"alpha"}}\n');
+  child.emitStdout('{"Status":"connect"}\n');
+  child.emitStdout('{"Status":"stop","Attributes":{"io.podman.compose.project":"beta"}}\n');
+  context.mock.timers.tick(500);
+  await settleNotifications();
+  assert.deepEqual(batches[1], [{ runtime: "podman" }]);
+});
+
+test("a recovered silent event stream immediately requests a catch-up snapshot", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const { spawnProcess, records } = createFakeSpawner();
+  const batches: (readonly ContainerRuntimeChange[])[] = [];
+  const watcher = new ContainerEventsWatcher({
+    readSettings: () => settings, spawnProcess, onEvent: (changes) => { batches.push(changes); },
+  });
+  context.after(() => watcher.dispose());
+  watcher.start();
+  context.mock.timers.tick(1000);
+  assert.equal(watcher.getRuntime(), "docker");
+  assert.equal(batches.length, 0);
+  records[0].child.emitExit(1);
+  assert.equal(watcher.getRuntime(), undefined);
+  context.mock.timers.tick(30000);
+  assert.equal(records.length, 2);
+  context.mock.timers.tick(1000);
+  context.mock.timers.tick(500);
+  await settleNotifications();
+  assert.deepEqual(batches, [[{ runtime: "docker" }]]);
+});
+
+test("network events borrow Compose identity from container events in the same batch", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const { spawnProcess, records } = createFakeSpawner();
+  const batches: (readonly ContainerRuntimeChange[])[] = [];
+  const watcher = new ContainerEventsWatcher({
+    readSettings: () => settings, spawnProcess, onEvent: (changes) => { batches.push(changes); },
+  });
+  context.after(() => watcher.dispose());
+  watcher.start();
+  const child = records[0].child;
+  child.emitStdout('{"Type":"network","Action":"connect","Actor":{"ID":"network-id","Attributes":{"container":"container-id"}}}\n');
+  child.emitStdout('{"Type":"container","Action":"start","Actor":{"ID":"container-id","Attributes":{"com.docker.compose.project":"alpha"}}}\n');
+  context.mock.timers.tick(500);
+  await settleNotifications();
+  assert.deepEqual(batches, [[{ runtime: "docker", composeProject: "alpha" }]]);
+  child.emitStdout('{"Type":"network","Action":"disconnect","Actor":{"ID":"network-id","Attributes":{"container":"container-id"}}}\n');
+  context.mock.timers.tick(500);
+  await settleNotifications();
+  assert.deepEqual(batches[1], [{ runtime: "docker", containerId: "container-id" }]);
+});
+
+test("events watcher filters Docker events before delivery without excluding routing actions", () => {
   const { spawnProcess, records } = createFakeSpawner();
   const watcher = new ContainerEventsWatcher({
     readSettings: () => settings,
@@ -108,6 +244,10 @@ test("events watcher subscribes with json format and container/network filters",
     "type=container",
     "--filter",
     "type=network",
+    ...[
+      "create", "start", "restart", "stop", "kill", "die", "destroy", "remove",
+      "rename", "update", "pause", "unpause", "connect", "disconnect",
+    ].flatMap((action) => ["--filter", `event=${action}`]),
   ]);
 
   watcher.dispose();
@@ -125,6 +265,7 @@ test("events watcher falls back to podman when docker cannot spawn", () => {
   watcher.start();
   assert.equal(records.length, 1);
   assert.equal(records[0].executable, "podman");
+  assert.equal(records[0].args.some((arg) => arg.startsWith("event=")), false);
   watcher.dispose();
 });
 

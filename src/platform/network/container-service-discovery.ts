@@ -36,6 +36,9 @@ export class ContainerServiceDiscoveryAdapter {
   /** Low-level command runner; production uses child_process.execFile. */
   private readonly runCommand: ContainerCommandRunner;
 
+  /** Only overlapping reads share rows; completed reads never outlive a runtime change. */
+  private readonly rowReadsInFlight = new Map<string, Promise<readonly RuntimeContainerRow[]>>();
+
   constructor(options: ContainerServiceDiscoveryOptions = {}) {
     this.runCommand = options.runCommand ?? runContainerCommand;
   }
@@ -56,8 +59,13 @@ export class ContainerServiceDiscoveryAdapter {
   async createSession(settings: ContainerRuntimeSettings): Promise<ContainerServiceDiscoverySession | undefined> {
     for (const executable of runtimeCandidates(settings.containerRuntime)) {
       try {
-        const runningRows = await this.listRuntimeRows(executable, false);
-        const contextRows = await this.listRuntimeRows(executable, true).catch(() => runningRows);
+        const contextRows = await this.listRuntimeRows(executable, true);
+        // A single all-container snapshot includes stopped source labels and
+        // live endpoints without two CLI launches or a race between lists.
+        // Older runtimes without recognizable state retain the explicit live query.
+        const runningRows = contextRows.some((row) => runtimeRowIsRunning(row) === undefined)
+          ? await this.listRuntimeRows(executable, false)
+          : contextRows.filter((row) => runtimeRowIsRunning(row) === true);
         return new ContainerServiceDiscoverySession(this.runCommand, executable, runningRows, contextRows);
       } catch {
         // Try the next configured runtime. UI refresh should not fail just
@@ -117,18 +125,8 @@ export class ContainerServiceDiscoveryAdapter {
       return ports;
     }
 
-    for (const executable of runtimeCandidates(settings.containerRuntime)) {
-      try {
-        const runningRows = await this.listRuntimeRows(executable, false);
-        const contextRows = await this.listRuntimeRows(executable, true).catch(() => runningRows);
-        return new ContainerServiceDiscoverySession(this.runCommand, executable, runningRows, contextRows)
-          .refreshComposePublishedPorts(projectName, composeFiles, ports);
-      } catch {
-        // Try the next configured runtime.
-      }
-    }
-
-    return ports;
+    const session = await this.createSession(settings);
+    return session?.refreshComposePublishedPorts(projectName, composeFiles, ports) ?? ports;
   }
 
   /**
@@ -149,18 +147,8 @@ export class ContainerServiceDiscoveryAdapter {
       return [];
     }
 
-    for (const executable of runtimeCandidates(settings.containerRuntime)) {
-      try {
-        const runningRows = await this.listRuntimeRows(executable, false);
-        const contextRows = await this.listRuntimeRows(executable, true).catch(() => runningRows);
-        return new ContainerServiceDiscoverySession(this.runCommand, executable, runningRows, contextRows)
-          .listLiveComposePublishedPorts(projectName, composeFiles, ports);
-      } catch {
-        // Try the next configured runtime.
-      }
-    }
-
-    return [];
+    const session = await this.createSession(settings);
+    return session?.listLiveComposePublishedPorts(projectName, composeFiles, ports) ?? [];
   }
 
   /**
@@ -201,8 +189,26 @@ export class ContainerServiceDiscoveryAdapter {
     return currentMappings;
   }
 
+  /** Shares concurrent CLI reads without caching stale endpoints across refreshes. */
+  private listRuntimeRows(
+    executable: "docker" | "podman",
+    includeStopped: boolean,
+  ): Promise<readonly RuntimeContainerRow[]> {
+    const key = `${executable}:${includeStopped}`;
+    const existingRead = this.rowReadsInFlight.get(key);
+    if (existingRead !== undefined) {
+      return existingRead;
+    }
+
+    const read = this.readRuntimeRows(executable, includeStopped).finally(() => {
+      this.rowReadsInFlight.delete(key);
+    });
+    this.rowReadsInFlight.set(key, read);
+    return read;
+  }
+
   /** Reads JSON rows from `docker container ls` or `podman container ls`. */
-  private async listRuntimeRows(
+  private async readRuntimeRows(
     executable: "docker" | "podman",
     includeStopped: boolean,
   ): Promise<readonly RuntimeContainerRow[]> {
@@ -230,8 +236,12 @@ export class ContainerServiceDiscoveryAdapter {
  * re-listing every container or re-inspecting the same id.
  */
 export class ContainerServiceDiscoverySession {
+  /** Stopped Compose services remain attachable but cannot supply live routes. */
   private readonly candidates: readonly ContainerServiceCandidate[];
+  private readonly liveCandidates: readonly ContainerServiceCandidate[];
   private readonly inspectedRows: RuntimeContainerInspectIdentityRow[] = [];
+  /** Pending and failed inspect attempts are shared only within this snapshot. */
+  private readonly inspectAttempts = new Map<string, Promise<void>>();
 
   constructor(
     private readonly runCommand: ContainerCommandRunner,
@@ -240,10 +250,17 @@ export class ContainerServiceDiscoverySession {
     private readonly contextRows: readonly RuntimeContainerRow[],
   ) {
     this.candidates = parseContainerRows(executable, buildAttachCandidateRows(runningRows, contextRows), contextRows);
+    const runningIds = new Set(runningRows.map((row) => readFirstString(row.ID, row.Id)).filter(isDefinedString));
+    this.liveCandidates = this.candidates.filter((candidate) => runningIds.has(candidate.containerId));
   }
 
   listCandidates(): readonly ContainerServiceCandidate[] {
     return this.candidates;
+  }
+
+  /** Allows an auto-selected snapshot to serve subsequent explicit lookups in the same pass. */
+  getRuntime(): "docker" | "podman" {
+    return this.executable;
   }
 
   refreshComposePublishedPorts(
@@ -251,7 +268,7 @@ export class ContainerServiceDiscoverySession {
     composeFiles: readonly string[],
     ports: readonly ComposePublishedPort[],
   ): readonly ComposePublishedPort[] {
-    return refreshPortsFromCandidates(projectName, composeFiles, ports, this.candidates);
+    return refreshPortsFromCandidates(projectName, composeFiles, ports, this.liveCandidates);
   }
 
   listLiveComposePublishedPorts(
@@ -259,7 +276,7 @@ export class ContainerServiceDiscoverySession {
     composeFiles: readonly string[],
     ports: readonly ComposePublishedPort[],
   ): readonly ComposePublishedPort[] {
-    return selectLivePortsFromCandidates(projectName, composeFiles, ports, this.candidates);
+    return selectLivePortsFromCandidates(projectName, composeFiles, ports, this.liveCandidates);
   }
 
   async refreshComposeContainerMappings(
@@ -306,17 +323,29 @@ export class ContainerServiceDiscoverySession {
       return rows;
     }
 
-    const missingContainerIds = inspectCandidateIds.filter((containerId) => !this.hasInspectedContainer(containerId));
-    try {
-      if (missingContainerIds.length > 0) {
-        const result = await this.runCommand(this.executable, ["container", "inspect", ...missingContainerIds], {
-          timeoutMs: LIST_TIMEOUT_MS,
-        });
-        this.addInspectedRows(parseRuntimeContainerInspectIdentityRows(result.stdout));
+    const missingContainerIds = inspectCandidateIds.filter(
+      (containerId) => !this.hasInspectedContainer(containerId) && !this.inspectAttempts.has(containerId),
+    );
+    if (missingContainerIds.length > 0) {
+      const attempt = this.inspectContainerNames(missingContainerIds);
+      for (const containerId of missingContainerIds) {
+        this.inspectAttempts.set(containerId, attempt);
       }
-      return mergeRuntimeContainerRowsWithInspectNames(rows, this.inspectedRows);
+    }
+
+    await Promise.all(inspectCandidateIds.map((containerId) => this.inspectAttempts.get(containerId)));
+    return mergeRuntimeContainerRowsWithInspectNames(rows, this.inspectedRows);
+  }
+
+  /** A disappeared container must not trigger the same doomed inspect for every attachment. */
+  private async inspectContainerNames(containerIds: readonly string[]): Promise<void> {
+    try {
+      const result = await this.runCommand(this.executable, ["container", "inspect", ...containerIds], {
+        timeoutMs: LIST_TIMEOUT_MS,
+      });
+      this.addInspectedRows(parseRuntimeContainerInspectIdentityRows(result.stdout));
     } catch {
-      return rows;
+      // Keep this snapshot usable; the next refresh creates a new session and retries.
     }
   }
 
@@ -344,9 +373,35 @@ export interface RuntimeContainerRow {
   readonly Names?: string;
   readonly Name?: string;
   readonly Image?: string;
+  /** Machine-readable lifecycle state, independent of human-readable uptime. */
+  readonly State?: string;
   readonly Status?: string;
   readonly Ports?: string;
   readonly Labels?: string;
+}
+
+/** Matches the running list, falling back to a separate query for unknown runtime output. */
+function runtimeRowIsRunning(row: RuntimeContainerRow): boolean | undefined {
+  const state = readFirstString(row.State)?.toLowerCase();
+  if (state !== undefined) {
+    if (["running", "paused", "restarting"].includes(state)) {
+      return true;
+    }
+    if (["created", "configured", "initialized", "stopped", "exited", "removing", "dead"].includes(state)) {
+      return false;
+    }
+  }
+
+  const status = readFirstString(row.Status);
+  if (status !== undefined) {
+    if (/^(?:up|running|paused|restarting)\b/i.test(status)) {
+      return true;
+    }
+    if (/^(?:created|configured|initialized|stopped|exited|removing|dead)\b/i.test(status)) {
+      return false;
+    }
+  }
+  return undefined;
 }
 
 export interface RuntimeContainerInspectIdentityRow {

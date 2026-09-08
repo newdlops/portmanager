@@ -60,7 +60,7 @@ test("container discovery idles without consumers and wakes through lifecycle ev
   assert.equal(source.includes("private hasBackgroundContainerDiscoveryConsumers(): boolean"), true);
   assert.equal(source.includes("setSidebarVisible(visible: boolean): void"), true);
   assert.equal(source.includes("private syncContainerEventsWatcher(): void"), true);
-  assert.equal(source.includes("private async handleContainerRuntimeEvent(): Promise<void>"), true);
+  assert.equal(source.includes("private async handleContainerRuntimeEvent("), true);
   assert.equal(source.includes("readContainerEventsWatchEnabled()"), true);
 
   const refreshStart = source.indexOf("async refreshContainerServices(");

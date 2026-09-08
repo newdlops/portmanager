@@ -338,6 +338,7 @@ test("discovers published port candidates through the configured runtime", async
         stdout: JSON.stringify({
           ID: "def456",
           Names: "redis",
+          State: "running",
           Ports: "0.0.0.0:16379->6379/tcp",
           Labels: "",
         }),
@@ -349,10 +350,6 @@ test("discovers published port candidates through the configured runtime", async
   const candidates = await adapter.list({ containerRuntime: "docker", containerImage: "alpine:3.20" });
 
   assert.deepEqual(calls, [
-    {
-      executable: "docker",
-      args: ["container", "ls", "--format", "{{json .}}"],
-    },
     {
       executable: "docker",
       args: ["container", "ls", "-a", "--format", "{{json .}}"],
@@ -855,6 +852,7 @@ test("reuses compose discovery rows within one refresh session", async () => {
     JSON.stringify({
       ID: "newclone987",
       Names: "network-workspace-postgres-1",
+      State: "running",
       Ports: "127.0.0.1:51612->5432/tcp",
       Labels:
         `com.docker.compose.project=network-workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=${cloneConfigFiles},` +
@@ -866,6 +864,7 @@ test("reuses compose discovery rows within one refresh session", async () => {
     JSON.stringify({
       ID: "original123",
       Names: "workspace-postgres-1",
+      State: "exited",
       Ports: "",
       Labels: "com.docker.compose.project=workspace,com.docker.compose.service=db,com.docker.compose.project.config_files=/workspace/compose.yaml",
     }),
@@ -920,7 +919,6 @@ test("reuses compose discovery rows within one refresh session", async () => {
   );
 
   assert.deepEqual(mutableCalls, [
-    ["container", "ls", "--format", "{{json .}}"],
     ["container", "ls", "-a", "--format", "{{json .}}"],
   ]);
   assert.equal(livePorts[0]?.actualHostPort, 51612);
