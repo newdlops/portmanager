@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8252",
+  "version": "0.0.8253",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -117,7 +117,9 @@
     "package:linux-x64": "node scripts/package-native-target.js package linux-x64",
     "publish": "node scripts/package-native-target.js publish",
     "verify:native": "node scripts/verify-native-artifacts.js",
-    "publish:precheck": "npm test && npm run package"
+    "publish:precheck": "npm test && npm run package",
+    "test:ci": "npm run compile && node --test --test-concurrency=1 out/test/unit/*.test.js",
+    "test:packaged": "node scripts/test-packaged-extension.mjs"
   },
   "contributes": {
     "viewsContainers": {
@@ -1066,6 +1068,7 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/vscode": "^1.95.0",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
     "typescript": "^5.7.2"
   }

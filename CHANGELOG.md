@@ -35,6 +35,14 @@ All notable changes to Port Manager are documented in this file.
 - Isolate the interface view of a network-scoped process: the hook interposes `getifaddrs` so `os.networkInterfaces()` reports only `127.0.0.1` and the process's own network loopback alias, hiding other networks' host-global `lo0` aliases (e.g. dev servers like vite no longer enumerate every network's loopback).
 - Serve every network-alias port through one protocol-sniffing listener instead of classifying ports as web vs raw. Each connection is demultiplexed by its first bytes: a TLS ClientHello is terminated with the dev certificate and proxied as HTTP, a plaintext HTTP request line is proxied as HTTP, and anything else is forwarded as raw TCP. **Fixes `ERR_SSL_PROTOCOL_ERROR`** on Docker Compose (and other containerized) web services, which the previous command-name heuristic misclassified as raw and served plain, so browsers rejected the HTTPS handshake. Databases and other raw protocols on the same alias continue to work over the raw path.
 
+## 0.0.8253
+
+- Verify all four native Marketplace targets in CI, including installation and activation of each packaged VSIX in a fresh VS Code profile.
+- Publish route files during sustained traffic and move route/DNS file operations off the control loop, with bounded queues, completion receipts, revision checks, and retryable partial failures.
+- Keep DNS publication and status requests responsive during listener scans and slow socket reads; preserve accepted mutations and complete half-closed responses.
+- Revalidate queued HTTP routes before connecting and preserve raw TCP half-close behavior.
+- Reduce large network-table construction cost while preserving route ownership and output order.
+
 ## 0.0.1
 
 Initial release.
