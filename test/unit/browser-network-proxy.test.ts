@@ -135,7 +135,8 @@ test("keeps Vite-facing requests on localhost while rewriting localhost response
     assert.match(response.body, new RegExp(`//product1:${activeEndpoint.listenPort}/src/main.ts`));
     assert.match(response.body, /https:\/\/product1:9443\/secure/);
     assert.doesNotMatch(response.body, /localhost|127\.0\.0\.1|\[::1\]/);
-    assert.equal(response.headers["content-length"], String(Buffer.byteLength(response.body)));
+    assert.equal(response.headers["content-length"], undefined);
+    assert.equal(response.headers["transfer-encoding"], "chunked");
   } finally {
     await proxy.dispose();
     await closeServer(upstream);
@@ -559,6 +560,46 @@ test("forwards browser proxy requests to HTTPS upstream targets", async () => {
     assert.equal(response.headers.location, `${publicOrigin}/secure`);
     assert.equal(response.headers["access-control-allow-origin"], publicOrigin);
   } finally {
+    await proxy.dispose();
+    await closeServer(upstream);
+  }
+});
+
+test("an unanswered port probe cannot block another network's browser listener", async (context) => {
+  const upstream = http.createServer((_request, response) => response.end("ready"));
+  await listen(upstream, 0, "127.0.0.1");
+  const blockedPort = await getAvailablePort();
+  const readyPort = await getAvailablePort();
+  const blockedProbe = new net.Socket();
+  // Simulate a dropped SYN without changing host packet-filter rules. All
+  // other probes and the eventual HTTP request use real loopback sockets.
+  const netModule = require("node:net") as typeof import("node:net");
+  const createConnection = netModule.createConnection;
+  context.mock.method(netModule, "createConnection", (options: net.NetConnectOpts) => {
+    return "port" in options && options.port === blockedPort ? blockedProbe : createConnection(options);
+  });
+  const proxy = new BrowserNetworkProxyManager({
+    resolve: () => ({ host: "127.0.0.1", port: getServerPort(upstream) }),
+  });
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      proxy.sync([
+        createEndpoint({ listenPorts: [blockedPort] }),
+        createEndpoint({ id: "network-2:3004", networkId: "network-2", listenPorts: [readyPort] }),
+      ]),
+      new Promise<never>((_resolve, reject) => {
+        deadline = setTimeout(() => reject(new Error("other network was blocked by a port probe")), 2_000);
+      }),
+    ]);
+    assert.equal(blockedProbe.destroyed, true);
+    assert.equal(proxy.get("network-1", 3004), undefined);
+    assert.equal(proxy.has("network-2:3004"), true);
+    const response = await requestHttp({ host: "127.0.0.1", port: readyPort, path: "/" });
+    assert.equal(response.body, "ready");
+  } finally {
+    clearTimeout(deadline);
+    blockedProbe.destroy(new Error("test cleanup"));
     await proxy.dispose();
     await closeServer(upstream);
   }

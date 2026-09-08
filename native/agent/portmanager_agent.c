@@ -1,4 +1,5 @@
 #include "portmanager_agent.h"
+#include "portmanager_agent_output.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -29,22 +30,64 @@
 #define PM_EVENT_LOOP_DEFAULT_POLL_MS 1000
 #define PM_ACCEPT_BUDGET_PER_TURN 512
 #define PM_CLIENT_READ_BUDGET_PER_TURN 512
-#define PM_CLIENT_RESPONSE_WRITE_BUDGET_MS 100
-#define PM_CONTROL_WRITE_BUDGET_MS 100
-#define PM_SNAPSHOT_BROADCAST_WRITE_BUDGET_MS 100
+#define PM_OUTPUT_CLIENT_BYTES_PER_TURN (64 * 1024)
+#define PM_OUTPUT_BYTES_PER_TURN (256 * 1024)
+#define PM_OUTPUT_TURN_MS 5
 /* Sustained mutation storms get a fixed scheduling deadline; the separate
  * socket budget bounds fan-out without forcing large snapshots at >4Hz. */
 #define PM_SNAPSHOT_BROADCAST_START_MAX_DELAY_MS \
   PM_SNAPSHOT_BROADCAST_MAX_DELAY_MS
+
+/* Accepted mutations survive a send-only client's close; abandoned read-only
+ * observations are canceled. Limits bound retained frames across all clients. */
+typedef struct pm_pending_scan {
+  struct pm_pending_scan *next;
+  char *line;
+  size_t bytes;
+  int mutation;
+  pm_scan_context *context;
+} pm_pending_scan;
+static size_t pm_pending_scan_count;
+static size_t pm_pending_scan_bytes;
+
+/* Delivery receipts retain request identity, never a pointer into the movable
+ * client array. A respawn RPC must not report success for an unsent command. */
+typedef struct pm_pending_control {
+  struct pm_pending_control *next;
+  pm_request request;
+  pm_output_receipt *receipt;
+} pm_pending_control;
+static size_t pm_pending_control_count;
+
+/* File receipts preserve accepted mutations independently of client lifetime.
+ * Retained responses have their own count/byte budget, separate from sockets. */
+typedef struct pm_pending_publication {
+  struct pm_pending_publication *next;
+  pm_request request;
+  pm_publication_receipt *receipt;
+  pm_buffer payload;
+} pm_pending_publication;
+static size_t pm_pending_publication_count;
+static size_t pm_pending_publication_bytes;
 
 typedef struct {
   int fd;
   int wants_events;
   int is_control;
   int control_pid;
+  int read_closed;
+  /* macOS reports HUP without POLLOUT after SHUT_WR; retry EAGAIN without spinning. */
+  long long output_retry_after_ms;
   char *buffer;
   size_t length;
   size_t capacity;
+  pm_pending_scan *pending_scans;
+  /* Heap-stable: control registry references survive client array compaction. */
+  pm_output_queue *output;
+  pm_pending_control *pending_controls;
+  size_t pending_control_count;
+  pm_pending_publication *pending_publications;
+  size_t pending_publication_count;
 } pm_client;
 
 /*
@@ -56,6 +99,7 @@ typedef struct {
 typedef struct {
   int pid;
   int fd;
+  pm_output_queue *output;
   /* Network scope the hooked parent registered with, so a respawn is routed
    * only to an ancestor in the escaped child's own network (never a shared or
    * cross-network ancestor, whose kill/wait virtualization would leak signals
@@ -70,10 +114,11 @@ static size_t pm_control_entry_capacity = 0;
 static long long pm_monotonic_milliseconds(void);
 static void pm_disconnect_client(pm_client *client);
 
-static void pm_control_registry_set(int pid, int fd, const char *network_id) {
+static void pm_control_registry_set(int pid, int fd, pm_output_queue *output, const char *network_id) {
   for (size_t index = 0; index < pm_control_entry_count; index++) {
     if (pm_control_entries[index].pid == pid) {
       pm_control_entries[index].fd = fd;
+      pm_control_entries[index].output = output;
       snprintf(pm_control_entries[index].network_id, sizeof(pm_control_entries[index].network_id), "%s",
                network_id != NULL ? network_id : "");
       return;
@@ -90,76 +135,24 @@ static void pm_control_registry_set(int pid, int fd, const char *network_id) {
   }
   pm_control_entries[pm_control_entry_count].pid = pid;
   pm_control_entries[pm_control_entry_count].fd = fd;
+  pm_control_entries[pm_control_entry_count].output = output;
   snprintf(pm_control_entries[pm_control_entry_count].network_id, sizeof(pm_control_entries[pm_control_entry_count].network_id), "%s",
            network_id != NULL ? network_id : "");
   pm_control_entry_count++;
 }
 
-/*
- * Returns the control fd for pid only when its registered network matches
- * want_network_id. A pid whose network differs returns -1 so the caller falls
- * through to the next candidate ancestor rather than routing cross-network.
- */
-static int pm_control_registry_fd_for_pid(int pid, const char *want_network_id) {
+/* Only a same-network ancestor may receive a queued control push. */
+static pm_output_queue *pm_control_registry_output_for_pid(int pid, const char *want_network_id) {
   for (size_t index = 0; index < pm_control_entry_count; index++) {
     if (pm_control_entries[index].pid == pid) {
       if (want_network_id == NULL || want_network_id[0] == '\0' ||
           strcmp(pm_control_entries[index].network_id, want_network_id) == 0) {
-        return pm_control_entries[index].fd;
+        return pm_control_entries[index].output;
       }
-      return -1;
+      return NULL;
     }
   }
-  return -1;
-}
-
-/*
- * Writes an entire buffer to a nonblocking control socket, waiting for
- * writability between partial writes. A RESPAWN line carries the escaped
- * child's full env and exceeds the socket send buffer, so a single write()
- * returns short; without draining it the push silently fails. Bounded so a
- * stuck reader cannot hang the daemon's poll loop.
- */
-static int pm_write_all_to_control(int fd, const char *data, size_t length) {
-  size_t written = 0;
-  long long deadline_ms = pm_monotonic_milliseconds() + PM_CONTROL_WRITE_BUDGET_MS;
-
-  while (written < length) {
-    if (written > 0 && pm_monotonic_milliseconds() >= deadline_ms) {
-      return -1;
-    }
-    ssize_t count = write(fd, data + written, length - written);
-    if (count > 0) {
-      written += (size_t)count;
-      continue;
-    }
-    if (count < 0 && errno == EINTR) {
-      if (pm_monotonic_milliseconds() >= deadline_ms) {
-        return -1;
-      }
-      continue;
-    }
-    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      struct pollfd writable = {.fd = fd, .events = POLLOUT, .revents = 0};
-      long long remaining_ms = deadline_ms - pm_monotonic_milliseconds();
-      int ready;
-
-      if (remaining_ms <= 0) {
-        return -1;
-      }
-      ready = poll(&writable, 1, (int)remaining_ms);
-      if (ready < 0 && errno == EINTR) {
-        continue;
-      }
-      if (ready <= 0 || (writable.revents & (POLLERR | POLLHUP | POLLNVAL))) {
-        return -1;
-      }
-      continue;
-    }
-    return -1;
-  }
-
-  return 0;
+  return NULL;
 }
 
 static void pm_control_registry_remove_fd(int fd) {
@@ -201,6 +194,7 @@ static int pm_set_nonblocking(int fd) {
     return -1;
   }
 
+  if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) return -1;
   return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
@@ -279,44 +273,7 @@ static int pm_create_server(const char *socket_path) {
   return fd;
 }
 
-/** Shares one deadline across event subscribers so slow windows cannot each
- * charge the singleton mutation loop a full socket-write timeout. */
-static int pm_write_all_until(int fd, const char *data, size_t length, long long deadline_ms) {
-  size_t offset = 0;
-
-  while (offset < length) {
-    if (offset > 0 && pm_monotonic_milliseconds() >= deadline_ms) {
-      return -1;
-    }
-    ssize_t written = write(fd, data + offset, length - offset);
-    if (written > 0) {
-      offset += (size_t)written;
-      continue;
-    }
-    if (written < 0 && errno == EINTR) {
-      if (pm_monotonic_milliseconds() >= deadline_ms) {
-        return -1;
-      }
-      continue;
-    }
-    if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      struct pollfd write_poll = {.fd = fd, .events = POLLOUT, .revents = 0};
-      long long remaining_ms = deadline_ms - pm_monotonic_milliseconds();
-
-      if (remaining_ms <= 0 ||
-          poll(&write_poll, 1, (int)remaining_ms) <= 0 ||
-          (write_poll.revents & (POLLERR | POLLHUP | POLLNVAL))) {
-        return -1;
-      }
-      continue;
-    }
-    return -1;
-  }
-
-  return 0;
-}
-
-static int pm_send_response(int fd, const pm_request *request, int ok, const char *payload, const char *error) {
+static int pm_send_response(pm_client *client, const pm_request *request, int ok, const char *payload, const char *error) {
   pm_buffer message;
   int result;
 
@@ -340,15 +297,74 @@ static int pm_send_response(int fd, const pm_request *request, int ok, const cha
   }
 
   if (result == 0) {
-    result = pm_write_all_until(
-      fd,
-      message.data,
-      message.length,
-      pm_monotonic_milliseconds() + PM_CLIENT_RESPONSE_WRITE_BUDGET_MS);
+    result = pm_output_send(client->output, message.data, message.length, pm_monotonic_milliseconds());
   }
 
   pm_buffer_free(&message);
   return result;
+}
+
+static void pm_clear_client_controls(pm_client *client) {
+  while (client->pending_controls != NULL) {
+    pm_pending_control *pending = client->pending_controls;
+    client->pending_controls = pending->next;
+    pm_output_receipt_release(pending->receipt);
+    free(pending);
+    pm_pending_control_count--;
+  }
+  client->pending_control_count = 0;
+}
+
+/** A completed write wakes its RPC on the main loop; a failed/expired write
+ * returns failure instead of acknowledging an action that was never delivered. */
+static int pm_finish_client_controls(pm_client *client) {
+  for (pm_pending_control **link = &client->pending_controls; *link != NULL; link = &(*link)->next) {
+    pm_pending_control *pending = *link;
+    int status = pm_output_receipt_status(pending->receipt);
+    if (status == 0) continue;
+    int result = pm_send_response(client, &pending->request, status > 0, NULL, "Control channel closed before command delivery.");
+    *link = pending->next;
+    pm_output_receipt_release(pending->receipt);
+    free(pending);
+    client->pending_control_count--;
+    pm_pending_control_count--;
+    return result;
+  }
+  return 0;
+}
+
+static void pm_free_pending_publication(pm_pending_publication *pending) {
+  pm_pending_publication_count--;
+  pm_pending_publication_bytes -= pending->payload.capacity;
+  pm_publication_release(pending->receipt);
+  pm_buffer_free(&pending->payload);
+  free(pending);
+}
+
+static void pm_clear_client_publications(pm_client *client) {
+  while (client->pending_publications != NULL) {
+    pm_pending_publication *pending = client->pending_publications;
+    client->pending_publications = pending->next;
+    pm_free_pending_publication(pending);
+  }
+  client->pending_publication_count = 0;
+}
+
+static int pm_finish_client_publications(pm_client *client) {
+  for (pm_pending_publication **link = &client->pending_publications; *link != NULL; link = &(*link)->next) {
+    pm_pending_publication *pending = *link;
+    int status = pm_publication_status(pending->receipt);
+    if (status == 0) continue;
+    const char *response = pm_publication_response(pending->receipt);
+    int result = pm_send_response(client, &pending->request, status > 0,
+      response == NULL ? pending->payload.data : response,
+      "Failed to publish Port Manager state within the file publication budget.");
+    *link = pending->next;
+    client->pending_publication_count--;
+    pm_free_pending_publication(pending);
+    return result;
+  }
+  return 0;
 }
 
 static int pm_build_snapshot_event(pm_agent_state *state, pm_buffer *message) {
@@ -367,152 +383,39 @@ static int pm_build_snapshot_event(pm_agent_state *state, pm_buffer *message) {
   return result;
 }
 
-/** Advances one subscriber by at most one successful nonblocking write so all
- * windows get a chance before any lagging window consumes the shared budget. */
-static int pm_write_event_progress(
-  pm_client *client,
-  const char *data,
-  size_t length,
-  size_t *offset,
-  long long deadline_ms) {
-  for (;;) {
-    ssize_t written;
-
-    if (pm_monotonic_milliseconds() >= deadline_ms) {
-      return 0;
-    }
-    written = write(client->fd, data + *offset, length - *offset);
-    if (written > 0) {
-      *offset += (size_t)written;
-      return *offset >= length ? 1 : 0;
-    }
-    if (written < 0 && errno == EINTR) {
-      continue;
-    }
-    if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      return 0;
-    }
-    return -1;
-  }
-}
-
+/** One shared snapshot enters each subscriber's FIFO without waiting for any
+ * reader. The poll loop drains partial frames alongside ordinary responses. */
 static int pm_broadcast_snapshot(pm_client *clients, size_t client_count, pm_agent_state *state) {
   pm_buffer message;
-  struct pollfd *write_fds = NULL;
-  size_t *write_offsets = NULL;
-  long long write_deadline_ms;
-  size_t subscriber_count = 0;
-  size_t sole_subscriber_index = 0;
-  int result = -1;
-
   pm_buffer_init(&message);
-  for (size_t index = 0; index < client_count; index++) {
-    if (clients[index].fd >= 0 && clients[index].wants_events) {
-      sole_subscriber_index = index;
-      subscriber_count++;
-    }
-  }
-  if (subscriber_count == 0) {
-    result = 0;
-    goto done;
-  }
-  if (pm_build_snapshot_event(state, &message) != 0) {
-    goto done;
-  }
-
-  write_deadline_ms = pm_monotonic_milliseconds() + PM_SNAPSHOT_BROADCAST_WRITE_BUDGET_MS;
-  if (subscriber_count == 1) {
-    if (pm_write_all_until(
-          clients[sole_subscriber_index].fd,
-          message.data,
-          message.length,
-          write_deadline_ms) != 0) {
-      pm_disconnect_client(&clients[sole_subscriber_index]);
-    }
-    result = 0;
-    goto done;
-  }
-
-  write_fds = (struct pollfd *)calloc(client_count, sizeof(struct pollfd));
-  write_offsets = (size_t *)calloc(client_count, sizeof(size_t));
-  if (write_fds == NULL || write_offsets == NULL) {
-    goto done;
-  }
-
-  for (size_t index = 0; index < client_count; index++) {
-    if (clients[index].fd >= 0 && clients[index].wants_events) {
-      int progress = pm_write_event_progress(
-        &clients[index], message.data, message.length, &write_offsets[index], write_deadline_ms);
-      if (progress < 0) {
-        pm_disconnect_client(&clients[index]);
-      }
-    }
-  }
-
-  for (;;) {
-    size_t pending_count = 0;
-    long long remaining_ms = write_deadline_ms - pm_monotonic_milliseconds();
-    int ready;
-
+  if (pm_build_snapshot_event(state, &message) != 0) { pm_buffer_free(&message); return -1; }
+  pm_output_message *shared = pm_output_message_create(message.data, message.length);
+  pm_buffer_free(&message);
+  if (shared == NULL) {
+    /* An over-budget frame cannot be delivered. Release subscriptions instead
+     * of retrying serialization in a tight loop ahead of DNS/control reads. */
     for (size_t index = 0; index < client_count; index++) {
-      write_fds[index].fd = -1;
-      write_fds[index].events = 0;
-      write_fds[index].revents = 0;
-      if (clients[index].fd >= 0 &&
-          clients[index].wants_events &&
-          write_offsets[index] < message.length) {
-        write_fds[index].fd = clients[index].fd;
-        write_fds[index].events = POLLOUT;
-        pending_count++;
-      }
+      if (clients[index].wants_events) pm_disconnect_client(&clients[index]);
     }
-
-    if (pending_count == 0 || remaining_ms <= 0) {
-      break;
-    }
-
-    ready = poll(write_fds, (nfds_t)client_count, (int)remaining_ms);
-    if (ready < 0 && errno == EINTR) {
-      continue;
-    }
-    if (ready <= 0) {
-      break;
-    }
-
-    for (size_t index = 0; index < client_count; index++) {
-      if (write_fds[index].fd < 0) {
-        continue;
-      }
-      if (write_fds[index].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-        pm_disconnect_client(&clients[index]);
-        continue;
-      }
-      if (write_fds[index].revents & POLLOUT) {
-        int progress = pm_write_event_progress(
-          &clients[index], message.data, message.length, &write_offsets[index], write_deadline_ms);
-        if (progress < 0) {
-          pm_disconnect_client(&clients[index]);
-        }
-      }
-    }
+    return 0;
   }
-
+  long long now = pm_monotonic_milliseconds();
   for (size_t index = 0; index < client_count; index++) {
-    if (clients[index].fd >= 0 &&
-        clients[index].wants_events &&
-        write_offsets[index] < message.length) {
-      /* A partial line can never share a stream with the next JSON event.
-       * Reconnect the lagging subscriber from a clean frame boundary. */
+    if (clients[index].fd >= 0 && clients[index].wants_events &&
+        pm_output_enqueue(clients[index].output, shared, 1, now) != 0) {
       pm_disconnect_client(&clients[index]);
     }
   }
-  result = 0;
+  pm_output_message_release(shared);
+  return 0;
+}
 
-done:
-  free(write_offsets);
-  free(write_fds);
-  pm_buffer_free(&message);
-  return result;
+/** Shutdown may finish already queued replies, bounded by their original deadlines. */
+static int pm_has_client_output(pm_client *clients, size_t count) {
+  for (size_t index = 0; index < count; index++) {
+    if (pm_output_pending(clients[index].output)) return 1;
+  }
+  return 0;
 }
 
 static int pm_has_event_clients(pm_client *clients, size_t client_count) {
@@ -630,8 +533,11 @@ static int pm_dispatch(pm_agent_state *state, const pm_request *request, pm_buff
       snprintf(error, error_size, "Invalid registerExistingProcess payload.");
       return -1;
     }
-    *state_changed = 1;
-    return pm_state_register_process(state, &input, payload);
+    unsigned long before_revision = state->registration_revision;
+    size_t before_pending = state->pending_count;
+    int result = pm_state_register_process(state, &input, payload);
+    *state_changed = state->registration_revision != before_revision || state->pending_count != before_pending;
+    return result;
   }
   if (strcmp(request->method, "releaseRouteAllocation") == 0) {
     char allocation_id[PM_ID];
@@ -704,7 +610,7 @@ static int pm_dispatch(pm_agent_state *state, const pm_request *request, pm_buff
   return -1;
 }
 
-static int pm_handle_line(pm_client *client, pm_agent_state *state, const char *line, int *snapshot_dirty, int *route_tables_dirty) {
+static int pm_handle_ready_line(pm_client *client, pm_agent_state *state, const char *line, int *snapshot_dirty) {
   pm_request request;
   pm_buffer payload;
   char error[PM_TEXT] = "Port Manager native daemon request failed.";
@@ -715,12 +621,12 @@ static int pm_handle_line(pm_client *client, pm_agent_state *state, const char *
   pm_buffer_init(&payload);
   if (pm_parse_request(line, &request) != 0) {
     snprintf(request.id_raw, sizeof(request.id_raw), "\"unknown\"");
-    int send_result = pm_send_response(client->fd, &request, 0, NULL, "Invalid Port Manager agent request message.");
+    int send_result = pm_send_response(client, &request, 0, NULL, "Invalid Port Manager agent request message.");
     pm_buffer_free(&payload);
     return send_result;
   }
 
-  if (pm_request_wants_events(&request) && !client->wants_events) {
+  if (client->fd >= 0 && pm_request_wants_events(&request) && !client->wants_events) {
     client->wants_events = 1;
     /* The first subscription receives current in-memory state without waiting
      * for the five-minute listener poll or a later mutation. */
@@ -740,9 +646,9 @@ static int pm_handle_line(pm_client *client, pm_agent_state *state, const char *
     if (pid > 0) {
       client->is_control = 1;
       client->control_pid = pid;
-      pm_control_registry_set(pid, client->fd, network_id);
+      pm_control_registry_set(pid, client->fd, client->output, network_id);
     }
-    int send_result = pm_send_response(client->fd, &request, 1, NULL, NULL);
+    int send_result = pm_send_response(client, &request, 1, NULL, NULL);
     pm_buffer_free(&payload);
     return send_result;
   }
@@ -757,7 +663,7 @@ static int pm_handle_line(pm_client *client, pm_agent_state *state, const char *
   if (strcmp(request.method, "respawnChild") == 0) {
     char parent_pids[PM_TEXT];
     char target_network_id[128];
-    int target_fd = -1;
+    pm_output_queue *target_output = NULL;
 
     parent_pids[0] = '\0';
     target_network_id[0] = '\0';
@@ -766,19 +672,22 @@ static int pm_handle_line(pm_client *client, pm_agent_state *state, const char *
     {
       char *saveptr = NULL;
       char *token = strtok_r(parent_pids, ",", &saveptr);
-      while (token != NULL && target_fd < 0) {
+      while (token != NULL && target_output == NULL) {
         int candidate = atoi(token);
         if (candidate > 0) {
           /* Same-network ancestors only: never route across network scope. */
-          target_fd = pm_control_registry_fd_for_pid(candidate, target_network_id);
+          target_output = pm_control_registry_output_for_pid(candidate, target_network_id);
         }
         token = strtok_r(NULL, ",", &saveptr);
       }
     }
 
-    int pushed = 0;
+    pm_pending_control *pending = NULL;
+    if (target_output != NULL && client->pending_control_count < 128 && pm_pending_control_count < 1024) {
+      pending = calloc(1, sizeof(*pending));
+    }
 
-    if (target_fd >= 0) {
+    if (pending != NULL) {
       char *line = (char *)malloc(PM_CLIENT_BUFFER_MAX);
       if (line != NULL) {
         if (pm_json_get_string(request.payload == NULL ? "" : request.payload, "line", line, PM_CLIENT_BUFFER_MAX) == 0) {
@@ -788,55 +697,170 @@ static int pm_handle_line(pm_client *client, pm_agent_state *state, const char *
             line[length + 1] = '\0';
             length++;
           }
-          pushed = pm_write_all_to_control(target_fd, line, length) == 0;
+          pending->receipt = pm_output_send_tracked(target_output, line, length, pm_monotonic_milliseconds());
         }
         free(line);
       }
     }
 
-    if (pushed) {
-      int send_result = pm_send_response(client->fd, &request, 1, NULL, NULL);
+    if (pending != NULL && pending->receipt != NULL) {
+      pending->request = request;
+      pending->request.payload = NULL;
+      pending->next = client->pending_controls;
+      client->pending_controls = pending;
+      client->pending_control_count++;
+      pm_pending_control_count++;
       pm_buffer_free(&payload);
-      return send_result;
+      return 0;
     } else {
-      int send_result = pm_send_response(client->fd, &request, 0, NULL, "No control channel for the requested parent pid.");
+      free(pending);
+      int send_result = pm_send_response(client, &request, 0, NULL, "No control channel for the requested parent pid.");
       pm_buffer_free(&payload);
       return send_result;
     }
   }
 
-  if (pm_dispatch(state, &request, &payload, &state_changed, &shutdown_requested, error, sizeof(error)) != 0) {
-    int send_result = pm_send_response(client->fd, &request, 0, NULL, error);
-    pm_buffer_free(&payload);
-    return send_result;
+  int may_publish = strcmp(request.method, "flushRouteTables") == 0 ||
+    strcmp(request.method, "repairRoutingState") == 0 ||
+    strcmp(request.method, "syncBrowserDns") == 0 || strcmp(request.method, "allocateRoute") == 0;
+  pm_pending_publication *pending = NULL;
+  if (may_publish && client->fd >= 0) {
+    if (client->pending_publication_count < 128 && pm_pending_publication_count < 1024 &&
+        pm_pending_publication_bytes < 8 * 1024 * 1024) pending = calloc(1, sizeof(*pending));
+    if (pending == NULL) return pm_send_response(client, &request, 0, NULL, "File publication request queue is full.");
   }
-
-  int send_result = pm_send_response(client->fd, &request, 1, payload.data, NULL);
+  unsigned long before_revision = state->route_dirty_revision;
+  int dispatched = pm_dispatch(state, &request, &payload, &state_changed, &shutdown_requested, error, sizeof(error));
+  pm_publication_receipt *receipt = state->request_publication;
+  state->request_publication = NULL;
   if (state_changed) {
-    /*
-     * Route allocations can arrive in large bind/connect bursts. Mark the state
-     * dirty here and let the event loop coalesce snapshot broadcasts and
-     * aggregate route-table writes after all ready clients in this poll turn
-     * have received their response frames.
-     */
     *snapshot_dirty = 1;
-    if (strcmp(request.method, "repairRoutingState") != 0) {
-      /* repairRoutingState has already completed its synchronous publish. */
-      state->route_tables_dirty = 1;
-      *route_tables_dirty = 1;
+    /* Domain paths which queued a captured snapshot already advanced the
+     * revision. Never advance it twice or clear it for an older repair. */
+    if (before_revision == state->route_dirty_revision) pm_mark_route_tables_dirty(state);
+  }
+  int send_result = 0;
+  if (dispatched != 0) {
+    send_result = pm_send_response(client, &request, 0, NULL, error);
+  } else if (receipt != NULL && client->fd >= 0) {
+    if (pending == NULL || payload.capacity > 8 * 1024 * 1024 - pm_pending_publication_bytes) {
+      send_result = pm_send_response(client, &request, 0, NULL, "File publication response queue is full.");
     } else {
-      /* The synchronous repair includes every mutation processed earlier on
-       * this single-threaded loop, so an older queued dirty flag is satisfied. */
-      state->route_tables_dirty = 0;
-      *route_tables_dirty = 0;
+      pending->request = request;
+      pending->request.payload = NULL;
+      pending->receipt = receipt;
+      receipt = NULL;
+      pending->payload = payload;
+      memset(&payload, 0, sizeof(payload));
+      pending->next = client->pending_publications;
+      client->pending_publications = pending;
+      client->pending_publication_count++;
+      pm_pending_publication_count++;
+      pm_pending_publication_bytes += pending->payload.capacity;
+      pending = NULL;
     }
+  } else if (client->fd >= 0) {
+    send_result = pm_send_response(client, &request, 1, payload.data, NULL);
   }
-  if (shutdown_requested) {
-    pm_running = 0;
-  }
-
+  if (shutdown_requested) pm_running = 0;
+  pm_publication_release(receipt);
+  free(pending);
   pm_buffer_free(&payload);
   return send_result;
+}
+
+/** Release references without a blocking wait; the broker reaps canceled jobs. */
+static void pm_free_pending_scan(pm_pending_scan *pending) {
+  pm_pending_scan_count--;
+  pm_pending_scan_bytes -= pending->bytes;
+  pm_scan_context_free(pending->context);
+  free(pending->line);
+  free(pending);
+}
+
+static void pm_clear_client_scans(pm_client *client, int keep_mutations) {
+  pm_pending_scan **link = &client->pending_scans;
+  while (*link != NULL) {
+    pm_pending_scan *pending = *link;
+    if (keep_mutations && pending->mutation) { link = &pending->next; continue; }
+    *link = pending->next;
+    pm_free_pending_scan(pending);
+  }
+}
+
+/** Preflight may defer one request while the same socket continues processing
+ * DNS/status/control frames. Replies remain correlated by their NDJSON id. */
+static int pm_handle_line(pm_client *client, pm_agent_state *state, const char *line, int *snapshot_dirty) {
+  pm_request request;
+  memset(&request, 0, sizeof(request));
+  if (pm_parse_request(line, &request) != 0) return pm_handle_ready_line(client, state, line, snapshot_dirty);
+  int snapshot = strcmp(request.method, "listSnapshot") == 0 || strcmp(request.method, "refreshSnapshot") == 0;
+  int mutation = strcmp(request.method, "repairRoutingState") == 0 || strcmp(request.method, "allocateRoute") == 0 ||
+                 strcmp(request.method, "releaseProcessRoute") == 0;
+  if (!snapshot && !mutation) return pm_handle_ready_line(client, state, line, snapshot_dirty);
+  if (pm_request_wants_events(&request) && !client->wants_events) {
+    client->wants_events = 1;
+    *snapshot_dirty = 1;
+  }
+  pm_scan_context *context = pm_scan_context_create();
+  int prepared = context == NULL ? -1 : pm_state_prepare_request(state, &request, context);
+  if (prepared > 0) {
+    size_t bytes = strlen(line) + 1;
+    if (pm_pending_scan_count >= 1024 || pm_pending_scan_bytes + bytes > 8 * 1024 * 1024) prepared = -1;
+    else {
+      pm_pending_scan *pending = calloc(1, sizeof(*pending));
+      if (pending != NULL) pending->line = strdup(line);
+      if (pending == NULL || pending->line == NULL) { free(pending); prepared = -1; }
+      else {
+        pending->bytes = bytes;
+        pending->mutation = mutation;
+        pending->context = context;
+        pm_pending_scan **tail = &client->pending_scans;
+        while (*tail != NULL) tail = &(*tail)->next;
+        *tail = pending;
+        pm_pending_scan_count++;
+        pm_pending_scan_bytes += bytes;
+        return 0;
+      }
+    }
+  }
+  int result;
+  if (prepared < 0) result = pm_send_response(client, &request, 0, NULL, "Could not prepare a fresh listener scan within the request budget.");
+  else {
+    pm_scan_use(context);
+    result = pm_handle_ready_line(client, state, line, snapshot_dirty);
+    pm_scan_use(NULL);
+  }
+  pm_scan_context_free(context);
+  return result;
+}
+
+/** Complete observations on the control thread, using current registry state.
+ * No client-array index or process pointer crosses the external wait. */
+static int pm_finish_client_scans(pm_client *client, pm_agent_state *state, int *snapshot_dirty) {
+  pm_pending_scan **link = &client->pending_scans;
+  size_t completed = 0;
+  while (*link != NULL && completed < 1) {
+    pm_pending_scan *pending = *link;
+    pm_request request;
+    memset(&request, 0, sizeof(request));
+    int prepared = pm_parse_request(pending->line, &request) == 0
+      ? pm_state_prepare_request(state, &request, pending->context) : -1;
+    if (prepared > 0) { link = &pending->next; continue; }
+    int result = 0;
+    if (prepared < 0) {
+      if (client->fd >= 0) result = pm_send_response(client, &request, 0, NULL, "Could not prepare a fresh listener scan within the request budget.");
+    } else {
+      pm_scan_use(pending->context);
+      result = pm_handle_ready_line(client, state, pending->line, snapshot_dirty);
+      pm_scan_use(NULL);
+    }
+    *link = pending->next;
+    pm_free_pending_scan(pending);
+    completed++;
+    if (client->fd >= 0 && result != 0) return -1;
+  }
+  return 0;
 }
 
 static int pm_add_client(pm_client **clients, size_t *count, size_t *capacity, int fd) {
@@ -853,13 +877,23 @@ static int pm_add_client(pm_client **clients, size_t *count, size_t *capacity, i
     *capacity = next_capacity;
   }
 
+  pm_output_queue *output = pm_output_create(fd);
+  if (output == NULL) return -1;
+  (*clients)[*count].output = output;
   (*clients)[*count].fd = fd;
   (*clients)[*count].wants_events = 0;
   (*clients)[*count].is_control = 0;
   (*clients)[*count].control_pid = 0;
+  (*clients)[*count].read_closed = 0;
+  (*clients)[*count].output_retry_after_ms = 0;
   (*clients)[*count].buffer = NULL;
   (*clients)[*count].length = 0;
   (*clients)[*count].capacity = 0;
+  (*clients)[*count].pending_scans = NULL;
+  (*clients)[*count].pending_controls = NULL;
+  (*clients)[*count].pending_control_count = 0;
+  (*clients)[*count].pending_publications = NULL;
+  (*clients)[*count].pending_publication_count = 0;
   (*count)++;
   return 0;
 }
@@ -869,7 +903,11 @@ static void pm_remove_client(pm_client *clients, size_t *count, size_t index) {
     pm_control_registry_remove_fd(clients[index].fd);
     close(clients[index].fd);
   }
+  pm_output_free(clients[index].output);
+  pm_clear_client_controls(&clients[index]);
+  pm_clear_client_publications(&clients[index]);
   free(clients[index].buffer);
+  pm_clear_client_scans(&clients[index], 0);
   memmove(&clients[index], &clients[index + 1], (*count - index - 1) * sizeof(pm_client));
   (*count)--;
 }
@@ -880,42 +918,63 @@ static void pm_disconnect_client(pm_client *client) {
     pm_control_registry_remove_fd(client->fd);
     close(client->fd);
   }
+  pm_output_disconnect(client->output);
+  pm_clear_client_controls(client);
+  pm_clear_client_publications(client);
   client->fd = -1;
   client->wants_events = 0;
+  pm_clear_client_scans(client, 1);
 }
 
-/** Removes marked clients while keeping the round-robin cursor attached to
- * the same next live fd instead of to an index shifted by memmove(). */
-static void pm_compact_clients_preserving_cursor(pm_client *clients, size_t *count, size_t *scan_cursor) {
-  int next_fd = -1;
-  size_t original_count = *count;
-
-  if (original_count > 0) {
-    size_t start = *scan_cursor % original_count;
-    for (size_t offset = 0; offset < original_count; offset++) {
-      size_t index = (start + offset) % original_count;
-      if (clients[index].fd >= 0) {
-        next_fd = clients[index].fd;
-        break;
-      }
-    }
+/** Preserve both scheduling positions by fd across removal/reallocation. */
+static int pm_cursor_fd(pm_client *clients, size_t count, size_t cursor) {
+  for (size_t offset = 0; offset < count; offset++) {
+    size_t index = (cursor + offset) % count;
+    if (clients[index].fd >= 0) return clients[index].fd;
   }
+  return -1;
+}
 
+static void pm_compact_clients_preserving_cursor(pm_client *clients, size_t *count, size_t *scan_cursor, size_t *output_cursor) {
+  int next_read_fd = pm_cursor_fd(clients, *count, *scan_cursor);
+  int next_output_fd = pm_cursor_fd(clients, *count, *output_cursor);
   for (size_t reverse = *count; reverse > 0;) {
     size_t index = --reverse;
-    if (clients[index].fd < 0) {
-      pm_remove_client(clients, count, index);
-    }
+    if (clients[index].fd < 0 && clients[index].pending_scans == NULL) pm_remove_client(clients, count, index);
   }
+  *scan_cursor = *output_cursor = 0;
+  for (size_t index = 0; index < *count; index++) {
+    if (clients[index].fd == next_read_fd) *scan_cursor = index;
+    if (clients[index].fd == next_output_fd) *output_cursor = index;
+  }
+}
 
-  *scan_cursor = 0;
-  if (next_fd >= 0) {
-    for (size_t index = 0; index < *count; index++) {
-      if (clients[index].fd == next_fd) {
-        *scan_cursor = index;
-        break;
+/** Output has its own cursor and aggregate work budget. A POLLOUT storm never
+ * consumes the request-read budget or polls synchronously on a slow reader. */
+static void pm_flush_clients(pm_client *clients, size_t count, struct pollfd *fds, size_t *cursor) {
+  size_t bytes = 0;
+  long long deadline = pm_monotonic_milliseconds() + PM_OUTPUT_TURN_MS;
+  size_t start = count == 0 ? 0 : *cursor % count;
+  for (size_t offset = 0; offset < count; offset++) {
+    size_t index = (start + offset) % count;
+    *cursor = (index + 1) % count;
+    if (clients[index].fd < 0) continue;
+    short events = fds[index + 1].revents;
+    if ((events & POLLOUT) || (clients[index].read_closed && (events & POLLHUP))) {
+      size_t budget = PM_OUTPUT_BYTES_PER_TURN - bytes;
+      if (budget > PM_OUTPUT_CLIENT_BYTES_PER_TURN) budget = PM_OUTPUT_CLIENT_BYTES_PER_TURN;
+      long written = pm_output_flush(clients[index].output, budget);
+      if (written < 0) pm_disconnect_client(&clients[index]);
+      else {
+        bytes += (size_t)written;
+        clients[index].output_retry_after_ms = written == 0 ? pm_monotonic_milliseconds() + 20 : 0;
       }
     }
+    if (!pm_running && (events & (POLLERR | POLLHUP | POLLNVAL))) {
+      if (send(clients[index].fd, "", 0, 0) < 0) pm_disconnect_client(&clients[index]);
+      else clients[index].read_closed = 1;
+    }
+    if (bytes >= PM_OUTPUT_BYTES_PER_TURN || pm_monotonic_milliseconds() >= deadline) break;
   }
 }
 
@@ -927,7 +986,6 @@ static int pm_process_client_buffer(
   pm_client *client,
   pm_agent_state *state,
   int *snapshot_dirty,
-  int *route_tables_dirty,
   size_t max_frames) {
   size_t processed_frames = 0;
 
@@ -956,7 +1014,7 @@ static int pm_process_client_buffer(
     processed_frames++;
 
     if (line_length > 0) {
-      if (pm_handle_line(client, state, line, snapshot_dirty, route_tables_dirty) != 0) {
+      if (pm_handle_line(client, state, line, snapshot_dirty) != 0) {
         return -1;
       }
     }
@@ -965,9 +1023,9 @@ static int pm_process_client_buffer(
   return 0;
 }
 
-static int pm_read_client(pm_client *client, pm_agent_state *state, int *snapshot_dirty, int *route_tables_dirty) {
+static int pm_read_client(pm_client *client, pm_agent_state *state, int *snapshot_dirty) {
   if (pm_client_has_complete_frame(client)) {
-    return pm_process_client_buffer(client, state, snapshot_dirty, route_tables_dirty, 1);
+    return pm_process_client_buffer(client, state, snapshot_dirty, 1);
   }
 
   for (;;) {
@@ -1003,14 +1061,19 @@ static int pm_read_client(pm_client *client, pm_agent_state *state, int *snapsho
       return -1;
     }
     if (bytes_read == 0) {
-      return -1;
+      /* A request writer may half-close while still reading a large response.
+       * HUP alone cannot distinguish SHUT_WR from close on macOS. A zero-byte
+       * send probes the peer's read side without adding any protocol bytes. */
+      if (send(client->fd, "", 0, 0) < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+      client->read_closed = 1;
+      return 0;
     }
 
     client->length += (size_t)bytes_read;
     client->buffer[client->length] = '\0';
     /* poll() is level-triggered, so one bounded read per turn preserves
      * throughput without letting a pipelined client monopolize the daemon. */
-    return pm_process_client_buffer(client, state, snapshot_dirty, route_tables_dirty, 1);
+    return pm_process_client_buffer(client, state, snapshot_dirty, 1);
   }
 }
 
@@ -1021,33 +1084,56 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
   size_t client_capacity = 0;
   size_t poll_capacity = 0;
   size_t client_scan_cursor = 0;
+  size_t client_output_cursor = 0;
   pm_buffer last_listener_signature;
   time_t next_poll = time(NULL) + 3;
   time_t last_io_at = 0;
   long long last_io_at_ms = 0;
   long long snapshot_dirty_since_ms = 0;
-  time_t route_table_flush_retry_after = 0;
   int snapshot_dirty = 0;
-  int route_tables_dirty = 0;
+  pm_scan_context *background_scan = NULL;
 
   pm_buffer_init(&last_listener_signature);
 
-  while (pm_running) {
+  while (pm_running || pm_has_client_output(clients, client_count) || pm_pending_control_count > 0 || pm_pending_publication_count > 0) {
     size_t poll_count = client_count + 1;
     size_t polled_client_count = client_count;
-    size_t dns_poll_index = 0;
     int ready;
     int handled_io = 0;
     int poll_timeout_ms = PM_EVENT_LOOP_DEFAULT_POLL_MS;
     size_t accepted_this_turn = 0;
     size_t clients_read_this_turn = 0;
 
-    /* Rebind attempts are time-gated internally, so this stays cheap. The DNS
-     * fd rides the tail poll slot; client slots keep their index + 1 layout. */
+    /* DNS answers and blocking file operations each own their worker. Only
+     * lifecycle changes and immutable publication completions run here. */
     pm_dns_maybe_rebind(state, time(NULL));
-    if (state->browser_dns_fd >= 0) {
-      dns_poll_index = poll_count;
-      poll_count++;
+    if (pm_running) {
+      int route_wait = pm_state_schedule_route_publication(state, last_io_at_ms);
+      if (route_wait < poll_timeout_ms) poll_timeout_ms = route_wait;
+    }
+    if ((pm_state_poll_publications(state) || pm_pending_publication_count > 0) && poll_timeout_ms > 20) poll_timeout_ms = 20;
+
+    /* Commands run as bounded subprocesses. Only active captures need the
+     * short poll cadence; an idle daemon keeps its existing wakeup policy. */
+    if (pm_scan_poll() || pm_pending_scan_count > 0 || pm_pending_control_count > 0) poll_timeout_ms = 20;
+    if (client_count > 0) {
+      size_t start = client_scan_cursor % client_count;
+      size_t completed = 0;
+      long long deadline = pm_monotonic_milliseconds() + 5;
+      /* A completed scan can wake many readers. Bound result application too,
+       * so a shared capture does not turn into a long burst ahead of DNS RPCs. */
+      for (size_t offset = 0; offset < client_count; offset++) {
+        size_t index = (start + offset) % client_count;
+        size_t before = pm_pending_scan_count + pm_pending_control_count + pm_pending_publication_count;
+        if (pm_finish_client_controls(&clients[index]) != 0 ||
+            pm_finish_client_publications(&clients[index]) != 0 ||
+            (pm_running && pm_finish_client_scans(&clients[index], state, &snapshot_dirty) != 0)) {
+          pm_disconnect_client(&clients[index]);
+        }
+        if (pm_pending_scan_count + pm_pending_control_count + pm_pending_publication_count < before) completed++;
+        client_scan_cursor = (index + 1) % client_count;
+        if (completed >= 8 || pm_monotonic_milliseconds() >= deadline) break;
+      }
     }
 
     if (snapshot_dirty && snapshot_dirty_since_ms > 0) {
@@ -1084,21 +1170,34 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
     }
 
     memset(poll_fds, 0, poll_count * sizeof(struct pollfd));
-    poll_fds[0].fd = server_fd;
+    poll_fds[0].fd = pm_running ? server_fd : -1;
     poll_fds[0].events = POLLIN;
     for (size_t index = 0; index < client_count; index++) {
+      int remaining = pm_output_remaining_ms(clients[index].output, pm_monotonic_milliseconds());
+      if (clients[index].fd >= 0 && clients[index].read_closed && send(clients[index].fd, "", 0, 0) < 0 &&
+          errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) pm_disconnect_client(&clients[index]);
+      if (clients[index].read_closed && clients[index].pending_scans == NULL && clients[index].pending_controls == NULL &&
+          clients[index].pending_publications == NULL &&
+          !pm_output_pending(clients[index].output)) {
+        pm_disconnect_client(&clients[index]);
+      } else if (remaining == 0) {
+        pm_dev_log("agent-output", "disconnect stalled fd=%d", clients[index].fd);
+        pm_disconnect_client(&clients[index]);
+      } else if (remaining > 0 && remaining < poll_timeout_ms) poll_timeout_ms = remaining;
       poll_fds[index + 1].fd = clients[index].fd;
-      poll_fds[index + 1].events = POLLIN;
+      if (clients[index].read_closed) {
+        long long retry_ms = clients[index].output_retry_after_ms - pm_monotonic_milliseconds();
+        if (!pm_output_pending(clients[index].output) || retry_ms > 0) poll_fds[index + 1].fd = -1;
+        if (retry_ms > 0 && retry_ms < poll_timeout_ms) poll_timeout_ms = (int)retry_ms;
+      }
+      poll_fds[index + 1].events = (pm_running && !clients[index].read_closed ? POLLIN : 0) |
+        (pm_output_pending(clients[index].output) ? POLLOUT : 0);
       /* One read can contain several newline-delimited requests. Their
        * remaining frames already live in userspace, so the kernel may no
        * longer report POLLIN; drain them on zero-wait round-robin turns. */
-      if (pm_client_has_complete_frame(&clients[index])) {
+      if (pm_running && clients[index].fd >= 0 && pm_client_has_complete_frame(&clients[index])) {
         poll_timeout_ms = 0;
       }
-    }
-    if (dns_poll_index > 0) {
-      poll_fds[dns_poll_index].fd = state->browser_dns_fd;
-      poll_fds[dns_poll_index].events = POLLIN;
     }
 
     ready = poll(poll_fds, (nfds_t)poll_count, poll_timeout_ms);
@@ -1115,13 +1214,10 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
       break;
     }
 
-    /* Browser lookups are data-plane traffic: answer them without marking the
-     * turn as request I/O, so resolver polling cannot defer listener scans or
-     * snapshot pacing. Error revents route through the same handler, which
-     * drops a broken socket and lets the bind retry replace it. */
-    if (ready > 0 && dns_poll_index > 0 &&
-        (poll_fds[dns_poll_index].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL))) {
-      pm_dns_handle_readable(state);
+    pm_flush_clients(clients, polled_client_count, poll_fds, &client_output_cursor);
+    if (!pm_running) {
+      pm_compact_clients_preserving_cursor(clients, &client_count, &client_scan_cursor, &client_output_cursor);
+      continue;
     }
 
     if (ready > 0 && (poll_fds[0].revents & POLLIN)) {
@@ -1173,7 +1269,7 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
         }
 
         buffered_frame = pm_client_has_complete_frame(&clients[index]);
-        if ((revents & POLLIN) || buffered_frame) {
+        if (((revents & POLLIN) && !clients[index].read_closed) || buffered_frame) {
           long long request_started_ms;
 
           if (clients_read_this_turn >= PM_CLIENT_READ_BUDGET_PER_TURN) {
@@ -1186,7 +1282,7 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
           handled_io = 1;
           next_scan_cursor = (index + 1) % polled_client_count;
           request_started_ms = pm_monotonic_milliseconds();
-          if (pm_read_client(&clients[index], state, &snapshot_dirty, &route_tables_dirty) != 0) {
+          if (pm_read_client(&clients[index], state, &snapshot_dirty) != 0) {
             /* Dispatch may have committed a mutation before its response write
              * discovered a dead client, so preserve the original fairness age. */
             if (snapshot_dirty && snapshot_dirty_since_ms == 0) {
@@ -1212,14 +1308,14 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
          * together. Consume their queued frame first and defer the close one
          * turn when needed, so an accepted registration is never discarded. */
         if ((revents & (POLLERR | POLLHUP | POLLNVAL)) &&
-            !(revents & POLLIN) &&
+            !clients[index].read_closed && !(revents & POLLIN) &&
             !buffered_frame) {
           pm_disconnect_client(&clients[index]);
         }
       }
 
       client_scan_cursor = next_scan_cursor;
-      pm_compact_clients_preserving_cursor(clients, &client_count, &client_scan_cursor);
+      pm_compact_clients_preserving_cursor(clients, &client_count, &client_scan_cursor, &client_output_cursor);
     }
 
     if (handled_io) {
@@ -1229,7 +1325,6 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
 
     if (pm_state_reap_children(state)) {
       snapshot_dirty = 1;
-      route_tables_dirty = 1;
     }
 
     if (snapshot_dirty && snapshot_dirty_since_ms == 0) {
@@ -1262,28 +1357,13 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
           snapshot_dirty = 0;
           snapshot_dirty_since_ms = 0;
         }
-        pm_compact_clients_preserving_cursor(clients, &client_count, &client_scan_cursor);
+        pm_compact_clients_preserving_cursor(clients, &client_count, &client_scan_cursor, &client_output_cursor);
       }
     }
 
-    /* UI state is memory-authoritative and latency-sensitive, so event fan-out
-     * gets the due turn before synchronous filesystem publication. Compact hook
-     * bursts still defer route files until idle/heartbeat without delaying
-     * request responses or the sidebar. */
-    if (route_tables_dirty || state->route_tables_dirty || pm_state_route_table_heartbeat_due(state, time(NULL))) {
-      time_t now = time(NULL);
-      int heartbeat_due = pm_state_route_table_heartbeat_due(state, now);
-
-      if (now >= route_table_flush_retry_after &&
-          (heartbeat_due || (!handled_io && (last_io_at == 0 || now - last_io_at >= PM_LISTENER_POLL_IDLE_GRACE_SECONDS)))) {
-        if (pm_state_flush_route_tables(state) == 0) {
-          route_tables_dirty = 0;
-          route_table_flush_retry_after = 0;
-        } else {
-          route_table_flush_retry_after = now + 1;
-        }
-      }
-    }
+    /* Hand off due snapshots after this turn's mutations; callbacks and file
+     * writes remain separate so status/control traffic cannot delay commits. */
+    pm_state_schedule_route_publication(state, last_io_at_ms);
 
     if (time(NULL) >= next_poll) {
       time_t now = time(NULL);
@@ -1292,7 +1372,13 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
       } else {
         pm_buffer signature;
         pm_buffer_init(&signature);
-        if (pm_state_listener_signature(state, &signature) == 0) {
+        pm_request request;
+        memset(&request, 0, sizeof(request));
+        snprintf(request.method, sizeof(request.method), "listSnapshot");
+        if (background_scan == NULL) background_scan = pm_scan_context_create();
+        int prepared = background_scan == NULL ? -1 : pm_state_prepare_request(state, &request, background_scan);
+        pm_scan_use(background_scan);
+        if (prepared == 0 && pm_state_listener_signature(state, &signature) == 0) {
           if (last_listener_signature.data == NULL || strcmp(last_listener_signature.data, signature.data == NULL ? "" : signature.data) != 0) {
             pm_buffer_free(&last_listener_signature);
             last_listener_signature = signature;
@@ -1300,8 +1386,14 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
             snapshot_dirty = 1;
           }
         }
+        pm_scan_use(NULL);
         pm_buffer_free(&signature);
-        next_poll = now + PM_LISTENER_POLL_INTERVAL_SECONDS;
+        if (prepared > 0) next_poll = now;
+        else {
+          pm_scan_context_free(background_scan);
+          background_scan = NULL;
+          next_poll = now + (prepared < 0 ? 1 : PM_LISTENER_POLL_INTERVAL_SECONDS);
+        }
       }
     }
 
@@ -1312,12 +1404,18 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
   }
 
   for (size_t index = 0; index < client_count; index++) {
-    close(clients[index].fd);
+    if (clients[index].fd >= 0) close(clients[index].fd);
+    pm_output_free(clients[index].output);
+    pm_clear_client_controls(&clients[index]);
+  pm_clear_client_publications(&clients[index]);
     free(clients[index].buffer);
+    pm_clear_client_scans(&clients[index], 0);
   }
   free(poll_fds);
   free(clients);
   pm_buffer_free(&last_listener_signature);
+  pm_scan_context_free(background_scan);
+  pm_scan_dispose();
 }
 
 int main(int argc, char **argv) {

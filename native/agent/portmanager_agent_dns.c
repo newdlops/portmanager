@@ -5,6 +5,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +42,21 @@
 #define PM_DNS_TYPE_A 1
 #define PM_DNS_TYPE_ANY 255
 #define PM_DNS_CLASS_IN 1
+
+/* The UDP worker only shares immutable records. A separate publication lane
+ * persists/fences replacements before the control thread swaps this pointer. */
+typedef struct pm_dns_worker {
+  pthread_t thread;
+  pthread_mutex_t records_mutex;
+  const pm_browser_dns_record *items;
+  size_t count;
+  int fd;
+  int wake_pipe[2];
+  atomic_int error;
+} pm_dns_worker;
+
+static int pm_dns_start_worker(pm_agent_state *state, int fd);
+static void pm_dns_stop_worker(pm_agent_state *state);
 
 static void pm_dns_set_error(pm_agent_state *state, const char *message) {
   snprintf(state->browser_dns_error, sizeof(state->browser_dns_error), "%s", message == NULL ? "" : message);
@@ -108,10 +127,10 @@ static int pm_dns_append_record(pm_agent_state *state, const char *hostname, con
   return 0;
 }
 
-static const unsigned char *pm_dns_lookup(const pm_agent_state *state, const char *hostname) {
-  for (size_t index = 0; index < state->browser_dns_count; index++) {
-    if (strcmp(state->browser_dns_items[index].hostname, hostname) == 0) {
-      return state->browser_dns_items[index].address;
+static const unsigned char *pm_dns_lookup(const pm_browser_dns_record *items, size_t count, const char *hostname) {
+  for (size_t index = 0; index < count; index++) {
+    if (strcmp(items[index].hostname, hostname) == 0) {
+      return items[index].address;
     }
   }
   return NULL;
@@ -142,7 +161,7 @@ static void pm_dns_add_pair(pm_agent_state *state, char *pair) {
 
 /* Records persist as `hostname\tipv4` lines so a restarted daemon (or one
  * started by the shell hook with no extension running) keeps answering. */
-static int pm_dns_persist_records(const pm_agent_state *state) {
+static int pm_dns_persist_records(const pm_agent_state *state, int (*validate)(void *), void *context) {
   pm_buffer text;
 
   if (state->browser_dns_state_path[0] == '\0') {
@@ -171,7 +190,7 @@ static int pm_dns_persist_records(const pm_agent_state *state) {
     }
   }
 
-  if (pm_write_atomic(state->browser_dns_state_path, text.data == NULL ? "" : text.data) != 0) {
+  if (pm_write_atomic_guarded(state->browser_dns_state_path, text.data == NULL ? "" : text.data, validate, context) != 0) {
     pm_dev_log("agent-dns", "persist failed path=%s", state->browser_dns_state_path);
     pm_buffer_free(&text);
     return -1;
@@ -315,7 +334,10 @@ static int pm_dns_revision_matches_document(const char *path, const char *revisi
   if (path == NULL || path[0] == '\0' || revision == NULL || revision[0] == '\0') {
     return 0;
   }
-  file = fopen(path, "r");
+  /* Concurrent managed child launches must not inherit publication files. */
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  file = fd < 0 ? NULL : fdopen(fd, "r");
+  if (file == NULL && fd >= 0) close(fd);
   if (file == NULL || fseek(file, 0, SEEK_END) != 0 || (length = ftell(file)) < 0 || fseek(file, 0, SEEK_SET) != 0) {
     if (file != NULL) fclose(file);
     return 0;
@@ -375,6 +397,15 @@ int pm_dns_maybe_rebind(pm_agent_state *state, time_t now) {
   int fd;
   int flags;
 
+  if (state->browser_dns_worker != NULL) {
+    int error = atomic_load(&state->browser_dns_worker->error);
+    if (error != 0) {
+      pm_dns_set_error(state, strerror(error));
+      pm_dev_log("agent-dns", "responder failed: %s", strerror(error));
+      pm_dns_stop_worker(state);
+      state->browser_dns_bind_retry_after = 0;
+    }
+  }
   if (state->browser_dns_fd >= 0 || state->browser_dns_requested_port < 0) {
     return 0;
   }
@@ -418,6 +449,12 @@ int pm_dns_maybe_rebind(pm_agent_state *state, time_t now) {
     return 0;
   }
 
+  int worker_error = pm_dns_start_worker(state, fd);
+  if (worker_error != 0) {
+    pm_dns_set_error(state, strerror(worker_error));
+    close(fd);
+    return 0;
+  }
   state->browser_dns_fd = fd;
   state->browser_dns_bound_port = (int)ntohs(bind_address.sin_port);
   pm_dns_set_error(state, "");
@@ -437,11 +474,9 @@ void pm_dns_init(pm_agent_state *state, int requested_port) {
 }
 
 void pm_dns_dispose(pm_agent_state *state) {
-  if (state->browser_dns_fd >= 0) {
-    close(state->browser_dns_fd);
-    state->browser_dns_fd = -1;
-  }
-  state->browser_dns_bound_port = 0;
+  pm_publication_dispose(state->browser_dns_publications);
+  state->browser_dns_publications = NULL;
+  pm_dns_stop_worker(state);
   free(state->browser_dns_items);
   state->browser_dns_items = NULL;
   state->browser_dns_count = 0;
@@ -515,7 +550,8 @@ static size_t pm_dns_write_header(
 }
 
 static size_t pm_dns_build_response(
-  const pm_agent_state *state,
+  const pm_browser_dns_record *items,
+  size_t count,
   const unsigned char *query,
   size_t query_length,
   unsigned char *response,
@@ -541,7 +577,7 @@ static size_t pm_dns_build_response(
     return pm_dns_write_header(response, query, 0, 0, 1);
   }
 
-  address = pm_dns_lookup(state, name);
+  address = pm_dns_lookup(items, count, name);
   if (address == NULL || klass != PM_DNS_CLASS_IN || (type != PM_DNS_TYPE_A && type != PM_DNS_TYPE_ANY)) {
     length = pm_dns_write_header(response, query, 1, 0, address == NULL ? 3 : 0);
     memcpy(response + length, query + 12, question_end - 12);
@@ -569,19 +605,15 @@ static size_t pm_dns_build_response(
   return length + 4;
 }
 
-int pm_dns_handle_readable(pm_agent_state *state) {
+static int pm_dns_handle_readable(pm_dns_worker *worker) {
   unsigned char query[PM_DNS_MAX_PACKET];
   unsigned char response[PM_DNS_MAX_RESPONSE];
-
-  if (state->browser_dns_fd < 0) {
-    return 0;
-  }
 
   for (int budget = 0; budget < PM_DNS_READ_BUDGET_PER_TURN; budget++) {
     struct sockaddr_in remote;
     socklen_t remote_length = sizeof(remote);
     ssize_t received = recvfrom(
-      state->browser_dns_fd, query, sizeof(query), 0, (struct sockaddr *)&remote, &remote_length);
+      worker->fd, query, sizeof(query), 0, (struct sockaddr *)&remote, &remote_length);
     size_t response_length;
 
     if (received < 0) {
@@ -591,24 +623,96 @@ int pm_dns_handle_readable(pm_agent_state *state) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
         return 0;
       }
-      /* A broken socket cannot be polled again; drop it and let the retry
-       * loop bind a replacement instead of spinning on POLLERR. */
-      pm_dns_set_error(state, strerror(errno));
-      pm_dev_log("agent-dns", "recvfrom failed: %s", strerror(errno));
-      close(state->browser_dns_fd);
-      state->browser_dns_fd = -1;
-      state->browser_dns_bound_port = 0;
-      state->browser_dns_bind_retry_after = 0;
+      atomic_store(&worker->error, errno);
       return -1;
     }
 
-    response_length = pm_dns_build_response(state, query, (size_t)received, response, sizeof(response));
+    pthread_mutex_lock(&worker->records_mutex);
+    response_length = pm_dns_build_response(worker->items, worker->count, query, (size_t)received, response, sizeof(response));
+    pthread_mutex_unlock(&worker->records_mutex);
     if (response_length > 0) {
-      sendto(state->browser_dns_fd, response, response_length, 0, (struct sockaddr *)&remote, remote_length);
+      sendto(worker->fd, response, response_length, 0, (struct sockaddr *)&remote, remote_length);
     }
   }
 
   return 0;
+}
+
+/** Sleeping on the socket and a shutdown pipe costs no idle polling or filesystem I/O. */
+static void *pm_dns_run_worker(void *context) {
+  pm_dns_worker *worker = context;
+  sigset_t signals;
+  sigfillset(&signals);
+  pthread_sigmask(SIG_BLOCK, &signals, NULL);
+  struct pollfd fds[2] = {{worker->wake_pipe[0], POLLIN, 0}, {worker->fd, POLLIN, 0}};
+  for (;;) {
+    int ready = poll(fds, 2, -1);
+    if (ready < 0) {
+      if (errno == EINTR) continue;
+      atomic_store(&worker->error, errno);
+      return NULL;
+    }
+    if (fds[0].revents) return NULL;
+    if (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+      atomic_store(&worker->error, EIO);
+      return NULL;
+    }
+    if ((fds[1].revents & POLLIN) && pm_dns_handle_readable(worker) != 0) return NULL;
+  }
+}
+
+/** All descriptors are CLOEXEC: a managed shell must not keep a retired DNS socket alive. */
+static int pm_dns_start_worker(pm_agent_state *state, int fd) {
+  pm_dns_worker *worker = calloc(1, sizeof(*worker));
+  if (worker == NULL) return ENOMEM;
+  worker->fd = fd;
+  worker->items = state->browser_dns_items;
+  worker->count = state->browser_dns_count;
+  atomic_init(&worker->error, 0);
+  int error = pthread_mutex_init(&worker->records_mutex, NULL);
+  if (error != 0) { free(worker); return error; }
+  if (pipe(worker->wake_pipe) != 0) {
+    error = errno;
+    pthread_mutex_destroy(&worker->records_mutex);
+    free(worker);
+    return error;
+  }
+  int descriptors[] = {fd, worker->wake_pipe[0], worker->wake_pipe[1]};
+  for (size_t index = 0; index < 3; index++) {
+    int flags = fcntl(descriptors[index], F_GETFL, 0);
+    if (flags < 0 || fcntl(descriptors[index], F_SETFL, flags | O_NONBLOCK) != 0 ||
+        fcntl(descriptors[index], F_SETFD, FD_CLOEXEC) != 0) {
+      error = errno;
+      goto failed;
+    }
+  }
+  error = pthread_create(&worker->thread, NULL, pm_dns_run_worker, worker);
+  if (error != 0) goto failed;
+  state->browser_dns_worker = worker;
+  return 0;
+failed:
+  close(worker->wake_pipe[0]);
+  close(worker->wake_pipe[1]);
+  pthread_mutex_destroy(&worker->records_mutex);
+  free(worker);
+  return error;
+}
+
+/** Join before closing descriptors or freeing records, including failed-worker rebinding. */
+static void pm_dns_stop_worker(pm_agent_state *state) {
+  pm_dns_worker *worker = state->browser_dns_worker;
+  if (worker != NULL) {
+    while (write(worker->wake_pipe[1], "x", 1) < 0 && errno == EINTR) {}
+    pthread_join(worker->thread, NULL);
+    close(worker->wake_pipe[0]);
+    close(worker->wake_pipe[1]);
+    pthread_mutex_destroy(&worker->records_mutex);
+    free(worker);
+    state->browser_dns_worker = NULL;
+  }
+  if (state->browser_dns_fd >= 0) close(state->browser_dns_fd);
+  state->browser_dns_fd = -1;
+  state->browser_dns_bound_port = 0;
 }
 
 int pm_dns_append_status_fields(const pm_agent_state *state, pm_buffer *payload) {
@@ -630,79 +734,116 @@ int pm_dns_append_status_fields(const pm_agent_state *state, pm_buffer *payload)
   return 0;
 }
 
-int pm_dns_sync(pm_agent_state *state, const char *payload_json, pm_buffer *response) {
-  const char *source = payload_json == NULL ? "" : payload_json;
-  char *records = (char *)malloc(strlen(source) + 2);
-  char *cursor;
-  char *pair;
-  char revision[PM_SMALL];
-  char shared_state_path[PM_TEXT];
-  int has_revision;
+/* Queue payloads own their records; only prepare/finish access the live state.
+ * Each DNS job starts after the prior completion has installed its revision. */
+typedef struct {
+  pm_agent_state *source;
   pm_agent_state replacement;
+  char shared_state_path[PM_TEXT];
+  char previous_revision[PM_SMALL];
+  int applied;
+} pm_dns_publication;
 
-  if (records == NULL) {
-    return -1;
+static void pm_dns_publication_prepare(void *context) {
+  pm_dns_publication *job = context;
+  snprintf(job->previous_revision, sizeof(job->previous_revision), "%s", job->source->browser_dns_revision);
+}
+
+static int pm_dns_publication_validate(void *context) {
+  pm_dns_publication *job = context;
+  return job->replacement.browser_dns_revision[0] == '\0' ||
+    pm_dns_revision_matches_document(job->shared_state_path, job->replacement.browser_dns_revision);
+}
+
+static int pm_dns_publication_run(void *context) {
+  pm_dns_publication *job = context;
+  const char *revision = job->replacement.browser_dns_revision;
+  if (!pm_dns_publication_validate(job) ||
+      (revision[0] == '\0' && job->previous_revision[0] != '\0')) {
+    pm_dev_log("agent-dns", "rejected stale or unreadable authoritative DNS revision");
+    return 0;
   }
-  /* An explicit empty records string is a legitimate full replace with zero
-   * rows (every logical network was removed), but a payload missing the key
-   * entirely is malformed and must not wipe live records. */
+  if (revision[0] != '\0' && strcmp(revision, job->previous_revision) == 0) {
+    job->applied = 2; /* Revisions are immutable, even if a retry changes rows. */
+    return 0;
+  }
+  if (pm_dns_persist_records(&job->replacement, pm_dns_publication_validate, job) == 0) job->applied = 1;
+  return 0;
+}
+
+static int pm_dns_publication_finish(void *context, int result, char **response) {
+  pm_dns_publication *job = context;
+  pm_agent_state *state = job->source;
+  int applied = result == 0 ? job->applied : 0;
+  if (applied == 1) {
+    pm_browser_dns_record *previous_items = state->browser_dns_items;
+    pm_dns_worker *worker = state->browser_dns_worker;
+    if (worker != NULL) pthread_mutex_lock(&worker->records_mutex);
+    state->browser_dns_items = job->replacement.browser_dns_items;
+    state->browser_dns_count = job->replacement.browser_dns_count;
+    state->browser_dns_capacity = job->replacement.browser_dns_capacity;
+    job->replacement.browser_dns_items = NULL;
+    if (worker != NULL) {
+      worker->items = state->browser_dns_items;
+      worker->count = state->browser_dns_count;
+      pthread_mutex_unlock(&worker->records_mutex);
+    }
+    free(previous_items);
+    snprintf(state->browser_dns_revision, sizeof(state->browser_dns_revision), "%s",
+      job->replacement.browser_dns_revision);
+  }
+  if (applied) {
+    state->browser_dns_bind_retry_after = 0;
+    pm_dns_maybe_rebind(state, time(NULL));
+    pm_dev_log("agent-dns", "sync records=%zu running=%d", state->browser_dns_count, state->browser_dns_fd >= 0);
+  }
+  pm_buffer payload;
+  pm_buffer_init(&payload);
+  int built = pm_dns_append_sync_response(state, &payload, applied != 0);
+  if (built != 0) { pm_buffer_free(&payload); return -1; }
+  *response = payload.data;
+  return result;
+}
+
+static void pm_dns_publication_free(void *context) {
+  pm_dns_publication *job = context;
+  free(job->replacement.browser_dns_items);
+  free(job);
+}
+
+int pm_dns_sync(pm_agent_state *state, const char *payload_json, pm_buffer *response) {
+  (void)response; /* The receipt supplies the response after durable publication. */
+  const char *source = payload_json == NULL ? "" : payload_json;
+  char *records = malloc(strlen(source) + 2);
+  if (records == NULL) return -1;
+  /* Empty is a legitimate full replace; a missing field must never wipe DNS. */
   if (pm_json_get_string(source, "records", records, strlen(source) + 2) != 0) {
     free(records);
     return -1;
   }
-
-  has_revision = pm_json_get_string(source, "revision", revision, sizeof(revision)) == 0 && revision[0] != '\0';
-  if (has_revision) {
-    if (pm_json_get_string(source, "sharedStatePath", shared_state_path, sizeof(shared_state_path)) != 0 ||
-        !pm_dns_revision_matches_document(shared_state_path, revision)) {
-      free(records);
-      pm_dev_log("agent-dns", "rejected stale or unreadable authoritative DNS revision");
-      return pm_dns_append_sync_response(state, response, 0);
-    }
-  } else if (state->browser_dns_revision[0] != '\0') {
-    free(records);
-    pm_dev_log("agent-dns", "rejected unversioned DNS sync after authoritative revision");
-    return pm_dns_append_sync_response(state, response, 0);
-  }
-
-  if (has_revision && strcmp(state->browser_dns_revision, revision) == 0) {
-    free(records);
-    /* The table is immutable for this revision, but an explicit sync still
-     * crosses the bind-retry boundary used to recover a closed UDP socket. */
-    state->browser_dns_bind_retry_after = 0;
-    pm_dns_maybe_rebind(state, time(NULL));
-    return pm_dns_append_sync_response(state, response, 1);
-  }
-
-  replacement = *state;
-  replacement.browser_dns_items = NULL;
-  replacement.browser_dns_count = 0;
-  replacement.browser_dns_capacity = 0;
-  cursor = records;
+  pm_dns_publication *job = calloc(1, sizeof(*job));
+  if (job == NULL) { free(records); return -1; }
+  job->source = state;
+  snprintf(job->replacement.browser_dns_state_path, sizeof(job->replacement.browser_dns_state_path), "%s",
+    state->browser_dns_state_path);
+  pm_json_get_string(source, "revision", job->replacement.browser_dns_revision,
+    sizeof(job->replacement.browser_dns_revision));
+  pm_json_get_string(source, "sharedStatePath", job->shared_state_path, sizeof(job->shared_state_path));
+  char *cursor = records;
+  char *pair;
   while ((pair = strsep(&cursor, ",")) != NULL) {
-    if (pair[0] != '\0') {
-      pm_dns_add_pair(&replacement, pair);
-    }
+    if (pair[0] != '\0') pm_dns_add_pair(&job->replacement, pair);
   }
   free(records);
-
-  if (has_revision) {
-    snprintf(replacement.browser_dns_revision, sizeof(replacement.browser_dns_revision), "%s", revision);
-  }
-
-  if (pm_dns_persist_records(&replacement) != 0) {
-    free(replacement.browser_dns_items);
-    return pm_dns_append_sync_response(state, response, 0);
-  }
-  free(state->browser_dns_items);
-  state->browser_dns_items = replacement.browser_dns_items;
-  state->browser_dns_count = replacement.browser_dns_count;
-  state->browser_dns_capacity = replacement.browser_dns_capacity;
-  snprintf(state->browser_dns_revision, sizeof(state->browser_dns_revision), "%s", replacement.browser_dns_revision);
-  /* A user-driven sync should not wait out the backoff window. */
-  state->browser_dns_bind_retry_after = 0;
-  pm_dns_maybe_rebind(state, time(NULL));
-  pm_dev_log("agent-dns", "sync records=%zu running=%d", state->browser_dns_count, state->browser_dns_fd >= 0);
-
-  return pm_dns_append_sync_response(state, response, 1);
+  if (state->browser_dns_publications == NULL)
+    state->browser_dns_publications = pm_publication_create(32u * 1024 * 1024, NULL, NULL);
+  static const pm_publication_operations operations = {
+    pm_dns_publication_prepare, pm_dns_publication_run, pm_dns_publication_finish, pm_dns_publication_free
+  };
+  size_t bytes = sizeof(*job) + job->replacement.browser_dns_capacity * sizeof(pm_browser_dns_record);
+  pm_publication_receipt *receipt = pm_publication_submit(state->browser_dns_publications, job, bytes, &operations, 0);
+  if (receipt == NULL) return -1;
+  pm_publication_release(state->request_publication);
+  state->request_publication = receipt;
+  return 0;
 }

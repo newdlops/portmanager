@@ -1,4 +1,5 @@
 #include "portmanager_agent.h"
+#include "../shared/pm_dev_log.h"
 #include "../shared/pm_peer_process.h"
 
 #include <arpa/inet.h>
@@ -9,6 +10,7 @@
 #include <limits.h>
 #include <netdb.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +22,8 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+extern char **environ;
 
 #define PM_PROCESS_INSPECT_TEXT 65536
 #define PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"
@@ -76,7 +80,7 @@ static const char *pm_listener_route_host(const pm_listener *listener, const cha
 static void pm_remove_pending_endpoint(pm_agent_state *state, int logical_port, const char *network_id);
 static int pm_listener_is_tracked(pm_agent_state *state, const pm_listener *listener);
 static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock);
-static unsigned long pm_atomic_write_sequence = 1;
+static atomic_ulong pm_atomic_write_sequence = 1;
 
 static void pm_copy(char *target, size_t size, const char *value) {
   if (size == 0) {
@@ -100,10 +104,11 @@ static int pm_text_empty(const char *value) {
   return value == NULL || value[0] == '\0';
 }
 
-static void pm_mark_route_tables_dirty(pm_agent_state *state) {
-  if (state != NULL) {
-    state->route_tables_dirty = 1;
-  }
+void pm_mark_route_tables_dirty(pm_agent_state *state) {
+  if (state == NULL) return;
+  state->route_dirty_revision++;
+  if (state->route_dirty_since_ms == 0) state->route_dirty_since_ms = pm_publication_now_ms();
+  state->route_tables_dirty = 1;
 }
 
 static int pm_route_table_ttl_seconds(void) {
@@ -719,6 +724,9 @@ void pm_state_init(pm_agent_state *state, const char *route_table_path, const ch
 }
 
 void pm_state_dispose(pm_agent_state *state) {
+  pm_publication_dispose(state->route_publications);
+  pm_publication_release(state->route_last_publication);
+  pm_publication_release(state->request_publication);
   free(state->processes);
   free(state->pending_routes);
   free(state->pending_endpoint_hints);
@@ -1701,7 +1709,7 @@ static void pm_refresh_established_route_observations(pm_agent_state *state) {
   pm_route_list routes = {0};
   pm_route_endpoint_index *route_index = NULL;
   size_t route_index_count = 0;
-  FILE *pipe;
+  const char *cursor;
   char line[2048];
   time_t now = time(NULL);
 
@@ -1720,14 +1728,14 @@ static void pm_refresh_established_route_observations(pm_agent_state *state) {
     return;
   }
 
-  pipe = popen("lsof -nP -iTCP -sTCP:ESTABLISHED -Fn 2>/dev/null", "r");
-  if (pipe == NULL) {
+  cursor = pm_scan_output("lsof -nP -iTCP -sTCP:ESTABLISHED -Fn 2>/dev/null");
+  if (cursor == NULL) {
     free(route_index);
     free(routes.items);
     return;
   }
 
-  while (fgets(line, sizeof(line), pipe) != NULL) {
+  while (pm_scan_read_line(line, sizeof(line), &cursor) != NULL) {
     size_t length = strlen(line);
     char local_host[PM_SMALL];
     char remote_host[PM_SMALL];
@@ -1755,7 +1763,6 @@ static void pm_refresh_established_route_observations(pm_agent_state *state) {
     pm_mark_established_endpoint_routes(state, route_index, route_index_count, remote_port, remote_host);
   }
 
-  pclose(pipe);
   free(route_index);
   free(routes.items);
 }
@@ -1837,34 +1844,15 @@ static void pm_trim_process_text(char *text) {
   }
 }
 
+/** Process text is captured during preflight; state application never starts ps. */
 static int pm_read_process_text(pid_t pid, const char *command_template, char *out, size_t out_size) {
   char command[PM_TEXT];
-  char line[4096];
-  FILE *pipe;
-  size_t used = 0;
-
-  if (out == NULL || out_size == 0 || pid <= 0) {
-    return 0;
-  }
-
+  if (out == NULL || out_size == 0 || pid <= 0) return 0;
   out[0] = '\0';
   snprintf(command, sizeof(command), command_template, (long)pid);
-  pipe = popen(command, "r");
-  if (pipe == NULL) {
-    return 0;
-  }
-
-  while (fgets(line, sizeof(line), pipe) != NULL && used + 1 < out_size) {
-    size_t line_length = strlen(line);
-    if (line_length > out_size - used - 1) {
-      line_length = out_size - used - 1;
-    }
-    memcpy(out + used, line, line_length);
-    used += line_length;
-    out[used] = '\0';
-  }
-
-  pclose(pipe);
+  const char *text = pm_scan_output(command);
+  if (text == NULL) return 0;
+  pm_copy(out, out_size, text);
   pm_trim_process_text(out);
   return out[0] != '\0';
 }
@@ -2470,6 +2458,7 @@ static int pm_reconcile_external_processes_with_listeners(
   const char *updated_at) {
   int changed = 0;
   time_t now = time(NULL);
+  unsigned long observed_revision = pm_scan_registration_revision("lsof -nP -iTCP -sTCP:LISTEN -Fpcn 2>/dev/null");
 
   for (size_t index = 0; index < state->process_count; index++) {
     pm_process *process = &state->processes[index];
@@ -2481,6 +2470,10 @@ static int pm_reconcile_external_processes_with_listeners(
     }
 
     listener = pm_find_listener_by_process_pid_endpoint(listeners, process);
+    /* A bind that arrived during this capture is authoritative for this row.
+     * Other rows still reconcile, so unrelated registration churn cannot
+     * cancel a shared full scan or indefinitely starve repair. */
+    if (process->registration_revision > observed_revision) continue;
     if (listener != NULL) {
       pm_clear_missing_listener_state(process);
       continue;
@@ -2582,7 +2575,12 @@ static int pm_cleanup_pending(pm_agent_state *state) {
         listener_scan_attempted = 1;
       }
 
-      if (listener_scan_ok && pm_listener_list_has_port(&listeners, state->pending_routes[read_index].route.actual_port)) {
+      if (!listener_scan_ok) {
+        /* Missing or failed preflight is uncertainty, not proof the listener
+         * disappeared. Retry expiry promptly without destroying its route. */
+        state->pending_routes[read_index].expires_at = now + 1;
+        keep_route = 1;
+      } else if (pm_listener_list_has_port(&listeners, state->pending_routes[read_index].route.actual_port)) {
         state->pending_routes[read_index].expires_at = now + PM_ROUTE_TTL_SECONDS;
         keep_route = 1;
       }
@@ -2851,17 +2849,23 @@ static char *pm_build_atomic_temp_path(const char *file_path) {
     "%s.tmp.%ld.%lu",
     file_path,
     (long)getpid(),
-    pm_atomic_write_sequence++);
+    atomic_fetch_add(&pm_atomic_write_sequence, 1));
   return temp_path;
 }
 
 int pm_write_atomic(const char *file_path, const char *text) {
+  return pm_write_atomic_guarded(file_path, text, NULL, NULL);
+}
+
+/* DNS can recheck its authoritative revision immediately before commit. Both
+ * lanes stop publishing canceled snapshots between blocking system calls. */
+int pm_write_atomic_guarded(const char *file_path, const char *text, int (*validate)(void *), void *context) {
   char *temp_path;
   int fd;
   size_t length = strlen(text);
   size_t offset = 0;
 
-  if (pm_mkdir_p_for_file(file_path) != 0) {
+  if (pm_publication_canceled() || pm_mkdir_p_for_file(file_path) != 0) {
     return -1;
   }
 
@@ -2870,7 +2874,7 @@ int pm_write_atomic(const char *file_path, const char *text) {
     return -1;
   }
 
-  fd = open(temp_path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+  fd = open(temp_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0600);
   if (fd < 0) {
     free(temp_path);
     return -1;
@@ -2896,8 +2900,9 @@ int pm_write_atomic(const char *file_path, const char *text) {
     offset += (size_t)written;
   }
 
-  close(fd);
-  if (rename(temp_path, file_path) != 0) {
+  int close_result = close(fd);
+  if (close_result != 0 || pm_publication_canceled() || (validate != NULL && !validate(context)) || pm_publication_canceled() ||
+      rename(temp_path, file_path) != 0) {
     unlink(temp_path);
     free(temp_path);
     return -1;
@@ -2933,7 +2938,7 @@ static int pm_read_route_table_generation(
     *owner_pid = 0;
   }
 
-  fd = open(file_path, O_RDONLY);
+  fd = open(file_path, O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     return -1;
   }
@@ -3024,7 +3029,7 @@ static int pm_route_table_file_fresh_for_reuse(const char *file_path, int waits_
   long now_ms;
   int existing_waits_for_first_handshake;
 
-  fd = open(file_path, O_RDONLY);
+  fd = open(file_path, O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     return 0;
   }
@@ -3054,11 +3059,25 @@ static int pm_unlink_route_table_file_if_not_newer(
   const pm_agent_state *state,
   const char *file_path,
   unsigned long sequence) {
-  if (pm_route_table_generation_is_newer(state, file_path, sequence)) {
+  if (pm_publication_canceled() || pm_route_table_generation_is_newer(state, file_path, sequence) || pm_publication_canceled()) {
+    errno = ECANCELED; /* Do not misclassify a refused deletion as a prior ENOENT. */
     return -1;
   }
 
   return unlink(file_path);
+}
+
+typedef struct {
+  const pm_agent_state *state;
+  const char *path;
+  unsigned long sequence;
+} pm_route_commit_guard;
+
+/* A different live daemon can publish while this worker is blocked in write.
+ * Recheck ownership at commit as well as at the initial generation preflight. */
+static int pm_route_commit_allowed(void *context) {
+  const pm_route_commit_guard *guard = context;
+  return !pm_route_table_generation_is_newer(guard->state, guard->path, guard->sequence);
 }
 
 static int pm_write_route_table_file(
@@ -3111,7 +3130,8 @@ static int pm_write_route_table_file(
            pm_buffer_append(&buffer, "}\n");
 
   if (result == 0) {
-    result = pm_write_atomic(file_path, buffer.data);
+    pm_route_commit_guard guard = { state, file_path, sequence };
+    result = pm_write_atomic_guarded(file_path, buffer.data, pm_route_commit_allowed, &guard);
   }
 
   pm_buffer_free(&buffer);
@@ -3237,8 +3257,57 @@ static int pm_compare_route_claim_items(const void *left, const void *right) {
   return strcmp(left_item->claim_path, right_item->claim_path);
 }
 
-static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock) {
-  pm_route_list routes;
+typedef struct {
+  const pm_route *route;
+  size_t position;
+} pm_network_route_position;
+
+static int pm_compare_network_route_identity(const void *left, const void *right) {
+  const pm_network_route_position *a = left, *b = right;
+  if (a->route->logical_port != b->route->logical_port)
+    return a->route->logical_port < b->route->logical_port ? -1 : 1;
+  int direction = strcmp(a->route->route_direction, b->route->route_direction);
+  if (direction != 0) return direction;
+  return a->position < b->position ? -1 : a->position > b->position;
+}
+
+static int pm_compare_network_route_position(const void *left, const void *right) {
+  const pm_network_route_position *a = left, *b = right;
+  return a->position < b->position ? -1 : a->position > b->position;
+}
+
+/* Preserve the existing last-owner-wins order without formatting/comparing
+ * every preceding identity for each route. Quadratic aggregate construction
+ * can otherwise exhaust every publication deadline on a 10,000-route table. */
+static int pm_build_network_route_snapshot(const pm_route_list *routes, const char *network, pm_route_list *output) {
+  pm_network_route_position *positions = malloc(routes->count * sizeof(*positions));
+  if (positions == NULL && routes->count > 0) return -1;
+  size_t count = 0, selected = 0;
+  for (size_t index = 0; index < routes->count; index++) {
+    if (strcmp(routes->items[index].network_id, network) == 0) {
+      positions[count].route = &routes->items[index];
+      positions[count++].position = index;
+    }
+  }
+  if (count > 0) qsort(positions, count, sizeof(*positions), pm_compare_network_route_identity);
+  for (size_t index = 0; index < count;) {
+    size_t end = index + 1;
+    while (end < count && positions[end].route->logical_port == positions[index].route->logical_port &&
+        strcmp(positions[end].route->route_direction, positions[index].route->route_direction) == 0) end++;
+    positions[selected++] = positions[end - 1];
+    index = end;
+  }
+  if (selected > 0) qsort(positions, selected, sizeof(*positions), pm_compare_network_route_position);
+  int result = 0;
+  for (size_t index = 0; index < selected; index++) {
+    if (pm_route_list_append(output, positions[index].route) != 0) { result = -1; break; }
+  }
+  free(positions);
+  return result;
+}
+
+/* Consumes the captured route list; all filesystem bookkeeping belongs to its writer. */
+static int pm_write_route_snapshot(pm_agent_state *state, pm_route_list routes) {
   pm_route_entry_item *entry_items = NULL;
   pm_route_claim_item *claim_items = NULL;
   size_t claim_item_count = 0;
@@ -3255,12 +3324,6 @@ static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock) {
   int endpoint_entries_complete = 1;
   int claim_entries_complete = 1;
   unsigned long sequence;
-  (void)wait_for_lock;
-
-  if (pm_build_routes(state, NULL, &routes) != 0) {
-    return -1;
-  }
-  pm_prune_bidirectional_refreshes_for_routes(state, routes.items, routes.count);
 
   if (routes.count > 0) {
     entry_items = (pm_route_entry_item *)malloc(routes.count * sizeof(pm_route_entry_item));
@@ -3391,14 +3454,9 @@ static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock) {
     char network_path[PM_TEXT];
     pm_route_list network_routes = {0};
 
-    for (size_t route_index = 0; route_index < routes.count; route_index++) {
-      if (strcmp(routes.items[route_index].network_id, current_networks[network_index]) == 0) {
-        pm_route_list_add_dedupe(&network_routes, &routes.items[route_index]);
-      }
-    }
-
+    int built = pm_build_network_route_snapshot(&routes, current_networks[network_index], &network_routes);
     pm_scoped_route_table_path(state->route_table_path, current_networks[network_index], network_path, sizeof(network_path));
-    if (pm_write_route_table_file_if_changed(state, network_path, network_routes.items, network_routes.count, sequence) != 0) {
+    if (built != 0 || pm_write_route_table_file_if_changed(state, network_path, network_routes.items, network_routes.count, sequence) != 0) {
       result = -1;
     }
     free(network_routes.items);
@@ -3438,14 +3496,25 @@ static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock) {
     }
   }
 
-  pm_string_array_clear(&state->written_network_ids, &state->written_network_count, &state->written_network_capacity);
-  state->written_network_ids = current_networks;
-  state->written_network_count = current_network_count;
-  state->written_network_capacity = current_network_capacity;
-  current_networks = NULL;
-  current_network_count = current_network_capacity = 0;
+  if (result != 0) {
+    /* A canceled/failed pass can have written some new files while failing to
+     * remove old ones. Retain both sets so the retry can finish cleanup. */
+    for (size_t index = 0; index < current_network_count; index++)
+      pm_string_array_add(&state->written_network_ids, &state->written_network_count, &state->written_network_capacity, current_networks[index]);
+    for (size_t index = 0; index < current_entry_count; index++)
+      pm_string_array_add(&state->written_entry_paths, &state->written_entry_count, &state->written_entry_capacity, current_entries[index]);
+    for (size_t index = 0; index < current_claim_count; index++)
+      pm_string_array_add(&state->written_claim_paths, &state->written_claim_count, &state->written_claim_capacity, current_claims[index]);
+  } else {
+    pm_string_array_clear(&state->written_network_ids, &state->written_network_count, &state->written_network_capacity);
+    state->written_network_ids = current_networks;
+    state->written_network_count = current_network_count;
+    state->written_network_capacity = current_network_capacity;
+    current_networks = NULL;
+    current_network_count = current_network_capacity = 0;
+  }
 
-  if (endpoint_entries_complete) {
+  if (result == 0 && endpoint_entries_complete) {
     pm_string_array_clear(&state->written_entry_paths, &state->written_entry_count, &state->written_entry_capacity);
     state->written_entry_paths = current_entries;
     state->written_entry_count = current_entry_count;
@@ -3454,7 +3523,7 @@ static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock) {
     current_entry_count = current_entry_capacity = 0;
   }
 
-  if (claim_entries_complete) {
+  if (result == 0 && claim_entries_complete) {
     pm_string_array_clear(&state->written_claim_paths, &state->written_claim_count, &state->written_claim_capacity);
     state->written_claim_paths = current_claims;
     state->written_claim_count = current_claim_count;
@@ -3475,19 +3544,176 @@ static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock) {
   return result;
 }
 
-int pm_state_flush_route_tables(pm_agent_state *state) {
-  int result;
+/* Startup cleanup precedes the socket loop; runtime writes use an isolated
+ * writer with captured routes and observations, never mutable registry rows. */
+static int pm_write_route_tables(pm_agent_state *state, int wait_for_lock) {
+  (void)wait_for_lock;
+  pm_route_list routes;
+  if (pm_build_routes(state, NULL, &routes) != 0) return -1;
+  pm_prune_bidirectional_refreshes_for_routes(state, routes.items, routes.count);
+  return pm_write_route_snapshot(state, routes);
+}
 
-  /*
-   * Background flushes run on the single socket loop. Route files are fallback
-   * shards, so a failed atomic write simply leaves daemon memory authoritative
-   * until the next idle or heartbeat flush.
-   */
-  result = pm_write_route_tables(state, 0);
+typedef struct {
+  pm_agent_state *source;
+  pm_agent_state *files;
+  pm_route_list routes;
+  pm_bidirectional_route_refresh *refreshes;
+  size_t refresh_count;
+  unsigned long revision;
+  unsigned long repair_revision;
+  time_t published_at;
+} pm_route_publication;
+
+static void pm_route_publication_files_free(void *context) {
+  pm_agent_state *files = context;
+  pm_state_dispose(files);
+  free(files);
+}
+
+static int pm_route_publication_init(pm_agent_state *state) {
+  if (state->route_publications != NULL) return 0;
+  pm_agent_state *files = calloc(1, sizeof(*files));
+  if (files == NULL) return -1;
+  pm_copy(files->route_table_path, sizeof(files->route_table_path), state->route_table_path);
+  pm_copy(files->route_table_writer_id, sizeof(files->route_table_writer_id), state->route_table_writer_id);
+  files->route_table_writer_started_ms = state->route_table_writer_started_ms;
+  files->route_table_sequence = state->route_table_sequence;
+  files->agent_pid = state->agent_pid;
+  /* Route snapshots include full process metadata and spare array capacity.
+   * Allow the existing 65,535-route scale; only active + latest are retained. */
+  pm_publication_lane *lane = pm_publication_create(256u * 1024 * 1024, files, pm_route_publication_files_free);
+  if (lane == NULL) { free(files); return -1; }
+  /* Startup adopted these paths; transfer ownership once. Only the route I/O
+   * worker may mutate them after this point. No live registry pointers escape. */
+#define PM_MOVE_FILE_FIELD(field) files->field = state->field; state->field = 0
+  PM_MOVE_FILE_FIELD(written_network_ids);
+  PM_MOVE_FILE_FIELD(written_network_count);
+  PM_MOVE_FILE_FIELD(written_network_capacity);
+  PM_MOVE_FILE_FIELD(written_entry_paths);
+  PM_MOVE_FILE_FIELD(written_entry_count);
+  PM_MOVE_FILE_FIELD(written_entry_capacity);
+  PM_MOVE_FILE_FIELD(written_claim_paths);
+  PM_MOVE_FILE_FIELD(written_claim_count);
+  PM_MOVE_FILE_FIELD(written_claim_capacity);
+  PM_MOVE_FILE_FIELD(route_table_signature_paths);
+  PM_MOVE_FILE_FIELD(route_table_signatures);
+  PM_MOVE_FILE_FIELD(route_table_signature_count);
+  PM_MOVE_FILE_FIELD(route_table_signature_capacity);
+#undef PM_MOVE_FILE_FIELD
+  state->route_publications = lane;
+  state->route_publication_files = files;
+  return 0;
+}
+
+static int pm_route_publication_run(void *context) {
+  pm_route_publication *job = context;
+  pm_agent_state *files = job->files;
+  if (job->repair_revision > files->route_repair_revision) pm_route_table_signatures_clear(files);
+  files->bidirectional_refreshes = job->refreshes;
+  files->bidirectional_refresh_count = job->refresh_count;
+  int result = pm_write_route_snapshot(files, job->routes);
+  job->routes.items = NULL; /* The writer consumed the captured list. */
+  files->bidirectional_refreshes = NULL;
+  files->bidirectional_refresh_count = 0;
   if (result == 0) {
-    state->route_tables_dirty = 0;
+    files->route_repair_revision = job->repair_revision;
+    job->published_at = files->route_table_refreshed_at;
+  }
+  pm_dev_log("agent-publication", "routes revision=%lu result=%d", job->revision, result);
+  return result;
+}
+
+static int pm_route_publication_finish(void *context, int result, char **response) {
+  pm_route_publication *job = context;
+  pm_agent_state *state = job->source;
+  (void)response;
+  if (result == 0) {
+    state->route_table_refreshed_at = job->published_at;
+    state->route_publication_retry_after_ms = 0;
+    if (state->route_dirty_revision == job->revision) {
+      state->route_tables_dirty = 0;
+      state->route_dirty_since_ms = 0;
+    }
+  } else {
+    if (state->route_dirty_since_ms == 0) state->route_dirty_since_ms = pm_publication_now_ms();
+    state->route_tables_dirty = 1;
+    state->route_publication_retry_after_ms = pm_publication_now_ms() + 1000;
   }
   return result;
+}
+
+static void pm_route_publication_free(void *context) {
+  pm_route_publication *job = context;
+  free(job->routes.items);
+  free(job->refreshes);
+  free(job);
+}
+
+int pm_state_flush_route_tables(pm_agent_state *state) {
+  if (pm_route_publication_init(state) != 0) return -1;
+  pm_route_publication *job = calloc(1, sizeof(*job));
+  if (job == NULL) return -1;
+  job->source = state;
+  job->files = state->route_publication_files;
+  job->revision = state->route_dirty_revision;
+  job->repair_revision = state->route_repair_revision;
+  if (pm_build_routes(state, NULL, &job->routes) != 0) { free(job); return -1; }
+  pm_prune_bidirectional_refreshes_for_routes(state, job->routes.items, job->routes.count);
+  job->refresh_count = state->bidirectional_refresh_count;
+  if (job->refresh_count > 0) {
+    job->refreshes = malloc(job->refresh_count * sizeof(*job->refreshes));
+    if (job->refreshes == NULL) { pm_route_publication_free(job); return -1; }
+    memcpy(job->refreshes, state->bidirectional_refreshes, job->refresh_count * sizeof(*job->refreshes));
+  }
+  static const pm_publication_operations operations = {
+    NULL, pm_route_publication_run, pm_route_publication_finish, pm_route_publication_free
+  };
+  size_t bytes = sizeof(*job) + job->routes.capacity * sizeof(pm_route) +
+    job->refresh_count * sizeof(*job->refreshes);
+  pm_publication_receipt *receipt = pm_publication_submit(state->route_publications, job, bytes, &operations, 1);
+  if (receipt == NULL) return -1;
+  pm_publication_release(state->route_last_publication);
+  state->route_last_publication = pm_publication_retain(receipt);
+  state->route_submitted_revision = state->route_dirty_revision;
+  /* Only the next mutation starts another coalescing window. A slow writer
+   * must not cause every input turn to recapture the entire route registry. */
+  state->route_dirty_since_ms = 0;
+  pm_publication_release(state->request_publication);
+  state->request_publication = receipt;
+  return 0;
+}
+
+int pm_state_poll_publications(pm_agent_state *state) {
+  int routes = pm_publication_poll(state->route_publications);
+  int dns = pm_publication_poll(state->browser_dns_publications);
+  return routes || dns;
+}
+
+/* Returns milliseconds until the next scheduling check. Continuous RPC input
+ * cannot move the oldest mutation's 250ms deadline; idle bursts coalesce 40ms.
+ * A busy writer retains at most one newer snapshot behind its active write. */
+int pm_state_schedule_route_publication(pm_agent_state *state, long long last_io_ms) {
+  long long now = pm_publication_now_ms();
+  if (state->route_last_publication != NULL &&
+      pm_publication_status(state->route_last_publication) == 0 &&
+      state->route_submitted_revision == state->route_dirty_revision) return 1000;
+  if (now < state->route_publication_retry_after_ms)
+    return (int)(state->route_publication_retry_after_ms - now);
+  int heartbeat = pm_state_route_table_heartbeat_due(state, time(NULL));
+  if (!state->route_tables_dirty && !heartbeat) return 1000;
+  if (state->route_dirty_since_ms > 0) {
+    long long due = state->route_dirty_since_ms + 250;
+    if (last_io_ms + 40 < due) due = last_io_ms + 40;
+    if (now < due) return (int)(due - now);
+  }
+  if (pm_state_flush_route_tables(state) != 0) {
+    state->route_publication_retry_after_ms = now + 1000;
+    return 1000;
+  }
+  pm_publication_release(state->request_publication);
+  state->request_publication = NULL;
+  return 20;
 }
 
 int pm_state_route_table_heartbeat_due(const pm_agent_state *state, time_t now) {
@@ -3512,20 +3738,11 @@ int pm_state_route_table_heartbeat_due(const pm_agent_state *state, time_t now) 
 }
 
 static int pm_flush_route_tables_for_allocation(pm_agent_state *state, const pm_route *route, int compact_response) {
-  /*
-   * Native hook callers already receive actualPort in the response frame. During
-   * bind/connect bursts, writing one endpoint file before every response keeps
-   * the single control loop in filesystem I/O and delays unrelated clients.
-   * Mark the daemon state dirty in the event loop and publish route tables in a
-   * coalesced idle or periodic busy flush instead.
-   */
-  if (compact_response) {
-    (void)state;
-    (void)route;
-    return 0;
-  }
-
-  return pm_write_route_tables(state, 1);
+  (void)route;
+  pm_mark_route_tables_dirty(state);
+  /* Compact hooks already know actualPort; other callers await a publication
+   * receipt before reading the generated fallback files. */
+  return compact_response ? 0 : pm_state_flush_route_tables(state);
 }
 
 static int pm_build_allocation_payload(
@@ -3845,6 +4062,7 @@ int pm_state_register_process(pm_agent_state *state, const pm_register_input *in
 
   process = pm_find_registered_route(state, input, source, network_id);
   pm_iso_now(now, sizeof(now));
+  int new_owner = process == NULL || process->pid != input->pid || strcmp(process->host, input->host) != 0;
 
   if (process == NULL) {
     if (pm_reserve_processes(state, state->process_count + 1) != 0) {
@@ -3855,6 +4073,9 @@ int pm_state_register_process(pm_agent_state *state, const pm_register_input *in
     snprintf(process->id, sizeof(process->id), "managed-process-%lu", state->next_process_id++);
   }
 
+  pm_process previous;
+  /* Preserve padding too, since the change check compares the complete row. */
+  memcpy(&previous, process, sizeof(previous));
   process->pid = input->pid;
   pm_copy(process->name, sizeof(process->name), input->name);
   pm_copy(process->command, sizeof(process->command), input->command);
@@ -3865,13 +4086,19 @@ int pm_state_register_process(pm_agent_state *state, const pm_register_input *in
   process->actual_port = input->actual_port;
   pm_copy(process->host, sizeof(process->host), input->host);
   pm_copy(process->status, sizeof(process->status), "running");
-  pm_copy(process->started_at, sizeof(process->started_at), now);
+  if (new_owner) pm_copy(process->started_at, sizeof(process->started_at), now);
   process->stopped_at[0] = '\0';
   pm_url(process->url, sizeof(process->url), input->host, input->actual_port);
   process->error_message[0] = '\0';
   pm_copy(process->source, sizeof(process->source), source);
   process->child_owned = 0;
-  pm_clear_missing_listener_state(process);
+  if (new_owner) pm_clear_missing_listener_state(process);
+
+  /* Duplicate bind reports preserve start time and observation progress.
+   * Metadata/owner changes advance only this row's registration fence. */
+  if (memcmp(&previous, process, sizeof(previous)) != 0) {
+    process->registration_revision = ++state->registration_revision;
+  }
 
   pm_remove_pending_endpoint(state, process->requested_port, network_id);
   /*
@@ -3897,17 +4124,17 @@ int pm_state_release_allocation(pm_agent_state *state, const char *allocation_id
 }
 
 static int pm_scan_lsof_command(const char *command, pm_listener_list *listeners, const char *updated_at) {
-  FILE *pipe = popen(command, "r");
+  const char *cursor = pm_scan_output(command);
   char line[2048];
   pid_t current_pid = 0;
   char current_name[PM_SMALL] = "";
   size_t initial_count = listeners->count;
 
-  if (pipe == NULL) {
+  if (cursor == NULL) {
     return -1;
   }
 
-  while (fgets(line, sizeof(line), pipe) != NULL) {
+  while (pm_scan_read_line(line, sizeof(line), &cursor) != NULL) {
     char *value;
     size_t length = strlen(line);
 
@@ -3971,7 +4198,6 @@ static int pm_scan_lsof_command(const char *command, pm_listener_list *listeners
     }
 
     if (pm_reserve_listeners(listeners, listeners->count + 1) != 0) {
-      pclose(pipe);
       listeners->count = initial_count;
       return -1;
     }
@@ -3981,6 +4207,7 @@ static int pm_scan_lsof_command(const char *command, pm_listener_list *listeners
     pm_copy(listener->local_address, sizeof(listener->local_address), address);
     listener->port = port;
     listener->pid = current_pid;
+    listener->registration_revision = pm_scan_registration_revision(command);
     pm_copy(listener->process_name, sizeof(listener->process_name), current_name);
     pm_copy(listener->command, sizeof(listener->command), current_name);
     pm_copy(listener->source, sizeof(listener->source), "external");
@@ -3988,19 +4215,8 @@ static int pm_scan_lsof_command(const char *command, pm_listener_list *listeners
     snprintf(listener->id, sizeof(listener->id), "tcp:%s:%d:%ld", listener->local_address, listener->port, (long)listener->pid);
   }
 
-  int close_status = pclose(pipe);
-
-  /*
-   * lsof returns 1 when a valid query has no matches. Shell execution errors
-   * (126/127), signals, and pclose failures must not masquerade as a fresh
-   * empty topology: explicit repair would otherwise erase the only usable
-   * listener observation and report success without recovering live routes.
-   */
-  if (close_status == -1 || !WIFEXITED(close_status) ||
-      (WEXITSTATUS(close_status) != 0 && WEXITSTATUS(close_status) != 1)) {
-    listeners->count = initial_count;
-    return -1;
-  }
+  /* The broker accepts lsof's normal empty exit (1), rejects failed/truncated
+   * captures, and exposes bytes only after the child has been reaped. */
   return 0;
 }
 
@@ -4056,6 +4272,7 @@ static int pm_listener_cache_store(pm_agent_state *state, const pm_listener_list
 }
 
 static void pm_listener_cache_invalidate(pm_agent_state *state) {
+  state->listener_observation_generation++;
   state->listener_cache_expires_at = 0;
   state->listener_cache_updated_at[0] = '\0';
 }
@@ -4078,6 +4295,11 @@ static int pm_scan_lsof_cached(pm_agent_state *state, pm_listener_list *listener
     pm_iso_now(updated_at, updated_at_size);
   }
   if (pm_scan_lsof(listeners, updated_at) != 0) {
+    /* A failed observation cannot erase the last coherent listener snapshot. */
+    if (state->listener_cache_updated_at[0] != '\0') {
+      pm_copy(updated_at, updated_at_size, state->listener_cache_updated_at);
+      return pm_listener_list_copy(listeners, state->listener_cache_items, state->listener_cache_count);
+    }
     return -1;
   }
 
@@ -4146,6 +4368,9 @@ int pm_state_release_process_route(pm_agent_state *state, const pm_release_proce
   pm_normalize_network(input->network_id, network_id, sizeof(network_id));
   pm_iso_now(updated_at, sizeof(updated_at));
   listener_scan_ok = pm_scan_lsof_for_port(input->actual_port, &listeners, updated_at) == 0;
+  char scan_command[128];
+  snprintf(scan_command, sizeof(scan_command), "lsof -nP -iTCP:%d -sTCP:LISTEN -Fpcn 2>/dev/null", input->actual_port);
+  unsigned long observed_revision = pm_scan_registration_revision(scan_command);
 
   if (input->allocation_id[0] != '\0') {
     size_t before = state->pending_count;
@@ -4165,6 +4390,10 @@ int pm_state_release_process_route(pm_agent_state *state, const pm_release_proce
         (network_id[0] != '\0' && strcmp(process->network_id, network_id) != 0)) {
       continue;
     }
+
+    /* A timeout is not evidence that the server stopped listening. Keep the
+     * last owner until a successful release check or fresh reconciliation. */
+    if (!listener_scan_ok || process->registration_revision > observed_revision) { retained = 1; continue; }
 
     active_listener = listener_scan_ok ? pm_find_listener_by_process_endpoint(&listeners, process) : NULL;
     if (active_listener != NULL) {
@@ -4244,28 +4473,47 @@ static char *pm_build_injected_command(const char *command, const char *mode, in
 
 static pid_t pm_spawn_shell(const pm_start_input *input, int actual_port, const char *routes_json, const char *routes_file) {
   char *command = pm_build_injected_command(input->command, input->injection_mode, actual_port);
-  pid_t child;
+  pid_t child = -1;
+  const char *keys[] = {"PORT", "PORT_MANAGER_ACTUAL_PORT", "PORT_MANAGER_LOGICAL_PORT", "PORT_MANAGER_ROUTES", "PORT_MANAGER_ROUTES_FILE"};
+  char actual_text[16], logical_text[16];
+  pm_buffer injected[5];
+  size_t inherited_count = 0, environment_count = 0;
+  char **environment = NULL;
 
   if (command == NULL) {
     return -1;
   }
 
+  /* The DNS worker makes this a multithreaded parent. Prepare argv/env before
+   * fork so the child only uses async-signal-safe calls until execve. */
+  snprintf(actual_text, sizeof(actual_text), "%d", actual_port);
+  snprintf(logical_text, sizeof(logical_text), "%d", input->requested_port);
+  const char *values[] = {actual_text, actual_text, logical_text, routes_json, routes_file};
+  for (size_t index = 0; index < 5; index++) pm_buffer_init(&injected[index]);
+  for (size_t index = 0; index < 5; index++) {
+    if (pm_buffer_appendf(&injected[index], "%s=%s", keys[index], values[index]) != 0) goto cleanup;
+  }
+  while (environ[inherited_count] != NULL) inherited_count++;
+  environment = calloc(inherited_count + 6, sizeof(char *));
+  if (environment == NULL) goto cleanup;
+  for (size_t index = 0; index < inherited_count; index++) {
+    int replaced = 0;
+    for (size_t key = 0; key < 5; key++) {
+      size_t length = strlen(keys[key]);
+      if (strncmp(environ[index], keys[key], length) == 0 && environ[index][length] == '=') {
+        replaced = 1;
+        break;
+      }
+    }
+    if (!replaced) environment[environment_count++] = environ[index];
+  }
+  for (size_t index = 0; index < 5; index++) environment[environment_count++] = injected[index].data;
+  char *argv[] = {"sh", "-c", command, NULL};
+
   child = fork();
   if (child == 0) {
-    char actual_text[16];
-    char logical_text[16];
-    int devnull;
-
-    snprintf(actual_text, sizeof(actual_text), "%d", actual_port);
-    snprintf(logical_text, sizeof(logical_text), "%d", input->requested_port);
-    setenv("PORT", actual_text, 1);
-    setenv("PORT_MANAGER_ACTUAL_PORT", actual_text, 1);
-    setenv("PORT_MANAGER_LOGICAL_PORT", logical_text, 1);
-    setenv("PORT_MANAGER_ROUTES", routes_json, 1);
-    setenv("PORT_MANAGER_ROUTES_FILE", routes_file, 1);
-    chdir(input->cwd);
-
-    devnull = open("/dev/null", O_RDWR);
+    if (chdir(input->cwd) != 0) _exit(127);
+    int devnull = open("/dev/null", O_RDWR);
     if (devnull >= 0) {
       dup2(devnull, STDIN_FILENO);
       dup2(devnull, STDOUT_FILENO);
@@ -4275,10 +4523,13 @@ static pid_t pm_spawn_shell(const pm_start_input *input, int actual_port, const 
       }
     }
 
-    execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+    execve("/bin/sh", argv, environment);
     _exit(127);
   }
 
+cleanup:
+  free(environment);
+  for (size_t index = 0; index < 5; index++) pm_buffer_free(&injected[index]);
   free(command);
   return child;
 }
@@ -4515,7 +4766,7 @@ static int pm_listener_is_tracked(pm_agent_state *state, const pm_listener *list
     pm_process *process = &state->processes[index];
     if (
       strcmp(process->status, "stopped") != 0 &&
-      process->pid == listener->pid &&
+      (process->pid == listener->pid || process->registration_revision > listener->registration_revision) &&
       process->actual_port == listener->port &&
       pm_endpoint_hosts_match(listener->local_address, process->host)
     ) {
@@ -4778,10 +5029,8 @@ int pm_state_daemon_status(pm_agent_state *state, pm_buffer *payload) {
   pm_route_list routes;
   char updated_at[PM_TIME];
 
+  /* Read-only status must remain available while an OS observation is pending. */
   pm_iso_now(updated_at, sizeof(updated_at));
-  if (pm_cleanup_pending(state)) {
-    pm_mark_route_tables_dirty(state);
-  }
   if (pm_build_routes(state, NULL, &routes) != 0) {
     return -1;
   }
@@ -4830,7 +5079,7 @@ int pm_state_repair_routing(pm_agent_state *state, pm_buffer *payload) {
    * response. Forget content signatures so fresh-looking files that were
    * truncated or externally replaced are also rewritten; generation guards
    * still prevent this daemon from overwriting a newer writer. */
-  pm_route_table_signatures_clear(state);
+  state->route_repair_revision++;
   return pm_state_flush_route_tables(state);
 }
 
@@ -4843,6 +5092,10 @@ int pm_state_reap_children(pm_agent_state *state) {
     if (pid <= 0) {
       break;
     }
+
+    /* A scan child can exit between broker polls; preserve its status while
+     * still reaping stopped/removed managed children through the wildcard. */
+    if (pm_scan_reaped(pid, status)) continue;
 
     for (size_t index = 0; index < state->process_count; index++) {
       pm_process *process = &state->processes[index];
@@ -4885,4 +5138,100 @@ int pm_state_listener_signature(pm_agent_state *state, pm_buffer *signature) {
 
   free(listeners.items);
   return 0;
+}
+
+/** Prepare only metadata the recovery policy will inspect. Existing registered
+ * listeners never launch ps; direct process-environment inspection stays the
+ * preferred path, and each external command is shared by the scan broker. */
+static int pm_prepare_listener_metadata(pm_agent_state *state, pm_scan_context *context) {
+  pm_listener_list listeners = {0};
+  char updated_at[PM_TIME];
+  int pending = 0;
+  pid_t previous_pid = 0;
+  if (pm_hook_recovery_disabled()) return 0;
+  pm_iso_now(updated_at, sizeof(updated_at));
+  if (pm_scan_lsof(&listeners, updated_at) != 0) return 0;
+  for (size_t index = 0; index < listeners.count; index++) {
+    const pm_listener *listener = &listeners.items[index];
+    if (listener->pid <= 0 || listener->pid == previous_pid || pm_listener_is_tracked(state, listener)) continue;
+    previous_pid = listener->pid;
+    char environment[PM_PROCESS_INSPECT_TEXT];
+    char command[128];
+    if (!pm_read_process_environment_text(listener->pid, environment, sizeof(environment))) {
+      snprintf(command, sizeof(command), "ps eww -p %ld 2>/dev/null", (long)listener->pid);
+      int result = pm_scan_require(context, command);
+      if (result != 0) { pending = pending || result > 0; continue; }
+      if (!pm_read_process_environment_via_ps(listener->pid, environment, sizeof(environment))) continue;
+    }
+    if (!pm_hook_recovery_has_active_environment(environment)) continue;
+    snprintf(command, sizeof(command), "ps -o command= -p %ld 2>/dev/null", (long)listener->pid);
+    if (pm_scan_require(context, command) > 0) pending = 1;
+  }
+  free(listeners.items);
+  return pending;
+}
+
+/**
+ * External observations are acquired before entering the synchronous state
+ * transition. Other RPCs can mutate the registry while commands run; when this
+ * request resumes it evaluates the observation against the current registry.
+ * No pointer into process/route arrays is held across an external wait.
+ */
+int pm_state_prepare_request(pm_agent_state *state, const pm_request *request, pm_scan_context *context) {
+  static const char *full_scan = "lsof -nP -iTCP -sTCP:LISTEN -Fpcn 2>/dev/null";
+  static const char *established_scan = "lsof -nP -iTCP -sTCP:ESTABLISHED -Fn 2>/dev/null";
+  int snapshot = strcmp(request->method, "listSnapshot") == 0 || strcmp(request->method, "refreshSnapshot") == 0;
+  int repair = strcmp(request->method, "repairRoutingState") == 0;
+  int allocation = strcmp(request->method, "allocateRoute") == 0;
+  int release = strcmp(request->method, "releaseProcessRoute") == 0;
+  int pending = 0;
+  int require_full = repair;
+  time_t now = time(NULL);
+  if (pm_scan_context_expired(context)) return -1;
+  pm_scan_context_update_generation(context, state->listener_observation_generation);
+  pm_scan_context_update_registration(context, state->registration_revision);
+  if (snapshot && (state->listener_cache_updated_at[0] == '\0' || now >= state->listener_cache_expires_at ||
+                   pm_state_needs_external_listener_fresh_scan(state))) require_full = 1;
+  if ((snapshot || repair || allocation) && state->pending_count > 0 &&
+      state->next_pending_expiry_scan_at <= now) require_full = 1;
+  if (require_full) {
+    int result = pm_scan_require(context, full_scan);
+    if (result < 0) return -1;
+    pending |= result;
+  }
+  if (strcmp(request->method, "refreshSnapshot") == 0 &&
+      now >= state->established_route_observation_scan_after && (state->process_count > 0 || state->pending_count > 0)) {
+    int result = pm_scan_require(context, established_scan);
+    if (result < 0) return -1;
+    pending |= result;
+  }
+  int port = 0;
+  if (release) {
+    pm_release_process_input input;
+    if (pm_parse_release_process_input(request->payload, &input) == 0) port = input.actual_port;
+  } else if (allocation) {
+    pm_allocate_input input;
+    if (pm_parse_allocate_input(request->payload, &input) == 0) {
+      char network_id[PM_SMALL];
+      pm_route route;
+      pm_normalize_network(input.network_id, network_id, sizeof(network_id));
+      if (strcmp(input.route_direction, "send") == 0 && network_id[0] == '\0' &&
+          pm_find_active_route(state, input.requested_port, network_id, &route) == NULL &&
+          pm_find_pending_endpoint(state, input.requested_port, network_id) == NULL) port = input.requested_port;
+    }
+  }
+  if (pm_is_valid_port(port)) {
+    char command[128];
+    snprintf(command, sizeof(command), "lsof -nP -iTCP:%d -sTCP:LISTEN -Fpcn 2>/dev/null", port);
+    int result = pm_scan_require(context, command);
+    if (result < 0) return -1;
+    pending |= result;
+  }
+  if (pending) return 1;
+  if (require_full && (snapshot || repair)) {
+    pm_scan_use(context);
+    pending = pm_prepare_listener_metadata(state, context);
+    pm_scan_use(NULL);
+  }
+  return pending;
 }

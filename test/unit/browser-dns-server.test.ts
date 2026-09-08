@@ -199,7 +199,7 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   assert.equal(ownerDnsStartIndex >= 0, true);
   assert.equal(ownerConvergeIndex > ownerDnsStartIndex, true);
   assert.equal(ownerComposeRepairIndex > ownerDnsStartIndex, true);
-  assert.equal(browserProxySyncSource.includes("this.syncBrowserDnsRecordsForNetworks(networks)"), true);
+  assert.equal(browserProxySyncSource.includes("this.syncBrowserDnsRecords()"), true);
   // Responder state now lives in the daemon; the owner path must consult the
   // daemon-backed view instead of an extension-host socket.
   assert.equal(browserProxySyncSource.includes("const dnsRunning = this.getBrowserDnsRuntimeState().running;"), true);

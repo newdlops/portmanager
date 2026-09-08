@@ -135,6 +135,9 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Lifecycle token prevents an async connect from attaching after stop/dispose. */
   private connectionGeneration = 0;
 
+  /** Concurrent readers share one refresh within the current connection lifetime. */
+  private refreshInFlight: { readonly generation: number; readonly promise: Promise<void> } | undefined;
+
   /** Existing-daemon reconnect used when the agent drops a lagging event subscriber. */
   private eventReconnectInFlight: Promise<void> | undefined;
 
@@ -314,8 +317,16 @@ export class LocalAgentClient implements PortManagerProcessService {
 
   /** Requests a fresh OS port scan from the agent. */
   async refresh(): Promise<void> {
-    const snapshot = await this.request<AgentSnapshot>("refreshSnapshot");
-    this.applySnapshot(snapshot);
+    const generation = this.connectionGeneration;
+    if (this.refreshInFlight?.generation === generation) return this.refreshInFlight.promise;
+    const promise = this.request<AgentSnapshot>("refreshSnapshot").then((snapshot) => {
+      // Stop/dispose must not resurrect a snapshot from the previous daemon.
+      if (!this.disposed && generation === this.connectionGeneration) this.applySnapshot(snapshot);
+    }).finally(() => {
+      if (this.refreshInFlight?.promise === promise) this.refreshInFlight = undefined;
+    });
+    this.refreshInFlight = { generation, promise };
+    return promise;
   }
 
   /** Forces live hook-route rediscovery and waits for route files to be republished. */

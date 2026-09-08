@@ -1,0 +1,79 @@
+name: Release packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A release is built and tested on the native CPU for every advertised target.
+# Publishing stays separate so only these exact, verified VSIX files are uploaded.
+jobs:
+  package:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-15
+          - target: darwin-x64
+            runner: macos-15-intel
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: linux-x64
+            runner: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.22.2
+          cache: npm
+      - name: Prepare native test prerequisites
+        run: |
+          mkdir -p .tmp/release-logs
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y lsof zsh xvfb
+          else
+            sudo ifconfig lo0 alias 127.93.164.7 up
+            sudo ifconfig lo0 alias 127.93.164.8 up
+          fi
+      - run: npm ci
+      - name: Build and verify native runtime
+        run: npm run build:hook 2>&1 | tee .tmp/release-logs/native-build.log
+        env:
+          PORT_MANAGER_NATIVE_TARGET: ${{ matrix.target }}
+      - name: Unit and native integration tests
+        run: npm run test:ci 2>&1 | tee .tmp/release-logs/tests.log
+        env:
+          PM_RUN_NATIVE_E2E: "1"
+      - name: Package target VSIX
+        run: npm run package:${{ matrix.target }} 2>&1 | tee .tmp/release-logs/package.log
+      - name: Install and activate packaged extension in a fresh profile
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            xvfb-run -a npm run test:packaged 2>&1 | tee .tmp/release-logs/activation.log
+          else
+            npm run test:packaged 2>&1 | tee .tmp/release-logs/activation.log
+          fi
+      - name: Upload verified VSIX
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: portmanager-${{ matrix.target }}
+          path: portmanager-${{ matrix.target }}-*.vsix
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload verification logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: logs-${{ matrix.target }}
+          path: .tmp/release-logs/
+          if-no-files-found: warn
+          retention-days: 30

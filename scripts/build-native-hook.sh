@@ -19,7 +19,7 @@ HOST_EXPOSURE_PROXY_SOURCE_FILE="$ROOT_DIR/native/host-exposure/portmanager_host
 PROCESS_LOOKUP_SOURCE_FILE="$ROOT_DIR/native/process-lookup/portmanager_process_lookup.c"
 CONTAINER_MAP_SOURCE_FILE="$ROOT_DIR/native/container-mutation/portmanager_container_map.c"
 DOCKER_SHIM_SOURCE_FILE="$ROOT_DIR/native/docker-shim/portmanager_docker_shim.c"
-AGENT_SOURCE_FILES="$ROOT_DIR/native/agent/portmanager_agent.c $ROOT_DIR/native/agent/portmanager_agent_probe.c $ROOT_DIR/native/agent/portmanager_agent_state.c $ROOT_DIR/native/agent/portmanager_agent_json.c $ROOT_DIR/native/agent/portmanager_agent_dns.c $PEER_PROCESS_SOURCE_FILE"
+AGENT_SOURCE_FILES="$ROOT_DIR/native/agent/portmanager_agent.c $ROOT_DIR/native/agent/portmanager_agent_probe.c $ROOT_DIR/native/agent/portmanager_agent_state.c $ROOT_DIR/native/agent/portmanager_agent_json.c $ROOT_DIR/native/agent/portmanager_agent_dns.c $ROOT_DIR/native/agent/portmanager_agent_scan.c $ROOT_DIR/native/agent/portmanager_agent_output.c $ROOT_DIR/native/agent/portmanager_agent_publication.c $PEER_PROCESS_SOURCE_FILE"
 OUTPUT_DIR="${PORT_MANAGER_NATIVE_OUTPUT_DIR:-$ROOT_DIR/media/native}"
 PACKAGE_VERSION="unknown"
 if command -v node >/dev/null 2>&1; then
@@ -94,7 +94,7 @@ case "$TARGET_SYSTEM" in
     cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$PROCESS_TRACKER_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_tracker"
     cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$CONTAINER_MAP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_container_map"
     cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$DOCKER_SHIM_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_docker_shim"
-    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$AGENT_VERSION_DEFINE" $AGENT_SOURCE_FILES "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_agent"
+    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS -pthread "$AGENT_VERSION_DEFINE" $AGENT_SOURCE_FILES "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_agent"
     if command -v codesign >/dev/null 2>&1; then
       # DYLD-injected helpers must survive macOS library validation paths.
       # Linker-signed output can be rejected by some runtimes, so sign the
@@ -122,7 +122,7 @@ case "$TARGET_SYSTEM" in
     cc -Wall -Wextra -O2 "$PROCESS_TRACKER_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_tracker"
     cc -Wall -Wextra -O2 "$CONTAINER_MAP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_container_map"
     cc -Wall -Wextra -O2 "$DOCKER_SHIM_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_docker_shim"
-    cc -Wall -Wextra -O2 "$AGENT_VERSION_DEFINE" $AGENT_SOURCE_FILES "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_agent"
+    cc -Wall -Wextra -O2 -pthread "$AGENT_VERSION_DEFINE" $AGENT_SOURCE_FILES "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_agent"
     ;;
 esac
 

@@ -1,4 +1,6 @@
 .vscode/**
+.github/**
+.vscode-test/**
 .portmanager/**
 .django-shell/**
 .claude/**

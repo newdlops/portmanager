@@ -16,6 +16,7 @@ Logical Network를 실제 격리 런타임에 연결하는 로우레벨 adapter�
 - 컨테이너리스 runtime과 공존할 수 있도록 capability descriptor 제공
 - 브라우저용 network-name alias를 loopback 주소로 해석하는 로컬 DNS responder 실행
 - macOS `getaddrinfo` 경로에서 각 브라우저 alias가 정확한 loopback 주소 하나로 해석되는지 검증
+- daemon의 network/port route shard를 중복 디렉터리 조회 없이 읽고 유효한 fallback snapshot으로 반환
 - 생성된 TLS leaf의 실제 SAN/CN이 모든 브라우저 hostname을 포함하는지 검증
 - 생성된 브라우저 TLS leaf를 macOS 기본 Keychain search list로 실제 검증하고 짧게 캐시
 
@@ -23,6 +24,7 @@ Logical Network를 실제 격리 런타임에 연결하는 로우레벨 adapter�
 
 - `browser-dns-server.ts`
 - `browser-dns-verifier.ts`
+- `generated-route-table-reader.ts`
 - `browser-tls-certificate.ts`
 - `browser-tls-trust.ts`
 - `container-runtime.ts`
@@ -49,3 +51,4 @@ Logical Network의 durable 상태는 여러 VS Code 창이 동시에 읽고 갱�
 `browser-dns-server.ts`는 `/etc/resolver/<network-name>` 같은 OS resolver 설정이 이미 Port Manager DNS 포트를 바라볼 때만 브라우저 alias를 해석한다. 권한이 필요한 resolver 파일 설치는 이 어댑터가 직접 수행하지 않는다. Extension hosts publish immutable shared-state revision snapshots; the daemon accepts only a snapshot whose named document still carries that revision, preventing a delayed window from replacing current aliases.
 `browser-tls-trust.ts`는 TreeView 렌더 경로에서 subprocess를 실행하지 않는다. 인증서 stat signature와 짧은 TTL의 마지막 결과만 동기적으로 반환하고, service가 비동기 `security verify-cert`를 수행한 뒤 UI를 갱신한다. 임의 CA를 검증 명령에 root로 주입하지 않아야 하며, 실제 기본 Keychain trust만 성공으로 인정한다.
 `browser-dns-verifier.ts`는 `/etc/resolver` 파일 존재를 성공으로 간주하지 않고 macOS system resolver가 single-label과 `.pm` alias 모두를 정확한 주소로 반환할 때만 준비 완료로 판단한다. `browser-tls-certificate.ts`도 hostname marker와 별개로 실제 signed leaf를 검사한다.
+`generated-route-table-reader.ts`는 생성 파일의 조회·파싱·변경 관찰을 담당하는 adapter다. 경로와 만료 유예 정책은 호출자가 주며, 폴더당 한 번 열거하고 최대 8개 파일을 병렬로 읽는다. snapshot reader는 파일 내용을 캐시하지 않고 network table → port shard 순서를 유지하며 손상·소실·만료된 파일 하나가 정상 파일까지 버리게 하지 않는다. `GeneratedRouteTableWatcher`만 파일별 관측을 보관한다. 이름이 알려진 이벤트는 변경 파일만 읽고, 초기화·이벤트 이름 누락·watch 재연결은 전체를 읽는다. 생성·교체·삭제를 50ms 고정 구간으로 합치고 라우팅 내용이 바뀔 때만 callback을 보낸다. heartbeat는 관측의 TTL만 갱신하며 만료 시각에 별도 wakeup으로 route 소실을 알린다. owner loss/dispose 뒤 늦게 끝난 읽기는 버린다. callback 뒤 실제 route 적용은 새 full snapshot으로 하며, 재동기화와 lease 판단은 extension에 남겨 둔다.

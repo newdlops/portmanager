@@ -1,6 +1,9 @@
 #ifndef PORTMANAGER_AGENT_H
 #define PORTMANAGER_AGENT_H
 
+#include "portmanager_agent_scan.h"
+#include "portmanager_agent_publication.h"
+
 #include <stddef.h>
 #include <sys/types.h>
 #include <time.h>
@@ -73,6 +76,8 @@ typedef struct {
   int child_owned;
   time_t missing_listener_since;
   int missing_listener_count;
+  /* Only observations begun at/after this registration can replace its owner. */
+  unsigned long registration_revision;
   char injection_mode[PM_SMALL];
   int scan_range;
   char scan_direction[PM_SMALL];
@@ -102,6 +107,8 @@ typedef struct {
   char command[PM_SMALL];
   char source[PM_SOURCE];
   char updated_at[PM_TIME];
+  /* Retained with cached diagnostics so stale PIDs never synthesize a second owner. */
+  unsigned long registration_revision;
 } pm_listener;
 
 typedef struct {
@@ -152,6 +159,9 @@ typedef struct {
   size_t listener_cache_count;
   time_t listener_cache_expires_at;
   char listener_cache_updated_at[PM_TIME];
+  /* Destructive topology changes invalidate captures; registrations fence only their own rows. */
+  unsigned long listener_observation_generation;
+  unsigned long registration_revision;
   char route_table_path[PM_TEXT];
   char agent_main_path[PM_TEXT];
   char version[PM_SMALL];
@@ -169,6 +179,19 @@ typedef struct {
    * This flag tracks whether the derived route-table files still need publishing.
    */
   int route_tables_dirty;
+  /* Oldest uncaptured mutation keeps its monotonic deadline across bursts.
+   * A completed older snapshot cannot clear a newer registry revision. */
+  unsigned long route_dirty_revision;
+  unsigned long route_repair_revision;
+  unsigned long route_submitted_revision;
+  long long route_dirty_since_ms;
+  long long route_publication_retry_after_ms;
+  pm_publication_lane *route_publications;
+  void *route_publication_files;
+  pm_publication_receipt *route_last_publication;
+  /* Dispatcher transfers this reference to its client without replaying the
+   * already accepted mutation when file I/O completes. */
+  pm_publication_receipt *request_publication;
   time_t established_route_observation_scan_after;
   unsigned long next_process_id;
   unsigned long next_allocation_id;
@@ -179,6 +202,9 @@ typedef struct {
    * memset-initialized state never reports a live responder.
    */
   int browser_dns_fd;
+  /* Opaque responder worker; registry/revision state stays on the control thread. */
+  struct pm_dns_worker *browser_dns_worker;
+  pm_publication_lane *browser_dns_publications;
   int browser_dns_requested_port;
   int browser_dns_bound_port;
   time_t browser_dns_bind_retry_after;
@@ -299,20 +325,25 @@ int pm_state_snapshot(pm_agent_state *state, pm_buffer *payload);
 /** Builds an event snapshot from in-memory state and the last listener cache only. */
 int pm_state_cached_snapshot(pm_agent_state *state, pm_buffer *payload);
 int pm_state_refresh_snapshot(pm_agent_state *state, pm_buffer *payload);
+/** Prepare external observations without entering a registry mutation: 1 pending, 0 ready, -1 failed. */
+int pm_state_prepare_request(pm_agent_state *state, const pm_request *request, pm_scan_context *context);
 /** Forces listener rediscovery/recovery and publishes route tables before returning. */
 int pm_state_repair_routing(pm_agent_state *state, pm_buffer *payload);
 int pm_state_reap_children(pm_agent_state *state);
 int pm_state_listener_signature(pm_agent_state *state, pm_buffer *signature);
 int pm_state_flush_route_tables(pm_agent_state *state);
+void pm_mark_route_tables_dirty(pm_agent_state *state);
+int pm_state_poll_publications(pm_agent_state *state);
+int pm_state_schedule_route_publication(pm_agent_state *state, long long last_io_ms);
 int pm_state_route_table_heartbeat_due(const pm_agent_state *state, time_t now);
 /** Writes text through a temp file and rename so readers never observe partial content. */
 int pm_write_atomic(const char *file_path, const char *text);
+int pm_write_atomic_guarded(const char *file_path, const char *text, int (*validate)(void *), void *context);
 
 /** Browser DNS responder (portmanager_agent_dns.c). */
 void pm_dns_init(pm_agent_state *state, int requested_port);
 void pm_dns_dispose(pm_agent_state *state);
 int pm_dns_maybe_rebind(pm_agent_state *state, time_t now);
-int pm_dns_handle_readable(pm_agent_state *state);
 int pm_dns_sync(pm_agent_state *state, const char *payload_json, pm_buffer *response);
 int pm_dns_append_status_fields(const pm_agent_state *state, pm_buffer *payload);
 

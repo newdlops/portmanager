@@ -50,7 +50,15 @@ export class BrowserDnsSyncCoordinator {
       return;
     }
 
+    const changed = this.queued?.signature !== batch.signature;
     this.queued = batch;
+    // A new network/revision has not failed yet. Do not make it inherit an
+    // older table's backoff; repeated snapshots of that table still back off.
+    if (changed && this.retryTimer !== undefined) {
+      this.deps.cancel(this.retryTimer);
+      this.retryTimer = undefined;
+      this.attempt = 0;
+    }
     if (this.active === undefined && this.retryTimer === undefined) {
       this.start();
     }
@@ -144,6 +152,14 @@ export class BrowserDnsSyncCoordinator {
       } catch {
         this.deps.onError(batch);
         this.queued ??= batch;
+      }
+
+      // A fence refresh or an event received during the failed request may
+      // already have supplied the current table. Publish it in this drain so
+      // the new alias is not exposed to DNS misses while an old retry sleeps.
+      if (this.queued !== undefined && this.queued.signature !== batch.signature) {
+        this.attempt = 0;
+        continue;
       }
 
       this.retry();

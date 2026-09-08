@@ -8,3 +8,4 @@ dist/
 /.zoek-rs/
 /.lh/
 /log.txt
+.vscode-test/

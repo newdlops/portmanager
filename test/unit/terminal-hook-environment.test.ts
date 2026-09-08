@@ -851,7 +851,7 @@ test("agent client startup and process mutations avoid blocking on full listener
     ),
     true,
   );
-  assert.equal(source.includes('const snapshot = await this.request<AgentSnapshot>("refreshSnapshot");'), true);
+  assert.equal(source.includes('this.request<AgentSnapshot>("refreshSnapshot")'), true);
   assert.equal(source.includes("const id = `extension-${process.pid}-${this.nextRequestId++}`;"), true);
   assert.equal(refreshBody.includes("void this.refresh().catch"), true);
   for (const mutationBody of mutationBodies) {
@@ -1142,7 +1142,7 @@ test("browser proxy target resolution uses a snapshot route index before refresh
   assert.equal(source.includes("private browserProxyRouteTargetByEndpointId = new Map<string, BrowserNetworkProxyTarget>();"), true);
   assert.equal(source.includes("private browserProxyGeneratedRouteTargetByEndpointId = new Map<string, BrowserNetworkProxyTarget>();"), true);
   assert.equal(source.includes("private async readGeneratedRouteTableRoutesForNetworks"), true);
-  assert.equal(source.includes("collectBrowserProxyRouteEndpoints(routes, networks, useDnsAlias, routeHintTextByEndpointId, processEndpoints)"), true);
+  assert.equal(source.includes("collectBrowserProxyRouteEndpoints(routes, networks, useDnsAlias, processEndpoints)"), true);
   assert.equal(source.includes("mergeLogicalPortRoutes("), true);
   assert.equal(
     resolveBody.indexOf("const indexedTarget = this.findBrowserProxyRouteTarget(endpoint.networkId, endpoint.logicalPort);") <

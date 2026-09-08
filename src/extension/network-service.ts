@@ -60,6 +60,7 @@ import {
 } from "../platform/network/container-runtime";
 import { browserDnsPort, normalizeBrowserDnsHostname } from "../platform/network/browser-dns-server";
 import { verifyBrowserDnsAliasesResolve } from "../platform/network/browser-dns-verifier";
+import { GeneratedRouteTableWatcher, readGeneratedRouteTableRoutes } from "../platform/network/generated-route-table-reader";
 import {
   CONTAINER_ALIAS_SERVICE_PREFIX,
   mergeComposeContainerMappingLineage,
@@ -273,8 +274,6 @@ const TERMINAL_NETWORK_SERVICE_ENTRY_SEPARATOR = " || ";
 // passes; rows are pruned as soon as the PID leaves the process snapshot.
 const BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS = 600_000;
 const BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS = 15_000;
-const BROWSER_PROXY_ROUTE_HINT_CACHE_TTL_MS = 30_000;
-const BROWSER_PROXY_ROUTE_HINT_MISS_CACHE_TTL_MS = 5_000;
 /*
  * Logical port gateway attribution verdicts.
  *
@@ -535,16 +534,11 @@ interface TerminalAttachmentMarkerState {
 }
 
 interface BrowserProxyCommandTextCacheEntry {
+  /** A reused PID or replacement process row must not inherit an old classification. */
+  readonly identity: string;
   /** Cached process argv text used only for browser-entrypoint classification. */
   readonly commandText: string | undefined;
   /** Wall-clock deadline; process command text is cheap to refresh but noisy in bursts. */
-  readonly expiresAtMs: number;
-}
-
-interface BrowserProxyRouteHintCacheEntry {
-  /** Cached cwd-derived dev-server hints used when daemon process rows lag behind route files. */
-  readonly hintText: string | undefined;
-  /** Wall-clock deadline; route hints are filesystem metadata and should stay cheap in refresh loops. */
   readonly expiresAtMs: number;
 }
 
@@ -700,6 +694,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Guards browser proxy reconciliation so process snapshot bursts do not overlap. */
   private browserProxySyncInFlight: Promise<void> | undefined;
 
+  /** Permanently stops queued timer/file reconciliations after extension disposal. */
+  private browserProxyDisposed = false;
+
   /** Requests one more browser proxy reconciliation after the current sync completes. */
   private browserProxySyncQueued = false;
 
@@ -773,8 +770,13 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Short-lived PID command cache used by browser proxy sync classification. */
   private readonly browserProxyProcessCommandTextCache = new Map<number, BrowserProxyCommandTextCacheEntry>();
 
-  /** Short-lived cwd hint cache used to classify route-file web endpoints. */
-  private readonly browserProxyRouteHintTextCache = new Map<string, BrowserProxyRouteHintCacheEntry>();
+  /** Shares cold command lookups across overlapping browser reconciliations. */
+  private readonly browserProxyProcessCommandTextInFlight = new Map<
+    number, { readonly identity: string; readonly promise: Promise<string | undefined> }
+  >();
+
+  /** The browser owner observes fallback files even when a daemon event was missed. */
+  private readonly browserProxyRouteTableWatcher: GeneratedRouteTableWatcher;
 
   /** Guards explicit resolver installation so duplicate UI actions cannot stack prompts. */
   private browserDnsResolverInstallInFlight: Promise<BrowserDnsResolverStatus> | undefined;
@@ -929,6 +931,21 @@ export class PortManagerNetworkService implements DisposableLike {
     }, {
       tlsCredentials: {
         getCredentials: () => readBrowserTlsCredentials(),
+      },
+      onRetryDue: async () => {
+        if (this.retainsBrowserNetworkProxyOwnership(this.browserNetworkProxyOwnershipGeneration)) {
+          await this.syncBrowserNetworkProxies();
+        } else {
+          await this.demoteBrowserNetworkProxyOwner();
+        }
+      },
+    });
+    this.browserProxyRouteTableWatcher = new GeneratedRouteTableWatcher({
+      expirationGraceMs: routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS),
+      onChanged: () => {
+        if (this.ownsBrowserNetworkProxyLease && !this.suppressRoutingRepairSideEffects) {
+          void this.syncBrowserNetworkProxies().catch(() => undefined);
+        }
       },
     });
     const nativeProcessLookupPath = this.context.asAbsolutePath(getProcessLookupHelperRelativePath());
@@ -1327,6 +1344,7 @@ export class PortManagerNetworkService implements DisposableLike {
   private async demoteBrowserNetworkProxyOwner(): Promise<void> {
     this.ownsBrowserNetworkProxyLease = false;
     this.browserNetworkProxyOwnershipGeneration += 1;
+    this.browserProxyRouteTableWatcher.clear();
     // As with logical routers, repeat cleanup catches host gateways opened by an
     // old reconciliation after its first asynchronous demotion pass began.
     await Promise.all([
@@ -1464,7 +1482,7 @@ export class PortManagerNetworkService implements DisposableLike {
    */
   async getBrowserIsolatedUrl(managedProcess: ManagedProcess): Promise<string | undefined> {
     const networks = this.registry.getSnapshot().networks;
-    this.syncBrowserDnsRecordsForNetworks(networks);
+    this.syncBrowserDnsRecords();
 
     if (!isBrowserProxyProcess(managedProcess, networks)) {
       return undefined;
@@ -2028,17 +2046,16 @@ export class PortManagerNetworkService implements DisposableLike {
     void this.context.globalState.update(BROWSER_DNS_INSTALL_OFFER_SIGNATURE_KEY, undefined);
   }
 
-  /** Publishes current network-name aliases to the daemon-owned DNS responder. */
-  private syncBrowserDnsRecords(): void {
+  /** Uses one durable snapshot for every publisher, including proxy and URL refreshes. */
+  private syncBrowserDnsRecords(): readonly NetworkDnsRecord[] {
     const document = this.sharedNetworkStateStore.load();
     if (document !== undefined) {
-      this.syncBrowserDnsRecordsForNetworks(document.state.networks, document.revision, this.sharedNetworkStateStore.filePath);
-      return;
+      return this.syncBrowserDnsRecordsForNetworks(document.state.networks, document.revision, this.sharedNetworkStateStore.filePath);
     }
-    this.syncBrowserDnsRecordsForNetworks(this.registry.getSnapshot().networks);
+    return this.syncBrowserDnsRecordsForNetworks(this.registry.getSnapshot().networks);
   }
 
-  /** Publishes aliases from the same snapshot used by browser proxy reconciliation. */
+  /** Keeps encoded aliases paired with the revision of the document that supplied them. */
   private syncBrowserDnsRecordsForNetworks(
     networks: readonly LogicalNetwork[],
     revision?: string,
@@ -3615,7 +3632,11 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Releases listeners and event subscriptions. */
   dispose(): void {
+    this.browserProxyDisposed = true;
+    this.browserProxyProcessCommandTextInFlight.clear();
+    this.browserProxyProcessCommandTextCache.clear();
     this.browserDnsSyncCoordinator?.dispose();
+    this.browserProxyRouteTableWatcher.dispose();
     if (this.ownerLeaseHeartbeatTimer !== undefined) {
       clearInterval(this.ownerLeaseHeartbeatTimer);
       this.ownerLeaseHeartbeatTimer = undefined;
@@ -5473,7 +5494,9 @@ export class PortManagerNetworkService implements DisposableLike {
     networkId: string,
     logicalPort: number,
   ): Promise<BrowserNetworkProxyTarget | undefined> {
-    const listener = await this.findNetworkScopedListener(networkId, logicalPort);
+    // findNetworkRoute already refreshed this snapshot; fallback must inspect
+    // that same observation instead of issuing a second OS refresh per miss.
+    const listener = await this.findNetworkScopedListener(networkId, logicalPort, undefined, false);
     if (listener === undefined) {
       return undefined;
     }
@@ -5489,6 +5512,7 @@ export class PortManagerNetworkService implements DisposableLike {
     networkId: string,
     logicalPort: number,
     targetHost?: string,
+    refreshIfMissing = true,
   ): Promise<ListeningPort | undefined> {
     const normalizedTargetHost = targetHost === undefined ? undefined : normalizeEndpointHostKey(targetHost);
     const findInSnapshot = async (snapshot: AgentSnapshot): Promise<ListeningPort | undefined> => {
@@ -5516,7 +5540,7 @@ export class PortManagerNetworkService implements DisposableLike {
     };
 
     const current = await findInSnapshot(this.getAgentSnapshot());
-    if (current !== undefined || this.processService === undefined) {
+    if (current !== undefined || this.processService === undefined || !refreshIfMissing) {
       return current;
     }
 
@@ -6227,6 +6251,7 @@ export class PortManagerNetworkService implements DisposableLike {
   private async syncBrowserNetworkProxies(
     options: BrowserNetworkProxySyncOptions = {},
   ): Promise<void> {
+    if (this.browserProxyDisposed) return;
     if (options.allowAdministratorPrompt === true) {
       this.browserProxyAdministratorPromptQueued = true;
     }
@@ -6248,7 +6273,7 @@ export class PortManagerNetworkService implements DisposableLike {
         this.browserProxySyncQueued = false;
         this.browserProxyAdministratorPromptQueued = false;
         await this.syncBrowserNetworkProxiesExclusive({ allowAdministratorPrompt });
-      } while (this.browserProxySyncQueued || this.browserProxyAdministratorPromptQueued);
+      } while (!this.browserProxyDisposed && (this.browserProxySyncQueued || this.browserProxyAdministratorPromptQueued));
     } finally {
       /*
        * Clear the generation in the runner's own continuation. If an external
@@ -6263,10 +6288,11 @@ export class PortManagerNetworkService implements DisposableLike {
   private async syncBrowserNetworkProxiesExclusive(
     options: BrowserNetworkProxySyncOptions = {},
   ): Promise<void> {
+    const startedAtMs = devLogEnabled() ? Date.now() : undefined;
     const snapshot = this.processService?.getSnapshot();
     const registrySnapshot = this.registry.getSnapshot();
     const networks = registrySnapshot.networks;
-    const dnsRecords = this.syncBrowserDnsRecordsForNetworks(networks);
+    const dnsRecords = this.syncBrowserDnsRecords();
 
     if (!tryAcquireBrowserNetworkProxyOwnerLease()) {
       await this.demoteBrowserNetworkProxyOwner();
@@ -6275,10 +6301,10 @@ export class PortManagerNetworkService implements DisposableLike {
 
     this.ownsBrowserNetworkProxyLease = true;
     const ownershipGeneration = this.browserNetworkProxyOwnershipGeneration;
-    // A closed daemon DNS socket is recoverable during ordinary owner
-    // convergence. Record availability, not a transient bind result, keeps
-    // published aliases stable while the daemon's bind retry recovers it.
-    await this.browserDnsSyncCoordinator?.waitForCurrentDrain().catch(() => undefined);
+    // DNS publication and TCP listeners use independent sockets. Reconcile
+    // the listeners immediately even while a daemon push/reconnect is pending;
+    // otherwise a healthy cached DNS answer can reach an unopened proxy port.
+    // Stable aliases also survive transient responder bind failures.
     const dnsRunning = this.getBrowserDnsRuntimeState().running;
     const useDnsAlias = dnsRunning || dnsRecords.length > 0;
     if (useDnsAlias) {
@@ -6289,18 +6315,19 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
-    const routes = mergeLogicalPortRoutes(
-      snapshot?.routes ?? [],
-      await this.readGeneratedRouteTableRoutesForNetworks(networks).catch(() => []),
-    );
-    const processCommandTextByPid = await this.readBrowserProxyProcessCommandTexts(snapshot?.processes ?? []);
+    // Route files and process metadata are independent fallback inputs. Read
+    // them together instead of adding their latencies before opening sockets.
+    const [generatedRoutes, processCommandTextByPid] = await Promise.all([
+      this.readGeneratedRouteTableRoutesForNetworks(networks).catch(() => []),
+      this.readBrowserProxyProcessCommandTexts(snapshot?.processes ?? []),
+    ]);
+    const routes = mergeLogicalPortRoutes(snapshot?.routes ?? [], generatedRoutes);
     const processEndpoints = collectBrowserProxyEndpoints(
       snapshot?.processes ?? [],
       networks,
       useDnsAlias,
       processCommandTextByPid,
     );
-    const routeHintTextByEndpointId = await this.readBrowserProxyRouteHintTexts(routes);
     if (!this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)) {
       await this.demoteBrowserNetworkProxyOwner();
       return;
@@ -6343,7 +6370,7 @@ export class PortManagerNetworkService implements DisposableLike {
       mergeBrowserProxyEndpoints(
         processEndpoints,
         mergeBrowserProxyEndpoints(
-          collectBrowserProxyRouteEndpoints(routes, networks, useDnsAlias, routeHintTextByEndpointId, processEndpoints),
+          collectBrowserProxyRouteEndpoints(routes, networks, useDnsAlias, processEndpoints),
           mergeBrowserProxyEndpoints(
             collectBrowserProxyComposeEndpoints(registrySnapshot.composeAttachments, networks, useDnsAlias),
             collectHostLocalGatewayRedirectEndpoints(hostLocalGatewayRedirects),
@@ -6376,6 +6403,7 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
+    const preparedAtMs = startedAtMs === undefined ? undefined : Date.now();
     await this.releaseHostGatewayPortsForBrowserEndpoints(endpoints).catch(() => undefined);
     if (!this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)) {
       await this.demoteBrowserNetworkProxyOwner();
@@ -6391,6 +6419,10 @@ export class PortManagerNetworkService implements DisposableLike {
     // Workers consume the elected owner's concrete port instead of attempting
     // a local bind when their DNS responder has not been started.
     publishBrowserNetworkProxyOwnerEndpoints(this.browserNetworkProxy, endpoints);
+    if (startedAtMs !== undefined && preparedAtMs !== undefined) {
+      const activeCount = endpoints.filter((endpoint) => this.browserNetworkProxy.has(endpoint.id)).length;
+      devLog("ts-browser-proxy", `sync routes=${routes.length} desired=${endpoints.length} active=${activeCount} prepareMs=${preparedAtMs - startedAtMs} bindMs=${Date.now() - preparedAtMs}`);
+    }
     await this.syncHostGatewayProxies(hostGatewayExposures).catch(() => undefined);
     if (!this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)) {
       await this.demoteBrowserNetworkProxyOwner();
@@ -6543,25 +6575,46 @@ export class PortManagerNetworkService implements DisposableLike {
         process.status === "running" &&
         process.networkId !== undefined &&
         process.url !== undefined &&
+        // These rows use route/Compose endpoints and isBrowserProxyProcess
+        // rejects them regardless of argv, so a process lookup cannot help.
+        process.source !== "detected" &&
+        process.source !== "compose" &&
+        process.source !== "allocated" &&
         !isPublicWebEntrypointProcess(process),
     );
-    const candidatePids = new Set(candidates.map((process) => process.pid));
+    const candidatesByPid = new Map(candidates.map((process) => [process.pid, process]));
+    const candidatePids = new Set(candidatesByPid.keys());
     this.pruneBrowserProxyProcessCommandTextCache(candidatePids, nowMs);
 
     const entries = await Promise.all(
-      candidates.map(async (process) => {
+      [...candidatesByPid.values()].map(async (process) => {
+        const identity = JSON.stringify([process.id, process.startedAt, process.networkId]);
         const cached = this.browserProxyProcessCommandTextCache.get(process.pid);
-        if (cached !== undefined && cached.expiresAtMs > nowMs) {
+        if (cached !== undefined && cached.identity === identity && cached.expiresAtMs > nowMs) {
           return cached.commandText === undefined ? undefined : ([process.pid, cached.commandText] as const);
         }
 
-        const command = await this.processEnvironmentProvider.readProcessCommand(process.pid).catch(() => undefined);
-        this.browserProxyProcessCommandTextCache.set(process.pid, {
-          commandText: command,
-          expiresAtMs:
-            Date.now() +
-            (command === undefined ? BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS : BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS),
-        });
+        let lookup = this.browserProxyProcessCommandTextInFlight.get(process.pid);
+        if (lookup?.identity !== identity) {
+          const promise = this.processEnvironmentProvider.readProcessCommand(process.pid).catch(() => undefined)
+            .then((command) => {
+              if (this.browserProxyProcessCommandTextInFlight.get(process.pid)?.promise === promise) {
+                this.browserProxyProcessCommandTextCache.set(process.pid, {
+                  identity, commandText: command,
+                  expiresAtMs: Date.now() +
+                    (command === undefined ? BROWSER_PROXY_COMMAND_TEXT_MISS_CACHE_TTL_MS : BROWSER_PROXY_COMMAND_TEXT_CACHE_TTL_MS),
+                });
+              }
+              return command;
+            }).finally(() => {
+              if (this.browserProxyProcessCommandTextInFlight.get(process.pid)?.promise === promise) {
+                this.browserProxyProcessCommandTextInFlight.delete(process.pid);
+              }
+            });
+          lookup = { identity, promise };
+          this.browserProxyProcessCommandTextInFlight.set(process.pid, lookup);
+        }
+        const command = await lookup.promise;
         return command === undefined ? undefined : ([process.pid, command] as const);
       }),
     );
@@ -6571,6 +6624,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Drops command-cache rows for disappeared processes and expired burst windows. */
   private pruneBrowserProxyProcessCommandTextCache(candidatePids: ReadonlySet<number>, nowMs: number): void {
+    for (const pid of this.browserProxyProcessCommandTextInFlight.keys()) {
+      if (!candidatePids.has(pid)) this.browserProxyProcessCommandTextInFlight.delete(pid);
+    }
     for (const [pid, entry] of this.browserProxyProcessCommandTextCache) {
       if (!candidatePids.has(pid) || entry.expiresAtMs <= nowMs) {
         this.browserProxyProcessCommandTextCache.delete(pid);
@@ -6586,87 +6642,13 @@ export class PortManagerNetworkService implements DisposableLike {
   private async readGeneratedRouteTableRoutesForNetworks(
     networks: readonly LogicalNetwork[],
   ): Promise<readonly LogicalPortRoute[]> {
-    if (networks.length === 0) {
-      return [];
-    }
-
     const baseRouteTablePath = getDefaultRouteTablePath();
-    const routeTableDirectory = path.dirname(baseRouteTablePath);
-    const filePaths = new Set<string>();
-
-    for (const network of networks) {
-      const networkRouteTablePath = getRouteTablePathForNetwork(network.id, baseRouteTablePath);
-      const parsedPath = path.parse(networkRouteTablePath);
-      const extension = parsedPath.ext.length > 0 ? parsedPath.ext : ".json";
-      const portShardPrefix = `${parsedPath.name}-port-`;
-
-      filePaths.add(networkRouteTablePath);
-
-      const entries = await fs.readdir(routeTableDirectory, { withFileTypes: true }).catch(() => []);
-      for (const entry of entries) {
-        if (entry.isFile() && entry.name.startsWith(portShardPrefix) && entry.name.endsWith(extension)) {
-          filePaths.add(path.join(routeTableDirectory, entry.name));
-        }
-      }
-    }
-
-    const routes: LogicalPortRoute[] = [];
-    for (const filePath of filePaths) {
-      routes.push(...(await readGeneratedRouteTableRoutes(filePath)));
-    }
-
-    return routes;
-  }
-
-  /** Builds cwd-derived browser endpoint hints for live route rows that have no managed process row yet. */
-  private async readBrowserProxyRouteHintTexts(
-    routes: readonly LogicalPortRoute[],
-  ): Promise<ReadonlyMap<string, string>> {
-    const nowMs = Date.now();
-    const routeByEndpointId = new Map<string, LogicalPortRoute>();
-    const activeCwds = new Set<string>();
-
-    for (const route of routes) {
-      if (route.networkId === undefined || route.cwd === undefined || !isLiveListenRoute(route) || !isTcpPort(route.logicalPort)) {
-        continue;
-      }
-
-      activeCwds.add(route.cwd);
-      routeByEndpointId.set(browserNetworkProxyEndpointId(route.networkId, route.logicalPort), route);
-    }
-
-    for (const [cwd, entry] of this.browserProxyRouteHintTextCache) {
-      if (!activeCwds.has(cwd) || entry.expiresAtMs <= nowMs) {
-        this.browserProxyRouteHintTextCache.delete(cwd);
-      }
-    }
-
-    const entries = await Promise.all(
-      [...routeByEndpointId.entries()].map(async ([endpointId, route]) => {
-        const hintText = await this.readBrowserProxyRouteHintText(route.cwd!);
-        const text = [route.processName, route.cwd, hintText].filter((part): part is string => part !== undefined).join(" ");
-        return [endpointId, text] as const;
-      }),
+    const tablePaths = networks.map((network) => getRouteTablePathForNetwork(network.id, baseRouteTablePath));
+    this.browserProxyRouteTableWatcher.setPaths(tablePaths);
+    return readGeneratedRouteTableRoutes(
+      tablePaths,
+      { expirationGraceMs: routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS) },
     );
-
-    return new Map(entries);
-  }
-
-  /** Reads generic project metadata that identifies a route row as a browser dev server. */
-  private async readBrowserProxyRouteHintText(cwd: string): Promise<string | undefined> {
-    const cached = this.browserProxyRouteHintTextCache.get(cwd);
-    if (cached !== undefined && cached.expiresAtMs > Date.now()) {
-      return cached.hintText;
-    }
-
-    const hintText = await readBrowserProxyRouteHintText(cwd).catch(() => undefined);
-    this.browserProxyRouteHintTextCache.set(cwd, {
-      hintText,
-      expiresAtMs:
-        Date.now() + (hintText === undefined ? BROWSER_PROXY_ROUTE_HINT_MISS_CACHE_TTL_MS : BROWSER_PROXY_ROUTE_HINT_CACHE_TTL_MS),
-    });
-
-    return hintText;
   }
 
   /**
@@ -9455,54 +9437,6 @@ function logicalRouteIdentity(route: Pick<LogicalPortRoute, "networkId" | "logic
   return `${route.networkId ?? ""}:${route.logicalPort}:${route.routeDirection === "send" ? "send" : "listen"}`;
 }
 
-async function readGeneratedRouteTableRoutes(filePath: string): Promise<readonly LogicalPortRoute[]> {
-  let parsed: unknown;
-
-  try {
-    parsed = JSON.parse(await fs.readFile(filePath, "utf8"));
-  } catch {
-    return [];
-  }
-
-  const document = parsed as {
-    readonly expiresAtMs?: unknown;
-    readonly routes?: unknown;
-  };
-
-  if (
-    typeof document.expiresAtMs === "number" &&
-    Number.isFinite(document.expiresAtMs) &&
-    Date.now() > document.expiresAtMs + routeTableRefreshMarginMs(ROUTE_TABLE_TTL_MS)
-  ) {
-    return [];
-  }
-
-  if (!Array.isArray(document.routes)) {
-    return [];
-  }
-
-  return document.routes.filter(isLogicalPortRoute);
-}
-
-function isLogicalPortRoute(value: unknown): value is LogicalPortRoute {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-
-  const route = value as Partial<LogicalPortRoute>;
-  return (
-    isTcpPort(route.logicalPort as number) &&
-    isTcpPort(route.actualPort as number) &&
-    typeof route.host === "string" &&
-    typeof route.status === "string" &&
-    typeof route.source === "string" &&
-    (route.networkId === undefined || typeof route.networkId === "string") &&
-    (route.routeDirection === undefined || route.routeDirection === "listen" || route.routeDirection === "send") &&
-    (route.cwd === undefined || typeof route.cwd === "string") &&
-    (route.processName === undefined || typeof route.processName === "string")
-  );
-}
-
 /** Builds a stable first-match index matching findMatchingRoute's route precedence. */
 function buildBrowserProxyRouteTargetIndex(
   routes: readonly LogicalPortRoute[],
@@ -9855,7 +9789,6 @@ function collectBrowserProxyRouteEndpoints(
   routes: readonly LogicalPortRoute[],
   networks: readonly LogicalNetwork[],
   useDnsAlias: boolean,
-  routeHintTextByEndpointId: ReadonlyMap<string, string>,
   processEndpoints: readonly BrowserNetworkProxyEndpoint[],
 ): readonly BrowserNetworkProxyEndpoint[] {
   const endpoints = new Map<string, BrowserNetworkProxyEndpoint>();
@@ -9883,7 +9816,6 @@ function collectBrowserProxyRouteEndpoints(
     // first byte, there is no need to classify the port as web vs raw ahead of
     // time — the classification heuristic broke exactly here for containerized
     // (Docker Compose) web services, which serve plain and reject HTTPS.
-    void routeHintTextByEndpointId;
     endpoints.set(endpointId, buildBrowserProxyRouteEndpoint(route, route.networkId, networks, useDnsAlias));
   }
 
@@ -10248,95 +10180,6 @@ function isPublicWebEntrypointText(text: string): boolean {
     /\buvicorn\b/,
     /\bgunicorn\b/,
   ].some((pattern) => pattern.test(normalizedText));
-}
-
-async function readBrowserProxyRouteHintText(cwd: string): Promise<string | undefined> {
-  const hints: string[] = [];
-
-  const packageJsonText = await readSmallTextFile(path.join(cwd, "package.json"));
-  if (packageJsonText !== undefined) {
-    hints.push(extractPackageBrowserRouteHints(packageJsonText));
-  }
-
-  for (const fileName of [
-    "vite.config.js",
-    "vite.config.mjs",
-    "vite.config.cjs",
-    "vite.config.ts",
-    "next.config.js",
-    "next.config.mjs",
-    "nuxt.config.js",
-    "nuxt.config.ts",
-    "astro.config.js",
-    "astro.config.mjs",
-    "astro.config.ts",
-    "svelte.config.js",
-    "webpack.config.js",
-    "vue.config.js",
-    "manage.py",
-  ]) {
-    if (await fileExists(path.join(cwd, fileName))) {
-      hints.push(fileName);
-    }
-  }
-
-  const pyprojectText = await readSmallTextFile(path.join(cwd, "pyproject.toml"));
-  if (pyprojectText !== undefined && /\b(django|uvicorn|gunicorn|daphne)\b/i.test(pyprojectText)) {
-    hints.push(pyprojectText);
-  }
-
-  const normalizedHints = hints.map((hint) => hint.trim()).filter((hint) => hint.length > 0);
-  return normalizedHints.length === 0 ? undefined : normalizedHints.join(" ");
-}
-
-function extractPackageBrowserRouteHints(packageJsonText: string): string {
-  try {
-    const packageJson = JSON.parse(packageJsonText) as {
-      readonly scripts?: unknown;
-      readonly dependencies?: unknown;
-      readonly devDependencies?: unknown;
-    };
-    const hints: string[] = [];
-
-    for (const value of Object.values(isRecord(packageJson.scripts) ? packageJson.scripts : {})) {
-      if (typeof value === "string") {
-        hints.push(value);
-      }
-    }
-
-    for (const dependencyBlock of [packageJson.dependencies, packageJson.devDependencies]) {
-      if (!isRecord(dependencyBlock)) {
-        continue;
-      }
-      hints.push(...Object.keys(dependencyBlock));
-    }
-
-    return hints.join(" ");
-  } catch {
-    return packageJsonText;
-  }
-}
-
-async function readSmallTextFile(filePath: string): Promise<string | undefined> {
-  try {
-    const stats = await fs.stat(filePath);
-    if (!stats.isFile() || stats.size > 128_000) {
-      return undefined;
-    }
-
-    return await fs.readFile(filePath, "utf8");
-  } catch {
-    return undefined;
-  }
-}
-
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    const stats = await fs.stat(filePath);
-    return stats.isFile();
-  } catch {
-    return false;
-  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

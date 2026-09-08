@@ -27,8 +27,6 @@ test("native registration is send-only while allocation and release remain round
   const clientLoopStart = agentSource.indexOf("revents = poll_fds[index + 1].revents;");
   const clientLoopEnd = agentSource.indexOf("if (handled_io)", clientLoopStart);
   const clientLoop = agentSource.slice(clientLoopStart, clientLoopEnd);
-  const eventLoopStart = agentSource.indexOf("static void pm_event_loop");
-  const eventLoop = agentSource.slice(eventLoopStart);
 
   assert.notEqual(registerStart, -1);
   assert.equal(hookSource.slice(registerStart, registerEnd).includes("pm_send_simple_payload_only"), true);
@@ -38,10 +36,8 @@ test("native registration is send-only while allocation and release remain round
   assert.equal(hookSource.includes('PORT_MANAGER_AGENT_SEND_TIMEOUT_MS'), true);
   assert.notEqual(clientLoopStart, -1);
   assert.equal(clientLoop.indexOf("if (revents & POLLIN)") < clientLoop.indexOf("POLLERR | POLLHUP | POLLNVAL"), true);
-  assert.notEqual(eventLoopStart, -1);
-  // UI fan-out is memory-authoritative and intentionally precedes deferred
-  // route-file publication during hook I/O bursts.
-  assert.equal(eventLoop.indexOf("pm_broadcast_snapshot(") < eventLoop.indexOf("pm_state_flush_route_tables(state)"), true);
+  // Publication now runs independently of UI fan-out. Its ordering and latency
+  // are covered by the native-agent-publication runtime regressions.
 });
 
 if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {

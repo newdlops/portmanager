@@ -185,6 +185,34 @@ per-network loopback alias는 호스트 전역 `lo0`에 존재하므로(macOS엔
 
 Local DNS responder(UDP `127.0.0.1:53153`)는 VS Code 창이 아니라 **공유 라우팅 데몬이 소유**한다. 창 소유 responder는 소켓 수명이 한 창에 묶이는 반면 레코드 갱신은 cross-window owner lease를 따라가므로, owner가 다른 창으로 넘어가면 소켓을 쥔 강등된 창의 테이블이 동결되어 이후 생성·attach된 네트워크가 NXDOMAIN이 된다. 모든 창은 전체 레코드 집합을 데몬에 idempotent full-replace로 push하고(owner 여부와 무관), push에는 durable shared-state revision과 문서 경로를 포함한다. 데몬은 현재 문서 revision만 적용하고 같은 revision replay는 성공 처리하며, 지연된 revision·문서 없는 writer·authoritative fence 뒤의 unversioned writer는 마지막 테이블을 보존한 채 `applied:false`로 거절한다. 레코드와 fence는 route table 옆에 원자적으로 영속화되어 데몬 재시작과 확장 미실행 구간에도 응답을 유지하며, 구버전 확장 창이 포트를 놓을 때까지 UDP bind를 재시도한다.
 
+Browser URL/proxy 갱신도 같은 durable snapshot으로 DNS를 게시해 version 없는 요청이 최신 게시를 밀어내지 않아야 한다. 새 revision과 fence rejection 뒤의 최신 문서는 이전 요청의 retry backoff 없이 전송하고, 동일 문서의 반복 실패만 backoff한다. Browser TCP listener 준비는 DNS 동기화 응답을 기다리지 않아야 하며, DNS가 이미 정상인 새 서버/재시작 경로를 daemon 재연결 대기 때문에 지연시키면 안 된다.
+
+네이티브 DNS 응답은 OS listener scan/repair의 대기를 공유하지 않는 전용 실행 흐름에서 처리한다. revision 검증·영속화는 별도 게시 worker가 담당하고, control thread가 완성된 레코드 집합만 짧은 임계 구간에서 교체한다. 종료와 재바인딩은 응답 작업 종료 후 소켓과 테이블을 회수해야 한다. 스레드가 있는 daemon의 managed child는 argv/env를 fork 전에 준비하고 exec까지 async-signal-safe 호출만 사용한다.
+
+실행 중 route 파일 게시와 DNS 영속화는 서로 독립된 직렬 실행 흐름에서 처리해 파일 I/O가 상태 조회·제어 요청·기존 DNS 답변을 막지 않아야 한다. route 변경은 idle 40ms 또는 최초 미수집 변경의 250ms 기한에 불변 사본을 예약하며, 지속적인 입력도 기한을 연장하지 않는다. 진행 중인 쓰기 뒤에는 최신 사본 하나만 병합하고 새 변경은 별도 예약 기한을 시작한다. 파일시스템 완료 시간은 이 예약 기한에 포함하지 않는다. TTL heartbeat는 유지한다. `flushRouteTables`·noncompact allocation·`repairRoutingState`는 파일 반영 후에만 성공을 반환하며 이전 사본 완료가 새 변경을 소거하면 안 된다. repair 강제 재작성과 writer generation 검증은 병합 후에도 유지하고, route generation·DNS authority는 rename 직전에 재확인한다. DNS 후속 작업은 앞선 완료가 반영된 revision을 기준으로 판정한다. route 사본은 진행 중인 것과 최신 대기 사본을 합해 256MiB, DNS 사본은 진행 중인 작업을 포함해 32개·32MiB로 제한한다. 부분 게시·삭제 실패는 이전 경로와 새 경로를 모두 보관해 재시도에서 정리를 이어간다. 응답 대기는 연결당 128개·전체 1,024개·payload 8MiB로 제한한다. 큐 진입부터 8초가 지나면 성공을 반환하지 않으며 기한 초과·종료 뒤 반환된 작업은 commit 전에 취소를 확인한다. 커널 파일 호출의 강제 중단에 의존하지 않고 daemon 종료가 해당 작업의 join에 묶이지 않아야 한다.
+
+새 DNS 게시와 상태 조회도 OS scan 완료를 기다리지 않아야 한다. `lsof`/fallback `ps`는 기한·출력 크기·동시 실행 수를 제한한 비동기 subprocess로 실행하고, 같은 socket의 다른 RPC는 응답 id로 독립 처리한다. stop/remove 같은 topology 무효화는 이전 관측을 폐기한다. 등록은 변경된 process의 revision으로만 보호하고 전체 스캔을 재시작하지 않는다. 관측 시작 이후 등록된 행은 이전 결과로 소유자·missing 상태를 바꾸지 않으며, 캐시에서도 이전 PID를 중복 process로 만들지 않는다. 동일 등록은 시작 시각과 revision을 유지한다. state 적용은 control thread에서만 수행한다. 실패·기한 초과의 부분 결과는 기존 정상 관측이나 살아 있는 route를 지우는 근거로 사용하지 않는다. 읽기 취소는 조회를 정리하되 이미 접수한 send-only mutation은 완료해야 한다.
+
+느린 socket 수신자가 새 DNS 게시·상태 조회를 지연시키면 안 된다. 응답·snapshot·control 명령은 연결별 FIFO로 대기시키고 단일 poll loop에서 nonblocking 부분 전송한다. 출력 작업은 연결당 64KiB, 전체 turn당 256KiB 또는 5ms로 제한한다. 대기 한도는 연결당 8MiB·128프레임, 전체 payload 64MiB·16,384프레임이며 프레임 대기는 1초를 넘기지 않는다. 한 바이트도 보내지 않은 snapshot만 최신 것으로 병합하고, 부분 프레임과 응답은 보존한다. 제어 명령은 전체 전송 후 성공을 알리며 중도 단절은 실패로 반환한다. 상대가 쓰기 방향만 닫았을 때와 daemon 종료 때도 기존 기한 안에서 남은 응답을 전송한다.
+
+Browser route가 없을 때는 한 번 갱신한 snapshot으로 route와 network-scoped listener를 함께 판정한다. 같은 client 연결의 동시 refresh는 하나로 합치고, 새 서버 등록을 지연시키는 miss cache를 두지 않는다. command 분류는 PID별로 합치되 프로세스 정체성이 바뀌면 이전 결과를 재사용하지 않는다.
+
+HTTP 응답의 localhost origin 재작성은 스트리밍을 유지해야 한다. URL·UTF-8 청크 경계와 기존 네트워크별 재작성 규칙을 보존하고, downstream backpressure 및 브라우저 취소를 upstream으로 전달한다. 재작성으로 본문 길이가 달라질 수 있으면 기존 Content-Length를 제거한다. route watcher는 이름이 알려진 변경 파일만 다시 읽고 TTL 만료를 별도로 관측하며, 초기화·이벤트 이름 누락·watch 재연결에서는 전체 파일을 조회한다. 실제 route 적용에 사용하는 snapshot reader는 매번 파일을 새로 읽는다.
+
+Browser proxy는 경로 조회와 TCP/TLS 연결 준비를 각각 제한된 시간 안에 끝내야 한다(기본 10초/5초). HTTP 준비 시간 초과는 504, 일반 연결 실패는 502로 응답하며 요청을 자동 재전송하지 않는다. 브라우저 취소·owner 인계 후 늦게 반환된 route는 HTTP/WebSocket/raw 모두 새 upstream 연결을 만들면 안 된다. 연결 준비 제한은 socket 할당 후 connect/secureConnect까지에만 적용하고, pool 대기·연결된 앱의 응답 대기·업로드·SSE·WebSocket·raw 세션의 유휴 시간에는 적용하지 않는다. keep-alive 재사용 socket은 이미 준비된 것으로 취급한다.
+
+HTTP pool admission은 별도의 대기 기한(기본 10초)과 개수 제한(upstream origin마다 동시 64개·대기 128개)을 둔다. 대기 초과는 504, 대기열 포화는 503이며, 취소·만료된 요청을 나중에 upstream으로 보내지 않는다. 대기열은 `ClientRequest` 생성 전에 관리하고 취소 시 즉시 제거한다. 이미 연결된 SSE 등 장기 응답은 이 대기 기한으로 종료하지 않는다. 실제로 기다린 요청은 전송 직전에 경로를 다시 조회하고 host/port/protocol 변경 시 새 origin의 admission을 거친다. 재조회와 origin 이동이 최초 대기 기한을 연장하면 안 되며, 이미 보낸 요청을 재전송하지 않는다.
+
+프로토콜 스니핑은 TCP 패킷 경계에 의존하지 않는다. HTTP method가 여러 청크로 나뉘어도 기존 Host/origin 재작성을 유지하도록 최대 8바이트의 접두부를 조합한다. HTTP인지 아직 판정할 수 없는 접두부는 기본 1초까지만 기다린 뒤 보관한 바이트 그대로 raw 경로로 전달하고, 판정 중 FIN을 받은 모호한 접두부도 raw head로 전달한다. reset·취소는 타이머와 접두부를 정리한다.
+
+서버가 먼저 인사말을 보내는 TCP 프로토콜도 alias를 통해 연결되어야 한다. 클라이언트가 기본 100ms 동안 침묵하면 upstream 연결을 준비하되, 서버 데이터가 도착해야 raw로 확정한다. 먼저 클라이언트 바이트가 도착하면 준비 연결을 취소하고 HTTP/TLS 판별을 유지한다. 첫 서버 데이터와 이후 양방향 바이트를 유실 없이 전달하고, 취소·owner 인계 뒤에는 연결을 만들지 않는다. 인사말 전 EOF는 대기 클라이언트와 준비 소켓을 함께 정리한다. raw/upgrade의 FIN은 한 방향 종료로 전달하고 반대 방향의 응답과 write buffer는 끝까지 비운다. 오류·reset·owner 해제는 양쪽을 정리한다.
+
+Browser listener 준비는 프로토콜 판별에 사용하지 않는 프로젝트 파일을 조회하지 않는다. Fallback route shard는 폴더당 한 번 열거하고 제한된 수로 병렬 읽되, network table과 port shard의 기존 우선순위 및 만료 정책을 유지한다. Bind 전 점유 확인에는 짧은 제한 시간을 두어 응답 없는 alias 하나가 다른 네트워크의 listener 준비를 무기한 막지 않아야 한다.
+
+Browser bind 실패는 짧은 초기 지연 뒤 자동 재시도하고, 연속 실패할 때만 대기 시간을 늘린다. 재시도 전에 현재 owner lease와 최신 desired endpoint를 확인하며, 제거·소유권 인계·종료 후에는 재생성하지 않는다. 주소나 후보 포트가 바뀐 endpoint에 이전 실패의 대기시간을 적용하지 않는다. 독립적인 bind는 최대 8개씩 병렬 준비하되 같은 bind 좌표의 후보 우선순위는 유지한다. TLS key/certificate와 지문은 한 번의 reconciliation에서 공통으로 사용하고, 교체 중 읽기·파싱 실패는 기존 연결을 끊지 않는다.
+
+Browser owner는 생성된 network route table과 port shard의 생성·원자적 교체·삭제를 감지해 daemon 이벤트 누락 시에도 proxy를 재동기화한다. 짧은 고정 구간으로 변경 신호를 합치고 실제 라우팅 내용이 같은 heartbeat는 갱신을 유발하지 않는다. 소유권을 잃으면 watcher와 진행 중인 읽기의 callback을 해제하며, watcher 장애 시 기존 주기적 reconciliation이 복구 경로로 남는다.
+
 Diagnostics UI는 **Repair Local DNS** 작업을 제공해야 한다. 이 작업은 파일 기반 상태가 정상으로 보여도 `/etc/resolver`, `/etc/hosts`, DNS 캐시와 per-network loopback alias를 관리자 승인 아래 멱등적으로 다시 적용하고, Local DNS responder의 현재 레코드 및 브라우저 proxy를 재동기화해야 한다. macOS 재부팅으로 비영속 `lo0` alias만 사라진 경우에도 최초 설치를 지우거나 네트워크별 작업을 반복하지 않고 한 번의 사용자 작업으로 복구되어야 한다.
 
 DNS/TLS 설치 알림은 실패 전에 영구적으로 억제 상태를 기록하면 안 된다. 설치 실패는

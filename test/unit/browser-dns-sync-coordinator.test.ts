@@ -15,15 +15,17 @@ function fixture(
   resolveRejected: (value: BrowserDnsSyncBatch) => RejectedResolution = () => ({ kind: "retry" }),
 ) {
   const timers: { readonly delay: number; readonly callback: () => void }[] = [];
+  const cancelled: unknown[] = [];
   return {
     timers,
+    cancelled,
     coordinator: new BrowserDnsSyncCoordinator({
       send,
       resolveRejected,
       onResult: () => undefined,
       onError: () => undefined,
       schedule: (delay, callback) => { timers.push({ delay, callback }); return callback; },
-      cancel: () => undefined,
+      cancel: (timer) => { cancelled.push(timer); },
     }),
   };
 }
@@ -111,7 +113,7 @@ test("coordinator retries an accepted table until the DNS responder is bound", a
   assert.deepEqual(sent, ["A", "A"]);
 });
 
-test("explicit flush bypasses an existing retry delay for the latest table", async () => {
+test("explicit flush bypasses an existing retry delay even for the same table", async () => {
   const sent: string[] = [];
   const f = fixture(async (value) => {
     sent.push(value.signature);
@@ -122,11 +124,87 @@ test("explicit flush bypasses an existing retry delay for the latest table", asy
   await tick();
   assert.equal(f.timers[0]?.delay, 100);
 
-  f.coordinator.enqueue(batch("B"));
+  f.coordinator.enqueue(batch("A"));
   await f.coordinator.flushPendingNow();
 
-  assert.deepEqual(sent, ["A", "B"]);
+  assert.deepEqual(sent, ["A", "A"]);
+  assert.deepEqual(f.cancelled, [f.timers[0]!.callback]);
+  f.coordinator.dispose();
 });
+
+test("a new DNS revision bypasses the failed revision's backoff", async () => {
+  const sent: string[] = [];
+  const f = fixture(async (value) => {
+    sent.push(value.signature);
+    if (value.signature === "A") throw new Error("daemon unavailable");
+    return { applied: true, running: true, port: 1 };
+  });
+  f.coordinator.enqueue(batch("A"));
+  await f.coordinator.waitForCurrentDrain();
+  const retry = f.timers[0]!;
+
+  // A new network must be published without waiting for A's retry timer.
+  f.coordinator.enqueue(batch("B"));
+  await f.coordinator.waitForCurrentDrain();
+
+  assert.deepEqual(sent, ["A", "B"]);
+  assert.deepEqual(f.cancelled, [retry.callback]);
+  assert.equal(f.timers.length, 1);
+  f.coordinator.dispose();
+});
+
+test("duplicate DNS revisions preserve transport backoff during snapshot churn", async () => {
+  const sent: string[] = [];
+  const f = fixture(async (value) => { sent.push(value.signature); throw new Error("offline"); });
+  f.coordinator.enqueue(batch("A"));
+  await f.coordinator.waitForCurrentDrain();
+
+  for (let index = 0; index < 20; index++) f.coordinator.enqueue(batch("A"));
+  await f.coordinator.waitForCurrentDrain();
+  assert.deepEqual(sent, ["A"]);
+  assert.equal(f.timers.length, 1);
+  assert.equal(f.cancelled.length, 0);
+
+  f.timers[0]!.callback();
+  await f.coordinator.waitForCurrentDrain();
+  assert.deepEqual(sent, ["A", "A"]);
+  assert.equal(f.timers[1]?.delay, 200);
+  f.coordinator.dispose();
+});
+
+for (const failure of ["transport", "bind"] as const) {
+  test(`a queued new revision is sent immediately after an in-flight ${failure} failure`, async () => {
+    const sent: string[] = [];
+    let release!: () => void;
+    let pending = 0;
+    let maxPending = 0;
+    const f = fixture(async (value) => {
+      sent.push(value.signature);
+      maxPending = Math.max(maxPending, ++pending);
+      try {
+        if (value.signature === "A") {
+          await new Promise<void>((resolve) => { release = resolve; });
+          if (failure === "transport") throw new Error("disconnected");
+          return { applied: true, running: false, port: 1 };
+        }
+        return { applied: true, running: true, port: 1 };
+      } finally {
+        pending--;
+      }
+    });
+
+    f.coordinator.enqueue(batch("A"));
+    f.coordinator.enqueue(batch("B"));
+    f.coordinator.enqueue(batch("C"));
+    release();
+    await f.coordinator.waitForCurrentDrain();
+
+    assert.deepEqual(sent, ["A", "C"]);
+    assert.equal(maxPending, 1);
+    assert.equal(f.timers.length, 0);
+    f.coordinator.dispose();
+  });
+}
 
 test("coordinator applies production resolver retry, replace, and drop outcomes", async () => {
   const outcomes: readonly RejectedResolution[] = [
@@ -145,11 +223,9 @@ test("coordinator applies production resolver retry, replace, and drop outcomes"
   assert.equal(f.timers.length, 1);
   f.timers[0]!.callback();
   await tick();
-  assert.deepEqual(sent, ["A", "A"]);
-  assert.equal(f.timers.length, 2);
-  f.timers[1]!.callback();
-  await tick();
   assert.deepEqual(sent, ["A", "A", "B"]);
-  assert.deepEqual(sent, ["A", "A", "B"]);
-  assert.equal(f.timers.length, 2);
+  // Fence rejection points us at a different, current document. It is ready
+  // to send now; only retrying the same failed document needs a timer.
+  assert.equal(f.timers.length, 1);
+  f.coordinator.dispose();
 });

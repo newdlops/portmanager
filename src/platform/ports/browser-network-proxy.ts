@@ -1,8 +1,13 @@
+import {
+  buildEndpointMetadata,
+  type BrowserNetworkProxyEndpointMetadata,
+} from "./browser-network-proxy-http";
+export { rewriteBrowserProxyResponseTextForTest } from "./browser-network-proxy-http";
 import { createHash } from "node:crypto";
 import * as http from "node:http";
 import * as https from "node:https";
 import * as net from "node:net";
-import * as tls from "node:tls";
+import { BrowserNetworkProxyTransport, sniffBrowserProxyConnection } from "./browser-network-proxy-transport";
 
 export interface BrowserNetworkProxyEndpoint {
   /** Stable id for one network/logical-port browser entrypoint. */
@@ -50,8 +55,24 @@ export interface BrowserNetworkProxyTargetResolver {
 }
 
 export interface BrowserNetworkProxyOptions {
-  /** Backoff after a failed bind, keeping background sync from retrying hot loops. */
+  /** Maximum wait for a live route; defaults to the agent RPC budget of 10s. */
+  readonly resolveTimeoutMs?: number;
+  /** TCP/TLS setup budget after socket allocation, default 5s; established streams have no idle limit. */
+  readonly connectTimeoutMs?: number;
+  /** Maximum wait for an ambiguous partial HTTP method before raw forwarding, default 1s. */
+  readonly sniffTimeoutMs?: number;
+  /** Idle clients probe for a server-first greeting after 100ms, without committing HTTP/TLS to raw TCP. */
+  readonly serverGreetingDelayMs?: number;
+  /** Per upstream origin HTTP concurrency; defaults to 64. */
+  readonly maxConcurrentHttpRequests?: number;
+  /** Per upstream origin waiting requests; defaults to 128. Overflow receives 503. */
+  readonly maxQueuedHttpRequests?: number;
+  /** Admission wait budget, default 10s. Expiry receives 504 without sending the request upstream. */
+  readonly queueTimeoutMs?: number;
+  /** Initial bind retry delay; repeated failures grow up to 30s (or a larger initial delay). */
   readonly retryDelayMs?: number;
+  /** Lets the owner refresh desired routes and validate its lease before a timed retry. */
+  readonly onRetryDue?: () => Promise<void>;
   /** Grace window before closing endpoints that briefly disappear from route snapshots. */
   readonly retireDelayMs?: number;
   /** Supplies the dev TLS certificate used by HTTPS browser-facing endpoints. */
@@ -67,8 +88,8 @@ export interface BrowserNetworkProxyTlsCredentials {
 
 export interface BrowserNetworkProxyTlsCredentialsProvider {
   /**
-   * Returns the active TLS identity. The manager calls this when opening a
-   * listener so certificate refreshes are picked up on the next reconciliation.
+   * Returns the active TLS identity once per sync/ensure. The next reconciliation
+   * observes certificate rotation without repeatedly loading each listener's PEM.
    */
   getCredentials(): BrowserNetworkProxyTlsCredentials | undefined;
 }
@@ -98,28 +119,6 @@ interface BrowserNetworkProxyListener {
 
 type BrowserNetworkProxyServer = net.Server;
 
-/** First byte of a TLS record for a handshake (ContentType handshake = 22). */
-const TLS_HANDSHAKE_RECORD_TYPE = 0x16;
-
-/** HTTP request-line method prefixes used to sniff plaintext HTTP from raw TCP. */
-const HTTP_REQUEST_METHOD_PREFIXES = [
-  "GET ",
-  "HEAD ",
-  "POST ",
-  "PUT ",
-  "DELETE ",
-  "OPTIONS ",
-  "PATCH ",
-  "CONNECT ",
-  "TRACE ",
-];
-
-/** True when a peeked chunk begins with an HTTP request line (method + space). */
-function looksLikeHttpRequestLine(chunk: Buffer): boolean {
-  const prefix = chunk.subarray(0, 8).toString("latin1");
-  return HTTP_REQUEST_METHOD_PREFIXES.some((method) => prefix.startsWith(method));
-}
-
 interface BrowserNetworkProxyServerBuild {
   /** Outer listener that sniffs each connection and demultiplexes TLS from raw TCP. */
   readonly server: net.Server;
@@ -134,52 +133,26 @@ interface BrowserNetworkProxyTlsDispatch {
   server?: https.Server;
 }
 
-interface BrowserNetworkProxyEndpointMetadata {
-  /** Browser-facing origin used in response rewrites. */
-  readonly publicOrigin: string;
-  /** Browser-facing protocol selected for HTTP URL rewrites. */
-  readonly publicProtocol: "http" | "https";
-  /** Browser-facing hostname formatted for URLs. */
-  readonly publicHost: string;
-  /** Concrete browser-facing port. The current logical port may use a fallback. */
-  readonly publicPort: number;
-  /** Current logical port whose localhost origin maps to publicPort. */
-  readonly logicalPort: number;
-  /** Localhost origin presented to development servers. */
-  readonly upstreamOrigin: string;
-  /** Host header value sent to development servers. */
-  readonly upstreamHostHeader: string;
-  /** Localhost variants that may appear in redirect/CORS headers. */
-  readonly upstreamOrigins: readonly string[];
-  /**
-   * Network-specific loopback address the hooked dev server actually binds to
-   * (e.g. 127.96.x). Apps that build self-URLs from their bound socket address
-   * (Vite's HMR/"Network:" URL, `server.address()`) emit this IP, which the
-   * localhost-only rewrite patterns miss — so it is rewritten to the public
-   * alias too. Undefined when it is just a localhost variant already covered.
-   */
-  readonly upstreamLoopbackHost?: string;
+/** One reconciliation observes one TLS identity, including during certificate rotation. */
+interface BrowserNetworkProxyTlsIdentity {
+  readonly credentials: BrowserNetworkProxyTlsCredentials;
+  readonly fingerprint: string;
 }
 
-const DEFAULT_RETRY_DELAY_MS = 30_000;
+interface BrowserNetworkProxyBindFailure {
+  readonly endpoint: BrowserNetworkProxyEndpoint;
+  readonly attempts: number;
+  readonly retryAtMs: number;
+}
+
+const DEFAULT_RETRY_DELAY_MS = 100;
+const MAX_RETRY_DELAY_MS = 30_000;
+const MAX_CONCURRENT_OPENS = 8;
 const DEFAULT_RETIRE_DELAY_MS = 30_000;
-const LOCALHOST_UPSTREAM_HOST = "localhost";
+/** A blackholed loopback probe must not stall every endpoint in a serialized sync. */
+const PORT_AVAILABILITY_TIMEOUT_MS = 250;
 const UPSTREAM_KEEP_ALIVE_MAX_SOCKETS = 64;
 const UPSTREAM_KEEP_ALIVE_MAX_FREE_SOCKETS = 16;
-const RESPONSE_ORIGIN_REWRITE_HEADER_NAMES = new Set([
-  "location",
-  "content-location",
-  "refresh",
-  "access-control-allow-origin",
-  "link",
-  "content-security-policy",
-  "content-security-policy-report-only",
-]);
-const ABSOLUTE_LOCALHOST_ORIGIN_PATTERN =
-  /\b(https?|wss?):\/\/(localhost|127\.0\.0\.1|\[::1\])(?::(\d{1,5}))?(?=\/|[?#"'`\s<);]|$)/gi;
-const PROTOCOL_RELATIVE_LOCALHOST_ORIGIN_PATTERN =
-  /(^|[^:])\/\/(localhost|127\.0\.0\.1|\[::1\])(?::(\d{1,5}))?(?=\/|[?#"'`\s<);]|$)/gi;
-
 /**
  * Development-only browser isolation proxy.
  *
@@ -191,8 +164,15 @@ export class BrowserNetworkProxyManager {
   /** Active browser entrypoints keyed by network/logical-port endpoint id. */
   private readonly listeners = new Map<string, BrowserNetworkProxyListener>();
 
-  /** Failed endpoint retries are throttled so missing macOS lo0 aliases stay cheap. */
-  private readonly retryAfterById = new Map<string, number>();
+  /** Only the latest desired endpoints may be resurrected by a timed bind retry. */
+  private desiredEndpoints = new Map<string, BrowserNetworkProxyEndpoint>();
+
+  /** Consecutive failures are scoped to immutable bind coordinates, not just endpoint IDs. */
+  private readonly bindFailures = new Map<string, BrowserNetworkProxyBindFailure>();
+
+  /** One wakeup serves all failed endpoints; neither the timer nor callbacks survive releaseAll. */
+  private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private retryInFlight = false;
 
   /** Delayed closes for endpoints that vanished during a transient routing refresh. */
   private readonly retireTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -210,10 +190,15 @@ export class BrowserNetworkProxyManager {
    */
   private ownershipGeneration = 0;
 
+  /** Per-request setup and cancellation is independent of listener reconciliation. */
+  private readonly transport: BrowserNetworkProxyTransport;
+
   constructor(
-    private readonly targetResolver: BrowserNetworkProxyTargetResolver,
+    targetResolver: BrowserNetworkProxyTargetResolver,
     private readonly options: BrowserNetworkProxyOptions = {},
-  ) {}
+  ) {
+    this.transport = new BrowserNetworkProxyTransport(targetResolver, options);
+  }
 
   /** Reconciles active browser proxies with the latest running web processes. */
   async sync(endpoints: Iterable<BrowserNetworkProxyEndpoint>): Promise<void> {
@@ -234,6 +219,14 @@ export class BrowserNetworkProxyManager {
         desired.set(endpoint.id, normalizeEndpoint(endpoint));
       }
     }
+    this.desiredEndpoints = desired;
+    for (const [id, failure] of this.bindFailures) {
+      const endpoint = desired.get(id);
+      if (endpoint === undefined || !sameBindCandidates(failure.endpoint, endpoint)) {
+        this.bindFailures.delete(id);
+      }
+    }
+    const tlsIdentity = desired.size === 0 ? undefined : this.readTlsIdentity();
 
     for (const [id, listener] of [...this.listeners]) {
       if (ownershipGeneration !== this.ownershipGeneration) {
@@ -248,42 +241,16 @@ export class BrowserNetworkProxyManager {
 
       this.cancelRetire(id);
       if (!isEndpointBindCurrent(listener.endpoint, endpoint)) {
-        await this.close(id);
+        await this.closeListener(id);
       } else {
-        this.reconcileListener(listener, endpoint);
+        this.reconcileListener(listener, endpoint, tlsIdentity);
       }
     }
 
-    for (const endpoint of desired.values()) {
-      if (ownershipGeneration !== this.ownershipGeneration) {
-        return;
-      }
-
-      this.cancelRetire(endpoint.id);
-      if (this.listeners.has(endpoint.id)) {
-        continue;
-      }
-
-      const retryAfter = this.retryAfterById.get(endpoint.id) ?? 0;
-      if (Date.now() < retryAfter) {
-        continue;
-      }
-
-      try {
-        await this.open(endpoint);
-        if (ownershipGeneration !== this.ownershipGeneration) {
-          await this.close(endpoint.id);
-          return;
-        }
-      } catch {
-        if (ownershipGeneration === this.ownershipGeneration) {
-          this.retryAfterById.set(
-            endpoint.id,
-            Date.now() + (this.options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS),
-          );
-        }
-      }
-    }
+    await this.openPendingEndpoints([...desired.values()].filter((endpoint) =>
+      !this.listeners.has(endpoint.id) && Date.now() >= (this.bindFailures.get(endpoint.id)?.retryAtMs ?? 0),
+    ), ownershipGeneration, tlsIdentity);
+    this.scheduleRetry();
   }
 
   /** Opens or returns one endpoint immediately, ignoring background retry backoff. */
@@ -300,31 +267,34 @@ export class BrowserNetworkProxyManager {
       return undefined;
     }
     const normalizedEndpoint = normalizeEndpoint(endpoint);
+    if (!isTcpPort(normalizedEndpoint.logicalPort) || normalizedEndpoint.listenPorts.length === 0) return undefined;
+    this.desiredEndpoints.set(normalizedEndpoint.id, normalizedEndpoint);
+    const tlsIdentity = this.readTlsIdentity();
     const listener = this.listeners.get(normalizedEndpoint.id);
     if (listener !== undefined && isEndpointBindCurrent(listener.endpoint, normalizedEndpoint)) {
       this.cancelRetire(normalizedEndpoint.id);
-      this.reconcileListener(listener, normalizedEndpoint);
+      this.reconcileListener(listener, normalizedEndpoint, tlsIdentity);
       return listener.endpoint;
     }
 
-    this.retryAfterById.delete(normalizedEndpoint.id);
-    await this.close(normalizedEndpoint.id);
+    this.bindFailures.delete(normalizedEndpoint.id);
+    await this.closeListener(normalizedEndpoint.id);
+    if (ownershipGeneration !== this.ownershipGeneration || !this.desiredEndpoints.has(normalizedEndpoint.id)) return undefined;
 
     try {
-      const activeEndpoint = await this.open(normalizedEndpoint);
-      if (ownershipGeneration !== this.ownershipGeneration) {
-        await this.close(normalizedEndpoint.id);
+      const activeEndpoint = await this.open(normalizedEndpoint, tlsIdentity);
+      if (ownershipGeneration !== this.ownershipGeneration || !this.desiredEndpoints.has(normalizedEndpoint.id)) {
+        await this.closeListener(normalizedEndpoint.id);
         return undefined;
       }
       return activeEndpoint;
     } catch {
-      if (ownershipGeneration === this.ownershipGeneration) {
-        this.retryAfterById.set(
-          normalizedEndpoint.id,
-          Date.now() + (this.options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS),
-        );
+      if (ownershipGeneration === this.ownershipGeneration && this.desiredEndpoints.has(normalizedEndpoint.id)) {
+        this.recordBindFailure(normalizedEndpoint);
       }
       return undefined;
+    } finally {
+      this.scheduleRetry();
     }
   }
 
@@ -340,11 +310,20 @@ export class BrowserNetworkProxyManager {
 
   /** Clears bind retry throttles when an external owner handoff may have freed the socket. */
   retryFailedEndpointsNow(): void {
-    this.retryAfterById.clear();
+    this.bindFailures.clear();
+    this.cancelRetry();
   }
 
   /** Closes one browser proxy endpoint. */
   async close(endpointId: string): Promise<void> {
+    this.desiredEndpoints.delete(endpointId);
+    this.bindFailures.delete(endpointId);
+    this.scheduleRetry();
+    await this.closeListener(endpointId);
+  }
+
+  /** Internal rebinding preserves the latest desired endpoint and its retry history. */
+  private async closeListener(endpointId: string): Promise<void> {
     this.cancelRetire(endpointId);
     const listener = this.listeners.get(endpointId);
     if (listener === undefined) {
@@ -352,7 +331,6 @@ export class BrowserNetworkProxyManager {
     }
 
     this.listeners.delete(endpointId);
-    this.retryAfterById.delete(endpointId);
 
     for (const socket of listener.sockets) {
       socket.destroy();
@@ -371,12 +349,14 @@ export class BrowserNetworkProxyManager {
    */
   async releaseAll(): Promise<void> {
     this.ownershipGeneration += 1;
+    this.desiredEndpoints.clear();
+    this.bindFailures.clear();
+    this.cancelRetry();
     const ids = [...this.listeners.keys()];
     for (const id of [...this.retireTimers.keys()]) {
       this.cancelRetire(id);
     }
-    await Promise.all(ids.map((id) => this.close(id)));
-    this.retryAfterById.clear();
+    await Promise.all(ids.map((id) => this.closeListener(id)));
   }
 
   /** Closes every browser proxy endpoint during extension shutdown. */
@@ -429,8 +409,99 @@ export class BrowserNetworkProxyManager {
     this.retireTimers.delete(endpointId);
   }
 
+  /** Independent binds share a batch; every earlier overlapping candidate retains priority. */
+  private async openPendingEndpoints(
+    pending: readonly BrowserNetworkProxyEndpoint[],
+    generation: number,
+    tlsIdentity: BrowserNetworkProxyTlsIdentity | undefined,
+  ): Promise<void> {
+    while (pending.length > 0 && generation === this.ownershipGeneration && !this.disposed) {
+      const batch: BrowserNetworkProxyEndpoint[] = [];
+      const deferred: BrowserNetworkProxyEndpoint[] = [];
+      const earlier: BrowserNetworkProxyEndpoint[] = [];
+      for (const endpoint of pending) {
+        if (batch.length < MAX_CONCURRENT_OPENS && !earlier.some((other) => shareBindCandidate(other, endpoint))) {
+          batch.push(endpoint);
+        } else {
+          deferred.push(endpoint);
+        }
+        earlier.push(endpoint);
+      }
+      await Promise.all(batch.map(async (endpoint) => {
+        if (!this.desiredEndpoints.has(endpoint.id)) return;
+        this.cancelRetire(endpoint.id);
+        try {
+          await this.open(endpoint, tlsIdentity);
+          if (generation !== this.ownershipGeneration || !this.desiredEndpoints.has(endpoint.id)) {
+            await this.closeListener(endpoint.id);
+          } else {
+            this.bindFailures.delete(endpoint.id);
+          }
+        } catch {
+          if (generation === this.ownershipGeneration && this.desiredEndpoints.has(endpoint.id)) {
+            this.recordBindFailure(endpoint);
+          }
+        }
+      }));
+      pending = deferred;
+    }
+  }
+
+  /** Short initial retries recover handoffs quickly; sustained failures remain cheap. */
+  private recordBindFailure(endpoint: BrowserNetworkProxyEndpoint): void {
+    const previous = this.bindFailures.get(endpoint.id);
+    const attempts = Math.min((previous?.attempts ?? 0) + 1, 16);
+    const initialDelay = Math.max(1, this.options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS);
+    const delay = Math.min(initialDelay * 2 ** (attempts - 1), Math.max(initialDelay, MAX_RETRY_DELAY_MS));
+    this.bindFailures.set(endpoint.id, { endpoint, attempts, retryAtMs: Date.now() + delay });
+  }
+
+  /** A timed retry re-enters the same serialized reconciliation and ownership checks. */
+  private scheduleRetry(): void {
+    this.cancelRetry();
+    if (this.disposed || this.retryInFlight || this.bindFailures.size === 0) return;
+    const nextRetry = Math.min(...[...this.bindFailures.values()].map((failure) => failure.retryAtMs));
+    const remainingDelay = nextRetry - Date.now();
+    const generation = this.ownershipGeneration;
+    // An owner refresh can fail before any bind; do not spin on an overdue deadline.
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined;
+      this.retryInFlight = true;
+      void Promise.resolve().then(async () => {
+        if (this.disposed || generation !== this.ownershipGeneration) return;
+        if (this.options.onRetryDue !== undefined) {
+          await this.options.onRetryDue();
+        } else {
+          await this.serialize(() => this.syncExclusive(this.desiredEndpoints.values(), generation));
+        }
+      }).catch(() => undefined).finally(() => {
+        this.retryInFlight = false;
+        this.scheduleRetry();
+      });
+    }, remainingDelay <= 0 ? DEFAULT_RETRY_DELAY_MS : remainingDelay);
+    this.retryTimer.unref?.();
+  }
+
+  private cancelRetry(): void {
+    if (this.retryTimer !== undefined) clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
+  }
+
+  /** Read failures during rotation keep existing TLS contexts alive until the next sync. */
+  private readTlsIdentity(): BrowserNetworkProxyTlsIdentity | undefined {
+    try {
+      const credentials = this.options.tlsCredentials?.getCredentials();
+      return credentials === undefined ? undefined : { credentials, fingerprint: fingerprintTlsCredentials(credentials) };
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Opens one endpoint on the first available preferred public port. */
-  private async open(endpoint: BrowserNetworkProxyEndpoint): Promise<ActiveBrowserNetworkProxyEndpoint> {
+  private async open(
+    endpoint: BrowserNetworkProxyEndpoint,
+    tlsIdentity?: BrowserNetworkProxyTlsIdentity,
+  ): Promise<ActiveBrowserNetworkProxyEndpoint> {
     if (this.disposed) {
       throw new Error("Browser proxy manager is disposed.");
     }
@@ -460,19 +531,25 @@ export class BrowserNetworkProxyManager {
         serverBuild = this.createServer(
           (request, response) => {
             if (listener !== undefined) {
-              void this.forwardHttp(listener.endpoint, listener.metadata, listener.httpAgent, listener.httpsAgent, request, response);
+              void this.transport.forwardHttp(listener.endpoint, listener.metadata, listener.httpAgent, listener.httpsAgent, request, response);
             }
           },
           (request, socket, head) => {
             if (listener !== undefined) {
-              void this.forwardUpgrade(listener.endpoint, listener.metadata, request, socket as net.Socket, head, listener.sockets);
+              void this.transport.forwardUpgrade(listener.endpoint, listener.metadata, request, socket as net.Socket, head, listener.sockets);
             }
           },
-          (socket) => {
+          (socket, head) => {
             if (listener !== undefined) {
-              void this.rawForward(listener.endpoint, socket, listener.sockets);
+              void this.transport.rawForward(listener.endpoint, socket, listener.sockets, head);
             }
           },
+          (socket, signal, onGreeting) => {
+            if (listener !== undefined) {
+              void this.transport.probeServerGreeting(listener.endpoint, socket, listener.sockets, signal, onGreeting);
+            }
+          },
+          tlsIdentity,
         );
       } catch (error) {
         httpAgent.destroy();
@@ -515,138 +592,6 @@ export class BrowserNetworkProxyManager {
     throw errors[0] ?? new Error(`Could not open browser proxy for ${endpoint.id}.`);
   }
 
-  /** Proxies one HTTP request while presenting localhost metadata upstream. */
-  private async forwardHttp(
-    endpoint: ActiveBrowserNetworkProxyEndpoint,
-    metadata: BrowserNetworkProxyEndpointMetadata,
-    httpAgent: http.Agent,
-    httpsAgent: https.Agent,
-    request: http.IncomingMessage,
-    response: http.ServerResponse,
-  ): Promise<void> {
-    let target: BrowserNetworkProxyTarget;
-
-    try {
-      target = await this.targetResolver.resolve(endpoint);
-    } catch {
-      writeGatewayError(response);
-      return;
-    }
-
-    const upstreamProtocol = normalizeTargetProtocol(target.protocol);
-    const upstreamMetadata = buildUpstreamMetadata(endpoint, metadata, upstreamProtocol);
-    const requestOptions = {
-      host: normalizeTargetHost(target.host),
-      port: target.port,
-      method: request.method,
-      path: request.url ?? "/",
-      headers: rewriteRequestHeaders(request.headers, upstreamMetadata),
-    };
-    const responseHandler = (upstreamResponse: http.IncomingMessage) => {
-      forwardUpstreamResponse(request, upstreamResponse, response, upstreamMetadata);
-    };
-    const upstreamRequest =
-      upstreamProtocol === "https"
-        ? https.request({ ...requestOptions, agent: httpsAgent, rejectUnauthorized: false }, responseHandler)
-        : http.request({ ...requestOptions, agent: httpAgent }, responseHandler);
-
-    upstreamRequest.once("error", () => writeGatewayError(response));
-    request.pipe(upstreamRequest);
-  }
-
-  /** Proxies a WebSocket upgrade after rewriting the handshake headers. */
-  private async forwardUpgrade(
-    endpoint: ActiveBrowserNetworkProxyEndpoint,
-    metadata: BrowserNetworkProxyEndpointMetadata,
-    request: http.IncomingMessage,
-    socket: net.Socket,
-    head: Buffer,
-    sockets: Set<net.Socket>,
-  ): Promise<void> {
-    let target: BrowserNetworkProxyTarget;
-
-    try {
-      target = await this.targetResolver.resolve(endpoint);
-    } catch {
-      socket.destroy();
-      return;
-    }
-
-    const targetHost = normalizeTargetHost(target.host);
-    const upstreamProtocol = normalizeTargetProtocol(target.protocol);
-    const upstreamMetadata = buildUpstreamMetadata(endpoint, metadata, upstreamProtocol);
-    const upstreamReadyEvent = upstreamProtocol === "https" ? "secureConnect" : "connect";
-    const upstream =
-      upstreamProtocol === "https"
-        ? tls.connect({
-            host: targetHost,
-            port: target.port,
-            rejectUnauthorized: false,
-            ...(net.isIP(targetHost) === 0 ? { servername: targetHost } : {}),
-          })
-        : net.createConnection({
-            host: targetHost,
-            port: target.port,
-          });
-    sockets.add(upstream);
-    upstream.once("close", () => sockets.delete(upstream));
-
-    const destroyBoth = () => {
-      socket.destroy();
-      upstream.destroy();
-    };
-
-    socket.once("error", destroyBoth);
-    upstream.once("error", destroyBoth);
-    socket.once("close", () => upstream.destroy());
-    upstream.once(upstreamReadyEvent, () => {
-      upstream.write(buildUpgradeRequest(request, upstreamMetadata));
-      if (head.length > 0) {
-        upstream.write(head);
-      }
-      socket.pipe(upstream);
-      upstream.pipe(socket);
-    });
-  }
-
-  /**
-   * Forwards a non-TLS connection to the upstream as raw TCP. This carries any
-   * protocol transparently (plain HTTP, WebSocket, database wire protocols), so
-   * a single per-port listener serves both HTTPS browsers and raw TCP clients
-   * without classifying the port ahead of time.
-   */
-  private async rawForward(
-    endpoint: ActiveBrowserNetworkProxyEndpoint,
-    clientSocket: net.Socket,
-    sockets: Set<net.Socket>,
-  ): Promise<void> {
-    let target: BrowserNetworkProxyTarget;
-
-    try {
-      target = await this.targetResolver.resolve(endpoint);
-    } catch {
-      clientSocket.destroy();
-      return;
-    }
-
-    const upstream = net.createConnection({ host: normalizeTargetHost(target.host), port: target.port });
-    sockets.add(upstream);
-    upstream.once("close", () => sockets.delete(upstream));
-
-    const destroyBoth = () => {
-      clientSocket.destroy();
-      upstream.destroy();
-    };
-    clientSocket.once("error", destroyBoth);
-    upstream.once("error", destroyBoth);
-    clientSocket.once("close", () => upstream.destroy());
-    upstream.once("close", () => clientSocket.destroy());
-    upstream.once("connect", () => {
-      clientSocket.pipe(upstream);
-      upstream.pipe(clientSocket);
-    });
-  }
-
   /**
    * Builds a protocol-sniffing listener. Each accepted connection is peeked and
    * demultiplexed by its first bytes:
@@ -662,9 +607,10 @@ export class BrowserNetworkProxyManager {
   private createServer(
     handler: http.RequestListener,
     onUpgrade: (request: http.IncomingMessage, socket: net.Socket, head: Buffer) => void,
-    onRawConnection: (socket: net.Socket) => void,
+    onRawConnection: (socket: net.Socket, head: Buffer) => void,
+    onServerGreeting: (socket: net.Socket, signal: AbortSignal, onGreeting: (forward: () => void) => void) => void,
+    tlsIdentity: BrowserNetworkProxyTlsIdentity | undefined,
   ): BrowserNetworkProxyServerBuild {
-    const credentials = this.options.tlsCredentials?.getCredentials();
     const httpServer = http.createServer(handler);
     httpServer.on("upgrade", (request, socket, head) => onUpgrade(request, socket as net.Socket, head));
 
@@ -677,29 +623,22 @@ export class BrowserNetworkProxyManager {
     };
     let tlsServer: https.Server | undefined;
     let tlsCredentialsFingerprint: string | undefined;
-    if (credentials !== undefined) {
-      tlsServer = installTls(credentials);
-      tlsCredentialsFingerprint = fingerprintTlsCredentials(credentials);
+    if (tlsIdentity !== undefined) {
+      tlsServer = installTls(tlsIdentity.credentials);
+      tlsCredentialsFingerprint = tlsIdentity.fingerprint;
     }
 
-    const server = net.createServer((socket) => {
-      socket.once("readable", () => {
-        const chunk = socket.read() as Buffer | null;
-        if (chunk === null || chunk.length === 0) {
-          // Nothing to sniff; let the upstream decide what an empty stream means.
-          onRawConnection(socket);
-          return;
-        }
-
-        socket.unshift(chunk);
-        if (chunk[0] === TLS_HANDSHAKE_RECORD_TYPE && tlsDispatch.server !== undefined) {
-          tlsDispatch.server.emit("connection", socket);
-        } else if (looksLikeHttpRequestLine(chunk)) {
-          httpServer.emit("connection", socket);
-        } else {
-          onRawConnection(socket);
-        }
-      });
+    const server = net.createServer({ allowHalfOpen: true }, (socket) => {
+      sniffBrowserProxyConnection(
+        socket,
+        () => httpServer.emit("connection", socket),
+        () => tlsDispatch.server?.emit("connection", socket),
+        (head) => onRawConnection(socket, head),
+        () => tlsDispatch.server !== undefined,
+        this.options.sniffTimeoutMs,
+        (signal, onGreeting) => onServerGreeting(socket, signal, onGreeting),
+        this.options.serverGreetingDelayMs,
+      );
       socket.once("error", () => socket.destroy());
     });
 
@@ -715,8 +654,12 @@ export class BrowserNetworkProxyManager {
   }
 
   /** Updates aliases and certificates without taking down established sockets. */
-  private reconcileListener(listener: BrowserNetworkProxyListener, desiredEndpoint: BrowserNetworkProxyEndpoint): void {
-    const credentials = this.options.tlsCredentials?.getCredentials();
+  private reconcileListener(
+    listener: BrowserNetworkProxyListener,
+    desiredEndpoint: BrowserNetworkProxyEndpoint,
+    tlsIdentity: BrowserNetworkProxyTlsIdentity | undefined,
+  ): void {
+    const credentials = tlsIdentity?.credentials;
     const needsTls = (desiredEndpoint.publicProtocol ?? "http") === "https";
     if (needsTls && credentials === undefined) {
       /*
@@ -727,8 +670,8 @@ export class BrowserNetworkProxyManager {
       return;
     }
     try {
-      if (credentials !== undefined) {
-        const fingerprint = fingerprintTlsCredentials(credentials);
+      if (tlsIdentity !== undefined) {
+        const { credentials, fingerprint } = tlsIdentity;
         if (listener.tlsServer === undefined) {
           // Install before publishing HTTPS metadata so a failed certificate
           // parse cannot turn a working HTTP endpoint into unusable HTTPS.
@@ -778,6 +721,19 @@ function normalizeEndpoint(endpoint: BrowserNetworkProxyEndpoint): BrowserNetwor
   };
 }
 
+/** A fresh bind coordinate must never inherit an unrelated port's failure deadline. */
+function sameBindCandidates(left: BrowserNetworkProxyEndpoint, right: BrowserNetworkProxyEndpoint): boolean {
+  return left.networkId === right.networkId && left.logicalPort === right.logicalPort &&
+    left.listenHost === right.listenHost && left.listenPorts.join(",") === right.listenPorts.join(",");
+}
+
+/** Distinct concrete IPv4 aliases are independent; wildcard/hostname/IPv6 overlap stays conservative. */
+function shareBindCandidate(left: BrowserNetworkProxyEndpoint, right: BrowserNetworkProxyEndpoint): boolean {
+  if (!left.listenPorts.some((port) => right.listenPorts.includes(port))) return false;
+  return left.listenHost === right.listenHost || left.listenHost === "0.0.0.0" || right.listenHost === "0.0.0.0" ||
+    net.isIP(left.listenHost) !== 4 || net.isIP(right.listenHost) !== 4;
+}
+
 function isEndpointBindCurrent(
   activeEndpoint: ActiveBrowserNetworkProxyEndpoint,
   desiredEndpoint: BrowserNetworkProxyEndpoint,
@@ -792,446 +748,6 @@ function isEndpointBindCurrent(
     activeEndpoint.listenHost === desiredEndpoint.listenHost &&
     desiredEndpoint.listenPorts.includes(activeEndpoint.listenPort)
   );
-}
-
-function rewriteRequestHeaders(headers: http.IncomingHttpHeaders, metadata: BrowserNetworkProxyEndpointMetadata): http.OutgoingHttpHeaders {
-  const nextHeaders: http.OutgoingHttpHeaders = {
-    ...headers,
-    host: metadata.upstreamHostHeader,
-    "accept-encoding": "identity",
-  };
-
-  const origin = rewriteHeaderOrigin(headers.origin, metadata.publicOrigin, metadata.upstreamOrigin);
-  const referer = rewriteHeaderOrigin(headers.referer, metadata.publicOrigin, metadata.upstreamOrigin);
-  if (origin !== undefined) {
-    nextHeaders.origin = origin;
-  }
-  if (referer !== undefined) {
-    nextHeaders.referer = referer;
-  }
-
-  return nextHeaders;
-}
-
-function rewriteResponseHeaders(headers: http.IncomingHttpHeaders, metadata: BrowserNetworkProxyEndpointMetadata): http.OutgoingHttpHeaders {
-  const nextHeaders: http.OutgoingHttpHeaders = {};
-
-  for (const [name, value] of Object.entries(headers)) {
-    if (value === undefined) {
-      continue;
-    }
-
-    const normalizedName = name.toLowerCase();
-    if (normalizedName === "set-cookie") {
-      nextHeaders[name] = rewriteSetCookieHeader(value);
-      continue;
-    }
-
-    nextHeaders[name] =
-      RESPONSE_ORIGIN_REWRITE_HEADER_NAMES.has(normalizedName) || headerValueIncludesAny(value, metadata.upstreamOrigins)
-        ? rewriteResponseHeaderValue(value, metadata)
-        : value;
-  }
-
-  return nextHeaders;
-}
-
-function forwardUpstreamResponse(
-  request: http.IncomingMessage,
-  upstreamResponse: http.IncomingMessage,
-  response: http.ServerResponse,
-  metadata: BrowserNetworkProxyEndpointMetadata,
-): void {
-  const shouldRewriteBody = shouldRewriteResponseBody(request, upstreamResponse);
-
-  if (!shouldRewriteBody) {
-    response.writeHead(
-      upstreamResponse.statusCode ?? 502,
-      upstreamResponse.statusMessage,
-      rewriteResponseHeaders(upstreamResponse.headers, metadata),
-    );
-    upstreamResponse.pipe(response);
-    return;
-  }
-
-  const chunks: Buffer[] = [];
-  upstreamResponse.on("data", (chunk: Buffer | string) => {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  });
-  upstreamResponse.once("error", () => writeGatewayError(response));
-  upstreamResponse.once("end", () => {
-    const body = Buffer.concat(chunks).toString("utf8");
-    const rewrittenBody = rewriteLocalhostOrigins(body, metadata);
-    const rewrittenBodyBuffer = Buffer.from(rewrittenBody, "utf8");
-    const headers = rewriteResponseHeaders(upstreamResponse.headers, metadata);
-
-    removeHeader(headers, "content-length");
-    removeHeader(headers, "transfer-encoding");
-    headers["content-length"] = rewrittenBodyBuffer.byteLength;
-
-    response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.statusMessage, headers);
-    response.end(rewrittenBodyBuffer);
-  });
-}
-
-function rewriteResponseHeaderValue(
-  value: string | string[],
-  metadata: BrowserNetworkProxyEndpointMetadata,
-): string | string[] {
-  if (Array.isArray(value)) {
-    return value.map((item) => rewriteResponseHeaderString(item, metadata));
-  }
-
-  return rewriteResponseHeaderString(value, metadata);
-}
-
-function rewriteResponseHeaderString(value: string, metadata: BrowserNetworkProxyEndpointMetadata): string {
-  if (!shouldRewriteLocalhostOrigins(value, metadata)) {
-    return value;
-  }
-
-  return rewriteLocalhostOrigins(value, metadata);
-}
-
-function rewriteSetCookieHeader(value: string | string[]): string | string[] {
-  if (Array.isArray(value)) {
-    return value.map((item) => (setCookieHasDomainAttribute(item) ? rewriteSetCookie(item) : item));
-  }
-
-  return setCookieHasDomainAttribute(value) ? rewriteSetCookie(value) : value;
-}
-
-function rewriteSetCookie(value: string): string {
-  return value
-    .split(";")
-    .filter((part) => !part.trim().toLowerCase().startsWith("domain="))
-    .join(";");
-}
-
-function headerValueIncludesAny(value: string | string[], needles: readonly string[]): boolean {
-  if (Array.isArray(value)) {
-    return value.some((item) => stringIncludesAny(item, needles));
-  }
-
-  return stringIncludesAny(value, needles);
-}
-
-function stringIncludesAny(value: string, needles: readonly string[]): boolean {
-  return needles.some((needle) => value.includes(needle));
-}
-
-function shouldRewriteLocalhostOrigins(value: string, metadata: BrowserNetworkProxyEndpointMetadata): boolean {
-  return (
-    metadata.upstreamOrigins.some((origin) => value.includes(origin)) ||
-    (metadata.upstreamLoopbackHost !== undefined && value.includes(metadata.upstreamLoopbackHost)) ||
-    regexMatches(ABSOLUTE_LOCALHOST_ORIGIN_PATTERN, value) ||
-    regexMatches(PROTOCOL_RELATIVE_LOCALHOST_ORIGIN_PATTERN, value)
-  );
-}
-
-function regexMatches(pattern: RegExp, value: string): boolean {
-  pattern.lastIndex = 0;
-  const matches = pattern.test(value);
-  pattern.lastIndex = 0;
-  return matches;
-}
-
-function rewriteLocalhostOrigins(value: string, metadata: BrowserNetworkProxyEndpointMetadata): string {
-  ABSOLUTE_LOCALHOST_ORIGIN_PATTERN.lastIndex = 0;
-  PROTOCOL_RELATIVE_LOCALHOST_ORIGIN_PATTERN.lastIndex = 0;
-
-  const absoluteRewritten = value.replace(
-    ABSOLUTE_LOCALHOST_ORIGIN_PATTERN,
-    (_match, protocol: string, _host: string, portText: string | undefined) =>
-      `${publicProtocolForLocalhostRewrite(protocol, metadata)}://${metadata.publicHost}:${publicPortForLocalhostRewrite(portText, metadata)}`,
-  );
-
-  const protocolRewritten = absoluteRewritten.replace(
-    PROTOCOL_RELATIVE_LOCALHOST_ORIGIN_PATTERN,
-    (match, prefix: string, _host: string, portText: string | undefined) => {
-      const separator = match.startsWith("//") ? "" : prefix;
-      return `${separator}//${metadata.publicHost}:${publicPortForLocalhostRewrite(portText, metadata)}`;
-    },
-  );
-
-  return rewriteUpstreamLoopbackOrigins(protocolRewritten, metadata);
-}
-
-/**
- * Rewrites the network loopback address the dev server binds to (127.96.x),
- * which the hard-coded localhost patterns do not cover. The hook rewrites the
- * server's bind to this address, so apps that self-reference their bound socket
- * (Vite HMR, `server.address()`) leak it into links; map it to the public alias.
- */
-function rewriteUpstreamLoopbackOrigins(value: string, metadata: BrowserNetworkProxyEndpointMetadata): string {
-  const host = metadata.upstreamLoopbackHost;
-  if (host === undefined || !value.includes(host)) {
-    return value;
-  }
-
-  const escaped = escapeRegExpLiteral(host);
-  const boundary = `(?=/|[?#"'\`\\s<);]|$)`;
-  const absolute = new RegExp(`\\b(https?|wss?):\\/\\/${escaped}(?::(\\d{1,5}))?${boundary}`, "gi");
-  const protocolRelative = new RegExp(`(^|[^:])\\/\\/${escaped}(?::(\\d{1,5}))?${boundary}`, "gi");
-
-  const absoluteRewritten = value.replace(
-    absolute,
-    (_match, protocol: string, portText: string | undefined) =>
-      `${publicProtocolForLocalhostRewrite(protocol, metadata)}://${metadata.publicHost}:${publicPortForLocalhostRewrite(portText, metadata)}`,
-  );
-
-  return absoluteRewritten.replace(protocolRelative, (match, prefix: string, portText: string | undefined) => {
-    const separator = match.startsWith("//") ? "" : prefix;
-    return `${separator}//${metadata.publicHost}:${publicPortForLocalhostRewrite(portText, metadata)}`;
-  });
-}
-
-function escapeRegExpLiteral(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function publicProtocolForLocalhostRewrite(
-  protocol: string,
-  metadata: BrowserNetworkProxyEndpointMetadata,
-): "http" | "https" | "ws" | "wss" {
-  const normalizedProtocol = protocol.toLowerCase();
-  if (normalizedProtocol === "ws" || normalizedProtocol === "wss") {
-    return metadata.publicProtocol === "https" ? "wss" : "ws";
-  }
-
-  return metadata.publicProtocol;
-}
-
-function publicPortForLocalhostRewrite(portText: string | undefined, metadata: BrowserNetworkProxyEndpointMetadata): number {
-  if (portText === undefined) {
-    return metadata.publicPort;
-  }
-  const port = Number(portText);
-  return port === metadata.logicalPort ? metadata.publicPort : port;
-}
-
-function setCookieHasDomainAttribute(value: string): boolean {
-  return value.toLowerCase().includes("domain=");
-}
-
-function rewriteHeaderOrigin(
-  value: string | undefined,
-  fromOrigin: string,
-  toOrigin: string,
-): string | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-
-  return value.replaceAll(fromOrigin, toOrigin);
-}
-
-function buildUpgradeRequest(request: http.IncomingMessage, metadata: BrowserNetworkProxyEndpointMetadata): string {
-  const lines = [`${request.method ?? "GET"} ${request.url ?? "/"} HTTP/${request.httpVersion}`];
-  const headers = rewriteRequestHeaders(request.headers, metadata);
-
-  for (const [name, value] of Object.entries(headers)) {
-    appendHeaderLines(lines, name, value);
-  }
-
-  return `${lines.join("\r\n")}\r\n\r\n`;
-}
-
-function appendHeaderLines(lines: string[], name: string, value: number | string | readonly string[] | undefined): void {
-  if (value === undefined) {
-    return;
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      lines.push(`${name}: ${item}`);
-    }
-    return;
-  }
-
-  lines.push(`${name}: ${value}`);
-}
-
-function buildEndpointMetadata(endpoint: ActiveBrowserNetworkProxyEndpoint): BrowserNetworkProxyEndpointMetadata {
-  const publicProtocol = endpoint.publicProtocol ?? "http";
-  const publicHost = formatHostForUrl(endpoint.publicHost ?? endpoint.listenHost);
-  const publicOrigin = `${publicProtocol}://${publicHost}:${endpoint.listenPort}`;
-  const upstreamHostHeader = `${LOCALHOST_UPSTREAM_HOST}:${endpoint.logicalPort}`;
-  const upstreamOrigin = `http://${upstreamHostHeader}`;
-  const upstreamLoopbackHost = normalizeUpstreamLoopbackHost(endpoint.responseRewriteLoopbackHost);
-
-  return {
-    publicOrigin,
-    publicProtocol,
-    publicHost,
-    publicPort: endpoint.listenPort,
-    logicalPort: endpoint.logicalPort,
-    upstreamOrigin,
-    upstreamHostHeader,
-    upstreamOrigins: buildUpstreamOrigins(endpoint.logicalPort, upstreamLoopbackHost),
-    upstreamLoopbackHost,
-  };
-}
-
-/**
- * Test seam: applies the response origin rewrite (headers/body share the same
- * logic) for one endpoint, so the localhost + network-loopback rewrites can be
- * verified without binding a real network loopback alias.
- */
-export function rewriteBrowserProxyResponseTextForTest(
-  text: string,
-  endpoint: ActiveBrowserNetworkProxyEndpoint,
-): string {
-  return rewriteLocalhostOrigins(text, buildEndpointMetadata(endpoint));
-}
-
-/** Browser-facing TLS and upstream application TLS are independent routing decisions. */
-function buildUpstreamMetadata(
-  endpoint: ActiveBrowserNetworkProxyEndpoint,
-  metadata: BrowserNetworkProxyEndpointMetadata,
-  protocol: "http" | "https",
-): BrowserNetworkProxyEndpointMetadata {
-  return {
-    ...metadata,
-    upstreamOrigin: `${protocol}://${metadata.upstreamHostHeader}`,
-    upstreamOrigins: buildUpstreamOrigins(endpoint.logicalPort, metadata.upstreamLoopbackHost),
-  };
-}
-
-function buildUpstreamOrigins(logicalPort: number, loopbackHost?: string): readonly string[] {
-  return ["http", "https"].flatMap((protocol) => {
-    const origins = [
-      `${protocol}://${LOCALHOST_UPSTREAM_HOST}:${logicalPort}`,
-      `${protocol}://127.0.0.1:${logicalPort}`,
-      `${protocol}://[::1]:${logicalPort}`,
-    ];
-    if (loopbackHost !== undefined) {
-      origins.push(`${protocol}://${loopbackHost}:${logicalPort}`);
-    }
-    return origins;
-  });
-}
-
-/**
- * The network loopback address the dev server binds to (127.96.x) when it is a
- * distinct address, not a plain localhost variant already handled by the
- * localhost rewrite patterns. Returned undefined for localhost/127.0.0.1/::1.
- */
-function normalizeUpstreamLoopbackHost(responseRewriteLoopbackHost: string | undefined): string | undefined {
-  const host = (responseRewriteLoopbackHost ?? "").trim();
-  if (host === "" || host === LOCALHOST_UPSTREAM_HOST || host === "127.0.0.1" || host === "::1" || host === "[::1]") {
-    return undefined;
-  }
-  return host;
-}
-
-function normalizeTargetProtocol(protocol: BrowserNetworkProxyTarget["protocol"]): "http" | "https" {
-  return protocol === "https" ? "https" : "http";
-}
-
-function normalizeTargetHost(host: string): string {
-  if (host === "0.0.0.0") {
-    return "127.0.0.1";
-  }
-
-  if (host === "::") {
-    return "::1";
-  }
-
-  return host;
-}
-
-function fingerprintTlsCredentials(credentials: BrowserNetworkProxyTlsCredentials): string {
-  const hash = createHash("sha256");
-  hash.update("key\0");
-  hash.update(credentials.key);
-  hash.update("\0cert\0");
-  hash.update(credentials.cert);
-  return hash.digest("hex");
-}
-
-function formatHostForUrl(host: string): string {
-  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-}
-
-function writeGatewayError(response: http.ServerResponse): void {
-  if (response.headersSent || response.destroyed) {
-    response.destroy();
-    return;
-  }
-
-  response.writeHead(502, "Bad Gateway");
-  response.end("Port Manager browser proxy could not reach the routed target.");
-}
-
-function shouldRewriteResponseBody(
-  request: http.IncomingMessage,
-  upstreamResponse: http.IncomingMessage,
-): boolean {
-  if (!responseMayHaveBody(request, upstreamResponse)) {
-    return false;
-  }
-
-  if (!isIdentityEncoded(upstreamResponse.headers["content-encoding"])) {
-    return false;
-  }
-
-  return isRewritableContentType(upstreamResponse.headers["content-type"]);
-}
-
-function responseMayHaveBody(request: http.IncomingMessage, upstreamResponse: http.IncomingMessage): boolean {
-  if (request.method?.toUpperCase() === "HEAD") {
-    return false;
-  }
-
-  const statusCode = upstreamResponse.statusCode ?? 200;
-  return statusCode !== 204 && statusCode !== 304 && (statusCode < 100 || statusCode >= 200);
-}
-
-function isIdentityEncoded(value: string | string[] | undefined): boolean {
-  const encoding = Array.isArray(value) ? value.join(",") : value;
-  return encoding === undefined || encoding.trim().length === 0 || /^identity$/i.test(encoding.trim());
-}
-
-function isRewritableContentType(value: string | string[] | undefined): boolean {
-  const contentType = Array.isArray(value) ? value[0] : value;
-  if (contentType === undefined) {
-    return false;
-  }
-
-  const parts = contentType.split(";").map((part) => part.trim().toLowerCase());
-  const mediaType = parts[0] ?? "";
-  if (mediaType === "text/event-stream") {
-    return false;
-  }
-
-  const charset = parts.find((part) => part.startsWith("charset="))?.slice("charset=".length).replace(/^"|"$/g, "");
-  if (charset !== undefined && charset !== "utf-8" && charset !== "utf8" && charset !== "us-ascii") {
-    return false;
-  }
-
-  return (
-    mediaType.startsWith("text/") ||
-    mediaType === "application/javascript" ||
-    mediaType === "application/x-javascript" ||
-    mediaType === "application/ecmascript" ||
-    mediaType === "application/json" ||
-    mediaType === "application/manifest+json" ||
-    mediaType === "application/xml" ||
-    mediaType === "application/xhtml+xml" ||
-    mediaType === "image/svg+xml" ||
-    mediaType.endsWith("+json") ||
-    mediaType.endsWith("+xml")
-  );
-}
-
-function removeHeader(headers: http.OutgoingHttpHeaders, name: string): void {
-  const normalizedName = name.toLowerCase();
-  for (const key of Object.keys(headers)) {
-    if (key.toLowerCase() === normalizedName) {
-      delete headers[key];
-    }
-  }
 }
 
 function listen(server: BrowserNetworkProxyServer, port: number, host: string): Promise<void> {
@@ -1259,6 +775,12 @@ function listen(server: BrowserNetworkProxyServer, port: number, host: string): 
 function assertPortAvailable(host: string, port: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const probe = net.createConnection({ host, port });
+    // An absent alias or stale packet-filter rule can silently drop SYNs.
+    // Fail this candidate promptly; a timeout never proves a bind is free.
+    probe.setTimeout(PORT_AVAILABILITY_TIMEOUT_MS, () => {
+      probe.destroy();
+      reject(new Error(`Browser proxy port check timed out: ${host}:${port}`));
+    });
     probe.once("connect", () => {
       probe.destroy();
       reject(new Error(`Browser proxy bind is already occupied: ${host}:${port}`));
@@ -1289,4 +811,13 @@ function closeServer(server: BrowserNetworkProxyServer): Promise<void> {
 
 function isTcpPort(port: number): boolean {
   return Number.isInteger(port) && port >= 1 && port <= 65_535;
+}
+
+function fingerprintTlsCredentials(credentials: BrowserNetworkProxyTlsCredentials): string {
+  const hash = createHash("sha256");
+  hash.update("key\0");
+  hash.update(credentials.key);
+  hash.update("\0cert\0");
+  hash.update(credentials.cert);
+  return hash.digest("hex");
 }

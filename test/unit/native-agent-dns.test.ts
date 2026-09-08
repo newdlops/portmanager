@@ -3,8 +3,10 @@ import { spawn, type ChildProcess } from "node:child_process";
 import dgram from "node:dgram";
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
+import { BrowserDnsSyncCoordinator, type BrowserDnsSyncBatch } from "../../src/extension/browser-dns-sync-coordinator";
 
 /**
  * Black-box coverage for the daemon-owned browser DNS responder.
@@ -16,7 +18,7 @@ import test, { type TestContext } from "node:test";
  */
 
 const projectRoot = path.resolve(__dirname, "../../..");
-const nativeAgentPath = path.join(projectRoot, "media", "native", "portmanager_agent");
+const nativeAgentPath = process.env.PORT_MANAGER_TEST_NATIVE_AGENT_PATH ?? path.join(projectRoot, "media", "native", "portmanager_agent");
 
 interface DnsAnswer {
   readonly rcode: number;
@@ -53,7 +55,7 @@ test("network service pushes browser DNS records from every window, not only the
   assert.equal(source.includes("browserDnsSyncCoordinator?.enqueue"), true);
   assert.equal(source.includes("syncBrowserDns(batch.records, batch.revision, batch.sharedStatePath)"), true);
   assert.equal(source.includes("resolveRejectedBrowserDnsSync"), true);
-  assert.equal(source.includes("waitForCurrentDrain"), true);
+  assert.equal(source.includes("flushPendingNow"), true);
   // The extension host must no longer own a responder socket of its own.
   assert.equal(source.includes("new BrowserDnsServer("), false);
   assert.equal(source.includes("encodeBrowserDnsSyncRecords"), true);
@@ -69,7 +71,8 @@ test("native agent sources wire the DNS responder into dispatch, poll loop, and 
   assert.equal(header.includes("int browser_dns_fd;"), true);
   assert.equal(agentSource.includes('strcmp(request->method, "syncBrowserDns")'), true);
   assert.equal(agentSource.includes("pm_dns_maybe_rebind(state, time(NULL));"), true);
-  assert.equal(agentSource.includes("pm_dns_handle_readable(state);"), true);
+  assert.equal(dnsSource.includes("pm_dns_handle_readable(worker)"), true);
+  assert.equal(agentSource.includes("pm_dns_handle_readable(state);"), false);
   assert.equal(agentSource.includes("pm_dns_init(&state, arguments.dns_port);"), true);
   // Both status payloads must publish responder state for extension diagnostics.
   assert.equal((stateSource.match(/pm_dns_append_status_fields/g) ?? []).length >= 2, true);
@@ -83,6 +86,137 @@ test("native agent sources wire the DNS responder into dispatch, poll loop, and 
 if (!fs.existsSync(nativeAgentPath)) {
   test("native agent answers browser DNS queries", { skip: "native agent binary is not built" }, () => undefined);
 } else {
+  test("managed shells inherit prepared routing env while the DNS worker is running", async (context) => {
+    const fixture = await startDnsAgent(context, undefined, 0, undefined, {
+      PORT: "old", PORT_MANAGER_ACTUAL_PORT: "old", PORT_MANAGER_LOGICAL_PORT: "old",
+      PM_DNS_TEST_INHERITED: "preserved",
+    });
+    if (fixture === undefined) return;
+    assert.ok(await readDnsPort(fixture.socketPath));
+    fs.writeFileSync(path.join(fixture.directory, "capture.sh"),
+      'printf \'%s\\n\' "$PORT" "$PORT_MANAGER_ACTUAL_PORT" "$PORT_MANAGER_LOGICAL_PORT" "$PORT_MANAGER_ROUTES" "$PORT_MANAGER_ROUTES_FILE" "$PM_DNS_TEST_INHERITED" > result.txt\n');
+    const reservation = net.createServer();
+    await new Promise<void>((resolve) => reservation.listen(0, "127.0.0.1", resolve));
+    const requestedPort = (reservation.address() as net.AddressInfo).port;
+    await new Promise<void>((resolve) => reservation.close(() => resolve()));
+    const started = await requestOnce<{ readonly actualPort: number }>(fixture.socketPath, {
+      id: "managed-env", method: "startManagedProcess", payload: {
+        name: "env fixture", command: "/bin/sh ./capture.sh", cwd: fixture.directory,
+        requestedPort, host: "127.0.0.1", injectionMode: "env", routingMode: "nearest", scanRange: 5,
+      },
+    });
+    const resultPath = path.join(fixture.directory, "result.txt");
+    const deadline = Date.now() + 2000;
+    while (!fs.existsSync(resultPath) || fs.readFileSync(resultPath, "utf8").split("\n").length < 7) {
+      assert.ok(Date.now() < deadline, "managed shell did not produce its inherited environment");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const lines = fs.readFileSync(resultPath, "utf8").trimEnd().split("\n");
+    assert.deepEqual(lines.slice(0, 3), [String(started.actualPort), String(started.actualPort), String(requestedPort)]);
+    assert.ok(Array.isArray(JSON.parse(lines[3]!)));
+    assert.equal(lines[4], fixture.routeTablePath);
+    assert.equal(lines[5], "preserved");
+  });
+
+  test("native DNS answers while the control thread waits for a listener scan", async (context) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pm-dns-worker-"));
+    const bin = path.join(directory, "bin");
+    fs.mkdirSync(bin);
+    const block = path.join(directory, "block");
+    const entered = path.join(directory, "entered");
+    const release = path.join(directory, "release");
+    // A test subprocess gate, not production instrumentation. Returning an
+    // empty successful scan keeps the fixture independent of the host topology.
+    fs.writeFileSync(path.join(bin, "lsof"), '#!/bin/sh\nif [ -f "$PM_DNS_TEST_BLOCK" ]; then\n  : > "$PM_DNS_TEST_ENTERED"\n  while [ ! -f "$PM_DNS_TEST_RELEASE" ]; do /bin/sleep 0.01; done\nfi\nexit 1\n', { mode: 0o755 });
+    const fixture = await startDnsAgent(context, directory, 0, undefined, {
+      PATH: `${bin}:${process.env.PATH}`, PM_DNS_TEST_BLOCK: block,
+      PM_DNS_TEST_ENTERED: entered, PM_DNS_TEST_RELEASE: release,
+    });
+    context.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+    if (fixture === undefined) return;
+    const port = await readDnsPort(fixture.socketPath);
+    assert.ok(port);
+    await requestOnce(fixture.socketPath, { id: "worker-sync", method: "syncBrowserDns", payload: { records: "responsive.pm=127.120.5.9" } });
+    fs.writeFileSync(block, "");
+    let repaired = false;
+    const repair = requestOnce(fixture.socketPath, { id: "blocked-repair", method: "repairRoutingState" })
+      .then(() => { repaired = true; });
+    // Attach rejection handling before awaiting the controlled scan boundary.
+    const settled = repair.then(() => undefined, (error: unknown) => error);
+    try {
+      const deadline = Date.now() + 2000;
+      while (!fs.existsSync(entered)) {
+        assert.ok(Date.now() < deadline, "listener scan did not start");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal((await dnsQuery(port, "responsive.pm", 1, 1000)).address, "127.120.5.9");
+      assert.equal(repaired, false, "DNS must complete before the scan is released");
+    } finally { fs.writeFileSync(release, ""); }
+    const error = await settled;
+    if (error) throw error;
+  });
+
+  test("native DNS publishes whole tables during concurrent UDP queries", async (context) => {
+    const fixture = await startDnsAgent(context);
+    if (fixture === undefined) return;
+    const port = await readDnsPort(fixture.socketPath);
+    assert.ok(port);
+    await requestOnce(fixture.socketPath, { id: "atomic-initial", method: "syncBrowserDns", payload: { records: "atomic.pm=127.120.5.9" } });
+    await Promise.all([
+      (async () => {
+        for (let index = 0; index < 20; index++) {
+          const address = index % 2 ? "127.120.5.9" : "127.120.5.10";
+          const records = [`atomic.pm=${address}`, ...Array.from({ length: 128 }, (_, row) => `row-${row}.pm=${address}`)].join(",");
+          await requestOnce(fixture.socketPath, { id: `atomic-${index}`, method: "syncBrowserDns", payload: { records } });
+        }
+      })(),
+      (async () => {
+        for (let index = 0; index < 100; index++) {
+          const answer = await dnsQuery(port, "atomic.pm");
+          assert.ok(answer.address === "127.120.5.9" || answer.address === "127.120.5.10");
+        }
+      })(),
+    ]);
+  });
+
+  test("DNS publication recovers a stale revision within the same drain before the first alias query", async (context) => {
+    const fixture = await startDnsAgent(context);
+    if (fixture === undefined) return;
+
+    const sharedStatePath = path.join(fixture.directory, "state.json");
+    fs.writeFileSync(sharedStatePath, JSON.stringify({
+      version: 1, revision: "B", state: { networks: [], attachments: [], exposures: [] },
+    }));
+    const current: BrowserDnsSyncBatch = {
+      records: "fresh.pm=127.120.5.9", revision: "B", sharedStatePath, signature: "B",
+    };
+    const sent: string[] = [];
+    const retries: number[] = [];
+    const coordinator = new BrowserDnsSyncCoordinator({
+      send: async (batch) => {
+        sent.push(batch.signature);
+        return requestOnce(fixture.socketPath, {
+          id: `publication-${batch.signature}`, method: "syncBrowserDns", payload: batch,
+        });
+      },
+      resolveRejected: () => ({ kind: "replace", batch: current }),
+      onResult: () => undefined,
+      onError: () => assert.fail("DNS publication transport failed"),
+      schedule: (delay) => { retries.push(delay); return delay; },
+      cancel: () => undefined,
+    });
+    context.after(() => coordinator.dispose());
+
+    coordinator.enqueue({ ...current, records: "stale.pm=127.120.5.10", revision: "A", signature: "A" });
+    await coordinator.waitForCurrentDrain();
+
+    assert.deepEqual(sent, ["A", "B"]);
+    assert.deepEqual(retries, []);
+    const port = (await readDnsPort(fixture.socketPath))!;
+    assert.deepEqual(await dnsQuery(port, "fresh.pm"), { rcode: 0, answerCount: 1, address: "127.120.5.9" });
+    assert.equal((await dnsQuery(port, "stale.pm")).rcode, 3);
+  });
+
   test("native agent answers A queries from synced records and NXDOMAINs unknown names", async (context) => {
     const fixture = await startDnsAgent(context);
     if (fixture === undefined) {
@@ -313,7 +447,7 @@ if (!fs.existsSync(nativeAgentPath)) {
   });
 }
 
-async function startDnsAgent(context: TestContext, reuseDirectory?: string, dnsPort = 0, dnsBindBlockPath?: string): Promise<DnsFixture | undefined> {
+async function startDnsAgent(context: TestContext, reuseDirectory?: string, dnsPort = 0, dnsBindBlockPath?: string, extraEnvironment: NodeJS.ProcessEnv = {}): Promise<DnsFixture | undefined> {
   const directory =
     reuseDirectory ??
     path.join(
@@ -336,7 +470,7 @@ async function startDnsAgent(context: TestContext, reuseDirectory?: string, dnsP
     path.join(projectRoot, "out", "src", "agent", "agent-main.js"),
     "--dns-port",
     String(dnsPort),
-  ], { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, ...(dnsBindBlockPath === undefined ? {} : { PORT_MANAGER_AGENT_TEST_DNS_BIND_BLOCK_PATH: dnsBindBlockPath }) } });
+  ], { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, ...extraEnvironment, ...(dnsBindBlockPath === undefined ? {} : { PORT_MANAGER_AGENT_TEST_DNS_BIND_BLOCK_PATH: dnsBindBlockPath }) } });
   agent.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
 
   context.after(async () => {

@@ -22,7 +22,7 @@ import { buildNodeRuntimeEnvironment } from "../../src/platform/process/node-run
  */
 
 const projectRoot = path.resolve(__dirname, "../../..");
-const nativeAgentPath = path.join(projectRoot, "media", "native", "portmanager_agent");
+const nativeAgentPath = process.env.PORT_MANAGER_TEST_NATIVE_AGENT_PATH ?? path.join(projectRoot, "media", "native", "portmanager_agent");
 
 test("native agent caches listener scans for concurrent snapshot readers", () => {
   const header = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.h"), "utf8");
@@ -69,16 +69,11 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(agentSource.includes("PM_SNAPSHOT_BROADCAST_MAX_DELAY_MS 250"), true);
   assert.equal(agentSource.includes("PM_ACCEPT_BUDGET_PER_TURN 512"), true);
   assert.equal(agentSource.includes("PM_CLIENT_READ_BUDGET_PER_TURN 512"), true);
-  assert.equal(agentSource.includes("PM_CLIENT_RESPONSE_WRITE_BUDGET_MS 100"), true);
-  assert.equal(agentSource.includes("PM_CONTROL_WRITE_BUDGET_MS 100"), true);
-  assert.equal(agentSource.includes("PM_SNAPSHOT_BROADCAST_WRITE_BUDGET_MS 100"), true);
   assert.equal(agentSource.includes("PM_SNAPSHOT_BROADCAST_START_MAX_DELAY_MS"), true);
   assert.equal(agentSource.includes("snapshot_dirty_since_ms"), true);
   assert.equal(agentSource.includes("size_t client_scan_cursor = 0;"), true);
   assert.equal(agentSource.includes("pm_client_has_complete_frame(&clients[index])"), true);
-  assert.equal(agentSource.includes("pm_process_client_buffer(client, state, snapshot_dirty, route_tables_dirty, 1)"), true);
-  assert.equal(agentSource.includes("static int pm_write_event_progress("), true);
-  assert.equal(agentSource.includes("ready = poll(write_fds"), true);
+  assert.equal(agentSource.includes("pm_process_client_buffer(client, state, snapshot_dirty, 1)"), true);
   assert.equal(agentSource.includes("PM_LISTEN_BACKLOG 16384"), true);
   assert.equal(agentSource.includes("static int pm_socket_has_live_server"), true);
   assert.equal(agentSource.includes("Port Manager agent is already listening"), true);
@@ -96,7 +91,6 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(agentSource.includes("PM_CLIENT_BUFFER_MAX 262144"), true);
   assert.equal(agentSource.includes("#include <poll.h>"), true);
   assert.equal(agentSource.includes("ready = poll("), true);
-  assert.equal(agentSource.includes("state->route_tables_dirty = 1;"), true);
   assert.equal(hookSource.includes("PM_MAX_ROUTES"), false);
   assert.equal(hookSource.includes("PM_ROUTE_MAPPING_INITIAL_CAPACITY"), true);
   assert.equal(hookSource.includes("PM_ROUTE_MAPPING_MAX_CAPACITY 65535"), true);
@@ -111,10 +105,9 @@ test("native agent caches listener scans for concurrent snapshot readers", () =>
   assert.equal(source.includes("static int pm_write_route_table_file_if_changed"), true);
   assert.equal(source.includes("PM_ROUTE_TABLE_WRITE_LOCK_BACKGROUND_ATTEMPTS"), false);
   assert.equal(source.includes("pm_route_table_generation_is_newer_for_publish"), true);
-  assert.equal(source.includes("static void pm_mark_route_tables_dirty"), true);
+  assert.equal(source.includes("void pm_mark_route_tables_dirty"), true);
   assert.equal(source.includes('pm_copy(state->version, sizeof(state->version), PORTMANAGER_PACKAGE_VERSION)'), true);
   assert.equal(source.includes('pm_buffer_append(payload, ",\\"version\\":")'), true);
-  assert.equal(source.includes("writing one endpoint file before every response"), true);
   assert.equal(source.includes("defer every registration source to the coalesced flush"), true);
   assert.equal(source.includes("pm_process_route_owner_matches_release"), true);
   assert.equal(source.includes("pm_scoped_route_ownership_mode(input->experimental_route_ownership_mode)"), true);
@@ -189,7 +182,7 @@ test("native agent route tables carry TTL and refresh unchanged files", () => {
   assert.equal(source.includes('PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"'), true);
   assert.equal(source.includes("PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15"), true);
   assert.equal(source.includes("static void pm_refresh_established_route_observations"), true);
-  assert.equal(source.includes('popen("lsof -nP -iTCP -sTCP:ESTABLISHED -Fn 2>/dev/null"'), true);
+  assert.equal(source.includes('pm_scan_output("lsof -nP -iTCP -sTCP:ESTABLISHED -Fn 2>/dev/null"'), true);
   assert.equal(source.includes("PM_ESTABLISHED_ROUTE_OBSERVATION_SCAN_INTERVAL_SECONDS 2"), true);
   assert.equal(source.includes("static int pm_build_route_endpoint_index"), true);
   assert.equal(source.includes("pm_route_endpoint_index_lower_bound"), true);
@@ -206,8 +199,6 @@ test("native agent route tables carry TTL and refresh unchanged files", () => {
   assert.equal(header.includes("pm_state_route_table_heartbeat_due"), true);
   assert.equal(source.includes("state->route_table_refreshed_at = time(NULL);"), true);
   assert.equal(source.includes("int pm_state_route_table_heartbeat_due"), true);
-  assert.equal(agentSource.includes("pm_state_route_table_heartbeat_due(state, time(NULL))"), true);
-  assert.equal(agentSource.includes("route_table_flush_retry_after"), true);
   assert.notEqual(writeStart, -1);
   assert.equal(writeBody.includes('\\"expiresAtMs\\":%ld,\\"ttlMs\\":%ld'), true);
   assert.equal(writeBody.includes('\\"ttlStartsAfterFirstHandshake\\":true'), true);
@@ -288,7 +279,7 @@ test("native agent recovers restarted hook routes from process environment", () 
   assert.equal(tsAgent.includes("const ROUTE_ALLOCATION_TTL_MS = 300_000;"), true);
 });
 
-test("native agent repair routing forces recovery and synchronous publication", () => {
+test("native agent repair routing forces a fresh listener capture before publication", () => {
   const header = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.h"), "utf8");
   const agentSource = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.c"), "utf8");
   const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
@@ -296,23 +287,20 @@ test("native agent repair routing forces recovery and synchronous publication", 
   const repairEnd = source.indexOf("int pm_state_reap_children", repairStart);
   const repairBody = source.slice(repairStart, repairEnd);
   const snapshotIndex = repairBody.indexOf("pm_state_snapshot_internal(state, payload, 1)");
-  const clearSignaturesIndex = repairBody.indexOf("pm_route_table_signatures_clear(state)");
   const flushIndex = repairBody.indexOf("pm_state_flush_route_tables(state)");
 
   assert.notEqual(repairStart, -1);
   assert.equal(header.includes("int pm_state_repair_routing"), true);
   assert.equal(agentSource.includes('strcmp(request->method, "repairRoutingState") == 0'), true);
   assert.equal(agentSource.includes('strcmp(request->method, "flushRouteTables") == 0'), true);
-  assert.equal(agentSource.includes('strcmp(request.method, "repairRoutingState") != 0'), true);
-  assert.equal(agentSource.includes("*route_tables_dirty = 0;"), true);
   assert.ok(snapshotIndex >= 0);
   assert.equal(repairBody.includes("pm_refresh_established_route_observations(state)"), false);
-  assert.ok(clearSignaturesIndex > snapshotIndex);
   assert.ok(flushIndex > snapshotIndex);
-  assert.ok(flushIndex > clearSignaturesIndex);
   assert.equal(source.includes("listener_scan_result != 0 && force_fresh_listener_scan"), true);
-  assert.equal(source.includes("WIFEXITED(close_status)"), true);
-  assert.equal(source.includes("WEXITSTATUS(close_status) != 1"), true);
+  const scanSource = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_scan.c"), "utf8");
+  assert.equal(scanSource.includes("WIFEXITED(job->status)"), true);
+  assert.equal(scanSource.includes("WEXITSTATUS(job->status) != 1"), true);
+  assert.equal(source.includes("popen("), false);
 });
 
 if (!fs.existsSync(nativeAgentPath)) {

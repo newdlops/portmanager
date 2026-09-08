@@ -116,6 +116,24 @@ run:
 npm run package
 ```
 
+## Native CI Packages
+
+Dispatch `.github/workflows/release-packages.yml` at the release commit. It uses
+native Apple Silicon, Intel macOS, Linux arm64, and Linux x64 runners. Every
+runner builds and verifies the native runtime, runs the unit suite with native
+integration tests enabled, packages its target, and installs that VSIX into a
+fresh VS Code profile. The packaged activation check verifies commands, the
+extension API, daemon build identity, DNS responder startup, and route-file
+publication. It does not perform the manual UI/admin/Compose checks below.
+
+Only successful jobs upload `portmanager-<target>` artifacts. Download all four
+from the same successful workflow run and publish those VSIX files unchanged.
+The workflow has read-only repository access and no Marketplace credentials;
+publishing uses the release operator's stored publisher credentials. Verification
+logs are uploaded separately even when a gate fails. `npm run test:packaged` is
+restricted to disposable CI runners because extension activation also creates
+user-level shell assets and starts a DNS responder.
+
 ## VSIX Install Verification
 
 Install the generated VSIX before publishing:
