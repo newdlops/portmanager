@@ -35,6 +35,12 @@ All notable changes to Port Manager are documented in this file.
 - Isolate the interface view of a network-scoped process: the hook interposes `getifaddrs` so `os.networkInterfaces()` reports only `127.0.0.1` and the process's own network loopback alias, hiding other networks' host-global `lo0` aliases (e.g. dev servers like vite no longer enumerate every network's loopback).
 - Serve every network-alias port through one protocol-sniffing listener instead of classifying ports as web vs raw. Each connection is demultiplexed by its first bytes: a TLS ClientHello is terminated with the dev certificate and proxied as HTTP, a plaintext HTTP request line is proxied as HTTP, and anything else is forwarded as raw TCP. **Fixes `ERR_SSL_PROTOCOL_ERROR`** on Docker Compose (and other containerized) web services, which the previous command-name heuristic misclassified as raw and served plain, so browsers rejected the HTTPS handshake. Databases and other raw protocols on the same alias continue to work over the raw path.
 
+## 0.0.8254
+
+- Reduce Docker background work by sharing one container snapshot between service discovery and Compose routing, and by polling every five minutes while healthy lifecycle events cover all active runtimes. Retain one-minute recovery polling when event coverage is unavailable or incomplete.
+- Filter Docker healthcheck and exec events at the daemon, serialize event bursts with a trailing refresh, and limit Compose override validation to the affected projects or known containers. Reconnection immediately catches up missed changes.
+- Preserve stopped Compose services as attachment candidates without publishing live routes for them, and share concurrent or failed inspect attempts within each refresh snapshot.
+
 ## 0.0.8253
 
 - Restore Linux native builds with platform-specific process environment lookup and libc symbol declarations.
