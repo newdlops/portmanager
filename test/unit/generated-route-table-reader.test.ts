@@ -130,21 +130,24 @@ test("one heartbeat reads only its changed shard among many networks", async (co
     }
   }
   let reads = 0, directoryReads = 0, signals = 0;
+  const readPaths: string[] = [];
   const watcher = new GeneratedRouteTableWatcher({ onChanged: () => { signals++; }, fileSystem: {
     readDirectory: (target) => { directoryReads++; return fs.readdir(target, { withFileTypes: true }); },
-    readTextFile: async (target) => { const text = await fs.readFile(target, "utf8"); reads++; return text; },
+    readTextFile: async (target) => { const text = await fs.readFile(target, "utf8"); reads++; readPaths.push(target); return text; },
   } });
   context.after(async () => { watcher.dispose(); await fs.rm(directory, { recursive: true, force: true }); });
   watcher.setPaths(tables);
   await waitFor(() => signals === 1);
   assert.equal(reads, 216);
-  reads = 0; directoryReads = 0;
+  reads = 0; directoryReads = 0; readPaths.length = 0;
   const shard = path.join(directory, "network-0-port-3000.json");
   await fs.writeFile(`${shard}.tmp`, JSON.stringify({ expiresAtMs: Date.now() + 60_000, routes: [route(50_000)] }));
   await fs.rename(`${shard}.tmp`, shard);
   await waitFor(() => reads > 0);
   await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal(reads, 1);
+  // fs.watch may report both replacement and metadata events for the same
+  // atomic rename. Neither event may reread any of the 215 unchanged files.
+  assert.deepEqual([...new Set(readPaths)], [shard]);
   assert.equal(directoryReads, 0);
   assert.equal(signals, 1);
 });

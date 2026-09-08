@@ -9,6 +9,12 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Keep the interposer in the agent only. Native arm64 macOS can reject this
+ * test dylib in protected /bin/sh scan children even on a CI VM without SIP. */
+__attribute__((constructor)) static void pm_test_publication_loaded(void) {
+  unsetenv("DYLD_INSERT_LIBRARIES");
+}
+
 static ssize_t pm_test_publication_write(int fd, const void *bytes, size_t length) {
   int saved_errno = errno;
   const char *root = getenv("PM_PUBLICATION_TEST_ROOT");
