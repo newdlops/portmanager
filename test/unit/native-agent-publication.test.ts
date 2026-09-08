@@ -114,7 +114,9 @@ async function fixture(context: TestContext, withGate = true) {
       fs.rmSync(path.join(directory, `entered-${kind}`), { force: true });
       fs.writeFileSync(path.join(directory, `block-${kind}`), "");
     },
-    entered: (kind: "routes" | "dns") => until(() => fs.existsSync(path.join(directory, `entered-${kind}`))),
+    // Repair performs an OS scan before publishing; fixture readiness must
+    // allow its bounded scan budget. Responsiveness assertions stay at 500ms.
+    entered: (kind: "routes" | "dns") => until(() => fs.existsSync(path.join(directory, `entered-${kind}`)), 6000),
     release(kind: "routes" | "dns") { fs.rmSync(path.join(directory, `block-${kind}`), { force: true }); },
   };
 }

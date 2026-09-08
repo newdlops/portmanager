@@ -18,7 +18,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#if defined(__APPLE__)
 #include <sys/sysctl.h>
+#endif
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/types.h>
@@ -97,6 +99,9 @@ typedef pid_t (*pm_wait4_fn)(pid_t, int *, int, struct rusage *);
 typedef pid_t (*pm_waitpid_fn)(pid_t, int *, int);
 typedef pid_t (*pm_wait3_fn)(int *, int, struct rusage *);
 typedef int (*pm_kill_fn)(pid_t, int);
+
+/* File interposition resolves libc before the networking symbol initializer. */
+static void *pm_resolve_symbol(const char *name);
 
 typedef struct {
   int logical_port;
@@ -5163,7 +5168,7 @@ static int pm_base64_decode(const char *input, char *output, size_t output_capac
  */
 /*
  * Reads a target pid's Port Manager network id from its environment via
- * KERN_PROCARGS2, using the SAME variable precedence as the detector's
+ * KERN_PROCARGS2 (macOS) or /proc (Linux), using the SAME variable precedence as the detector's
  * process-lookup helper (so the value equals the RESPAWN target for the genuine
  * escaped child). Lets a respawn refuse to signal any pid that is not in the
  * intended network — the guarantee that a respawn's kill can never cross a
@@ -5177,7 +5182,6 @@ static int pm_read_process_network_id(pid_t pid, char *buf, size_t size) {
     "NEWDLOPS_PM_NETWORK_ID",
     "NEWDLOPS_PM_BORROWED_NETWORK_ID",
   };
-  int mib[3] = {CTL_KERN, KERN_PROCARGS2, (int)pid};
   size_t buffer_size = 0;
   char *buffer;
 
@@ -5186,6 +5190,8 @@ static int pm_read_process_network_id(pid_t pid, char *buf, size_t size) {
   }
   buf[0] = '\0';
 
+#if defined(__APPLE__)
+  int mib[3] = {CTL_KERN, KERN_PROCARGS2, (int)pid};
   if (sysctl(mib, 3, NULL, &buffer_size, NULL, 0) != 0 || buffer_size == 0) {
     return -1;
   }
@@ -5197,6 +5203,21 @@ static int pm_read_process_network_id(pid_t pid, char *buf, size_t size) {
     free(buffer);
     return -1;
   }
+#else
+  /* procfs reports st_size=0, so read the NUL-delimited environment with a
+   * fixed upper bound and reject truncation before authorizing any signal. */
+  char proc_path[64];
+  snprintf(proc_path, sizeof(proc_path), "/proc/%ld/environ", (long)pid);
+  FILE *environment = fopen(proc_path, "rb");
+  if (environment == NULL) return -1;
+  const size_t capacity = 2 * 1024 * 1024;
+  buffer = (char *)malloc(capacity);
+  if (buffer == NULL) { fclose(environment); return -1; }
+  buffer_size = fread(buffer, 1, capacity, environment);
+  int invalid = ferror(environment) || buffer_size == capacity;
+  fclose(environment);
+  if (invalid || buffer_size == 0) { free(buffer); return -1; }
+#endif
 
   for (size_t variable_index = 0; variable_index < sizeof(variables) / sizeof(variables[0]); variable_index++) {
     const char *name = variables[variable_index];
@@ -5208,7 +5229,7 @@ static int pm_read_process_network_id(pid_t pid, char *buf, size_t size) {
       size_t remaining = buffer_size - offset;
       size_t entry_length = strnlen(entry, remaining);
 
-      if (entry_length > name_length && entry[name_length] == '=' && strncmp(entry, name, name_length) == 0) {
+      if (entry_length < remaining && entry_length > name_length && entry[name_length] == '=' && strncmp(entry, name, name_length) == 0) {
         snprintf(buf, size, "%s", entry + name_length + 1);
         free(buffer);
         return buf[0] == '\0' ? -1 : 0;

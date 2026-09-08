@@ -448,14 +448,8 @@ if (!fs.existsSync(nativeAgentPath)) {
 }
 
 async function startDnsAgent(context: TestContext, reuseDirectory?: string, dnsPort = 0, dnsBindBlockPath?: string, extraEnvironment: NodeJS.ProcessEnv = {}): Promise<DnsFixture | undefined> {
-  const directory =
-    reuseDirectory ??
-    path.join(
-      projectRoot,
-      ".tmp",
-      "native-agent-dns-tests",
-      `run-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`,
-    );
+  // Keep the socket below sockaddr_un's path limit even in deeply nested CI checkouts.
+  const directory = reuseDirectory ?? fs.mkdtempSync(path.join(os.tmpdir(), "pm-dns-"));
   fs.mkdirSync(directory, { recursive: true });
   const socketPath = path.join(directory, "agent.sock");
   const routeTablePath = path.join(directory, "routes.json");

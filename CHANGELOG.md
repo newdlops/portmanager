@@ -37,6 +37,7 @@ All notable changes to Port Manager are documented in this file.
 
 ## 0.0.8253
 
+- Restore Linux native builds with platform-specific process environment lookup and libc symbol declarations.
 - Verify all four native Marketplace targets in CI, including installation and activation of each packaged VSIX in a fresh VS Code profile.
 - Publish route files during sustained traffic and move route/DNS file operations off the control loop, with bounded queues, completion receipts, revision checks, and retryable partial failures.
 - Keep DNS publication and status requests responsive during listener scans and slow socket reads; preserve accepted mutations and complete half-closed responses.

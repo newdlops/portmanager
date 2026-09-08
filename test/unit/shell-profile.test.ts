@@ -186,6 +186,11 @@ test("prelude uses builtins, suspends dynamic PM activation, and postlude restor
   fs.writeFileSync(postludePath, postlude);
 
   const command = [
+    // Set synthetic preload paths after the OS loader starts the shell. This
+    // exercises filtering without depending on SIP stripping invalid dylibs.
+    "export PORT_MANAGER_HOOK=1 PORT_MANAGER_HOOK_DISABLED=",
+    `export DYLD_INSERT_LIBRARIES=${shellQuote(`${hookLibrary}:${staleHook}:/user/lib.dylib`)}`,
+    `export LD_PRELOAD=${shellQuote(`/user/lib.so:${hookLibrary}`)}`,
     `source ${shellQuote(preludePath)}`,
     'print -r -- "during=$PORT_MANAGER_HOOK|$PATH|${DYLD_INSERT_LIBRARIES:-}|${LD_PRELOAD:-}|${BASH_ENV:-}|$PORT_MANAGER_NETWORK_ID|${PORT_MANAGER_PRELOAD_REPAIR:-}"',
     `source ${shellQuote(postludePath)}`,
@@ -194,17 +199,18 @@ test("prelude uses builtins, suspends dynamic PM activation, and postlude restor
     `source ${shellQuote(postludePath)}`,
     'print -r -- "after=$PORT_MANAGER_HOOK|$PATH|${DYLD_INSERT_LIBRARIES:-}"',
   ].join("; ");
-  const result = spawnSync("/bin/zsh", ["-dfc", command], {
+  const result = spawnSync("/bin/zsh", ["-df"], {
+    input: `${command}\n`,
     encoding: "utf8",
     env: {
       HOME: root,
       PATH: `${externalRuntimeShims}:${runtimeShims}:/user/bin:/usr/bin:/bin`,
-      DYLD_INSERT_LIBRARIES: `${hookLibrary}:${staleHook}:/user/lib.dylib`,
-      LD_PRELOAD: `/user/lib.so:${hookLibrary}`,
+      DYLD_INSERT_LIBRARIES: "",
+      LD_PRELOAD: "",
       BASH_ENV: bashRestore,
       PORT_MANAGER_PREV_BASH_ENV: "/user/bash-env.sh",
-      PORT_MANAGER_HOOK: "1",
-      PORT_MANAGER_HOOK_DISABLED: "",
+      PORT_MANAGER_HOOK: "0",
+      PORT_MANAGER_HOOK_DISABLED: "1",
       PORT_MANAGER_RUNTIME_SHIM_DIR: runtimeShims,
       PORT_MANAGER_RUNTIME_SHIM_READY: "1",
       PORT_MANAGER_PRELOAD_REPAIR: "1",
@@ -212,13 +218,11 @@ test("prelude uses builtins, suspends dynamic PM activation, and postlude restor
     },
   });
 
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.status, 0, JSON.stringify({ signal: result.signal, error: result.error?.message, stdout: result.stdout, stderr: result.stderr }));
   const [during, nested, after] = result.stdout.trim().split("\n");
-  // macOS strips DYLD_* while launching the protected /bin/zsh fixture; LD_PRELOAD
-  // proves the same list filter preserves unrelated entries.
-  assert.equal(during, "during=0|/user/bin:/usr/bin:/bin||/user/lib.so|/user/bash-env.sh|network-a|1");
+  assert.equal(during, "during=0|/user/bin:/usr/bin:/bin|/user/lib.dylib|/user/lib.so|/user/bash-env.sh|network-a|1");
   assert.equal(nested, "nested=1");
-  assert.equal(after, `after=1|${runtimeShims}:/user/bin:/usr/bin:/bin|${hookLibrary}:`);
+  assert.equal(after, `after=1|${runtimeShims}:/user/bin:/usr/bin:/bin|${hookLibrary}:/user/lib.dylib`);
 });
 
 test("managed zsh login profiles keep user initialization clean and prompt commands routed", (t) => {
