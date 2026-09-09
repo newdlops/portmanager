@@ -35,6 +35,10 @@ All notable changes to Port Manager are documented in this file.
 - Isolate the interface view of a network-scoped process: the hook interposes `getifaddrs` so `os.networkInterfaces()` reports only `127.0.0.1` and the process's own network loopback alias, hiding other networks' host-global `lo0` aliases (e.g. dev servers like vite no longer enumerate every network's loopback).
 - Serve every network-alias port through one protocol-sniffing listener instead of classifying ports as web vs raw. Each connection is demultiplexed by its first bytes: a TLS ClientHello is terminated with the dev certificate and proxied as HTTP, a plaintext HTTP request line is proxied as HTTP, and anything else is forwarded as raw TCP. **Fixes `ERR_SSL_PROTOCOL_ERROR`** on Docker Compose (and other containerized) web services, which the previous command-name heuristic misclassified as raw and served plain, so browsers rejected the HTTPS handshake. Databases and other raw protocols on the same alias continue to work over the raw path.
 
+## 0.0.8256
+
+- Release the Docker idle CPU optimizations from 0.0.8254 and 0.0.8255 to the Marketplace: share discovery snapshots, use lifecycle events with bounded recovery polling, and avoid Compose revalidation for terminal-only shared-state changes.
+
 ## 0.0.8255
 
 - Keep Docker idle when another VS Code window only changes terminal attachments. Shared-state reload now validates only changed Compose networks, including additions, removals, and ownership moves; JSON row/property order does not trigger runtime work.
