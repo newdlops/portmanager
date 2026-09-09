@@ -122,6 +122,8 @@ Docker/Podman discovery나 `docker compose config`가 일시적으로 실패하�
 
 Docker CPU 부하를 줄이기 위해 자동 탐색은 lifecycle event를 우선 사용한다. 정상 이벤트 스트림이 사용하는 모든 runtime을 커버하면 전체 탐색은 5분 간격의 누락 복구용으로 수행하고, 스트림 장애나 runtime 혼용으로 커버가 불완전하면 기존 1분 탐색을 유지한다. 하나의 탐색 스냅샷을 후보 목록과 route reconciliation이 공유해야 한다. 이벤트 burst는 직렬 처리하되 처리 도중 발생한 마지막 변경을 빠뜨리지 않아야 하며, Compose label이나 알려진 container ID로 범위를 확인할 수 있으면 관련 네트워크만 override를 강제 검증한다. 정체성을 확인할 수 없으면 해당 runtime 전체를 검증한다. 재연결과 사용자의 명시적 새로고침은 주기 제한을 기다리지 않는다. startup, shared state reload, attach, stale routing repair의 기존 override 검증 보장은 유지한다.
 
+공유 상태 reload는 Compose attachment의 추가·변경·삭제가 있는 네트워크만 runtime 조회와 override 강제 검증을 수행한다. 터미널 연결·표시 정보만 달라지거나 동일 Compose row의 순서만 바뀐 경우에는 정상 override를 다시 만들기 위해 Docker를 호출하지 않는다. 공유 document는 즉시 적용하고 느린 후속 작업은 직렬화하여 최신 변경을 한 번 더 처리한다. 한 갱신에서 이미 검증한 override를 TSV 배포 때문에 재검증하지 않으며, 누락 파일 복구와 실패한 범위의 후속 재시도는 유지한다.
+
 #### Network Runtime Adapter
 
 Logical Network를 실제 시스템에서 구현하는 어댑터다. VS Code 확장만으로 모든 플랫폼에서 임의 프로세스의 network namespace를 만들 수는 없으므로, 런타임 구현은 인터페이스 뒤에 둔다.

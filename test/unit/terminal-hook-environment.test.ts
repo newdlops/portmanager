@@ -1875,8 +1875,9 @@ test("stale routing repair reuses readable compose overrides", () => {
   assert.equal(attachBody.includes("await this.composePublishMutator.restoreHiddenPortsOverride(input.existingMutation, {"), true);
   assert.equal(startBody.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });"), true);
   assert.equal(startBody.includes("await this.reconcileComposeOverrideFiles(undefined, { force: true });"), true);
-  assert.equal(reloadBody.includes("await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });"), true);
-  assert.equal(reloadBody.includes("await this.reconcileComposeOverrideFiles(undefined, { force: true });"), true);
+  // Compose scope/ordering/burst behavior is covered by shared-network-refresh.test.ts.
+  assert.equal(reloadBody.includes("changedComposeAttachmentNetworkIds("), true);
+  assert.equal(reloadBody.includes("await this.refreshSharedNetworkRoutingState();"), true);
   assert.equal(repairBody.includes("const cleanupSummary = await this.clearRoutingFiles();"), true);
   assert.equal(repairBody.includes("refreshTerminals("), false);
   assert.equal(repairBody.includes("const terminalCount = this.registry.getSnapshot().terminalWindows.length;"), true);

@@ -6,7 +6,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import * as vscode from "vscode";
 import {
   BrowserDnsSyncCoordinator,
@@ -879,6 +879,15 @@ export class PortManagerNetworkService implements DisposableLike {
   /** True while applying file changes from another VS Code window. */
   private applyingSharedNetworkState = false;
 
+  /** Shared documents apply immediately; their slower routing work drains one latest-state queue. */
+  private sharedNetworkRoutingRefreshInFlight: Promise<void> | undefined;
+
+  /** Revisions received during I/O request one trailing pass over the newest registry. */
+  private sharedNetworkRoutingRefreshQueued = false;
+
+  /** Terminal-only revisions never invalidate Compose; changed and removed owners retain their scope until drained. */
+  private readonly sharedNetworkComposeRefreshNetworkIds = new Set<string>();
+
   /** Extension-local state changes that are not owned by the pure registry. */
   private readonly localChangeEvents = new SimpleEventEmitter<void>();
 
@@ -1038,7 +1047,9 @@ export class PortManagerNetworkService implements DisposableLike {
   async start(): Promise<void> {
     this.disposables.push(
       this.sharedNetworkStateStore.watch(() => {
-        void this.reloadSharedNetworkState();
+        void this.reloadSharedNetworkState().catch((error) => {
+          devLog("ts-container-refresh", `shared-state refresh deferred: ${formatError(error)}`);
+        });
       }),
       this.watchOwnerLeaseFiles(),
       vscode.window.onDidOpenTerminal((terminal) => {
@@ -1293,6 +1304,8 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Stops owner-only automatic work when another extension host owns the control plane. */
   private demoteControlPlaneOwner(): void {
     const wasControlPlaneOwner = this.ownsControlPlaneLease;
+    this.sharedNetworkRoutingRefreshQueued = false;
+    this.sharedNetworkComposeRefreshNetworkIds.clear();
 
     if (
       !this.ownsControlPlaneLease &&
@@ -3763,6 +3776,8 @@ export class PortManagerNetworkService implements DisposableLike {
     this.ownsControlPlaneLease = false;
     this.ownsLogicalRouterLease = false;
     this.ownsBrowserNetworkProxyLease = false;
+    this.sharedNetworkRoutingRefreshQueued = false;
+    this.sharedNetworkComposeRefreshNetworkIds.clear();
     this.logicalRouterOwnershipGeneration += 1;
     this.browserNetworkProxyOwnershipGeneration += 1;
     this.registry.dispose();
@@ -3834,6 +3849,7 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
+    const previousComposeAttachments = this.registry.getSnapshot().composeAttachments;
     this.persistedNetworkStateSignature = signature;
     this.applyingSharedNetworkState = true;
     try {
@@ -3845,17 +3861,73 @@ export class PortManagerNetworkService implements DisposableLike {
     this.syncVscodeWindowProcessAttachment();
 
     if (this.ownsControlPlaneLease && tryAcquireControlPlaneOwnerLease()) {
-      await this.reopenPersistedExposures();
-      await this.writeHostAccessBindingsFile();
-      await this.reconcileComposeOverrideFiles(undefined, { force: true });
-      await this.reconcileComposeAttachmentPublishedPorts({ force: true }).catch(() => undefined);
-      await this.writeComposeProjectRoutingFile({ forceComposeOverrideRefresh: true });
-      await this.writeTerminalNetworkSelectionFile();
-      await this.rehydrateBrowserDnsAndProxies().catch(() => undefined);
-      await this.syncLogicalPortRouters();
+      for (const networkId of changedComposeAttachmentNetworkIds(
+        previousComposeAttachments, this.registry.getSnapshot().composeAttachments,
+      )) {
+        this.sharedNetworkComposeRefreshNetworkIds.add(networkId);
+      }
+      await this.refreshSharedNetworkRoutingState();
     } else if (this.ownsControlPlaneLease) {
       this.demoteControlPlaneOwner();
     }
+  }
+
+  /** Coalesces cross-window side effects without blocking adoption of a newer shared document. */
+  private refreshSharedNetworkRoutingState(): Promise<void> {
+    this.sharedNetworkRoutingRefreshQueued = true;
+    if (this.sharedNetworkRoutingRefreshInFlight !== undefined) {
+      return this.sharedNetworkRoutingRefreshInFlight;
+    }
+    // Reserve the slot before any registry side effect can synchronously re-enter this path.
+    this.sharedNetworkRoutingRefreshInFlight = Promise.resolve()
+      .then(() => this.refreshSharedNetworkRoutingStateSerially())
+      .finally(() => {
+        this.sharedNetworkRoutingRefreshInFlight = undefined;
+        if (this.sharedNetworkRoutingRefreshQueued && this.ownsControlPlaneLease) {
+          // A revision arriving at promise settlement still needs its trailing pass.
+          void this.refreshSharedNetworkRoutingState().catch(() => undefined);
+        }
+      });
+    return this.sharedNetworkRoutingRefreshInFlight;
+  }
+
+  /** Rebuilds Compose only for changed owners; other revisions keep routing files and DNS current without runtime reads. */
+  private async refreshSharedNetworkRoutingStateSerially(): Promise<void> {
+    do {
+      this.sharedNetworkRoutingRefreshQueued = false;
+      if (!this.ownsControlPlaneLease || !tryAcquireControlPlaneOwnerLease()) {
+        this.sharedNetworkComposeRefreshNetworkIds.clear();
+        this.demoteControlPlaneOwner();
+        return;
+      }
+      const networkIds = [...this.sharedNetworkComposeRefreshNetworkIds];
+      this.sharedNetworkComposeRefreshNetworkIds.clear();
+      try {
+        await this.reopenPersistedExposures();
+        await this.writeHostAccessBindingsFile();
+        if (!this.ownsControlPlaneLease) return;
+        if (networkIds.length > 0) {
+          const attachments = filterComposeAttachmentsByNetworkIds(this.registry.getSnapshot().composeAttachments, networkIds);
+          await this.reconcileComposeOverrideFiles(attachments, { force: true });
+          if (!this.ownsControlPlaneLease) return;
+          await this.reconcileComposeAttachmentPublishedPorts({ force: true, networkIds }).catch(() => undefined);
+        }
+        if (!this.ownsControlPlaneLease) return;
+        // Changed overrides were validated above. Publishing reuses them and still
+        // repairs a missing file, instead of running the same Docker recovery twice.
+        await this.writeComposeProjectRoutingFile();
+        await this.writeTerminalNetworkSelectionFile();
+        await this.rehydrateBrowserDnsAndProxies().catch(() => undefined);
+        await this.syncLogicalPortRouters();
+      } catch (error) {
+        // Retain failed scopes for a later revision or background tick, without
+        // turning a persistent filesystem failure into an immediate retry loop.
+        if (this.ownsControlPlaneLease) {
+          for (const networkId of networkIds) this.sharedNetworkComposeRefreshNetworkIds.add(networkId);
+        }
+        throw error;
+      }
+    } while (this.sharedNetworkRoutingRefreshQueued);
   }
 
   /** Reads the current VS Code workspace/window terminal default. */
@@ -4261,6 +4333,9 @@ export class PortManagerNetworkService implements DisposableLike {
 
     this.syncComposeRoutingFreshnessHeartbeat();
     this.syncContainerEventsWatcher();
+    if (this.sharedNetworkComposeRefreshNetworkIds.size > 0) {
+      await this.refreshSharedNetworkRoutingState().catch(() => undefined);
+    }
     await Promise.all([
       this.refreshTerminals({ background: true }).catch(() => []),
       this.refreshBackgroundContainerState().catch(() => undefined),
@@ -4366,6 +4441,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
     // Wait out an older poll before taking the event's snapshot. Joining a
     // read that started before the event could otherwise hide its final port.
+    await this.sharedNetworkRoutingRefreshInFlight?.catch(() => undefined);
     await this.backgroundContainerRefreshInFlight?.catch(() => undefined);
     await this.containerServiceRefreshInFlight?.catch(() => undefined);
     await this.composeAttachmentReconcileInFlight?.catch(() => undefined);
@@ -8580,6 +8656,25 @@ function composeAttachmentWorkingDirectory(attachment: ComposeAttachment): strin
 
 function stringifyPersistedNetworkState(state: LogicalNetworkRegistryState): string {
   return JSON.stringify(state);
+}
+
+/** Array/property order is not a runtime change; removals must still clean their former network's routes. */
+function changedComposeAttachmentNetworkIds(
+  previous: readonly ComposeAttachment[],
+  current: readonly ComposeAttachment[],
+): readonly string[] {
+  const previousById = new Map(previous.map((attachment) => [attachment.id, attachment]));
+  const networkIds = new Set<string>();
+  for (const attachment of current) {
+    const before = previousById.get(attachment.id);
+    previousById.delete(attachment.id);
+    if (!isDeepStrictEqual(before, attachment)) {
+      if (before !== undefined) networkIds.add(before.networkId);
+      networkIds.add(attachment.networkId);
+    }
+  }
+  for (const removed of previousById.values()) networkIds.add(removed.networkId);
+  return [...networkIds];
 }
 
 /** True when a persisted compose row should keep participating in live endpoint reconciliation. */
