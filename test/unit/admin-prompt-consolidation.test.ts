@@ -55,9 +55,10 @@ test("browser DNS install covers terminal aliases and names missing networks", (
   const source = readSource("src/extension/network-service.ts");
 
   const installStart = source.indexOf("private async installBrowserDnsResolversExclusive");
-  const installBody = source.slice(installStart, installStart + 3000);
+  const installBody = source.slice(installStart, source.indexOf("private async detectBrowserDnsPrivilegedDrift", installStart));
   assert.equal(installBody.includes("additionalLoopbackAddresses: this.collectTerminalLoopbackAddresses()"), true);
-  assert.equal(installBody.includes("browser alias setup is missing for logical network"), true);
+  // The prompt names what actually drifted (for example the moved alias address).
+  assert.equal(installBody.includes("describeBrowserDnsDrift(drift)"), true);
   assert.equal(installBody.includes("buildNetworkAdminSetupPromptMessage"), true);
 
   // The setup script builder accepts extra loopback addresses to ride along.
@@ -69,6 +70,41 @@ test("browser DNS install covers terminal aliases and names missing networks", (
   // Repair and renewal pass their own trigger descriptions.
   assert.equal(source.includes('"a browser TLS certificate renewal was requested"'), true);
   assert.equal(source.includes("needs repair (${record.tlsStatusDetail"), true);
+});
+
+test("browser DNS escalates only on fresh root-owned drift, never on cached or user-owned failures", () => {
+  const source = readSource("src/extension/network-service.ts");
+  const installStart = source.indexOf("private async installBrowserDnsResolversExclusive");
+  const promptIndex = source.indexOf("runShellScriptWithAdministratorPrivileges(", installStart);
+  const gate = source.slice(installStart, promptIndex);
+
+  // The decision precedes the prompt and ignores the cached `configured` flags,
+  // which fold in the lo0 alias cache and the 30-second Keychain trust cache.
+  assert.equal(gate.includes("await this.detectBrowserDnsPrivilegedDrift(status.records)"), true);
+  assert.equal(gate.includes("return this.recoverBrowserDnsWithoutPrivileges();"), true);
+  assert.equal(gate.includes("missingCount"), false);
+  assert.equal(gate.includes(".configured"), false);
+  // A failed verification no longer falls through into the privileged script.
+  assert.equal(gate.includes("verifyBrowserAccessReadiness"), false);
+
+  const recoverStart = source.indexOf("private async recoverBrowserDnsWithoutPrivileges()");
+  const recoverBody = source.slice(recoverStart, source.indexOf("private maybeOfferBrowserDnsResolverInstall", recoverStart));
+  assert.notEqual(recoverStart, -1);
+  assert.equal(recoverBody.includes("runShellScriptWithAdministratorPrivileges"), false);
+  assert.equal(recoverBody.includes("throw new LocalDnsRecoveryWithoutPrivilegesError"), true);
+  // Keychain re-registration (its own password dialog) needs a real untrusted verdict.
+  assert.equal(recoverBody.includes('if (trust.state === "untrusted") {'), true);
+
+  // Drift reads lo0 freshly; a failed probe must stay distinguishable from "missing".
+  const driftStart = source.indexOf("private async detectBrowserDnsPrivilegedDrift(");
+  const driftBody = source.slice(driftStart, recoverStart);
+  assert.equal(driftBody.includes("await probeLoopbackAliasAddresses()"), true);
+  assert.equal(source.includes("async function probeLoopbackAliasAddresses(): Promise<ReadonlySet<string> | undefined>"), true);
+
+  // Attach prompts only for a confirmed-absent terminal alias.
+  const ensureStart = source.indexOf("async ensureTerminalRoutingHostReadyForNetwork(");
+  const ensureBody = source.slice(ensureStart, source.indexOf("runShellScriptWithAdministratorPrivileges(", ensureStart));
+  assert.equal(ensureBody.includes("if (aliases === undefined || aliases.has(address)) {"), true);
 });
 
 test("background DNS reconciliation cannot open administrator authorization", () => {

@@ -76,11 +76,19 @@ export async function refreshBrowserTlsTrustStatus(
     { timeout: 15_000, maxBuffer: 256 * 1024 },
   )
     .then((): BrowserTlsTrustStatus => ({ state: "trusted", detail: "Trusted by the macOS default Keychain search list." }))
-    .catch((error): BrowserTlsTrustStatus => ({
-      state: "untrusted",
-      detail: conciseTrustError(error),
-    }))
-    .then((status) => {
+    .catch((error): BrowserTlsTrustStatus | undefined =>
+      isTrustVerificationVerdict(error) ? { state: "untrusted", detail: conciseTrustError(error) } : undefined,
+    )
+    .then((status): BrowserTlsTrustStatus => {
+      if (status === undefined) {
+        // No verdict (timeout or spawn failure on a loaded machine). Reporting
+        // `untrusted` here made callers re-register the CA, which opens a macOS
+        // password dialog although trust never changed. Keep the last result
+        // for this material, otherwise stay `checking`, and cache neither.
+        return cachedTrust?.materialSignature === materialSignature
+          ? cachedTrust.status
+          : { state: "checking", detail: "macOS Keychain trust check did not finish; it retries on the next refresh." };
+      }
       // A privileged repair can rotate the CA while an older verification is
       // still running. Never publish the old result for the new material.
       if (readMaterialSignature(caCertificatePath, leafCertificatePath) === materialSignature) {
@@ -96,6 +104,20 @@ export async function refreshBrowserTlsTrustStatus(
 
   trustRefreshInFlight = { materialSignature, promise: refresh };
   return refresh;
+}
+
+/**
+ * True only when `security verify-cert` ran to completion and rejected the
+ * leaf (non-zero numeric exit). A timeout kill (`killed`) or a spawn failure
+ * (string `code` such as `ENOENT`) says nothing about trust.
+ */
+export function isTrustVerificationVerdict(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+
+  const record = error as { readonly code?: unknown; readonly killed?: unknown; readonly signal?: unknown };
+  return typeof record.code === "number" && record.killed !== true && (record.signal === undefined || record.signal === null);
 }
 
 /** Forces the next status read to re-evaluate Keychain trust. */

@@ -34,7 +34,13 @@ import {
   terminalAttachmentsShareIdentity,
   type LogicalNetworkRegistryState,
 } from "../core/networks/logical-network-registry";
+import {
+  describeBrowserDnsDrift,
+  detectBrowserDnsDrift,
+  type BrowserDnsDriftReason,
+} from "../core/networks/browser-dns-drift";
 import { selectHostDefaultGatewayExposure } from "../core/networks/host-default-gateway";
+import { LocalDnsRecoveryWithoutPrivilegesError } from "../shared/errors";
 import {
   ACTUAL_LOOPBACK_HOST_ENV,
   browserLoopbackAddressForNetwork,
@@ -1692,11 +1698,19 @@ export class PortManagerNetworkService implements DisposableLike {
     this.browserDnsAliasStatusRefreshInFlight = refresh;
   }
 
-  /** Installs macOS resolver rows so browser URLs can use network names as hosts. */
+  /**
+   * Installs macOS resolver rows so browser URLs can use network names as hosts.
+   * The administrator prompt opens only when root-owned state drifted from the
+   * alias → loopback mapping (see installBrowserDnsResolversExclusive) or the
+   * caller passes an explicit force flag from a user's escalation choice.
+   */
   async installBrowserDnsResolvers(
     options: {
       readonly forceTlsRenewal?: boolean;
-      /** Reapply resolver, hosts, and loopback setup even when cached diagnostics look healthy. */
+      /**
+       * Reapply resolver, hosts, and loopback setup even without drift. Only an
+       * explicit "reapply with administrator privileges" choice may set this.
+       */
       readonly forceResolverSetup?: boolean;
       readonly triggerDescription?: string;
     } = {},
@@ -1714,19 +1728,21 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * Rebuilds the complete host-side Local DNS path after reboot or resolver drift.
+   * Rebuilds the host-side Local DNS path after reboot or resolver drift.
    *
-   * Unlike first-time installation, recovery deliberately bypasses the status
-   * shortcut: `/etc/resolver` may look correct while macOS has lost its lo0
-   * aliases or resolver cache. The setup script is idempotent, so reapplying it
-   * safely restores resolver rows, hosts entries, terminal/browser aliases, and
-   * refreshes the browser proxy data plane in one user-authorized operation.
+   * Recovery re-probes lo0 and rereads `/etc/resolver` and `/etc/hosts` instead
+   * of trusting cached diagnostics, so aliases macOS dropped at reboot are still
+   * found. When that root-owned state already matches every alias → loopback
+   * mapping, only the user-owned layers (daemon DNS table, Keychain trust, proxy
+   * listeners) are repaired and no administrator prompt opens. The caller may
+   * pass `forcePrivilegedSetup` only after the user explicitly asks to reapply
+   * the privileged script (for example to restart a wedged mDNSResponder).
    */
-  async repairLocalDns(): Promise<BrowserDnsResolverStatus> {
+  async repairLocalDns(options: { readonly forcePrivilegedSetup?: boolean } = {}): Promise<BrowserDnsResolverStatus> {
     await this.flushBrowserDnsDaemonSync();
 
     return this.installBrowserDnsResolvers({
-      forceResolverSetup: true,
+      forceResolverSetup: options.forcePrivilegedSetup === true,
       triggerDescription: "Local DNS recovery was requested",
     });
   }
@@ -1744,17 +1760,24 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * Repairs the browser alias for one network. A stale certificate (expired,
-   * expiring, or missing this alias's hostname) forces a leaf reissue; other
-   * gaps reuse the idempotent resolver/hosts/alias install path.
+   * Repairs the browser alias for one network. Stale certificate material
+   * (expired, expiring, or missing this alias's hostname) forces a leaf
+   * reissue. Keychain trust problems do not: trust lives in the user's login
+   * keychain and is restored without root. Other gaps go through the drift-gated
+   * install path, which stays promptless when root-owned state is current.
    */
   async repairBrowserDnsAlias(networkId: string): Promise<BrowserDnsResolverStatus> {
     const record = this.getBrowserDnsResolverStatus().records.find(
       (candidate) => candidate.networkId === networkId,
     );
+    const tlsState = readBrowserTlsCertificateState();
+    const certificateStale =
+      record !== undefined &&
+      tlsState.available &&
+      (tlsState.expired || tlsState.expiresSoon || !browserTlsStateCoversRecord(tlsState, record));
 
     return this.installBrowserDnsResolvers({
-      forceTlsRenewal: record?.tlsStale === true,
+      forceTlsRenewal: certificateStale,
       triggerDescription:
         record === undefined
           ? "a browser alias repair was requested"
@@ -1772,8 +1795,8 @@ export class PortManagerNetworkService implements DisposableLike {
       return this.getBrowserDnsResolverStatus();
     }
 
-    invalidateLoopbackAliasCache();
-    await readLoopbackAliasAddresses();
+    // A failed probe keeps the last good lo0 snapshot rather than an empty set.
+    await probeLoopbackAliasAddresses();
     invalidateBrowserTlsTrustStatus();
     await refreshBrowserTlsTrustStatus(BROWSER_TLS_CA_CERT_PATH, BROWSER_TLS_SERVER_CERT_PATH);
     await this.flushBrowserDnsDaemonSync();
@@ -1832,7 +1855,14 @@ export class PortManagerNetworkService implements DisposableLike {
     mode: "auto" | "loopback" | "high-port",
   ): Promise<void> {
     const address = loopbackAddressForNetwork(network.id);
-    if (await isLoopbackAddressAliasConfiguredAsync(address)) {
+    // The network's address never moves, so only a confirmed-absent alias
+    // (typically dropped by macOS at reboot) justifies the admin prompt. An
+    // unknown probe result defers to the attach script's own alias check.
+    const aliases = await probeLoopbackAliasAddresses();
+    if (aliases === undefined || aliases.has(address)) {
+      if (aliases === undefined && process.platform === "darwin") {
+        devLog("ts-browser-dns", `terminal alias probe failed address=${address}; skipping admin prompt`);
+      }
       return;
     }
 
@@ -1909,33 +1939,33 @@ export class PortManagerNetworkService implements DisposableLike {
     if (!status.supported || status.records.length === 0) {
       return status;
     }
-    // Explicit renewal and recovery must run even when every alias currently
-    // reports configured. Resolver state and non-persistent lo0 aliases can
-    // drift underneath otherwise healthy-looking files and cached diagnostics.
-    if (
-      status.missingCount === 0 &&
-      options.forceTlsRenewal !== true &&
-      options.forceResolverSetup !== true
-    ) {
-      try {
-        const verifiedStatus = await this.verifyBrowserAccessReadiness();
-        this.clearBrowserDnsInstallOfferSignature();
-        return verifiedStatus;
-      } catch {
-        // Generated files can look healthy while macOS split DNS or the daemon
-        // is not. Fall through to the idempotent privileged repair and then
-        // repeat the real resolver check below.
-      }
+
+    /*
+     * Escalate only on fresh evidence that root-owned state disagrees with the
+     * alias → loopback mapping. The cached `configured` flags must not decide
+     * this: they fold in the lo0 alias cache (empty right after invalidation)
+     * and the 30-second Keychain trust cache (`checking` once it lapses), which
+     * reported every alias missing and asked for the administrator password
+     * while every address was unchanged. A failed verification is not drift
+     * either; the root rewrite cannot fix a stale daemon table or resolver answer.
+     */
+    const forced = options.forceTlsRenewal === true || options.forceResolverSetup === true;
+    const drift = await this.detectBrowserDnsPrivilegedDrift(status.records);
+    const driftDescription = describeBrowserDnsDrift(drift);
+    devLog(
+      "ts-browser-dns",
+      `install escalate=${forced || drift.length > 0} forced=${forced} drift=${drift.length}${driftDescription === undefined ? "" : ` (${driftDescription})`}`,
+    );
+    if (!forced && drift.length === 0) {
+      return this.recoverBrowserDnsWithoutPrivileges();
     }
 
-    const unconfiguredNames = status.records
-      .filter((record) => !record.configured)
-      .map((record) => record.networkName);
     const triggerDescription =
-      options.triggerDescription ??
-      (unconfiguredNames.length > 0
-        ? `browser alias setup is missing for logical network${unconfiguredNames.length === 1 ? "" : "s"} ${formatNetworkNameList(unconfiguredNames)}`
-        : "browser alias setup was requested");
+      options.triggerDescription === undefined
+        ? driftDescription ?? "browser alias setup was requested"
+        : driftDescription === undefined
+          ? options.triggerDescription
+          : `${options.triggerDescription} (${driftDescription})`;
 
     await runShellScriptWithAdministratorPrivileges(
       buildBrowserDnsResolverSetupScript(
@@ -1978,6 +2008,75 @@ export class PortManagerNetworkService implements DisposableLike {
       throw new Error(`Browser DNS/TLS verification failed for: ${missingAliases || "unknown alias"}.`);
     }
     return installedStatus;
+  }
+
+  /**
+   * Compares root-owned DNS state with the expected alias → loopback mapping
+   * using fresh reads only: a new `ifconfig lo0` probe (unknown on failure) and
+   * stat-validated `/etc/resolver`, `/etc/hosts`, and TLS material. The pure
+   * policy in core/networks/browser-dns-drift decides what counts as drift.
+   */
+  private async detectBrowserDnsPrivilegedDrift(
+    records: readonly NetworkDnsRecord[],
+  ): Promise<readonly BrowserDnsDriftReason[]> {
+    const loopbackAliases = await probeLoopbackAliasAddresses();
+    const tlsState = readBrowserTlsCertificateState();
+    const secureResolverConfigured = isBrowserDnsResolverConfigured(BROWSER_SECURE_DNS_SUFFIX);
+    const ownedHostsEntries = readBrowserDnsOwnedHostsEntries();
+
+    return detectBrowserDnsDrift(
+      records.map((record) => ({
+        hostname: record.hostname,
+        expectedAddress: record.address,
+        loopbackAliases,
+        resolverConfigured: secureResolverConfigured && isBrowserDnsResolverConfigured(record.hostname),
+        hostsAddresses: readBrowserDnsHostsAddresses(record.hostname),
+        ownedHostsAddresses: ownedHostsEntries
+          .filter((entry) => entry.hostname === record.hostname)
+          .map((entry) => entry.address),
+        tls: {
+          available: tlsState.available,
+          coversHostname: browserTlsStateCoversRecord(tlsState, record),
+          expired: tlsState.expired,
+        },
+      })),
+    );
+  }
+
+  /**
+   * Repairs every Local DNS layer the user owns, then proves the result.
+   *
+   * Runs when root-owned state already matches the alias mapping, which is the
+   * usual case when an older alias stops routing: the daemon's DNS table or
+   * responder lagged, Keychain trust lapsed, or a proxy listener dropped. The
+   * daemon table is re-pushed, trust is restored in the login keychain only if
+   * a fresh check returns an actual `untrusted` verdict (a timed-out check is
+   * `checking` and never re-registers the CA, whose keychain dialog would ask
+   * for the password again), failed proxy endpoints are retried, and
+   * getaddrinfo must resolve every alias. Failure raises
+   * LocalDnsRecoveryWithoutPrivilegesError instead of an administrator prompt.
+   */
+  private async recoverBrowserDnsWithoutPrivileges(): Promise<BrowserDnsResolverStatus> {
+    try {
+      await this.flushBrowserDnsDaemonSync();
+      invalidateBrowserTlsTrustStatus();
+      const trust = await refreshBrowserTlsTrustStatus(BROWSER_TLS_CA_CERT_PATH, BROWSER_TLS_SERVER_CERT_PATH);
+      if (trust.state === "untrusted") {
+        await ensureBrowserTlsCertificateTrustedForCurrentUser();
+      }
+      this.browserNetworkProxy.retryFailedEndpointsNow();
+      await this.syncBrowserNetworkProxies().catch(() => undefined);
+
+      const verifiedStatus = await this.verifyBrowserAccessReadiness();
+      this.clearBrowserDnsInstallOfferSignature();
+      this.localChangeEvents.emit();
+      return verifiedStatus;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      devLog("ts-browser-dns", `promptless recovery failed: ${detail}`);
+      this.localChangeEvents.emit();
+      throw new LocalDnsRecoveryWithoutPrivilegesError(detail, { cause: error });
+    }
   }
 
   /** Offers one user-driven resolver repair for each distinct missing alias set. */
@@ -10759,6 +10858,19 @@ function isBrowserDnsHostsEntryConfigured(hostname: string, address: string): bo
   });
 }
 
+/** Addresses of every /etc/hosts row that lists the hostname, owned block or not. */
+function readBrowserDnsHostsAddresses(hostname: string): readonly string[] {
+  const content = readTextFileWithStatCache("/etc/hosts");
+  if (content === undefined) {
+    return [];
+  }
+
+  return content.split(/\r?\n/).flatMap((line) => {
+    const [hostAddress, ...hostnames] = line.replace(/#.*/, "").trim().split(/\s+/);
+    return hostAddress !== undefined && hostAddress.length > 0 && hostnames.includes(hostname) ? [hostAddress] : [];
+  });
+}
+
 /**
  * Treat stale entries inside Port Manager's owned hosts block as drift even when
  * another line happens to contain the desired hostname. macOS hosts lookup can
@@ -10866,10 +10978,14 @@ async function readLoopbackAliasAddresses(): Promise<ReadonlySet<string>> {
       return next;
     })
     .catch(() => {
-      const next: LoopbackAliasCacheState = {
-        readAtMs: Date.now(),
-        addresses: cache?.addresses ?? new Set<string>(),
-      };
+      // A failed probe is not evidence that aliases vanished. Keep the last good
+      // snapshot (throttled for one TTL), but never publish an empty set as a
+      // fresh reading: that made every alias look missing for five seconds and
+      // opened administrator prompts although nothing had changed.
+      if (cache === undefined) {
+        return { readAtMs: 0, addresses: EMPTY_LOOPBACK_ALIAS_ADDRESSES };
+      }
+      const next: LoopbackAliasCacheState = { readAtMs: Date.now(), addresses: cache.addresses };
       loopbackAliasCache = next;
       return next;
     })
@@ -10878,6 +10994,31 @@ async function readLoopbackAliasAddresses(): Promise<ReadonlySet<string>> {
     });
 
   return (await loopbackAliasCacheRefreshInFlight).addresses;
+}
+
+/**
+ * Fresh lo0 read for decisions that may open an administrator prompt. Unlike
+ * readLoopbackAliasAddresses it bypasses the TTL, retries once with a longer
+ * budget (ifconfig can exceed one second while the machine is loaded), and
+ * reports a failed probe as `undefined` so callers can treat it as unknown.
+ */
+async function probeLoopbackAliasAddresses(): Promise<ReadonlySet<string> | undefined> {
+  if (process.platform !== "darwin") {
+    return undefined;
+  }
+
+  for (const timeout of [2_000, 5_000]) {
+    try {
+      const { stdout } = await execFileAsync("ifconfig", ["lo0"], { timeout });
+      const addresses = parseLoopbackAliasAddresses(String(stdout));
+      loopbackAliasCache = { readAtMs: Date.now(), addresses };
+      return addresses;
+    } catch {
+      // Retry once; a second failure leaves the answer unknown.
+    }
+  }
+
+  return undefined;
 }
 
 /** Non-default 127.x.x.x hosts must exist on macOS lo0 before local binds work. */

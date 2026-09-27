@@ -41,6 +41,7 @@ import {
   buildBrowserTlsRepairShellFunctions,
 } from "../platform/network/browser-tls-assets";
 import type { PortManagerNetworkService } from "./network-service";
+import { LocalDnsRecoveryWithoutPrivilegesError } from "../shared/errors";
 import type { PortManagerProcessService } from "./process-service";
 import {
   buildShellProfilePostludeScript,
@@ -1771,10 +1772,15 @@ export class PortManagerCommandController implements DisposableLike {
     }
   }
 
-  /** Force-reapplies the complete macOS Local DNS path after alias or resolver drift. */
-  private async repairLocalDns(): Promise<void> {
+  /**
+   * Repairs the macOS Local DNS path. The service asks for the administrator
+   * password only when root-owned state drifted from the alias → loopback
+   * mapping; otherwise it repairs the user-owned layers. If that promptless
+   * repair fails, the user may explicitly choose the privileged reapply.
+   */
+  private async repairLocalDns(options: { readonly forcePrivilegedSetup?: boolean } = {}): Promise<void> {
     try {
-      const status = await this.dependencies.networkService.repairLocalDns();
+      const status = await this.dependencies.networkService.repairLocalDns(options);
       this.dependencies.treeProvider.refresh();
 
       if (!status.supported) {
@@ -1808,7 +1814,22 @@ export class PortManagerCommandController implements DisposableLike {
         `Local DNS repaired: ${status.installedCount}/${status.records.length} aliases are ready.`,
       );
     } catch (error) {
-      await vscode.window.showWarningMessage(`Local DNS repair failed: ${toErrorMessage(error)}`);
+      this.dependencies.treeProvider.refresh();
+      if (!(error instanceof LocalDnsRecoveryWithoutPrivilegesError) || options.forcePrivilegedSetup === true) {
+        await vscode.window.showWarningMessage(`Local DNS repair failed: ${toErrorMessage(error)}`);
+        return;
+      }
+
+      // Every alias still maps to its unchanged loopback address, so the
+      // privileged rewrite is offered, never started, from this failure.
+      const reapply = "Reapply with Administrator Privileges";
+      const selection = await vscode.window.showWarningMessage(
+        `Local DNS repair failed: ${toErrorMessage(error)} No drift was found in loopback aliases, resolvers, hosts entries, or the TLS certificate, so no administrator change was made.`,
+        reapply,
+      );
+      if (selection === reapply) {
+        await this.repairLocalDns({ forcePrivilegedSetup: true });
+      }
     }
   }
 

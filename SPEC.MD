@@ -217,7 +217,7 @@ Browser bind 실패는 짧은 초기 지연 뒤 자동 재시도하고, 연속 �
 
 Browser owner는 생성된 network route table과 port shard의 생성·원자적 교체·삭제를 감지해 daemon 이벤트 누락 시에도 proxy를 재동기화한다. 짧은 고정 구간으로 변경 신호를 합치고 실제 라우팅 내용이 같은 heartbeat는 갱신을 유발하지 않는다. 소유권을 잃으면 watcher와 진행 중인 읽기의 callback을 해제하며, watcher 장애 시 기존 주기적 reconciliation이 복구 경로로 남는다.
 
-Diagnostics UI는 **Repair Local DNS** 작업을 제공해야 한다. 이 작업은 파일 기반 상태가 정상으로 보여도 `/etc/resolver`, `/etc/hosts`, DNS 캐시와 per-network loopback alias를 관리자 승인 아래 멱등적으로 다시 적용하고, Local DNS responder의 현재 레코드 및 브라우저 proxy를 재동기화해야 한다. macOS 재부팅으로 비영속 `lo0` alias만 사라진 경우에도 최초 설치를 지우거나 네트워크별 작업을 반복하지 않고 한 번의 사용자 작업으로 복구되어야 한다.
+Diagnostics UI는 **Repair Local DNS** 작업을 제공해야 한다. 이 작업은 캐시된 진단 대신 `lo0`를 새로 조회하고 `/etc/resolver`, `/etc/hosts`, dev TLS 인증서를 다시 읽어, root 소유 상태가 별칭 → loopback 매핑과 실제로 어긋난 경우(새로 생겼거나 이름이 바뀐 별칭, hosts에 남은 이전 주소, 사라진 `lo0` alias, 인증서 누락·만료·hostname 미포함)에만 관리자 승인 아래 설치 스크립트를 멱등적으로 다시 적용한다. loopback 주소는 네트워크 id에서 결정되므로 매핑이 그대로이면 관리자 비밀번호를 묻지 않고, Local DNS responder 레코드 재동기화, login keychain 신뢰 복구, 브라우저 proxy 재동기화만 수행한 뒤 macOS getaddrinfo로 검증한다. Keychain 신뢰 캐시 만료(`checking`), 실패한 `lo0` 조회, 인증서 갱신 창(만료 전 30일), getaddrinfo 검증 실패는 권한 상승 사유가 아니다. 권한 없는 복구가 실패해도 자동으로 권한을 요청하지 않으며, 사용자가 명시적으로 선택한 경우에만 관리자 권한 재적용(DNS 캐시 재시작 포함)을 실행한다. macOS 재부팅으로 비영속 `lo0` alias만 사라진 경우에는 최초 설치를 지우거나 네트워크별 작업을 반복하지 않고 한 번의 사용자 작업(관리자 승인 1회)으로 복구되어야 한다.
 
 DNS/TLS 설치 알림은 실패 전에 영구적으로 억제 상태를 기록하면 안 된다. 설치 실패는
 실제 오류와 재시도 작업을 보여주고, 사용자가 알림을 명시적으로 닫은 경우에만 같은

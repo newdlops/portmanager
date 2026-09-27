@@ -15,6 +15,7 @@
 - `types.ts`
 - `events.ts`
 - `workspace-path.ts`: worktree 간 repository-owned 경로 판별과 치환
+- `errors.ts`: 계층 간에 종류로 분기하는 오류 (예: 권한 없이 끝난 Local DNS 복구 실패)
 
 ## 외부 의존성
 

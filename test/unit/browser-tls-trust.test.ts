@@ -4,8 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
 import {
   invalidateBrowserTlsTrustStatus,
+  isTrustVerificationVerdict,
   readCachedBrowserTlsTrustStatus,
   refreshBrowserTlsTrustStatus,
 } from "../../src/platform/network/browser-tls-trust";
@@ -24,6 +28,21 @@ test("missing TLS material is never reported as trusted", async () => {
   const expectedState = process.platform === "darwin" ? "untrusted" : "unsupported";
   assert.equal(cached.state, expectedState);
   assert.equal(refreshed.state, expectedState);
+});
+
+test("only a completed verify-cert rejection counts as untrusted", async () => {
+  // Real execFile error shapes: a timed-out or unlaunchable check has no trust
+  // verdict, and treating it as untrusted re-registered the CA through a macOS
+  // password dialog while trust was unchanged.
+  const run = promisify(execFile);
+  const settle = async (command: string, args: string[], timeout?: number): Promise<unknown> =>
+    run(command, args, timeout === undefined ? {} : { timeout }).then(() => undefined, (error: unknown) => error);
+
+  assert.equal(isTrustVerificationVerdict(await settle("/bin/sh", ["-c", "exit 1"])), true);
+  assert.equal(isTrustVerificationVerdict(await settle("/bin/sleep", ["5"], 50)), false);
+  assert.equal(isTrustVerificationVerdict(await settle("/nonexistent/portmanager-security", [])), false);
+  assert.equal(isTrustVerificationVerdict(undefined), false);
+  assert.equal(isTrustVerificationVerdict(new Error("no code")), false);
 });
 
 test("TLS readiness evaluates the real leaf against the default macOS keychain", () => {

@@ -325,7 +325,9 @@ test("Local DNS repair is a forced, user-visible recovery path", () => {
     };
   };
 
-  const repairStart = networkServiceSource.indexOf("async repairLocalDns(): Promise<BrowserDnsResolverStatus>");
+  const repairStart = networkServiceSource.indexOf(
+    "async repairLocalDns(options: { readonly forcePrivilegedSetup?: boolean } = {}): Promise<BrowserDnsResolverStatus>",
+  );
   const repairEnd = networkServiceSource.indexOf("async renewBrowserTlsCertificate", repairStart);
   const repairBody = networkServiceSource.slice(repairStart, repairEnd);
   assert.notEqual(repairStart, -1);
@@ -333,19 +335,25 @@ test("Local DNS repair is a forced, user-visible recovery path", () => {
   // reflects the responder the daemon actually runs.
   assert.equal(repairBody.includes("await this.flushBrowserDnsDaemonSync();"), true);
   assert.equal(networkServiceSource.includes("await this.browserDnsSyncCoordinator?.flushPendingNow();"), true);
-  assert.equal(repairBody.includes("forceResolverSetup: true"), true);
+  // Repair no longer forces the privileged script; only the user's explicit escalation does.
+  assert.equal(repairBody.includes("forceResolverSetup: true"), false);
+  assert.equal(repairBody.includes("forceResolverSetup: options.forcePrivilegedSetup === true"), true);
 
   const exclusiveStart = networkServiceSource.indexOf("private async installBrowserDnsResolversExclusive");
   const exclusiveEnd = networkServiceSource.indexOf("private maybeOfferBrowserDnsResolverInstall", exclusiveStart);
   const exclusiveBody = networkServiceSource.slice(exclusiveStart, exclusiveEnd);
-  assert.equal(exclusiveBody.includes("options.forceResolverSetup !== true"), true);
+  assert.equal(exclusiveBody.includes("options.forceResolverSetup === true"), true);
+  assert.equal(exclusiveBody.includes("if (!forced && drift.length === 0) {"), true);
   assert.equal(exclusiveBody.includes("invalidateLoopbackAliasCache();"), true);
   assert.equal(exclusiveBody.includes("await readLoopbackAliasAddresses().catch(() => undefined);"), true);
   assert.equal(networkServiceSource.includes("dscacheutil -flushcache"), true);
   assert.equal(networkServiceSource.includes("killall -HUP mDNSResponder"), true);
 
   assert.equal(commandSource.includes('"portManager.repairLocalDns"'), true);
-  assert.equal(commandSource.includes("this.dependencies.networkService.repairLocalDns()"), true);
+  assert.equal(commandSource.includes("this.dependencies.networkService.repairLocalDns(options)"), true);
+  // A failed promptless repair offers, but never starts, the privileged reapply.
+  assert.equal(commandSource.includes("error instanceof LocalDnsRecoveryWithoutPrivilegesError"), true);
+  assert.equal(commandSource.includes("await this.repairLocalDns({ forcePrivilegedSetup: true });"), true);
   assert.equal(treeSource.includes('"Repair Local DNS"'), true);
   assert.equal(treeSource.includes('"portManager.repairLocalDns"'), true);
   assert.equal(specSource.includes("Diagnostics UI는 **Repair Local DNS** 작업을 제공해야 한다."), true);
@@ -353,7 +361,7 @@ test("Local DNS repair is a forced, user-visible recovery path", () => {
   assert.equal(packageJson.activationEvents?.includes("onCommand:portManager.repairLocalDns"), true);
   assert.equal(
     packageJson.contributes?.commands?.some(
-      (command) => command.command === "portManager.repairLocalDns" && command.title === "Port Manager: Repair Local DNS",
+      (command) => command.command === "portManager.repairLocalDns" && command.title === "Repair Local DNS",
     ),
     true,
   );

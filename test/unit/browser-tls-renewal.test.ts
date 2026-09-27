@@ -60,13 +60,22 @@ test("install script renews expiring certificates and supports forced renewal", 
   assert.equal(installBody.includes("options.forceTlsRenewal === true"), true);
   assert.equal(installBody.includes('rm -f "$__pm_tls_server_cert" "$__pm_tls_server_key" "$__pm_tls_hosts_file"'), true);
 
-  // Forced renewal bypasses the everything-configured early return.
+  // Forced renewal escalates even when root-owned state shows no drift.
   const exclusiveStart = source.indexOf("private async installBrowserDnsResolversExclusive");
-  const exclusiveEnd = source.indexOf("/** Offers one user-driven resolver repair", exclusiveStart);
+  const exclusiveEnd = source.indexOf("private async detectBrowserDnsPrivilegedDrift", exclusiveStart);
   const exclusiveBody = source.slice(exclusiveStart, exclusiveEnd);
-  assert.equal(exclusiveBody.includes("options.forceTlsRenewal !== true"), true);
-  assert.equal(exclusiveBody.includes("options.forceResolverSetup !== true"), true);
+  assert.notEqual(exclusiveEnd, -1);
+  assert.equal(
+    exclusiveBody.includes("const forced = options.forceTlsRenewal === true || options.forceResolverSetup === true;"),
+    true,
+  );
   assert.equal(exclusiveBody.includes("forceTlsRenewal: options.forceTlsRenewal === true,"), true);
+
+  // Keychain trust alone never reissues the leaf; only stale certificate material does.
+  const aliasRepairStart = source.indexOf("async repairBrowserDnsAlias(networkId: string)");
+  const aliasRepairBody = source.slice(aliasRepairStart, source.indexOf("async verifyBrowserAccessReadiness", aliasRepairStart));
+  assert.equal(aliasRepairBody.includes("record?.tlsStale === true"), false);
+  assert.equal(aliasRepairBody.includes("forceTlsRenewal: certificateStale,"), true);
 
   assert.equal(source.includes("async renewBrowserTlsCertificate(): Promise<BrowserDnsResolverStatus>"), true);
   assert.equal(source.includes("async repairBrowserDnsAlias(networkId: string): Promise<BrowserDnsResolverStatus>"), true);

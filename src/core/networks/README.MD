@@ -13,12 +13,14 @@ Logical Network, Terminal Attachment, Host Port Exposure의 순수 도메인 상
 - 상태 변경 이벤트 발행
 - logical route 후보를 작업 디렉터리 범위로 좁히는 순수 선택 로직
 - hookless host-machine localhost 요청의 기본 gateway 후보 선택
+- 브라우저 DNS의 관리자 권한 갱신 여부 판정: 별칭 → loopback 매핑과 root 소유 상태(lo0, resolver, hosts, TLS)가 실제로 어긋났을 때만 drift로 본다
 
 ## 주요 진입점
 
 - `logical-network-registry.ts`
 - `logical-route-selection.ts`
 - `host-default-gateway.ts`
+- `browser-dns-drift.ts`
 
 ## 외부 의존성
 
