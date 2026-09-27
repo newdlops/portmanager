@@ -2,7 +2,7 @@
   "name": "portmanager",
   "displayName": "Logical Network",
   "description": "Attach development terminals to logical networks and expose selected network ports from VS Code.",
-  "version": "0.0.8256",
+  "version": "0.0.8258",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -142,341 +142,341 @@
     "commands": [
       {
         "command": "portManager.initializeWorktree",
-        "title": "Port Manager: Initialize This Worktree",
+        "title": "Initialize This Worktree",
         "category": "Port Manager",
         "icon": "$(rocket)"
       },
       {
         "command": "portManager.createIsolatedWorktree",
-        "title": "Port Manager: Create Isolated Worktree",
+        "title": "Create Isolated Worktree",
         "category": "Port Manager",
         "icon": "$(new-folder)"
       },
       {
         "command": "portManager.finishIsolatedWorktreeSetup",
-        "title": "Port Manager: Finish Isolated Worktree Setup",
+        "title": "Finish Isolated Worktree Setup",
         "category": "Port Manager",
         "icon": "$(debug-rerun)"
       },
       {
         "command": "portManager.createLogicalNetwork",
-        "title": "Port Manager: Create Logical Network",
+        "title": "Create Logical Network",
         "category": "Port Manager",
         "icon": "$(vm)"
       },
       {
         "command": "portManager.removeLogicalNetwork",
-        "title": "Port Manager: Remove Logical Network",
+        "title": "Remove Logical Network",
         "category": "Port Manager",
         "icon": "$(trash)"
       },
       {
         "command": "portManager.refreshTerminals",
-        "title": "Port Manager: Refresh Terminal Windows",
+        "title": "Refresh Terminal Windows",
         "category": "Port Manager",
         "icon": "$(refresh)"
       },
       {
         "command": "portManager.refreshContainerServices",
-        "title": "Port Manager: Refresh Services",
+        "title": "Refresh Services",
         "category": "Port Manager",
         "icon": "$(refresh)"
       },
       {
         "command": "portManager.openNetworkTerminal",
-        "title": "Port Manager: Open Terminal in Logical Network",
+        "title": "Open Terminal in Logical Network",
         "category": "Port Manager",
         "icon": "$(terminal-new)"
       },
       {
         "command": "portManager.attachTerminalToNetwork",
-        "title": "Port Manager: Attach Terminal Window to Network",
+        "title": "Attach Terminal Window to Network",
         "category": "Port Manager",
         "icon": "$(debug-console)"
       },
       {
         "command": "portManager.attachActiveTerminalToNetwork",
-        "title": "Port Manager: Attach Active Terminal to Network",
+        "title": "Attach Active Terminal to Network",
         "category": "Port Manager",
         "icon": "$(terminal)"
       },
       {
         "command": "portManager.revealTerminalWindow",
-        "title": "Port Manager: Reveal Terminal Window",
+        "title": "Reveal Terminal Window",
         "category": "Port Manager",
         "icon": "$(go-to-file)"
       },
       {
         "command": "portManager.attachProcessToNetwork",
-        "title": "Port Manager: Attach Process to Network",
+        "title": "Attach Process to Network",
         "category": "Port Manager",
         "icon": "$(debug-alt)"
       },
       {
         "command": "portManager.attachVscodeWindowTerminalsToNetwork",
-        "title": "Port Manager: Attach VS Code Window Terminals to Network",
+        "title": "Attach VS Code Window Terminals to Network",
         "category": "Port Manager",
         "icon": "$(terminal)"
       },
       {
         "command": "portManager.detachVscodeWindowTerminalsFromNetwork",
-        "title": "Port Manager: Detach VS Code Window Terminals from Network",
+        "title": "Detach VS Code Window Terminals from Network",
         "category": "Port Manager",
         "icon": "$(debug-disconnect)"
       },
       {
         "command": "portManager.copyTerminalRoutingScript",
-        "title": "Port Manager: Copy Terminal Routing Script",
+        "title": "Copy Terminal Routing Script",
         "category": "Port Manager",
         "icon": "$(copy)"
       },
       {
         "command": "portManager.attachContainerToNetwork",
-        "title": "Port Manager: Attach Service to Network",
+        "title": "Attach Service to Network",
         "category": "Port Manager",
         "icon": "$(server-environment)"
       },
       {
         "command": "portManager.detachTerminalFromNetwork",
-        "title": "Port Manager: Detach Terminal from Network",
+        "title": "Detach Terminal from Network",
         "category": "Port Manager",
         "icon": "$(debug-disconnect)"
       },
       {
         "command": "portManager.resetTerminalNetworkSettings",
-        "title": "Port Manager: Reset Terminal Network Settings",
+        "title": "Reset Terminal Network Settings",
         "category": "Port Manager",
         "icon": "$(debug-disconnect)"
       },
       {
         "command": "portManager.addHostPortExposure",
-        "title": "Port Manager: Add Host Port Exposure",
+        "title": "Add Host Port Exposure",
         "category": "Port Manager",
         "icon": "$(ports-view-icon)"
       },
       {
         "command": "portManager.addHostAccessBinding",
-        "title": "Port Manager: Add Host Access Binding",
+        "title": "Add Host Access Binding",
         "category": "Port Manager",
         "icon": "$(arrow-swap)"
       },
       {
         "command": "portManager.addComposePublishedPort",
-        "title": "Port Manager: Add Compose Published Port",
+        "title": "Add Compose Published Port",
         "category": "Port Manager",
         "icon": "$(database)"
       },
       {
         "command": "portManager.copyComposeAttachment",
-        "title": "Port Manager: Copy Compose Attachment",
+        "title": "Copy Compose Attachment",
         "category": "Port Manager",
         "icon": "$(copy)"
       },
       {
         "command": "portManager.detachComposeAttachment",
-        "title": "Port Manager: Detach Service from Network",
+        "title": "Detach Service from Network",
         "category": "Port Manager",
         "icon": "$(debug-disconnect)"
       },
       {
         "command": "portManager.renameComposeAttachment",
-        "title": "Port Manager: Rename Compose Project",
+        "title": "Rename Compose Project",
         "category": "Port Manager",
         "icon": "$(edit)"
       },
       {
         "command": "portManager.removeComposeAttachment",
-        "title": "Port Manager: Remove Compose Attachment",
+        "title": "Remove Compose Attachment",
         "category": "Port Manager",
         "icon": "$(trash)"
       },
       {
         "command": "portManager.saveBindingPreset",
-        "title": "Port Manager: Save Binding Preset",
+        "title": "Save Binding Preset",
         "category": "Port Manager",
         "icon": "$(save)"
       },
       {
         "command": "portManager.applyBindingPreset",
-        "title": "Port Manager: Apply Binding Preset",
+        "title": "Apply Binding Preset",
         "category": "Port Manager",
         "icon": "$(cloud-download)"
       },
       {
         "command": "portManager.removeHostAccessBinding",
-        "title": "Port Manager: Remove Host Access Binding",
+        "title": "Remove Host Access Binding",
         "category": "Port Manager",
         "icon": "$(trash)"
       },
       {
         "command": "portManager.removeHostPortExposure",
-        "title": "Port Manager: Remove Host Port Exposure",
+        "title": "Remove Host Port Exposure",
         "category": "Port Manager",
         "icon": "$(trash)"
       },
       {
         "command": "portManager.copyHostPortExposureUrl",
-        "title": "Port Manager: Copy Host Exposure URL",
+        "title": "Copy Host Exposure URL",
         "category": "Port Manager",
         "icon": "$(copy)"
       },
       {
         "command": "portManager.openHostPortExposureUrl",
-        "title": "Port Manager: Open Host Exposure URL",
+        "title": "Open Host Exposure URL",
         "category": "Port Manager",
         "icon": "$(link-external)"
       },
       {
         "command": "portManager.startDaemon",
-        "title": "Port Manager: Start Daemon",
+        "title": "Start Daemon",
         "category": "Port Manager",
         "icon": "$(server-process)"
       },
       {
         "command": "portManager.restartDaemon",
-        "title": "Port Manager: Restart Daemon",
+        "title": "Restart Daemon",
         "category": "Port Manager",
         "icon": "$(debug-restart)"
       },
       {
         "command": "portManager.stopDaemon",
-        "title": "Port Manager: Stop Daemon",
+        "title": "Stop Daemon",
         "category": "Port Manager",
         "icon": "$(debug-disconnect)"
       },
       {
         "command": "portManager.showDaemonStatus",
-        "title": "Port Manager: Daemon Status",
+        "title": "Daemon Status",
         "category": "Port Manager",
         "icon": "$(pulse)"
       },
       {
         "command": "portManager.fixStaleRouting",
-        "title": "Port Manager: Fix Stale Routing",
+        "title": "Fix Stale Routing",
         "category": "Port Manager",
         "icon": "$(debug-rerun)"
       },
       {
         "command": "portManager.repairLocalDns",
-        "title": "Port Manager: Repair Local DNS",
+        "title": "Repair Local DNS",
         "category": "Port Manager",
         "icon": "$(tools)"
       },
       {
         "command": "portManager.clearRoutingFiles",
-        "title": "Port Manager: Clear All Routing Cache",
+        "title": "Clear All Routing Cache",
         "category": "Port Manager",
         "icon": "$(clear-all)"
       },
       {
         "command": "portManager.clearGlobalStorageFiles",
-        "title": "Port Manager: Clear Global Storage Files",
+        "title": "Clear Global Storage Files",
         "category": "Port Manager",
         "icon": "$(clear-all)"
       },
       {
         "command": "portManager.resetRouting",
-        "title": "Port Manager: Reset Routing",
+        "title": "Reset Routing",
         "category": "Port Manager",
         "icon": "$(clear-all)"
       },
       {
         "command": "portManager.clearNetworkCache",
-        "title": "Port Manager: Clear Network Cache",
+        "title": "Clear Network Cache",
         "category": "Port Manager",
         "icon": "$(clear-all)"
       },
       {
         "command": "portManager.startManagedProcess",
-        "title": "Port Manager: Start Managed Process",
+        "title": "Start Managed Process",
         "category": "Port Manager"
       },
       {
         "command": "portManager.addExistingProcess",
-        "title": "Port Manager: Add Existing Process",
+        "title": "Add Existing Process",
         "category": "Port Manager"
       },
       {
         "command": "portManager.refresh",
-        "title": "Port Manager: Refresh",
+        "title": "Refresh",
         "category": "Port Manager",
         "icon": "$(refresh)"
       },
       {
         "command": "portManager.showStatusMenu",
-        "title": "Port Manager: Show Status Menu",
+        "title": "Show Status Menu",
         "category": "Port Manager",
         "icon": "$(target)"
       },
       {
         "command": "portManager.openOwnerUi",
-        "title": "Port Manager: Make This Window Control Owner",
+        "title": "Make This Window Control Owner",
         "category": "Port Manager",
         "icon": "$(window)"
       },
       {
         "command": "portManager.stopProcess",
-        "title": "Port Manager: Stop Process",
+        "title": "Stop Process",
         "category": "Port Manager",
         "icon": "$(debug-stop)"
       },
       {
         "command": "portManager.restartProcess",
-        "title": "Port Manager: Restart Process",
+        "title": "Restart Process",
         "category": "Port Manager",
         "icon": "$(debug-restart)"
       },
       {
         "command": "portManager.stopAllProcesses",
-        "title": "Port Manager: Stop All Processes",
+        "title": "Stop All Processes",
         "category": "Port Manager",
         "icon": "$(debug-stop)"
       },
       {
         "command": "portManager.copyRoutedUrl",
-        "title": "Port Manager: Copy Routed URL",
+        "title": "Copy Routed URL",
         "category": "Port Manager",
         "icon": "$(copy)"
       },
       {
         "command": "portManager.openRoutedUrl",
-        "title": "Port Manager: Open Routed URL",
+        "title": "Open Routed URL",
         "category": "Port Manager",
         "icon": "$(link-external)"
       },
       {
         "command": "portManager.removeProcess",
-        "title": "Port Manager: Remove Process",
+        "title": "Remove Process",
         "category": "Port Manager",
         "icon": "$(trash)"
       },
       {
         "command": "portManager.installExternalCli",
-        "title": "Port Manager: Install External CLI",
+        "title": "Install External CLI",
         "category": "Port Manager",
         "icon": "$(terminal)"
       },
       {
         "command": "portManager.installShellHook",
-        "title": "Port Manager: Install or Repair pm Shell Integration",
+        "title": "Install or Repair pm Shell Integration",
         "category": "Port Manager",
         "icon": "$(plug)"
       },
       {
         "command": "portManager.restoreShellProfiles",
-        "title": "Port Manager: Restore Shell Profiles",
+        "title": "Restore Shell Profiles",
         "category": "Port Manager",
         "icon": "$(discard)"
       },
       {
         "command": "portManager.renewBrowserTlsCertificate",
-        "title": "Port Manager: Renew Browser TLS Certificate",
+        "title": "Renew Browser TLS Certificate",
         "category": "Port Manager",
         "icon": "$(shield)"
       },
       {
         "command": "portManager.openSettings",
-        "title": "Port Manager: Open Settings",
+        "title": "Open Settings",
         "category": "Port Manager",
         "icon": "$(settings-gear)"
       }
@@ -502,6 +502,11 @@
           "command": "portManager.openSettings",
           "when": "view == portManager.processes",
           "group": "navigation@3"
+        },
+        {
+          "command": "portManager.createLogicalNetwork",
+          "when": "view == portManager.processes",
+          "group": "1_create@1"
         }
       ],
       "commandPalette": [
@@ -568,36 +573,6 @@
       ],
       "view/item/context": [
         {
-          "command": "portManager.createIsolatedWorktree",
-          "when": "view == portManager.processes && viewItem == section.networks",
-          "group": "network@0"
-        },
-        {
-          "command": "portManager.createLogicalNetwork",
-          "when": "view == portManager.processes && viewItem == section.networks",
-          "group": "network@1"
-        },
-        {
-          "command": "portManager.addHostPortExposure",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
-          "group": "network@2"
-        },
-        {
-          "command": "portManager.addHostAccessBinding",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
-          "group": "network@3"
-        },
-        {
-          "command": "portManager.addComposePublishedPort",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
-          "group": "network@4"
-        },
-        {
-          "command": "portManager.attachContainerToNetwork",
-          "when": "view == portManager.processes && viewItem == logicalNetwork",
-          "group": "network@5"
-        },
-        {
           "command": "portManager.openNetworkTerminal",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
           "group": "inline@1"
@@ -608,39 +583,74 @@
           "group": "inline@2"
         },
         {
-          "command": "portManager.attachProcessToNetwork",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
-          "group": "network@7"
+          "command": "portManager.openNetworkTerminal",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "1_connect@1"
+        },
+        {
+          "command": "portManager.attachActiveTerminalToNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "1_connect@2"
+        },
+        {
+          "command": "portManager.attachTerminalToNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "1_connect@3"
         },
         {
           "command": "portManager.attachVscodeWindowTerminalsToNetwork",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
-          "group": "network@8"
+          "group": "1_connect@4"
+        },
+        {
+          "command": "portManager.attachContainerToNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "1_connect@5"
         },
         {
           "command": "portManager.copyTerminalRoutingScript",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
-          "group": "network@9"
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "1_connect@6"
+        },
+        {
+          "command": "portManager.addHostPortExposure",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "2_ports@1"
+        },
+        {
+          "command": "portManager.addHostAccessBinding",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "2_ports@2"
+        },
+        {
+          "command": "portManager.addComposePublishedPort",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "2_ports@3"
+        },
+        {
+          "command": "portManager.attachProcessToNetwork",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "2_ports@4"
         },
         {
           "command": "portManager.saveBindingPreset",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
-          "group": "network@10"
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "3_presets@1"
         },
         {
           "command": "portManager.applyBindingPreset",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
-          "group": "network@11"
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "3_presets@2"
         },
         {
           "command": "portManager.clearNetworkCache",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == logicalNetwork",
-          "group": "network@12"
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "8_maintenance@1"
         },
         {
           "command": "portManager.removeLogicalNetwork",
           "when": "view == portManager.processes && viewItem == logicalNetwork",
-          "group": "network@13"
+          "group": "9_remove@1"
         },
         {
           "command": "portManager.refreshContainerServices",
@@ -694,7 +704,7 @@
         },
         {
           "command": "portManager.detachTerminalFromNetwork",
-          "when": "view == portManager.processes && portManager.isControlPlaneOwner && viewItem == terminalAttachment",
+          "when": "view == portManager.processes && viewItem == terminalAttachment",
           "group": "terminal@4"
         },
         {

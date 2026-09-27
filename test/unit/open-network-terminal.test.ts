@@ -21,9 +21,12 @@ test("logical networks expose an activation-backed open-terminal action", () => 
       };
     };
   };
-  const treeSource = readSource("src/ui/sidebar/port-manager-tree.ts");
   const command = "portManager.openNetworkTerminal";
-  const menu = manifest.contributes?.menus?.["view/item/context"]?.find((item) => item.command === command);
+  const networkMenus =
+    manifest.contributes?.menus?.["view/item/context"]?.filter(
+      (item) => item.command === command && item.when?.includes("viewItem == logicalNetwork"),
+    ) ?? [];
+  const menu = networkMenus[0];
 
   assert.equal(manifest.activationEvents?.includes(`onCommand:${command}`), true);
   assert.equal(
@@ -32,9 +35,8 @@ test("logical networks expose an activation-backed open-terminal action", () => 
   );
   assert.equal(menu?.when?.includes("viewItem == logicalNetwork"), true);
   assert.equal(menu?.group, "inline@1");
-  assert.equal(treeSource.includes('"Open Network Terminal"'), true);
-  assert.equal(treeSource.includes('"Start a new terminal in this network"'), true);
-  assert.equal(treeSource.includes('count: 6, singular: "action"'), true);
+  // The hover button has a right-click twin so the action is discoverable without hovering.
+  assert.deepEqual(networkMenus.map((item) => item.group), ["inline@1", "1_connect@1"]);
 });
 
 test("open-terminal prepares routing before creation and queues attachment before reveal", () => {

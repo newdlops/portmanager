@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { formatSidebarSummary } from "./sidebar-presentation";
+import { formatSidebarCounts, formatSidebarSummary, summarizeSidebarIssues } from "./sidebar-presentation";
 import type {
   AgentDaemonStatus,
   AgentSnapshot,
@@ -54,11 +54,8 @@ export interface PortManagerNetworkTreeSource {
   onDidChange(listener: () => void): DisposableLike;
 }
 
-type TreeSectionKind = "overview" | "networks" | "services" | "system";
-type NetworkActionGroupKind = "quick" | "advanced";
+type TreeSectionKind = "services" | "system";
 type SidebarGroupKind =
-  | "network.connections"
-  | "network.portMappings"
   | "system.health"
   | "system.browserDns"
   | "system.runtime"
@@ -78,6 +75,11 @@ interface NetworkRouteConnection {
   readonly logicalPort: number;
   /** Route source family used for icon selection and diagnostics. */
   readonly kind: "daemon" | "compose" | "hostAccess" | "hostExposure";
+  /**
+   * Backing host binding/exposure id for host-mapping rows. Network children
+   * swap those rows for the actionable binding leaf so its menus stay attached.
+   */
+  readonly sourceId?: string;
   /** Tooltip explains why this row exists and what owns it. */
   readonly tooltip: vscode.MarkdownString;
   /** VS Code product icon id. */
@@ -106,10 +108,6 @@ interface RoutingTimelineEntry {
 interface ActionAvailability {
   /** Owner-scoped commands stay actionable because their command wrapper acquires ownership. */
   readonly enabled: boolean;
-  /** Short ownership-transfer guidance shown once on the primary Connect group. */
-  readonly ownerTransferNote?: string;
-  /** Full ownership source detail for native hover help; never permits command links. */
-  readonly ownerTransferTooltip?: vscode.MarkdownString;
 }
 
 /**
@@ -137,7 +135,6 @@ type PortManagerTreeItem =
   | NetworkRoutingGroupTreeItem
   | NetworkRouteConnectionTreeItem
   | RoutingTimelineTreeItem
-  | NetworkActionGroupTreeItem
   | SidebarGroupTreeItem
   | ActionTreeItem
   | PlannedFeatureTreeItem
@@ -193,8 +190,26 @@ export class PortManagerTreeProvider
   /** Snapshot/index cache shared by every expanded branch in the current repaint. */
   private renderGeneration: TreeRenderGeneration | undefined;
 
+  /**
+   * Tree view whose activity-bar badge mirrors the issue count. Bound once by
+   * activation; stays undefined in fixture tests that drive rows directly.
+   */
+  private view: Pick<vscode.TreeView<PortManagerTreeItem>, "badge"> | undefined;
+
+  /** Last badge text written, so unchanged repaints skip the VS Code UI bridge. */
+  private renderedBadgeKey: string | undefined;
+
   constructor(private readonly source: PortManagerNetworkTreeSource) {
     this.sourceSubscription = this.source.onDidChange(() => this.refresh());
+  }
+
+  /**
+   * Connects the created tree view so problems stay visible on the activity
+   * bar icon even while the sidebar is collapsed or hidden.
+   */
+  bindView(view: Pick<vscode.TreeView<PortManagerTreeItem>, "badge">): void {
+    this.view = view;
+    this.updateViewBadge();
   }
 
   /** Triggers a full tree refresh after process state changes or manual refresh. */
@@ -210,8 +225,29 @@ export class PortManagerTreeProvider
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = undefined;
       this.onDidChangeTreeDataEmitter.fire(undefined);
+      this.updateViewBadge();
     }, TREE_REFRESH_DEBOUNCE_MS);
     this.refreshTimer.unref();
+  }
+
+  /**
+   * Recomputes the issue badge from the same render generation the rows use,
+   * so a visible sidebar pays for the snapshot once per repaint.
+   */
+  private updateViewBadge(): void {
+    if (this.view === undefined) {
+      return;
+    }
+
+    const { snapshot, agentSnapshot, daemon } = this.getRenderGeneration();
+    const issues = summarizeSidebarIssues(snapshot, agentSnapshot, daemon);
+    const badgeKey = issues.count === 0 ? "" : `${issues.count}\n${issues.tooltip}`;
+    if (badgeKey === this.renderedBadgeKey) {
+      return;
+    }
+
+    this.renderedBadgeKey = badgeKey;
+    this.view.badge = issues.count === 0 ? undefined : { value: issues.count, tooltip: issues.tooltip };
   }
 
   /** Captures all cheap render inputs once for the current tree generation. */
@@ -311,8 +347,11 @@ export class PortManagerTreeProvider
   }
 
   /**
-   * Converts the daemon snapshot into grouped tree rows. VS Code tree groups
-   * now act as accordions for the logical network model. Legacy daemon,
+   * Converts the daemon snapshot into tree rows. Logical networks sit directly
+   * at the root so their state scans without opening a section, and each one
+   * expands straight into its routed ports and connections. Network commands
+   * live in inline buttons and the network context menu rather than action
+   * rows. Services and System stay collapsed below the networks. Legacy daemon,
    * route, managed-process, and listener rows remain implemented below for
    * compatibility, but they are intentionally not surfaced from the root.
    */
@@ -321,241 +360,39 @@ export class PortManagerTreeProvider
     const { snapshot, agentSnapshot, daemon, ownerAction } = generation;
     const getRouteRows: NetworkRouteRowsResolver = (networkId) =>
       this.getNetworkRouteRows(generation, networkId);
-    const getCurrentRouteRows: NetworkRouteRowsResolver = (networkId) =>
-      buildNetworkRouteConnectionRows(networkId, snapshot, agentSnapshot, "current");
 
     if (element === undefined) {
       return [
-        new TreeSectionItem(
-          "overview",
-          "Overview",
-          formatCurrentRoutingSummary(snapshot, agentSnapshot, getCurrentRouteRows),
-          "target",
-          vscode.TreeItemCollapsibleState.Collapsed,
+        ...buildOnboardingActionItems(snapshot, ownerAction),
+        ...snapshot.networks.map((network) =>
+          new LogicalNetworkTreeItem(
+            network,
+            snapshot.attachments,
+            snapshot.exposures,
+            snapshot.hostAccessBindings,
+            snapshot.composeAttachments,
+            getRouteRows(network.id).length,
+            snapshot.vscodeWindowTerminalBinding?.networkId === network.id,
+          ),
         ),
-        new TreeSectionItem(
-          "networks",
-          "Networks",
-          snapshot.networks.length === 0
-            ? "No networks"
-            : formatSidebarSummary("Available", [{ count: snapshot.networks.length, singular: "network" }]),
-          "vm",
-          vscode.TreeItemCollapsibleState.Expanded,
-        ),
+        ...buildStaleRouteScopeItems(snapshot, agentSnapshot),
         new TreeSectionItem(
           "services",
           "Services",
           formatContainerSectionDescription(snapshot.containerServiceCandidates),
           "server-environment",
-          vscode.TreeItemCollapsibleState.Collapsed,
         ),
         new TreeSectionItem(
           "system",
           "System",
           formatDiagnosticsSummary(daemon, snapshot),
-          daemon.restartRequired ? "warning" : "pulse",
-          vscode.TreeItemCollapsibleState.Collapsed,
+          daemon.restartRequired || daemon.status === "error" ? "warning" : "pulse",
         ),
       ];
     }
 
     if (element instanceof LogicalNetworkTreeItem) {
-      const attachments = snapshot.attachments.filter((attachment) => attachment.networkId === element.network.id);
-      const exposures = snapshot.exposures.filter((exposure) => exposure.networkId === element.network.id);
-      const hostAccessBindings = snapshot.hostAccessBindings.filter((binding) => binding.networkId === element.network.id);
-      const composeAttachments = snapshot.composeAttachments.filter((attachment) => attachment.networkId === element.network.id);
-      const windowTerminalBinding = snapshot.vscodeWindowTerminalBinding?.networkId === element.network.id
-        ? snapshot.vscodeWindowTerminalBinding
-        : undefined;
-      const routeRows = getRouteRows(element.network.id);
-      const connectionRows: PortManagerTreeItem[] = [
-        ...(windowTerminalBinding !== undefined
-          ? [new VscodeWindowTerminalBindingTreeItem(windowTerminalBinding, element.network)]
-          : []),
-        ...attachments.map((attachment) => new TerminalAttachmentTreeItem(attachment)),
-        ...composeAttachments.map((attachment) => new ComposeAttachmentTreeItem(attachment)),
-      ];
-      const portMappingRows: PortManagerTreeItem[] = [
-        ...exposures.map((exposure) => new HostPortExposureTreeItem(exposure, [element.network])),
-        ...hostAccessBindings.map((binding) => new HostAccessBindingTreeItem(binding)),
-      ];
-
-      return [
-        new NetworkRoutingGroupTreeItem(
-          element.network,
-          "Routes",
-          formatNetworkRouteGroupDescription(routeRows, attachments, windowTerminalBinding),
-          routeRows,
-          "network",
-        ),
-        new SidebarGroupTreeItem(
-          "network.connections",
-          "Connections",
-          connectionRows.length === 0
-            ? "No connections"
-            : formatSidebarSummary("Connected", [{ count: connectionRows.length, singular: "connection" }]),
-          "plug",
-          connectionRows.length > 0 ? connectionRows : [new EmptyTreeItem("No connections", "Attach a terminal or service")],
-          element.network.id,
-        ),
-        new SidebarGroupTreeItem(
-          "network.portMappings",
-          "Port mappings",
-          portMappingRows.length === 0
-            ? "No mappings"
-            : formatSidebarSummary("Mapped", [{ count: portMappingRows.length, singular: "mapping" }]),
-          "references",
-          portMappingRows.length > 0 ? portMappingRows : [new EmptyTreeItem("No port mappings", "Add a host binding or host access")],
-          element.network.id,
-        ),
-        new NetworkActionGroupTreeItem(
-          element.network,
-          "quick",
-          "Connect actions",
-          formatSidebarSummary("Available", [{ count: 6, singular: "action" }]),
-          "plug",
-          ownerAction,
-        ),
-        new NetworkActionGroupTreeItem(
-          element.network,
-          "advanced",
-          "Manage actions",
-          formatSidebarSummary("Available"),
-          "tools",
-        ),
-      ];
-    }
-
-    if (element instanceof NetworkActionGroupTreeItem) {
-      if (element.kind === "quick") {
-        return [
-          new ActionTreeItem(
-            "Open Network Terminal",
-            "portManager.openNetworkTerminal",
-            "terminal-new",
-            "Start a new terminal in this network",
-            element.network,
-            ownerAction,
-          ),
-          new ActionTreeItem(
-            "Attach Active Terminal",
-            "portManager.attachActiveTerminalToNetwork",
-            "terminal",
-            "Use current VS Code terminal",
-            element.network,
-            ownerAction,
-          ),
-          new ActionTreeItem(
-            "Attach Terminal",
-            "portManager.attachTerminalToNetwork",
-            "terminal",
-            "Choose a terminal window",
-            element.network,
-            ownerAction,
-          ),
-          new ActionTreeItem(
-            "Use for VS Code Terminals",
-            "portManager.attachVscodeWindowTerminalsToNetwork",
-            "terminal",
-            "Make this window default",
-            element.network,
-          ),
-          new ActionTreeItem(
-            "Attach Service",
-            "portManager.attachContainerToNetwork",
-            "server-environment",
-            "Choose a discovered service",
-            { network: element.network },
-            ownerAction,
-          ),
-          new ActionTreeItem(
-            "Copy Terminal Script",
-            "portManager.copyTerminalRoutingScript",
-            "copy",
-            "For external terminal UIs",
-            element.network,
-            ownerAction,
-          ),
-        ];
-      }
-
-      const networkAttachments = snapshot.attachments.filter((attachment) => attachment.networkId === element.network.id);
-      const networkComposeAttachments = snapshot.composeAttachments.filter(
-        (attachment) => attachment.networkId === element.network.id,
-      );
-      return [
-        new ActionTreeItem(
-          "Add Host Binding",
-          "portManager.addHostPortExposure",
-          "add",
-          "Expose network port",
-          element.network,
-          ownerAction,
-        ),
-        new ActionTreeItem(
-          "Add Host Access",
-          "portManager.addHostAccessBinding",
-          "arrow-swap",
-          "Reach host port from network",
-          element.network,
-          ownerAction,
-        ),
-        new ActionTreeItem(
-          "Add Compose Port",
-          "portManager.addComposePublishedPort",
-          "database",
-          "Manually attach published service",
-          element.network,
-          ownerAction,
-        ),
-        ...(networkComposeAttachments.length > 0
-          ? [
-              new ActionTreeItem(
-                "Copy Compose Attachment",
-                "portManager.copyComposeAttachment",
-                "copy",
-                "Duplicate existing attachment",
-                element.network,
-                ownerAction,
-              ),
-            ]
-          : []),
-        new ActionTreeItem(
-          "Attach Process",
-          "portManager.attachProcessToNetwork",
-          "debug-alt",
-          "Attach existing backend PID",
-          element.network,
-          ownerAction,
-        ),
-        new ActionTreeItem(
-          "Save Binding Preset",
-          "portManager.saveBindingPreset",
-          "save",
-          "Save current bindings",
-          element.network,
-          ownerAction,
-        ),
-        new ActionTreeItem(
-          "Apply Binding Preset",
-          "portManager.applyBindingPreset",
-          "cloud-download",
-          "Load saved bindings",
-          element.network,
-          ownerAction,
-        ),
-        new ActionTreeItem(
-          "Clear Network Cache",
-          "portManager.clearNetworkCache",
-          "clear-all",
-          "Remove generated route maps",
-          element.network,
-          ownerAction,
-        ),
-        ...(networkAttachments.length > 0
-          ? [new ActionTreeItem("Detach Terminal", "portManager.detachTerminalFromNetwork", "debug-disconnect", undefined, undefined, ownerAction)]
-          : []),
-      ];
+      return buildNetworkChildItems(element.network, snapshot, getRouteRows(element.network.id));
     }
 
     if (element instanceof NetworkRoutingGroupTreeItem) {
@@ -605,54 +442,14 @@ export class PortManagerTreeProvider
     }
 
     switch (element.kind) {
-      case "overview":
-        return buildCurrentRoutingGroupItems(snapshot, agentSnapshot, getCurrentRouteRows);
-      case "networks":
-        return [
-          ...(snapshot.vscodeWindowTerminalBinding === undefined
-            ? [
-                new ActionTreeItem(
-                  "Initialize This Worktree",
-                  "portManager.initializeWorktree",
-                  "rocket",
-                  "Create and use one default network",
-                  undefined,
-                  ownerAction,
-                ),
-              ]
-            : []),
-          new ActionTreeItem(
-            "Create Isolated Worktree",
-            "portManager.createIsolatedWorktree",
-            "new-folder",
-            "Worktree + network + Compose copy",
-            undefined,
-            ownerAction,
-          ),
-          ...snapshot.networks.map((network) =>
-            new LogicalNetworkTreeItem(
-              network,
-              snapshot.attachments,
-              snapshot.exposures,
-              snapshot.hostAccessBindings,
-              snapshot.composeAttachments,
-              getRouteRows(network.id).length,
-              snapshot.vscodeWindowTerminalBinding?.networkId === network.id,
-            ),
-          ),
-        ];
       case "services":
-        return [
-          ...(snapshot.containerServiceCandidates.length > 0
-            ? buildContainerServiceTreeItems(snapshot.containerServiceCandidates, ownerAction)
-            : [new EmptyTreeItem("No published services", "Start compose services")]),
-        ];
-      case "system":
+        return snapshot.containerServiceCandidates.length > 0
+          ? buildContainerServiceTreeItems(snapshot.containerServiceCandidates, ownerAction)
+          : [new EmptyTreeItem("No published services", "Start compose services")];
+      case "system": {
         const browserDns = this.getBrowserDnsStatus(generation);
-        const systemGroups = buildSystemGroupItems(daemon, snapshot, agentSnapshot, browserDns, ownerAction);
-        return [
-          ...systemGroups,
-        ];
+        return buildSystemGroupItems(daemon, snapshot, agentSnapshot, browserDns, ownerAction);
+      }
     }
   }
 
@@ -668,7 +465,7 @@ export class PortManagerTreeProvider
   }
 }
 
-/** One clickable command row in the Actions accordion. */
+/** One clickable command row: root onboarding shortcuts and System health, DNS, and maintenance actions. */
 class ActionTreeItem extends vscode.TreeItem {
   readonly contextValue: string;
 
@@ -694,7 +491,10 @@ class ActionTreeItem extends vscode.TreeItem {
   }
 }
 
-/** Collapsible route status group for the root current view and each network. */
+/**
+ * Collapsible route group for a route scope that has no network row, such as
+ * routes left behind by a removed network. Known networks list routes inline.
+ */
 class NetworkRoutingGroupTreeItem extends vscode.TreeItem {
   readonly contextValue = "networkRoutingGroup";
 
@@ -705,12 +505,13 @@ class NetworkRoutingGroupTreeItem extends vscode.TreeItem {
     readonly routeRows: readonly NetworkRouteConnection[],
     idPrefix: string,
     icon: string = "references",
+    color?: vscode.ThemeColor,
   ) {
     super(label, vscode.TreeItemCollapsibleState.Collapsed);
     this.id = `${idPrefix}:routes:${network.id}`;
     this.description = description;
     this.tooltip = buildNetworkRoutingGroupTooltip(network, description, routeRows);
-    this.iconPath = new vscode.ThemeIcon(icon);
+    this.iconPath = new vscode.ThemeIcon(icon, color);
   }
 }
 
@@ -740,28 +541,8 @@ class RoutingTimelineTreeItem extends vscode.TreeItem {
   }
 }
 
-/** Collapsible action group nested under a logical network. */
-class NetworkActionGroupTreeItem extends vscode.TreeItem {
-  readonly contextValue = "networkActionGroup";
-
-  constructor(
-    readonly network: LogicalNetwork,
-    readonly kind: NetworkActionGroupKind,
-    label: string,
-    description: string,
-    icon: string,
-    availability: ActionAvailability = { enabled: true },
-  ) {
-    super(label, vscode.TreeItemCollapsibleState.Collapsed);
-    this.id = `network-action:${network.id}:${kind}`;
-    this.description = description;
-    this.tooltip = availability.ownerTransferTooltip ?? new vscode.MarkdownString(`${label}\n\n${description}`);
-    this.iconPath = new vscode.ThemeIcon(icon);
-  }
-}
-
 /**
- * Inert category wrapper that keeps dense native tree branches scannable.
+ * Inert category wrapper that keeps the dense System branch scannable.
  * Its children are prebuilt leaf items so commands, context values, and drag
  * identity stay exactly with their original leaf implementations.
  */
@@ -774,11 +555,9 @@ class SidebarGroupTreeItem extends vscode.TreeItem {
     description: string,
     icon: string,
     readonly children: readonly PortManagerTreeItem[],
-    networkId?: string,
   ) {
     super(label, vscode.TreeItemCollapsibleState.Collapsed);
-    // Network categories repeat per logical network, unlike the single System branch.
-    this.id = networkId === undefined ? `sidebar-group:${kind}` : `sidebar-group:${kind}:${networkId}`;
+    this.id = `sidebar-group:${kind}`;
     this.contextValue = `sidebarGroup.${kind}`;
     this.description = description;
     this.tooltip = new vscode.MarkdownString(`${label}\n\n${description}`);
@@ -786,21 +565,18 @@ class SidebarGroupTreeItem extends vscode.TreeItem {
   }
 }
 
-/** Collapsible root row used as a VS Code tree accordion section. */
+/** Collapsed root section listed below the networks. */
 class TreeSectionItem extends vscode.TreeItem {
   constructor(
     readonly kind: TreeSectionKind,
     label: string,
     description: string,
     icon: string,
-    collapsibleState: vscode.TreeItemCollapsibleState = vscode.TreeItemCollapsibleState.Expanded,
   ) {
-    super(label, collapsibleState);
+    super(label, vscode.TreeItemCollapsibleState.Collapsed);
     // Labels/kinds evolved for scanability, but menu `when` clauses and saved
     // expansion state still key off these long-lived section identities.
-    const legacyIdentity: Record<TreeSectionKind, "current" | "networks" | "containers" | "daemon"> = {
-      overview: "current",
-      networks: "networks",
+    const legacyIdentity: Record<TreeSectionKind, "containers" | "daemon"> = {
       services: "containers",
       system: "daemon",
     };
@@ -824,7 +600,11 @@ class PlannedFeatureTreeItem extends vscode.TreeItem {
   }
 }
 
-/** Logical Network row backed by real service state. */
+/**
+ * Root Logical Network row backed by real service state. The description leads
+ * with a text state so it never depends on the icon color, and the row only
+ * shows an expander when routes or connections exist to list beneath it.
+ */
 export class LogicalNetworkTreeItem extends vscode.TreeItem {
   readonly contextValue = "logicalNetwork";
 
@@ -841,9 +621,16 @@ export class LogicalNetworkTreeItem extends vscode.TreeItem {
     const exposureCount = exposures.filter((exposure) => exposure.networkId === network.id).length;
     const hostAccessCount = hostAccessBindings.filter((binding) => binding.networkId === network.id).length;
     const composeCount = composeAttachments.filter((attachment) => attachment.networkId === network.id).length;
+    // Mirrors buildNetworkChildItems: the window binding row counts as a child too.
+    const hasChildren =
+      isCurrentWindowNetwork || routeCount + attachmentCount + exposureCount + hostAccessCount + composeCount > 0;
     super(
       network.name,
-      vscode.TreeItemCollapsibleState.Collapsed,
+      !hasChildren
+        ? vscode.TreeItemCollapsibleState.None
+        : isCurrentWindowNetwork
+          ? vscode.TreeItemCollapsibleState.Expanded
+          : vscode.TreeItemCollapsibleState.Collapsed,
     );
     this.id = network.id;
     this.description = buildNetworkDescription(
@@ -864,10 +651,7 @@ export class LogicalNetworkTreeItem extends vscode.TreeItem {
       routeCount,
       isCurrentWindowNetwork,
     );
-    this.iconPath = new vscode.ThemeIcon(
-      network.status === "running" ? "vm-active" : "vm-outline",
-      network.status === "error" ? new vscode.ThemeColor("testing.iconFailed") : undefined,
-    );
+    this.iconPath = buildNetworkIcon(network, hasChildren);
   }
 }
 
@@ -1044,11 +828,15 @@ export class TerminalAttachmentTreeItem extends vscode.TreeItem {
   constructor(readonly attachment: TerminalAttachment) {
     super(attachment.terminalTitle ?? `PID ${attachment.rootPid}`, vscode.TreeItemCollapsibleState.None);
     this.id = attachment.id;
-    this.description = `${attachment.mode ?? "isolated"} ${attachment.status}`;
+    this.description = formatTerminalAttachmentDescription(attachment);
     this.tooltip = buildTerminalAttachmentTooltip(attachment);
     this.iconPath = new vscode.ThemeIcon(
-      attachment.mode === "logical" ? "warning" : "plug",
-      attachment.mode === "logical" ? new vscode.ThemeColor("charts.yellow") : undefined,
+      attachment.mode === "logical" ? "warning" : attachment.status === "error" ? "error" : "terminal",
+      attachment.mode === "logical"
+        ? new vscode.ThemeColor("charts.yellow")
+        : attachment.status === "error"
+          ? new vscode.ThemeColor("testing.iconFailed")
+          : undefined,
     );
     this.command = {
       command: "portManager.revealTerminalWindow",
@@ -1058,7 +846,15 @@ export class TerminalAttachmentTreeItem extends vscode.TreeItem {
   }
 }
 
-/** Current VS Code window-wide terminal network default. */
+/**
+ * Current VS Code window-wide terminal network default. Selecting the row is
+ * inert; detaching lives in its context menu so a stray click under the network
+ * cannot drop the window's routing.
+ *
+ * The row renders twice (under its network and in System's runtime list), and
+ * VS Code rejects duplicate ids anywhere in one tree, so the System copy gets
+ * its own id. Under the network row the name would only repeat the parent label.
+ */
 export class VscodeWindowTerminalBindingTreeItem extends vscode.TreeItem {
   readonly contextValue: string;
 
@@ -1066,22 +862,18 @@ export class VscodeWindowTerminalBindingTreeItem extends vscode.TreeItem {
     readonly binding: VscodeWindowTerminalBinding,
     network: LogicalNetwork | undefined,
     availability: ActionAvailability = { enabled: true },
+    placement: "network" | "system" = "system",
   ) {
-    super("VS Code Window Terminals", vscode.TreeItemCollapsibleState.None);
-    this.id = binding.id;
+    super("VS Code terminals", vscode.TreeItemCollapsibleState.None);
+    this.id = placement === "system" ? `system:${binding.id}` : binding.id;
     this.contextValue = availability.enabled ? "vscodeWindowTerminalBinding" : "vscodeWindowTerminalBinding.disabled";
-    this.description = network?.name ?? binding.networkId;
+    const state = binding.status === "attached" ? "window default" : binding.status;
+    this.description = placement === "system" ? `${state} · ${network?.name ?? binding.networkId}` : state;
     this.tooltip = buildVscodeWindowTerminalBindingTooltip(binding, network);
     this.iconPath = new vscode.ThemeIcon(
       binding.status === "attached" ? "terminal" : "warning",
       binding.status === "error" ? new vscode.ThemeColor("testing.iconFailed") : undefined,
     );
-    if (availability.enabled) {
-      this.command = {
-        command: "portManager.detachVscodeWindowTerminalsFromNetwork",
-        title: "Detach VS Code Window Terminals",
-      };
-    }
   }
 }
 
@@ -1093,11 +885,11 @@ export class HostPortExposureTreeItem extends vscode.TreeItem {
     readonly exposure: HostPortExposure,
     networks: readonly LogicalNetwork[],
   ) {
-    super(`${exposure.hostAddress}:${exposure.hostPort}`, vscode.TreeItemCollapsibleState.None);
+    super(`${exposure.hostAddress}:${exposure.hostPort} → ${exposure.targetPort}`, vscode.TreeItemCollapsibleState.None);
     const network = networks.find((item) => item.id === exposure.networkId);
     this.id = exposure.id;
     this.contextValue = exposure.status === "active" ? "hostExposureActive" : "hostExposure";
-    this.description = `${network?.name ?? exposure.networkId} -> logical ${exposure.targetPort}`;
+    this.description = formatRouteDescription(["host binding"], exposure.status, "active");
     this.tooltip = buildExposureTooltip(exposure, network);
     this.iconPath = new vscode.ThemeIcon(
       exposure.status === "active" ? "link-external" : "warning",
@@ -1111,9 +903,9 @@ export class HostAccessBindingTreeItem extends vscode.TreeItem {
   readonly contextValue = "hostAccessBinding";
 
   constructor(readonly binding: HostAccessBinding) {
-    super(`network:${binding.logicalPort}`, vscode.TreeItemCollapsibleState.None);
+    super(`${binding.logicalPort} → ${binding.hostAddress}:${binding.hostPort}`, vscode.TreeItemCollapsibleState.None);
     this.id = binding.id;
-    this.description = `host ${binding.hostAddress}:${binding.hostPort}`;
+    this.description = formatRouteDescription(["host access"], binding.status, "active");
     this.tooltip = buildHostAccessBindingTooltip(binding);
     this.iconPath = new vscode.ThemeIcon(
       binding.status === "active" ? "arrow-swap" : "warning",
@@ -1328,11 +1120,11 @@ function buildSystemGroupItems(
   ];
 
   return [
-    new SidebarGroupTreeItem("system.health", "Health", formatSidebarSummary(capitalizeForSidebar(daemon.status), [{ count: healthRows.length, singular: "detail" }]), "pulse", healthRows),
+    new SidebarGroupTreeItem("system.health", "Health", formatDaemonState(daemon), "pulse", healthRows),
     new SidebarGroupTreeItem("system.browserDns", "Browser access & DNS", formatBrowserDnsSummary(browserDns), "globe", browserRows),
     new SidebarGroupTreeItem("system.runtime", "Runtime & terminal discovery", formatRuntimeDiscoverySummary(snapshot), "terminal", runtimeRows),
-    new SidebarGroupTreeItem("system.activity", "Recent activity", activityEntries.length === 0 ? "No activity" : formatSidebarSummary("Available", [{ count: activityEntries.length, singular: "event" }]), "history", activityRows),
-    new SidebarGroupTreeItem("system.maintenance", "Maintenance", formatSidebarSummary("Available", [{ count: maintenanceRows.length, singular: "action" }]), "tools", maintenanceRows),
+    new SidebarGroupTreeItem("system.activity", "Recent activity", activityEntries.length === 0 ? "No activity" : formatSidebarCounts([{ count: activityEntries.length, singular: "event" }]), "history", activityRows),
+    new SidebarGroupTreeItem("system.maintenance", "Maintenance", formatSidebarCounts([{ count: maintenanceRows.length, singular: "action" }]), "tools", maintenanceRows),
   ];
 }
 
@@ -1694,29 +1486,12 @@ function isControlPlaneOwner(controlPlane: ControlPlaneStatus | undefined): bool
   return controlPlane?.role === "owner";
 }
 
-function buildOwnerActionAvailability(controlPlane: ControlPlaneStatus | undefined): ActionAvailability {
-  return isControlPlaneOwner(controlPlane)
-    ? { enabled: true }
-    : {
-        enabled: true,
-        ownerTransferNote: formatOwnerTransferGuidance(controlPlane),
-        ownerTransferTooltip: buildOwnerTransferTooltip(controlPlane),
-      };
-}
-
-/** Explains that selecting an owner-scoped command transfers control to this window. */
-function formatOwnerTransferGuidance(controlPlane: ControlPlaneStatus | undefined): string {
-  return "takes ownership in this window";
-}
-
-/** Keeps the source-window detail available on hover without making the tooltip trusted. */
-function buildOwnerTransferTooltip(controlPlane: ControlPlaneStatus | undefined): vscode.MarkdownString {
-  const tooltip = new vscode.MarkdownString(undefined, true);
-  tooltip.isTrusted = false;
-  tooltip.appendMarkdown("**Connect** transfers control to this window before continuing.\n\n");
-  tooltip.appendMarkdown(`Current owner: \`${escapeMarkdown(formatOwnerWindowTitle(controlPlane))}\`\n`);
-  tooltip.appendMarkdown(`Owner PID: \`${controlPlane?.ownerPid ?? "unknown"}\``);
-  return tooltip;
+/**
+ * Every window keeps owner-scoped actions enabled: the command wrapper takes
+ * control-plane ownership before running, so non-owner windows never dead-end.
+ */
+function buildOwnerActionAvailability(_controlPlane: ControlPlaneStatus | undefined): ActionAvailability {
+  return { enabled: true };
 }
 
 function formatOwnerOnlyActionReason(controlPlane: ControlPlaneStatus | undefined): string {
@@ -1747,30 +1522,24 @@ function formatControlPlaneRoleDescription(controlPlane: ControlPlaneStatus | un
   return "owner unknown";
 }
 
-/** One-line compact summary for the collapsed diagnostics section. */
+/**
+ * One-line System summary: daemon health first, then this window's role only
+ * when it is not the owner. PIDs and discovery counts live in the Health and
+ * Runtime groups so the collapsed row stays readable.
+ */
 function formatDiagnosticsSummary(daemon: AgentDaemonStatus, snapshot: NetworkSnapshot): string {
-  const daemonSummary = daemon.restartRequired ? "Daemon stale" : capitalizeForSidebar(daemon.status);
-  return formatSidebarSummary(`${formatSystemControlPlaneSummary(snapshot.controlPlane)} · ${daemonSummary}`, [
-    { count: snapshot.terminalWindows.length, singular: "terminal" },
-    { count: snapshot.runtimes.length, singular: "runtime" },
-  ]);
+  const role =
+    snapshot.controlPlane?.role === "worker"
+      ? "worker window"
+      : snapshot.controlPlane?.role === "unowned"
+        ? "no owner"
+        : undefined;
+  return role === undefined ? formatDaemonState(daemon) : `${formatDaemonState(daemon)} · ${role}`;
 }
 
-/** Compact root-only control-plane wording avoids commas while detail rows retain full context. */
-function formatSystemControlPlaneSummary(controlPlane: ControlPlaneStatus | undefined): string {
-  if (controlPlane?.role === "owner") {
-    return `Owner pid ${controlPlane.currentPid}`;
-  }
-
-  if (controlPlane?.role === "worker") {
-    return `Worker · owner pid ${controlPlane.ownerPid ?? "unknown"}`;
-  }
-
-  if (controlPlane?.role === "unowned") {
-    return "No owner";
-  }
-
-  return "Owner unknown";
+/** Daemon health as sentence-case text; a stale build outranks the lifecycle state. */
+function formatDaemonState(daemon: AgentDaemonStatus): string {
+  return daemon.restartRequired ? "Daemon stale" : capitalizeForSidebar(daemon.status);
 }
 
 /** Uses text, rather than icon color, to make sidebar state legible at a glance. */
@@ -1810,78 +1579,127 @@ function formatRuntimeDiscoverySummary(snapshot: NetworkSnapshot): string {
     return "No terminals or runtimes";
   }
 
-  return formatSidebarSummary("Discovered", [
+  return formatSidebarCounts([
     { count: snapshot.terminalWindows.length, singular: "terminal" },
     { count: snapshot.runtimes.length, singular: "runtime" },
   ]);
 }
 
-/** One-line current routing summary for the root section. */
-export function formatCurrentRoutingSummary(
+/**
+ * First-run shortcuts listed above the networks. Initialize stays until this
+ * window has a default network; the isolated-worktree row only fills the empty
+ * state because the view toolbar already carries that command.
+ */
+function buildOnboardingActionItems(
   snapshot: NetworkSnapshot,
-  agentSnapshot: AgentSnapshot,
-  getRouteRows: NetworkRouteRowsResolver,
-): string {
-  const projection = projectCurrentRouting(snapshot, agentSnapshot);
-  const currentNetwork = snapshot.networks.find((network) => network.id === snapshot.vscodeWindowTerminalBinding?.networkId);
-  const routeCount = countAllNetworkRouteConnections(projection.networkIds, getRouteRows);
-
-  if (currentNetwork !== undefined) {
-    return formatSidebarSummary("VS Code routing", [{ count: routeCount, singular: "route" }]);
-  }
-
-  if (projection.attachedTerminalCount > 0 && projection.networkIds.length === 1) {
-    return formatSidebarSummary("Terminal routing", [{ count: routeCount, singular: "route" }]);
-  }
-
-  if (projection.networkIds.length > 0) {
-    return formatSidebarSummary("Active", [
-      { count: projection.networkIds.length, singular: "network" },
-      { count: projection.attachedTerminalCount, singular: "terminal" },
-      { count: routeCount, singular: "route" },
-    ]);
-  }
-
-  return formatSidebarSummary("No current network");
-}
-
-/** Builds the root current-routing groups, including stale route scopes. */
-function buildCurrentRoutingGroupItems(
-  snapshot: NetworkSnapshot,
-  agentSnapshot: AgentSnapshot,
-  getRouteRows: NetworkRouteRowsResolver,
+  ownerAction: ActionAvailability,
 ): PortManagerTreeItem[] {
-  const networkIds = projectCurrentRouting(snapshot, agentSnapshot).networkIds;
-
-  const currentNetworkIds = new Set(networkIds);
-  const knownNetworks = snapshot.networks.filter((network) => currentNetworkIds.has(network.id));
-  const knownNetworkIds = new Set(knownNetworks.map((network) => network.id));
-  const staleNetworkScopes = [...networkIds]
-    .filter((networkId) => !knownNetworkIds.has(networkId))
-    .map((networkId) => ({ id: networkId, name: `Unknown Network ${networkId.slice(0, 8)}` }));
-  const groups = [...knownNetworks, ...staleNetworkScopes].map((network) => {
-    const routeRows = getRouteRows(network.id);
-    const attachments = snapshot.attachments.filter((attachment) => attachment.networkId === network.id);
-    const binding = snapshot.vscodeWindowTerminalBinding?.networkId === network.id
-      ? snapshot.vscodeWindowTerminalBinding
-      : undefined;
-    const description = formatNetworkRouteGroupDescription(routeRows, attachments, binding);
-
-    return new NetworkRoutingGroupTreeItem(network, network.name, description, routeRows, "current", "target");
-  });
-
-  return groups.length > 0 ? groups : [new EmptyTreeItem("No current network", "Attach a terminal or choose VS Code default")];
+  return [
+    ...(snapshot.vscodeWindowTerminalBinding === undefined
+      ? [
+          new ActionTreeItem(
+            "Initialize This Worktree",
+            "portManager.initializeWorktree",
+            "rocket",
+            "Create and use one default network",
+            undefined,
+            ownerAction,
+          ),
+        ]
+      : []),
+    ...(snapshot.networks.length === 0
+      ? [
+          new ActionTreeItem(
+            "Create Isolated Worktree",
+            "portManager.createIsolatedWorktree",
+            "new-folder",
+            "Worktree + network + Compose copy",
+            undefined,
+            ownerAction,
+          ),
+        ]
+      : []),
+  ];
 }
 
-/** Counts only route rows included by the caller's display projection. */
-function countAllNetworkRouteConnections(
-  networkIds: readonly string[],
-  getRouteRows: NetworkRouteRowsResolver,
-): number {
-  return networkIds.reduce(
-    (total, networkId) => total + getRouteRows(networkId).length,
-    0,
+/**
+ * Active routes can outlive the network row that owned them, for example when
+ * a network is removed while its servers keep running. Those scopes get a
+ * warning row after the known networks so the leftover routes stay visible.
+ */
+function buildStaleRouteScopeItems(
+  snapshot: NetworkSnapshot,
+  agentSnapshot: AgentSnapshot,
+): PortManagerTreeItem[] {
+  const knownNetworkIds = new Set(snapshot.networks.map((network) => network.id));
+
+  return projectCurrentRouting(snapshot, agentSnapshot)
+    .networkIds.filter((networkId) => !knownNetworkIds.has(networkId))
+    .map((networkId) => {
+      const scope = { id: networkId, name: `Unknown network ${networkId.slice(0, 8)}` };
+      const routeRows = buildNetworkRouteConnectionRows(networkId, snapshot, agentSnapshot, "current");
+      const description = routeRows.length === 0
+        ? "Stale · no routes"
+        : formatSidebarSummary("Stale", [{ count: routeRows.length, singular: "route" }]);
+
+      return new NetworkRoutingGroupTreeItem(
+        scope,
+        scope.name,
+        description,
+        routeRows,
+        "stale",
+        "warning",
+        new vscode.ThemeColor("problemsWarningIcon.foreground"),
+      );
+    });
+}
+
+/**
+ * Flattens one network into scan order: routed ports first (sorted by logical
+ * port), then the window default, terminals, and Compose projects that feed
+ * them. Host bindings and host access arrive as route rows but render through
+ * their own leaves so the open/copy/remove menus stay attached to them.
+ */
+function buildNetworkChildItems(
+  network: LogicalNetwork,
+  snapshot: NetworkSnapshot,
+  routeRows: readonly NetworkRouteConnection[],
+): PortManagerTreeItem[] {
+  const exposuresById = new Map(
+    snapshot.exposures.filter((exposure) => exposure.networkId === network.id).map((exposure) => [exposure.id, exposure]),
   );
+  const hostAccessById = new Map(
+    snapshot.hostAccessBindings.filter((binding) => binding.networkId === network.id).map((binding) => [binding.id, binding]),
+  );
+  const portRows = routeRows.map((route): PortManagerTreeItem => {
+    const exposure = route.kind === "hostExposure" && route.sourceId !== undefined
+      ? exposuresById.get(route.sourceId)
+      : undefined;
+    if (exposure !== undefined) {
+      return new HostPortExposureTreeItem(exposure, [network]);
+    }
+
+    const binding = route.kind === "hostAccess" && route.sourceId !== undefined
+      ? hostAccessById.get(route.sourceId)
+      : undefined;
+    return binding !== undefined ? new HostAccessBindingTreeItem(binding) : new NetworkRouteConnectionTreeItem(route);
+  });
+  const windowBinding = snapshot.vscodeWindowTerminalBinding?.networkId === network.id
+    ? snapshot.vscodeWindowTerminalBinding
+    : undefined;
+
+  return [
+    ...portRows,
+    ...(windowBinding !== undefined
+      ? [new VscodeWindowTerminalBindingTreeItem(windowBinding, network, { enabled: true }, "network")]
+      : []),
+    ...snapshot.attachments
+      .filter((attachment) => attachment.networkId === network.id)
+      .map((attachment) => new TerminalAttachmentTreeItem(attachment)),
+    ...snapshot.composeAttachments
+      .filter((attachment) => attachment.networkId === network.id)
+      .map((attachment) => new ComposeAttachmentTreeItem(attachment)),
+  ];
 }
 
 /** Compact active/current context projection shared by root routing rows and their summary. */
@@ -1929,22 +1747,6 @@ export function projectCurrentRouting(
     networkIds: [...networkIds],
     attachedTerminalCount: snapshot.attachments.filter((attachment) => attachment.status === "attached").length,
   };
-}
-
-/** Describes a route group using current context before raw route count. */
-function formatNetworkRouteGroupDescription(
-  routeRows: readonly NetworkRouteConnection[],
-  attachments: readonly TerminalAttachment[],
-  binding: VscodeWindowTerminalBinding | undefined,
-): string {
-  if (routeRows.length === 0 && binding === undefined) {
-    return "No routes";
-  }
-
-  return formatSidebarSummary(binding !== undefined ? "VS Code default" : "Available", [
-    { count: attachments.filter((attachment) => attachment.status === "attached").length, singular: "terminal" },
-    { count: routeRows.length, singular: "route" },
-  ]);
 }
 
 /** Normalizes every route source for one network into display rows. */
@@ -1997,18 +1799,21 @@ function buildNetworkRouteConnectionRows(
   return rows.sort((left, right) => left.logicalPort - right.logicalPort || left.label.localeCompare(right.label));
 }
 
+/**
+ * Route rows read as `logical → transport` with the owner as description.
+ * Healthy states stay implicit; only a non-default status is spelled out.
+ */
 function buildDaemonRouteConnection(route: LogicalPortRoute): NetworkRouteConnection {
   const owner = route.processName ?? route.source;
-  const direction = route.routeDirection === "send" ? "sender" : "listener";
 
   return {
     id: `route:${route.networkId ?? "global"}:daemon:${route.logicalPort}:${route.actualPort}:${route.processId ?? route.source}:${route.routeDirection ?? "listen"}`,
-    label: `${route.logicalPort} -> ${route.host}:${route.actualPort}`,
-    description: `${direction}, ${owner}, ${route.status}`,
+    label: `${route.logicalPort} → ${route.host}:${route.actualPort}`,
+    description: formatRouteDescription([owner, route.routeDirection === "send" ? "sender" : undefined], route.status, "running"),
     logicalPort: route.logicalPort,
     kind: "daemon",
     tooltip: buildRouteTooltip(route),
-    icon: route.source === "compose" ? "server-environment" : "symbol-interface",
+    icon: route.status === "error" ? "error" : route.source === "compose" ? "server-environment" : "symbol-interface",
     ...(route.status === "error" ? { color: new vscode.ThemeColor("testing.iconFailed") } : {}),
   };
 }
@@ -2019,12 +1824,12 @@ function buildComposeRouteConnection(
 ): NetworkRouteConnection {
   return {
     id: `route:${attachment.networkId}:compose:${attachment.id}:${port.serviceName}:${port.logicalPort}:${port.actualHostPort}`,
-    label: `${port.logicalPort} -> ${port.actualHostAddress}:${port.actualHostPort}`,
-    description: `${attachment.projectName}/${port.serviceName}, compose ${attachment.status}`,
+    label: `${port.logicalPort} → ${port.actualHostAddress}:${port.actualHostPort}`,
+    description: formatRouteDescription([`${attachment.projectName}/${port.serviceName}`], attachment.status, "attached"),
     logicalPort: port.logicalPort,
     kind: "compose",
     tooltip: buildComposeRouteTooltip(attachment, port),
-    icon: "server-environment",
+    icon: attachment.status === "error" ? "error" : "server-environment",
     ...(attachment.status === "error" ? { color: new vscode.ThemeColor("testing.iconFailed") } : {}),
   };
 }
@@ -2032,10 +1837,11 @@ function buildComposeRouteConnection(
 function buildHostAccessRouteConnection(binding: HostAccessBinding): NetworkRouteConnection {
   return {
     id: `route:${binding.networkId}:host-access:${binding.id}`,
-    label: `${binding.logicalPort} -> ${binding.hostAddress}:${binding.hostPort}`,
-    description: `host access, ${binding.status}`,
+    label: `${binding.logicalPort} → ${binding.hostAddress}:${binding.hostPort}`,
+    description: formatRouteDescription(["host access"], binding.status, "active"),
     logicalPort: binding.logicalPort,
     kind: "hostAccess",
+    sourceId: binding.id,
     tooltip: buildHostAccessBindingTooltip(binding),
     icon: "arrow-swap",
     ...(binding.status === "error" ? { color: new vscode.ThemeColor("testing.iconFailed") } : {}),
@@ -2045,14 +1851,35 @@ function buildHostAccessRouteConnection(binding: HostAccessBinding): NetworkRout
 function buildHostExposureRouteConnection(exposure: HostPortExposure): NetworkRouteConnection {
   return {
     id: `route:${exposure.networkId}:host-exposure:${exposure.id}`,
-    label: `${exposure.hostAddress}:${exposure.hostPort} -> network:${exposure.targetPort}`,
-    description: `host exposure, ${exposure.status}`,
+    label: `${exposure.hostAddress}:${exposure.hostPort} → ${exposure.targetPort}`,
+    description: formatRouteDescription(["host binding"], exposure.status, "active"),
     logicalPort: exposure.targetPort,
     kind: "hostExposure",
+    sourceId: exposure.id,
     tooltip: buildExposureTooltip(exposure, undefined),
     icon: "link-external",
     ...(exposure.status === "error" ? { color: new vscode.ThemeColor("testing.iconFailed") } : {}),
   };
+}
+
+/** Joins route context with ` · ` and appends the status only when it is not the healthy one. */
+function formatRouteDescription(
+  parts: readonly (string | undefined)[],
+  status: string,
+  healthyStatus: string,
+): string {
+  return [...parts, status === healthyStatus ? undefined : status]
+    .filter((part): part is string => part !== undefined && part.length > 0)
+    .join(" · ");
+}
+
+/** Terminal rows name only the exceptional cases: shared-port mode or a non-attached state. */
+function formatTerminalAttachmentDescription(attachment: TerminalAttachment): string {
+  return formatRouteDescription(
+    [attachment.mode === "logical" ? "logical mode" : "terminal"],
+    attachment.status,
+    "attached",
+  );
 }
 
 function formatTerminalSectionDescription(
@@ -2238,6 +2065,11 @@ function isTerminalAttachment(argument: unknown): argument is TerminalAttachment
   );
 }
 
+/**
+ * `<state> · <routes> · <terminals>` for a root network row. Host mappings are
+ * already counted as routes and Compose projects feed routes, so the row keeps
+ * two counts; the tooltip retains the full per-source breakdown.
+ */
 function buildNetworkDescription(
   network: LogicalNetwork,
   attachmentCount: number,
@@ -2247,14 +2079,42 @@ function buildNetworkDescription(
   routeCount: number,
   isCurrentWindowNetwork: boolean,
 ): string {
-  const state = network.status === "error" ? "Error" : isCurrentWindowNetwork ? "Current" : network.status === "running" ? "Ready" : "Stopped";
+  const hasActivity = routeCount + attachmentCount + exposureCount + hostAccessCount + composeCount > 0;
+  const state =
+    network.status === "error"
+      ? "Error"
+      : network.status === "creating"
+        ? "Creating"
+        : network.status === "stopped"
+          ? "Stopped"
+          : isCurrentWindowNetwork
+            ? "This window"
+            : hasActivity
+              ? "Active"
+              : "Idle";
   return formatSidebarSummary(state, [
     { count: routeCount, singular: "route" },
     { count: attachmentCount, singular: "terminal" },
-    { count: exposureCount, singular: "binding" },
-    { count: hostAccessCount, singular: "host access" },
-    { count: composeCount, singular: "compose attachment" },
   ]);
+}
+
+/**
+ * Network icon shape and color follow the same state as the description text:
+ * red on error, dimmed when stopped, green once something routes through it.
+ */
+function buildNetworkIcon(network: LogicalNetwork, hasChildren: boolean): vscode.ThemeIcon {
+  switch (network.status) {
+    case "error":
+      return new vscode.ThemeIcon("vm", new vscode.ThemeColor("testing.iconFailed"));
+    case "creating":
+      return new vscode.ThemeIcon("loading~spin");
+    case "stopped":
+      return new vscode.ThemeIcon("vm-outline", new vscode.ThemeColor("disabledForeground"));
+    case "running":
+      return hasChildren
+        ? new vscode.ThemeIcon("vm-active", new vscode.ThemeColor("testing.iconPassed"))
+        : new vscode.ThemeIcon("vm-outline");
+  }
 }
 
 /** Builds tooltip details for one logical network. */
@@ -2369,13 +2229,15 @@ function buildComposeAttachmentTooltip(attachment: ComposeAttachment): vscode.Ma
 
 /** Builds a compact row description; folder, file, and route details live in child rows. */
 function formatComposeAttachmentDescription(attachment: ComposeAttachment): string {
-  const details = [
+  return formatRouteDescription(
+    [
+      "compose",
+      attachment.mutation === undefined ? undefined : `from ${attachment.mutation.originalProjectName}`,
+      `${attachment.ports.length} port${attachment.ports.length === 1 ? "" : "s"}`,
+    ],
     attachment.status,
-    attachment.mutation?.originalProjectName,
-    `${attachment.ports.length} port${attachment.ports.length === 1 ? "" : "s"}`,
-  ].filter((item): item is string => item !== undefined && item.length > 0);
-
-  return details.join(" | ");
+    "attached",
+  );
 }
 
 function buildComposeAttachmentDetailRows(attachment: ComposeAttachment): PortManagerTreeItem[] {
@@ -2912,7 +2774,7 @@ function formatContainerSectionDescription(candidates: readonly ContainerService
       ),
   ).size;
   const rawContainerCount = candidates.filter((candidate) => candidate.composeProject === undefined).length;
-  return candidates.length === 0 ? "No services" : formatSidebarSummary("Available", [
+  return candidates.length === 0 ? "No services" : formatSidebarCounts([
     { count: composeProjectCount, singular: "compose project" },
     { count: rawContainerCount, singular: "container" },
   ]);

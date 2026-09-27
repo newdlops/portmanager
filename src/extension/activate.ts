@@ -161,6 +161,8 @@ export function activate(context: vscode.ExtensionContext): PortManagerExtension
     treeDataProvider: treeProvider,
     dragAndDropController: treeProvider,
   });
+  // The provider mirrors routing problems onto the activity-bar badge.
+  treeProvider.bindView(treeView);
   // Background terminal/container discovery idles while the view is hidden;
   // visibility changes wake it so the sidebar catches up immediately.
   networkService.setSidebarVisible(treeView.visible);

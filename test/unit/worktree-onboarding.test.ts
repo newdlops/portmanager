@@ -29,9 +29,10 @@ test("worktree initialization is a visible, activation-backed primary action", (
     false,
   );
 
-  const networksCaseStart = treeSource.indexOf('case "networks":');
-  const networksCaseEnd = treeSource.indexOf('case "services":', networksCaseStart);
+  const networksCaseStart = treeSource.indexOf("function buildOnboardingActionItems(");
+  const networksCaseEnd = treeSource.indexOf("function buildStaleRouteScopeItems(", networksCaseStart);
   const networksCase = treeSource.slice(networksCaseStart, networksCaseEnd);
+  assert.notEqual(networksCaseStart, -1);
   assert.equal(networksCase.includes('"Initialize This Worktree"'), true);
   assert.equal(networksCase.includes('"Create and use one default network"'), true);
   assert.equal(networksCase.includes("snapshot.vscodeWindowTerminalBinding === undefined"), true);

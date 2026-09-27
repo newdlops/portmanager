@@ -7,9 +7,9 @@ Port Manager의 VS Code 사용자 인터페이스를 담당한다.
 ## 책임
 
 - 사이드바 Tree View 구성
-- Logical Network, Terminal Session, Host Port Exposure 중심의 기본 화면 표시
-- NetworkSnapshot 기반 실제 상태 렌더링
-- 주요 명령을 각 섹션의 action row와 context menu에서 실행 가능하게 노출
+- Logical Network를 루트에 두고 그 아래 라우팅 포트와 연결을 바로 보여주는 기본 화면 표시
+- NetworkSnapshot 기반 실제 상태 렌더링과 Activity Bar 실패 배지
+- 네트워크 명령을 인라인 버튼과 그룹화된 context menu로 노출 (action row 없음)
 - 레거시 관리형 프로세스 UI를 기본 화면에서 숨김
 - Tree item context value와 command 연결
 

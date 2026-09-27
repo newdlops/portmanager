@@ -15,7 +15,7 @@ test("isolated worktree is a visible activation-backed primary action", () => {
     readonly contributes?: {
       readonly commands?: ReadonlyArray<{ readonly command: string }>;
       readonly menus?: {
-        readonly "view/title"?: ReadonlyArray<{ readonly command: string }>;
+        readonly "view/title"?: ReadonlyArray<{ readonly command: string; readonly group?: string }>;
         readonly commandPalette?: ReadonlyArray<{ readonly command: string; readonly when?: string }>;
       };
     };
@@ -35,9 +35,13 @@ test("isolated worktree is a visible activation-backed primary action", () => {
   );
   assert.equal(treeSource.includes('"Create Isolated Worktree"'), true);
   assert.equal(treeSource.includes('"Worktree + network + Compose copy"'), true);
-  const viewTitleCommands = manifest.contributes?.menus?.["view/title"]?.map((entry) => entry.command) ?? [];
-  assert.equal(viewTitleCommands.includes("portManager.createIsolatedWorktree"), true);
-  assert.equal(viewTitleCommands.includes("portManager.createLogicalNetwork"), false);
+  // The worktree flow owns the primary toolbar slot; raw network creation stays in the overflow menu.
+  const primaryViewTitleCommands =
+    manifest.contributes?.menus?.["view/title"]
+      ?.filter((entry) => entry.group?.startsWith("navigation"))
+      .map((entry) => entry.command) ?? [];
+  assert.equal(primaryViewTitleCommands.includes("portManager.createIsolatedWorktree"), true);
+  assert.equal(primaryViewTitleCommands.includes("portManager.createLogicalNetwork"), false);
 });
 
 test("guided setup orders worktree, durable network state, compose copy, verification, and handoff", () => {

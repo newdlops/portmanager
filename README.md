@@ -31,7 +31,7 @@ The previous managed-process routing, native hook, and rerun-on-failure implemen
 - Attach Docker Compose published ports as logical-network service routes by moving selected services into a hidden network-scoped Compose project, so the original host ports become reusable.
 - Copy an attached Compose project into another logical network as a separate hidden Compose project, including stopped services so later `docker compose start` or `up` commands keep using the copied project.
 - Discover running Docker/Podman services with published ports, group Compose services by project, and attach them from the Compose / Containers sidebar section.
-- Start every primary network command from sidebar action rows, not only Command Palette.
+- Start every primary network command from the sidebar, not only the Command Palette: hover a network for its terminal buttons, or right-click it for the grouped connect, port, preset, and cleanup actions.
 - Expose a host TCP port to a target address and port through `Local TCP Proxy`.
 - Close proxy listeners when exposures or networks are removed.
 - Reopen persisted active exposures when the extension starts.
