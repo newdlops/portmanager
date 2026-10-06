@@ -118,6 +118,10 @@ import {
 } from "../platform/ports/logical-port-router";
 import { NodeTcpConnectionProcessResolver } from "../platform/ports/tcp-connection-process-resolver";
 import { ProcessTrackerManager } from "../platform/process/process-tracker-manager";
+import {
+  getPersistentNativeHookLibraryPath,
+  preparePersistentNativeHookLibrary,
+} from "../platform/process/native-executable";
 import { devLog, devLogEnabled } from "../platform/dev-log";
 import { resolveNetworkBrowserTargetUrl, selectTerminalNetworkFallback, type NetworkBrowserTarget } from "../platform/browser-terminal-links";
 import {
@@ -7996,7 +8000,7 @@ export class PortManagerNetworkService implements DisposableLike {
     // Per-terminal attach must scaffold too — the window-binding path alone
     // never fires for terminals attached individually (docs/per-network-env.md).
     ensureNetworkEnvFileScaffold(networkId, networkName);
-    const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
+    const hookLibraryPath = preparePersistentNativeHookLibrary(this.context.asAbsolutePath(getHookLibraryRelativePath()));
     const agentMainPath = this.context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
     const nativeAgentPath = this.context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
     const nativeContainerMapPath = this.context.asAbsolutePath(path.join("media", "native", "portmanager_container_map"));
@@ -8133,7 +8137,7 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Builds the full detach bootstrap stored in globalStorage and sourced by the shell. */
   private buildTerminalDetachScriptBody(): string {
-    const hookLibraryPath = this.context.asAbsolutePath(getHookLibraryRelativePath());
+    const hookLibraryPath = getPersistentNativeHookLibraryPath(this.context.asAbsolutePath(getHookLibraryRelativePath()));
     const asdfShimLauncherPath = this.context.asAbsolutePath(getAsdfShimLauncherRelativePath());
     const runtimeCommandShimPath = this.context.asAbsolutePath(getRuntimeCommandShimRelativePath());
     const runtimeShimDirectory = prepareRuntimeShimLauncherDirectory(

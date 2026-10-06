@@ -22,7 +22,11 @@ import {
 import { buildExistingCloneMutationFromCandidate } from "../platform/network/container-service-discovery";
 import { isValidComposeProjectName } from "../platform/network/compose-publish-mutator";
 import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
-import { canLoadNativeHookLibrary, canRunNativeAgentBinary } from "../platform/process/native-executable";
+import {
+  canLoadNativeHookLibrary,
+  canRunNativeAgentBinary,
+  preparePersistentNativeHookLibrary,
+} from "../platform/process/native-executable";
 import { verifyInstalledShellIntegration } from "../platform/process/shell-integration-verifier";
 import { readPortManagerPackageVersion } from "../shared/package-version";
 import type { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
@@ -2012,7 +2016,7 @@ export class PortManagerCommandController implements DisposableLike {
     options: { readonly force?: boolean } = {},
   ): Promise<ShellHookAssets> {
     const settings = readPortManagerSettings();
-    const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
+    const hookLibraryPath = preparePersistentNativeHookLibrary(context.asAbsolutePath(getHookLibraryRelativePath()));
     const asdfShimLauncherPath = context.asAbsolutePath(getAsdfShimLauncherRelativePath());
     const runtimeCommandShimPath = context.asAbsolutePath(getRuntimeCommandShimRelativePath());
     const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));

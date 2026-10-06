@@ -27,6 +27,7 @@ import {
   type RuntimeCommandShimName,
 } from "./compose-project-routing";
 import { normalizeBrowserDnsHostname } from "../platform/network/browser-dns-server";
+import { preparePersistentNativeHookLibrary } from "../platform/process/native-executable";
 
 /**
  * Keeps new VS Code terminals on the pre-bind routing path.
@@ -201,7 +202,7 @@ export function applyTerminalHookEnvironment(
 
   ensureNetworkEnvFileScaffold(scope.networkId, scope.networkName);
 
-  const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
+  const hookLibraryPath = preparePersistentNativeHookLibrary(context.asAbsolutePath(getHookLibraryRelativePath()));
   const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
   const nativeAgentPath = context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
   const nativeContainerMapPath = context.asAbsolutePath(path.join("media", "native", "portmanager_container_map"));
@@ -303,7 +304,7 @@ function applyGlobalNetworkEnvironment(
   collection: vscode.EnvironmentVariableCollection,
   settings: PortManagerSettings,
 ): void {
-  const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
+  const hookLibraryPath = preparePersistentNativeHookLibrary(context.asAbsolutePath(getHookLibraryRelativePath()));
   const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
   const nativeAgentPath = context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
   const nativeContainerMapPath = context.asAbsolutePath(path.join("media", "native", "portmanager_container_map"));
@@ -373,7 +374,7 @@ function applyScopelessGatewayEnvironment(
   collection: vscode.EnvironmentVariableCollection,
   settings: PortManagerSettings,
 ): void {
-  const hookLibraryPath = context.asAbsolutePath(getHookLibraryRelativePath());
+  const hookLibraryPath = preparePersistentNativeHookLibrary(context.asAbsolutePath(getHookLibraryRelativePath()));
   const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
   const nativeAgentPath = context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
   const nativeContainerMapPath = context.asAbsolutePath(path.join("media", "native", "portmanager_container_map"));

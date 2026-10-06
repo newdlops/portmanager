@@ -1,8 +1,52 @@
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { buildNodeRuntimeEnvironment } from "./node-runtime";
 
 export type SupportedNativeArchitecture = "arm64" | "x64";
+
+/**
+ * Terminal children outlive extension upgrades, so their preload path must not
+ * point into a versioned VSIX directory. Keep the packaged suffix for the
+ * existing shell preload cleanup rules, and separate CPU/OS loader targets.
+ */
+export function getPersistentNativeHookLibraryPath(
+  packagedHookPath: string,
+  runtimeDirectory = path.join(os.homedir(), ".portmanager", "runtime", `${process.platform}-${process.arch}`),
+): string {
+  return path.join(runtimeDirectory, "media", "native", path.basename(packagedHookPath));
+}
+
+/**
+ * Publishes a real copy of the hook outside the removable extension directory.
+ * A symlink would break on uninstall; an in-place write could invalidate the
+ * code signature of an already mapped dylib. Atomic rename lets running
+ * processes retain their old inode while new children load the current hook.
+ * Publication errors propagate instead of exporting an ephemeral fallback.
+ */
+export function preparePersistentNativeHookLibrary(packagedHookPath: string, runtimeDirectory?: string): string {
+  const hookPath = getPersistentNativeHookLibraryPath(packagedHookPath, runtimeDirectory);
+  const contents = fs.readFileSync(packagedHookPath);
+  try {
+    if (!fs.lstatSync(hookPath).isSymbolicLink() && fs.readFileSync(hookPath).equals(contents)) {
+      return hookPath;
+    }
+  } catch {
+    // Missing or unreadable cached copies are replaced atomically below.
+  }
+
+  fs.mkdirSync(path.dirname(hookPath), { recursive: true });
+  const temporaryPath = `${hookPath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, contents, { mode: 0o700, flag: "wx" });
+    fs.renameSync(temporaryPath, hookPath);
+  } finally {
+    fs.rmSync(temporaryPath, { force: true });
+  }
+  return hookPath;
+}
 
 /**
  * Proves that the OS loader can execute the packaged native agent.

@@ -5,13 +5,73 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 
-import { readNativeBinaryArchitectures } from "../../src/platform/process/native-executable";
+import {
+  canLoadNativeHookLibrary,
+  getPersistentNativeHookLibraryPath,
+  preparePersistentNativeHookLibrary,
+  readNativeBinaryArchitectures,
+} from "../../src/platform/process/native-executable";
 
 const root = path.resolve(__dirname, "../../..");
 
 function readSource(relativePath: string): string {
   return fs.readFileSync(path.join(root, relativePath), "utf8");
 }
+
+test("terminal preload survives VSIX removal and updates without changing an open binary", (context) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-hook-upgrade-"));
+  context.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const runtimeDirectory = path.join(directory, "runtime");
+  const libraryName = "libportmanager_hook.dylib";
+  const oldPackagedPath = path.join(directory, "extension-old", libraryName);
+  const newPackagedPath = path.join(directory, "extension-new", libraryName);
+  fs.mkdirSync(path.dirname(oldPackagedPath));
+  fs.mkdirSync(path.dirname(newPackagedPath));
+  fs.writeFileSync(oldPackagedPath, "old-hook");
+  fs.writeFileSync(newPackagedPath, "new-hook");
+
+  const preloadPath = preparePersistentNativeHookLibrary(oldPackagedPath, runtimeDirectory);
+  assert.equal(preloadPath, getPersistentNativeHookLibraryPath(newPackagedPath, runtimeDirectory));
+  assert.equal(fs.lstatSync(preloadPath).isSymbolicLink(), false, "a symlink still depends on the old VSIX");
+  const originalInode = fs.statSync(preloadPath).ino;
+  assert.equal(preparePersistentNativeHookLibrary(oldPackagedPath, runtimeDirectory), preloadPath);
+  assert.equal(fs.statSync(preloadPath).ino, originalInode, "unchanged hooks must not be republished");
+  fs.rmSync(path.dirname(oldPackagedPath), { recursive: true });
+  assert.equal(fs.readFileSync(preloadPath, "utf8"), "old-hook");
+
+  // A mapped dylib holds the old inode. Updating the shared pathname must not
+  // modify its bytes or its code signature underneath a running process.
+  const mappedBinary = fs.openSync(preloadPath, "r");
+  try {
+    assert.equal(preparePersistentNativeHookLibrary(newPackagedPath, runtimeDirectory), preloadPath);
+    assert.equal(fs.readFileSync(preloadPath, "utf8"), "new-hook");
+    assert.equal(fs.readFileSync(mappedBinary, "utf8"), "old-hook");
+  } finally {
+    fs.closeSync(mappedBinary);
+  }
+  fs.rmSync(path.dirname(newPackagedPath), { recursive: true });
+  assert.equal(fs.readFileSync(preloadPath, "utf8"), "new-hook");
+  assert.throws(() => preparePersistentNativeHookLibrary(newPackagedPath, runtimeDirectory), { code: "ENOENT" });
+  assert.equal(fs.readFileSync(preloadPath, "utf8"), "new-hook", "failed publication preserves the active copy");
+});
+
+test("a persisted signed hook still loads after its packaged file is deleted", (context) => {
+  const hookName = process.platform === "darwin" ? "libportmanager_hook.dylib" : "libportmanager_hook.so";
+  const hookPath = path.join(root, "media", "native", hookName);
+  const agentPath = path.join(root, "media", "native", "portmanager_agent");
+  if (process.platform === "win32" || !fs.existsSync(hookPath) || !fs.existsSync(agentPath)) {
+    context.skip("native hook and agent not built for this platform");
+    return;
+  }
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-hook-loader-"));
+  context.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const packagedPath = path.join(directory, hookName);
+  fs.copyFileSync(hookPath, packagedPath);
+  const persistentPath = preparePersistentNativeHookLibrary(packagedPath, path.join(directory, "runtime"));
+  fs.unlinkSync(packagedPath);
+
+  assert.equal(canLoadNativeHookLibrary(agentPath, persistentPath), true, "the OS loader must accept the surviving copy");
+});
 
 test("native release scripts fail closed and package one explicit Marketplace target", () => {
   const manifest = JSON.parse(readSource("package.json")) as { readonly scripts?: Readonly<Record<string, string>> };

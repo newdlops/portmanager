@@ -157,6 +157,12 @@ Native Socket Hook 기반 Logical Network의 클라이언트 라우팅 1차 경�
 
 hook의 `bind`는 서버를 per-network loopback alias로 옮기는 in-process 재작성을 계속 담당한다(프로세스 밖에서는 불가능). preload를 잃은 서버(보호 경계 뒤 절대경로 `#!` 인터프리터)는 alias bind를 못 받아 같은 포트 다중 네트워크 격리가 서버 측에서 깨질 수 있으며, 이는 명시적 실패로 드러난다.
 
+터미널·외부 셸·attach 스크립트의 preload와 hint는 확장 버전 디렉터리가 아니라
+`~/.portmanager/runtime/<OS>-<CPU>/media/native/`의 고정 hook 사본을 가리킨다.
+확장 업데이트가 이전 VSIX를 삭제해도 이미 실행 중인 launcher의 자식이 누락 dylib로
+즉시 종료되어서는 안 된다. 사본 갱신은 atomic rename으로 기존 프로세스가 매핑한
+바이너리를 보존하며, 사본 생성 실패 시 버전 디렉터리로 조용히 fallback하지 않는다.
+
 `bind(..., port=0)`은 예외다. 커널이 고른 ephemeral 포트는 호스트에서 이미 유일하므로
 주소까지 per-network loopback으로 옮겨도 포트 재사용 이득이 없다. 이 좌표는 raw
 localhost에 유지하고 네트워크 스코프 route만 등록한다. 그러면 Electron helper,
