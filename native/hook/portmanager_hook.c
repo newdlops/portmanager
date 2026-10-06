@@ -6479,15 +6479,46 @@ static int pm_loopback_addr_is_visible(uint32_t host_order_ip) {
 }
 
 /*
+ * True when an interface entry is another logical network's loopback alias,
+ * i.e. an IPv4 127.x address this process is not allowed to see.
+ */
+static int pm_ifaddr_is_foreign_loopback(const struct ifaddrs *entry) {
+  const struct sockaddr *addr = entry->ifa_addr;
+  uint32_t ip;
+
+  if (addr == NULL || addr->sa_family != AF_INET) {
+    return 0;
+  }
+  ip = ntohl(((const struct sockaddr_in *)addr)->sin_addr.s_addr);
+  return (ip >> 24) == 127 && !pm_loopback_addr_is_visible(ip);
+}
+
+/*
  * Isolates the interface view for a network-scoped process. The per-network
  * loopback aliases live on the host-global lo0, so any process could otherwise
  * enumerate every other network's alias via getifaddrs()/os.networkInterfaces().
- * We detach the address of foreign aliases (getifaddrs(3) permits a NULL
- * ifa_addr, which every well-behaved caller skips) instead of restructuring or
- * freeing the list, so the caller's freeifaddrs() stays correct on every libc.
+ *
+ * Foreign aliases are unlinked from the list rather than left in place with a
+ * NULL ifa_addr. getifaddrs(3) allows a NULL address, but real callers do not
+ * all skip it: Chromium's network service dereferences it and crashes on
+ * startup in a loop, so Playwright/Chromium never loads a page from a
+ * network-scoped terminal. Unlinking keeps every visible entry well-formed.
+ *
+ * freeifaddrs(head) must keep working, so the list head is never replaced:
+ *   - Darwin libinfo and glibc allocate the whole list as one block owned by
+ *     the head, so unlinked entries are still reclaimed by freeifaddrs(head).
+ *   - If the head itself is foreign, the first kept entry is copied into the
+ *     head. Its strings and sockaddrs stay inside the same allocation, so the
+ *     copy stays valid until the caller frees the list.
+ *   - On a libc that allocates per entry (e.g. musl), unlinked entries are
+ *     leaked instead of freed here, because only that libc's freeifaddrs()
+ *     knows how they were allocated. That is a bounded leak, not a double free.
+ * A list made only of foreign aliases has nothing left to show, so its single
+ * head keeps a detached address as before.
  */
 static int pm_getifaddrs_hook(struct ifaddrs **ifap) {
-  struct ifaddrs *entry;
+  struct ifaddrs *head;
+  struct ifaddrs *previous;
   int result;
 
   pm_ensure_symbols();
@@ -6506,21 +6537,26 @@ static int pm_getifaddrs_hook(struct ifaddrs **ifap) {
     return result;
   }
 
-  for (entry = *ifap; entry != NULL; entry = entry->ifa_next) {
-    const struct sockaddr *addr = entry->ifa_addr;
-    uint32_t ip;
+  head = *ifap;
 
-    if (addr == NULL || addr->sa_family != AF_INET) {
-      continue;
+  /* Unlink every foreign entry after the head; the head is handled below. */
+  previous = head;
+  while (previous->ifa_next != NULL) {
+    if (pm_ifaddr_is_foreign_loopback(previous->ifa_next)) {
+      previous->ifa_next = previous->ifa_next->ifa_next;
+    } else {
+      previous = previous->ifa_next;
     }
-    ip = ntohl(((const struct sockaddr_in *)addr)->sin_addr.s_addr);
-    if ((ip >> 24) != 127 || pm_loopback_addr_is_visible(ip)) {
-      continue;
-    }
+  }
 
-    /* A different network's loopback alias: hide it from this process. */
-    entry->ifa_addr = NULL;
-    entry->ifa_netmask = NULL;
+  if (pm_ifaddr_is_foreign_loopback(head)) {
+    if (head->ifa_next != NULL) {
+      /* Every entry after the head is now visible: the head adopts the first one. */
+      *head = *head->ifa_next;
+    } else {
+      head->ifa_addr = NULL;
+      head->ifa_netmask = NULL;
+    }
   }
 
   return result;
