@@ -65,6 +65,9 @@ socket 취소는 기다리는 callback을 즉시 제거하고, OS 작업은 실�
 주소 목록은 순서를 보존한 최대 64개이고 Node의 IPv4/IPv6 fallback을 유지한다.
 완료 결과를 DNS cache로 보관하지 않는다. 취소된 shared route waiter도 원래
 Promise에서 분리하되 실제 resolver 작업의 슬롯은 조기 반환하지 않는다.
+호스트명 bind는 `resolveListenHost`로 같은 DNS 상한과 5초 기한을 적용한 뒤
+숫자 주소를 Node listener에 넘긴다. 동기 listen 실패는 unbound server를 닫아
+listener lease를 반환한다.
 
 Logical Router의 Node fallback도 route/TCP 준비를 각 5초로 제한하고 FIN 응답을
 보존한다. HTTP의 전역 활성/대기 또는 upstream/DNS 예산 초과는 503이며 POST를

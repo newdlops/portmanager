@@ -146,6 +146,62 @@ test("synchronous host bind failure returns listener capacity before retry", asy
   } finally { await manager.dispose(); }
 });
 
+test("hostname binds coalesce under the same DNS quota and release failed listener reservations", { timeout: 10000 }, async t => {
+  const callbacks: Parameters<ProxyDnsLookup>[2][] = [];
+  const resources = new ProxyNetworkResources({ budget: new ProxyResourceBudget({ dnsJobs: 1 }),
+    maxNodeDnsJobs: 1, lookup: (_host, _options, callback) => { callbacks.push(callback); } });
+  const manager = new HostPortProxyManager({ resolve: () => ({ host: "127.0.0.1", port: 1 }) }, { resources });
+  t.after(async () => { for (const callback of callbacks) callback(null, "127.0.0.1", 4); await manager.dispose(); });
+  const ports = [await availablePort(), await availablePort(), await availablePort()];
+  const exposure = (id: string, host: string, port: number): HostPortExposure => ({ id, networkId: "test",
+    hostAddress: host, hostPort: port, targetAddress: "127.0.0.1", targetPort: 1, protocol: "tcp",
+    status: "active", createdAt: new Date().toISOString() });
+  const first = manager.open(exposure("bind-one", "shared-bind.fixture", ports[0]));
+  const second = manager.open(exposure("bind-two", "shared-bind.fixture", ports[1]));
+  await until(() => resources.pendingDnsWaiters === 2);
+  assert.equal(callbacks.length, 1);
+  assert.equal(resources.budget.used.dnsJobs, 1);
+  await assert.rejects(manager.open(exposure("bind-excess", "other-bind.fixture", ports[2])),
+    error => error instanceof ProxyResourceLimitError && error.resource === "dnsJobs");
+  await until(() => resources.budget.used.listeners === 2);
+  callbacks[0](null, "127.0.0.1", 4);
+  await within(Promise.all([first, second]));
+  assert.equal(resources.budget.used.dnsJobs, 0);
+  await manager.dispose();
+  await until(() => resources.budget.used.listeners === 0);
+});
+
+test("listener DNS deadlines detach waiters while real OS work retains its quota", async () => {
+  let complete!: Parameters<ProxyDnsLookup>[2];
+  const resources = new ProxyNetworkResources({ budget: new ProxyResourceBudget({ dnsJobs: 1 }),
+    lookup: (_host, _options, callback) => { complete = callback; } });
+  await assert.rejects(within(resources.resolveListenHost("slow-bind.fixture", 20)), { code: "ETIMEDOUT" });
+  assert.equal(resources.pendingDnsWaiters, 0);
+  assert.equal(resources.budget.used.dnsJobs, 1);
+  assert.equal(await resources.resolveListenHost("127.0.0.1"), "127.0.0.1");
+  await assert.rejects(resources.resolveListenHost("next-bind.fixture"),
+    error => error instanceof ProxyResourceLimitError && error.resource === "dnsJobs");
+  complete(null, "127.0.0.1", 4);
+  await until(() => resources.budget.used.dnsJobs === 0);
+});
+
+test("browser hostname binding uses the resource broker instead of Node's implicit DNS", async t => {
+  let lookups = 0;
+  const resources = new ProxyNetworkResources({ lookup: (_host, options, callback) => {
+    lookups++;
+    queueMicrotask(() => options.all ? callback(null, [{ address: "127.0.0.1", family: 4 }], 4)
+      : callback(null, "127.0.0.1", 4));
+  } });
+  const manager = new BrowserNetworkProxyManager({ resolve: () => ({ host: "127.0.0.1", port: 1 }) }, { resources });
+  t.after(() => manager.dispose());
+  const port = await availablePort();
+  assert.ok(await manager.ensure({ id: "hostname-bind", networkId: "test", logicalPort: 1,
+    listenHost: "browser-bind.fixture", listenPorts: [port], publicHost: "localhost" }));
+  assert.equal(lookups, 2, "availability probe and bind both use budgeted OS operations");
+  await manager.dispose();
+  await until(() => resources.budget.used.listeners === 0 && resources.budget.used.dnsJobs === 0);
+});
+
 test("parent control output bounds bytes and preserves complete frames on resume", async () => {
   const resources = new ProxyNetworkResources({ budget: new ProxyResourceBudget({ controlBytes: 8 }) });
   const frames: string[] = [];

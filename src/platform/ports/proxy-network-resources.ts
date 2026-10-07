@@ -92,6 +92,31 @@ export class ProxyNetworkResources {
     server.once("error", () => { if (!server.listening) lease.release(); });
   }
 
+  /** Resolve bind names through the same OS-job ceiling as outgoing sockets. */
+  resolveListenHost(host: string, timeoutMs = 5000): Promise<string> {
+    if (host === "" || net.isIP(host) !== 0) return Promise.resolve(host);
+    const cancellation = new AbortController();
+    const deadline = performance.now() + timeoutMs;
+    return new Promise((resolve, reject) => {
+      const timedOut = () => Object.assign(new Error("Proxy listener DNS lookup timed out."), { code: "ETIMEDOUT" });
+      const finish = (error?: Error, address?: string) => {
+        clearTimeout(timer);
+        cancellation.abort();
+        if (error !== undefined) reject(error); else resolve(address!);
+      };
+      const timer = setTimeout(() => finish(timedOut()), timeoutMs);
+      timer.unref();
+      this.lookupFor(cancellation.signal)(host, { family: 0, hints: 0 }, (error, address) => {
+        // A DNS callback can run before an overdue timer. Keep the original
+        // deadline and detach canceled waiters while the OS job stays counted.
+        if (performance.now() >= deadline) finish(timedOut());
+        else if (error != null) finish(error);
+        else if (typeof address !== "string" || net.isIP(address) === 0) finish(new Error("Invalid listener DNS address."));
+        else finish(undefined, address);
+      });
+    });
+  }
+
   /** Called before sniffing/route work so overloaded clients cannot start another job. */
   admitClient(socket: net.Socket): boolean {
     if (this.clients.has(socket)) return true;

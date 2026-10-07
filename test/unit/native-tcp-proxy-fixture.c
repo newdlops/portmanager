@@ -1,8 +1,10 @@
 #include <errno.h>
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 #include <time.h>
 
@@ -22,15 +24,15 @@ static int fixture_max_poll_ms = 0;
 static int fixture_late_ready = 0;
 static int fixture_late_immediate = 0;
 static atomic_int fixture_dns_calls = 0;
-static int64_t fixture_interrupt_ms = 1000000;
+static int64_t fixture_virtual_ms = 1000000;
 
 /* Scheduler delays can legitimately exhaust a 35ms budget before three
- * interruptions on a busy VM. Model their monotonic cost deterministically;
+ * interruptions/address attempts on a busy VM. Model their monotonic cost deterministically;
  * the remaining setup modes still exercise real elapsed time and real fds. */
 static int fixture_clock_gettime(clockid_t clock, struct timespec *value) {
-  if (!fixture_interrupt || clock != CLOCK_MONOTONIC) return clock_gettime(clock, value);
-  value->tv_sec = (time_t)(fixture_interrupt_ms / 1000);
-  value->tv_nsec = (long)(fixture_interrupt_ms % 1000) * 1000000;
+  if ((!fixture_interrupt && !fixture_addresses) || clock != CLOCK_MONOTONIC) return clock_gettime(clock, value);
+  value->tv_sec = (time_t)(fixture_virtual_ms / 1000);
+  value->tv_nsec = (long)(fixture_virtual_ms % 1000) * 1000000;
   return 0;
 }
 
@@ -43,11 +45,35 @@ static int fixture_getaddrinfo(const char *host, const char *service, const stru
     return EAI_NONAME;
   }
   if (fixture_addresses && hints != NULL) {
-    struct addrinfo multiple = *hints;
-    multiple.ai_flags &= ~AI_NUMERICHOST;
-    return getaddrinfo("localhost", service, &multiple, results);
+    /* CI's localhost can have only one address. Supply two owned candidates
+       explicitly so this policy test does not depend on machine DNS setup. */
+    struct addrinfo *first = calloc(1, sizeof(*first));
+    struct addrinfo *second = calloc(1, sizeof(*second));
+    struct sockaddr_in *one = calloc(1, sizeof(*one));
+    struct sockaddr_in *two = calloc(1, sizeof(*two));
+    if (first == NULL || second == NULL || one == NULL || two == NULL) {
+      free(first); free(second); free(one); free(two); return EAI_MEMORY;
+    }
+    one->sin_family = two->sin_family = AF_INET;
+    one->sin_addr.s_addr = two->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    one->sin_port = two->sin_port = htons((unsigned short)atoi(service));
+    first->ai_family = second->ai_family = AF_INET;
+    first->ai_socktype = second->ai_socktype = SOCK_STREAM;
+    first->ai_protocol = second->ai_protocol = IPPROTO_TCP;
+    first->ai_addrlen = second->ai_addrlen = sizeof(*one);
+    first->ai_addr = (struct sockaddr *)one; second->ai_addr = (struct sockaddr *)two;
+    first->ai_next = second; *results = first;
+    return 0;
   }
   return getaddrinfo(host, service, hints, results);
+}
+
+static void fixture_freeaddrinfo(struct addrinfo *results) {
+  if (!fixture_addresses) { freeaddrinfo(results); return; }
+  while (results != NULL) {
+    struct addrinfo *next = results->ai_next;
+    free(results->ai_addr); free(results); results = next;
+  }
 }
 
 static int fixture_connect(int fd, const struct sockaddr *address, socklen_t length) {
@@ -59,8 +85,7 @@ static int fixture_connect(int fd, const struct sockaddr *address, socklen_t len
     return 0;
   }
   if (fixture_addresses && fixture_connect_calls % 2 == 1) {
-    struct timespec pause = { .tv_sec = 0, .tv_nsec = 20000000 };
-    nanosleep(&pause, NULL);
+    fixture_virtual_ms += 20;
     errno = ECONNREFUSED;
     return -1;
   }
@@ -80,11 +105,11 @@ static int fixture_poll(struct pollfd *descriptors, nfds_t count, int timeout) {
       return 1;
     }
     if (fixture_interrupt && fixture_attempt_polls++ < 3) {
-      fixture_interrupt_ms += 10;
+      fixture_virtual_ms += 10;
       errno = EINTR;
       return -1;
     }
-    if (fixture_interrupt) { fixture_interrupt_ms += timeout; return 0; }
+    if (fixture_interrupt || fixture_addresses) { fixture_virtual_ms += timeout; return 0; }
     return poll(NULL, 0, timeout);
   }
   return poll(descriptors, count, timeout);
@@ -93,11 +118,13 @@ static int fixture_poll(struct pollfd *descriptors, nfds_t count, int timeout) {
 #define connect fixture_connect
 #define poll fixture_poll
 #define getaddrinfo fixture_getaddrinfo
+#define freeaddrinfo fixture_freeaddrinfo
 #define clock_gettime fixture_clock_gettime
 #include "../../native/shared/pm_tcp_proxy.c"
 #undef connect
 #undef poll
 #undef getaddrinfo
+#undef freeaddrinfo
 #undef clock_gettime
 
 /** Count real descriptors before and after repeated preparation failure. */

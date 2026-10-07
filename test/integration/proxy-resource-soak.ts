@@ -13,7 +13,7 @@ import type { ProxyResourceLimits } from "../../src/core/networks/proxy-resource
 import type { HostPortExposure, LogicalNetwork } from "../../src/shared/types";
 
 const execute = promisify(execFile);
-interface ProcessSample { pid: number; parent: number; rssKiB: number; cpuSeconds: number; descriptors: number }
+interface ProcessSample { pid: number; parent: number; command: string; rssKiB: number; cpuSeconds: number; descriptors: number }
 interface Sample {
   elapsedSeconds: number; phase: string; cycle: number; resources: ProxyResourceLimits;
   heapBytes: number; eventLoopP99Ms: number; processes: ProcessSample[];
@@ -85,6 +85,9 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
   });
   sse.on("error", error => { streamError = error; });
   await until(() => heartbeats > 0);
+  // Built-in VS Code services start lazily after activation. Let their initial
+  // process/FD growth settle before measuring the extension's steady state.
+  if (options.service) await delay(30_000);
   const lag = monitorEventLoopDelay({ resolution: 20 });
   lag.enable();
   const started = performance.now();
@@ -173,7 +176,10 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
     const settled = samples.filter(entry => entry.phase === "settled");
     const first = settled[0];
     const last = settled[settled.length - 1];
-    assert.ok(last.processes.length <= first.processes.length, "Proxy children accumulated after cleanup");
+    // The live service periodically launches discovery commands. Compare the
+    // data-plane helpers only; keep all other descendants in the raw metrics.
+    const proxyChildren = (entry: Sample) => entry.processes.filter(row => /portmanager_(?:tcp_router|host_exposure_proxy)(?:\.exe)?$/.test(row.command)).length;
+    assert.ok(proxyChildren(last) <= proxyChildren(first), "Proxy children accumulated after cleanup");
     const firstHost = first.processes.find(entry => entry.pid === process.pid)!;
     const lastHost = last.processes.find(entry => entry.pid === process.pid)!;
     assert.ok(lastHost.descriptors <= firstHost.descriptors + 8, "Host FD/handle count grew after warmup");
@@ -196,6 +202,7 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
     fs.writeFileSync(options.reportPath, JSON.stringify({ platform: process.platform, arch: process.arch,
       nodeVersion: process.version, commit: process.env.GITHUB_SHA,
       scope: options.service ? "real-extension-host-and-daemon" : "standalone-proxy-managers",
+      warmupSeconds: options.service ? 30 : 0,
       nativeProxy: nativeProxyPath !== undefined, nativeRouter: nativeRouterPath !== undefined,
       seconds: (performance.now() - started) / 1000, requestedSeconds: options.seconds, cycles: cycle,
       exchanges, sseHeartbeats: heartbeats, limits: resources.budget.limits, baseline,
@@ -210,14 +217,15 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
 async function processSamples(hostPid: number, daemonPid?: number): Promise<ProcessSample[]> {
   let rows: ProcessSample[];
   if (process.platform === "win32") {
-    const script = "Get-CimInstance Win32_Process | ForEach-Object { $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; if ($p) { [PSCustomObject]@{pid=$_.ProcessId;parent=$_.ParentProcessId;rssKiB=[math]::Round($p.WorkingSet64/1024);cpuSeconds=$p.CPU;descriptors=$p.HandleCount} } } | ConvertTo-Json -Compress";
+    const script = "Get-CimInstance Win32_Process | ForEach-Object { $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; if ($p) { [PSCustomObject]@{pid=$_.ProcessId;parent=$_.ParentProcessId;command=$_.Name;rssKiB=[math]::Round($p.WorkingSet64/1024);cpuSeconds=$p.CPU;descriptors=$p.HandleCount} } } | ConvertTo-Json -Compress";
     const result = await execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 });
     rows = JSON.parse(result.stdout);
   } else {
-    const result = await execute("ps", ["-axo", "pid=,ppid=,rss=,time="], { timeout: 5000 });
+    const result = await execute("ps", ["-axo", "pid=,ppid=,rss=,time=,comm="], { timeout: 5000 });
     rows = result.stdout.trim().split("\n").map(line => {
-      const [pid, parent, rss, time] = line.trim().split(/\s+/);
-      return { pid: Number(pid), parent: Number(parent), rssKiB: Number(rss), cpuSeconds: cpuTime(time), descriptors: 0 };
+      const [pid, parent, rss, time, ...command] = line.trim().split(/\s+/);
+      return { pid: Number(pid), parent: Number(parent), command: command.join(" "),
+        rssKiB: Number(rss), cpuSeconds: cpuTime(time), descriptors: 0 };
     });
   }
   const selected = new Set([hostPid, ...(daemonPid ? [daemonPid] : [])]);

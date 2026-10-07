@@ -203,6 +203,10 @@ Node proxy DNS는 진행 중 같은 lookup 조건만 공유하고 OS 호출을 �
 cache하지 않는다. 실제 route resolver도 timeout 뒤 아직 끝나지 않은 작업을
 계속 계산하며, shared Promise의 canceled client callback은 분리한다.
 
+호스트명 listener bind도 같은 DNS broker를 사용하며 5초 준비 기한을 가진다.
+기한 초과 뒤 OS lookup이 늦게 끝나도 새 listener를 만들지 않고 실제 완료까지
+DNS 슬롯을 유지한다. 동기 bind 오류도 listener 예약을 반환한다.
+
 HTTP 전역 admission·upstream·DNS 예산 초과는 503이고 POST 자동 재전송은 없다.
 raw 초과는 새 연결만 거부한다. 유휴 HTTP pool만 공통 상한과 30초 보관 기한으로
 정리하고 활성 SSE/WS/raw를 퇴출하지 않는다. Node socket 용량은 실제 close로

@@ -581,7 +581,8 @@ export class BrowserNetworkProxyManager {
       try {
         this.resources.reserveListener(server);
         await assertPortAvailable(endpoint.listenHost, listenPort, this.resources);
-        await listen(server, listenPort, endpoint.listenHost);
+        const listenHost = await this.resources.resolveListenHost(endpoint.listenHost);
+        await listen(server, listenPort, listenHost);
         listener = {
           endpoint: activeEndpoint,
           metadata,

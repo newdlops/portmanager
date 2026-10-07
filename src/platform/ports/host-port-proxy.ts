@@ -190,7 +190,8 @@ export class HostPortProxyManager {
 
     try {
       this.resources.reserveListener(server);
-      await listen(server, exposure.hostPort, exposure.hostAddress);
+      const listenHost = await this.resources.resolveListenHost(exposure.hostAddress);
+      await listen(server, exposure.hostPort, listenHost);
     } catch (error) {
       // Invalid listen options can throw before Node emits error. Closing the
       // unbound server also returns its reservation through the close event.
