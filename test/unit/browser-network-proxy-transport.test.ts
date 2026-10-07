@@ -4,6 +4,7 @@ import * as http from "node:http";
 import * as https from "node:https";
 import * as net from "node:net";
 import * as tls from "node:tls";
+import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
 import {
@@ -134,6 +135,79 @@ test("HTTP resolver failures and invalid targets produce a complete 502 response
   }
 });
 
+test("an overdue route Promise cannot deliver a POST before its delayed timeout callback", async context => {
+  let connections = 0;
+  const backend = http.createServer((_request, response) => response.end("unexpected"));
+  backend.on("connection", () => { connections++; });
+  const backendPort = await listen(context, backend);
+  const { port } = await openProxy(context, { resolve: () => {
+    const until = performance.now() + 50;
+    while (performance.now() < until) { /* Simulate synchronous extension host work. */ }
+    return { host: "127.0.0.1", port: backendPort };
+  } }, { resolveTimeoutMs: 20 });
+  const { client, result } = request(port, "/write", "POST");
+  context.after(() => client.destroy());
+  client.end("do-not-replay");
+  assert.equal((await within(result)).status, 504);
+  assert.equal(connections, 0);
+});
+
+for (const kind of ["raw", "http", "https"] as const) {
+  test(kind + " listener bounds TCP clients before routing and preserves its admitted session", async context => {
+    const backendClosed = deferred<void>();
+    let connections = 0, resolutions = 0;
+    const backend = kind === "raw"
+      ? net.createServer(socket => { socket.write("held"); socket.once("close", () => backendClosed.resolve()); })
+      : http.createServer((_incoming, response) => {
+        response.writeHead(200, { "content-type": "text/plain" });
+        response.write("held");
+        response.once("close", () => backendClosed.resolve());
+      });
+    backend.on("connection", () => { connections++; });
+    const backendPort = await listen(context, backend);
+    const { port } = await openProxy(context, { resolve: () => {
+      resolutions++;
+      return { host: "127.0.0.1", port: backendPort };
+    } }, { maxConnectionsPerListener: 1, serverGreetingDelayMs: 20,
+      ...(kind === "https" ? { tlsCredentials: { getCredentials: () => TLS_IDENTITY } } : {}) });
+
+    const openClient = async () => {
+      const socket = kind === "https"
+        ? tls.connect({ host: "127.0.0.1", port, rejectUnauthorized: false })
+        : net.createConnection({ host: "127.0.0.1", port });
+      socket.on("error", () => {});
+      context.after(() => socket.destroy());
+      await within(once(socket, kind === "https" ? "secureConnect" : "connect"));
+      const held = waitForText(socket, "held");
+      if (kind !== "raw") socket.write(HTTP_REQUEST);
+      await held;
+      return socket;
+    };
+    const first = await openClient();
+    const excess = await connect(context, port);
+    excess.resume();
+    await within(once(excess, "close"));
+    assert.equal(first.destroyed, false);
+    assert.equal(resolutions, 1, "an excess client must not start lookup or a greeting probe");
+    assert.equal(connections, 1);
+    first.destroy();
+    await within(backendClosed.promise);
+    // The backend and public sockets acknowledge FIN on different turns.
+    // Probe independent new clients until the public listener has observed
+    // closure; never require its slot to be free at the backend's close event.
+    const deadline = performance.now() + 2000;
+    for (;;) {
+      try { await openClient(); break; }
+      catch (error) {
+        if (!(error instanceof Error) || !error.message.startsWith("socket closed before held:")
+            || performance.now() >= deadline) throw error;
+        await delay(5);
+      }
+    }
+    assert.equal(connections, 2, "closing an admitted client must return its listener slot");
+  });
+}
+
 test("owner release drops pending HTTP, upgrade, and raw routes before late resolution", async (context) => {
   let connections = 0;
   const backend = net.createServer((socket) => socket.resume());
@@ -159,6 +233,27 @@ test("owner release drops pending HTTP, upgrade, and raw routes before late reso
 });
 
 for (const kind of ["raw", "upgrade"] as const) {
+  test(`${kind} rejects late TCP readiness before an overdue setup timer can run`, async context => {
+    let clock = 0, writes = 0;
+    context.mock.method(performance, "now", () => clock);
+    const upstream = new net.Socket();
+    Object.defineProperty(upstream, "connecting", { value: true });
+    context.mock.method(require("node:net") as typeof net, "createConnection", () => upstream);
+    context.mock.method(upstream, "write", () => { writes++; return true; });
+    const client = new net.Socket();
+    context.after(() => { client.destroy(); upstream.destroy(); });
+    const transport = new BrowserNetworkProxyTransport({ resolve: () => ({ host: "127.0.0.1", port: 3004 }) },
+      { connectTimeoutMs: 10_000 });
+    if (kind === "raw") await transport.rawForward(endpoint, client, new Set(), Buffer.from("payload"));
+    else await transport.forwardUpgrade(endpoint, buildEndpointMetadata(endpoint), new http.IncomingMessage(client),
+      client, Buffer.from("payload"), new Set());
+    clock = 10_001;
+    upstream.emit("connect");
+    assert.ok(upstream.destroyed);
+    assert.ok(client.destroyed);
+    assert.equal(writes, 0, "late readiness must not send a raw prefix or upgrade handshake");
+  });
+
   test(`${kind} cancellation releases its resolver wait before the resolver settles`, async () => {
     const route = deferred<BrowserNetworkProxyTarget>();
     const client = new net.Socket();
@@ -187,6 +282,43 @@ for (const kind of ["raw", "upgrade"] as const) {
     assert.ok(stalled.destroyed);
     await delay(0);
     assert.equal(sockets.size, 0);
+  });
+}
+
+for (const protocol of ["http", "https"] as const) {
+  test(`${protocol} rejects late transport readiness without sending a POST`, async context => {
+    let clock = 0, posts = 0;
+    context.mock.method(performance, "now", () => clock);
+    const handler = (_request: http.IncomingMessage, response: http.ServerResponse) => { posts++; response.end("unexpected"); };
+    const backend = protocol === "https" ? https.createServer(TLS_IDENTITY, handler) : http.createServer(handler);
+    const targetPort = await listen(context, backend);
+    const httpAgent = new http.Agent({ keepAlive: true });
+    const httpsAgent = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
+    context.after(() => { httpAgent.destroy(); httpsAgent.destroy(); });
+    const agent = protocol === "https" ? httpsAgent : httpAgent;
+    const originalCreate = agent.createConnection;
+    context.mock.method(agent, "createConnection", function(this: http.Agent,
+      options: Parameters<http.Agent["createConnection"]>[0], callback: Parameters<http.Agent["createConnection"]>[1]) {
+      const socket = originalCreate.call(this, options, callback) as net.Socket;
+      const originalEmit = socket.emit;
+      context.mock.method(socket, "emit", function(this: net.Socket, event: string | symbol, ...args: unknown[]) {
+        if (event === (protocol === "https" ? "secureConnect" : "connect")) clock = 10_001;
+        return Reflect.apply(originalEmit, this, [event, ...args]) as boolean;
+      });
+      return socket;
+    });
+    const transport = new BrowserNetworkProxyTransport({ resolve: () => ({ host: "127.0.0.1", port: targetPort, protocol }) },
+      { connectTimeoutMs: 10_000 });
+    const frontend = http.createServer((incoming, outgoing) => {
+      void transport.forwardHttp(endpoint, buildEndpointMetadata(endpoint), httpAgent, httpsAgent, incoming, outgoing);
+    });
+    const port = await listen(context, frontend);
+    const post = request(port, "/", "POST");
+    context.after(() => post.client.destroy());
+    post.client.end("must not be sent");
+    assert.equal((await within(post.result)).status, 504);
+    await delay(20);
+    assert.equal(posts, 0, "expiry must precede ClientRequest's ready-event flush");
   });
 }
 

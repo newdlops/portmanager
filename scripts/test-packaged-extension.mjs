@@ -33,6 +33,13 @@ fs.writeFileSync(path.join(userData, "User", "settings.json"), JSON.stringify({
   "extensions.autoUpdate": false,
   "telemetry.telemetryLevel": "off",
   "portManager.developmentLogPath": "",
+  // Avoid unrelated host ingress ownership during the controlled soak. The
+  // workload opens the production managers explicitly under their shared budget.
+  "portManager.globalNetwork": false,
+  "portManager.logicalPortGateway": false,
+  "portManager.watchPreferredPorts": false,
+  "portManager.monitorAllListeningPorts": false,
+  "portManager.containerEventsWatch": false,
 }));
 const vscodeExecutablePath = await downloadAndUnzipVSCode("stable");
 const [cli, ...cliArgs] = resolveCliArgsFromVSCodeExecutablePath(vscodeExecutablePath);
@@ -55,6 +62,8 @@ await runTests({
   extensionTestsEnv: {
     PM_TEST_EXTENSION_PATH: extensionPath,
     PM_TEST_EXTENSION_VERSION: manifest.version,
+    PM_TEST_RESOURCE_SOAK_SECONDS: process.env.PM_TEST_RESOURCE_SOAK_SECONDS ?? "0",
+    PM_TEST_RESOURCE_SOAK_REPORT: process.env.PM_TEST_RESOURCE_SOAK_REPORT ?? path.join(root, ".tmp", "resource-soak.json"),
     TMPDIR: runtimeTemp,
     TMP: runtimeTemp,
     TEMP: runtimeTemp,

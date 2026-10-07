@@ -2,6 +2,11 @@ name: Release packages
 
 on:
   workflow_dispatch:
+    inputs:
+      resource_soak_seconds:
+        description: "Production proxy resource soak (0 disables, maximum 3600 seconds)"
+        type: string
+        default: "0"
 
 permissions:
   contents: read
@@ -12,7 +17,7 @@ jobs:
   package:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 35
+    timeout-minutes: 65
     strategy:
       fail-fast: false
       matrix:
@@ -56,6 +61,9 @@ jobs:
       - name: Package target VSIX
         run: npm run package:${{ matrix.target }} 2>&1 | tee .tmp/release-logs/package.log
       - name: Install and activate packaged extension in a fresh profile
+        env:
+          PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
+          PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
         run: |
           if [[ "$RUNNER_OS" == Linux ]]; then
             xvfb-run -a npm run test:packaged 2>&1 | tee .tmp/release-logs/activation.log
@@ -74,6 +82,34 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: logs-${{ matrix.target }}
+          path: .tmp/release-logs/
+          if-no-files-found: warn
+          retention-days: 30
+  windows-fallback:
+    name: Windows Node fallback
+    if: inputs.resource_soak_seconds != '0'
+    runs-on: windows-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.22.2
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - name: Verify Node fallback lifecycle and shared resource limits
+        run: node --test --test-concurrency=1 out/test/unit/proxy-network-resources.test.js out/test/unit/host-port-proxy-lifecycle.test.js out/test/unit/browser-network-proxy-transport.test.js out/test/unit/logical-port-router.test.js out/test/unit/router-verdict-cache.test.js
+      - name: Soak production Node proxy managers
+        run: node out/test/integration/proxy-resource-soak.js
+        env:
+          PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
+          PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
+      - name: Upload Windows fallback report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: logs-windows-fallback
           path: .tmp/release-logs/
           if-no-files-found: warn
           retention-days: 30

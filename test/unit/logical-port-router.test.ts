@@ -227,9 +227,9 @@ test("native logical router pending route requests time out instead of blocking 
   const buildScript = fs.readFileSync(path.join(root, "scripts/build-native-hook.sh"), "utf8");
 
   assert.equal(routerSource.includes("PM_ROUTER_ROUTE_RESPONSE_TIMEOUT_MS 5000"), true);
-  assert.equal(routerSource.includes("clock_gettime(CLOCK_REALTIME, &deadline)"), true);
-  assert.equal(routerSource.includes("pthread_cond_timedwait(&route.condition, &pm_pending_mutex, &deadline)"), true);
-  assert.equal(routerSource.includes("if (!route.resolved || route.failed"), true);
+  assert.equal(routerSource.includes("pm_tcp_proxy_condition_init(&route.condition)"), true);
+  assert.equal(routerSource.includes("pm_tcp_proxy_condition_wait(&route.condition, &pm_pending_mutex, deadline)"), true);
+  assert.equal(routerSource.includes("finished >= deadline || !route.resolved || route.failed"), true);
   assert.equal(routerSource.includes("listener_list_t"), true);
   assert.equal(routerSource.includes("\"LISTEN\\t\""), true);
   assert.equal(routerSource.includes("\"READY\\tcontrol\\t%d\\n\""), true);
@@ -239,8 +239,8 @@ test("native logical router pending route requests time out instead of blocking 
   assert.equal(routerSource.includes("PM_ROUTER_BACKLOG 1024"), true);
   assert.equal(routerSource.includes("static void *pm_copy_thread"), false);
   assert.equal(routerSource.includes("static void pm_accept_ready_connections"), true);
-  assert.equal(routerSource.includes("flags | O_NONBLOCK"), true);
-  assert.equal(routerSource.includes("struct pollfd poll_fds[4]"), true);
+  assert.equal(routerSource.includes("pm_tcp_proxy_prepare_socket(fd)"), true);
+  assert.equal(routerSource.includes("pm_tcp_proxy_forward(connection->client_fd, target_fd)"), true);
   assert.match(buildScript, /-pthread "\$TCP_ROUTER_SOURCE_FILE"/);
 });
 

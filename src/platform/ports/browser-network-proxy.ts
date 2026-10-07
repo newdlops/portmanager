@@ -8,6 +8,7 @@ import * as http from "node:http";
 import * as https from "node:https";
 import * as net from "node:net";
 import { BrowserNetworkProxyTransport, sniffBrowserProxyConnection } from "./browser-network-proxy-transport";
+import { defaultProxyNetworkResources, type ProxyNetworkResources } from "./proxy-network-resources";
 
 export interface BrowserNetworkProxyEndpoint {
   /** Stable id for one network/logical-port browser entrypoint. */
@@ -55,10 +56,14 @@ export interface BrowserNetworkProxyTargetResolver {
 }
 
 export interface BrowserNetworkProxyOptions {
+  /** One shared budget/lookup broker across every proxy owner in the extension host. */
+  readonly resources?: ProxyNetworkResources;
   /** Maximum wait for a live route; defaults to the agent RPC budget of 10s. */
   readonly resolveTimeoutMs?: number;
   /** TCP/TLS setup budget after socket allocation, default 5s; established streams have no idle limit. */
   readonly connectTimeoutMs?: number;
+  /** TCP clients per public listener, including sniff/TLS/raw/route waits; default 256. */
+  readonly maxConnectionsPerListener?: number;
   /** Maximum wait for an ambiguous partial HTTP method before raw forwarding, default 1s. */
   readonly sniffTimeoutMs?: number;
   /** Idle clients probe for a server-first greeting after 100ms, without committing HTTP/TLS to raw TCP. */
@@ -153,6 +158,7 @@ const DEFAULT_RETIRE_DELAY_MS = 30_000;
 const PORT_AVAILABILITY_TIMEOUT_MS = 250;
 const UPSTREAM_KEEP_ALIVE_MAX_SOCKETS = 64;
 const UPSTREAM_KEEP_ALIVE_MAX_FREE_SOCKETS = 16;
+const DEFAULT_MAX_CONNECTIONS = 256;
 /**
  * Development-only browser isolation proxy.
  *
@@ -192,12 +198,18 @@ export class BrowserNetworkProxyManager {
 
   /** Per-request setup and cancellation is independent of listener reconciliation. */
   private readonly transport: BrowserNetworkProxyTransport;
+  /** Covers accepted sockets before HTTP pool admission and all raw/upgrade sessions. */
+  private readonly maxConnections: number;
+  private readonly resources: ProxyNetworkResources;
 
   constructor(
     targetResolver: BrowserNetworkProxyTargetResolver,
     private readonly options: BrowserNetworkProxyOptions = {},
   ) {
+    this.resources = options.resources ?? defaultProxyNetworkResources;
     this.transport = new BrowserNetworkProxyTransport(targetResolver, options);
+    const limit = options.maxConnectionsPerListener ?? Number(process.env.PORT_MANAGER_PROXY_MAX_CONNECTIONS);
+    this.maxConnections = Number.isSafeInteger(limit) && limit > 0 && limit <= 4096 ? limit : DEFAULT_MAX_CONNECTIONS;
   }
 
   /** Reconciles active browser proxies with the latest running web processes. */
@@ -524,6 +536,8 @@ export class BrowserNetworkProxyManager {
         maxFreeSockets: UPSTREAM_KEEP_ALIVE_MAX_FREE_SOCKETS,
         rejectUnauthorized: false,
       });
+      this.resources.configureAgent(httpAgent);
+      this.resources.configureAgent(httpsAgent);
       const sockets = new Set<net.Socket>();
       let serverBuild: BrowserNetworkProxyServerBuild;
       let listener: BrowserNetworkProxyListener | undefined;
@@ -565,7 +579,8 @@ export class BrowserNetworkProxyManager {
       });
 
       try {
-        await assertPortAvailable(endpoint.listenHost, listenPort);
+        this.resources.reserveListener(server);
+        await assertPortAvailable(endpoint.listenHost, listenPort, this.resources);
         await listen(server, listenPort, endpoint.listenHost);
         listener = {
           endpoint: activeEndpoint,
@@ -629,6 +644,7 @@ export class BrowserNetworkProxyManager {
     }
 
     const server = net.createServer({ allowHalfOpen: true }, (socket) => {
+      if (!this.resources.admitClient(socket)) return;
       sniffBrowserProxyConnection(
         socket,
         () => httpServer.emit("connection", socket),
@@ -641,6 +657,9 @@ export class BrowserNetworkProxyManager {
       );
       socket.once("error", () => socket.destroy());
     });
+    // Admission precedes sniffing and server-first probes; rejecting excess
+    // clients cannot open an upstream or displace an established session.
+    server.maxConnections = this.maxConnections;
 
     // httpServer/tlsServer are never listened on; they are fed sockets by the
     // sniffer and kept alive by its connection-listener closure.
@@ -772,9 +791,9 @@ function listen(server: BrowserNetworkProxyServer, port: number, host: string): 
 }
 
 /** Detects an already-owned listener even on runtimes that permit a shared bind. */
-function assertPortAvailable(host: string, port: number): Promise<void> {
+function assertPortAvailable(host: string, port: number, resources: ProxyNetworkResources): Promise<void> {
   return new Promise((resolve, reject) => {
-    const probe = net.createConnection({ host, port });
+    const probe = resources.connect({ host, port });
     // An absent alias or stale packet-filter rule can silently drop SYNs.
     // Fail this candidate promptly; a timeout never proves a bind is free.
     probe.setTimeout(PORT_AVAILABILITY_TIMEOUT_MS, () => {

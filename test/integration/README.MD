@@ -9,10 +9,23 @@
 - 빈 VS Code 프로필에 설치한 패키지의 파일과 버전을 확인한다.
 - 확장 API, 명령 등록, 데몬 기동, DNS responder와 라우트 발행을 확인한다.
 - 라우팅 세부 동작은 `test/unit`의 실제 네이티브 바이너리 테스트가 담당한다.
+- 선택한 시간 동안 실제 확장 호스트에서 네트워크 생성/삭제, TCP FIN·취소,
+  HTTP GET/POST와 유지 중인 SSE를 함께 반복하며 공통 예산 반환을 검증한다.
+- 확장 호스트와 데몬 및 자식들의 RSS, CPU 누적 시간, FD(Windows: handle),
+  이벤트 루프 p99와 heap을 JSON으로 기록한다.
 
 ## 주요 진입점
 
 `npm run test:packaged` → `scripts/test-packaged-extension.mjs` → `packaged-extension.ts`.
+
+`Release packages`의 `resource_soak_seconds=1200`으로 20분 검증을 켠다.
+macOS/Linux는 설치된 VSIX의 실제 확장 호스트를 사용한다. Windows job은
+`proxy-resource-soak.ts`의 standalone 진입점에서 Node 대체 경로만 확인한다.
+Windows 네이티브 격리나 VSIX 활성화 지원을 뜻하지 않는다.
+
+로컬 rehearsal은 `PM_TEST_RESOURCE_SOAK_SECONDS=30 node
+out/test/integration/proxy-resource-soak.js`로 실행할 수 있다. 확장은 활성화하지
+않으며 셸/DNS 자산을 쓰지 않는다. 보고서는 `.tmp/resource-soak.json`에 저장한다.
 
 ## 외부 의존성
 

@@ -24,7 +24,80 @@
 - `browser-network-proxy-http.ts`: HTTP 헤더·origin 변환과 본문 스트리밍
 - `browser-network-proxy-transport.ts`: 요청별 경로 조회·연결 준비·취소와 TCP 접두부 판별
 - `logical-port-router.ts`
+- `proxy-network-resources.ts`: 공통 예산과 DNS/socket/child/HTTP pool/control의 lease 수명
 - `tcp-connection-process-resolver.ts`
+
+## 공통 자원 예산
+
+한 **확장 호스트와 그 proxy 자식 helper**가 `defaultProxyNetworkResources`를
+공유한다. Host Exposure, Host Gateway, Browser Proxy, Logical Router를 모두 포함하며,
+서비스 재생성으로 아직 끝나지 않은 작업의 예산을 초기화하지 않는다. 별도 확장
+호스트/daemon, 사용자 앱과 OS kernel backlog는 이 회계 범위 밖이다. 내장 호출자와
+테스트는 `resources` 옵션으로 같은 객체를 주입할 수 있다.
+
+| 자원 | 기본 전체 상한 | 반환 시점 |
+| --- | ---: | --- |
+| 리스너 용량 | 256 | Node close/실패, native CLOSED/실패/exit |
+| 클라이언트 연결 용량 | 1,024 | Node socket close, native helper exit |
+| upstream socket 용량 | 1,024 | 실제 close; HTTP 유휴 풀도 포함 |
+| native helper | 8 | 실제 exit 또는 spawn 실패 |
+| DNS 작업 용량 | 32 | OS callback 또는 native helper exit |
+| 실제 route resolver 작업 | 64 | 원래 Promise의 완료·실패 |
+| HTTP 활성 요청 | 256 | upstream request close 뒤 Agent 정리 |
+| HTTP 대기 요청 | 256 | admission·취소·만료 |
+| 보관하는 유휴 HTTP socket | 64 | 재사용·close·30초 경과 |
+| 부모→native 제어 payload | 512KiB | write callback; helper별 64KiB |
+
+native helper는 시작 전에 연결/upstream 용량을 각 기본 32개(요청 상한이 더
+작으면 그 값), DNS 용량을 기본 2개 예약한다. native env로 전달해 실제
+worker/resolver의 상한도 같아진다. **예약은 사용량보다 보수적**이며 유휴
+helper도 차지한다. 초과 helper는 Node fallback으로 열되 그 경로도 공통 예산을
+따른다. Host helper는 숫자 bind 주소에 리스너 1개, hostname에 최악의 8개를 예약한다.
+공유 native router는 dual-stack LISTEN마다 2개를 예약하고 CLOSED 확인까지
+반환하지 않는다. 같은 포트의 reopen은 이전 CLOSE 확인 뒤 시작해 이전 답변이
+새 예약을 해제하지 않게 한다. 리스너만 내려도 기존 native 스트림과 warm helper의
+연결/DNS 예약은 유지하며, dispose/exit가 이를 반환한다.
+
+Node DNS는 같은 hostname/family/hints/all/order의 **진행 중 조회만** 공유한다.
+동시 OS 호출은 broker 전체에서 기본 4개이며 숫자 주소는 이를 거치지 않는다.
+socket 취소는 기다리는 callback을 즉시 제거하고, OS 작업은 실제 callback까지
+명목 슬롯을 차지한다. timeout/retry가 중단할 수 없는 OS 작업을 계속 늘리지 않는다.
+주소 목록은 순서를 보존한 최대 64개이고 Node의 IPv4/IPv6 fallback을 유지한다.
+완료 결과를 DNS cache로 보관하지 않는다. 취소된 shared route waiter도 원래
+Promise에서 분리하되 실제 resolver 작업의 슬롯은 조기 반환하지 않는다.
+
+Logical Router의 Node fallback도 route/TCP 준비를 각 5초로 제한하고 FIN 응답을
+보존한다. HTTP의 전역 활성/대기 또는 upstream/DNS 예산 초과는 503이며 POST를
+재실행하지 않는다. raw는 새 연결만 거부하고 기존 세션을 퇴출하지 않는다.
+유휴 풀 만료는 활성 SSE/WS/raw에 적용하지 않는다. 거부 socket의 비동기 close 등
+일시적 정리 단계는 admission 수치와 구분하며, OS RSS 자체의 제한 기능은 아니다.
+
+control write는 1KiB 이내의 단일 프레임만 enqueue하며 부분 전송은 Node가
+보존한다. LISTEN을 enqueue하지 못하면 새 예약을 반환한다. CLOSE는 drain과
+공통 control 예산 반환 때 재시도하고 CLOSED/exit 전 예약을 반환하지 않는다.
+진단은 공유 dev-log의 `proxy-budget`에 resource/used/max만 남기며 자원별 1초에
+한 번으로 제한한다. 이 adapter는 관련 IO 자원의 예산 수명을 소유하는 하나의
+경계로 유지한다. 순수 카운터 정책은 core에 두고 작은 파일을 억지로 합치지 않는다.
+
+### 검증 (2026-10-07)
+
+Darwin arm64 기본 전체 검사 843개 중 836개 통과·opt-in 7개 skip, 별도 opt-in
+실행 7개 통과. Linux arm64/Alpine 3.20에서 두 helper의 `-Wall -Wextra -Werror`
+빌드와 DNS/예산/전송/캐시 90개, 추가 CLOSE/reopen 경계 1개가 통과했다.
+Darwin native build/artifact 검증 11개도 통과했다.
+
+새 공통 예산 검사는 다음을 실제 TCP/HTTP/native 또는 지연 OS callback adapter로
+확인한다: 네 owner의 공유 admission, 실패 bind/실제 close 반환, 취소 뒤 DNS 4개
+상한 유지와 숫자 주소 독립성, 동일 이름/다른 포트 공유 및 IPv4/IPv6 fallback,
+실제 route 작업의 늦은 완료와 canceled waiter 1,000개의 callback 제거,
+origin 간 HTTP 활성/대기 제한과 미전송 POST, 전역 유휴 풀 상한/expiry와 SSE 보존,
+native/Node 혼합 예약, warm router retirement, 중복 close, 비동기 Agent factory,
+제어 큐의 프레임 보존 및 가용 용량 뒤 CLOSE 재시도·동일 포트 reopen 회계.
+
+전체 검사 중 agent의 10,000건 publication 부하 검사가 한 차례 기한을 넘겼다.
+변경하지 않은 agent의 공유 dev-log 단독 재현에서 재시도 후 10,000건을 게시했고,
+최종 전체 실행에서도 통과했다. 검사 기준이나 production 기한은 변경하지 않았다.
+이 검증은 RSS 자체의 상한 또는 여러 확장 호스트의 머신 전체 예산을 증명하지 않는다.
 
 ## 외부 의존성
 
@@ -34,6 +107,22 @@
 - 운영체제별 포트 조회 명령
 
 ## 주의사항
+
+Host exposure의 Node fallback도 연결 수(기본 256)와 target 조회/TCP 준비
+기한(각 기본 5초)을 적용한다. 진행 중 조회는 완료된 결과의 150ms TTL과 별개로
+공유하고 실패/만료 결과는 보관하지 않는다. FIN을 받은 요청의 지연된 응답은
+보존하며, 확인된 reset·취소·owner 종료 뒤에는 새 upstream을 만들지 않는다.
+동일 exposure의 bind는 하나로 합치고 close/dispose가 늦은 bind 결과를 폐기한다.
+native host helper는 node-runtime의 공통 환경 정제를 재사용해 terminal preload와
+network scope를 상속하지 않는다. 이미 선택된 실제 좌표가 다시 라우팅되지 않게 한다.
+브라우저 listener도 protocol sniff 이전부터 기본 256개 TCP client를 제한하며,
+HTTP pool 밖의 TLS/raw/upgrade/조회 대기를 포함한다. 초과 client는 조회와 greeting
+probe 전에 거부하고 기존 세션은 유지한다. lookup 완료에서는 monotonic 기한을
+재확인하므로 busy host의 overdue timer보다 앞선 Promise도 upstream을 만들 수 없다.
+완료된 host target cache도 monotonic TTL을 사용한다. Node TCP/TLS의 준비 이벤트는
+기한을 다시 검사하며, 브라우저는 이 검사를 Node ClientRequest의 준비 이벤트
+전송보다 먼저 실행한다. 늦은 이벤트는 POST·upgrade handshake·raw 접두부를
+전송하지 않고 준비 소켓을 회수한다. 정상 준비 뒤 앱 응답·FIN·유휴에는 적용하지 않는다.
 
 명령 실행 실패는 확장 전체 실패가 아니라 세부 정보 누락으로 처리한다.
 `host-port-proxy.ts`는 Host Port Exposure를 위한 listener/proxy만 담당한다. 가능한 환경에서는 native helper로 accept/connect/byte-copy 데이터 plane을 실행하고, helper가 없거나 시작에 실패하면 Node.js stream proxy로 fallback한다. 이 proxy는 컨테이너 수준의 Logical Network 격리를 제공하지 않으며, 터미널 프로세스가 호스트 포트 namespace를 점유하지 않게 만드는 책임을 갖지 않는다.

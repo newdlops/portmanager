@@ -7,6 +7,8 @@ import { execFileSync } from "node:child_process";
 import * as vscode from "vscode";
 import type { PortManagerExtensionApi } from "../../src/extension/activate";
 import type { AgentDaemonStatus } from "../../src/shared/types";
+import type { PortManagerNetworkService } from "../../src/extension/network-service";
+import { runResourceSoak } from "./proxy-resource-soak";
 
 /**
  * Runs inside the real extension host against a VSIX installed in a fresh CI
@@ -19,7 +21,21 @@ export async function run(): Promise<void> {
   assert.ok(extension, "Installed extension is not discoverable.");
   assert.equal(fs.realpathSync(extension.extensionPath), fs.realpathSync(process.env.PM_TEST_EXTENSION_PATH!));
   assert.equal(extension.packageJSON.version, process.env.PM_TEST_EXTENSION_VERSION);
-  const api = await extension.activate();
+  const soakSeconds = Number(process.env.PM_TEST_RESOURCE_SOAK_SECONDS ?? 0);
+  let networkService: PortManagerNetworkService | undefined;
+  let serviceStarted: Promise<void> | undefined;
+  // Observe the existing activation seam in the installed module. No testing
+  // backdoor or additional public extension API is added to the product.
+  const networkModule = require(path.join(extension.extensionPath, "out", "src", "extension", "network-service")) as typeof import("../../src/extension/network-service");
+  const originalStart = networkModule.PortManagerNetworkService.prototype.start;
+  if (soakSeconds > 0) networkModule.PortManagerNetworkService.prototype.start = function () {
+    networkService = this;
+    serviceStarted = originalStart.call(this);
+    return serviceStarted;
+  };
+  let api: PortManagerExtensionApi;
+  try { api = await extension.activate(); }
+  finally { networkModule.PortManagerNetworkService.prototype.start = originalStart; }
   assert.equal(extension.isActive, true);
   assert.ok(Array.isArray(api.listLogicalNetworks()));
   assert.equal(typeof api.getTerminalDetachScript(), "string");
@@ -52,6 +68,12 @@ export async function run(): Promise<void> {
   assert.equal(await request<boolean>("flushRouteTables"), true);
   console.log(JSON.stringify({ extension: extension.id, version: status.version, platform: process.platform,
     arch: process.arch, browserDnsRunning: status.browserDnsRunning, agentMainPath: status.agentMainPath }));
+  if (soakSeconds > 0) {
+    assert.ok(networkService, "The soak must observe this installed extension's actual network service.");
+    await serviceStarted;
+    await runResourceSoak({ moduleRoot: extension.extensionPath, service: networkService, seconds: soakSeconds,
+      reportPath: process.env.PM_TEST_RESOURCE_SOAK_REPORT! });
+  }
 }
 
 /** Keeps each readiness probe bounded and ignores asynchronous snapshots. */

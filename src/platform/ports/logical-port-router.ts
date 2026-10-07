@@ -1,8 +1,11 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
+import { performance } from "node:perf_hooks";
 import type { DisposableLike } from "../../shared/types";
 import { buildNodeRuntimeEnvironment } from "../process/node-runtime";
+import { defaultProxyNetworkResources, type NativeProxyReservation, type ProxyNetworkResources } from "./proxy-network-resources";
+import type { ProxyResourceLease } from "../../core/networks/proxy-resource-budget";
 
 export interface LogicalPortRouterConnection {
   /** Logical TCP port the local client connected to. */
@@ -49,6 +52,7 @@ export interface NativeLogicalPortRouterQuery extends LogicalPortRouterConnectio
 }
 
 export interface LogicalPortRouterOptions {
+  readonly resources?: ProxyNetworkResources;
   /** Optional native TCP router helper used for the data plane. */
   readonly nativeRouterPath?: string;
   /** Startup timeout for one native listener process. */
@@ -82,6 +86,7 @@ const LOOPBACK_LISTEN_TARGETS: readonly LoopbackListenTarget[] = [
 ];
 const DEFAULT_NATIVE_STARTUP_TIMEOUT_MS = 1500;
 const DEFAULT_RETIRE_DELAY_MS = 30_000;
+const ROUTE_SETUP_TIMEOUT_MS = 5000;
 
 /**
  * Opens real localhost listeners for logical ports and forwards per connection.
@@ -109,11 +114,12 @@ export class LogicalPortRouterManager implements DisposableLike {
 
   /** Delayed closes for ports that vanish during transient route-table refreshes. */
   private readonly retireTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  private readonly resources: ProxyNetworkResources;
 
   constructor(
     private readonly targetResolver: LogicalPortRouterTargetResolver,
     private readonly options: LogicalPortRouterOptions = {},
-  ) {}
+  ) { this.resources = options.resources ?? defaultProxyNetworkResources; }
 
   /** Reconciles active localhost routers with the latest logical route table. */
   async sync(logicalPorts: Iterable<number>): Promise<void> {
@@ -183,6 +189,7 @@ export class LogicalPortRouterManager implements DisposableLike {
       const server = this.createServer(logicalPort, sockets);
 
       try {
+        this.resources.reserveListener(server);
         await listen(server, logicalPort, target);
         servers.push(server);
       } catch (error) {
@@ -259,9 +266,11 @@ export class LogicalPortRouterManager implements DisposableLike {
 
   /** Builds one loopback listener for a logical port/address pair. */
   private createServer(logicalPort: number, sockets: Set<net.Socket>): net.Server {
-    return net.createServer((incoming) => {
+    return net.createServer({ allowHalfOpen: true }, (incoming) => {
+      if (!this.resources.admitClient(incoming)) return;
       sockets.add(incoming);
       incoming.once("close", () => sockets.delete(incoming));
+      incoming.once("error", () => incoming.destroy());
       void this.forwardConnection(logicalPort, incoming, sockets);
     });
   }
@@ -297,6 +306,7 @@ export class LogicalPortRouterManager implements DisposableLike {
       nativeRouterPath,
       this.targetResolver,
       this.options.nativeStartupTimeoutMs ?? DEFAULT_NATIVE_STARTUP_TIMEOUT_MS,
+      this.resources,
     );
     return this.nativeRouter;
   }
@@ -307,37 +317,59 @@ export class LogicalPortRouterManager implements DisposableLike {
     incoming: net.Socket,
     sockets: Set<net.Socket>,
   ): Promise<void> {
-    let target: LogicalPortRouterTarget;
+    let target: LogicalPortRouterTarget | undefined;
+    const cancellation = new AbortController();
+    const cancel = () => cancellation.abort();
+    const routeDeadline = performance.now() + ROUTE_SETUP_TIMEOUT_MS;
+    const routeTimer = setTimeout(() => { incoming.destroy(); cancel(); }, ROUTE_SETUP_TIMEOUT_MS);
+    routeTimer.unref();
+    incoming.once("close", cancel);
 
     try {
-      target = await this.targetResolver.resolve({
+      target = await this.resources.awaitRoute(this.resources.runRoute(() => this.targetResolver.resolve({
         logicalPort,
         localAddress: incoming.localAddress,
         localPort: incoming.localPort,
         remoteAddress: incoming.remoteAddress,
         remotePort: incoming.remotePort,
-      });
+      })), cancellation.signal);
     } catch {
+      incoming.destroy();
+      return;
+    } finally {
+      clearTimeout(routeTimer);
+      incoming.off("close", cancel);
+    }
+
+    if (target === undefined || incoming.destroyed || performance.now() >= routeDeadline) {
       incoming.destroy();
       return;
     }
 
-    if (incoming.destroyed) {
-      return;
-    }
-
-    const outgoing = net.createConnection({
-      host: target.host,
-      port: target.port,
-    });
+    let outgoing: net.Socket;
+    const connectDeadline = performance.now() + ROUTE_SETUP_TIMEOUT_MS;
+    try { outgoing = this.resources.connect({ host: target.host, port: target.port, allowHalfOpen: true }); }
+    catch { incoming.destroy(); return; }
     sockets.add(outgoing);
     outgoing.once("close", () => sockets.delete(outgoing));
-    incoming.once("close", () => outgoing.destroy());
-
-    incoming.on("error", () => outgoing.destroy());
-    outgoing.on("error", () => incoming.destroy());
-    incoming.pipe(outgoing);
-    outgoing.pipe(incoming);
+    const destroyBoth = () => { clearTimeout(timer); incoming.destroy(); outgoing.destroy(); };
+    const timer = setTimeout(destroyBoth, Math.max(0, connectDeadline - performance.now()));
+    timer.unref();
+    incoming.once("error", destroyBoth);
+    outgoing.once("error", destroyBoth);
+    incoming.once("close", () => {
+      if (!incoming.readableEnded || !incoming.writableFinished) destroyBoth();
+    });
+    outgoing.once("close", () => {
+      clearTimeout(timer);
+      if (!outgoing.readableEnded || !outgoing.writableFinished) destroyBoth();
+    });
+    outgoing.once("connect", () => {
+      clearTimeout(timer);
+      if (incoming.destroyed || outgoing.destroyed || performance.now() >= connectDeadline) { destroyBoth(); return; }
+      incoming.pipe(outgoing);
+      outgoing.pipe(incoming);
+    });
   }
 }
 
@@ -350,6 +382,10 @@ export class LogicalPortRouterManager implements DisposableLike {
  * Node streams.
  */
 class NativeLogicalPortRouterProcess {
+  /** Worker/DNS capacity stays reserved while accepted streams or the warm helper remain. */
+  private reservation: NativeProxyReservation | undefined;
+  private childCreated = false;
+  private detachControlAvailable: (() => void) | undefined;
   /** Child process running the native router helper for many logical ports. */
   private child: ChildProcessWithoutNullStreams | undefined;
 
@@ -386,13 +422,21 @@ class NativeLogicalPortRouterProcess {
       readonly resolve: () => void;
       readonly reject: (error: Error) => void;
       readonly timer: NodeJS.Timeout;
+      readonly promise: Promise<void>;
     }
   >();
+  /** Each dual-stack LISTEN owns two units until LISTEN_ERROR/CLOSED or child exit. */
+  private readonly portReservations = new Map<number, ProxyResourceLease>();
+  /** Reopen waits for CLOSED so an old port-only reply cannot release the new lease. */
+  private readonly pendingCloses = new Map<number, {
+    readonly promise: Promise<void>; readonly resolve: () => void; readonly timer: NodeJS.Timeout; sent: boolean;
+  }>();
 
   constructor(
     private readonly executablePath: string,
     private readonly targetResolver: LogicalPortRouterTargetResolver,
     private readonly startupTimeoutMs: number,
+    private readonly resources: ProxyNetworkResources,
   ) {}
 
   /** Starts the shared helper and waits until it can accept LISTEN commands. */
@@ -406,19 +450,38 @@ class NativeLogicalPortRouterProcess {
 
     this.closed = false;
     this.controlReady = false;
+    this.reservation = this.resources.reserveNative(256, 0);
     this.child = spawn(this.executablePath, ["--control"], {
       // The router's outbound target connection must not re-enter Port Manager's native hook.
-      env: buildNodeRuntimeEnvironment(),
+      env: { ...buildNodeRuntimeEnvironment(),
+        PORT_MANAGER_PROXY_MAX_CONNECTIONS: String(this.reservation.connections),
+        PORT_MANAGER_PROXY_MAX_DNS_JOBS: String(this.reservation.dnsJobs) },
       stdio: ["pipe", "pipe", "pipe"],
     });
+    this.childCreated = this.child.pid !== undefined;
 
     this.child.stdout.setEncoding("utf8");
     this.child.stderr.setEncoding("utf8");
     this.child.stdout.on("data", (chunk: string) => this.handleStdout(chunk));
     this.child.stderr.on("data", (chunk: string) => this.rememberStderr(chunk));
-    this.child.once("error", (error) => this.rejectStartup(error));
+    this.child.stdin.on("error", () => {});
+    const retryCloses = () => {
+      for (const [port, closing] of this.pendingCloses) {
+        if (!closing.sent) closing.sent = this.writeControlLine(`CLOSE\t${port}\n`);
+      }
+    };
+    this.child.stdin.on("drain", retryCloses);
+    this.detachControlAvailable = this.resources.onControlAvailable(retryCloses);
+    const child = this.child;
+    this.child.once("error", (error) => {
+      if (child.pid === undefined) { this.reservation?.release(); this.detachControlAvailable?.(); }
+      this.rejectStartup(error);
+    });
     this.child.once("exit", (code, signal) => {
       this.closed = true;
+      this.reservation?.release();
+      this.detachControlAvailable?.();
+      this.releasePortReservations();
       this.controlReady = false;
       this.activePorts.clear();
       this.rejectPendingListens(
@@ -438,18 +501,27 @@ class NativeLogicalPortRouterProcess {
 
   async open(logicalPort: number): Promise<LogicalPortRouterListenerHandle> {
     await this.start();
+    await this.pendingCloses.get(logicalPort)?.promise;
+    if (!this.isControlReady()) throw new Error("Native logical router closed before LISTEN.");
     if (this.activePorts.has(logicalPort)) {
       return new NativeLogicalPortRouterPortHandle(this, logicalPort);
     }
-
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingListens.delete(logicalPort);
-        reject(new Error(`Native logical router timed out opening ${logicalPort}${this.formatStderrSuffix()}`));
-      }, this.startupTimeoutMs);
-      this.pendingListens.set(logicalPort, { resolve, reject, timer });
-      this.writeControlLine(`LISTEN\t${logicalPort}\n`);
-    });
+    const existing = this.pendingListens.get(logicalPort);
+    if (existing !== undefined) { await existing.promise; return new NativeLogicalPortRouterPortHandle(this, logicalPort); }
+    const lease = this.resources.acquire({ listeners: 2 });
+    this.portReservations.set(logicalPort, lease);
+    let resolve!: () => void, reject!: (error: Error) => void;
+    const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+    const timer = setTimeout(() => {
+      this.pendingListens.delete(logicalPort);
+      reject(new Error(`Native logical router timed out opening ${logicalPort}${this.formatStderrSuffix()}`));
+      void this.closePort(logicalPort).catch(() => undefined);
+    }, this.startupTimeoutMs);
+    this.pendingListens.set(logicalPort, { resolve, reject, timer, promise });
+    if (!this.writeControlLine(`LISTEN\t${logicalPort}\n`)) {
+      this.rejectListen(logicalPort, new Error("Native logical router control budget exhausted before LISTEN."));
+    }
+    await promise;
 
     return new NativeLogicalPortRouterPortHandle(this, logicalPort);
   }
@@ -468,6 +540,8 @@ class NativeLogicalPortRouterProcess {
 
   /** Stops accepting new connections for one port while accepted native streams stay alive. */
   async closePort(logicalPort: number): Promise<void> {
+    const closing = this.pendingCloses.get(logicalPort);
+    if (closing !== undefined) return closing.promise;
     this.activePorts.delete(logicalPort);
     const pending = this.pendingListens.get(logicalPort);
     if (pending !== undefined) {
@@ -475,9 +549,15 @@ class NativeLogicalPortRouterProcess {
       pending.reject(new Error(`Native logical router closed ${logicalPort}.`));
       this.pendingListens.delete(logicalPort);
     }
-    if (this.isActive()) {
-      this.writeControlLine(`CLOSE\t${logicalPort}\n`);
-    }
+    if (!this.portReservations.has(logicalPort)) return;
+    if (!this.isActive()) return; // Child exit returns the lease; issuing a kill is not completion.
+    let resolve!: () => void, reject!: (error: Error) => void;
+    const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+    const timer = setTimeout(() => reject(new Error(`Native logical router did not confirm CLOSE ${logicalPort}.`)), this.startupTimeoutMs);
+    const entry = { promise, resolve, timer, sent: false };
+    this.pendingCloses.set(logicalPort, entry);
+    entry.sent = this.writeControlLine(`CLOSE\t${logicalPort}\n`);
+    return promise;
   }
 
   async close(): Promise<void> {
@@ -490,6 +570,7 @@ class NativeLogicalPortRouterProcess {
     const child = this.child;
     this.child = undefined;
     if (child === undefined) {
+      if (!this.childCreated) this.reservation?.release();
       return;
     }
 
@@ -549,6 +630,10 @@ class NativeLogicalPortRouterProcess {
     const closedPort = parseNativeRouterPortStatusLine(line, "CLOSED");
     if (closedPort !== undefined) {
       this.activePorts.delete(closedPort);
+      this.portReservations.get(closedPort)?.release();
+      this.portReservations.delete(closedPort);
+      const closing = this.pendingCloses.get(closedPort);
+      if (closing !== undefined) { clearTimeout(closing.timer); closing.resolve(); this.pendingCloses.delete(closedPort); }
       return;
     }
 
@@ -558,7 +643,7 @@ class NativeLogicalPortRouterProcess {
     }
 
     try {
-      const target = await this.targetResolver.resolve(query);
+      const target = await this.resources.runRoute(() => this.targetResolver.resolve(query));
       this.writeResponse(`ROUTE\t${query.id}\t${target.host}\t${target.port}\n`);
     } catch {
       this.writeResponse(`ERROR\t${query.id}\n`);
@@ -569,12 +654,12 @@ class NativeLogicalPortRouterProcess {
     this.writeControlLine(line);
   }
 
-  private writeControlLine(line: string): void {
+  private writeControlLine(line: string): boolean {
     if (this.child === undefined || this.child.stdin.destroyed) {
-      return;
+      return false;
     }
 
-    this.child.stdin.write(line, "utf8");
+    return this.resources.writeControl(this.child.stdin, line);
   }
 
   private rememberStderr(chunk: string): void {
@@ -617,6 +702,12 @@ class NativeLogicalPortRouterProcess {
   }
 
   private rejectListen(logicalPort: number, error: Error): void {
+    // A pending CLOSE retains the lease until its own acknowledgement, even
+    // when this late LISTEN_ERROR belongs to the attempt that just timed out.
+    if (!this.pendingCloses.has(logicalPort)) {
+      this.portReservations.get(logicalPort)?.release();
+      this.portReservations.delete(logicalPort);
+    }
     const pending = this.pendingListens.get(logicalPort);
     if (pending === undefined) {
       return;
@@ -633,6 +724,13 @@ class NativeLogicalPortRouterProcess {
       pending.reject(error);
     }
     this.pendingListens.clear();
+  }
+
+  private releasePortReservations(): void {
+    for (const lease of this.portReservations.values()) lease.release();
+    this.portReservations.clear();
+    for (const closing of this.pendingCloses.values()) { clearTimeout(closing.timer); closing.resolve(); }
+    this.pendingCloses.clear();
   }
 
   private formatStderrSuffix(): string {

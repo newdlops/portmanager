@@ -4,6 +4,8 @@ import * as net from "node:net";
 import * as tls from "node:tls";
 import { performance } from "node:perf_hooks";
 import { devLog } from "../dev-log";
+import { defaultProxyNetworkResources, ProxyResourceLimitError, type ProxyNetworkResources } from "./proxy-network-resources";
+import type { ProxyResourceLease } from "../../core/networks/proxy-resource-budget";
 import type {
   ActiveBrowserNetworkProxyEndpoint,
   BrowserNetworkProxyOptions,
@@ -47,11 +49,13 @@ export class BrowserNetworkProxyTransport {
   private readonly queueTimeoutMs: number;
   private readonly maxConcurrentHttpRequests: number;
   private readonly maxQueuedHttpRequests: number;
+  private readonly resources: ProxyNetworkResources;
 
   constructor(
     private readonly targetResolver: BrowserNetworkProxyTargetResolver,
     options: BrowserNetworkProxyOptions,
   ) {
+    this.resources = options.resources ?? defaultProxyNetworkResources;
     this.resolveTimeoutMs = positiveTimeout(options.resolveTimeoutMs, DEFAULT_RESOLVE_TIMEOUT_MS);
     this.connectTimeoutMs = positiveTimeout(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS);
     this.queueTimeoutMs = positiveTimeout(options.queueTimeoutMs, 10_000);
@@ -70,6 +74,8 @@ export class BrowserNetworkProxyTransport {
   ): Promise<void> {
     let releaseAdmission: (() => void) | undefined;
     try {
+      this.resources.configureAgent(httpAgent);
+      this.resources.configureAgent(httpsAgent);
       let target = await this.resolveTarget(endpoint, response);
       // Listener shutdown destroys its socket synchronously; IncomingMessage /
       // ServerResponse close flags may follow one turn later during owner handoff.
@@ -121,6 +127,7 @@ export class BrowserNetworkProxyTransport {
       // already connected keep-alive socket will not emit another ready event.
       let clearConnectionDeadline = () => {};
       const onSocket = (socket: net.Socket) => {
+        this.resources.activateSocket(socket);
         if (isConnected(socket, protocol)) return;
         clearConnectionDeadline = connectionDeadline(socket, protocol === "https" ? "secureConnect" : "connect",
           this.connectTimeoutMs, () => {
@@ -147,7 +154,7 @@ export class BrowserNetworkProxyTransport {
       upstream.once("error", (error) => {
         cleanup();
         request.unpipe(upstream);
-        writeGatewayError(response, error instanceof BrowserProxyTimeoutError ? 504 : 502);
+        writeGatewayError(response, error instanceof BrowserProxyTimeoutError ? 504 : error instanceof ProxyResourceLimitError ? 503 : 502);
       });
       upstream.once("close", cleanup);
       request.once("aborted", abortUpstream);
@@ -155,7 +162,8 @@ export class BrowserNetworkProxyTransport {
       request.pipe(upstream);
     } catch (error) {
       releaseAdmission?.();
-      writeGatewayError(response, error instanceof BrowserProxyTimeoutError ? 504 : error instanceof BrowserProxyOverloadError ? 503 : 502);
+      writeGatewayError(response, error instanceof BrowserProxyTimeoutError ? 504
+        : error instanceof BrowserProxyOverloadError || error instanceof ProxyResourceLimitError ? 503 : 502);
     }
   }
 
@@ -169,7 +177,7 @@ export class BrowserNetworkProxyTransport {
     if (queue === undefined) {
       const ownedQueues = queues;
       queue = new HttpAdmissionQueue(Math.min(this.maxConcurrentHttpRequests, agent.maxSockets), this.maxQueuedHttpRequests,
-        () => ownedQueues.delete(key));
+        () => ownedQueues.delete(key), this.resources);
       queues.set(key, queue);
     }
     return queue.acquire(request, response, deadline, () => timeoutError(endpoint, "queue", this.queueTimeoutMs));
@@ -192,9 +200,9 @@ export class BrowserNetworkProxyTransport {
       const protocol = target.protocol === "https" ? "https" : "http";
       const upstreamMetadata = buildUpstreamMetadata(endpoint, metadata, protocol);
       const upstream = protocol === "https"
-        ? tls.connect({ host, port: target.port, rejectUnauthorized: false,
-            ...(net.isIP(host) === 0 ? { servername: host } : {}) })
-        : net.createConnection({ host, port: target.port, allowHalfOpen: true });
+        ? this.resources.connect({ host, port: target.port, rejectUnauthorized: false,
+            ...(net.isIP(host) === 0 ? { servername: host } : {}) }, true)
+        : this.resources.connect({ host, port: target.port, allowHalfOpen: true });
       upstream.allowHalfOpen = true;
       this.forwardSockets(endpoint, socket, upstream, sockets, protocol === "https" ? "secureConnect" : "connect", () => {
         upstream.write(buildUpgradeRequest(request, upstreamMetadata));
@@ -215,7 +223,7 @@ export class BrowserNetworkProxyTransport {
     try {
       const target = await this.resolveTarget(endpoint, client);
       if (target === undefined || client.destroyed) return;
-      const upstream = net.createConnection({ host: normalizeTargetHost(target.host), port: target.port, allowHalfOpen: true });
+      const upstream = this.resources.connect({ host: normalizeTargetHost(target.host), port: target.port, allowHalfOpen: true });
       this.forwardSockets(endpoint, client, upstream, sockets, "connect", () => {
         // The sniffer may already have consumed FIN; unshift after end would
         // discard the prefix. Write these bounded bytes before piping the rest.
@@ -241,7 +249,7 @@ export class BrowserNetworkProxyTransport {
     try {
       const target = await this.resolveTarget(endpoint, client, signal);
       if (target === undefined || client.destroyed || signal.aborted) return;
-      upstream = net.createConnection({ host: normalizeTargetHost(target.host), port: target.port, allowHalfOpen: true });
+      upstream = this.resources.connect({ host: normalizeTargetHost(target.host), port: target.port, allowHalfOpen: true });
       const peer = upstream;
       sockets.add(peer);
       client.once("close", cancel);
@@ -288,6 +296,12 @@ export class BrowserNetworkProxyTransport {
   ): Promise<BrowserNetworkProxyTarget | undefined> {
     if (client.destroyed || signal?.aborted) return Promise.resolve(undefined);
     return new Promise((resolve, reject) => {
+      const started = performance.now();
+      const remaining = admissionDeadline === undefined ? Infinity : admissionDeadline - started;
+      const queueLimited = remaining <= this.resolveTimeoutMs;
+      const deadline = Math.min(started + this.resolveTimeoutMs, admissionDeadline ?? Infinity);
+      const expired = () => timeoutError(endpoint,
+        queueLimited ? "queue" : "resolve", queueLimited ? this.queueTimeoutMs : this.resolveTimeoutMs);
       let settled = false;
       const finish = (target?: BrowserNetworkProxyTarget, error?: unknown) => {
         if (settled) return;
@@ -295,20 +309,20 @@ export class BrowserNetworkProxyTransport {
         clearTimeout(timer);
         client.off("close", cancel);
         signal?.removeEventListener("abort", cancel);
+        // Promise jobs can precede an overdue timer after the host was busy.
+        // That result must not create an upstream or extend queue admission.
+        if (target !== undefined && performance.now() >= deadline) error = expired();
         if (error !== undefined) reject(error);
         else resolve(target);
       };
       const cancel = () => finish();
-      const remaining = admissionDeadline === undefined ? Infinity : admissionDeadline - performance.now();
-      const queueLimited = remaining <= this.resolveTimeoutMs;
-      const timer = setTimeout(() => finish(undefined, timeoutError(endpoint,
-        queueLimited ? "queue" : "resolve", queueLimited ? this.queueTimeoutMs : this.resolveTimeoutMs)),
+      const timer = setTimeout(() => finish(undefined, expired()),
         Math.max(0, Math.min(this.resolveTimeoutMs, remaining)));
       timer.unref();
       client.once("close", cancel);
       signal?.addEventListener("abort", cancel, { once: true });
       try {
-        Promise.resolve(this.targetResolver.resolve(endpoint)).then(
+        this.resources.runRoute(() => this.targetResolver.resolve(endpoint)).then(
           (target) => finish(target),
           (error: unknown) => finish(undefined, error ?? new Error("Browser proxy route lookup failed.")),
         );
@@ -338,7 +352,7 @@ export class BrowserNetworkProxyTransport {
       destroyBoth();
     });
     const onReady = () => {
-      if (client.destroyed) { destroyBoth(); return; }
+      if (client.destroyed || upstream.destroyed) { destroyBoth(); return; }
       beforePipe?.();
       client.pipe(upstream);
       upstream.pipe(client);
@@ -382,27 +396,44 @@ class HttpAdmissionQueue {
   /** Set insertion order provides FIFO admission and constant-time cancellation. */
   private readonly waiting = new Set<() => void>();
 
-  constructor(private readonly limit: number, private readonly maxWaiting: number, private readonly onIdle: () => void) {}
+  constructor(private readonly limit: number, private readonly maxWaiting: number, private readonly onIdle: () => void,
+    private readonly resources: ProxyNetworkResources) {}
 
   acquire(request: http.IncomingMessage, response: http.ServerResponse, deadline: number,
     expire: () => Error): Promise<HttpAdmission | undefined> {
     const canceled = () => request.aborted || request.socket.destroyed || response.destroyed;
     if (canceled()) { this.removeIfIdle(); return Promise.resolve(undefined); }
     if (performance.now() >= deadline) { this.removeIfIdle(); return Promise.reject(expire()); }
-    if (this.active < this.limit) { this.active++; return Promise.resolve({ release: this.permit(), waited: false }); }
+    if (this.active < this.limit) {
+      try {
+        const lease = this.resources.acquire({ httpRequests: 1 });
+        this.active++;
+        return Promise.resolve({ release: this.permit(lease), waited: false });
+      } catch (error) { this.removeIfIdle(); return Promise.reject(error); }
+    }
     if (this.waiting.size >= this.maxWaiting) return Promise.reject(new BrowserProxyOverloadError("HTTP admission queue is full."));
+    let queued: ProxyResourceLease;
+    try { queued = this.resources.acquire({ queuedHttpRequests: 1 }); }
+    catch (error) { return Promise.reject(error); }
     return new Promise((resolve, reject) => {
       let settled = false;
       const finish = (admit: boolean, error?: Error) => {
         if (settled) return;
         settled = true;
         this.waiting.delete(grant);
+        queued.release();
         clearTimeout(timer);
         request.off("aborted", cancel);
         request.socket.off("close", cancel);
         response.off("close", cancel);
         if (admit && !canceled() && performance.now() >= deadline) reject(expire());
-        else if (admit && !canceled()) { this.active++; resolve({ release: this.permit(), waited: true }); }
+        else if (admit && !canceled()) {
+          try {
+            const lease = this.resources.acquire({ httpRequests: 1 });
+            this.active++;
+            resolve({ release: this.permit(lease), waited: true });
+          } catch (overload) { reject(overload); }
+        }
         else if (error !== undefined) reject(error);
         else resolve(undefined);
         this.removeIfIdle();
@@ -419,11 +450,12 @@ class HttpAdmissionQueue {
   }
 
   /** Idempotent release keeps abort/error/close races from manufacturing extra capacity. */
-  private permit(): () => void {
+  private permit(lease: ProxyResourceLease): () => void {
     let released = false;
     return () => {
       if (released) return;
       released = true;
+      lease.release();
       this.active--;
       while (this.active < this.limit && this.waiting.size > 0) this.waiting.values().next().value!();
       this.removeIfIdle();
@@ -503,14 +535,21 @@ export function sniffBrowserProxyConnection(
 
 /** Unlike socket.setTimeout, this bounds only setup and cannot kill an idle SSE/WS/raw stream. */
 function connectionDeadline(socket: net.Socket, readyEvent: "connect" | "secureConnect", delayMs: number, expire: () => void): () => void {
+  const deadline = performance.now() + delayMs;
   const cleanup = () => {
     clearTimeout(timer);
-    socket.off(readyEvent, cleanup);
+    socket.off(readyEvent, onReady);
     socket.off("close", cleanup);
+  };
+  const onReady = () => {
+    cleanup();
+    // Node's request flush also listens for readiness. Expire first when
+    // scheduling delay carried this event past the original setup budget.
+    if (performance.now() >= deadline) expire();
   };
   const timer = setTimeout(() => { cleanup(); expire(); }, delayMs);
   timer.unref();
-  socket.once(readyEvent, cleanup);
+  socket.prependOnceListener(readyEvent, onReady);
   socket.once("close", cleanup);
   return cleanup;
 }

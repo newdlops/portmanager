@@ -155,6 +155,61 @@ Native Socket Hook 기반 Logical Network의 클라이언트 라우팅 1차 경�
 
 게이트웨이가 논리 포트를 점유하는 동안 non-attached 터미널에서 시작된 서버가 같은 포트에 bind하면, hook이 그 서버를 고포트로 재배치해 passthrough owner로 등록한다. 게이트웨이는 `portManager.logicalPortGateway` 설정으로 끌 수 있으며, 끄면 in-process hook fast-path만 사용한다.
 
+native TCP router와 raw Host Exposure helper는 연결마다 하나의 worker에서
+양방향 64KiB 버퍼로 전달한다. helper당 기본 256개의 연결을 허용하되 listener와
+OS fd 한도를 반영해 새 연결 admission을 줄이며, 초과 시 기존 연결을 끊거나 다른
+네트워크를 추측하지 않고 새 연결만 거부한다. DNS와 모든 주소의 TCP connect는
+기본 5초의 monotonic 준비 기한 하나를 공유한다. 숫자 주소는 DNS worker를 만들지
+않고 같은 이름의 진행 중 조회는 공유하며, OS 조회는 최대 4개로 제한한다.
+기한 뒤 반환된 결과는 새 upstream을 만들지 않는다. FIN은 버퍼를 배출한 뒤
+반대편 쓰기로 전달하고 reset/error는 양쪽 자원을 정리한다. 준비 기한은 연결된
+raw 세션의 유휴 시간에 적용하지 않는다. Node Host Exposure fallback도 연결
+상한과 준비 기한, FIN 보존, 취소와 owner 종료의 수명 규칙을 따른다.
+프로세스 귀속 캐시는 유효한 PID/시작 시각 쌍만 보관하고 실제 항목 상한을 유지하며,
+조회가 잦아도 attachment 변경을 관측할 TTL을 연장하지 않는다. 귀속·완료된 target
+캐시의 TTL은 monotonic 경과 시간으로 판단해 시스템 시계 역행으로 늘어나지 않는다.
+TCP connect의 성공 반환과 TCP/TLS 준비 이벤트도 원래 기한을 다시 확인한다.
+늦은 준비 이벤트가 overdue timer보다 먼저 실행돼도 upstream을 보존하거나
+HTTP POST·upgrade handshake·raw 접두부를 보내서는 안 된다. 브라우저 연결의
+기한 검사는 Node ClientRequest의 준비 이벤트 전송보다 먼저 적용한다.
+
+native TCP helper의 control 출력은 연결 worker와 분리한 bounded FIFO를 사용한다
+(최대 4,096프레임·payload 4MiB, 프레임당 1KiB). controller가 stdout 읽기를 멈춰도
+응답의 monotonic 기한이 계속 흐르고 만료된 연결은 회수되어야 한다. 부분 전송
+프레임은 제거하지 않으며, 같은 control stream이 복구된 뒤의 늦은 응답은 새
+target을 만들지 않는다. 이미 연결된 TCP 데이터 흐름은 control 정체로 종료하지
+않는다. wall-clock 변경이나 timer보다 먼저 실행된 완료 signal도 기한을 연장하지
+않도록 최종 완료 시각을 확인한다.
+
+확장 호스트 하나와 그 proxy 자식 helper는 **한 공통 자원 예산**을 사용한다.
+Host Exposure·Host Gateway·Browser Proxy·Logical Router의 기본 전체 상한은
+listener 용량 256, client/upstream 용량 각각 1,024, native helper 8,
+DNS 작업 용량 32, 실제 route resolver 작업 64, HTTP 활성/대기 각각 256,
+유휴 HTTP socket 64다. 이 회계는 별도 확장 호스트/daemon·사용자 앱·kernel
+backlog를 포함하지 않는다. 다중 자원 admission은 원자적이며 실패·취소·종료
+경합에서 lease를 두 번 반환해도 추가 용량을 만들면 안 된다.
+
+native는 시작 전에 worker/upstream 용량 각 기본 32와 DNS 용량 기본 2를
+예약하고 같은 상한을 child env로 전달한다. 예약은 유휴 helper에도 보수적으로
+적용하며 실제 exit/spawn 실패 전 반환하지 않는다. 새 helper가 예산에 들어가지
+못하면 Node fallback도 같은 예산을 적용한다. native router의 dual-stack LISTEN은
+용량 2를 예약하고 실제 CLOSED/실패/exit 확인으로 반환한다. reopen은 이전
+CLOSE 확인 뒤 시작하며 listener retire는 기존 스트림의 용량을 해제하지 않는다.
+
+Node proxy DNS는 진행 중 같은 lookup 조건만 공유하고 OS 호출을 전체 broker에서
+기본 4개로 제한한다. 취소는 client callback만 제거하고 OS 작업 슬롯은 실제
+완료까지 유지한다. 늦은 성공/실패를 소비하되 canceled socket을 target에 연결하지
+않는다. 숫자 주소와 Node의 IPv4/IPv6 fallback을 보존하고 완료 DNS 결과를
+cache하지 않는다. 실제 route resolver도 timeout 뒤 아직 끝나지 않은 작업을
+계속 계산하며, shared Promise의 canceled client callback은 분리한다.
+
+HTTP 전역 admission·upstream·DNS 예산 초과는 503이고 POST 자동 재전송은 없다.
+raw 초과는 새 연결만 거부한다. 유휴 HTTP pool만 공통 상한과 30초 보관 기한으로
+정리하고 활성 SSE/WS/raw를 퇴출하지 않는다. Node socket 용량은 실제 close로
+반환한다. 부모→native control payload는 전체 512KiB·helper별 64KiB로 제한하며
+1KiB 이내 단일 프레임의 부분 전송 경계를 보존한다. enqueue하지 못한 LISTEN은
+예약을 반환하고 CLOSE는 가용 용량 때 재시도하되 확인 전 예약을 반환하지 않는다.
+
 hook의 `bind`는 서버를 per-network loopback alias로 옮기는 in-process 재작성을 계속 담당한다(프로세스 밖에서는 불가능). preload를 잃은 서버(보호 경계 뒤 절대경로 `#!` 인터프리터)는 alias bind를 못 받아 같은 포트 다중 네트워크 격리가 서버 측에서 깨질 수 있으며, 이는 명시적 실패로 드러난다.
 
 터미널·외부 셸·attach 스크립트의 preload와 hint는 확장 버전 디렉터리가 아니라
@@ -212,6 +267,12 @@ HTTP 응답의 localhost origin 재작성은 스트리밍을 유지해야 한다
 Browser proxy는 경로 조회와 TCP/TLS 연결 준비를 각각 제한된 시간 안에 끝내야 한다(기본 10초/5초). HTTP 준비 시간 초과는 504, 일반 연결 실패는 502로 응답하며 요청을 자동 재전송하지 않는다. 브라우저 취소·owner 인계 후 늦게 반환된 route는 HTTP/WebSocket/raw 모두 새 upstream 연결을 만들면 안 된다. 연결 준비 제한은 socket 할당 후 connect/secureConnect까지에만 적용하고, pool 대기·연결된 앱의 응답 대기·업로드·SSE·WebSocket·raw 세션의 유휴 시간에는 적용하지 않는다. keep-alive 재사용 socket은 이미 준비된 것으로 취급한다.
 
 HTTP pool admission은 별도의 대기 기한(기본 10초)과 개수 제한(upstream origin마다 동시 64개·대기 128개)을 둔다. 대기 초과는 504, 대기열 포화는 503이며, 취소·만료된 요청을 나중에 upstream으로 보내지 않는다. 대기열은 `ClientRequest` 생성 전에 관리하고 취소 시 즉시 제거한다. 이미 연결된 SSE 등 장기 응답은 이 대기 기한으로 종료하지 않는다. 실제로 기다린 요청은 전송 직전에 경로를 다시 조회하고 host/port/protocol 변경 시 새 origin의 admission을 거친다. 재조회와 origin 이동이 최초 대기 기한을 연장하면 안 되며, 이미 보낸 요청을 재전송하지 않는다.
+
+브라우저 TCP listener는 프로토콜 판별 이전부터 기본 256개 연결 상한을 둔다.
+이 상한은 아직 조용한 클라이언트, TLS 준비, route 대기, raw/upgrade를 함께 포함한다.
+초과 연결은 조회·인사말 probe 전에 거부하고 이미 연결된 세션은 유지한다.
+확장 호스트가 바빠 Promise 완료가 만료된 timer보다 먼저 실행되어도, 조회 결과의
+monotonic 기한을 다시 검사해 늦은 upstream 연결과 POST 전송을 차단한다.
 
 프로토콜 스니핑은 TCP 패킷 경계에 의존하지 않는다. HTTP method가 여러 청크로 나뉘어도 기존 Host/origin 재작성을 유지하도록 최대 8바이트의 접두부를 조합한다. HTTP인지 아직 판정할 수 없는 접두부는 기본 1초까지만 기다린 뒤 보관한 바이트 그대로 raw 경로로 전달하고, 판정 중 FIN을 받은 모호한 접두부도 raw head로 전달한다. reset·취소는 타이머와 접두부를 정리한다.
 
