@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath, runTests } from "@vscode/test-electron";
 
@@ -45,21 +45,29 @@ fs.writeFileSync(path.join(userData, "User", "settings.json"), JSON.stringify({
     "portManager.containerEventsWatch": false,
   } : {}),
 }));
+console.log("Packaged validation: download VS Code");
 const vscodeExecutablePath = await withinBudget(downloadAndUnzipVSCode("stable"), 120_000, "VS Code download");
 const [cli, ...cliArgs] = resolveCliArgsFromVSCodeExecutablePath(vscodeExecutablePath);
 const profileArgs = ["--user-data-dir", userData, "--extensions-dir", extensions];
-const install = spawnSync(cli, [...cliArgs, ...profileArgs, "--install-extension", vsix, "--force"], {
+console.log("Packaged validation: install VSIX");
+const install = spawn(cli, [...cliArgs, ...profileArgs, "--install-extension", vsix, "--force"], {
   env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
   stdio: "inherit",
   timeout: 120_000,
+  // A synchronous spawn can keep its caller blocked after the default TERM
+  // if Electron ignores it. Keep the watchdog alive and force this CI-only CLI.
+  killSignal: "SIGKILL",
 });
-if (install.error) throw install.error;
-assert.equal(install.status, 0, "VSIX installation failed.");
+await new Promise((resolve, reject) => {
+  install.once("error", reject);
+  install.once("exit", (code, signal) => code === 0 ? resolve() : reject(new Error(`VSIX installation failed: ${code ?? signal}.`)));
+});
 const installed = fs.readdirSync(extensions).find((entry) => entry.startsWith(`${manifest.publisher}.${manifest.name}-${manifest.version}`));
 assert.ok(installed, "Installed extension directory is missing.");
 const extensionPath = path.join(extensions, installed);
 // Bound the test runner as well as individual workload operations so a VS Code
 // startup/exit stall still uploads a useful CI log instead of waiting an hour.
+console.log("Packaged validation: run extension host tests");
 await withinBudget(runTests({
   vscodeExecutablePath,
   extensionDevelopmentPath: extensionPath,
