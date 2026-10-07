@@ -23,6 +23,16 @@ macOS/Linux는 설치된 VSIX의 실제 확장 호스트를 사용한다. Window
 `proxy-resource-soak.ts`의 standalone 진입점에서 Node 대체 경로만 확인한다.
 Windows 네이티브 격리나 VSIX 활성화 지원을 뜻하지 않는다.
 
+실제 확장 호스트는 VS Code 자체의 지연 초기화를 위해 먼저 30초 예열한다.
+각 생성/삭제 cycle 뒤 모든 proxy 예산이 유지 중인 SSE의 기준값으로 돌아와야
+한다. 마지막에는 SSE도 닫고 남은 예산까지 반환하는지 확인한다. 수치에는 실제
+사용량뿐 아니라 native helper의 보수적인 용량 예약이 포함된다.
+
+steady state의 proxy helper 수는 증가하면 안 된다. 확장 호스트 FD/handle은
+예열 뒤 +8 이하, RSS는 +96 MiB 이하를 실패 기준으로 사용하며 전체 표본을
+보관해 추세를 검토한다. 이는 RSS 상한이나 임의 사용자 앱의 성능 보장이 아니다.
+process tree에는 daemon과 일반 VS Code 자식/일시적 discovery 명령도 기록한다.
+
 로컬 rehearsal은 `PM_TEST_RESOURCE_SOAK_SECONDS=30 node
 out/test/integration/proxy-resource-soak.js`로 실행할 수 있다. 확장은 활성화하지
 않으며 셸/DNS 자산을 쓰지 않는다. 보고서는 `.tmp/resource-soak.json`에 저장한다.

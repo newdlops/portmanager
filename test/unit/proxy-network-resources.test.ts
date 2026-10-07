@@ -185,6 +185,17 @@ test("listener DNS deadlines detach waiters while real OS work retains its quota
   await until(() => resources.budget.used.dnsJobs === 0);
 });
 
+test("hostname bind preserves Node's ordered non-link-local address selection", async () => {
+  const resources = new ProxyNetworkResources({ lookup: (host, options, callback) => {
+    assert.equal(options.all, true);
+    callback(null, host === "only-link-local.fixture" ? [{ address: "fea0::1", family: 6 }]
+      : [{ address: "fea0::1", family: 6 }, { address: "127.0.0.1", family: 4 }, { address: "::1", family: 6 }], 4);
+  } });
+  assert.equal(await resources.resolveListenHost("ordered-bind.fixture"), "127.0.0.1");
+  assert.equal(await resources.resolveListenHost("only-link-local.fixture"), "fea0::1");
+  assert.equal(resources.budget.used.dnsJobs, 0);
+});
+
 test("browser hostname binding uses the resource broker instead of Node's implicit DNS", async t => {
   let lookups = 0;
   const resources = new ProxyNetworkResources({ lookup: (_host, options, callback) => {

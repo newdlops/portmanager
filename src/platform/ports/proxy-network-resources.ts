@@ -106,13 +106,19 @@ export class ProxyNetworkResources {
       };
       const timer = setTimeout(() => finish(timedOut()), timeoutMs);
       timer.unref();
-      this.lookupFor(cancellation.signal)(host, { family: 0, hints: 0 }, (error, address) => {
+      this.lookupFor(cancellation.signal)(host, { family: 0, hints: 0, all: true }, (error, address) => {
         // A DNS callback can run before an overdue timer. Keep the original
         // deadline and detach canceled waiters while the OS job stays counted.
         if (performance.now() >= deadline) finish(timedOut());
         else if (error != null) finish(error);
-        else if (typeof address !== "string" || net.isIP(address) === 0) finish(new Error("Invalid listener DNS address."));
-        else finish(undefined, address);
+        else {
+          const candidates = Array.isArray(address) ? address : [{ address }];
+          // Node's hostname listener prefers an address outside the IPv6
+          // link-local range, or its first result when every candidate is local.
+          const selected = candidates.find(row => !(net.isIP(row.address) === 6 && /^fe[89ab][0-9a-f]:/i.test(row.address))) ?? candidates[0];
+          if (selected === undefined || net.isIP(selected.address) === 0) finish(new Error("Invalid listener DNS address."));
+          else finish(undefined, selected.address);
+        }
       });
     });
   }
