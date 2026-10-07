@@ -120,26 +120,26 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
         const endpoints: { raw: number; http: number }[] = [];
         for (let index = 0; index < 3; index++) {
           const name = `soak-${cycle}-${index}`;
-          const network = options.service ? await options.service.createNetwork(name, "nativeHelper")
+          const network = options.service ? await within(options.service.createNetwork(name, "nativeHelper"), "create network")
             : registry.addNetwork({ id: name, name, status: "running", runtimeKind: "nativeHelper", createdAt: new Date().toISOString() });
           networks.push(network);
           const rawPort = await availablePort();
           // The real service chooses the raw native path for a wildcard bind;
           // all clients and fixture targets still use ordinary loopback.
-          const exposure = options.service ? await options.service.createExposure({ networkId: network.id,
-            hostAddress: "0.0.0.0", hostPort: rawPort, targetAddress: "127.0.0.1", targetPort: echoPort })
+          const exposure = options.service ? await within(options.service.createExposure({ networkId: network.id,
+            hostAddress: "0.0.0.0", hostPort: rawPort, targetAddress: "127.0.0.1", targetPort: echoPort }), "create exposure")
             : { id: name, networkId: network.id, hostAddress: "127.0.0.1", hostPort: rawPort,
               targetAddress: "127.0.0.1", targetPort: echoPort, protocol: "tcp" as const,
               status: "active" as const, createdAt: new Date().toISOString() };
           exposures.push(exposure);
-          if (!options.service) await host.open(exposure);
+          if (!options.service) await within(host.open(exposure), "open host listener");
           const browserPort = await availablePort();
-          assert.ok(await browser.ensure({ id: name, networkId: network.id, logicalPort: httpPort,
-            listenHost: "127.0.0.1", listenPorts: [browserPort], publicHost: "localhost" }));
+          assert.ok(await within(browser.ensure({ id: name, networkId: network.id, logicalPort: httpPort,
+            listenHost: "127.0.0.1", listenPorts: [browserPort], publicHost: "localhost" }), "open browser listener"));
           endpoints.push({ raw: rawPort, http: browserPort });
         }
         routerPort = await availablePort();
-        await router.open(routerPort);
+        await within(router.open(routerPort), "open logical router");
         if (cycle === 1 || cycle % 5 === 0) await sample("active");
         for (let burst = 0; burst < 4; burst++) {
           await Promise.all(endpoints.flatMap(endpoint => [
@@ -154,14 +154,14 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
         }
         assert.equal(streamError, undefined, "Existing SSE stream failed during churn");
       } finally {
-        if (routerPort !== undefined) await router.close(routerPort);
-        await router.releaseAll();
+        if (routerPort !== undefined) await within(router.close(routerPort), "close logical router");
+        await within(router.releaseAll(), "release logical routers");
         router.dispose();
-        await browser.dispose();
-        await host.dispose();
-        for (const exposure of exposures) if (options.service) await options.service.removeExposure(exposure.id);
+        await within(browser.dispose(), "dispose browser listeners");
+        await within(host.dispose(), "dispose host listeners");
+        for (const exposure of exposures) if (options.service) await within(options.service.removeExposure(exposure.id), "remove exposure");
         for (const network of networks) {
-          if (options.service) await options.service.removeNetwork(network.id);
+          if (options.service) await within(options.service.removeNetwork(network.id), "remove network");
           else registry.removeNetwork(network.id);
         }
       }
@@ -190,9 +190,9 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
   } catch (error) { failure = error; }
   finally {
     sse.destroy();
-    await sentinel.dispose();
+    await within(sentinel.dispose(), "close SSE sentinel").catch(error => { failure ??= error; });
     for (const socket of liveSockets) socket.destroy();
-    await Promise.all([close(echoServer), close(httpServer)]);
+    await within(Promise.all([close(echoServer), close(httpServer)]), "close fixture backends").catch(error => { failure ??= error; });
     lag.disable();
     const cleanedBaseline = { ...baseline, listeners: baseline.listeners - 1, connections: baseline.connections - 1,
       upstreams: baseline.upstreams - 1, httpRequests: baseline.httpRequests - 1 };
@@ -281,10 +281,10 @@ async function until(condition: () => boolean, milliseconds = 5000): Promise<voi
     await delay(20);
   }
 }
-async function within<T>(work: Promise<T>): Promise<T> {
+async function within<T>(work: Promise<T>, operation = "exchange"): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try { return await Promise.race([work, new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error("Soak exchange deadline exceeded")), 10_000);
+    timer = setTimeout(() => reject(new Error(`Soak ${operation} deadline exceeded`)), 10_000);
   })]); } finally { clearTimeout(timer); }
 }
 async function listen(server: net.Server): Promise<number> {

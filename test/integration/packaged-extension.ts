@@ -34,7 +34,7 @@ export async function run(): Promise<void> {
     return serviceStarted;
   };
   let api: PortManagerExtensionApi;
-  try { api = await extension.activate(); }
+  try { api = await readyWithin(extension.activate(), "extension activation"); }
   finally { networkModule.PortManagerNetworkService.prototype.start = originalStart; }
   assert.equal(extension.isActive, true);
   assert.ok(Array.isArray(api.listLogicalNetworks()));
@@ -70,10 +70,18 @@ export async function run(): Promise<void> {
     arch: process.arch, browserDnsRunning: status.browserDnsRunning, agentMainPath: status.agentMainPath }));
   if (soakSeconds > 0) {
     assert.ok(networkService, "The soak must observe this installed extension's actual network service.");
-    await serviceStarted;
+    await readyWithin(serviceStarted!, "network service startup");
     await runResourceSoak({ moduleRoot: extension.extensionPath, service: networkService, seconds: soakSeconds,
       reportPath: process.env.PM_TEST_RESOURCE_SOAK_REPORT! });
   }
+}
+
+/** A readiness hang must end before the soak duration begins. */
+async function readyWithin<T>(work: PromiseLike<T>, operation: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try { return await Promise.race([work, new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`Packaged ${operation} exceeded 30s.`)), 30_000);
+  })]); } finally { clearTimeout(timer); }
 }
 
 /** Keeps each readiness probe bounded and ignores asynchronous snapshots. */

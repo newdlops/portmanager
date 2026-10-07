@@ -45,7 +45,7 @@ fs.writeFileSync(path.join(userData, "User", "settings.json"), JSON.stringify({
     "portManager.containerEventsWatch": false,
   } : {}),
 }));
-const vscodeExecutablePath = await downloadAndUnzipVSCode("stable");
+const vscodeExecutablePath = await withinBudget(downloadAndUnzipVSCode("stable"), 120_000, "VS Code download");
 const [cli, ...cliArgs] = resolveCliArgsFromVSCodeExecutablePath(vscodeExecutablePath);
 const profileArgs = ["--user-data-dir", userData, "--extensions-dir", extensions];
 const install = spawnSync(cli, [...cliArgs, ...profileArgs, "--install-extension", vsix, "--force"], {
@@ -58,7 +58,9 @@ assert.equal(install.status, 0, "VSIX installation failed.");
 const installed = fs.readdirSync(extensions).find((entry) => entry.startsWith(`${manifest.publisher}.${manifest.name}-${manifest.version}`));
 assert.ok(installed, "Installed extension directory is missing.");
 const extensionPath = path.join(extensions, installed);
-await runTests({
+// Bound the test runner as well as individual workload operations so a VS Code
+// startup/exit stall still uploads a useful CI log instead of waiting an hour.
+await withinBudget(runTests({
   vscodeExecutablePath,
   extensionDevelopmentPath: extensionPath,
   extensionTestsPath: path.join(root, "out", "test", "integration", "packaged-extension.js"),
@@ -72,5 +74,13 @@ await runTests({
     TMP: runtimeTemp,
     TEMP: runtimeTemp,
   },
-});
+}), (soakSeconds + 180) * 1000, "Packaged extension test runner");
 console.log(`Verified installed ${manifest.publisher}.${manifest.name}@${manifest.version} (${target}).`);
+
+/** Keeps external downloads and application lifecycle failures reviewable in CI. */
+async function withinBudget(work, milliseconds, operation) {
+  let timer;
+  try { return await Promise.race([work, new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${operation} exceeded ${milliseconds}ms.`)), milliseconds);
+  })]); } finally { clearTimeout(timer); }
+}

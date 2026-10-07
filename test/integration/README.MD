@@ -19,6 +19,10 @@
 `npm run test:packaged` → `scripts/test-packaged-extension.mjs` → `packaged-extension.ts`.
 
 `Release packages`의 `resource_soak_seconds=1200`으로 20분 검증을 켠다.
+`validation_target`으로 한 환경만 재실행할 수 있다(기본값 `all`). fixture의
+VS Code 다운로드는 120초, 확장 활성화와 서비스 준비는 각 30초,
+각 제어/정리 작업은 10초, VS Code test runner는 부하 시간 +180초로 제한해
+시작·종료 지연이나 멈춘 작업을 로그가 남는 실패로 만든다.
 macOS/Linux는 설치된 VSIX의 실제 확장 호스트를 사용한다. Windows job은
 `proxy-resource-soak.ts`의 standalone 진입점에서 Node 대체 경로만 확인한다.
 Windows 네이티브 격리나 VSIX 활성화 지원을 뜻하지 않는다.

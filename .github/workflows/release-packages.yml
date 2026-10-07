@@ -3,6 +3,17 @@ name: Release packages
 on:
   workflow_dispatch:
     inputs:
+      validation_target:
+        description: "Environment to validate"
+        type: choice
+        default: all
+        options:
+          - all
+          - darwin-arm64
+          - darwin-x64
+          - linux-arm64
+          - linux-x64
+          - windows-fallback
       resource_soak_seconds:
         description: "Production proxy resource soak (0 disables, maximum 3600 seconds)"
         type: string
@@ -15,21 +26,14 @@ permissions:
 # Publishing stays separate so only these exact, verified VSIX files are uploaded.
 jobs:
   package:
+    if: inputs.validation_target != 'windows-fallback'
     name: ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ fromJSON('{"darwin-arm64":"macos-15","darwin-x64":"macos-15-intel","linux-arm64":"ubuntu-24.04-arm","linux-x64":"ubuntu-24.04"}')[matrix.target] }}
     timeout-minutes: 65
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: darwin-arm64
-            runner: macos-15
-          - target: darwin-x64
-            runner: macos-15-intel
-          - target: linux-arm64
-            runner: ubuntu-24.04-arm
-          - target: linux-x64
-            runner: ubuntu-24.04
+        target: ${{ (!inputs.validation_target || inputs.validation_target == 'all') && fromJSON('["darwin-arm64","darwin-x64","linux-arm64","linux-x64"]') || fromJSON(format('["{0}"]', inputs.validation_target)) }}
     defaults:
       run:
         shell: bash
@@ -87,7 +91,7 @@ jobs:
           retention-days: 30
   windows-fallback:
     name: Windows Node fallback
-    if: inputs.resource_soak_seconds != '0'
+    if: inputs.resource_soak_seconds != '0' && (!inputs.validation_target || inputs.validation_target == 'all' || inputs.validation_target == 'windows-fallback')
     runs-on: windows-latest
     timeout-minutes: 65
     steps:
