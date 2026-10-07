@@ -153,7 +153,8 @@ test("treats v2 dash placeholders as unresolved attribution", () => {
   });
 });
 
-test("native logical router helper starts without inherited hook environment", async () => {
+// Executable shebang fixtures model POSIX native helpers; Windows uses Node.
+test("native logical router helper starts without inherited hook environment", { skip: process.platform === "win32" }, async () => {
   const logicalPort = 61234;
   const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pm-router-env-"));
   const routerPath = path.join(tempDirectory, "router.js");
@@ -375,7 +376,7 @@ test("closes a logical router opened by a sync superseded during owner handoff",
   }
 });
 
-test("native logical router tunnels TLS responses after handshake", async () => {
+test("native logical router tunnels TLS responses after handshake", { skip: process.platform === "win32" }, async () => {
   const nativeRouterPath = path.resolve(__dirname, "../../../media/native/portmanager_tcp_router");
   if (!fs.existsSync(nativeRouterPath)) {
     return;
@@ -415,7 +416,7 @@ test("native logical router tunnels TLS responses after handshake", async () => 
   }
 });
 
-test("uses one shared native router process for many logical ports", async (context) => {
+test("uses one shared native router process for many logical ports", { skip: process.platform === "win32" }, async (context) => {
   const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pm-router-budget-"));
   const nativeRouterPath = path.join(tempDirectory, "native-router.js");
   const markerPath = path.join(tempDirectory, "native-router-started");
@@ -461,7 +462,7 @@ test("uses one shared native router process for many logical ports", async (cont
   }
 });
 
-test("keeps the native router process alive after all logical listeners close", async () => {
+test("keeps the native router process alive after all logical listeners close", { skip: process.platform === "win32" }, async () => {
   const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pm-router-idle-"));
   const nativeRouterPath = path.join(tempDirectory, "native-router.js");
   const markerPath = path.join(tempDirectory, "native-router-events");

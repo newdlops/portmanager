@@ -53,8 +53,11 @@ static int request_id(int output, char *id, size_t capacity, int64_t deadline) {
     if (strncmp(line, "CONNECT\t", 8) != 0) continue;
     char *end = strchr(line + 8, '\t');
     if (end == NULL || (size_t)(end - line - 8) >= capacity) return -1;
-    *end = '\0';
-    snprintf(id, capacity, "%s", line + 8);
+    /* The parsed boundary already proves the copy fits; keep that proof
+       explicit so GCC's fortified format diagnostics need no truncation. */
+    size_t length = (size_t)(end - line - 8);
+    memcpy(id, line + 8, length);
+    id[length] = '\0';
     return 0;
   }
   return -1;
