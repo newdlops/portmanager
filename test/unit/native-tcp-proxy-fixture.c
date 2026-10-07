@@ -2,6 +2,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <sys/socket.h>
 #include <time.h>
 
@@ -21,6 +22,17 @@ static int fixture_max_poll_ms = 0;
 static int fixture_late_ready = 0;
 static int fixture_late_immediate = 0;
 static atomic_int fixture_dns_calls = 0;
+static int64_t fixture_interrupt_ms = 1000000;
+
+/* Scheduler delays can legitimately exhaust a 35ms budget before three
+ * interruptions on a busy VM. Model their monotonic cost deterministically;
+ * the remaining setup modes still exercise real elapsed time and real fds. */
+static int fixture_clock_gettime(clockid_t clock, struct timespec *value) {
+  if (!fixture_interrupt || clock != CLOCK_MONOTONIC) return clock_gettime(clock, value);
+  value->tv_sec = (time_t)(fixture_interrupt_ms / 1000);
+  value->tv_nsec = (long)(fixture_interrupt_ms % 1000) * 1000000;
+  return 0;
+}
 
 static int fixture_getaddrinfo(const char *host, const char *service, const struct addrinfo *hints, struct addrinfo **results) {
   if (fixture_dns && host[0] == 'p' && host[1] == 'm') {
@@ -68,11 +80,11 @@ static int fixture_poll(struct pollfd *descriptors, nfds_t count, int timeout) {
       return 1;
     }
     if (fixture_interrupt && fixture_attempt_polls++ < 3) {
-      struct timespec pause = { .tv_sec = 0, .tv_nsec = 10000000 };
-      nanosleep(&pause, NULL);
+      fixture_interrupt_ms += 10;
       errno = EINTR;
       return -1;
     }
+    if (fixture_interrupt) { fixture_interrupt_ms += timeout; return 0; }
     return poll(NULL, 0, timeout);
   }
   return poll(descriptors, count, timeout);
@@ -81,10 +93,12 @@ static int fixture_poll(struct pollfd *descriptors, nfds_t count, int timeout) {
 #define connect fixture_connect
 #define poll fixture_poll
 #define getaddrinfo fixture_getaddrinfo
+#define clock_gettime fixture_clock_gettime
 #include "../../native/shared/pm_tcp_proxy.c"
 #undef connect
 #undef poll
 #undef getaddrinfo
+#undef clock_gettime
 
 /** Count real descriptors before and after repeated preparation failure. */
 static int fixture_fd_count(void) {

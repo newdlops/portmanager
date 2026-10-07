@@ -38,7 +38,10 @@ test("native TCP preparation has one deadline across addresses/EINTR and release
       assert.equal(result.fdDelta, 0, mode);
       assert.ok(result.elapsedMs < 600, mode + " must not restart its budget for each retry/address");
       if (mode !== "refused" && mode !== "shared") assert.ok(result.elapsedMs >= 120, mode + " must exercise an actual deadline");
-      if (mode === "interrupt") assert.ok(result.polls >= 12, "interrupts must consume the original budget");
+      if (mode === "interrupt") {
+        assert.equal(result.polls, 16, "each attempt has three interruptions and one final wait");
+        assert.equal(result.elapsedMs, 140, "interruptions consume four original 35ms budgets");
+      }
       if (mode === "addresses") {
         assert.ok(result.connectCalls >= 8, "both addresses must be attempted");
         assert.ok(result.maxPollMs <= 20, "the first address already consumed 20ms of the 35ms budget");
