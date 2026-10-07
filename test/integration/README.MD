@@ -12,7 +12,7 @@
 - 선택한 시간 동안 실제 확장 호스트에서 네트워크 생성/삭제, TCP FIN·취소,
   HTTP GET/POST와 유지 중인 SSE를 함께 반복하며 공통 예산 반환을 검증한다.
 - 확장 호스트와 데몬 및 자식들의 RSS, CPU 누적 시간, FD(Windows: handle),
-  이벤트 루프 p99와 heap을 JSON으로 기록한다.
+  이벤트 루프 p99와 heap 사용량·용량, external/ArrayBuffer bytes를 JSON으로 기록한다.
 
 ## 주요 진입점
 
@@ -27,6 +27,9 @@ CI 단계 자체도 20분 이하 workload에서는 30분으로 제한한다. mac
 GUI runner는 `caffeinate -dis`로 실행 중 화면/시스템 idle sleep을 막고, 종료하면
 자동 해제한다. 이것은 검증 환경을 일정하게 유지하기 위한 조치이며, 이전 지연의
 원인이 sleep이었다는 뜻은 아니다.
+VM 전체의 절전 차단은 준비 단계에서 시작해 실패 로그 업로드까지 유지한다.
+이 CI 소유 프로세스는 runner cleanup이 종료하며 80분 상한도 가진다. 로그 artifact
+업로드는 5분으로 제한하고, 실패/정리 수치는 job stdout에도 요약한다.
 GUI 앱에는 `caffeinate -dis -w <VS Code PID>`도 연결하고 정상 종료/실패/기한 초과
 때 함께 정리한다. ARM 장시간 재측정은 macOS 26 runner에서 같은 workload와 판정
 기준을 사용하며, JSON은 OS release/version을 기록한다. macOS 15의 단기 실제 확장
@@ -67,6 +70,11 @@ macOS arm64의 20분 실제 확장 호스트 검증은 아직 완료되지 않�
 못했다. 아래 네 환경은 원본 JSON에서 20분 이상 실행과 종료 후 예산 반환을
 확인한 확정 결과다.
 
+macOS 26 ARM의 2분 진단은 75 cycle·3,000 왕복·151 SSE heartbeat를 수행했다.
+FD 변화는 0이고 종료 후 예산은 모두 0이었지만, 호스트 RSS 증가 100.9 MiB로
+96 MiB 기준에 실패했다. 이 결과는 20분 통과 증거가 아니며, 전체 메모리 추세의
+추가 조사가 필요하다.
+
 | 환경 | 생성/삭제 cycle | TCP/HTTP 왕복 | 호스트 FD/handle 변화 | 호스트 RSS 중앙값: 첫/마지막 5분 (MiB) | 호스트 평균 CPU |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | darwin-x64 | 637 | 25,480 | -6 | 199.5 → 219.4 | 24.5% |
@@ -95,7 +103,8 @@ macOS 두 환경은 각각 837/837 통과, Linux 두 환경은 각각 820 통과
 
 - [네 환경 장시간 측정](https://github.com/newdlops/portmanager/actions/runs/37642599092): macOS arm64 job은 취소됐으며 위 네 job의 성공 artifact만 사용했다.
 - [macOS arm64 30초 실제 확장 호스트 검증](https://github.com/newdlops/portmanager/actions/runs/37665793532)
-- [macOS arm64 장시간 재측정 — 진행 중](https://github.com/newdlops/portmanager/actions/runs/37672196132)
+- [macOS 26 ARM 2분 RSS 실패 진단](https://github.com/newdlops/portmanager/actions/runs/37681529261)
+- [macOS arm64/macOS 26 장시간 재측정 — 진행 중](https://github.com/newdlops/portmanager/actions/runs/37677710829)
 - [최종 제품 코드의 다섯 환경 회귀 검증](https://github.com/newdlops/portmanager/actions/runs/37645246517)
 
 원본은 위 실행의 `logs-*` artifact와 로컬 `.tmp/proxy-resource-validation/20m/*/resource-soak.json`에 있다.

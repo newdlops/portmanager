@@ -68,7 +68,8 @@ const extensionPath = path.join(extensions, installed);
 // Bound the test runner as well as individual workload operations so a VS Code
 // startup/exit stall still uploads a useful CI log instead of waiting an hour.
 console.log("Packaged validation: run extension host tests");
-await runOwnedProcess(vscodeExecutablePath, [...profileArgs, "--disable-extensions", "--skip-welcome",
+const resourceReportPath = process.env.PM_TEST_RESOURCE_SOAK_REPORT ?? path.join(root, ".tmp", "resource-soak.json");
+try { await runOwnedProcess(vscodeExecutablePath, [...profileArgs, "--disable-extensions", "--skip-welcome",
   "--skip-release-notes", "--no-sandbox", "--disable-gpu-sandbox", "--disable-updates", "--no-cached-data",
   "--disable-workspace-trust", `--extensionDevelopmentPath=${extensionPath}`,
   `--extensionTestsPath=${path.join(root, "out", "test", "integration", "packaged-extension.js")}`, workspace], {
@@ -76,11 +77,23 @@ await runOwnedProcess(vscodeExecutablePath, [...profileArgs, "--disable-extensio
     PM_TEST_EXTENSION_PATH: extensionPath,
     PM_TEST_EXTENSION_VERSION: manifest.version,
     PM_TEST_RESOURCE_SOAK_SECONDS: process.env.PM_TEST_RESOURCE_SOAK_SECONDS ?? "0",
-    PM_TEST_RESOURCE_SOAK_REPORT: process.env.PM_TEST_RESOURCE_SOAK_REPORT ?? path.join(root, ".tmp", "resource-soak.json"),
+    PM_TEST_RESOURCE_SOAK_REPORT: resourceReportPath,
     TMPDIR: runtimeTemp,
     TMP: runtimeTemp,
     TEMP: runtimeTemp,
-  }, (soakSeconds + 180) * 1000);
+  }, (soakSeconds + 180) * 1000); }
+finally {
+  // Preserve the failure and cleanup counters in the job log even if the
+  // separate artifact transport fails. Full samples remain in the JSON file.
+  if (fs.existsSync(resourceReportPath)) {
+    try {
+      const report = JSON.parse(fs.readFileSync(resourceReportPath, "utf8"));
+      const { status, error, scope, platform, arch, seconds, requestedSeconds, cycles, exchanges, profile } = report;
+      console.log("Resource report summary:", JSON.stringify({ status, error, scope, platform, arch,
+        seconds, requestedSeconds, cycles, exchanges, profile, cleanup: report.samples.at(-1)?.resources }));
+    } catch (error) { console.error("Resource report summary unavailable:", error); }
+  }
+}
 console.log(`Verified installed ${manifest.publisher}.${manifest.name}@${manifest.version} (${target}).`);
 
 /** Keeps external downloads and application lifecycle failures reviewable in CI. */

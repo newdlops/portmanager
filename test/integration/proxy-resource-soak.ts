@@ -17,7 +17,8 @@ const execute = promisify(execFile);
 interface ProcessSample { pid: number; parent: number; command: string; rssKiB: number; cpuSeconds: number; descriptors: number }
 interface Sample {
   elapsedSeconds: number; phase: string; cycle: number; resources: ProxyResourceLimits;
-  heapBytes: number; eventLoopP99Ms: number; processes: ProcessSample[];
+  heapBytes: number; heapCapacityBytes: number; externalBytes: number; arrayBufferBytes: number;
+  eventLoopP99Ms: number; processes: ProcessSample[];
 }
 export interface ResourceSoakOptions {
   moduleRoot: string;
@@ -103,8 +104,10 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
     for (const [key, value] of Object.entries(current)) {
       assert.ok(value <= resources.budget.limits[key as keyof ProxyResourceLimits], `Exceeded ${key} budget`);
     }
+    const memory = process.memoryUsage();
     samples.push({ elapsedSeconds: (performance.now() - started) / 1000, phase, cycle, resources: current,
-      heapBytes: process.memoryUsage().heapUsed, eventLoopP99Ms: lag.percentile(99) / 1e6, processes });
+      heapBytes: memory.heapUsed, heapCapacityBytes: memory.heapTotal, externalBytes: memory.external,
+      arrayBufferBytes: memory.arrayBuffers, eventLoopP99Ms: lag.percentile(99) / 1e6, processes });
     lag.reset();
   };
   await sample("baseline");
