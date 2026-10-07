@@ -23,6 +23,10 @@
 VS Code 다운로드는 120초, 확장 활성화와 서비스 준비는 각 30초,
 각 제어/정리 작업은 10초, VS Code test runner는 부하 시간 +180초로 제한해
 시작·종료 지연이나 멈춘 작업을 로그가 남는 실패로 만든다.
+CI 단계 자체도 20분 이하 workload에서는 30분으로 제한한다. macOS의 일회용
+GUI runner는 `caffeinate -dis`로 실행 중 화면/시스템 idle sleep을 막고, 종료하면
+자동 해제한다. 이것은 검증 환경을 일정하게 유지하기 위한 조치이며, 이전 지연의
+원인이 sleep이었다는 뜻은 아니다.
 macOS/Linux는 설치된 VSIX의 실제 확장 호스트를 사용한다. Windows job은
 `proxy-resource-soak.ts`의 standalone 진입점에서 Node 대체 경로만 확인한다.
 Windows 네이티브 격리나 VSIX 활성화 지원을 뜻하지 않는다.

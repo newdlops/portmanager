@@ -29,7 +29,7 @@ jobs:
     if: inputs.validation_target != 'windows-fallback'
     name: ${{ matrix.target }}
     runs-on: ${{ fromJSON('{"darwin-arm64":"macos-15","darwin-x64":"macos-15-intel","linux-arm64":"ubuntu-24.04-arm","linux-x64":"ubuntu-24.04"}')[matrix.target] }}
-    timeout-minutes: 65
+    timeout-minutes: ${{ fromJSON(inputs.resource_soak_seconds || '0') > 1200 && 80 || 45 }}
     strategy:
       fail-fast: false
       matrix:
@@ -65,6 +65,9 @@ jobs:
       - name: Package target VSIX
         run: npm run package:${{ matrix.target }} 2>&1 | tee .tmp/release-logs/package.log
       - name: Install and activate packaged extension in a fresh profile
+        # Bound the runner step independently of the Node/app watchdog. A child
+        # retaining a pipeline or an unresponsive app must still produce a result.
+        timeout-minutes: ${{ fromJSON(inputs.resource_soak_seconds || '0') > 1200 && 70 || 30 }}
         env:
           PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
           PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
@@ -72,7 +75,10 @@ jobs:
           if [[ "$RUNNER_OS" == Linux ]]; then
             xvfb-run -a npm run test:packaged 2>&1 | tee .tmp/release-logs/activation.log
           else
-            npm run test:packaged 2>&1 | tee .tmp/release-logs/activation.log
+            # Keep the disposable GUI VM awake during long unattended workloads.
+            # This assertion ends with the command and never changes host settings.
+            pmset -g custom 2>&1 | tee .tmp/release-logs/power-settings.log
+            caffeinate -dis npm run test:packaged 2>&1 | tee .tmp/release-logs/activation.log
           fi
       - name: Upload verified VSIX
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
