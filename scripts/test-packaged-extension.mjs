@@ -9,7 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath, runTests } from "@vscode/test-electron";
+import { downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath } from "@vscode/test-electron";
 
 assert.equal(process.env.CI, "true", "Packaged activation requires a disposable CI runner.");
 assert.ok(process.env.RUNNER_TEMP, "RUNNER_TEMP must identify the disposable runner.");
@@ -68,12 +68,11 @@ const extensionPath = path.join(extensions, installed);
 // Bound the test runner as well as individual workload operations so a VS Code
 // startup/exit stall still uploads a useful CI log instead of waiting an hour.
 console.log("Packaged validation: run extension host tests");
-await withinBudget(runTests({
-  vscodeExecutablePath,
-  extensionDevelopmentPath: extensionPath,
-  extensionTestsPath: path.join(root, "out", "test", "integration", "packaged-extension.js"),
-  launchArgs: [...profileArgs, "--disable-extensions", "--skip-welcome", "--skip-release-notes", "--no-sandbox", workspace],
-  extensionTestsEnv: {
+await runOwnedProcess(vscodeExecutablePath, [...profileArgs, "--disable-extensions", "--skip-welcome",
+  "--skip-release-notes", "--no-sandbox", "--disable-gpu-sandbox", "--disable-updates", "--no-cached-data",
+  "--disable-workspace-trust", `--extensionDevelopmentPath=${extensionPath}`,
+  `--extensionTestsPath=${path.join(root, "out", "test", "integration", "packaged-extension.js")}`, workspace], {
+    ...process.env,
     PM_TEST_EXTENSION_PATH: extensionPath,
     PM_TEST_EXTENSION_VERSION: manifest.version,
     PM_TEST_RESOURCE_SOAK_SECONDS: process.env.PM_TEST_RESOURCE_SOAK_SECONDS ?? "0",
@@ -81,8 +80,7 @@ await withinBudget(runTests({
     TMPDIR: runtimeTemp,
     TMP: runtimeTemp,
     TEMP: runtimeTemp,
-  },
-}), (soakSeconds + 180) * 1000, "Packaged extension test runner");
+  }, (soakSeconds + 180) * 1000);
 console.log(`Verified installed ${manifest.publisher}.${manifest.name}@${manifest.version} (${target}).`);
 
 /** Keeps external downloads and application lifecycle failures reviewable in CI. */
@@ -91,4 +89,28 @@ async function withinBudget(work, milliseconds, operation) {
   try { return await Promise.race([work, new Promise((_resolve, reject) => {
     timer = setTimeout(() => reject(new Error(`${operation} exceeded ${milliseconds}ms.`)), milliseconds);
   })]); } finally { clearTimeout(timer); }
+}
+
+/** Own the disposable app's process group so a timeout also closes inherited
+ * output pipes. Rejecting the SDK Promise alone leaves its child running. */
+function runOwnedProcess(executable, args, env, milliseconds) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, { env, stdio: "inherit", detached: true });
+    let finished = false;
+    const finish = (error) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      // Only descendants of this freshly-created CI process group are owned.
+      // Close their inherited pipes even after the app's main process exits.
+      if (child.pid) { try { process.kill(-child.pid, "SIGKILL"); } catch {} }
+      if (error) reject(error); else resolve();
+    };
+    const timer = setTimeout(() => {
+      finish(new Error(`Packaged extension test runner exceeded ${milliseconds}ms.`));
+    }, milliseconds);
+    child.once("error", finish);
+    child.once("exit", (code, signal) => finish(code === 0 ? undefined
+      : new Error(`Packaged extension tests failed: ${code ?? signal}.`)));
+  });
 }
