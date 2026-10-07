@@ -188,9 +188,9 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
     for (const socket of liveSockets) socket.destroy();
     await Promise.all([close(echoServer), close(httpServer)]);
     lag.disable();
-    await until(() => resources.budget.used.connections === baseline.connections - 1
-      && resources.budget.used.upstreams === baseline.upstreams - 1
-      && resources.budget.used.httpRequests === baseline.httpRequests - 1, 10_000).catch(error => { failure ??= error; });
+    const cleanedBaseline = { ...baseline, listeners: baseline.listeners - 1, connections: baseline.connections - 1,
+      upstreams: baseline.upstreams - 1, httpRequests: baseline.httpRequests - 1 };
+    await until(() => equalResources(resources.budget.used, cleanedBaseline), 10_000).catch(error => { failure ??= error; });
     await sample("after-cleanup").catch(error => { failure ??= error; });
     fs.mkdirSync(path.dirname(options.reportPath), { recursive: true });
     fs.writeFileSync(options.reportPath, JSON.stringify({ platform: process.platform, arch: process.arch,
@@ -323,7 +323,10 @@ async function httpExchange(port: number, method: string, expected: string): Pro
         response.setEncoding("utf8");
         response.on("data", chunk => { received += chunk; });
         response.once("error", reject);
-        response.once("end", () => { assert.equal(response.statusCode, 200); resolve(received); });
+        response.once("end", () => {
+          if (response.statusCode !== 200) reject(new Error(`Unexpected soak HTTP status: ${response.statusCode}`));
+          else resolve(received);
+        });
       });
       request.once("error", reject);
       request.end(method === "POST" ? expected : undefined);

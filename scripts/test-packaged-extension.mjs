@@ -14,6 +14,8 @@ import { downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath, runTest
 assert.equal(process.env.CI, "true", "Packaged activation requires a disposable CI runner.");
 assert.ok(process.env.RUNNER_TEMP, "RUNNER_TEMP must identify the disposable runner.");
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const soakSeconds = Number(process.env.PM_TEST_RESOURCE_SOAK_SECONDS ?? 0);
+assert.ok(Number.isInteger(soakSeconds) && soakSeconds >= 0 && soakSeconds <= 3600, "Invalid resource soak duration.");
 const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const target = `${process.platform}-${process.arch}`;
 const vsix = path.join(root, `portmanager-${target}-${manifest.version}.vsix`);
@@ -35,11 +37,13 @@ fs.writeFileSync(path.join(userData, "User", "settings.json"), JSON.stringify({
   "portManager.developmentLogPath": "",
   // Avoid unrelated host ingress ownership during the controlled soak. The
   // workload opens the production managers explicitly under their shared budget.
-  "portManager.globalNetwork": false,
-  "portManager.logicalPortGateway": false,
-  "portManager.watchPreferredPorts": false,
-  "portManager.monitorAllListeningPorts": false,
-  "portManager.containerEventsWatch": false,
+  ...(soakSeconds > 0 ? {
+    "portManager.globalNetwork": false,
+    "portManager.logicalPortGateway": false,
+    "portManager.watchPreferredPorts": false,
+    "portManager.monitorAllListeningPorts": false,
+    "portManager.containerEventsWatch": false,
+  } : {}),
 }));
 const vscodeExecutablePath = await downloadAndUnzipVSCode("stable");
 const [cli, ...cliArgs] = resolveCliArgsFromVSCodeExecutablePath(vscodeExecutablePath);
