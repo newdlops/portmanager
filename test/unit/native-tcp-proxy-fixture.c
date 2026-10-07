@@ -30,7 +30,7 @@ static int64_t fixture_virtual_ms = 1000000;
  * interruptions/address attempts on a busy VM. Model their monotonic cost deterministically;
  * the remaining setup modes still exercise real elapsed time and real fds. */
 static int fixture_clock_gettime(clockid_t clock, struct timespec *value) {
-  if ((!fixture_interrupt && !fixture_addresses) || clock != CLOCK_MONOTONIC) return clock_gettime(clock, value);
+  if ((!fixture_timeout && !fixture_late_immediate) || clock != CLOCK_MONOTONIC) return clock_gettime(clock, value);
   value->tv_sec = (time_t)(fixture_virtual_ms / 1000);
   value->tv_nsec = (long)(fixture_virtual_ms % 1000) * 1000000;
   return 0;
@@ -80,8 +80,7 @@ static int fixture_connect(int fd, const struct sockaddr *address, socklen_t len
   fixture_connect_calls++;
   if (fixture_late_immediate) {
     /* Model descheduling across a successful connect syscall. */
-    struct timespec pause = { .tv_sec = 0, .tv_nsec = 50000000 };
-    nanosleep(&pause, NULL);
+    fixture_virtual_ms += 50;
     return 0;
   }
   if (fixture_addresses && fixture_connect_calls % 2 == 1) {
@@ -99,8 +98,7 @@ static int fixture_poll(struct pollfd *descriptors, nfds_t count, int timeout) {
     if (timeout > fixture_max_poll_ms) fixture_max_poll_ms = timeout;
     if (fixture_late_ready) {
       /* Readiness may win the kernel race, yet its worker resumes overdue. */
-      struct timespec pause = { .tv_sec = 0, .tv_nsec = 50000000 };
-      nanosleep(&pause, NULL);
+      fixture_virtual_ms += 50;
       descriptors[0].revents = POLLOUT;
       return 1;
     }
@@ -109,7 +107,8 @@ static int fixture_poll(struct pollfd *descriptors, nfds_t count, int timeout) {
       errno = EINTR;
       return -1;
     }
-    if (fixture_interrupt || fixture_addresses) { fixture_virtual_ms += timeout; return 0; }
+    fixture_virtual_ms += timeout;
+    return 0;
     return poll(NULL, 0, timeout);
   }
   return poll(descriptors, count, timeout);

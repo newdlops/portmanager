@@ -43,9 +43,13 @@ test("native TCP preparation has one deadline across addresses/EINTR and release
         assert.equal(result.elapsedMs, 140, "interruptions consume four original 35ms budgets");
       }
       if (mode === "addresses") {
-        assert.ok(result.connectCalls >= 8, "both addresses must be attempted");
-        assert.ok(result.maxPollMs <= 20, "the first address already consumed 20ms of the 35ms budget");
+        assert.equal(result.connectCalls, 8, "both addresses must be attempted");
+        assert.equal(result.maxPollMs, 15, "the first address already consumed 20ms of the 35ms budget");
+        assert.equal(result.elapsedMs, 140);
       }
+      if (mode === "timeout") assert.equal(result.elapsedMs, 140);
+      if (mode === "late-ready" || mode === "late-immediate") assert.equal(result.elapsedMs, 200,
+        "late success must be rejected against the original 35ms deadline");
       if (mode === "dns") {
         assert.equal(result.dnsCalls, 4, "blocked resolver jobs must stay bounded");
         assert.equal(result.connectCalls, 1, "numeric targets must bypass occupied DNS workers");
