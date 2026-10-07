@@ -27,6 +27,10 @@ CI 단계 자체도 20분 이하 workload에서는 30분으로 제한한다. mac
 GUI runner는 `caffeinate -dis`로 실행 중 화면/시스템 idle sleep을 막고, 종료하면
 자동 해제한다. 이것은 검증 환경을 일정하게 유지하기 위한 조치이며, 이전 지연의
 원인이 sleep이었다는 뜻은 아니다.
+GUI 앱에는 `caffeinate -dis -w <VS Code PID>`도 연결하고 정상 종료/실패/기한 초과
+때 함께 정리한다. ARM 장시간 재측정은 macOS 26 runner에서 같은 workload와 판정
+기준을 사용하며, JSON은 OS release/version을 기록한다. macOS 15의 단기 실제 확장
+호스트 검증과 전체 기능 회귀 결과도 별도로 보관한다.
 macOS/Linux는 설치된 VSIX의 실제 확장 호스트를 사용한다. Windows job은
 `proxy-resource-soak.ts`의 standalone 진입점에서 Node 대체 경로만 확인한다.
 Windows 네이티브 격리나 VSIX 활성화 지원을 뜻하지 않는다.
@@ -54,3 +58,49 @@ out/test/integration/proxy-resource-soak.js`로 실행할 수 있다. 확장은 
 확장 활성화는 사용자 단위 셸 자산과 DNS 포트를 사용하므로 일회용 CI에서만 실행한다.
 프로필과 임시 소켓은 매번 새로 생성한다. 화면 레이아웃, 관리자 DNS/TLS 설정,
 Compose/worktree 온보딩의 수동 검증을 대체하지 않는다.
+
+<!-- proxy-resource-validation-results:start -->
+## 2026-10-08 확정된 검증 결과와 남은 항목
+
+macOS arm64의 20분 실제 확장 호스트 검증은 아직 완료되지 않았다. 30초 실행과
+837개 단위·네이티브 테스트는 통과했으나, 장시간 CI의 완료 로그를 확보하지
+못했다. 아래 네 환경은 원본 JSON에서 20분 이상 실행과 종료 후 예산 반환을
+확인한 확정 결과다.
+
+| 환경 | 생성/삭제 cycle | TCP/HTTP 왕복 | 호스트 FD/handle 변화 | 호스트 RSS 중앙값: 첫/마지막 5분 (MiB) | 호스트 평균 CPU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| darwin-x64 | 637 | 25,480 | -6 | 199.5 → 219.4 | 24.5% |
+| linux-arm64 | 1,052 | 42,080 | +0 | 257.5 → 265.2 | 12.2% |
+| linux-x64 | 1,026 | 41,040 | +0 | 237.1 → 242.6 | 12.7% |
+| windows | 930 | 37,200 | -2 | 79.8 → 59.9 | 4.3% |
+
+총 3,645 cycle과 145,800 TCP/HTTP 왕복을 검증했다. 각 cycle에서
+3개 network의 노출/연결을 생성하고 제거하면서 유지 중인 SSE를 확인했다.
+종료 후 listener/client/upstream/native helper/DNS/route/HTTP 활성·대기/idle/control
+예산은 위 네 환경 모두 0이었다.
+
+macOS/Linux는 설치된 VSIX의 실제 확장 호스트·daemon과 자식을 측정했다.
+Windows는 production Node proxy manager의 standalone 실행이며, Windows
+네이티브 격리/VSIX 활성화 검증을 포함하지 않는다.
+
+RSS는 V8/allocator 보유와 지연 초기화 때문에 최초 수치로 즉시 돌아오지 않는다.
+표의 5분 중앙값과 전체 JSON 표본으로 변화를 확인할 수 있다. CPU는 호스트
+프로세스의 누적 CPU 시간으로 계산한 한 코어 기준 수치이며, fixture와 샘플링
+비용도 포함한다. process tree 표본에는 VS Code 서비스와 일시적 관찰 명령이
+포함될 수 있으므로 애플리케이션 자체의 단독 비용이나 RSS 상한을 뜻하지 않는다.
+
+제품 코드의 호스트명 bind 주소 선택 보완은 별도 전체 회귀 검증으로 확인했다.
+macOS 두 환경은 각각 837/837 통과, Linux 두 환경은 각각 820 통과·16 플랫폼
+조건 skip, Windows의 선택한 Node fallback suite는 98 통과·18 플랫폼 조건 skip이다.
+
+- [네 환경 장시간 측정](https://github.com/newdlops/portmanager/actions/runs/37642599092): macOS arm64 job은 취소됐으며 위 네 job의 성공 artifact만 사용했다.
+- [macOS arm64 30초 실제 확장 호스트 검증](https://github.com/newdlops/portmanager/actions/runs/37665793532)
+- [macOS arm64 장시간 재측정 — 진행 중](https://github.com/newdlops/portmanager/actions/runs/37672196132)
+- [최종 제품 코드의 다섯 환경 회귀 검증](https://github.com/newdlops/portmanager/actions/runs/37645246517)
+
+원본은 위 실행의 `logs-*` artifact와 로컬 `.tmp/proxy-resource-validation/20m/*/resource-soak.json`에 있다.
+장시간 측정 commit은 네 환경 `1c2c1c7`, 전 플랫폼 제품 회귀 검증은 `9ee2338`이다.
+이후에는 검증 fixture/CI의 시간 제한과 선택 실행을 보완했다. 장시간 workload는
+숫자 bind 주소를 사용하며 호스트명 주소 선택은 별도 DNS quota·취소·시간 제한·
+IPv4/IPv6 선택 테스트로 검증했다.
+<!-- proxy-resource-validation-results:end -->

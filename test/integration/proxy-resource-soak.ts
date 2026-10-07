@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as net from "node:net";
 import * as path from "node:path";
+import * as os from "node:os";
 import { execFile } from "node:child_process";
 import { once } from "node:events";
 import { monitorEventLoopDelay, performance } from "node:perf_hooks";
@@ -200,7 +201,7 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
     await sample("after-cleanup").catch(error => { failure ??= error; });
     fs.mkdirSync(path.dirname(options.reportPath), { recursive: true });
     fs.writeFileSync(options.reportPath, JSON.stringify({ platform: process.platform, arch: process.arch,
-      nodeVersion: process.version, commit: process.env.GITHUB_SHA,
+      nodeVersion: process.version, osRelease: os.release(), osVersion: os.version(), commit: process.env.GITHUB_SHA,
       scope: options.service ? "real-extension-host-and-daemon" : "standalone-proxy-managers",
       warmupSeconds: options.service ? 30 : 0,
       nativeProxy: nativeProxyPath !== undefined, nativeRouter: nativeRouterPath !== undefined,

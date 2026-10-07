@@ -96,11 +96,13 @@ async function withinBudget(work, milliseconds, operation) {
 function runOwnedProcess(executable, args, env, milliseconds) {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, { env, stdio: "inherit", detached: true });
+    let wakeGuard;
     let finished = false;
     const finish = (error) => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      wakeGuard?.kill("SIGTERM");
       // Only descendants of this freshly-created CI process group are owned.
       // Close their inherited pipes even after the app's main process exits.
       if (child.pid) { try { process.kill(-child.pid, "SIGKILL"); } catch {} }
@@ -112,5 +114,15 @@ function runOwnedProcess(executable, args, env, milliseconds) {
     child.once("error", finish);
     child.once("exit", (code, signal) => finish(code === 0 ? undefined
       : new Error(`Packaged extension tests failed: ${code ?? signal}.`)));
+    if (process.platform === "darwin" && child.pid) {
+      // A command wrapper keeps the VM awake; -w additionally associates the
+      // assertion with the actual GUI app rather than npm's process identity.
+      wakeGuard = spawn("/usr/bin/caffeinate", ["-dis", "-w", String(child.pid)], { stdio: "ignore" });
+      wakeGuard.once("error", finish);
+      wakeGuard.once("exit", (code, signal) => {
+        if (!finished && (code !== 0 || signal)) finish(new Error(`macOS app wake guard failed: ${code ?? signal}.`));
+      });
+      console.log(`Packaged validation: macOS app wake assertion pid=${child.pid}`);
+    }
   });
 }

@@ -28,7 +28,7 @@ jobs:
   package:
     if: inputs.validation_target != 'windows-fallback'
     name: ${{ matrix.target }}
-    runs-on: ${{ fromJSON('{"darwin-arm64":"macos-15","darwin-x64":"macos-15-intel","linux-arm64":"ubuntu-24.04-arm","linux-x64":"ubuntu-24.04"}')[matrix.target] }}
+    runs-on: ${{ fromJSON('{"darwin-arm64":"macos-26","darwin-x64":"macos-15-intel","linux-arm64":"ubuntu-24.04-arm","linux-x64":"ubuntu-24.04"}')[matrix.target] }}
     timeout-minutes: ${{ fromJSON(inputs.resource_soak_seconds || '0') > 1200 && 80 || 45 }}
     strategy:
       fail-fast: false
