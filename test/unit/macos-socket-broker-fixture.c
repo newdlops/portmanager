@@ -25,7 +25,7 @@ int main(int argc, char **argv) {
     target.sin_port = htons((unsigned short)atoi(argv[2]));
     target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0 || connect(fd, (struct sockaddr *)&target, sizeof(target)) != 0) return 1;
+    if (fd < 0 || (strcmp(argv[2], "unconnected") != 0 && connect(fd, (struct sockaddr *)&target, sizeof(target)) != 0)) return 1;
     char byte = 'x';
     struct iovec data = { &byte, 1 };
     union { struct cmsghdr aligned; char bytes[CMSG_SPACE(sizeof(int))]; } ancillary;

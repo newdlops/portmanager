@@ -80,6 +80,7 @@ test("macOS kernel policy rejects raw cross-network access with the hook disable
   await probe(true, "read", own.envFilePath);
   await probe(true, "write", path.join(own.filesDirectory, "state.pid"));
   await probe(true, "brokered-tcp", ownSocket);
+  await probe(true, "socket-only");
   await probe(false, "tcp", "127.0.0.1", String(ownPort));
   await probe(false, "read", other.envFilePath);
   await probe(false, "read", controllerPath);
@@ -106,4 +107,18 @@ test("macOS kernel policy rejects raw cross-network access with the hook disable
   assert.equal(fs.readFileSync(sharedSource, "utf8"), "fixture", "shared source writes remain explicitly permitted");
   const node = await run("/usr/bin/sandbox-exec", ["-p", profile, process.execPath, "-e", "process.stdout.write('runtime-ok')"], { env: environment, timeout: 5000 });
   assert.equal(node.stdout, "runtime-ok", "the installed host Node runtime must work inside the policy");
+  const unconnectedSocket = path.join(socketDirectory, "u.sock");
+  const unconnectedBroker = spawn(brokerExecutable, [unconnectedSocket, "unconnected"], { stdio: ["ignore", "pipe", "pipe"] });
+  context.after(async () => {
+    if (unconnectedBroker.exitCode === null && unconnectedBroker.signalCode === null) {
+      unconnectedBroker.kill("SIGTERM"); await once(unconnectedBroker, "exit");
+    }
+  });
+  await once(unconnectedBroker.stdout!, "data");
+  const unconnectedProfile = buildMacosNetworkSandboxProfile({ networkId: "network-a", namespaceDirectories: [own.directory],
+    sharedWorkspaceDirectories: [root], agentSocketPath: unconnectedSocket });
+  await assert.rejects(run("/usr/bin/sandbox-exec", ["-p", unconnectedProfile, executable, "brokered-connect",
+    unconnectedSocket, "127.0.0.1", String(otherPort)], { env: environment, timeout: 5000 }),
+    error => (error as { code?: number; stdout?: string }).code === 1 && /denied errno=(1|13)/.test((error as { stdout?: string }).stdout ?? ""),
+    "a broker-created unconnected FD must not widen the caller's raw connect authority");
 });

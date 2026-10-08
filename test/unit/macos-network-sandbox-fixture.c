@@ -18,7 +18,10 @@ int main(int argc, char **argv) {
   }
   int fd = -1;
   int result = -1;
-  if (argc == 3 && strcmp(argv[1], "read") == 0) {
+  if (argc == 2 && strcmp(argv[1], "socket-only") == 0) {
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    result = fd >= 0 ? 0 : -1;
+  } else if (argc == 3 && strcmp(argv[1], "read") == 0) {
     fd = open(argv[2], O_RDONLY);
     if (fd >= 0) {
       char byte;
@@ -42,7 +45,8 @@ int main(int argc, char **argv) {
     snprintf(address.sun_path, sizeof(address.sun_path), "%s", argv[2]);
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd >= 0) result = connect(fd, (struct sockaddr *)&address, sizeof(address));
-  } else if (argc == 3 && strcmp(argv[1], "brokered-tcp") == 0) {
+  } else if ((argc == 3 && strcmp(argv[1], "brokered-tcp") == 0) ||
+             (argc == 5 && strcmp(argv[1], "brokered-connect") == 0)) {
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
@@ -61,7 +65,14 @@ int main(int argc, char **argv) {
     if (header == NULL || header->cmsg_type != SCM_RIGHTS) return 3;
     memcpy(&fd, CMSG_DATA(header), sizeof(fd));
     close(control);
-    result = write(fd, "fixture", 7) == 7 ? 0 : -1;
+    if (argc == 5) {
+      struct sockaddr_in target;
+      memset(&target, 0, sizeof(target));
+      target.sin_family = AF_INET;
+      target.sin_port = htons((unsigned short)atoi(argv[4]));
+      if (inet_pton(AF_INET, argv[3], &target.sin_addr) != 1) return 2;
+      result = connect(fd, (struct sockaddr *)&target, sizeof(target));
+    } else result = write(fd, "fixture", 7) == 7 ? 0 : -1;
   } else if (argc == 3 && strcmp(argv[1], "signal") == 0) {
     result = kill((pid_t)atoi(argv[2]), 0);
   } else if (argc == 3 && strcmp(argv[1], "unlink") == 0) {

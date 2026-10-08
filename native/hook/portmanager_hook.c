@@ -31,6 +31,7 @@
 
 #include "../shared/pm_dev_log.h"
 #include "../shared/pm_network_namespace.h"
+#include "../network-broker/pm_network_broker_client.h"
 
 /*
  * Port Manager native socket hook.
@@ -77,6 +78,8 @@
 
 typedef int (*pm_bind_fn)(int, const struct sockaddr *, socklen_t);
 typedef int (*pm_connect_fn)(int, const struct sockaddr *, socklen_t);
+typedef int (*pm_listen_fn)(int, int);
+typedef int (*pm_accept_fn)(int, struct sockaddr *, socklen_t *);
 typedef int (*pm_getsockname_fn)(int, struct sockaddr *, socklen_t *);
 typedef int (*pm_getifaddrs_fn)(struct ifaddrs **);
 typedef int (*pm_execve_fn)(const char *, char *const [], char *const []);
@@ -138,6 +141,8 @@ typedef struct pm_cached_route {
 #if defined(__APPLE__)
 static pm_bind_fn pm_real_bind = bind;
 static pm_connect_fn pm_real_connect = connect;
+static pm_listen_fn pm_real_listen = listen;
+static pm_accept_fn pm_real_accept = accept;
 static pm_getsockname_fn pm_real_getsockname = getsockname;
 static pm_getifaddrs_fn pm_real_getifaddrs = getifaddrs;
 static pm_execve_fn pm_real_execve = execve;
@@ -152,6 +157,8 @@ static pm_kill_fn pm_real_kill = kill;
 #else
 static pm_bind_fn pm_real_bind = NULL;
 static pm_connect_fn pm_real_connect = NULL;
+static pm_listen_fn pm_real_listen = NULL;
+static pm_accept_fn pm_real_accept = NULL;
 static pm_getsockname_fn pm_real_getsockname = NULL;
 static pm_getifaddrs_fn pm_real_getifaddrs = NULL;
 static pm_execve_fn pm_real_execve = NULL;
@@ -1653,6 +1660,8 @@ static void pm_ensure_symbols(void) {
   if (pm_real_connect == NULL) {
     pm_real_connect = (pm_connect_fn)pm_resolve_symbol("connect");
   }
+  if (pm_real_listen == NULL) pm_real_listen = (pm_listen_fn)pm_resolve_symbol("listen");
+  if (pm_real_accept == NULL) pm_real_accept = (pm_accept_fn)pm_resolve_symbol("accept");
 
   if (pm_real_getsockname == NULL) {
     pm_real_getsockname = (pm_getsockname_fn)pm_resolve_symbol("getsockname");
@@ -4457,6 +4466,56 @@ static int pm_bind_localhost_relocation(
   return 0;
 }
 
+/* Kernel mode precedes cooperative routing and opt-out env. The broker fixes
+ * the realm independently; changing env only loses access, never widens it. */
+static const char *pm_network_broker_path(void) {
+  const char *path = getenv("PORT_MANAGER_NETWORK_BROKER_SOCKET");
+  return pm_hook_depth == 0 && path != NULL && path[0] != '\0' ? path : NULL;
+}
+static int pm_network_broker_tcp_fd(int fd) {
+  int type; socklen_t size = sizeof(type);
+  struct sockaddr_storage local; socklen_t length = sizeof(local);
+  return pm_real_getsockname != NULL && getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &size) == 0 && type == SOCK_STREAM &&
+    pm_real_getsockname(fd, (struct sockaddr *)&local, &length) == 0 && (local.ss_family == AF_INET || local.ss_family == AF_INET6);
+}
+static int pm_network_broker_operation(int fd, int operation, const struct sockaddr *address, socklen_t length,
+    int backlog, unsigned int flags, struct sockaddr *peer, socklen_t *peer_length) {
+  pm_nb_request request;
+  memset(&request, 0, sizeof(request)); request.magic = PM_NB_MAGIC; request.version = PM_NB_VERSION;
+  request.operation = (uint16_t)operation; request.backlog = backlog; request.flags = flags;
+  if (address != NULL) {
+    if (length > sizeof(request.address)) { errno = EINVAL; return -1; }
+    request.address_length = length; memcpy(request.address, address, length);
+  }
+  pm_nb_response response;
+  int received = -1;
+  const char *path = pm_network_broker_path();
+  pm_hook_depth++;
+  int result = pm_nb_client_call(path, &request, fd, &response, &received);
+  int error = errno;
+  pm_hook_depth--;
+  if (result != 0) { errno = error; return -1; }
+  if (operation != PM_NB_ACCEPT) return response.result;
+  if (received < 0) { errno = EPROTO; return -1; }
+  if (!(flags & PM_NB_CLOEXEC) && fcntl(received, F_SETFD, 0) != 0) { error = errno; close(received); errno = error; return -1; }
+  if (peer != NULL && peer_length != NULL) {
+    socklen_t copy = *peer_length < response.address_length ? *peer_length : response.address_length;
+    memcpy(peer, response.address, copy); *peer_length = response.address_length;
+  }
+  return received;
+}
+static int pm_listen_hook(int fd, int backlog) {
+  pm_ensure_symbols();
+  if (pm_network_broker_path() != NULL && pm_network_broker_tcp_fd(fd)) return pm_network_broker_operation(fd, PM_NB_LISTEN, NULL, 0, backlog, 0, NULL, NULL);
+  if (pm_real_listen == NULL) { errno = ENOSYS; return -1; }
+  return pm_real_listen(fd, backlog);
+}
+static int pm_accept_hook(int fd, struct sockaddr *address, socklen_t *length) {
+  pm_ensure_symbols();
+  if (pm_network_broker_path() != NULL && pm_network_broker_tcp_fd(fd)) return pm_network_broker_operation(fd, PM_NB_ACCEPT, NULL, 0, 0, 0, address, length);
+  if (pm_real_accept == NULL) { errno = ENOSYS; return -1; }
+  return pm_real_accept(fd, address, length);
+}
 static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   struct sockaddr_storage rewritten;
   char host[128];
@@ -4472,6 +4531,10 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
   if (pm_real_bind == NULL) {
     errno = ENOSYS;
     return -1;
+  }
+
+  if (pm_network_broker_path() != NULL && pm_is_supported_sockaddr(addr, addrlen) && pm_network_broker_tcp_fd(sockfd)) {
+    return pm_network_broker_operation(sockfd, PM_NB_BIND, addr, addrlen, 0, 0, NULL, NULL);
   }
 
   if (!pm_hook_enabled() || pm_hook_depth > 0 || !pm_is_supported_sockaddr(addr, addrlen)) {
@@ -4734,6 +4797,10 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
   if (pm_real_connect == NULL) {
     errno = ENOSYS;
     return -1;
+  }
+
+  if (pm_network_broker_path() != NULL && pm_is_supported_sockaddr(addr, addrlen) && pm_network_broker_tcp_fd(sockfd)) {
+    return pm_network_broker_operation(sockfd, PM_NB_CONNECT, addr, addrlen, 0, 0, NULL, NULL);
   }
 
   if (pm_should_block_docker_socket(addr, addrlen)) {
@@ -6899,6 +6966,8 @@ static int pm_uname_hook(struct utsname *buf) {
 
 PM_DYLD_INTERPOSE(pm_bind_hook, bind);
 PM_DYLD_INTERPOSE(pm_connect_hook, connect);
+PM_DYLD_INTERPOSE(pm_listen_hook, listen);
+PM_DYLD_INTERPOSE(pm_accept_hook, accept);
 PM_DYLD_INTERPOSE(pm_getsockname_hook, getsockname);
 PM_DYLD_INTERPOSE(pm_getifaddrs_hook, getifaddrs);
 PM_DYLD_INTERPOSE(pm_execve_hook, execve);
@@ -6924,6 +6993,8 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   return pm_connect_hook(sockfd, addr, addrlen);
 }
+int listen(int sockfd, int backlog) { return pm_listen_hook(sockfd, backlog); }
+int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) { return pm_accept_hook(sockfd, addr, addrlen); }
 
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
   return pm_getsockname_hook(sockfd, addr, addrlen);
