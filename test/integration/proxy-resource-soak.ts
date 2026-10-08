@@ -6,9 +6,12 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { execFile } from "node:child_process";
 import { once } from "node:events";
-import { monitorEventLoopDelay, performance } from "node:perf_hooks";
+import type { HeapProfiler } from "node:inspector";
+import { Session } from "node:inspector/promises";
+import { constants, monitorEventLoopDelay, performance, PerformanceObserver } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
+import { getHeapCodeStatistics, getHeapSpaceStatistics, getHeapStatistics } from "node:v8";
 import type { PortManagerNetworkService } from "../../src/extension/network-service";
 import type { ProxyResourceLimits } from "../../src/core/networks/proxy-resource-budget";
 import type { HostPortExposure, LogicalNetwork } from "../../src/shared/types";
@@ -18,6 +21,11 @@ interface ProcessSample { pid: number; parent: number; command: string; rssKiB: 
 interface Sample {
   elapsedSeconds: number; phase: string; cycle: number; resources: ProxyResourceLimits;
   heapBytes: number; heapCapacityBytes: number; externalBytes: number; arrayBufferBytes: number;
+  heapSpaces: ReturnType<typeof getHeapSpaceStatistics>;
+  heapCode: ReturnType<typeof getHeapCodeStatistics>;
+  nativeContexts: number; detachedContexts: number; globalHandleBytes: number;
+  gc: { count: number; major: number; minor: number; durationMs: number };
+  allocationSites?: ReturnType<typeof summarizeAllocations>;
   eventLoopP99Ms: number; processes: ProcessSample[];
 }
 export interface ResourceSoakOptions {
@@ -98,6 +106,36 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
   let cycle = 0;
   let exchanges = 0;
   let failure: unknown;
+  const gc = { count: 0, major: 0, minor: 0, durationMs: 0 };
+  const gcObserver = new PerformanceObserver(entries => {
+    for (const entry of entries.getEntries()) {
+      const kind = (entry as typeof entry & { detail: { kind: number } }).detail.kind;
+      gc.count++;
+      gc.durationMs += entry.duration;
+      if (kind === constants.NODE_PERFORMANCE_GC_MAJOR) gc.major++;
+      if (kind === constants.NODE_PERFORMANCE_GC_MINOR) gc.minor++;
+    }
+  });
+  gcObserver.observe({ entryTypes: ["gc"] });
+  // Sampling is diagnostic-only: no object values or heap snapshot are saved,
+  // and the normal 20-minute gate never changes GC behavior or its thresholds.
+  const heapSession = process.env.PM_TEST_RESOURCE_HEAP_SAMPLING === "1" ? new Session() : undefined;
+  const writeReport = (status: "running" | "passed" | "failed"): void => {
+    const report = { platform: process.platform, arch: process.arch,
+      nodeVersion: process.version, osRelease: os.release(), osVersion: os.version(), commit: process.env.GITHUB_SHA,
+      scope: options.service ? "real-extension-host-and-daemon" : "standalone-proxy-managers",
+      warmupSeconds: options.service ? 30 : 0, heapSampling: heapSession !== undefined,
+      nativeProxy: nativeProxyPath !== undefined, nativeRouter: nativeRouterPath !== undefined,
+      seconds: (performance.now() - started) / 1000, requestedSeconds: options.seconds, cycles: cycle,
+      exchanges, sseHeartbeats: heartbeats, limits: resources.budget.limits, baseline,
+      status, error: failure === undefined ? undefined : String(failure),
+      profile: summarize(samples, process.pid), samples };
+    fs.mkdirSync(path.dirname(options.reportPath), { recursive: true });
+    // Replace complete checkpoints so interrupted CI uploads retain readable
+    // evidence. A running checkpoint can never be mistaken for a pass.
+    fs.writeFileSync(`${options.reportPath}.tmp`, JSON.stringify(report, null, 2));
+    fs.renameSync(`${options.reportPath}.tmp`, options.reportPath);
+  };
   const sample = async (phase: string): Promise<void> => {
     const processes = await processSamples(process.pid, options.service?.getDaemonStatus().pid);
     const current = resources.budget.used;
@@ -105,13 +143,24 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
       assert.ok(value <= resources.budget.limits[key as keyof ProxyResourceLimits], `Exceeded ${key} budget`);
     }
     const memory = process.memoryUsage();
+    const heap = getHeapStatistics();
+    const allocations = heapSession && (phase === "after-cleanup" || phase === "settled" && cycle % 25 === 0)
+      ? summarizeAllocations((await heapSession.post("HeapProfiler.getSamplingProfile")).profile) : undefined;
     samples.push({ elapsedSeconds: (performance.now() - started) / 1000, phase, cycle, resources: current,
       heapBytes: memory.heapUsed, heapCapacityBytes: memory.heapTotal, externalBytes: memory.external,
-      arrayBufferBytes: memory.arrayBuffers, eventLoopP99Ms: lag.percentile(99) / 1e6, processes });
+      arrayBufferBytes: memory.arrayBuffers, heapSpaces: getHeapSpaceStatistics(), heapCode: getHeapCodeStatistics(),
+      nativeContexts: heap.number_of_native_contexts, detachedContexts: heap.number_of_detached_contexts,
+      globalHandleBytes: heap.used_global_handles_size, gc: { ...gc }, allocationSites: allocations,
+      eventLoopP99Ms: lag.percentile(99) / 1e6, processes });
     lag.reset();
+    writeReport("running");
   };
-  await sample("baseline");
   try {
+    if (heapSession) {
+      heapSession.connect();
+      await heapSession.post("HeapProfiler.startSampling", { samplingInterval: 64 * 1024 });
+    }
+    await sample("baseline");
     while (performance.now() - started < options.seconds * 1000) {
       cycle++;
       const networks: LogicalNetwork[] = [];
@@ -202,19 +251,32 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
       upstreams: baseline.upstreams - 1, httpRequests: baseline.httpRequests - 1 };
     await until(() => equalResources(resources.budget.used, cleanedBaseline), 10_000).catch(error => { failure ??= error; });
     await sample("after-cleanup").catch(error => { failure ??= error; });
-    fs.mkdirSync(path.dirname(options.reportPath), { recursive: true });
-    fs.writeFileSync(options.reportPath, JSON.stringify({ platform: process.platform, arch: process.arch,
-      nodeVersion: process.version, osRelease: os.release(), osVersion: os.version(), commit: process.env.GITHUB_SHA,
-      scope: options.service ? "real-extension-host-and-daemon" : "standalone-proxy-managers",
-      warmupSeconds: options.service ? 30 : 0,
-      nativeProxy: nativeProxyPath !== undefined, nativeRouter: nativeRouterPath !== undefined,
-      seconds: (performance.now() - started) / 1000, requestedSeconds: options.seconds, cycles: cycle,
-      exchanges, sseHeartbeats: heartbeats, limits: resources.budget.limits, baseline,
-      status: failure === undefined ? "passed" : "failed", error: failure === undefined ? undefined : String(failure),
-      profile: summarize(samples, process.pid), samples }, null, 2));
+    gcObserver.disconnect();
+    heapSession?.disconnect();
+    writeReport(failure === undefined ? "passed" : "failed");
   }
   if (failure !== undefined) throw failure;
   console.log(`Resource soak passed: ${cycle} cycles, ${exchanges} exchanges; ${options.reportPath}`);
+}
+
+/** Sampled allocation stacks contain code locations, never application object values. */
+function summarizeAllocations(profile: HeapProfiler.SamplingHeapProfile) {
+  const sites = new Map<string, { functionName: string; url: string; line: number; bytes: number; callers: string[] }>();
+  const visit = (node: HeapProfiler.SamplingHeapProfileNode, parents: string[]): void => {
+    const frame = node.callFrame;
+    const location = `${frame.functionName || "(anonymous)"} ${frame.url}:${frame.lineNumber + 1}`;
+    const callers = parents.slice(-8);
+    if (node.selfSize > 0) {
+      const key = JSON.stringify([...callers, location]);
+      const site = sites.get(key) ?? { functionName: frame.functionName, url: frame.url, line: frame.lineNumber + 1, bytes: 0, callers };
+      site.bytes += node.selfSize;
+      sites.set(key, site);
+    }
+    for (const child of node.children) visit(child, [...parents, location]);
+  };
+  visit(profile.head, []);
+  const entries = [...sites.values()].sort((left, right) => right.bytes - left.bytes);
+  return { sampledLiveBytes: entries.reduce((sum, site) => sum + site.bytes, 0), sites: entries.slice(0, 40) };
 }
 
 /** OS counters are sampled infrequently; short-lived measurement commands are excluded. */

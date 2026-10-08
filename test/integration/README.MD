@@ -13,6 +13,8 @@
   HTTP GET/POST와 유지 중인 SSE를 함께 반복하며 공통 예산 반환을 검증한다.
 - 확장 호스트와 데몬 및 자식들의 RSS, CPU 누적 시간, FD(Windows: handle),
   이벤트 루프 p99와 heap 사용량·용량, external/ArrayBuffer bytes를 JSON으로 기록한다.
+- heap 영역·코드 용량·GC·context/handle 수를 기록하고 매 표본 뒤 원자적으로 checkpoint를 저장한다.
+  중단된 checkpoint의 `running` 상태는 검증 통과가 아니다.
 
 ## 주요 진입점
 
@@ -23,6 +25,9 @@
 VS Code 다운로드는 120초, 확장 활성화와 서비스 준비는 각 30초,
 각 제어/정리 작업은 10초, VS Code test runner는 부하 시간 +180초로 제한해
 시작·종료 지연이나 멈춘 작업을 로그가 남는 실패로 만든다.
+원인 조사 실행은 `resource_heap_sampling=true`로 64KiB 간격의 할당 함수 표본을
+추가한다. 객체 값·heap snapshot은 저장하지 않는다. 최종 20분 gate에서는 이
+옵션을 끄며 GC 강제 실행과 기존 FD/RSS 판정 기준 변경은 하지 않는다.
 CI 단계 자체도 20분 이하 workload에서는 30분으로 제한한다. macOS의 일회용
 GUI runner는 `caffeinate -dis`로 실행 중 화면/시스템 idle sleep을 막고, 종료하면
 자동 해제한다. 이것은 검증 환경을 일정하게 유지하기 위한 조치이며, 이전 지연의
@@ -75,6 +80,12 @@ FD 변화는 0이고 종료 후 예산은 모두 0이었지만, 호스트 RSS �
 96 MiB 기준에 실패했다. 이 결과는 20분 통과 증거가 아니며, 전체 메모리 추세의
 추가 조사가 필요하다.
 
+최신 20분 재측정(`b5f754d`, run `37686151446`)은 CI가 45분 실행 상한을 넘겼고
+취소로 종료됐다. job log 조회는 `404 BlobNotFound`, artifact는 0개였으므로
+전체 heap 용량·external/ArrayBuffer·RSS 추세를 회수하지 못했다. 정상적인
+장시간 실행과 로그 회수가 가능한 일회용 macOS ARM 환경에서 추가 검증이 필요하다.
+단계 실패나 로그 부재를 검증 통과로 간주하지 않으며 96 MiB 기준은 유지한다.
+
 | 환경 | 생성/삭제 cycle | TCP/HTTP 왕복 | 호스트 FD/handle 변화 | 호스트 RSS 중앙값: 첫/마지막 5분 (MiB) | 호스트 평균 CPU |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | darwin-x64 | 637 | 25,480 | -6 | 199.5 → 219.4 | 24.5% |
@@ -104,7 +115,7 @@ macOS 두 환경은 각각 837/837 통과, Linux 두 환경은 각각 820 통과
 - [네 환경 장시간 측정](https://github.com/newdlops/portmanager/actions/runs/37642599092): macOS arm64 job은 취소됐으며 위 네 job의 성공 artifact만 사용했다.
 - [macOS arm64 30초 실제 확장 호스트 검증](https://github.com/newdlops/portmanager/actions/runs/37665793532)
 - [macOS 26 ARM 2분 RSS 실패 진단](https://github.com/newdlops/portmanager/actions/runs/37681529261)
-- [macOS arm64/macOS 26 장시간 재측정 — 진행 중](https://github.com/newdlops/portmanager/actions/runs/37677710829)
+- [macOS arm64/macOS 26 장시간 재측정 — 취소, 결과 미회수](https://github.com/newdlops/portmanager/actions/runs/37686151446)
 - [최종 제품 코드의 다섯 환경 회귀 검증](https://github.com/newdlops/portmanager/actions/runs/37645246517)
 
 원본은 위 실행의 `logs-*` artifact와 로컬 `.tmp/proxy-resource-validation/20m/*/resource-soak.json`에 있다.

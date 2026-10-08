@@ -18,6 +18,10 @@ on:
         description: "Production proxy resource soak (0 disables, maximum 3600 seconds)"
         type: string
         default: "0"
+      resource_heap_sampling:
+        description: "Collect allocation-site diagnostics (keep off for the final resource gate)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -76,6 +80,7 @@ jobs:
         env:
           PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
           PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
+          PM_TEST_RESOURCE_HEAP_SAMPLING: ${{ inputs.resource_heap_sampling && '1' || '0' }}
         run: |
           if [[ "$RUNNER_OS" == Linux ]]; then
             xvfb-run -a npm run test:packaged 2>&1 | tee .tmp/release-logs/activation.log
@@ -121,6 +126,7 @@ jobs:
         env:
           PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
           PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
+          PM_TEST_RESOURCE_HEAP_SAMPLING: ${{ inputs.resource_heap_sampling && '1' || '0' }}
       - name: Upload Windows fallback report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
