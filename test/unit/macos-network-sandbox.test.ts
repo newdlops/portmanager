@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 
 import { buildMacosNetworkSandboxProfile } from "../../src/platform/process/macos-network-sandbox";
 import { networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
+import { ensureAgentControllerToken, ensureAgentNetworkToken, getAgentNetworkTokenPath, readAgentControllerToken } from "../../src/agent/agent-authorization";
 
 const run = promisify(execFile);
 
@@ -25,6 +26,10 @@ test("macOS kernel policy rejects raw cross-network access with the hook disable
   fs.mkdirSync(other.filesDirectory, { recursive: true, mode: 0o700 });
   fs.writeFileSync(own.envFilePath, "synthetic-a\n", { mode: 0o600 });
   fs.writeFileSync(other.envFilePath, "synthetic-b\n", { mode: 0o600 });
+  const controllerPath = path.join(root, ".portmanager", "security", "agent-control", "fixture.key");
+  const controllerToken = ensureAgentControllerToken(controllerPath);
+  ensureAgentNetworkToken("fixture", "network-a", controllerPath);
+  ensureAgentNetworkToken("fixture", "network-b", controllerPath);
   const sharedSource = path.join(root, "shared-source.txt");
   fs.writeFileSync(sharedSource, "host source stays unchanged\n");
   const executable = path.join(root, "raw-probe");
@@ -77,6 +82,11 @@ test("macOS kernel policy rejects raw cross-network access with the hook disable
   await probe(true, "brokered-tcp", ownSocket);
   await probe(false, "tcp", "127.0.0.1", String(ownPort));
   await probe(false, "read", other.envFilePath);
+  await probe(false, "read", controllerPath);
+  await probe(false, "write", controllerPath);
+  await probe(false, "read", getAgentNetworkTokenPath(controllerPath, "network-a"));
+  await probe(false, "read", getAgentNetworkTokenPath(controllerPath, "network-b"));
+  await probe(false, "link", controllerPath, path.join(own.filesDirectory, "controller.key"));
   await probe(false, "write", other.envFilePath);
   await probe(true, "write", sharedSource);
   await probe(false, "tcp", "127.0.0.1", String(otherPort));
@@ -88,6 +98,10 @@ test("macOS kernel policy rejects raw cross-network access with the hook disable
   const symlink = path.join(own.filesDirectory, "other.env");
   fs.symlinkSync(other.envFilePath, symlink);
   await probe(false, "read", symlink);
+  const controllerLink = path.join(own.filesDirectory, "controller-link.key");
+  fs.symlinkSync(controllerPath, controllerLink);
+  await probe(false, "read", controllerLink);
+  assert.equal(readAgentControllerToken(controllerPath), controllerToken, "kernel rejection must preserve the private key");
   assert.equal(fs.readFileSync(other.envFilePath, "utf8"), "synthetic-b\n");
   assert.equal(fs.readFileSync(sharedSource, "utf8"), "fixture", "shared source writes remain explicitly permitted");
   const node = await run("/usr/bin/sandbox-exec", ["-p", profile, process.execPath, "-e", "process.stdout.write('runtime-ok')"], { env: environment, timeout: 5000 });

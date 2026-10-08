@@ -78,7 +78,7 @@ test("native control registration authenticates its socket PID and keeps its net
   await once(socket, "connect");
   async function request(method: string, payload: unknown, authorization: string | undefined = controllerToken,
     authorizationNetworkId?: string): Promise<Response> {
-    const id = `audit-control-${++sequence}`;
+    const id = `${authorization === controllerToken ? "audit-control" : "extension-forged"}-${++sequence}`;
     socket.write(JSON.stringify({ id, method, payload, authorization, authorizationNetworkId }) + "\n");
     const deadline = performance.now() + 2000;
     while (!replies.has(id)) {
@@ -93,6 +93,7 @@ test("native control registration authenticates its socket PID and keeps its net
     return request(method, payload, "");
   }
   assert.equal((await anonymous("shutdownDaemon")).ok, false);
+  assert.equal((await anonymous("daemonStatus")).ok, true, "readiness is public without granting event subscription");
   assert.equal((await anonymous("listSnapshot")).ok, false);
   assert.equal((await anonymous("registerExistingProcess", { pid: child.pid, networkId: "network-b", requestedPort: 31001 })).ok, false);
   assert.equal((await anonymous("shutdownDaemon", { authorization: controllerToken })).ok, false,
@@ -142,5 +143,7 @@ test("native control registration authenticates its socket PID and keeps its net
   assert.equal((await request("controlChannel", { pid: process.pid, networkId: "network-b" })).ok, false);
   assert.equal((await request("respawnChild", { parentPids: String(process.pid), networkId: "", line: "FIXTURE_ONLY" })).ok, false);
   assert.equal((await request("respawnChild", { parentPids: String(process.pid), networkId: "network-b", line: "FIXTURE_ONLY" })).ok, false);
+  await delay(80);
+  assert.deepEqual(events, [], "forged extension ids on accepted guest/anonymous requests must not receive any snapshot");
   assert.equal(child.exitCode, null, "rejected requests must not stop the daemon");
 });
