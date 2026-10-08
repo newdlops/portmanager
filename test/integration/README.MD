@@ -43,6 +43,9 @@ GUI 앱에는 `caffeinate -dis -w <VS Code PID>`도 연결하고 정상 종료/�
 때 함께 정리한다. ARM 장시간 재측정은 macOS 26 runner에서 같은 workload와 판정
 기준을 사용하며, JSON은 OS release/version을 기록한다. macOS 15의 단기 실제 확장
 호스트 검증과 전체 기능 회귀 결과도 별도로 보관한다.
+`macos_arm_runner`로 macOS 14/15/26의 표준 M1 이미지를 선택할 수 있다. 기본은
+26이며, 실행·결과 회수 경로를 진단하기 위한 이미지 선택은 workload·판정 기준을
+변경하지 않는다. 실제 선택한 OS는 보고서에 기록한다.
 macOS/Linux는 설치된 VSIX의 실제 확장 호스트를 사용한다. Windows job은
 `proxy-resource-soak.ts`의 standalone 진입점에서 Node 대체 경로만 확인한다.
 Windows 네이티브 격리나 VSIX 활성화 지원을 뜻하지 않는다.
@@ -117,6 +120,12 @@ CreateArtifact 요청 시간 초과로 업로드되지 않았다. 이 결과도 
 1,198,561 bytes·1.8 MiB였다. 따라서 checkpoint는 최신 표본만 유지하고 전체 기록은
 JSONL에 추가하도록 수정했다. 판정 뒤 전체 JSON을 한 번 저장하며 30초 예열·20분
 부하·FD +8/RSS +96 MiB 기준과 강제 GC 금지는 그대로 유지한다.
+
+증분 기록 재측정(`2637998`, run `37723912431`)은 Intel macOS·두 Linux·Windows
+fallback의 20분 gate를 통과했다. macOS 26 ARM은 부하 단계와 ArtifactService 업로드가
+실패했고 마지막 정리 단계가 실행 상한 뒤 취소로 종료됐다. job log 다운로드도
+404여서 압축 프레임을 회수하지 못했으므로 macOS ARM의 원본 판정은 미확정이다.
+동일 제품/측정 코드와 기준으로 표준 macOS 14 ARM 이미지를 사용하는 진단을 진행한다.
 
 | 환경 | 생성/삭제 cycle | TCP/HTTP 왕복 | 호스트 FD/handle 변화 | 호스트 RSS 중앙값: 첫/마지막 5분 (MiB) | 호스트 평균 CPU |
 | --- | ---: | ---: | ---: | ---: | ---: |
