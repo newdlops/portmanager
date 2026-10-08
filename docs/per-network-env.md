@@ -1,7 +1,7 @@
-# Per-network environment file (`.portmanager/env/<network>.env`)
+# Per-network environment file (`.portmanager/namespaces/<id-key>/environment.env`)
 
 > **What it does.** A hooked process attached to logical network `<name>` looks
-> for `.portmanager/env/<name>.env` from its working directory upward and
+> for `.portmanager/namespaces/<id-key>/environment.env` from its working directory upward and
 > applies the KEY=VALUE lines to its own environment **before `main()` runs** —
 > ahead of every runtime's env snapshot (CPython `os.environ`, JVM, Go), and
 > with **overwrite** semantics, so the per-network file beats both inherited
@@ -26,16 +26,30 @@ in each workspace folder — open it and fill in values. `.portmanager/` is
 machine-local, so it is added to the repo-local `.git/info/exclude` (the shared
 `.gitignore` is never touched; hand-written variants of the entry are
 recognized and not duplicated).
-The file is keyed by the network **name** (network id is the fallback key when
-a network has no name; names are used verbatim as file names — non-ASCII
-works, `/` maps to `-`):
+The file is keyed by the stable network **id**: `id-` followed by the lowercase
+hex encoding of its UTF-8 bytes. Names can repeat, contain slashes or dot
+segments, and change without selecting another network's settings.
 
 ```
-repo/.portmanager/env/alphac.env     # applies inside network "alphac"
+repo/.portmanager/namespaces/<id-key>/environment.env
 ```
 
 You can also create it by hand anywhere from the app working directory upward;
 the scaffold never overwrites an existing file.
+
+Directories are private (`0700`) and newly published files are private
+(`0600`). Publication does not expose a partial file or overwrite another
+process's completed copy. IDs longer than 124 bytes are rejected rather than
+truncated into a shared filename.
+
+Legacy `.portmanager/env/<name>.env` and `.portmanager/files/<name>/` settings
+are copied once when the current network list identifies one owner. Originals
+remain in place. A private ownership receipt prevents a deleted name being
+automatically imported by a different ID later. If names collide after slash,
+case, or Unicode normalization, attach reports the preserved legacy path's
+ambiguity. Select the intended values and initialize this ID's
+`environment.env` and `files/` explicitly before retrying. Symlinks or special
+files also require explicit migration; automatic import never follows them.
 
 Contents are dotenv-shaped:
 
@@ -57,12 +71,12 @@ virtualization involved.
   variable, so the injected value survives `load_dotenv()` while
   non-conflicting `.env` keys still load.
 - **Once per process tree**: the marker
-  `PORT_MANAGER_NETWORK_ENV_APPLIED=<network>` is set alongside the values, so
+  `PORT_MANAGER_NETWORK_ENV_APPLIED=<network-id>` is set alongside the values, so
   children inherit rather than re-apply — a value the app deliberately changes
   mid-tree is not stomped in its children. The shell itself is unhooked and
   marker-free, so every fresh command re-reads the file; edits apply from the
   next launch.
-- **Discovery**: nearest `.portmanager/env/<network>.env` from the process cwd
+- **Discovery**: nearest `.portmanager/namespaces/<id-key>/environment.env` from the process cwd
   upward (64 levels max).
 - **Format**: `KEY=VALUE` per line, optional `export ` prefix, `#` comments,
   one matching quote pair stripped from the value. No interpolation, no
@@ -97,7 +111,7 @@ interpret that actual port as a second logical port and route twice.
 ## Verifying
 
 ```sh
-# in an attached terminal, with repo/.portmanager/env/<network>.env present:
+# in an attached terminal, with this ID's environment.env present:
 python3 -c "import os; print(os.environ.get('S3_BUCKET'))"   # -> alphac-dev-bucket
 ```
 
@@ -110,5 +124,6 @@ Or enable the dev-log ([dev-logging.md](dev-logging.md)) and look for
 |---------|----------|
 | Injection (constructor) | `native/hook/portmanager_hook.c` (`pm_apply_network_env_file`, `pm_network_env_apply_line`, `pm_find_network_env_file`; called from `pm_hook_loaded`) |
 | Hookless child URL handoff | `native/hook/portmanager_hook.c` (`pm_rewrite_route_backed_child_environment`, wired into execve/posix_spawn/posix_spawnp) |
-| Network name delivery | `src/extension/terminal-hook-environment.ts` (`PORT_MANAGER_NETWORK_NAME`) |
+| Stable key | `src/core/networks/network-identity.ts`, `native/shared/pm_network_namespace.h` |
+| Private scaffold/migration | `src/platform/process/network-file-scaffold.ts` |
 | Related | [per-network-hostname.md](per-network-hostname.md) — per-network *identity*; this doc — per-network *values* (overlay); [per-network-files.md](per-network-files.md) — whole-file *replacement* |

@@ -129,6 +129,49 @@ export function hostLocalGatewayLoopbackAddressForNetwork(networkId: string): st
   return `127.${secondOctet}.${thirdOctet}.${fourthOctet}`;
 }
 
+/**
+ * Allocate identity before creating OS resources. Hashes give stable addresses,
+ * but not uniqueness; a UUID which collides in any of the three address bands
+ * must be retried before a listener, DNS row, or terminal can use it.
+ */
+export function allocateNetworkIdWithUniqueAddresses(
+  existingIds: readonly string[],
+  createCandidate: () => string,
+): string {
+  const ids = new Set(existingIds);
+  const addresses = new Set(existingIds.flatMap(networkAddresses));
+
+  for (let attempt = 0; attempt < 128; attempt++) {
+    const candidate = createCandidate();
+    if (candidate.length === 0 || isGlobalNetworkId(candidate) || ids.has(candidate)) {
+      continue;
+    }
+    if (networkAddresses(candidate).every(address => !addresses.has(address))) {
+      return candidate;
+    }
+  }
+
+  throw new Error("Could not allocate a logical network with unique loopback addresses.");
+}
+
+/** Rejects an identity collision even for callers which do not use the allocator. */
+export function assertNetworkAddressesAreUnique(networkId: string, existingIds: readonly string[]): void {
+  const candidate = new Set(networkAddresses(networkId));
+  const collision = existingIds.find(id => id !== networkId && networkAddresses(id).some(address => candidate.has(address)));
+  if (collision !== undefined) {
+    throw new Error(`Logical networks ${networkId} and ${collision} share a loopback address.`);
+  }
+}
+
+/** All addresses participate: a browser or host gateway collision also mixes realms. */
+function networkAddresses(networkId: string): string[] {
+  return [
+    loopbackAddressForNetwork(networkId),
+    browserLoopbackAddressForNetwork(networkId),
+    hostLocalGatewayLoopbackAddressForNetwork(networkId),
+  ];
+}
+
 function fnv1a32(value: string): number {
   let hash = 0x811c9dc5;
 

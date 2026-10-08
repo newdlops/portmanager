@@ -18,6 +18,7 @@
 - routing disabled 상태에서 hook dylib/so를 agent에 실제 preload해 동적 로더 호환성 검증
 - hook 라이브러리를 `~/.portmanager/runtime/<OS>-<CPU>/media/native/`의 고정 경로에 원자적으로 복사하여 확장 업데이트 뒤에도 기존 launcher의 preload 경로 유지
 - 설치된 shell script를 `sh -n`으로 검사하고 실제 source 후 `pm` 함수 및 profile marker 유지 검증
+- ID 기반 네트워크 파일 scaffold와 소유자가 명확한 legacy 설정의 비파괴 마이그레이션
 - UI가 터미널 창/세션으로 그룹화할 수 있는 tty, process group, console 식별자 제공
 
 ## 주요 진입점
@@ -29,6 +30,7 @@
 - `node-process-environment.ts`
 - `native-process-lookup.ts`
 - `native-executable.ts`
+- `network-file-scaffold.ts`: 0700 디렉터리, 0600 파일, 원자적 미교체 게시 및 symlink 거부
 - `shell-integration-verifier.ts`
 - `node-terminal-candidate-provider.ts`
 
@@ -42,3 +44,7 @@
 ## 주의사항
 
 프로세스 상태 전이의 의미는 `src/core`가 결정하고, 이 모듈은 실행 메커니즘만 제공한다.
+현재 Borrowed Network는 협조적인 preload 라우팅이다. 훅 opt-out과 직접 시스템 호출을
+권한 경계로 강제하지 않으므로 제품 전체를 악성 코드에 대한 보안 sandbox로 표현하지 않는다.
+사용자 선택대로 소스는 공유하고 기존 쓰기를 유지한다. 공유 코드 변경이 다른 네트워크의
+다음 실행에 미치는 영향은 이 경계에 포함되지 않으며, 전면적인 악성 코드 격리를 보장할 수 없다.

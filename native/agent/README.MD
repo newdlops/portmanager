@@ -7,6 +7,7 @@ Port Manager의 단일 로컬 daemon을 저수준 POSIX 프로세스로 제공�
 ## 책임
 
 - 기존 NDJSON agent socket 프로토콜 수신
+- Unix kernel peer UID/PID 확인과 controlChannel의 실제 접속 PID·불변 네트워크 범위 검증
 - logical port route 할당과 route table 파일 갱신
 - hook/CLI/VS Code에서 등록한 프로세스 registry 유지
 - managed process start/stop/restart/remove 처리
@@ -42,6 +43,10 @@ Port Manager의 단일 로컬 daemon을 저수준 POSIX 프로세스로 제공�
 Windows named pipe와 PowerShell listener scan은 native daemon에서 처리하지 않는다.
 VS Code 시작 경로는 미지원 플랫폼이나 바이너리 부재 시 기존 Node daemon으로 fallback한다.
 명시적 routing repair는 `lsof`의 정상 무결과(exit 1)는 허용하지만 실행/권한/신호 오류를 빈 listener 표로 취급하지 않는다.
+`controlChannel`은 연결의 실제 PID만 등록할 수 있고 빈 scope, 다른 PID, 등록 후 scope 변경을
+거부한다. `respawnChild`의 빈 networkId는 wildcard 권한이 아니다. 이 검사는 임의 PID 제어
+채널 탈취를 막지만, 같은 UID의 모든 관리 RPC 권한을 분리한 보안 sandbox는 아니다.
+프로그램이 주장하는 networkId/환경값을 신뢰하지 않는 전용 broker 경계가 별도로 필요하다.
 DNS 응답 worker는 registry·파일·로그에 접근하지 않고 UDP와 shutdown pipe를 poll한다. DNS 게시 worker가 revision 검증과 영속화를 마친 뒤 control thread가 mutex 아래 레코드 포인터/개수만 교체하고 이전 테이블을 회수한다. packet 생성 중에만 같은 mutex를 잡으며, bind 실패는 control thread의 기존 backoff로 재시도한다. 종료·소켓 오류 시 응답 worker를 깨워 join한 후 descriptor를 닫는다. UDP와 wakeup pipe, 게시 파일은 CLOEXEC으로 managed child에 유출되지 않는다.
 managed child의 command/env 구성은 fork 전에 끝낸다. child는 chdir/open/dup2/close/execve/_exit만 사용해 DNS 스레드가 있는 부모에서 libc 상태를 상속한 뒤 잠기는 일을 방지한다.
 

@@ -7,6 +7,8 @@ Logical Network, Terminal Attachment, Host Port Exposure의 순수 도메인 상
 ## 책임
 
 - Logical Network 생성과 삭제
+- 세 loopback 주소 대역의 충돌 검사와 재시도 할당, 저장 상태 적용 전 검증
+- 표시 이름과 파일시스템 정규화에 영향을 받지 않는 ID 기반 namespace key
 - Terminal Attachment 상태 저장
 - Host Port Exposure 상태 저장
 - Network snapshot 생성
@@ -18,6 +20,8 @@ Logical Network, Terminal Attachment, Host Port Exposure의 순수 도메인 상
 ## 주요 진입점
 
 - `logical-network-registry.ts`
+- `loopback-address.ts`
+- `network-identity.ts`: UTF-8 ID를 lowercase hex로 인코딩; native namespace header와 동일 규약
 - `logical-route-selection.ts`
 - `host-default-gateway.ts`
 - `browser-dns-drift.ts`

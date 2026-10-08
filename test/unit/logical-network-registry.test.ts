@@ -37,6 +37,33 @@ function createNetwork(overrides: Partial<LogicalNetwork> = {}): LogicalNetwork 
   };
 }
 
+test("registry rejects actual alias collisions without committing another network", () => {
+  const registry = new LogicalNetworkRegistry([runtime]);
+  const first = "network-00000000-0000-4000-8000-00000000130b";
+  const second = "network-00000000-0000-4000-8000-0000000016a8";
+  registry.addNetwork(createNetwork({ id: first }));
+  assert.throws(() => registry.addNetwork(createNetwork({ id: second, name: "independent app" })), /share a loopback address/);
+  assert.deepEqual(registry.getSnapshot().networks.map(network => network.id), [first]);
+});
+
+test("colliding persisted identities fail before replacing the last safe state", () => {
+  const registry = new LogicalNetworkRegistry([runtime]);
+  registry.addNetwork(createNetwork());
+  const before = registry.getSnapshot();
+  const state = {
+    ...registry.getPersistedState(),
+    networks: [
+      createNetwork({ id: "network-00000000-0000-4000-8000-00000000130b" }),
+      createNetwork({ id: "network-00000000-0000-4000-8000-0000000016a8" }),
+    ],
+  };
+  assert.throws(() => new LogicalNetworkRegistry([runtime], state), /share a loopback address/);
+  assert.throws(() => registry.replacePersistedState(state), /share a loopback address/);
+  assert.equal(registry.getSnapshot(), before);
+  assert.throws(() => registry.replacePersistedState({ ...state, networks: [createNetwork(), createNetwork()] }), /duplicate/);
+  assert.equal(registry.getSnapshot(), before);
+});
+
 function createExposure(overrides: Partial<HostPortExposure> = {}): HostPortExposure {
   return {
     id: "exposure-1",

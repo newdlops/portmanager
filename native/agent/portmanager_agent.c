@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "portmanager_agent.h"
 #include "portmanager_agent_output.h"
 
@@ -15,6 +17,7 @@
 #include <unistd.h>
 
 #include "../shared/pm_dev_log.h"
+#include "../shared/pm_network_namespace.h"
 
 #define PM_CLIENT_BUFFER_INITIAL 2048
 /* Large enough for a respawnChild request carrying an escaped child's full
@@ -72,6 +75,8 @@ static size_t pm_pending_publication_bytes;
 
 typedef struct {
   int fd;
+  /* Kernel-authenticated connection owner; request payloads cannot choose it. */
+  pid_t peer_pid;
   int wants_events;
   int is_control;
   int control_pid;
@@ -114,21 +119,22 @@ static size_t pm_control_entry_capacity = 0;
 static long long pm_monotonic_milliseconds(void);
 static void pm_disconnect_client(pm_client *client);
 
-static void pm_control_registry_set(int pid, int fd, pm_output_queue *output, const char *network_id) {
+static int pm_control_registry_set(int pid, int fd, pm_output_queue *output, const char *network_id) {
   for (size_t index = 0; index < pm_control_entry_count; index++) {
     if (pm_control_entries[index].pid == pid) {
+      if (strcmp(pm_control_entries[index].network_id, network_id) != 0) return -1;
       pm_control_entries[index].fd = fd;
       pm_control_entries[index].output = output;
       snprintf(pm_control_entries[index].network_id, sizeof(pm_control_entries[index].network_id), "%s",
                network_id != NULL ? network_id : "");
-      return;
+      return 0;
     }
   }
   if (pm_control_entry_count + 1 > pm_control_entry_capacity) {
     size_t next_capacity = pm_control_entry_capacity == 0 ? 32 : pm_control_entry_capacity * 2;
     pm_control_entry *next = (pm_control_entry *)realloc(pm_control_entries, next_capacity * sizeof(pm_control_entry));
     if (next == NULL) {
-      return;
+      return -1;
     }
     pm_control_entries = next;
     pm_control_entry_capacity = next_capacity;
@@ -139,13 +145,14 @@ static void pm_control_registry_set(int pid, int fd, pm_output_queue *output, co
   snprintf(pm_control_entries[pm_control_entry_count].network_id, sizeof(pm_control_entries[pm_control_entry_count].network_id), "%s",
            network_id != NULL ? network_id : "");
   pm_control_entry_count++;
+  return 0;
 }
 
 /* Only a same-network ancestor may receive a queued control push. */
 static pm_output_queue *pm_control_registry_output_for_pid(int pid, const char *want_network_id) {
   for (size_t index = 0; index < pm_control_entry_count; index++) {
     if (pm_control_entries[index].pid == pid) {
-      if (want_network_id == NULL || want_network_id[0] == '\0' ||
+      if (want_network_id != NULL && want_network_id[0] != '\0' &&
           strcmp(pm_control_entries[index].network_id, want_network_id) == 0) {
         return pm_control_entries[index].output;
       }
@@ -641,14 +648,20 @@ static int pm_handle_ready_line(pm_client *client, pm_agent_state *state, const 
   if (strcmp(request.method, "controlChannel") == 0) {
     int pid = pm_json_get_int(request.payload == NULL ? "" : request.payload, "pid", 0);
     char network_id[128];
+    char namespace_key[PM_NETWORK_NAMESPACE_KEY_SIZE];
     network_id[0] = '\0';
-    pm_json_get_string(request.payload == NULL ? "" : request.payload, "networkId", network_id, sizeof(network_id));
-    if (pid > 0) {
+    int valid_scope = pm_json_get_string(request.payload == NULL ? "" : request.payload, "networkId", network_id, sizeof(network_id)) == 0 &&
+      pm_network_namespace_key(network_id, namespace_key, sizeof(namespace_key)) == 0;
+    int accepted = valid_scope && pid > 0 && pid == client->peer_pid &&
+      kill(client->peer_pid, 0) == 0 && (!client->is_control || client->control_pid == pid);
+    if (accepted && pm_control_registry_set(pid, client->fd, client->output, network_id) == 0) {
       client->is_control = 1;
       client->control_pid = pid;
-      pm_control_registry_set(pid, client->fd, client->output, network_id);
+    } else {
+      accepted = 0;
     }
-    int send_result = pm_send_response(client, &request, 1, NULL, NULL);
+    int send_result = pm_send_response(client, &request, accepted, NULL,
+      accepted ? NULL : "Control channel must identify its live socket peer and an unchanged nonempty network scope.");
     pm_buffer_free(&payload);
     return send_result;
   }
@@ -668,7 +681,12 @@ static int pm_handle_ready_line(pm_client *client, pm_agent_state *state, const 
     parent_pids[0] = '\0';
     target_network_id[0] = '\0';
     pm_json_get_string(request.payload == NULL ? "" : request.payload, "parentPids", parent_pids, sizeof(parent_pids));
-    pm_json_get_string(request.payload == NULL ? "" : request.payload, "networkId", target_network_id, sizeof(target_network_id));
+    if (pm_json_get_string(request.payload == NULL ? "" : request.payload, "networkId", target_network_id, sizeof(target_network_id)) != 0 ||
+        target_network_id[0] == '\0') {
+      int send_result = pm_send_response(client, &request, 0, NULL, "Respawn requires an explicit network scope.");
+      pm_buffer_free(&payload);
+      return send_result;
+    }
     {
       char *saveptr = NULL;
       char *token = strtok_r(parent_pids, ",", &saveptr);
@@ -863,9 +881,33 @@ static int pm_finish_client_scans(pm_client *client, pm_agent_state *state, int 
   return 0;
 }
 
+/** Socket permissions are complemented by authenticated credentials before dispatch. */
+static int pm_read_socket_peer(int fd, pid_t *pid) {
+#if defined(__APPLE__)
+  uid_t uid;
+  gid_t gid;
+  socklen_t size = sizeof(*pid);
+  if (getpeereid(fd, &uid, &gid) != 0 || uid != geteuid() ||
+      getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, pid, &size) != 0 || size != sizeof(*pid) || *pid <= 0) return -1;
+  return 0;
+#elif defined(__linux__)
+  struct ucred peer;
+  socklen_t size = sizeof(peer);
+  if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &size) != 0 || size != sizeof(peer) ||
+      peer.uid != geteuid() || peer.pid <= 0) return -1;
+  *pid = peer.pid;
+  return 0;
+#else
+  (void)fd; (void)pid;
+  return -1;
+#endif
+}
+
 static int pm_add_client(pm_client **clients, size_t *count, size_t *capacity, int fd) {
   pm_client *next;
   size_t next_capacity;
+  pid_t peer_pid;
+  if (pm_read_socket_peer(fd, &peer_pid) != 0) return -1;
 
   if (*count + 1 > *capacity) {
     next_capacity = *capacity == 0 ? 16 : *capacity * 2;
@@ -881,6 +923,7 @@ static int pm_add_client(pm_client **clients, size_t *count, size_t *capacity, i
   if (output == NULL) return -1;
   (*clients)[*count].output = output;
   (*clients)[*count].fd = fd;
+  (*clients)[*count].peer_pid = peer_pid;
   (*clients)[*count].wants_events = 0;
   (*clients)[*count].is_control = 0;
   (*clients)[*count].control_pid = 0;

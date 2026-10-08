@@ -43,6 +43,7 @@ import { selectHostDefaultGatewayExposure } from "../core/networks/host-default-
 import { LocalDnsRecoveryWithoutPrivilegesError } from "../shared/errors";
 import {
   ACTUAL_LOOPBACK_HOST_ENV,
+  allocateNetworkIdWithUniqueAddresses,
   browserLoopbackAddressForNetwork,
   GLOBAL_LOGICAL_NETWORK_ID,
   hostLocalGatewayLoopbackAddressForNetwork,
@@ -582,6 +583,9 @@ interface HostLocalGatewayRedirect {
 export class PortManagerNetworkService implements DisposableLike {
   /** Pure domain store for networks, attachments, exposures, and terminal rows. */
   private readonly registry: LogicalNetworkRegistry;
+
+  /** Identities reserved while asynchronous OS creation has not reached the registry. */
+  private readonly creatingNetworkIds = new Set<string>();
 
   /** Cross-window durable state store shared by every VS Code extension host. */
   private readonly sharedNetworkStateStore: SharedLogicalNetworkStateStore;
@@ -2323,18 +2327,34 @@ export class PortManagerNetworkService implements DisposableLike {
     requireContainerLevelRuntime(runtime);
 
     const network: LogicalNetwork = {
-      id: createId("network"),
+      id: allocateNetworkIdWithUniqueAddresses(
+        [...this.registry.getSnapshot().networks.map(existing => existing.id), ...this.creatingNetworkIds],
+        () => createId("network"),
+      ),
       name,
       status: "running",
       runtimeKind: runtime.kind,
       createdAt: new Date().toISOString(),
     };
 
-    if (runtime.kind === "container") {
-      await this.containerRuntime.createNetwork(network, readContainerRuntimeSettings());
+    this.creatingNetworkIds.add(network.id);
+    let containerCreated = false;
+    try {
+      if (runtime.kind === "container") {
+        await this.containerRuntime.createNetwork(network, readContainerRuntimeSettings());
+        containerCreated = true;
+      }
+      return this.registry.addNetwork(network);
+    } catch (error) {
+      // A changed shared document can still reject admission after OS creation.
+      // Release only the container created by this attempt, never another row.
+      if (containerCreated) {
+        await this.containerRuntime.removeNetwork(network.id).catch(() => undefined);
+      }
+      throw error;
+    } finally {
+      this.creatingNetworkIds.delete(network.id);
     }
-
-    return this.registry.addNetwork(network);
   }
 
   /** Removes a network and closes any host exposures that belonged to it. */
@@ -3947,16 +3967,17 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     const signature = stringifyPersistedNetworkState(document.state);
-    this.sharedNetworkStateRevision = document.revision;
     if (signature === this.persistedNetworkStateSignature) {
+      this.sharedNetworkStateRevision = document.revision;
       return;
     }
 
     const previousComposeAttachments = this.registry.getSnapshot().composeAttachments;
-    this.persistedNetworkStateSignature = signature;
     this.applyingSharedNetworkState = true;
     try {
       this.registry.replacePersistedState(document.state);
+      this.sharedNetworkStateRevision = document.revision;
+      this.persistedNetworkStateSignature = signature;
     } finally {
       this.applyingSharedNetworkState = false;
     }
@@ -4076,6 +4097,7 @@ export class PortManagerNetworkService implements DisposableLike {
         : {
             networkId,
             networkName: this.registry.getNetwork(networkId)?.name,
+            namespaceNetworks: this.registry.getSnapshot().networks,
             networkDnsAlias: normalizeBrowserDnsHostname(this.registry.getNetwork(networkId)?.name ?? ""),
             composeRoutingFilePath: this.getComposeProjectRoutingFilePath(networkId),
             terminalAttachmentMarkerDirectoryPath: this.getTerminalAttachmentMarkerDirectoryPath(),
@@ -7999,7 +8021,7 @@ export class PortManagerNetworkService implements DisposableLike {
   private buildTerminalRoutingScriptBody(networkId: string, networkName: string, settings: PortManagerSettings): string {
     // Per-terminal attach must scaffold too — the window-binding path alone
     // never fires for terminals attached individually (docs/per-network-env.md).
-    ensureNetworkEnvFileScaffold(networkId, networkName);
+    ensureNetworkEnvFileScaffold(networkId, networkName, this.registry.getSnapshot().networks);
     const hookLibraryPath = preparePersistentNativeHookLibrary(this.context.asAbsolutePath(getHookLibraryRelativePath()));
     const agentMainPath = this.context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
     const nativeAgentPath = this.context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));

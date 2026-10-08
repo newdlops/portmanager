@@ -28,6 +28,7 @@ import {
 } from "./compose-project-routing";
 import { normalizeBrowserDnsHostname } from "../platform/network/browser-dns-server";
 import { preparePersistentNativeHookLibrary } from "../platform/process/native-executable";
+import { ensureNetworkNamespaceScaffold, type NamespaceNetworkIdentity } from "../platform/process/network-file-scaffold";
 
 /**
  * Keeps new VS Code terminals on the pre-bind routing path.
@@ -129,6 +130,8 @@ export interface TerminalHookEnvironmentScope {
   readonly networkId: string;
   /** Display name used by shell startup hooks to label attached terminals. */
   readonly networkName?: string;
+  /** Current identities used to prevent ambiguous legacy name-based imports. */
+  readonly namespaceNetworks?: readonly NamespaceNetworkIdentity[];
   /** Single-label DNS alias for this network, when the name is resolver-safe. */
   readonly networkDnsAlias?: string;
   /** Dynamic Compose/container routing map consumed by Docker/Podman shims. */
@@ -200,7 +203,7 @@ export function applyTerminalHookEnvironment(
     return;
   }
 
-  ensureNetworkEnvFileScaffold(scope.networkId, scope.networkName);
+  ensureNetworkEnvFileScaffold(scope.networkId, scope.networkName, scope.namespaceNetworks);
 
   const hookLibraryPath = preparePersistentNativeHookLibrary(context.asAbsolutePath(getHookLibraryRelativePath()));
   const agentMainPath = context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
@@ -443,59 +446,28 @@ function applyLoopbackRoutingHosts(
 /**
  * Scaffolds `<workspaceFolder>/.portmanager/` so both per-network mechanisms
  * are ready the moment anything attaches to the network — window bindings AND
- * per-terminal attach scripts: `env/<network>.env` (injected before main(),
- * docs/per-network-env.md) and `files/<network>/` (existence-based exclusive
- * file substitution, docs/per-network-files.md). The app `.env` is auto-split:
- * a copy is seeded as `files/<network>/.env` so every network starts on an
- * independent (initially identical) file that the hook substitutes exclusively
- * from then on. The native hook only READS these paths. `.portmanager/` is
+ * per-terminal attach scripts. Stable ids own `namespaces/<id-key>/` with an
+ * `environment.env` overlay and exclusive `files/` mirror. Unambiguous legacy
+ * name-based settings are copied without replacing their originals. The app
+ * `.env` starts as a private independent copy. `.portmanager/` is
  * machine-local state, so it is ignored via the repo-LOCAL `.git/info/exclude`
- * — never the shared .gitignore. Idempotent and silent — never overwrites
- * existing content, ignores filesystem errors.
+ * — never the shared .gitignore. Existing content is never overwritten;
+ * ambiguous or unsafe namespace state fails before terminal attach.
  */
-export function ensureNetworkEnvFileScaffold(networkId: string, networkName: string | undefined): void {
-  const networkKey = networkName !== undefined && networkName.length > 0 ? networkName : networkId;
-  const safeKey = networkKey.replace(/\//g, "-");
-
+export function ensureNetworkEnvFileScaffold(
+  networkId: string,
+  networkName: string | undefined,
+  knownNetworks: readonly NamespaceNetworkIdentity[] = [],
+): void {
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
     if (folder.uri.scheme !== "file") {
       continue;
     }
-    try {
-      const root = folder.uri.fsPath;
-      const envDirectory = path.join(root, ".portmanager", "env");
-      const filesDirectory = path.join(root, ".portmanager", "files", safeKey);
-      fs.mkdirSync(envDirectory, { recursive: true });
-      fs.mkdirSync(filesDirectory, { recursive: true });
-      ensureLocalGitExclude(root);
-      const envFilePath = path.join(envDirectory, `${safeKey}.env`);
-      if (!fs.existsSync(envFilePath)) {
-        fs.writeFileSync(
-          envFilePath,
-          [
-            `# Port Manager per-network environment for "${networkKey}".`,
-            "# KEY=VALUE lines are injected into every process of this network before",
-            "# main() — they win over inherited terminal env and the app's own .env.",
-            "# PORT_MANAGER_*/NEWDLOPS_PM_*/PATH/BASH_ENV/preload keys are ignored.",
-            "# See docs/per-network-env.md. Examples:",
-            "#",
-            "# GOOGLE_APPLICATION_CREDENTIALS=/path/credential.this-network.json",
-            "# S3_BUCKET=this-network-dev-bucket",
-            "",
-          ].join("\n"),
-        );
-      }
-      // Auto-split the app .env: seed this network's own copy once. Content is
-      // identical at copy time (behavior-neutral); afterwards the network talks
-      // only to its copy (docs/per-network-files.md), so edits are independent.
-      const originalDotenvPath = path.join(root, ".env");
-      const substituteDotenvPath = path.join(filesDirectory, ".env");
-      if (fs.existsSync(originalDotenvPath) && !fs.existsSync(substituteDotenvPath)) {
-        fs.copyFileSync(originalDotenvPath, substituteDotenvPath);
-      }
-    } catch {
-      // Best-effort scaffold: a read-only or vanished folder must not break attach.
-    }
+    const root = folder.uri.fsPath;
+    // Unsafe namespace state must surface before a terminal is attached. A
+    // silent fallback would read shared or another network's credentials.
+    ensureNetworkNamespaceScaffold(root, networkId, networkName, knownNetworks);
+    ensureLocalGitExclude(root);
   }
 }
 

@@ -1,4 +1,4 @@
-# Per-network file substitution (`.portmanager/files/<network>/…`)
+# Per-network file substitution (`.portmanager/namespaces/<id-key>/files/…`)
 
 > **The rule.** When a per-network counterpart of a file exists under
 > `.portmanager`, a hooked process talks **only** to that counterpart — the
@@ -9,23 +9,30 @@
 
 ## Layout
 
-The substitute mirrors the original path, keyed by network name (network id
-when the network has no name; `/` in names maps to `-`):
+The substitute mirrors the original path, keyed by stable network ID. `<id-key>`
+is `id-` plus lowercase UTF-8 hex, shared by TypeScript and the native hook.
+Display names never choose a file namespace, so duplicate, renamed, slash,
+dot-segment and long names cannot merge storage.
 
 ```
 <root>/config.json                                # original
-<root>/.portmanager/files/alphac/config.json      # what network "alphac" opens
+<root>/.portmanager/namespaces/<id-key>/files/config.json
 <root>/.env                                       # original
-<root>/.portmanager/files/alphac/.env             # full .env replacement for "alphac"
+<root>/.portmanager/namespaces/<id-key>/files/.env
 ```
 
 `<root>` is the nearest ancestor of the process working directory that
 contains a `.portmanager` directory (resolved once at process start). The
-`files/<network>/` directory is scaffolded automatically whenever anything
+`namespaces/<id-key>/files/` directory is scaffolded automatically whenever anything
 attaches to the network — a window binding or a per-terminal attach script —
 and the app's root `.env` (when present) is **auto-split**: a copy is seeded as
-`files/<network>/.env`, identical at copy time, so each network starts on its
+`namespaces/<id-key>/files/.env`, identical at copy time, so each network starts on its
 own independent file.
+
+The [environment-file migration](per-network-env.md) also imports unambiguous
+legacy `files/<name>/` trees without overwriting or deleting their originals.
+Automatic migration rejects symlinks and special files. Namespace directories
+are private (`0700`); seeded/copied configuration files are private (`0600`).
 
 ## Semantics
 
@@ -39,6 +46,9 @@ own independent file.
   original) and serves it — every read AND write from then on lands in
   `.portmanager`; the original is never read or written again by hooked
   processes. Each network copies up independently from the original.
+  Copy-up publishes a complete file atomically without replacing an existing
+  copy. A failed copy stays scoped to the mirror and reports an error instead
+  of reading shared credentials. Mirror leaf and parent symlinks are rejected.
 - **Automatic state split (zero intervention)**: an `O_CREAT` open of a
   genuinely NEW file is redirected into the mirror (parents auto-created) when
   it looks like process-private state by ecosystem convention — inside a
@@ -75,8 +85,8 @@ own independent file.
 
 ## Relation to the per-network env file
 
-[`.portmanager/env/<network>.env`](per-network-env.md) is the **overlay** tool:
-injected values win, everything else stays. `files/<network>/…` is the
+[`namespaces/<id-key>/environment.env`](per-network-env.md) is the **overlay** tool:
+injected values win, everything else stays. `namespaces/<id-key>/files/…` is the
 **replacement** tool: the whole file is swapped. Use the env file for a few
 per-network values; use a substitute when the process must not see the
 original at all.
@@ -97,6 +107,9 @@ original at all.
 - Unhooked processes (SIP shells, escaped trees) see the original path — for
   auto-split state that means the symlink window (most recently started
   network), and for hand-made substitutes the untouched original.
+- Cooperative file substitution is not an OS security sandbox. Hook opt-out,
+  direct syscalls and shared writable source remain outside its enforcement.
+  A kernel policy is being tested separately; it is not connected to attach yet.
 
 ## Source map
 
