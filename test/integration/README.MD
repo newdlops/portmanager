@@ -53,6 +53,14 @@ macOS ARM의 부하 실행은 `supervise-packaged-validation.mjs`가 하나의 �
 포함한 유한 기한을 가지며, timeout/정리 시 PID와 고유 profile marker로 확인한
 이 CI 실행 소유의 process group만 종료한다. 같은 호스트를 재시작하거나 예열,
 GC, RSS/FD 기준을 바꾸지 않는다.
+artifact와 runner stdout의 annotation이 함께 유실되는 경우를 대비해 각 immutable
+checkpoint와 최종 숫자 보고서를 별도 프로세스에서 공개 Checks API로 직접 보관한다
+(`scripts/publish-resource-trace.mjs`). 요청마다 최대 50개 annotation에 전체 gzip/base64
+보고서를 넣고 JSON 바이트의 SHA-256을 기록한다. 크기를 초과하면 자르지 않고 실패한다.
+응답의 check id·commit·annotation 수를 확인하며 20초 요청 기한을 둔다. 이 check는
+`neutral`이고 원래 보고서의 `running`/`failed` 상태를 그대로 보존하므로 gate 통과가 아니다.
+`checks: write` 토큰은 보관 단계에만 주며 측정 대상 앱에는 전달하지 않는다.
+API 경계는 [GitHub Checks 문서](https://docs.github.com/en/rest/checks/runs)를 따른다.
 GUI 앱에는 `caffeinate -dis -w <VS Code PID>`도 연결하고 정상 종료/실패/기한 초과
 때 함께 정리한다. ARM 장시간 재측정은 macOS 26 runner에서 같은 workload와 판정
 기준을 사용하며, JSON은 OS release/version을 기록한다. macOS 15의 단기 실제 확장
@@ -163,6 +171,14 @@ artifact도 0개, job log는 404 BlobNotFound, 전체 run archive는 빈 22-byte
 검증했고, 로컬 실제 pipe의 reader를 500ms 지연한 네 segment도 byte 단위 일치했다.
 이 검사는 CI에서의 원본 회수를 대신하지 않는다. 장시간 실행과 결과 회수가 가능한
 일회용 macOS ARM 환경이 필요하며 20분·FD +8/RSS +96 MiB 기준은 유지한다.
+
+연속 실행의 중간 checkpoint를 추가한 macOS 26 ARM 검증(`865b51b`, run `37752875410`)은
+준비 로그와 실제 설치 VSIX의 baseline을 회수했다. 839개 단위·네이티브 테스트는
+통과했고 baseline은 host PID 17775, `real-extension-host-and-daemon`, `running`이었다.
+5/10/15분 snapshot 단계는 성공했으나 각 artifact 업로드와 최종 gate 단계는 실패했다.
+45분 상한으로 job이 취소된 뒤에도 회수된 artifact는 준비 로그와 baseline뿐이었다.
+job log는 404, 전체 run archive는 빈 22-byte ZIP, check annotation은 상한·용량 안내
+2개뿐이었다. 따라서 최종 RSS/FD·실패 사유·정리 결과는 원본 보고서 없이는 판단할 수 없다.
 
 | 환경 | 생성/삭제 cycle | TCP/HTTP 왕복 | 호스트 FD/handle 변화 | 호스트 RSS 중앙값: 첫/마지막 5분 (MiB) | 호스트 평균 CPU |
 | --- | ---: | ---: | ---: | ---: | ---: |

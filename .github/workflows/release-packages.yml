@@ -40,6 +40,11 @@ jobs:
   package:
     if: inputs.validation_target != 'windows-fallback'
     name: ${{ matrix.target }}
+    # The trace publisher uses the public metadata API after each snapshot.
+    # Its token is passed only to those steps, never to the measured app.
+    permissions:
+      contents: read
+      checks: write
     runs-on: ${{ matrix.target == 'darwin-arm64' && (inputs.macos_arm_runner || 'macos-26') || fromJSON('{"darwin-x64":"macos-15-intel","linux-arm64":"ubuntu-24.04-arm","linux-x64":"ubuntu-24.04"}')[matrix.target] }}
     timeout-minutes: ${{ fromJSON(inputs.resource_soak_seconds || '0') > 1200 && 80 || 45 }}
     strategy:
@@ -126,6 +131,12 @@ jobs:
           PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
           PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
         run: node scripts/supervise-packaged-validation.mjs snapshot 0
+      - name: Preserve macOS ARM baseline through the Checks API
+        if: always() && steps.resource_baseline.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          PM_TEST_TRACE_TOKEN: ${{ github.token }}
+        run: node scripts/publish-resource-trace.mjs baseline "$GITHUB_WORKSPACE/.tmp/release-logs/snapshots/0/resource-soak.json"
       - name: Preserve macOS ARM measurement baseline
         if: always() && steps.resource_baseline.outcome == 'success'
         timeout-minutes: 1
@@ -143,6 +154,12 @@ jobs:
           PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
           PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
         run: node scripts/supervise-packaged-validation.mjs snapshot 300
+      - name: Preserve macOS ARM 5-minute trace through the Checks API
+        if: always() && steps.resource_5m.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          PM_TEST_TRACE_TOKEN: ${{ github.token }}
+        run: node scripts/publish-resource-trace.mjs 5m "$GITHUB_WORKSPACE/.tmp/release-logs/snapshots/300/resource-soak.json"
       - name: Preserve macOS ARM 5-minute diagnostic trace
         if: always() && steps.resource_5m.outcome == 'success'
         timeout-minutes: 1
@@ -160,6 +177,12 @@ jobs:
           PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
           PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
         run: node scripts/supervise-packaged-validation.mjs snapshot 600
+      - name: Preserve macOS ARM 10-minute trace through the Checks API
+        if: always() && steps.resource_10m.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          PM_TEST_TRACE_TOKEN: ${{ github.token }}
+        run: node scripts/publish-resource-trace.mjs 10m "$GITHUB_WORKSPACE/.tmp/release-logs/snapshots/600/resource-soak.json"
       - name: Preserve macOS ARM 10-minute diagnostic trace
         if: always() && steps.resource_10m.outcome == 'success'
         timeout-minutes: 1
@@ -177,6 +200,12 @@ jobs:
           PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
           PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
         run: node scripts/supervise-packaged-validation.mjs snapshot 900
+      - name: Preserve macOS ARM 15-minute trace through the Checks API
+        if: always() && steps.resource_15m.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          PM_TEST_TRACE_TOKEN: ${{ github.token }}
+        run: node scripts/publish-resource-trace.mjs 15m "$GITHUB_WORKSPACE/.tmp/release-logs/snapshots/900/resource-soak.json"
       - name: Preserve macOS ARM 15-minute diagnostic trace
         if: always() && steps.resource_15m.outcome == 'success'
         timeout-minutes: 1
@@ -193,6 +222,12 @@ jobs:
           PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
           PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
         run: node scripts/supervise-packaged-validation.mjs wait
+      - name: Preserve final macOS ARM trace through the Checks API
+        if: always() && steps.resource_background.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          PM_TEST_TRACE_TOKEN: ${{ github.token }}
+        run: node scripts/publish-resource-trace.mjs final "$GITHUB_WORKSPACE/.tmp/release-logs/resource-soak.json"
       - name: Stop owned macOS ARM validation processes
         if: always() && steps.resource_background.outcome == 'success'
         timeout-minutes: 1
