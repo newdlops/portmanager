@@ -17,6 +17,7 @@
 - Mach-O/ELF header와 native agent argument-parser probe로 현재 CPU/OS loader 호환성 검증
 - routing disabled 상태에서 hook dylib/so를 agent에 실제 preload해 동적 로더 호환성 검증
 - hook 라이브러리를 `~/.portmanager/runtime/<OS>-<CPU>/media/native/`의 고정 경로에 원자적으로 복사하여 확장 업데이트 뒤에도 기존 launcher의 preload 경로 유지
+- 변경 없는 hook 재게시 확인은 source/target의 inode·size·mtime·ctime으로 전체 binary 재읽기를 생략한다. 최대 8개 metadata만 보관하며 손상·교체·symlink는 byte 검증과 원자적 복사로 복구한다.
 - 설치된 shell script를 `sh -n`으로 검사하고 실제 source 후 `pm` 함수 및 profile marker 유지 검증
 - UI가 터미널 창/세션으로 그룹화할 수 있는 tty, process group, console 식별자 제공
 

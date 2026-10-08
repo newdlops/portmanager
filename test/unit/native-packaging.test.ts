@@ -55,6 +55,51 @@ test("terminal preload survives VSIX removal and updates without changing an ope
   assert.equal(fs.readFileSync(preloadPath, "utf8"), "new-hook", "failed publication preserves the active copy");
 });
 
+test("unchanged hook publications avoid binary reads and still repair same-size mutations", (context) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-hook-refresh-"));
+  context.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const packagedPath = path.join(directory, "libportmanager_hook.dylib");
+  fs.writeFileSync(packagedPath, "old-hook");
+  const persistentPath = preparePersistentNativeHookLibrary(packagedPath, path.join(directory, "runtime"));
+  const sourceStats = fs.statSync(packagedPath);
+  const targetStats = fs.statSync(persistentPath);
+  // Patch the underlying Node export: TypeScript's import-star object exposes
+  // getters, so mocking that wrapper would not observe the platform module.
+  const binaryReads = context.mock.method(require("node:fs") as typeof fs, "readFileSync");
+  for (let index = 0; index < 20; index++) {
+    assert.equal(preparePersistentNativeHookLibrary(packagedPath, path.join(directory, "runtime")), persistentPath);
+  }
+  assert.equal(binaryReads.mock.callCount(), 0, "steady refreshes only stat unchanged copies");
+
+  fs.writeFileSync(persistentPath, "bad-hook");
+  fs.utimesSync(persistentPath, targetStats.atime, targetStats.mtime);
+  assert.equal(preparePersistentNativeHookLibrary(packagedPath, path.join(directory, "runtime")), persistentPath);
+  assert.equal(fs.readFileSync(persistentPath, "utf8"), "old-hook", "ctime invalidates a damaged copy even when size/mtime match");
+
+  fs.writeFileSync(packagedPath, "new-hook");
+  fs.utimesSync(packagedPath, sourceStats.atime, sourceStats.mtime);
+  preparePersistentNativeHookLibrary(packagedPath, path.join(directory, "runtime"));
+  assert.equal(fs.readFileSync(persistentPath, "utf8"), "new-hook", "source mutations still publish the new bytes");
+});
+
+test("cached hook publication never accepts a replacement symlink", (context) => {
+  if (process.platform === "win32") {
+    context.skip("Windows symlink creation requires a separate privilege");
+    return;
+  }
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-hook-symlink-"));
+  context.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const packagedPath = path.join(directory, "libportmanager_hook.dylib");
+  fs.writeFileSync(packagedPath, "hook");
+  const persistentPath = preparePersistentNativeHookLibrary(packagedPath, path.join(directory, "runtime"));
+  fs.unlinkSync(persistentPath);
+  fs.symlinkSync(packagedPath, persistentPath);
+  preparePersistentNativeHookLibrary(packagedPath, path.join(directory, "runtime"));
+  assert.equal(fs.lstatSync(persistentPath).isSymbolicLink(), false);
+  fs.unlinkSync(packagedPath);
+  assert.equal(fs.readFileSync(persistentPath, "utf8"), "hook", "the repaired copy survives package removal");
+});
+
 test("a persisted signed hook still loads after its packaged file is deleted", (context) => {
   const hookName = process.platform === "darwin" ? "libportmanager_hook.dylib" : "libportmanager_hook.so";
   const hookPath = path.join(root, "media", "native", hookName);
