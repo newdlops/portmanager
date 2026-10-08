@@ -2499,7 +2499,7 @@ test("Node daemon denies unauthenticated controllers before scans or event subsc
   context.after(() => socket.destroy());
   const messages = collectAgentMessages(socket);
   const before = scans;
-  for (const method of ["shutdownDaemon", "listSnapshot", "registerExistingProcess"] as const) {
+  for (const method of ["shutdownDaemon", "listSnapshot", "registerExistingProcess", "registerProcessScope", "resolveProcessScope"] as const) {
     const id = `extension-denied-${method}`;
     socket.write(encodeAgentMessage({ id, method, payload: { pid: process.pid, requestedPort: 3000 } }));
     const response = await waitForAgentMessage(messages, message => isResponseForRequest(message, id));
@@ -2512,6 +2512,15 @@ test("Node daemon denies unauthenticated controllers before scans or event subsc
   socket.write(encodeAgentMessage({ id, method: "listSnapshot", authorization: readAgentControllerToken(controllerTokenPath) }));
   const response = await waitForAgentMessage(messages, message => isResponseForRequest(message, id));
   assert.equal((response as { ok: boolean }).ok, true);
+  assert.equal((response as { payload: { daemon: { authenticatesProcessScopes: boolean } } }).payload.daemon.authenticatesProcessScopes, false);
+  for (const method of ["registerProcessScope", "resolveProcessScope"] as const) {
+    const requestId = `controller-unsupported-${method}`;
+    socket.write(encodeAgentMessage({ id: requestId, method, payload: { pid: process.pid, birth: 1, networkId: "network-a" },
+      authorization: readAgentControllerToken(controllerTokenPath) }));
+    const unsupported = await waitForAgentMessage(messages, message => isResponseForRequest(message, requestId));
+    assert.equal((unsupported as { ok: boolean }).ok, false);
+    assert.match((unsupported as { error: string }).error, /require the native agent/);
+  }
 });
 
 function createControllerTokenPath(context: TestContext, routeTablePath: string): string {

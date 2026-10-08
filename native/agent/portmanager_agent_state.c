@@ -4869,7 +4869,7 @@ static int pm_append_snapshot_from_listeners(
     goto cleanup;
   }
 
-  if (pm_buffer_appendf(payload, "{\"agentPid\":%ld,\"daemon\":{\"controllerAuthorizationVersion\":1,\"authenticatesNetworkPeers\":true,\"status\":\"running\",\"pid\":%ld,\"startedAt\":", (long)state->agent_pid, (long)state->agent_pid) != 0 ||
+  if (pm_buffer_appendf(payload, "{\"agentPid\":%ld,\"daemon\":{\"controllerAuthorizationVersion\":1,\"authenticatesNetworkPeers\":true,\"authenticatesProcessScopes\":true,\"status\":\"running\",\"pid\":%ld,\"startedAt\":", (long)state->agent_pid, (long)state->agent_pid) != 0 ||
       pm_json_append_string(payload, state->started_at) != 0 ||
       pm_buffer_append(payload, ",\"updatedAt\":") != 0 ||
       pm_json_append_string(payload, updated_at) != 0 ||
@@ -5037,7 +5037,7 @@ int pm_state_daemon_status(pm_agent_state *state, pm_buffer *payload) {
     return -1;
   }
 
-  if (pm_buffer_appendf(payload, "{\"controllerAuthorizationVersion\":1,\"authenticatesNetworkPeers\":true,\"status\":\"running\",\"pid\":%ld,\"startedAt\":", (long)state->agent_pid) != 0 ||
+  if (pm_buffer_appendf(payload, "{\"controllerAuthorizationVersion\":1,\"authenticatesNetworkPeers\":true,\"authenticatesProcessScopes\":true,\"status\":\"running\",\"pid\":%ld,\"startedAt\":", (long)state->agent_pid) != 0 ||
       pm_json_append_string(payload, state->started_at) != 0 ||
       pm_buffer_append(payload, ",\"updatedAt\":") != 0 ||
       pm_json_append_string(payload, updated_at) != 0 ||

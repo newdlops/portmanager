@@ -4,6 +4,7 @@
 #include "../shared/pm_network_namespace.h"
 #include <pwd.h>
 #include <arpa/inet.h>
+#include <limits.h>
 #if defined(__APPLE__)
 #include <libproc.h>
 #include <sys/proc_info.h>
@@ -19,6 +20,8 @@ typedef struct {
   pid_t pid;
   unsigned long long birth;
   char network_id[128];
+  /* Set only by a controller before exec or by observed trusted ancestry. */
+  int controller_scope;
 } pm_authenticated_scope;
 typedef struct {
   char controller_path[PM_TEXT];
@@ -146,7 +149,79 @@ static int pm_auth_pin_scope(pm_authorization *auth, pid_t pid, unsigned long lo
   }
   pm_authenticated_scope *scope = &auth->scopes[auth->count++];
   scope->pid = pid; scope->birth = birth;
+  scope->controller_scope = 0;
   snprintf(scope->network_id, sizeof(scope->network_id), "%s", network_id);
+  return 0;
+}
+
+/* Parentage is read from the OS, never workload JSON or environment. Bounds
+ * and birth checks exclude cycles, PID reuse and a newer replacement parent. */
+static pid_t pm_auth_process_parent(pid_t pid) {
+#if defined(__APPLE__)
+  struct proc_bsdinfo info;
+  return proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) == sizeof(info) &&
+    info.pbi_uid == geteuid() ? (pid_t)info.pbi_ppid : 0;
+#elif defined(__linux__)
+  char file[64], text[4096];
+  snprintf(file, sizeof(file), "/proc/%ld/stat", (long)pid);
+  int fd = open(file, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return 0;
+  ssize_t length = read(fd, text, sizeof(text) - 1); close(fd);
+  if (length <= 0) return 0;
+  text[length] = '\0';
+  char *cursor = strrchr(text, ')'), state; long parent = 0;
+  return cursor != NULL && sscanf(cursor + 1, " %c %ld", &state, &parent) == 2 &&
+    parent > 0 && parent <= INT_MAX ? (pid_t)parent : 0;
+#else
+  (void)pid; return 0;
+#endif
+}
+
+static pm_authenticated_scope *pm_auth_exact_scope(pm_authorization *auth, pid_t pid, unsigned long long birth) {
+  for (size_t index = 0; index < auth->count; index++) {
+    if (auth->scopes[index].pid == pid && auth->scopes[index].birth == birth) return &auth->scopes[index];
+  }
+  return NULL;
+}
+
+/* Only controller-origin scope can authorize descendants. Ordinary network
+ * tokens retain their existing exact-peer binding and do not create roots. */
+static pm_authenticated_scope *pm_auth_controller_scope(pm_authorization *auth, pid_t pid, unsigned long long birth) {
+  if (birth == 0 || pm_auth_process_birth(pid) != birth) return NULL;
+  pid_t current = pid;
+  unsigned long long current_birth = birth;
+  for (int depth = 0; depth < 64 && current > 1 && current_birth != 0; depth++) {
+    pm_authenticated_scope *scope = pm_auth_exact_scope(auth, current, current_birth);
+    if (scope != NULL && scope->controller_scope) {
+      if (current == pid) return scope;
+      char network_id[128]; snprintf(network_id, sizeof(network_id), "%s", scope->network_id);
+      if (pm_auth_process_birth(current) != current_birth) return NULL;
+      /* An earlier conflicting guest pin or a full registry must not erase a
+       * witnessed controller ancestor and reopen another network's token. */
+      if (pm_auth_pin_scope(auth, pid, birth, network_id) != 0) return scope;
+      scope = pm_auth_exact_scope(auth, pid, birth);
+      if (scope != NULL) scope->controller_scope = 1;
+      return scope;
+    }
+    pid_t parent = pm_auth_process_parent(current);
+    unsigned long long parent_birth = parent > 1 ? pm_auth_process_birth(parent) : 0;
+    if (parent == current || parent_birth == 0 || parent_birth > current_birth ||
+        pm_auth_process_birth(current) != current_birth) return NULL;
+    current = parent; current_birth = parent_birth;
+  }
+  return NULL;
+}
+
+static int pm_auth_register_controller_scope(pm_authorization *auth, pid_t pid, unsigned long long birth, const char *network_id) {
+  char key[PM_NETWORK_NAMESPACE_KEY_SIZE];
+  if (pid <= 1 || pm_network_namespace_key(network_id, key, sizeof(key)) != 0 ||
+      birth == 0 || pm_auth_process_birth(pid) != birth) return -1;
+  pm_authenticated_scope *inherited = pm_auth_controller_scope(auth, pid, birth);
+  if (inherited != NULL && strcmp(inherited->network_id, network_id) != 0) return -1;
+  if (pm_auth_pin_scope(auth, pid, birth, network_id) != 0) return -1;
+  pm_authenticated_scope *scope = pm_auth_exact_scope(auth, pid, birth);
+  if (scope == NULL) return -1;
+  scope->controller_scope = 1;
   return 0;
 }
 
@@ -237,6 +312,8 @@ static int pm_auth_request(pm_authorization *auth, pm_agent_state *state, const 
   if (length == 0 || host[length - 1] != '\n') return -1;
   host[length - 1] = '\0';
   if (strncmp(host, "127.", 4) != 0) return -1;
+  pm_authenticated_scope *trusted_scope = pm_auth_controller_scope(auth, peer_pid, peer_birth);
+  if (trusted_scope != NULL && strcmp(trusted_scope->network_id, request->authorization_network_id) != 0) return -1;
   char network_id[128];
   pm_json_get_string(request->payload, "networkId", network_id, sizeof(network_id));
   if (strcmp(request->method, "releaseRouteAllocation") == 0) {

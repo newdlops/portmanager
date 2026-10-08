@@ -1390,9 +1390,14 @@ static int pm_file_substitution_make_parents(char *candidate) {
     if (*cursor == '/') {
       *cursor = '\0';
       struct stat directory_stat;
-      int created = mkdir(candidate, 0700);
-      int valid = (created == 0 || errno == EEXIST) && lstat(candidate, &directory_stat) == 0 &&
-        S_ISDIR(directory_stat.st_mode) && directory_stat.st_uid == geteuid();
+      /* Common namespace parents already exist and are read-only under the
+       * kernel policy. Do not attempt mkdir there merely to get EEXIST. */
+      int observed = lstat(candidate, &directory_stat);
+      if (observed != 0 && errno == ENOENT) {
+        int created = mkdir(candidate, 0700);
+        if (created == 0 || errno == EEXIST) observed = lstat(candidate, &directory_stat);
+      }
+      int valid = observed == 0 && S_ISDIR(directory_stat.st_mode) && directory_stat.st_uid == geteuid();
       *cursor = '/';
       if (!valid) { errno = EACCES; return -1; }
     }

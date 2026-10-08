@@ -34,6 +34,9 @@ export function buildMacosNetworkSandboxProfile(scope: MacosNetworkSandboxScope)
     }
     return directory;
   });
+  // The nofollow mirror walk opens these common parents as directories.
+  // Allow enumeration/traversal of their names, never data in another realm.
+  const namespaceParents = [...new Set(directories.flatMap(directory => [path.dirname(directory), path.dirname(path.dirname(directory))]))];
   const profile = [
     "(version 1)", "(deny default)",
     "(allow process-exec process-fork)",
@@ -48,6 +51,7 @@ export function buildMacosNetworkSandboxProfile(scope: MacosNetworkSandboxScope)
     "(allow file-read* file-map-executable (require-all (regex #\"/[.]portmanager/runtime/\") (require-not (regex #\"/[.]portmanager/namespaces/\"))))",
     ...sharedDirectories.map(directory => `(allow file-write* (require-all (subpath ${profileString(directory)}) (require-not (regex #\"/[.]portmanager(/|$)\"))))`),
     ...directories.map(directory => `(allow file-read* file-write* file-map-executable (subpath ${profileString(directory)}))`),
+    ...namespaceParents.map(directory => `(allow file-read-data (require-all (vnode-type DIRECTORY) (literal ${profileString(directory)})))`),
     "(allow file-read-data file-write-data (literal \"/dev/null\"))",
     "(allow mach-lookup (global-name \"com.apple.logd\") (global-name \"com.apple.system.logger\") (global-name \"com.apple.system.opendirectoryd.libinfo\"))",
   ];

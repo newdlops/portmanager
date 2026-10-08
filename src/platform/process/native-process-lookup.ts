@@ -20,6 +20,8 @@ interface NativeProcessLookupProviderOptions {
 }
 
 export interface NativeProcessLookupDetails {
+  /** OS process creation identity; microseconds on macOS, start ticks on Linux. */
+  readonly birth?: number;
   /** Process table row for the inspected PID, when the process still exists. */
   readonly row?: ProcessTableRow;
   /** Parent chain from direct parent up to the visible root. */
@@ -32,6 +34,11 @@ export interface NativeProcessLookupDetails {
   readonly argv?: readonly string[];
   /** Full environment as KEY=VALUE entries (only populated by captureProcess). */
   readonly env?: readonly string[];
+}
+
+export interface NativeProcessIdentity {
+  readonly pid: number;
+  readonly birth: number;
 }
 
 /**
@@ -51,6 +58,19 @@ export class NativeProcessLookupProvider {
   constructor(options: NativeProcessLookupProviderOptions = {}) {
     this.helperPath = options.helperPath ?? resolveDefaultProcessLookupHelperPath();
     this.runCommand = options.commandRunner ?? runExecFile;
+  }
+
+  /** Direct OS identity query without a process-table or environment scan. */
+  async readProcessIdentity(pid: number): Promise<NativeProcessIdentity | undefined> {
+    if (this.disabled || process.platform === "win32" || !isPositiveInteger(pid)) return undefined;
+    try {
+      const { stdout } = await this.runCommand(this.helperPath, ["identity", String(pid)]);
+      const identity = parseNativeProcessIdentity(toText(stdout));
+      return identity?.pid === pid ? identity : undefined;
+    } catch {
+      // A single exited PID is not evidence that the entire helper is broken.
+      return undefined;
+    }
   }
 
   /** Returns native process-table rows, or undefined when fallback should run. */
@@ -126,6 +146,7 @@ export function parseNativeProcessLookupDetails(output: string): NativeProcessLo
     : [];
   const cwd = parseNonEmptyString(parsed?.cwd);
   const networkId = parseNonEmptyString(parsed?.networkId);
+  const birth = typeof parsed?.birth === "number" && Number.isSafeInteger(parsed.birth) && parsed.birth > 0 ? parsed.birth : undefined;
   const argv = Array.isArray(parsed?.argv)
     ? parsed.argv.filter((entry): entry is string => typeof entry === "string")
     : undefined;
@@ -134,6 +155,7 @@ export function parseNativeProcessLookupDetails(output: string): NativeProcessLo
     : undefined;
 
   return {
+    ...(birth === undefined ? {} : { birth }),
     ...(row === undefined ? {} : { row }),
     ancestorPids,
     ...(cwd === undefined ? {} : { cwd }),
@@ -141,6 +163,14 @@ export function parseNativeProcessLookupDetails(output: string): NativeProcessLo
     ...(argv === undefined ? {} : { argv }),
     ...(env === undefined ? {} : { env }),
   };
+}
+
+/** Accept only exact positive integers: rounding could authenticate a reused PID. */
+export function parseNativeProcessIdentity(output: string): NativeProcessIdentity | undefined {
+  const parsed = asRecord(JSON.parse(output) as unknown);
+  if (!isPositiveInteger(parsed?.pid) || parsed.pid > 2147483647 || typeof parsed.birth !== "number" ||
+      !Number.isSafeInteger(parsed.birth) || parsed.birth <= 0) return undefined;
+  return { pid: parsed.pid, birth: parsed.birth };
 }
 
 function parseNativeProcessTableRow(value: unknown): ProcessTableRow | undefined {

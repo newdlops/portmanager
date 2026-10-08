@@ -23,6 +23,7 @@ import type {
   RegisteredProcessInput,
 } from "../shared/types";
 import type { PortManagerProcessService } from "./process-service";
+import type { AuthenticatedProcessScope, ResolveProcessScopePayload } from "../agent/protocol";
 
 /**
  * VS Code extension client for the single local Port Manager agent.
@@ -42,6 +43,8 @@ type AgentMethod =
   | "shutdownDaemon"
   | "startManagedProcess"
   | "registerExistingProcess"
+  | "registerProcessScope"
+  | "resolveProcessScope"
   | "stopProcess"
   | "restartProcess"
   | "removeProcess"
@@ -441,6 +444,11 @@ export class LocalAgentClient implements PortManagerProcessService {
     this.upsertKnownProcess(process);
 
     return process;
+  }
+
+  /** Resolve OS PID/birth against controller roots before reading untrusted env. */
+  async resolveProcessScope(input: ResolveProcessScopePayload): Promise<AuthenticatedProcessScope | null> {
+    return this.request<AuthenticatedProcessScope | null>("resolveProcessScope", input);
   }
 
   /** Stops a process through the agent when it owns the child PID. */

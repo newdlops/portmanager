@@ -27,6 +27,7 @@ typedef struct pm_process_row {
   int parent_pid;
   int process_group_id;
   char terminal_id[PM_TTY_SIZE];
+  unsigned long long birth;
 } pm_process_row;
 
 typedef struct pm_process_table {
@@ -223,6 +224,13 @@ static int pm_linux_read_row(int pid, pm_process_row *row) {
   row->parent_pid = (int)parent_pid;
   row->process_group_id = (int)process_group_id;
   row->terminal_id[0] = '\0';
+  row->birth = 0;
+  char *birth_cursor = end_comm + 2;
+  for (int field = 3; field < 22 && birth_cursor != NULL; field++) {
+    birth_cursor = strchr(birth_cursor, ' ');
+    if (birth_cursor != NULL) birth_cursor++;
+  }
+  if (birth_cursor != NULL) row->birth = strtoull(birth_cursor, NULL, 10);
   pm_linux_tty_from_device(tty_device, row->terminal_id, sizeof(row->terminal_id));
   return 0;
 }
@@ -362,6 +370,7 @@ static int pm_read_process_table(pm_process_table *table) {
     row.parent_pid = (int)process_info.pbi_ppid;
     row.process_group_id = (int)process_info.pbi_pgid;
     row.terminal_id[0] = '\0';
+    row.birth = (unsigned long long)process_info.pbi_start_tvsec * 1000000 + process_info.pbi_start_tvusec;
 
     if (terminal_device != NODEV) {
       terminal_name = devname(terminal_device, S_IFCHR);
@@ -634,6 +643,7 @@ static void pm_print_inspect(pm_process_table *table, int pid, int include_args)
 
   printf("{\"pid\":%d", pid);
   if (row != NULL) {
+    if (row->birth != 0) printf(",\"birth\":%llu", row->birth);
     fputs(",\"row\":", stdout);
     pm_print_row(row);
     fputs(",\"ancestorPids\":", stdout);
@@ -654,9 +664,46 @@ static void pm_print_inspect(pm_process_table *table, int pid, int include_args)
   fputs("}\n", stdout);
 }
 
+/* Security identity queries must not enumerate every process, resolve TTY
+ * names, or read an environment. A disappeared PID simply has no identity. */
+static int pm_print_identity(int pid) {
+  unsigned long long birth = 0;
+#if defined(__APPLE__)
+  struct proc_bsdinfo info;
+  if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) == sizeof(info) && info.pbi_uid == geteuid()) {
+    birth = (unsigned long long)info.pbi_start_tvsec * 1000000 + info.pbi_start_tvusec;
+  }
+#elif defined(__linux__)
+  char filename[64], text[4096];
+  snprintf(filename, sizeof(filename), "/proc/%d/stat", pid);
+  struct stat stats;
+  FILE *file = stat(filename, &stats) == 0 && stats.st_uid == geteuid() ? fopen(filename, "r") : NULL;
+  if (file != NULL) {
+    if (fgets(text, sizeof(text), file) != NULL) {
+      char *cursor = strrchr(text, ')');
+      if (cursor != NULL) cursor += 2;
+      for (int field = 3; field < 22 && cursor != NULL; field++) {
+        cursor = strchr(cursor, ' '); if (cursor != NULL) cursor++;
+      }
+      if (cursor != NULL) birth = strtoull(cursor, NULL, 10);
+    }
+    fclose(file);
+  }
+#endif
+  if (birth == 0) return 1;
+  printf("{\"pid\":%d,\"birth\":%llu}\n", pid, birth);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   pm_process_table table = {0};
   int result = 0;
+
+  if (argc == 3 && strcmp(argv[1], "identity") == 0) {
+    char *end; errno = 0;
+    long pid = strtol(argv[2], &end, 10);
+    return errno == 0 && *end == '\0' && pid > 1 && pid <= INT_MAX ? pm_print_identity((int)pid) : 2;
+  }
 
   if (argc < 2) {
     fprintf(stderr, "usage: portmanager_process_lookup list|inspect <pid>\n");

@@ -292,11 +292,16 @@ macOS와 Windows는 Linux network namespace와 같은 per-process 네트워크 �
 
 별도 native launcher 후보는 보호된 profile을 읽고 상속 FD·기존 권한 환경을 정리한
 뒤, 실제 커널 거절과 broker transport를 확인한다. 표준 IO만 명시적으로 상속하는
-SETEXEC로 같은 PID를 유지하며, private pipe의 record와 exec EOF로 시작을 확인한다.
+SETEXEC로 같은 PID를 유지하며, private socketpair의 record와 exec EOF로 시작을 확인한다.
 실제 PTY에서는 해당 terminal device만 허용하고 자기·자식 신호와 자기 scheduling만
 허용한다. 호스트 zsh·Node·Python, 다른 TTY 거절과 종료 신호를 무시하는 자식 회수를
-합성 테스트로 확인했다. 이 launcher도 제품 attach·인증된 PID 등록·packaging에 아직
-연결하지 않았으며, stdout의 테스트용 ready 문구는 제품의 trusted 확인 채널이 아니다.
+합성 테스트로 확인했다. controller 옵션을 쌍으로 지정하면 정책 확인 뒤 실제 fork
+PID·birth를 데몬에 등록하고 동일 tuple의 승인 후에만 private ACK로 exec를 허용한다.
+잘못된 응답·거절·기한·취소에는 실행하지 않는다. 이 launcher도 제품 attach·proxy 귀속·
+packaging에는 아직 연결하지 않았으며, stdout의 테스트용 ready 문구는 제품의 trusted
+확인 채널이 아니다. namespace 미러의 nofollow 탐색에는 공통 부모의 directory 읽기만
+허용하고 기존 부모에 불필요한 mkdir를 시도하지 않는다. 타 namespace 파일과 키는 계속
+거절한다.
 
 agent 소스의 RPC 권한은 별도로 분리한다. controller 키는 workload 환경에 넣지 않으며
 보호된 `.portmanager/security/agent-control/`에 저장한다. 네트워크 키는 stable ID별로
@@ -316,6 +321,14 @@ agent 소스의 RPC 권한은 별도로 분리한다. controller 키는 workload
 거부한다. 강제 격리 연결은 `controllerAuthorizationVersion: 1`과
 `authenticatesNetworkPeers: true`를 확인해야 한다. 이 RPC 인증만으로 파일·직접 syscall·
 proxy 귀속 경계를 완성했다고 표시하지 않는다.
+
+`registerProcessScope`·`resolveProcessScope`는 controller 전용이다. 현재 PID/birth와
+controller-origin root·OS 조상을 확인하고 위조 env보다 우선하는 불변 scope를 제공한다.
+일반 workload token으로 만든 peer scope는 subtree root가 아니다. 관측된 자손은
+reparent 뒤에도 birth를 확인하고, controller route 등록도 scope의 networkId와 같아야
+한다. native의 `authenticatesProcessScopes: true`를 확인하며 Node fallback은 이 RPC를
+거절한다. daemon 재시작의 root 재등록, 관측 전 orphan 처리, 실제 recovery/proxy의
+API 사용은 제품 연결 전에 검증해야 한다.
 
 제품 경로에 연결하기 전에 다음을 검증한다.
 

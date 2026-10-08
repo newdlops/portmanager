@@ -2,6 +2,7 @@
 #include "../network-broker/pm_network_broker_client.h"
 #include "../shared/pm_network_namespace.h"
 #include "../shared/pm_dev_log.h"
+#include "../agent/portmanager_agent.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -26,10 +27,11 @@
 #define PM_LAUNCH_PROFILE_BYTES (128 * 1024)
 #define PM_LAUNCH_START_MS 8000
 #define PM_LAUNCH_STOP_MS 2000
-enum { PM_LAUNCH_POLICY_READY = 1, PM_LAUNCH_EXEC_FAILED = 2 };
+enum { PM_LAUNCH_POLICY_READY = 1, PM_LAUNCH_EXEC_FAILED = 2, PM_LAUNCH_AUTHORIZED = 3, PM_LAUNCH_EXEC_START = 4 };
 typedef struct { unsigned int magic, phase; int error, reserved; } pm_launch_record;
 typedef struct {
   const char *profile_path, *broker_path, *hook_path, *network_id;
+  const char *agent_path, *controller_path;
   int command_index, guard, announce;
 } pm_launch_options;
 static volatile sig_atomic_t pm_launch_signal;
@@ -75,11 +77,14 @@ static int pm_launch_parse(int argc, char **argv, pm_launch_options *options) {
     else if (strcmp(argument, "--broker") == 0 && options->broker_path == NULL) options->broker_path = argv[++index];
     else if (strcmp(argument, "--hook") == 0 && options->hook_path == NULL) options->hook_path = argv[++index];
     else if (strcmp(argument, "--network-id") == 0 && options->network_id == NULL) options->network_id = argv[++index];
+    else if (strcmp(argument, "--agent-socket") == 0 && options->agent_path == NULL) options->agent_path = argv[++index];
+    else if (strcmp(argument, "--controller-token-file") == 0 && options->controller_path == NULL) options->controller_path = argv[++index];
     else return -1;
   }
   char key[PM_NETWORK_NAMESPACE_KEY_SIZE];
   return options->command_index > 0 && options->command_index < argc && options->profile_path != NULL &&
     options->broker_path != NULL && options->hook_path != NULL && options->network_id != NULL &&
+    (options->agent_path == NULL) == (options->controller_path == NULL) &&
     pm_network_namespace_key(options->network_id, key, sizeof(key)) == 0 ? 0 : -1;
 }
 /* A descriptor-rooted walk rejects symlinks without a check/open race. The
@@ -164,6 +169,33 @@ static int pm_launch_record_write(unsigned int phase, int error) {
   }
   return 0;
 }
+
+#include "pm_network_launch_authorization.h"
+
+/* The guard blocks before executing application code. Only the supervisor's
+ * private socket can release it; this descriptor disappears on SETEXEC. */
+static int pm_launch_record_read(int fd, pm_launch_record *record, long long deadline) {
+  size_t offset = 0;
+  while (offset < sizeof(*record)) {
+    if (pm_launch_signal != 0) { errno = EINTR; return -1; }
+    long long remaining = deadline - pm_nb_client_now();
+    if (remaining <= 0) { errno = ETIMEDOUT; return -1; }
+    struct pollfd descriptor = { .fd = fd, .events = POLLIN };
+    int ready = poll(&descriptor, 1, remaining > 50 ? 50 : (int)remaining);
+    if (ready < 0 && errno == EINTR) continue;
+    if (ready < 0) return -1;
+    if (ready == 0) continue;
+    ssize_t count = read(fd, (char *)record + offset, sizeof(*record) - offset);
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) { if (count == 0) errno = EPROTO; return -1; }
+    offset += (size_t)count;
+  }
+  if (record->magic != PM_LAUNCH_MAGIC || record->reserved != 0 || record->error != 0) {
+    errno = record->magic == PM_LAUNCH_MAGIC && record->phase == PM_LAUNCH_EXEC_FAILED && record->error > 0 ? record->error : EPROTO;
+    return -1;
+  }
+  return 0;
+}
 static void pm_launch_clean_environment(void) {
   extern char **environ;
   char *diagnostics = getenv("PORT_MANAGER_DEV_LOG") == NULL ? NULL : strdup(getenv("PORT_MANAGER_DEV_LOG"));
@@ -194,7 +226,7 @@ static int pm_launch_application_exec(const pm_launch_options *options, char **a
   if (error != 0) { posix_spawnattr_destroy(&attributes); return error; }
   error = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETEXEC | POSIX_SPAWN_CLOEXEC_DEFAULT);
   for (int fd = 0; error == 0 && fd < 3; fd++) error = posix_spawn_file_actions_addinherit_np(&actions, fd);
-  if (error == 0 && pm_launch_record_write(PM_LAUNCH_POLICY_READY, 0) != 0) error = errno;
+  if (error == 0 && pm_launch_record_write(PM_LAUNCH_EXEC_START, 0) != 0) error = errno;
   if (error == 0) {
     signal(SIGPIPE, SIG_DFL);
     error = posix_spawnp(NULL, argv[options->command_index], &actions, &attributes, &argv[options->command_index], environ);
@@ -209,7 +241,7 @@ static int pm_launch_application_exec(const pm_launch_options *options, char **a
  * denial and authorized broker transport before any application code runs. */
 static int pm_launch_guard(const pm_launch_options *options, char **argv) {
   struct stat pipe_info;
-  if (fstat(3, &pipe_info) != 0 || !S_ISFIFO(pipe_info.st_mode)) {
+  if (fstat(3, &pipe_info) != 0 || !S_ISSOCK(pipe_info.st_mode)) {
     pm_dev_log("network-launcher", "guard readiness descriptor unavailable errno=%d", errno); return 125;
   }
   if (fcntl(3, F_SETFD, FD_CLOEXEC) != 0) {
@@ -234,6 +266,10 @@ static int pm_launch_guard(const pm_launch_options *options, char **argv) {
   int result = connect(socket, (struct sockaddr *)&target, sizeof(target));
   int error = errno; close(socket);
   if (result == 0 || (error != EPERM && error != EACCES)) { errno = EACCES; goto rejected; }
+  if (pm_launch_record_write(PM_LAUNCH_POLICY_READY, 0) != 0) goto rejected;
+  pm_launch_record authorized;
+  if (pm_launch_record_read(3, &authorized, pm_nb_client_now() + PM_LAUNCH_START_MS) != 0) goto rejected;
+  if (authorized.phase != PM_LAUNCH_AUTHORIZED) { errno = EACCES; goto rejected; }
   if (setenv("PORT_MANAGER_NETWORK_ID", options->network_id, 1) != 0 ||
       setenv("PORT_MANAGER_NETWORK_BROKER_SOCKET", options->broker_path, 1) != 0 ||
       setenv("PORT_MANAGER_HOOK", "1", 1) != 0 || setenv("PORT_MANAGER_AGENT_REQUIRED", "0", 1) != 0 ||
@@ -246,9 +282,8 @@ rejected:
   (void)pm_launch_record_write(PM_LAUNCH_EXEC_FAILED, error);
   return 125;
 }
-static int pm_launch_wait_ready(int fd) {
+static int pm_launch_wait_ready(int fd, long long deadline) {
   unsigned char bytes[sizeof(pm_launch_record) * 2 + 1]; size_t length = 0;
-  long long deadline = pm_nb_client_now() + PM_LAUNCH_START_MS;
   if (fcntl(fd, F_SETFL, O_NONBLOCK) != 0) return -1;
   for (;;) {
     if (pm_launch_signal != 0) { errno = EINTR; return -1; }
@@ -270,14 +305,14 @@ static int pm_launch_wait_ready(int fd) {
   pm_launch_record record;
   if (length == sizeof(record) * 2) {
     pm_launch_record failure; memcpy(&record, bytes, sizeof(record)); memcpy(&failure, bytes + sizeof(record), sizeof(failure));
-    if (record.magic == PM_LAUNCH_MAGIC && record.phase == PM_LAUNCH_POLICY_READY &&
+    if (record.magic == PM_LAUNCH_MAGIC && record.phase == PM_LAUNCH_EXEC_START &&
         failure.magic == PM_LAUNCH_MAGIC && failure.phase == PM_LAUNCH_EXEC_FAILED && failure.error > 0) {
       errno = failure.error; return -1;
     }
   }
   if (length != sizeof(record)) { errno = EPROTO; return -1; }
   memcpy(&record, bytes, sizeof(record));
-  if (record.magic != PM_LAUNCH_MAGIC || record.phase != PM_LAUNCH_POLICY_READY || record.error != 0 || record.reserved != 0) {
+  if (record.magic != PM_LAUNCH_MAGIC || record.phase != PM_LAUNCH_EXEC_START || record.error != 0 || record.reserved != 0) {
     errno = record.phase == PM_LAUNCH_EXEC_FAILED && record.error > 0 ? record.error : EACCES; return -1;
   }
   return 0;
@@ -340,7 +375,7 @@ int main(int argc, char **argv) {
   arguments[index++] = "--";
   for (int position = options.command_index; position < argc; position++) arguments[index++] = argv[position];
   int ready[2];
-  if (pipe(ready) != 0) { free(arguments); free(profile); return 125; }
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, ready) != 0) { free(arguments); free(profile); return 125; }
   if (fcntl(ready[0], F_SETFD, FD_CLOEXEC) != 0) { close(ready[0]); close(ready[1]); free(arguments); free(profile); return 125; }
   pm_launch_clean_environment();
   signal(SIGCHLD, SIG_DFL);
@@ -359,7 +394,14 @@ int main(int argc, char **argv) {
   pid_t foreground = isatty(0) ? tcgetpgrp(0) : -1;
   signal(SIGTTOU, SIG_IGN);
   if (foreground > 0) (void)tcsetpgrp(0, child);
-  int accepted = birth != 0 && pm_launch_wait_ready(ready[0]) == 0;
+  long long deadline = pm_nb_client_now() + PM_LAUNCH_START_MS;
+  pm_launch_record policy;
+  int accepted = birth != 0 && pm_launch_record_read(ready[0], &policy, deadline) == 0 && policy.phase == PM_LAUNCH_POLICY_READY;
+  if (accepted && options.agent_path != NULL) accepted = pm_launch_register_scope(&options, child, birth, deadline) == 0;
+  if (accepted) {
+    pm_launch_record authorized = { .magic = PM_LAUNCH_MAGIC, .phase = PM_LAUNCH_AUTHORIZED };
+    accepted = write(ready[0], &authorized, sizeof(authorized)) == sizeof(authorized) && pm_launch_wait_ready(ready[0], deadline) == 0;
+  }
   close(ready[0]);
   if (accepted) {
     pm_dev_log("network-launcher", "policy ready child_pid=%ld birth=%llu", (long)child, birth);

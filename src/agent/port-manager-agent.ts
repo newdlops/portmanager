@@ -1283,6 +1283,9 @@ export class PortManagerAgent implements DisposableLike {
         return this.startManagedProcess(request.payload as AgentStartManagedProcessRequest);
       case "registerExistingProcess":
         return this.registerExistingProcess(request.payload as RegisteredProcessInput);
+      case "registerProcessScope":
+      case "resolveProcessScope":
+        throw new Error("Authenticated process scopes require the native agent; fallback execution is unavailable.");
       case "stopProcess": {
         const payload = request.payload as StopProcessPayload;
         return this.stopProcess(payload.id, payload.signal);
@@ -2629,6 +2632,7 @@ function buildDaemonStatus(options: {
   return {
     controllerAuthorizationVersion: 1,
     authenticatesNetworkPeers: false,
+    authenticatesProcessScopes: false,
     status: "running",
     pid: options.agentPid,
     startedAt: options.startedAt,

@@ -504,6 +504,27 @@ static int pm_dispatch(pm_agent_state *state, const pm_request *request, pm_buff
   if (strcmp(request->method, "daemonStatus") == 0) {
     return pm_state_daemon_status(state, payload);
   }
+  /* These methods have no network/anonymous authorization path. The launcher
+   * sends its own fork identity before the child receives permission to exec. */
+  if (strcmp(request->method, "registerProcessScope") == 0 || strcmp(request->method, "resolveProcessScope") == 0) {
+    long raw_pid = pm_json_get_long(request->payload, "pid", 0);
+    long raw_birth = pm_json_get_long(request->payload, "birth", 0);
+    char network_id[128]; network_id[0] = '\0';
+    if (raw_pid <= 1 || raw_pid > INT_MAX || raw_birth <= 0 ||
+        pm_auth_process_birth((pid_t)raw_pid) != (unsigned long long)raw_birth) {
+      snprintf(error, error_size, "Process scope requires a current PID and matching birth."); return -1;
+    }
+    if (strcmp(request->method, "registerProcessScope") == 0 &&
+        (pm_json_get_string(request->payload, "networkId", network_id, sizeof(network_id)) != 0 ||
+         pm_auth_register_controller_scope(&pm_auth, (pid_t)raw_pid, (unsigned long long)raw_birth, network_id) != 0)) {
+      snprintf(error, error_size, "Process scope registration denied."); return -1;
+    }
+    pm_authenticated_scope *scope = pm_auth_controller_scope(&pm_auth, (pid_t)raw_pid, (unsigned long long)raw_birth);
+    if (scope == NULL) return pm_buffer_append(payload, "null");
+    if (pm_buffer_appendf(payload, "{\"pid\":%ld,\"birth\":%llu,\"networkId\":", raw_pid, (unsigned long long)raw_birth) != 0 ||
+        pm_json_append_string(payload, scope->network_id) != 0) return -1;
+    return pm_buffer_append(payload, "}");
+  }
   if (strcmp(request->method, "refreshSnapshot") == 0) {
     return pm_state_refresh_snapshot(state, payload);
   }
@@ -543,6 +564,11 @@ static int pm_dispatch(pm_agent_state *state, const pm_request *request, pm_buff
     if (pm_parse_register_input(request->payload, &input) != 0) {
       snprintf(error, error_size, "Invalid registerExistingProcess payload.");
       return -1;
+    }
+    pm_authenticated_scope *scope = input.pid > 1 ?
+      pm_auth_controller_scope(&pm_auth, input.pid, pm_auth_process_birth(input.pid)) : NULL;
+    if (scope != NULL && strcmp(scope->network_id, input.network_id) != 0) {
+      snprintf(error, error_size, "Registered route differs from authenticated process scope."); return -1;
     }
     unsigned long before_revision = state->registration_revision;
     size_t before_pending = state->pending_count;

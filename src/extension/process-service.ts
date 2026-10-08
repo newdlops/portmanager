@@ -7,6 +7,7 @@ import type {
   PortManagerSettings,
   RegisteredProcessInput,
 } from "../shared/types";
+import type { AuthenticatedProcessScope, ResolveProcessScopePayload } from "../agent/protocol";
 
 /**
  * Extension-facing process service boundary.
@@ -44,6 +45,8 @@ export interface PortManagerProcessService {
   startManagedProcess(input: ManagedProcessStartInput, settings: PortManagerSettings): Promise<ManagedProcess>;
   /** Registers an already running process with the shared agent state. */
   registerExistingProcess(input: RegisteredProcessInput): Promise<ManagedProcess>;
+  /** Optional only for legacy adapters; guarded execution requires this method. */
+  resolveProcessScope?(input: ResolveProcessScopePayload): Promise<AuthenticatedProcessScope | null>;
   /** Stops a managed process when the agent owns its child process. */
   stopProcess(id: string, settings: PortManagerSettings): Promise<ManagedProcess | undefined>;
   /** Restarts a managed process through its agent-side launch profile. */

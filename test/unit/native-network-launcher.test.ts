@@ -48,7 +48,9 @@ test("protected launcher confirms kernel policy, drops inherited authority and s
   const launcherPath = path.join(runtime, "launch"), brokerPath = path.join(runtime, "broker"), hookPath = path.join(runtime, "hook.dylib");
   for (const [input, output] of [["native/network-launcher/portmanager_network_launch.c", launcherPath],
     ["native/network-broker/portmanager_network_broker.c", brokerPath]]) {
-    execFileSync("cc", ["-Wall", "-Wextra", "-Werror", "-O2", path.join(source, input), path.join(source, "native/shared/pm_dev_log.c"), "-o", output]);
+    const dependencies = input.includes("network-launcher") ? [path.join(source, "native/agent/portmanager_agent_json.c")] : [];
+    execFileSync("cc", ["-Wall", "-Wextra", "-Werror", "-O2", path.join(source, input), ...dependencies,
+      path.join(source, "native/shared/pm_dev_log.c"), "-o", output]);
   }
   execFileSync("cc", ["-Wall", "-Wextra", "-O2", "-dynamiclib", path.join(source, "native/hook/portmanager_hook.c"),
     path.join(source, "native/shared/pm_dev_log.c"), "-o", hookPath]);

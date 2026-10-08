@@ -52,6 +52,18 @@ controller 키가 필요하다. workload 키는 자신이 소유한 TCP endpoint
 현재 권한을 다시 확인한다. PID는 kernel 생성 시각과 함께 최대 8,192개까지 고정하며, 새 PID
 등록 시 종료된 정체성을 회수하고 살아 있는 PID의 네트워크 변경은 거부한다.
 
+`registerProcessScope`·`resolveProcessScope`는 controller 전용이며 실제 PID·birth를
+검사한다. launcher가 exec 전에 등록한 root와 OS에서 확인한 최대 64단계의 자손만
+controller-origin scope로 취급한다. 네트워크 키의 일반 peer 등록은 subtree root가
+되지 않는다. 관측된 자손은 reparent 뒤에도 현재 birth를 확인하며 같은 scope를 유지한다.
+다른 네트워크 키나 위조한 env가 이 scope를 덮을 수 없고 controller의 route 등록도
+해당 PID의 scope와 다른 networkId를 주장하면 거부한다. 오래된 PID/birth는 재사용하지
+않는다. 충돌한 일반 peer 등록이나 꽉 찬 표가 확인된 controller 조상을 지우지 않는다.
+미확인 정체성은 `null`이며 제품의 강제 경로에서 env 추측으로 대체해서는 안 된다.
+이 표는 daemon 메모리에만 있으므로 restart 등록 복구와 관측 전 orphan 처리는 남아 있다.
+native status/snapshot은 `authenticatesProcessScopes: true`를 제공하고 Node fallback은
+false를 제공하며 이 두 RPC를 controller에게도 거절한다.
+
 키 읽기는 directory FD의 `openat`/`O_NOFOLLOW`로 parent/leaf symlink를 거부하고 소유자와
 0700 디렉터리·0600 파일을 확인한다. `--controller-token-file`로 별도 private 경로를 지정할 수
 있고 기본 경로는 OS 계정 home 아래 `.portmanager/security/agent-control/`다. 키가 없으면
