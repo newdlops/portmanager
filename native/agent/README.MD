@@ -23,6 +23,7 @@ Port Manager의 단일 로컬 daemon을 저수준 POSIX 프로세스로 제공�
 ## 주요 진입점
 
 - `portmanager_agent.c`: Unix-domain socket server와 protocol dispatch
+- `portmanager_agent_authorization.h`: private 키, kernel PID/생성 시각, 네트워크별 route 권한 확인
 - `portmanager_agent_probe.c`: 터미널 시작용 daemon readiness와 stale-lock 검사
 - `portmanager_agent_state.c`: route, process, snapshot, child lifecycle 상태
 - `portmanager_agent_json.c`: protocol payload 파싱과 JSON 응답 작성
@@ -44,9 +45,19 @@ Windows named pipe와 PowerShell listener scan은 native daemon에서 처리하�
 VS Code 시작 경로는 미지원 플랫폼이나 바이너리 부재 시 기존 Node daemon으로 fallback한다.
 명시적 routing repair는 `lsof`의 정상 무결과(exit 1)는 허용하지만 실행/권한/신호 오류를 빈 listener 표로 취급하지 않는다.
 `controlChannel`은 연결의 실제 PID만 등록할 수 있고 빈 scope, 다른 PID, 등록 후 scope 변경을
-거부한다. `respawnChild`의 빈 networkId는 wildcard 권한이 아니다. 이 검사는 임의 PID 제어
-채널 탈취를 막지만, 같은 UID의 모든 관리 RPC 권한을 분리한 보안 sandbox는 아니다.
-프로그램이 주장하는 networkId/환경값을 신뢰하지 않는 전용 broker 경계가 별도로 필요하다.
+거부한다. `respawnChild`의 빈 networkId는 wildcard 권한이 아니다. 관리 RPC·snapshot·respawn은
+controller 키가 필요하다. workload 키는 자신이 소유한 TCP endpoint의 route 등록/해제,
+자기 네트워크의 할당/해제와 실제 peer PID의 control 등록에만 쓸 수 있다. 다른 PID, group,
+네트워크, loopback 주소, allocation을 주장하면 scan/구독/실행 전에 거부한다. 지연된 실행도
+현재 권한을 다시 확인한다. PID는 kernel 생성 시각과 함께 최대 8,192개까지 고정하며, 새 PID
+등록 시 종료된 정체성을 회수하고 살아 있는 PID의 네트워크 변경은 거부한다.
+
+키 읽기는 directory FD의 `openat`/`O_NOFOLLOW`로 parent/leaf symlink를 거부하고 소유자와
+0700 디렉터리·0600 파일을 확인한다. `--controller-token-file`로 별도 private 경로를 지정할 수
+있고 기본 경로는 OS 계정 home 아래 `.portmanager/security/agent-control/`다. 키가 없으면
+socket 생성 전에 종료한다. 익명 readiness만 허용하며 요청 id prefix만으로 snapshot을
+구독할 수 없다. 이 인증은 커널 sandbox 자체가 아니다. 같은 UID의 비격리 프로세스는 파일
+권한만으로 배제할 수 없으며, 고정 scope broker·커널 정책·실제 terminal attach 연결이 남아 있다.
 DNS 응답 worker는 registry·파일·로그에 접근하지 않고 UDP와 shutdown pipe를 poll한다. DNS 게시 worker가 revision 검증과 영속화를 마친 뒤 control thread가 mutex 아래 레코드 포인터/개수만 교체하고 이전 테이블을 회수한다. packet 생성 중에만 같은 mutex를 잡으며, bind 실패는 control thread의 기존 backoff로 재시도한다. 종료·소켓 오류 시 응답 worker를 깨워 join한 후 descriptor를 닫는다. UDP와 wakeup pipe, 게시 파일은 CLOEXEC으로 managed child에 유출되지 않는다.
 managed child의 command/env 구성은 fork 전에 끝낸다. child는 chdir/open/dup2/close/execve/_exit만 사용해 DNS 스레드가 있는 부모에서 libc 상태를 상속한 뒤 잠기는 일을 방지한다.
 

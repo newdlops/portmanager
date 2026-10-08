@@ -655,6 +655,7 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     fs.writeFileSync(routeTablePath, JSON.stringify({ updatedAt: "2026-07-07T00:00:00.000Z", routes: [] }), "utf8");
     const claimPath = getRouteTablePathForGatewayClaimPort(address.port, routeTablePath);
     const clientEnv = {
+      PORT_MANAGER_AGENT_NETWORK_TOKEN: "f".repeat(64),
       PORT_MANAGER_GLOBAL_ROUTES_FILE: routeTablePath,
       PORT_MANAGER_FIXED_PROTOCOL_PORTS: String(address.port),
       PORT_MANAGER_AGENT_SOCKET: path.join(tempDir, "missing-agent.sock"),
@@ -1228,6 +1229,7 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
 
     const clientEnv = {
       PORT_MANAGER_AGENT_SOCKET: agentSocketPath,
+      PORT_MANAGER_AGENT_NETWORK_TOKEN: "f".repeat(64),
       PORT_MANAGER_CONNECT_ROUTE_WAIT_MS: "0",
       PORT_MANAGER_SEND_ALLOCATION_JOIN_WAIT_MS: "2000",
       PORT_MANAGER_AGENT_TIMEOUT_MS: "3000",
@@ -1317,6 +1319,7 @@ if (hookLibraryPath === undefined || !fs.existsSync(hookLibraryPath)) {
     const result = await runHookedNodeClient(logicalPort, routeTablePath, "network-a", {
       env: {
         PORT_MANAGER_AGENT_SOCKET: agentSocketPath,
+        PORT_MANAGER_AGENT_NETWORK_TOKEN: "f".repeat(64),
         PORT_MANAGER_ACTUAL_LOOPBACK_HOST: "127.81.154.127",
         PORT_MANAGER_AGENT_TIMEOUT_MS: "1000",
       },

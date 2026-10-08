@@ -290,6 +290,25 @@ macOS와 Windows는 Linux network namespace와 같은 per-process 네트워크 �
 이 후보는 아직 제품 attach 경로에 연결되지 않았다. 숫자 `127.x` 주소별 Seatbelt
 규칙이 지원되지 않으므로 TCP는 네트워크 ID가 고정된 broker에서 중계해야 한다.
 
+agent 소스의 RPC 권한은 별도로 분리한다. controller 키는 workload 환경에 넣지 않으며
+보호된 `.portmanager/security/agent-control/`에 저장한다. 네트워크 키는 stable ID별로
+구분하고 `authorizationNetworkId`·실제 kernel peer PID·프로세스 생성 시각에 묶는다.
+
+| 요청자 | 허용 범위 |
+| --- | --- |
+| 익명 | `daemonStatus` readiness만, snapshot 구독 불가 |
+| controller 키 | 관리 RPC, 전체 snapshot, respawn, 종료 |
+| 네트워크 키 | 자기 network의 할당/해제, 자기 PID가 실제 소유한 TCP endpoint의 등록, 자기 PID의 control channel |
+
+권한 검사는 scan·snapshot 구독보다 먼저 실행하고 지연된 요청도 다시 확인한다. 다른
+네트워크의 allocation은 route release로도 지울 수 없어야 한다. 살아 있는 PID의 scope는
+변경하지 않으며 PID 생성 시각으로 재사용을 구분한다. 등록 표는 최대 8,192개로 제한하고
+새 PID 등록 시 종료된 정체성을 회수한다. 생성된 셸 스크립트에는 key 경로만 남기고 key
+값은 기록하지 않는다. Node fallback은 실제 peer PID를 확인할 수 없으므로 workload RPC를
+거부한다. 강제 격리 연결은 `controllerAuthorizationVersion: 1`과
+`authenticatesNetworkPeers: true`를 확인해야 한다. 이 RPC 인증만으로 파일·직접 syscall·
+proxy 귀속 경계를 완성했다고 표시하지 않는다.
+
 제품 경로에 연결하기 전에 다음을 검증한다.
 
 - 전용 broker가 kernel peer PID와 불변 네트워크 ID를 사용하고 관리 RPC를 거부할 것

@@ -46,6 +46,10 @@ export interface AgentRequestMessage<TPayload = unknown> {
   readonly id: AgentRequestId;
   /** Request method understood by the agent dispatcher. */
   readonly method: AgentRequestMethod;
+  /** Private controller or network capability; never include it in logs/events. */
+  readonly authorization?: string;
+  /** Realm of a workload capability; controller requests omit it. */
+  readonly authorizationNetworkId?: string;
   /** Method-specific data. Empty requests may omit it. */
   readonly payload?: TPayload;
 }

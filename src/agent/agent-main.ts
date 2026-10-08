@@ -19,6 +19,7 @@ import { browserDnsPort } from "../platform/network/browser-dns-server";
 interface ParsedArguments {
   /** Local socket or named-pipe path where the agent should listen. */
   readonly socketPath: string;
+  readonly controllerTokenPath?: string;
   /** Dynamic route table file path chosen by the extension or shell hook. */
   readonly routeTablePath?: string;
   /** Browser DNS UDP port override; 0 selects an ephemeral port for tests. */
@@ -38,6 +39,7 @@ async function main(args: readonly string[]): Promise<void> {
     const routeTablePath =
       parsedArguments.routeTablePath ?? process.env.PORT_MANAGER_GLOBAL_ROUTES_FILE ?? process.env.PORT_MANAGER_ROUTES_FILE;
     const agent = new PortManagerAgent({
+      controllerTokenPath: parsedArguments.controllerTokenPath,
       processLauncher: new NodeProcessLauncher(),
       portAvailabilityProvider: new NodePortScanner(),
       listeningPortProvider: new NodeListeningPortProvider(),
@@ -69,20 +71,23 @@ function parseArguments(args: readonly string[]): ParsedArguments {
   const socketFlagIndex = args.indexOf("--socket");
   const socketPath = socketFlagIndex >= 0 ? args[socketFlagIndex + 1] : undefined;
   const routeTableFlagIndex = args.indexOf("--route-table");
+  const controllerFlagIndex = args.indexOf("--controller-token-file");
+  const controllerTokenPath = controllerFlagIndex >= 0 ? args[controllerFlagIndex + 1] : undefined;
   const routeTablePath = routeTableFlagIndex >= 0 ? args[routeTableFlagIndex + 1] : undefined;
   const dnsPortFlagIndex = args.indexOf("--dns-port");
   const dnsPortText = dnsPortFlagIndex >= 0 ? args[dnsPortFlagIndex + 1] : undefined;
   const dnsPort = dnsPortText === undefined ? undefined : Number.parseInt(dnsPortText, 10);
 
   if (socketPath === undefined || socketPath.trim().length === 0) {
-    throw new Error("Usage: port-manager-agent --socket <path> [--route-table <path>] [--dns-port <port>]");
+    throw new Error("Usage: port-manager-agent --socket <path> [--route-table <path>] [--dns-port <port>] [--controller-token-file <path>]");
   }
   if (dnsPort !== undefined && (!Number.isInteger(dnsPort) || dnsPort < 0 || dnsPort > 65535)) {
-    throw new Error("Usage: port-manager-agent --socket <path> [--route-table <path>] [--dns-port <port>]");
+    throw new Error("Usage: port-manager-agent --socket <path> [--route-table <path>] [--dns-port <port>] [--controller-token-file <path>]");
   }
 
   return {
     socketPath,
+    ...(controllerTokenPath === undefined ? {} : { controllerTokenPath }),
     ...(routeTablePath !== undefined && routeTablePath.trim().length > 0 ? { routeTablePath } : {}),
     ...(dnsPort !== undefined ? { dnsPort } : {}),
   };

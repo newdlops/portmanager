@@ -8,6 +8,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
 import { getRouteTablePathForLogicalPort } from "../../src/agent/route-table";
+import { createTestAgentCredential, testAgentAuthorization } from "./native-agent-test-authorization";
 
 const root = path.resolve(__dirname, "../../..");
 const agentPath = process.env.PORT_MANAGER_TEST_NATIVE_AGENT_PATH ?? path.join(root, "media/native/portmanager_agent");
@@ -57,7 +58,7 @@ async function channel(context: TestContext, socketPath: string) {
     socket, messages,
     send(method: string, payload?: unknown) {
       const id = `scan-test-${++sequence}`;
-      socket.write(`${JSON.stringify({ id, method, payload })}\n`);
+      socket.write(`${JSON.stringify({ id, method, payload, authorization: testAgentAuthorization(socketPath) })}\n`);
       return id;
     },
     async reply<T = unknown>(id: string, timeoutMs = 1500): Promise<T> {
@@ -76,7 +77,8 @@ async function fixture(context: TestContext, timeoutMs = 3000, script = gatedSca
   fs.writeFileSync(path.join(directory, "lsof"), script, { mode: 0o755 });
   let stderr = "";
   const child = spawn(agentPath, ["--socket", paths.socket, "--route-table", paths.routes,
-    "--agent-main", path.join(root, "out/src/agent/agent-main.js"), "--dns-port", "0"], {
+    "--agent-main", path.join(root, "out/src/agent/agent-main.js"), "--dns-port", "0",
+    "--controller-token-file", createTestAgentCredential(paths.socket)], {
     stdio: ["ignore", "ignore", "pipe"], env: {
       ...process.env, PATH: `${directory}:${process.env.PATH}`, PORT_MANAGER_AGENT_DISABLE_HOOK_RECOVERY: "1",
       PORT_MANAGER_AGENT_SCAN_TIMEOUT_MS: String(timeoutMs), PM_SCAN_DATA: paths.data, PM_SCAN_PIDS: paths.pids,

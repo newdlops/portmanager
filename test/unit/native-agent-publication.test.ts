@@ -8,6 +8,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
 import { getRouteTablePathForLogicalPort } from "../../src/agent/route-table";
+import { createTestAgentCredential, testAgentAuthorization } from "./native-agent-test-authorization";
 
 const root = path.resolve(__dirname, "../../..");
 const agentPath = process.env.PORT_MANAGER_TEST_NATIVE_AGENT_PATH ?? path.join(root, "media/native/portmanager_agent");
@@ -44,7 +45,7 @@ async function channel(socketPath: string) {
     socket, messages,
     send(method: string, payload?: unknown) {
       const id = `publication-${++sequence}`;
-      socket.write(`${JSON.stringify({ id, method, payload })}\n`);
+      socket.write(`${JSON.stringify({ id, method, payload, authorization: testAgentAuthorization(socketPath) })}\n`);
       return id;
     },
     async reply<T = unknown>(id: string, timeoutMs = 2000): Promise<T> {
@@ -83,7 +84,8 @@ async function fixture(context: TestContext, withGate = true) {
   fs.writeFileSync(scan, "");
   fs.writeFileSync(path.join(directory, "lsof"), '#!/bin/sh\n/bin/cat "$PM_PUBLICATION_SCAN"\n', { mode: 0o755 });
   child = spawn(agentPath, ["--socket", socketPath, "--route-table", routes,
-    "--agent-main", path.join(root, "out/src/agent/agent-main.js"), "--dns-port", "0"], {
+    "--agent-main", path.join(root, "out/src/agent/agent-main.js"), "--dns-port", "0",
+    "--controller-token-file", createTestAgentCredential(socketPath)], {
     stdio: ["ignore", "ignore", "pipe"], env: {
       ...process.env, PATH: `${directory}:${process.env.PATH}`, PORT_MANAGER_AGENT_DISABLE_HOOK_RECOVERY: "1",
       DYLD_INSERT_LIBRARIES: withGate ? library : "", PM_PUBLICATION_TEST_ROOT: directory, PM_PUBLICATION_SCAN: scan,

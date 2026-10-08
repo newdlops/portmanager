@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { readPortManagerPackageVersion } from "../shared/package-version";
 import { getAgentSocketPath } from "../agent/agent-socket";
+import { AGENT_NETWORK_TOKEN_ENV, ensureAgentNetworkToken, getAgentControllerTokenPath, getAgentNetworkTokenPath } from "../agent/agent-authorization";
 import {
   getDefaultHostAccessBindingsPath,
   getDefaultRouteTablePath,
@@ -74,6 +75,16 @@ export const EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV = "PORT_MANAGER_EXPERIMENTAL_
 export const AGENT_REQUIRED_ENV = "PORT_MANAGER_AGENT_REQUIRED";
 export const ESCAPED_SERVER_RESPAWN_ENV = "PORT_MANAGER_ESCAPED_SERVER_RESPAWN";
 export const NETWORK_DNS_ALIAS_ENV = "PORT_MANAGER_NETWORK_DNS_ALIAS";
+
+/** Keep capabilities out of generated scripts. Only the trusted pre-sandbox
+ * attach reads a key; child shells normally inherit the already loaded value. */
+export function buildAgentNetworkTokenShellExport(socketPath: string, networkId: string, onlyWhenMissing = false): string {
+  ensureAgentNetworkToken(socketPath, networkId);
+  const tokenPath = getAgentNetworkTokenPath(getAgentControllerTokenPath(socketPath), networkId);
+  const load = `if ! IFS= read -r ${AGENT_NETWORK_TOKEN_ENV} < ${shellQuote(tokenPath)}; then\n` +
+    `  printf '%s\\n' 'Port Manager network authorization is unavailable; open a new attached terminal.' >&2\n  return 1\nfi\nexport ${AGENT_NETWORK_TOKEN_ENV}`;
+  return onlyWhenMissing ? `if [ -z "\${${AGENT_NETWORK_TOKEN_ENV}:-}" ]; then\n${load}\nfi` : load;
+}
 const PRELOAD_PACKAGE_MANAGER_NAMES: readonly string[] = ["npm", "npx", "pnpm", "pnpx", "corepack", "uv", "uvx", "yarn", "yarnpkg"];
 const RUNTIME_COMMAND_SHIM_NAMES: readonly RuntimeCommandShimName[] = ["docker", "podman", "docker-compose", "podman-compose"];
 const PRELOAD_RUNTIME_LAUNCHER_NAMES = [
@@ -257,6 +268,7 @@ export function applyTerminalHookEnvironment(
   collection.replace("NEWDLOPS_PM_NETWORK_ID", scope.networkId, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   collection.replace("NEWDLOPS_PM_BORROWED_NETWORK_ID", scope.networkId, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace(AGENT_NETWORK_TOKEN_ENV, ensureAgentNetworkToken(getAgentSocketPath(), scope.networkId), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_AGENT_MAIN", agentMainPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
@@ -339,6 +351,7 @@ function applyGlobalNetworkEnvironment(
   collection.replace("NEWDLOPS_PM_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   collection.replace("NEWDLOPS_PM_BORROWED_NETWORK_ID", GLOBAL_LOGICAL_NETWORK_ID, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   collection.replace(NETWORK_IS_GLOBAL_ENV, "1", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
+  collection.replace(AGENT_NETWORK_TOKEN_ENV, ensureAgentNetworkToken(getAgentSocketPath(), GLOBAL_LOGICAL_NETWORK_ID), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath(), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_AGENT_MAIN", agentMainPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
@@ -400,6 +413,7 @@ function applyScopelessGatewayEnvironment(
   collection.replace("PORT_MANAGER_HOOK", "1", TERMINAL_ACTIVATION_MUTATOR_OPTIONS);
   collection.replace("PORT_MANAGER_HOOK_DISABLED", "", TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   // Dev-log endpoint (docs/dev-logging.md): even scopeless gateway terminals log.
+  collection.replace(AGENT_NETWORK_TOKEN_ENV, ensureAgentNetworkToken(getAgentSocketPath(), GLOBAL_LOGICAL_NETWORK_ID), TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   if (process.env.PORT_MANAGER_DEV_LOG !== undefined && process.env.PORT_MANAGER_DEV_LOG.length > 0) {
     collection.replace("PORT_MANAGER_DEV_LOG", process.env.PORT_MANAGER_DEV_LOG, TERMINAL_CONTEXT_MUTATOR_OPTIONS);
   }
@@ -1564,6 +1578,7 @@ export NEWDLOPS_PM_BORROWED_NETWORK_ID=${shellQuote(scope.networkId)}`;
             : `unset ${NETWORK_LOOPBACK_HOST_ENV}`,
         ].join("\n");
   const agentExports = [
+    scope.agentSocketPath === undefined ? "" : buildAgentNetworkTokenShellExport(scope.agentSocketPath, scope.networkId ?? GLOBAL_LOGICAL_NETWORK_ID, true),
     scope.agentSocketPath === undefined ? "" : `export PORT_MANAGER_AGENT_SOCKET=${shellQuote(scope.agentSocketPath)}`,
     scope.agentMainPath === undefined ? "" : `export PORT_MANAGER_AGENT_MAIN=${shellQuote(scope.agentMainPath)}`,
     scope.agentExecutablePath === undefined

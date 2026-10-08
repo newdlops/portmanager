@@ -2950,18 +2950,20 @@ static int pm_read_route_table_generation(
   }
 
   buffer[count] = '\0';
-  if (pm_json_get_string(buffer, "writerId", writer_id, writer_id_size) != 0 || writer_id[0] == '\0') {
+  const char *generation = pm_json_object(buffer, "generation");
+  if (generation == NULL) generation = buffer; /* Older flat generation metadata. */
+  if (pm_json_get_string(generation, "writerId", writer_id, writer_id_size) != 0 || writer_id[0] == '\0') {
     return -1;
   }
 
   if (writer_started_ms != NULL) {
-    *writer_started_ms = pm_json_get_long(buffer, "writerStartedAtMs", 0);
+    *writer_started_ms = pm_json_get_long(generation, "writerStartedAtMs", 0);
   }
-  raw_sequence = pm_json_get_long(buffer, "sequence", 0);
+  raw_sequence = pm_json_get_long(generation, "sequence", 0);
   if (sequence != NULL && raw_sequence > 0) {
     *sequence = (unsigned long)raw_sequence;
   }
-  raw_pid = pm_json_get_long(buffer, "pid", 0);
+  raw_pid = pm_json_get_long(generation, "pid", 0);
   if (owner_pid != NULL && raw_pid > 0) {
     *owner_pid = (pid_t)raw_pid;
   }
@@ -4867,7 +4869,7 @@ static int pm_append_snapshot_from_listeners(
     goto cleanup;
   }
 
-  if (pm_buffer_appendf(payload, "{\"agentPid\":%ld,\"daemon\":{\"status\":\"running\",\"pid\":%ld,\"startedAt\":", (long)state->agent_pid, (long)state->agent_pid) != 0 ||
+  if (pm_buffer_appendf(payload, "{\"agentPid\":%ld,\"daemon\":{\"controllerAuthorizationVersion\":1,\"authenticatesNetworkPeers\":true,\"status\":\"running\",\"pid\":%ld,\"startedAt\":", (long)state->agent_pid, (long)state->agent_pid) != 0 ||
       pm_json_append_string(payload, state->started_at) != 0 ||
       pm_buffer_append(payload, ",\"updatedAt\":") != 0 ||
       pm_json_append_string(payload, updated_at) != 0 ||
@@ -5035,7 +5037,7 @@ int pm_state_daemon_status(pm_agent_state *state, pm_buffer *payload) {
     return -1;
   }
 
-  if (pm_buffer_appendf(payload, "{\"status\":\"running\",\"pid\":%ld,\"startedAt\":", (long)state->agent_pid) != 0 ||
+  if (pm_buffer_appendf(payload, "{\"controllerAuthorizationVersion\":1,\"authenticatesNetworkPeers\":true,\"status\":\"running\",\"pid\":%ld,\"startedAt\":", (long)state->agent_pid) != 0 ||
       pm_json_append_string(payload, state->started_at) != 0 ||
       pm_buffer_append(payload, ",\"updatedAt\":") != 0 ||
       pm_json_append_string(payload, updated_at) != 0 ||

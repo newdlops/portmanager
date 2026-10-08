@@ -5,6 +5,8 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
+import { ensureAgentNetworkToken } from "../../src/agent/agent-authorization";
+import { createTestAgentCredential, testAgentAuthorization, testAgentCredentialPath } from "./native-agent-test-authorization";
 
 /**
  * End-to-end coverage for scope-less gateway bind relocation (native hook).
@@ -49,7 +51,7 @@ function requestSnapshot(socketPath: string): Promise<readonly AgentRoute[]> {
     }, 3000);
 
     client.on("connect", () =>
-      client.write(`${JSON.stringify({ id: `probe-${process.pid}`, method: "listSnapshot", payload: {} })}\n`),
+      client.write(`${JSON.stringify({ id: `probe-${process.pid}`, method: "listSnapshot", payload: {}, authorization: testAgentAuthorization(socketPath) })}\n`),
     );
     client.setEncoding("utf8");
     client.on("data", (chunk: string) => {
@@ -130,7 +132,8 @@ async function startFixture(): Promise<Fixture> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-gateway-reloc-"));
   const socketPath = path.join(dir, "agent.sock");
   const baseRoutes = path.join(dir, "routes.json");
-  const agent = spawn(agentPath, ["--socket", socketPath, "--route-table", baseRoutes, "--agent-main", agentMainPath], {
+  const agent = spawn(agentPath, ["--socket", socketPath, "--route-table", baseRoutes, "--agent-main", agentMainPath,
+    "--controller-token-file", createTestAgentCredential(socketPath)], {
     env: cleanBinderEnvironment({}),
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -158,6 +161,7 @@ function spawnBinder(fixture: Fixture, logicalPort: number): ChildProcess {
         PORT_MANAGER_GLOBAL_ROUTES_FILE: fixture.baseRoutes,
         PORT_MANAGER_ROUTES_FILE: fixture.baseRoutes,
         PORT_MANAGER_AGENT_SOCKET: fixture.socketPath,
+        PORT_MANAGER_AGENT_NETWORK_TOKEN: ensureAgentNetworkToken(fixture.socketPath, "network-global", testAgentCredentialPath(fixture.socketPath)),
         PORT_MANAGER_VIRTUAL_PORT_START: "53000",
         PORT_MANAGER_VIRTUAL_PORT_END: "59999",
         PORT_MANAGER_SCAN_RANGE: "20",

@@ -509,6 +509,7 @@ function spawnHookedBinder(options: HookedBinderOptions): ChildProcess {
       PORT_MANAGER_HOOK: "1",
       PORT_MANAGER_HOOK_DISABLED: "",
       PORT_MANAGER_AGENT_SOCKET: options.socketPath,
+      PORT_MANAGER_AGENT_NETWORK_TOKEN: "f".repeat(64), // Inert capability for this mock agent only.
       PORT_MANAGER_AGENT_TIMEOUT_MS: "5000",
       PORT_MANAGER_AGENT_ROUNDTRIP_TIMEOUT_MS: "5000",
       PORT_MANAGER_AGENT_SEND_TIMEOUT_MS: options.sendTimeoutMs === undefined ? "" : String(options.sendTimeoutMs),

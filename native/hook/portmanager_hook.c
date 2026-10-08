@@ -2392,6 +2392,14 @@ static int pm_agent_request(
   size_t response_size,
   int wait_for_response) {
   char socket_path[PM_MAX_PATH];
+  char authorization_prefix[512], authorization_network[256];
+  const char *token = getenv("PORT_MANAGER_AGENT_NETWORK_TOKEN");
+  const char *network_id = pm_current_network_id();
+  if (token == NULL || strlen(token) != 64 || strspn(token, "0123456789abcdef") != 64 || request[0] != '{') return -1;
+  pm_json_escape(network_id != NULL && network_id[0] != '\0' ? network_id : "network-global", authorization_network, sizeof(authorization_network));
+  int prefix_length = snprintf(authorization_prefix, sizeof(authorization_prefix),
+    "{\"authorization\":\"%s\",\"authorizationNetworkId\":\"%s\",", token, authorization_network);
+  if (prefix_length < 0 || (size_t)prefix_length >= sizeof(authorization_prefix)) return -1;
   struct sockaddr_un server_addr;
   int fd = -1;
   size_t request_len = strlen(request);
@@ -2451,6 +2459,14 @@ static int pm_agent_request(
     usleep(2000);
   }
 
+  size_t prefix_offset = 0;
+  while (prefix_offset < (size_t)prefix_length) {
+    written = write(fd, authorization_prefix + prefix_offset, (size_t)prefix_length - prefix_offset);
+    if (written < 0 && errno == EINTR) continue;
+    if (written <= 0) { close(fd); return -1; }
+    prefix_offset += (size_t)written;
+  }
+  request++; request_len--;
   while (request_len > 0) {
     written = write(fd, request, request_len);
     if (written < 0 && errno == EINTR) {
@@ -5556,9 +5572,11 @@ static void pm_control_dispatch_line(const char *line) {
 static int pm_control_connect(void) {
   char socket_path[PM_MAX_PATH];
   struct sockaddr_un address;
-  char hello[320];
+  char hello[768], network_json[256];
   size_t hello_length;
   const char *network_id;
+  const char *token = getenv("PORT_MANAGER_AGENT_NETWORK_TOKEN");
+  if (token == NULL || strlen(token) != 64 || strspn(token, "0123456789abcdef") != 64) return -1;
   int fd;
 
   pm_ensure_symbols();
@@ -5586,16 +5604,19 @@ static int pm_control_connect(void) {
   }
   pm_debug("control connected socket=%s", socket_path);
 
-  /* Register the network scope so the daemon routes a RESPAWN only to a
-   * same-network ancestor (network ids are [a-z0-9-], so JSON-safe unescaped). */
+  /* Authenticate this network scope; escape legacy ids before sending them so
+   * punctuation cannot alter the control protocol. */
   network_id = pm_current_network_id();
+  pm_json_escape(network_id, network_json, sizeof(network_json));
   hello_length = (size_t)snprintf(
     hello,
     sizeof(hello),
-    "{\"id\":\"hook-control-%ld\",\"method\":\"controlChannel\",\"payload\":{\"pid\":%ld,\"networkId\":\"%s\"}}\n",
+    "{\"id\":\"hook-control-%ld\",\"method\":\"controlChannel\",\"authorization\":\"%s\",\"authorizationNetworkId\":\"%s\",\"payload\":{\"pid\":%ld,\"networkId\":\"%s\"}}\n",
     (long)getpid(),
+    token,
+    network_json,
     (long)getpid(),
-    network_id != NULL ? network_id : "");
+    network_json);
   if (hello_length >= sizeof(hello) || write(fd, hello, hello_length) != (ssize_t)hello_length) {
     close(fd);
     return -1;

@@ -800,6 +800,10 @@ export type AgentDaemonState = "starting" | "running" | "disconnected" | "error"
 export type AgentDaemonVersionStatus = "current" | "stale" | "unknown";
 
 export interface AgentDaemonStatus {
+  /** Protocol boundary required before connecting a security broker. Absent on older daemons. */
+  readonly controllerAuthorizationVersion?: number;
+  /** True only when workload requests authenticate the connection's kernel PID. */
+  readonly authenticatesNetworkPeers?: boolean;
   /** Current extension-side view of the local daemon lifecycle. */
   readonly status: AgentDaemonState;
   /** PID of the single local agent process when connected. */

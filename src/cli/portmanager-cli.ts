@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
 import { getAgentSocketPath, removeStaleSocketFile } from "../agent/agent-socket";
+import { ensureAgentControllerToken, getAgentControllerTokenPath, readAgentControllerToken } from "../agent/agent-authorization";
 import { getDefaultRouteTablePath } from "../agent/route-table";
 import {
   encodeAgentMessage,
@@ -259,6 +260,7 @@ class AgentCliClient {
 
   /** Connects to an existing daemon or starts one from this extension package. */
   async connectOrStart(): Promise<void> {
+    ensureAgentControllerToken(getAgentControllerTokenPath(getAgentSocketPath()));
     try {
       this.socket = await openSocket();
       this.attachSocketHandlers(this.socket);
@@ -293,7 +295,8 @@ class AgentCliClient {
     }
 
     const id = `cli-${process.pid}-${this.nextRequestId++}`;
-    const request: AgentRequestMessage = { id, method, payload };
+    const request: AgentRequestMessage = { id, method, payload,
+      authorization: readAgentControllerToken(getAgentControllerTokenPath(getAgentSocketPath())) };
 
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -326,7 +329,8 @@ class AgentCliClient {
     if (canRunNativeAgentBinary(this.nativeAgentPath)) {
       const child = spawn(
         this.nativeAgentPath,
-        ["--socket", socketPath, "--route-table", getDefaultRouteTablePath(), "--agent-main", this.agentMainPath],
+        ["--socket", socketPath, "--route-table", getDefaultRouteTablePath(), "--agent-main", this.agentMainPath,
+          "--controller-token-file", getAgentControllerTokenPath(socketPath)],
         {
           detached: true,
           env: buildNodeRuntimeEnvironment(),
@@ -352,6 +356,8 @@ class AgentCliClient {
       socketPath,
       "--route-table",
       getDefaultRouteTablePath(),
+      "--controller-token-file",
+      getAgentControllerTokenPath(socketPath),
     ], {
       detached: true,
       env: buildNodeRuntimeEnvironment(),

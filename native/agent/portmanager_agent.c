@@ -18,6 +18,9 @@
 
 #include "../shared/pm_dev_log.h"
 #include "../shared/pm_network_namespace.h"
+#include "portmanager_agent_authorization.h"
+
+static pm_authorization pm_auth;
 
 #define PM_CLIENT_BUFFER_INITIAL 2048
 /* Large enough for a respawnChild request carrying an escaped child's full
@@ -77,6 +80,7 @@ typedef struct {
   int fd;
   /* Kernel-authenticated connection owner; request payloads cannot choose it. */
   pid_t peer_pid;
+  unsigned long long peer_birth;
   int wants_events;
   int is_control;
   int control_pid;
@@ -633,7 +637,13 @@ static int pm_handle_ready_line(pm_client *client, pm_agent_state *state, const 
     return send_result;
   }
 
-  if (client->fd >= 0 && pm_request_wants_events(&request) && !client->wants_events) {
+  int role = pm_auth_request(&pm_auth, state, &request, client->peer_pid, client->peer_birth);
+  if (role < 0) {
+    pm_buffer_free(&payload);
+    return pm_send_response(client, &request, 0, NULL, "Agent authorization denied.");
+  }
+
+  if (role == 2 && client->fd >= 0 && pm_request_wants_events(&request) && !client->wants_events) {
     client->wants_events = 1;
     /* The first subscription receives current in-memory state without waiting
      * for the five-minute listener poll or a later mutation. */
@@ -812,11 +822,13 @@ static int pm_handle_line(pm_client *client, pm_agent_state *state, const char *
   pm_request request;
   memset(&request, 0, sizeof(request));
   if (pm_parse_request(line, &request) != 0) return pm_handle_ready_line(client, state, line, snapshot_dirty);
+  int role = pm_auth_request(&pm_auth, state, &request, client->peer_pid, client->peer_birth);
+  if (role < 0) return pm_send_response(client, &request, 0, NULL, "Agent authorization denied.");
   int snapshot = strcmp(request.method, "listSnapshot") == 0 || strcmp(request.method, "refreshSnapshot") == 0;
   int mutation = strcmp(request.method, "repairRoutingState") == 0 || strcmp(request.method, "allocateRoute") == 0 ||
                  strcmp(request.method, "releaseProcessRoute") == 0;
   if (!snapshot && !mutation) return pm_handle_ready_line(client, state, line, snapshot_dirty);
-  if (pm_request_wants_events(&request) && !client->wants_events) {
+  if (role == 2 && pm_request_wants_events(&request) && !client->wants_events) {
     client->wants_events = 1;
     *snapshot_dirty = 1;
   }
@@ -862,12 +874,14 @@ static int pm_finish_client_scans(pm_client *client, pm_agent_state *state, int 
     pm_pending_scan *pending = *link;
     pm_request request;
     memset(&request, 0, sizeof(request));
-    int prepared = pm_parse_request(pending->line, &request) == 0
-      ? pm_state_prepare_request(state, &request, pending->context) : -1;
+    int authorized = pm_parse_request(pending->line, &request) == 0 &&
+      pm_auth_request(&pm_auth, state, &request, client->peer_pid, client->peer_birth) >= 0;
+    int prepared = authorized ? pm_state_prepare_request(state, &request, pending->context) : -1;
     if (prepared > 0) { link = &pending->next; continue; }
     int result = 0;
     if (prepared < 0) {
-      if (client->fd >= 0) result = pm_send_response(client, &request, 0, NULL, "Could not prepare a fresh listener scan within the request budget.");
+      if (client->fd >= 0) result = pm_send_response(client, &request, 0, NULL, authorized ?
+        "Could not prepare a fresh listener scan within the request budget." : "Agent authorization denied.");
     } else {
       pm_scan_use(pending->context);
       result = pm_handle_ready_line(client, state, pending->line, snapshot_dirty);
@@ -924,6 +938,7 @@ static int pm_add_client(pm_client **clients, size_t *count, size_t *capacity, i
   (*clients)[*count].output = output;
   (*clients)[*count].fd = fd;
   (*clients)[*count].peer_pid = peer_pid;
+  (*clients)[*count].peer_birth = pm_auth_process_birth(peer_pid);
   (*clients)[*count].wants_events = 0;
   (*clients)[*count].is_control = 0;
   (*clients)[*count].control_pid = 0;
@@ -1489,8 +1504,14 @@ int main(int argc, char **argv) {
     return pm_probe_daemon(arguments.socket_path, arguments.agent_main_path) == 0 ? 0 : 1;
   }
 
+  if (pm_auth_init(&pm_auth, arguments.controller_token_path, arguments.socket_path) != 0) {
+    fprintf(stderr, "Port Manager requires a private controller credential before startup.\n");
+    return 1;
+  }
+
   server_fd = pm_create_server(arguments.socket_path);
   if (server_fd < 0) {
+    free(pm_auth.scopes);
     return 1;
   }
 
@@ -1501,5 +1522,6 @@ int main(int argc, char **argv) {
   pm_state_dispose(&state);
   close(server_fd);
   unlink(arguments.socket_path);
+  free(pm_auth.scopes);
   return 0;
 }

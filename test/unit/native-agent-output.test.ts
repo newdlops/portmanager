@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
+import { createTestAgentCredential, testAgentAuthorization } from "./native-agent-test-authorization";
 
 const root = path.resolve(__dirname, "../../..");
 const agent = process.env.PORT_MANAGER_TEST_NATIVE_AGENT_PATH ?? path.join(root, "media/native/portmanager_agent");
@@ -42,7 +43,7 @@ async function connect(context: TestContext, socketPath: string) {
     socket, messages,
     send(method: string, payload?: unknown, extension = false) {
       const id = `${extension ? "extension-" : ""}output-${++sequence}`;
-      socket.write(JSON.stringify({ id, method, payload }) + "\n");
+      socket.write(JSON.stringify({ id, method, payload, authorization: testAgentAuthorization(socketPath) }) + "\n");
       return id;
     },
     async reply(id: string, timeoutMs = 2000) {
@@ -62,7 +63,8 @@ async function fixture(context: TestContext) {
   const data = path.join(directory, "data");
   fs.writeFileSync(data, Array.from({ length: 2000 }, (_, index) => `p${1000000 + index}\ncfixture\nn127.0.0.1:${30000 + index}\n`).join(""));
   const child = spawn(agent, ["--socket", socketPath, "--route-table", path.join(directory, "routes"),
-    "--agent-main", path.join(root, "out/src/agent/agent-main.js"), "--dns-port", "0"], {
+    "--agent-main", path.join(root, "out/src/agent/agent-main.js"), "--dns-port", "0",
+    "--controller-token-file", createTestAgentCredential(socketPath)], {
     stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, PATH: `${directory}:${process.env.PATH}`,
       PORT_MANAGER_AGENT_DISABLE_HOOK_RECOVERY: "1", PM_OUTPUT_DATA: data },
   });

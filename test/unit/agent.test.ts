@@ -7,6 +7,7 @@ import test, { type TestContext } from "node:test";
 
 import { PortManagerAgent } from "../../src/agent/port-manager-agent";
 import { encodeAgentMessage, NdjsonMessageBuffer } from "../../src/agent/protocol";
+import { ensureAgentControllerToken, readAgentControllerToken } from "../../src/agent/agent-authorization";
 import {
   getNetworkRouteTablePath,
   getRouteTablePathForComposeClaimPort,
@@ -2395,6 +2396,7 @@ test("listSnapshot does not publish route tables when route state is unchanged",
 
 test("skips extension socket snapshot broadcasts for unchanged refresh requests", async (context) => {
   const routeTablePath = createRouteTablePath(context);
+  const controllerTokenPath = createControllerTokenPath(context, routeTablePath);
   const socketPath = path.join(os.tmpdir(), `portmanager-agent-socket-${process.pid}-${Date.now()}.sock`);
   const listeners: readonly ListeningPort[] = [
     createListener({
@@ -2405,6 +2407,7 @@ test("skips extension socket snapshot broadcasts for unchanged refresh requests"
     }),
   ];
   const agent = new PortManagerAgent({
+    controllerTokenPath,
     processLauncher: createFakeLauncher(),
     portAvailabilityProvider: createAvailablePortProvider(),
     listeningPortProvider: {
@@ -2426,14 +2429,15 @@ test("skips extension socket snapshot broadcasts for unchanged refresh requests"
   const messages = collectAgentMessages(socket);
   context.after(() => socket.destroy());
 
-  socket.write(encodeAgentMessage({ id: "extension-first-refresh", method: "refreshSnapshot" }));
+  const authorization = readAgentControllerToken(controllerTokenPath);
+  socket.write(encodeAgentMessage({ id: "extension-first-refresh", method: "refreshSnapshot", authorization }));
   await waitForAgentMessage(messages, (message) => isResponseForRequest(message, "extension-first-refresh"));
   await waitForAgentMessage(messages, isSnapshotEvent);
   assert.equal(messages.filter(isSnapshotEvent).length, 1);
 
   await delay(80);
   messages.splice(0, messages.length);
-  socket.write(encodeAgentMessage({ id: "extension-second-refresh", method: "refreshSnapshot" }));
+  socket.write(encodeAgentMessage({ id: "extension-second-refresh", method: "refreshSnapshot", authorization }));
   await waitForAgentMessage(messages, (message) => isResponseForRequest(message, "extension-second-refresh"));
   await delay(80);
 
@@ -2442,8 +2446,10 @@ test("skips extension socket snapshot broadcasts for unchanged refresh requests"
 
 test("keeps hook sockets out of snapshot event fan-out", async (context) => {
   const routeTablePath = createRouteTablePath(context);
+  const controllerTokenPath = createControllerTokenPath(context, routeTablePath);
   const socketPath = path.join(os.tmpdir(), `portmanager-agent-hook-socket-${process.pid}-${Date.now()}.sock`);
   const agent = new PortManagerAgent({
+    controllerTokenPath,
     processLauncher: createFakeLauncher(),
     portAvailabilityProvider: createAvailablePortProvider(),
     listeningPortProvider: {
@@ -2472,12 +2478,49 @@ test("keeps hook sockets out of snapshot event fan-out", async (context) => {
   const messages = collectAgentMessages(socket);
   context.after(() => socket.destroy());
 
-  socket.write(encodeAgentMessage({ id: "hook-refresh", method: "refreshSnapshot" }));
+  socket.write(encodeAgentMessage({ id: "hook-refresh", method: "refreshSnapshot", authorization: readAgentControllerToken(controllerTokenPath) }));
   await waitForAgentMessage(messages, (message) => isResponseForRequest(message, "hook-refresh"));
   await delay(80);
 
   assert.equal(messages.filter(isSnapshotEvent).length, 0);
 });
+
+test("Node daemon denies unauthenticated controllers before scans or event subscription", async context => {
+  const routeTablePath = createRouteTablePath(context);
+  const controllerTokenPath = createControllerTokenPath(context, routeTablePath);
+  const directory = path.dirname(controllerTokenPath);
+  const socketPath = path.join(directory, "socket");
+  let scans = 0;
+  const agent = new PortManagerAgent({ controllerTokenPath, routeTablePath, processLauncher: createFakeLauncher(),
+    listeningPortProvider: { list: async () => { scans++; return []; } }, listenerScanIntervalMs: 60_000 });
+  context.after(() => agent.dispose());
+  if (!(await listenAgentOrSkip(context, agent, socketPath))) return;
+  const socket = await openAgentSocket(socketPath);
+  context.after(() => socket.destroy());
+  const messages = collectAgentMessages(socket);
+  const before = scans;
+  for (const method of ["shutdownDaemon", "listSnapshot", "registerExistingProcess"] as const) {
+    const id = `extension-denied-${method}`;
+    socket.write(encodeAgentMessage({ id, method, payload: { pid: process.pid, requestedPort: 3000 } }));
+    const response = await waitForAgentMessage(messages, message => isResponseForRequest(message, id));
+    assert.equal((response as { ok: boolean }).ok, false);
+  }
+  await delay(80);
+  assert.equal(scans, before);
+  assert.equal(messages.filter(isSnapshotEvent).length, 0);
+  const id = "controller-snapshot";
+  socket.write(encodeAgentMessage({ id, method: "listSnapshot", authorization: readAgentControllerToken(controllerTokenPath) }));
+  const response = await waitForAgentMessage(messages, message => isResponseForRequest(message, id));
+  assert.equal((response as { ok: boolean }).ok, true);
+});
+
+function createControllerTokenPath(context: TestContext, routeTablePath: string): string {
+  const directory = fs.mkdtempSync(path.join(fs.realpathSync(path.dirname(routeTablePath)), "pm-node-auth-"));
+  context.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const tokenPath = path.join(directory, "controller.key");
+  ensureAgentControllerToken(tokenPath);
+  return tokenPath;
+}
 
 function createFakeLauncher(): ProcessLauncher {
   return {
