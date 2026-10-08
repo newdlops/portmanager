@@ -44,6 +44,15 @@ ArtifactService와 job log blob이 함께 유실돼도 조회 가능한 check an
 측정 종료 뒤 네 개의 별도 단계가 각각 4,000자 data frame을 최대 8개씩 기록한다.
 32 frame을 넘으면 자르지 않고 보관 불가를 표시한다. `running` 보고서는 그대로
 유지하며, annotation 복구 역시 원본 전체 표본과 최종 판정을 확인해야 한다.
+macOS ARM의 부하 실행은 `supervise-packaged-validation.mjs`가 하나의 설치된 VSIX
+확장 호스트를 연속 실행하고 stdout/stderr를 일반 파일에 보관한다. 준비 로그를
+부하 전에 업로드하고, 동일 host PID의 baseline·5/10/15분 checkpoint를 부하 중
+별도 artifact로 보존한다. checkpoint는 원인 조사용이며 `running`을 통과로
+바꾸지 않는다. 최종 gate는 원래 20분 실행과 판정 뒤의 전체 보고서 및 launcher
+종료 코드를 확인한다. 감독자는 원래 앱 watchdog과 별도로 설치/종료 여유를
+포함한 유한 기한을 가지며, timeout/정리 시 PID와 고유 profile marker로 확인한
+이 CI 실행 소유의 process group만 종료한다. 같은 호스트를 재시작하거나 예열,
+GC, RSS/FD 기준을 바꾸지 않는다.
 GUI 앱에는 `caffeinate -dis -w <VS Code PID>`도 연결하고 정상 종료/실패/기한 초과
 때 함께 정리한다. ARM 장시간 재측정은 macOS 26 runner에서 같은 workload와 판정
 기준을 사용하며, JSON은 OS release/version을 기록한다. macOS 15의 단기 실제 확장
@@ -142,6 +151,18 @@ VSIX의 확장 호스트에서 120.7초·92 cycle·3,680 왕복·151 SSE heartbe
 external은 6.8 → 7.1 MiB, native/detached context는 1/0으로 유지됐다.
 이 표본에서는 V8 heap 물리 공간 증가가 RSS 증가의 대부분에 해당하며, 전체
 장시간 추세와 20분 gate 통과는 여전히 추가 확인이 필요하다.
+
+check annotation 회수 경로를 추가한 동일 제품 코드의 macOS 26 ARM 20분 실행
+(`8aad71a`, run `37734716878`)도 원본 보고서를 확보하지 못했다. 네 개의 보관 단계는
+완료로 보고됐지만 두 artifact 업로드는 실패했고, 마지막 job 정리는 45분 상한을
+넘겼다. 일반 취소 뒤에도 종료되지 않아 강제 취소했으며 최종 상태는 cancelled다.
+최종 check annotation은 실행 상한·runner 용량 안내 2개뿐이며 보고서 frame은 0개다.
+artifact도 0개, job log는 404 BlobNotFound, 전체 run archive는 빈 22-byte ZIP이었다.
+따라서 이 실행의 부하 결과·RSS/FD·최종 예산 반환은 미확정이며 통과로 분류하지 않는다.
+보관 형식은 기존 네 환경의 20분 보고서와 새 ARM 2분 보고서에서 원본 복원 일치를
+검증했고, 로컬 실제 pipe의 reader를 500ms 지연한 네 segment도 byte 단위 일치했다.
+이 검사는 CI에서의 원본 회수를 대신하지 않는다. 장시간 실행과 결과 회수가 가능한
+일회용 macOS ARM 환경이 필요하며 20분·FD +8/RSS +96 MiB 기준은 유지한다.
 
 | 환경 | 생성/삭제 cycle | TCP/HTTP 왕복 | 호스트 FD/handle 변화 | 호스트 RSS 중앙값: 첫/마지막 5분 (MiB) | 호스트 평균 CPU |
 | --- | ---: | ---: | ---: | ---: | ---: |

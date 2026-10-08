@@ -164,6 +164,11 @@ async function withinBudget(work, milliseconds, operation) {
 function runOwnedProcess(executable, args, env, milliseconds) {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, { env, stdio: "inherit", detached: true });
+    // An external CI supervisor may need to stop this separate app group if the
+    // launcher itself stalls. The unique profile marker prevents PID reuse bugs.
+    const appRecord = process.env.PM_TEST_RESOURCE_APP_RECORD;
+    if (appRecord && child.pid) fs.writeFileSync(appRecord, JSON.stringify({ ownerPid: process.pid,
+      codePid: child.pid, marker: args[args.indexOf("--user-data-dir") + 1] }));
     let wakeGuard;
     let finished = false;
     const finish = (error) => {
@@ -171,6 +176,7 @@ function runOwnedProcess(executable, args, env, milliseconds) {
       finished = true;
       clearTimeout(timer);
       wakeGuard?.kill("SIGTERM");
+      if (appRecord) { try { fs.unlinkSync(appRecord); } catch {} }
       // Only descendants of this freshly-created CI process group are owned.
       // Close their inherited pipes even after the app's main process exits.
       if (child.pid) { try { process.kill(-child.pid, "SIGKILL"); } catch {} }

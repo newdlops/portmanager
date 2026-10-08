@@ -81,7 +81,17 @@ jobs:
           PM_RUN_NATIVE_E2E: "1"
       - name: Package target VSIX
         run: npm run package:${{ matrix.target }} 2>&1 | tee .tmp/release-logs/package.log
+      - name: Preserve macOS ARM prerequisites before the workload
+        if: matrix.target == 'darwin-arm64' && fromJSON(inputs.resource_soak_seconds || '0') > 0
+        timeout-minutes: 2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: logs-darwin-arm64-prerequisites
+          path: .tmp/release-logs/
+          if-no-files-found: error
+          retention-days: 30
       - name: Install and activate packaged extension in a fresh profile
+        if: matrix.target != 'darwin-arm64' || fromJSON(inputs.resource_soak_seconds || '0') == 0
         # Bound the runner step independently of the Node/app watchdog. A child
         # retaining a pipeline or an unresponsive app must still produce a result.
         timeout-minutes: ${{ fromJSON(inputs.resource_soak_seconds || '0') > 1200 && 70 || 30 }}
@@ -98,6 +108,98 @@ jobs:
             pmset -g custom 2>&1 | tee .tmp/release-logs/power-settings.log
             caffeinate -dis npm run test:packaged 2>&1 | tee .tmp/release-logs/activation.log
           fi
+      # The same native extension host runs continuously across these steps.
+      # Early artifacts preserve diagnostic evidence before a late upload outage.
+      - name: Start continuous macOS ARM packaged validation
+        id: resource_background
+        if: matrix.target == 'darwin-arm64' && fromJSON(inputs.resource_soak_seconds || '0') > 0
+        env:
+          PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
+          PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
+          PM_TEST_RESOURCE_HEAP_SAMPLING: ${{ inputs.resource_heap_sampling && '1' || '0' }}
+        run: node scripts/supervise-packaged-validation.mjs start
+      - name: Snapshot macOS ARM measurement baseline
+        id: resource_baseline
+        if: always() && steps.resource_background.outcome == 'success'
+        timeout-minutes: 8
+        env:
+          PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
+          PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
+        run: node scripts/supervise-packaged-validation.mjs snapshot 0
+      - name: Preserve macOS ARM measurement baseline
+        if: always() && steps.resource_baseline.outcome == 'success'
+        timeout-minutes: 1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: logs-darwin-arm64-baseline
+          path: .tmp/release-logs/snapshots/0/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Snapshot continuous macOS ARM workload at 5 minutes
+        id: resource_5m
+        if: always() && steps.resource_background.outcome == 'success' && fromJSON(inputs.resource_soak_seconds || '0') >= 300
+        timeout-minutes: 8
+        env:
+          PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
+          PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
+        run: node scripts/supervise-packaged-validation.mjs snapshot 300
+      - name: Preserve macOS ARM 5-minute diagnostic trace
+        if: always() && steps.resource_5m.outcome == 'success'
+        timeout-minutes: 1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: logs-darwin-arm64-5m
+          path: .tmp/release-logs/snapshots/300/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Snapshot continuous macOS ARM workload at 10 minutes
+        id: resource_10m
+        if: always() && steps.resource_background.outcome == 'success' && fromJSON(inputs.resource_soak_seconds || '0') >= 600
+        timeout-minutes: 8
+        env:
+          PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
+          PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
+        run: node scripts/supervise-packaged-validation.mjs snapshot 600
+      - name: Preserve macOS ARM 10-minute diagnostic trace
+        if: always() && steps.resource_10m.outcome == 'success'
+        timeout-minutes: 1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: logs-darwin-arm64-10m
+          path: .tmp/release-logs/snapshots/600/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Snapshot continuous macOS ARM workload at 15 minutes
+        id: resource_15m
+        if: always() && steps.resource_background.outcome == 'success' && fromJSON(inputs.resource_soak_seconds || '0') >= 900
+        timeout-minutes: 8
+        env:
+          PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
+          PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
+        run: node scripts/supervise-packaged-validation.mjs snapshot 900
+      - name: Preserve macOS ARM 15-minute diagnostic trace
+        if: always() && steps.resource_15m.outcome == 'success'
+        timeout-minutes: 1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: logs-darwin-arm64-15m
+          path: .tmp/release-logs/snapshots/900/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Verify final continuous macOS ARM resource gate
+        if: always() && steps.resource_background.outcome == 'success'
+        timeout-minutes: ${{ fromJSON(inputs.resource_soak_seconds || '0') > 1200 && 70 || 30 }}
+        env:
+          PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
+          PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
+        run: node scripts/supervise-packaged-validation.mjs wait
+      - name: Stop owned macOS ARM validation processes
+        if: always() && steps.resource_background.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          PM_TEST_RESOURCE_SOAK_SECONDS: ${{ inputs.resource_soak_seconds }}
+          PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
+        run: node scripts/supervise-packaged-validation.mjs stop
       # Check annotations use the runner's metadata API instead of its log/blob
       # storage. Separate steps respect the ten-notice/4096-character limits.
       - name: Preserve resource trace annotations 1/4
