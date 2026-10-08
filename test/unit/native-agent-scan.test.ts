@@ -88,11 +88,28 @@ async function fixture(context: TestContext, timeoutMs = 3000, script = gatedSca
   child.stderr!.on("data", (chunk) => { stderr += chunk.toString(); });
   context.after(async () => {
     fs.writeFileSync(paths.release, "");
-    if (running(child)) { child.kill("SIGTERM"); await until(() => !running(child)).catch(() => child.kill("SIGKILL")); }
+    if (running(child)) {
+      child.kill("SIGTERM");
+      await until(() => !running(child)).catch(async () => {
+        child.kill("SIGKILL");
+        await until(() => !running(child));
+      });
+    }
     await fs.promises.rm(directory, { recursive: true, force: true });
   });
   await until(() => { assert.ok(running(child), stderr); return fs.existsSync(paths.socket); });
-  const client = await channel(context, paths.socket);
+  // bind creates the pathname before listen is connectable. Retry only this
+  // initial refusal against the same live child, within one readiness budget.
+  let client: Awaited<ReturnType<typeof channel>> | undefined;
+  const readyDeadline = Date.now() + 2000;
+  while (client === undefined) {
+    try { client = await channel(context, paths.socket); }
+    catch (error) {
+      assert.ok(running(child), stderr);
+      if ((error as NodeJS.ErrnoException).code !== "ECONNREFUSED" || Date.now() >= readyDeadline) throw error;
+      await delay(5);
+    }
+  }
   return { paths, client, child, pids: () => fs.readFileSync(paths.pids, "utf8").trim().split("\n").filter(Boolean).map(Number) };
 }
 
@@ -209,12 +226,14 @@ test("a registration during a scan fences out the old listener owner", async (co
 });
 
 test("a timed out scan discards partial output, retains the last snapshot and kills its process group", async (context) => {
-  const { paths, client, pids } = await fixture(context, 600);
+  // Both the seed observation and the deliberately blocked observation use
+  // the production budget; an overloaded host must not invalidate the seed.
+  const { paths, client, pids } = await fixture(context);
   fs.writeFileSync(paths.data, `p${process.pid}\ncfixture\nn127.0.0.1:48393\n`);
-  await client.reply(client.send("repairRoutingState"));
+  await client.reply(client.send("repairRoutingState"), 5000);
   fs.writeFileSync(paths.data, `p${process.pid}\ncpartial\nn127.0.0.1:48394\n`);
   fs.writeFileSync(paths.block, "");
-  await assert.rejects(client.reply(client.send("repairRoutingState"), 1500), /fresh listener scan/);
+  await assert.rejects(client.reply(client.send("repairRoutingState"), 5000), /fresh listener scan/);
   const snapshot = await client.reply<{ listeners: { port: number }[] }>(client.send("listSnapshot"));
   assert.equal(snapshot.listeners.some((row) => row.port === 48393), true);
   assert.equal(snapshot.listeners.some((row) => row.port === 48394), false);
@@ -231,22 +250,27 @@ test("abandoning a read-only scan cancels its subprocess before the command dead
 });
 
 test("a release scan timeout preserves its live route until a successful observation", async (context) => {
-  const { paths, client } = await fixture(context, 600);
+  // Keep the production scan budget: this case needs a successful new OS
+  // observation after the timeout, not a second subsecond scheduling race.
+  const { paths, client } = await fixture(context);
   const payload = { pid: process.pid, requestedPort: 48397, actualPort: 48398, host: "127.0.0.1", networkId: "release" };
   await client.reply(client.send("registerExistingProcess", { ...payload, name: "release", command: "release", cwd: root, source: "hooked" }));
   fs.writeFileSync(paths.block, "");
-  assert.equal(await client.reply(client.send("releaseProcessRoute", payload)), false);
+  assert.equal(await client.reply(client.send("releaseProcessRoute", payload), 5000), false);
   assert.equal((await client.reply<{ routeCount: number }>(client.send("daemonStatus"))).routeCount, 1);
   fs.writeFileSync(paths.release, "");
-  assert.equal(await client.reply(client.send("releaseProcessRoute", payload)), true);
+  assert.equal(await client.reply(client.send("releaseProcessRoute", payload), 5000), true);
   assert.equal((await client.reply<{ routeCount: number }>(client.send("daemonStatus"))).routeCount, 0);
 });
 
 test("scan deadlines also kill a descendant that holds stdout after its wrapper exits", async (context) => {
   const script = ['#!/bin/sh', '/bin/sleep 30 &', 'printf "%s\\n" "$!" >> "$PM_SCAN_PIDS"', 'exit 0'].join("\n");
-  const { client, pids } = await fixture(context, 600, script);
-  await assert.rejects(client.reply(client.send("repairRoutingState"), 1500), /fresh listener scan/);
-  assert.equal(pids().length, 1);
+  // Use the production command budget so a loaded OS can start the wrapper.
+  // Witness the live descendant before accepting timeout as cancellation proof.
+  const { client, pids } = await fixture(context, 3000, script);
+  const rejected = assert.rejects(client.reply(client.send("repairRoutingState"), 5000), /fresh listener scan/);
+  await until(() => pids().length === 1 && alive(pids()[0]), 2500);
+  await rejected;
   await until(() => pids().every((pid) => !alive(pid)), 1000);
 });
 
