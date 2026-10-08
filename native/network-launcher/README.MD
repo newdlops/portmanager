@@ -1,0 +1,53 @@
+# Network Workload Launcher
+
+## 역할
+
+호스트 파일·언어 런타임을 유지하는 macOS 실행 경로에서, 커널 정책 적용 확인과
+실제 exec 사이의 경계를 감독한다. 부모 supervisor는 프로그램 하나만 시작하며
+workload가 임의 명령·PID·network id를 보내는 관리 프로토콜은 제공하지 않는다.
+
+## 책임
+
+- 보호된 runtime의 launcher/hook 및 private profile을 descriptor로 확인
+- 상속된 nonstandard FD와 이전 네트워크/preload 환경을 정리
+- 실제 macOS 정책에서 private profile 읽기와 raw TCP connect가 거절됨을 확인
+- 고정 범위 broker가 승인한 socket만 받아 transport 준비 확인
+- 별도 pipe의 고정 크기 record와 exec의 CLOEXEC EOF로 시작 결과 확인
+- 시작 기한, 신호 전달, 소유한 PID/birth/process group의 종료 관리
+
+## 주요 진입점
+
+`portmanager_network_launch.c`:
+
+```text
+--profile <private SBPL file> --broker <fixed Unix endpoint>
+--hook <protected dylib> --network-id <stable id> [--announce-ready] -- <program> <args...>
+```
+
+profile은 `.portmanager/security/profiles/`, 실행 파일과 hook은
+`.portmanager/runtime/` 아래에 둔다. profile은 private regular file이며 symlink와
+hardlink를 거부한다. 로드한 profile 바이트를 sandbox-exec에 전달해 다시 읽는 경합을
+피한다. guard의 pipe는 exec 성공 시 닫히고 애플리케이션에 상속되지 않는다.
+FD inventory는 정책 적용 전에만 사용한다. 프로그램 교체는 macOS의
+`POSIX_SPAWN_SETEXEC | POSIX_SPAWN_CLOEXEC_DEFAULT`와 표준 IO의 명시적 상속으로
+처리해, guard 안에서 process-info 권한을 추가로 허용하지 않는다.
+기존 커널 정책을 해제하거나 다른 네트워크로 완화하는 기능은 없다.
+
+실제 TTY에서는 trusted parent의 stdin device만 정책에 추가한다. 다른 `/dev/tty*`
+읽기는 기본 host-read allowlist에서 제외하며, `/dev/tty`는 해당 세션의 kernel alias다.
+셸은 자기·자식에게만 신호를 보내고 자기 scheduling만 조정할 수 있다. 다른 sandbox의
+프로세스 신호·우선순위와 다른 TTY의 접근은 합성 프로세스/PTY로 별도 검증한다.
+
+## 외부 의존성
+
+macOS `sandbox-exec`, libproc, POSIX fork/exec/pipes/poll/process groups,
+`native/network-broker/pm_network_broker_client.h`, 공유 `pm_dev_log.c`.
+
+## 상태와 주의사항
+
+새 실행 후보이며 아직 제품 attach/packaging에 연결하지 않았다. guard probe는
+커널 적용과 broker transport의 시작 확인이며, 생성된 profile 전체의 보안 검증을
+대체하지 않는다. 정책 생성은 trusted controller의 책임이다.
+실제 terminal readiness 전달, 인증된 PID/route 귀속, shell bootstrap과 SIP preload
+복구, DNS/host access 및 공유 resource-budget 통합은 별도 연결해야 한다.
+Linux 및 다른 macOS 버전의 실행 지원은 확인하지 않았다.

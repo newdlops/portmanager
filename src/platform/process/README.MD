@@ -31,7 +31,7 @@
 - `native-process-lookup.ts`
 - `native-executable.ts`
 - `network-file-scaffold.ts`: 0700 디렉터리, 0600 파일, 원자적 미교체 게시 및 symlink 거부
-- `macos-network-sandbox.ts`: 별도 커널 정책 후보. 공유 소스 쓰기를 유지하며 현재 attach에는 연결되지 않음
+- `macos-network-sandbox.ts`: 별도 커널 정책 후보. 공유 소스 쓰기를 유지하며 현재 attach에는 연결되지 않음. `native/network-launcher/` 후보와 실제 PTY·호스트 zsh/Node/Python 실행을 검증하며, 자기 scheduling·자식 신호와 해당 TTY device만 허용
 - `shell-integration-verifier.ts`
 - `node-terminal-candidate-provider.ts`
 

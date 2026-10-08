@@ -81,6 +81,8 @@ test("macOS kernel policy rejects raw cross-network access with the hook disable
   await probe(true, "write", path.join(own.filesDirectory, "state.pid"));
   await probe(true, "brokered-tcp", ownSocket);
   await probe(true, "socket-only");
+  await probe(true, "child-signal");
+  await probe(true, "priority", "0");
   await probe(false, "tcp", "127.0.0.1", String(ownPort));
   await probe(false, "read", other.envFilePath);
   await probe(false, "read", controllerPath);
@@ -95,6 +97,17 @@ test("macOS kernel policy rejects raw cross-network access with the hook disable
   await probe(false, "unlink", ownSocket);
   await probe(false, "link", other.envFilePath, path.join(own.filesDirectory, "hardlink.env"));
   await probe(false, "signal", String(process.pid));
+  const otherProfile = buildMacosNetworkSandboxProfile({ networkId: "network-b", namespaceDirectories: [other.directory],
+    sharedWorkspaceDirectories: [root] });
+  const otherVictim = spawn("/usr/bin/sandbox-exec", ["-p", otherProfile, executable, "hold"], {
+    env: environment, stdio: ["ignore", "pipe", "pipe"],
+  });
+  context.after(async () => {
+    if (otherVictim.exitCode === null && otherVictim.signalCode === null) { otherVictim.kill("SIGTERM"); await once(otherVictim, "exit"); }
+  });
+  await once(otherVictim.stdout!, "data");
+  await probe(false, "signal", String(otherVictim.pid));
+  await probe(false, "priority", String(otherVictim.pid));
   await probe(false, "process-env", String(victim.pid));
   const symlink = path.join(own.filesDirectory, "other.env");
   fs.symlinkSync(other.envFilePath, symlink);

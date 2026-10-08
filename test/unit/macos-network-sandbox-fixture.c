@@ -7,8 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <sys/un.h>
 #include <sys/sysctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 int main(int argc, char **argv) {
@@ -21,6 +23,15 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "socket-only") == 0) {
     fd = socket(AF_INET, SOCK_STREAM, 0);
     result = fd >= 0 ? 0 : -1;
+  } else if (argc == 2 && strcmp(argv[1], "child-signal") == 0) {
+    pid_t child = fork();
+    if (child == 0) { sleep(1); _exit(0); }
+    if (child > 0) {
+      result = kill(child, SIGTERM);
+      int error = errno, status;
+      while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+      errno = error;
+    }
   } else if (argc == 3 && strcmp(argv[1], "read") == 0) {
     fd = open(argv[2], O_RDONLY);
     if (fd >= 0) {
@@ -75,6 +86,8 @@ int main(int argc, char **argv) {
     } else result = write(fd, "fixture", 7) == 7 ? 0 : -1;
   } else if (argc == 3 && strcmp(argv[1], "signal") == 0) {
     result = kill((pid_t)atoi(argv[2]), 0);
+  } else if (argc == 3 && strcmp(argv[1], "priority") == 0) {
+    result = setpriority(PRIO_PROCESS, (id_t)atoi(argv[2]), 5);
   } else if (argc == 3 && strcmp(argv[1], "unlink") == 0) {
     result = unlink(argv[2]);
   } else if (argc == 4 && strcmp(argv[1], "link") == 0) {
