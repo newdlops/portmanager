@@ -120,19 +120,22 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
   // Sampling is diagnostic-only: no object values or heap snapshot are saved,
   // and the normal 20-minute gate never changes GC behavior or its thresholds.
   const heapSession = process.env.PM_TEST_RESOURCE_HEAP_SAMPLING === "1" ? new Session() : undefined;
-  const writeReport = (status: "running" | "passed" | "failed"): void => {
+  const journalPath = `${options.reportPath.replace(/\.json$/, "")}.jsonl`;
+  const writeReport = (status: "running" | "passed" | "failed", latestSample?: Sample): void => {
     const report = { platform: process.platform, arch: process.arch,
       nodeVersion: process.version, osRelease: os.release(), osVersion: os.version(), commit: process.env.GITHUB_SHA,
+      hostPid: process.pid,
       scope: options.service ? "real-extension-host-and-daemon" : "standalone-proxy-managers",
       warmupSeconds: options.service ? 30 : 0, heapSampling: heapSession !== undefined,
       nativeProxy: nativeProxyPath !== undefined, nativeRouter: nativeRouterPath !== undefined,
       seconds: (performance.now() - started) / 1000, requestedSeconds: options.seconds, cycles: cycle,
       exchanges, sseHeartbeats: heartbeats, limits: resources.budget.limits, baseline,
       status, error: failure === undefined ? undefined : String(failure),
-      profile: summarize(samples, process.pid), samples };
-    fs.mkdirSync(path.dirname(options.reportPath), { recursive: true });
-    // Replace complete checkpoints so interrupted CI uploads retain readable
-    // evidence. A running checkpoint can never be mistaken for a pass.
+      ...(status === "running" ? { samplesJournal: path.basename(journalPath), latestSample }
+        : { profile: summarize(samples, process.pid), samples }) };
+    // Checkpoints stay constant in size; rewriting the entire growing trace
+    // caused quadratic allocation/I/O and polluted the host's RSS measurement.
+    // The complete final JSON is serialized only after the resource/RSS checks.
     fs.writeFileSync(`${options.reportPath}.tmp`, JSON.stringify(report, null, 2));
     fs.renameSync(`${options.reportPath}.tmp`, options.reportPath);
   };
@@ -146,16 +149,20 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
     const heap = getHeapStatistics();
     const allocations = heapSession && (phase === "after-cleanup" || phase === "settled" && cycle % 25 === 0)
       ? summarizeAllocations((await heapSession.post("HeapProfiler.getSamplingProfile")).profile) : undefined;
-    samples.push({ elapsedSeconds: (performance.now() - started) / 1000, phase, cycle, resources: current,
+    const entry: Sample = { elapsedSeconds: (performance.now() - started) / 1000, phase, cycle, resources: current,
       heapBytes: memory.heapUsed, heapCapacityBytes: memory.heapTotal, externalBytes: memory.external,
       arrayBufferBytes: memory.arrayBuffers, heapSpaces: getHeapSpaceStatistics(), heapCode: getHeapCodeStatistics(),
       nativeContexts: heap.number_of_native_contexts, detachedContexts: heap.number_of_detached_contexts,
       globalHandleBytes: heap.used_global_handles_size, gc: { ...gc }, allocationSites: allocations,
-      eventLoopP99Ms: lag.percentile(99) / 1e6, processes });
+      eventLoopP99Ms: lag.percentile(99) / 1e6, processes };
+    samples.push(entry);
+    fs.appendFileSync(journalPath, `${JSON.stringify(entry)}\n`);
     lag.reset();
-    writeReport("running");
+    writeReport("running", entry);
   };
   try {
+    fs.mkdirSync(path.dirname(options.reportPath), { recursive: true });
+    fs.writeFileSync(journalPath, "");
     if (heapSession) {
       heapSession.connect();
       await heapSession.post("HeapProfiler.startSampling", { samplingInterval: 64 * 1024 });
@@ -231,7 +238,10 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
     const last = settled[settled.length - 1];
     // The live service periodically launches discovery commands. Compare the
     // data-plane helpers only; keep all other descendants in the raw metrics.
-    const proxyChildren = (entry: Sample) => entry.processes.filter(row => /portmanager_(?:tcp_router|host_exposure_proxy)(?:\.exe)?$/.test(row.command)).length;
+    // Linux comm is limited to 15 characters; match its actual short names as
+    // well so the helper-growth check does not silently count every child as 0.
+    const proxyChildren = (entry: Sample) => entry.processes.filter(row =>
+      /(?:portmanager_(?:tcp_router|host_exposure_proxy)(?:\.exe)?$|^portmanager_(?:tcp|hos)$)/.test(row.command)).length;
     assert.ok(proxyChildren(last) <= proxyChildren(first), "Proxy children accumulated after cleanup");
     const firstHost = first.processes.find(entry => entry.pid === process.pid)!;
     const lastHost = last.processes.find(entry => entry.pid === process.pid)!;

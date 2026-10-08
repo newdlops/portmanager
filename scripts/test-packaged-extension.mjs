@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath } from "@vscode/test-electron";
 
@@ -90,7 +91,23 @@ finally {
       const report = JSON.parse(fs.readFileSync(resourceReportPath, "utf8"));
       const { status, error, scope, platform, arch, seconds, requestedSeconds, cycles, exchanges, profile } = report;
       console.log("Resource report summary:", JSON.stringify({ status, error, scope, platform, arch,
-        seconds, requestedSeconds, cycles, exchanges, profile, cleanup: report.samples.at(-1)?.resources }));
+        seconds, requestedSeconds, cycles, exchanges, profile, cleanup: report.samples?.at(-1)?.resources,
+        latestResources: report.latestSample?.resources }));
+      // ArtifactService can time out even when this job's ordinary logs remain
+      // downloadable. Numeric samples contain no object values or snapshots;
+      // retain the full report through that independent existing log transport.
+      if (!Array.isArray(report.samples) && report.samplesJournal) {
+        const journalPath = path.join(path.dirname(resourceReportPath), path.basename(report.samplesJournal));
+        const journal = fs.readFileSync(journalPath, "utf8");
+        // A forced exit may interrupt the last append. Keep complete records
+        // and retain the running status; incomplete data can never become a pass.
+        report.samples = journal.slice(0, journal.lastIndexOf("\n") + 1).split("\n").filter(Boolean).map(line => JSON.parse(line));
+      }
+      const encoded = gzipSync(JSON.stringify(report)).toString("base64");
+      const chunks = encoded.match(/.{1,8192}/g) ?? [];
+      console.log(`PM_RESOURCE_REPORT_GZIP_BASE64_BEGIN ${chunks.length}`);
+      for (let index = 0; index < chunks.length; index++) console.log(`PM_RESOURCE_REPORT_GZIP_BASE64 ${index + 1}/${chunks.length} ${chunks[index]}`);
+      console.log("PM_RESOURCE_REPORT_GZIP_BASE64_END");
     } catch (error) { console.error("Resource report summary unavailable:", error); }
   }
 }

@@ -13,8 +13,9 @@
   HTTP GET/POST와 유지 중인 SSE를 함께 반복하며 공통 예산 반환을 검증한다.
 - 확장 호스트와 데몬 및 자식들의 RSS, CPU 누적 시간, FD(Windows: handle),
   이벤트 루프 p99와 heap 사용량·용량, external/ArrayBuffer bytes를 JSON으로 기록한다.
-- heap 영역·코드 용량·GC·context/handle 수를 기록하고 매 표본 뒤 원자적으로 checkpoint를 저장한다.
-  중단된 checkpoint의 `running` 상태는 검증 통과가 아니다.
+- heap 영역·코드 용량·GC·context/handle 수를 JSONL에 증분 기록하고 최신 표본의 작은
+  checkpoint만 원자적으로 갱신한다. 전체 JSON은 판정 뒤 한 번 저장한다. 누적 표본을
+  매번 직렬화해 측정기 자체의 RSS를 키우지 않는다. `running`은 검증 통과가 아니다.
 
 ## 주요 진입점
 
@@ -34,7 +35,10 @@ GUI runner는 `caffeinate -dis`로 실행 중 화면/시스템 idle sleep을 막
 원인이 sleep이었다는 뜻은 아니다.
 VM 전체의 절전 차단은 준비 단계에서 시작해 실패 로그 업로드까지 유지한다.
 이 CI 소유 프로세스는 runner cleanup이 종료하며 80분 상한도 가진다. 로그 artifact
-업로드는 5분으로 제한하고, 실패/정리 수치는 job stdout에도 요약한다.
+업로드는 5분으로 제한하고, 실패/정리 수치는 job stdout에도 요약한다. ArtifactService
+실패 때도 원본을 회수하도록 전체 숫자 보고서를 gzip/base64의 8KiB 로그 프레임으로
+보관한다(`PM_RESOURCE_REPORT_GZIP_BASE64_*`). 이 작업은 앱 측정이 끝난 뒤 부모
+launcher에서 수행하며 측정 대상 확장 호스트의 RSS 판정에 포함되지 않는다.
 GUI 앱에는 `caffeinate -dis -w <VS Code PID>`도 연결하고 정상 종료/실패/기한 초과
 때 함께 정리한다. ARM 장시간 재측정은 macOS 26 runner에서 같은 workload와 판정
 기준을 사용하며, JSON은 OS release/version을 기록한다. macOS 15의 단기 실제 확장
@@ -85,6 +89,34 @@ FD 변화는 0이고 종료 후 예산은 모두 0이었지만, 호스트 RSS �
 전체 heap 용량·external/ArrayBuffer·RSS 추세를 회수하지 못했다. 정상적인
 장시간 실행과 로그 회수가 가능한 일회용 macOS ARM 환경에서 추가 검증이 필요하다.
 단계 실패나 로그 부재를 검증 통과로 간주하지 않으며 96 MiB 기준은 유지한다.
+
+추가 원인 조사에서는 terminal picker 갱신마다 `preparePersistentNativeHookLibrary`가
+변경 없는 hook 두 개를 통째로 읽어 일시적인 Buffer를 반복 할당하는 경로를 찾았다.
+macOS ARM/Node 22의 별도 새 프로세스에서 같은 128,064-byte hook을 500회 준비하면
+heap은 약 4.5 MiB로 유지됐지만 RSS는 57.6 MiB 증가했다. source/target의
+inode·size·mtime·ctime을 검증하고 최대 8개 metadata만 보관하는 수정 뒤에는 같은
+재현의 RSS 증가가 7.0 MiB였고, 변경 없는 준비에서는 binary read가 0회였다.
+같은 크기·mtime을 유지한 source/target 변경과 symlink 교체도 복구 테스트를 통과했다.
+이 결과는 메모리 증가의 한 기여 경로를 입증하며 전체 확장 호스트의 단독 원인이나
+20분 통과를 입증하지는 않는다.
+
+별도 실제 macOS 26 ARM 2분 할당 진단(`0c79262`, run `37719023098`)은 수정 전
+제품 코드로 80 cycle·3,200 왕복을 수행했다. major GC 뒤 heap 용량과 RSS가 감소했고,
+마지막 RSS 증가는 44.4 MiB, FD 변화는 -3, 종료 후 예산은 모두 0이었다.
+할당 표본 수집이 켜진 진단 결과이므로 최종 gate를 대신하지 않는다. 수정된 제품
+코드(`3f8811e`)의 20분 검증(run `37719704960`)은 표본 수집을 끈 상태로 별도 실행한다.
+
+`3f8811e` 재측정은 Linux ARM/Windows가 통과했으나 macOS ARM·Intel/Linux x64는
+RSS 기준에 실패했다. macOS ARM 작업 로그에서 실제 1200.8초·813 cycle·32,520 왕복,
+RSS +108.9 MiB·FD +0·종료 예산 모두 0을 회수했다. 전체 파일은 ArtifactService의
+CreateArtifact 요청 시간 초과로 업로드되지 않았다. 이 결과도 통과로 분류하지 않는다.
+
+이 실행에 추가한 전체 checkpoint 반복 저장은 측정기 자체의 큰 할당을 유발했다.
+같은 413개 표본으로 별도 새 Node 22 프로세스에서 재현한 결과, 전체 재저장은
+403,924,768 bytes를 쓰며 RSS가 127.2 MiB 증가했고 JSONL 증분 기록은
+1,198,561 bytes·1.8 MiB였다. 따라서 checkpoint는 최신 표본만 유지하고 전체 기록은
+JSONL에 추가하도록 수정했다. 판정 뒤 전체 JSON을 한 번 저장하며 30초 예열·20분
+부하·FD +8/RSS +96 MiB 기준과 강제 GC 금지는 그대로 유지한다.
 
 | 환경 | 생성/삭제 cycle | TCP/HTTP 왕복 | 호스트 FD/handle 변화 | 호스트 RSS 중앙값: 첫/마지막 5분 (MiB) | 호스트 평균 CPU |
 | --- | ---: | ---: | ---: | ---: | ---: |
