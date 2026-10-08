@@ -241,12 +241,18 @@ test("a timed out scan discards partial output, retains the last snapshot and ki
 });
 
 test("abandoning a read-only scan cancels its subprocess before the command deadline", async (context) => {
-  const { paths, client, pids } = await fixture(context);
+  // Give process startup a separate budget, then retain the strict 500ms
+  // cancellation bound. A live wrapper must be witnessed before disconnect.
+  const commandDeadline = 8000;
+  const { paths, client, pids } = await fixture(context, commandDeadline);
   fs.writeFileSync(paths.block, "");
+  const started = performance.now();
   client.send("listSnapshot");
-  await until(() => fs.existsSync(paths.entered));
+  await until(() => fs.existsSync(paths.entered), 5000);
+  assert.ok(pids().some(alive), "cancellation must target a running scan");
   client.socket.destroy();
   await until(() => pids().every((pid) => !alive(pid)), 500);
+  assert.ok(performance.now() - started < commandDeadline, "disconnect must cancel before the command timeout");
 });
 
 test("a release scan timeout preserves its live route until a successful observation", async (context) => {
