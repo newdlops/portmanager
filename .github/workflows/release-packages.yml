@@ -98,6 +98,32 @@ jobs:
             pmset -g custom 2>&1 | tee .tmp/release-logs/power-settings.log
             caffeinate -dis npm run test:packaged 2>&1 | tee .tmp/release-logs/activation.log
           fi
+      # Check annotations use the runner's metadata API instead of its log/blob
+      # storage. Separate steps respect the ten-notice/4096-character limits.
+      - name: Preserve resource trace annotations 1/4
+        if: always() && inputs.resource_soak_seconds != '0'
+        timeout-minutes: 1
+        env:
+          PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
+        run: node scripts/test-packaged-extension.mjs --resource-report-annotations=0
+      - name: Preserve resource trace annotations 2/4
+        if: always() && inputs.resource_soak_seconds != '0'
+        timeout-minutes: 1
+        env:
+          PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
+        run: node scripts/test-packaged-extension.mjs --resource-report-annotations=1
+      - name: Preserve resource trace annotations 3/4
+        if: always() && inputs.resource_soak_seconds != '0'
+        timeout-minutes: 1
+        env:
+          PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
+        run: node scripts/test-packaged-extension.mjs --resource-report-annotations=2
+      - name: Preserve resource trace annotations 4/4
+        if: always() && inputs.resource_soak_seconds != '0'
+        timeout-minutes: 1
+        env:
+          PM_TEST_RESOURCE_SOAK_REPORT: ${{ github.workspace }}/.tmp/release-logs/resource-soak.json
+        run: node scripts/test-packaged-extension.mjs --resource-report-annotations=3
       - name: Upload verified VSIX
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

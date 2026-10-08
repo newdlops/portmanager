@@ -39,6 +39,11 @@ VM 전체의 절전 차단은 준비 단계에서 시작해 실패 로그 업로
 실패 때도 원본을 회수하도록 전체 숫자 보고서를 gzip/base64의 8KiB 로그 프레임으로
 보관한다(`PM_RESOURCE_REPORT_GZIP_BASE64_*`). 이 작업은 앱 측정이 끝난 뒤 부모
 launcher에서 수행하며 측정 대상 확장 호스트의 RSS 판정에 포함되지 않는다.
+ArtifactService와 job log blob이 함께 유실돼도 조회 가능한 check annotation에
+숫자 보고서를 추가 보관한다. 메시지 4,096자·단계당 notice 10개 제한을 지키도록
+측정 종료 뒤 네 개의 별도 단계가 각각 4,000자 data frame을 최대 8개씩 기록한다.
+32 frame을 넘으면 자르지 않고 보관 불가를 표시한다. `running` 보고서는 그대로
+유지하며, annotation 복구 역시 원본 전체 표본과 최종 판정을 확인해야 한다.
 GUI 앱에는 `caffeinate -dis -w <VS Code PID>`도 연결하고 정상 종료/실패/기한 초과
 때 함께 정리한다. ARM 장시간 재측정은 macOS 26 runner에서 같은 workload와 판정
 기준을 사용하며, JSON은 OS release/version을 기록한다. macOS 15의 단기 실제 확장
@@ -107,7 +112,7 @@ inode·size·mtime·ctime을 검증하고 최대 8개 metadata만 보관하는 �
 제품 코드로 80 cycle·3,200 왕복을 수행했다. major GC 뒤 heap 용량과 RSS가 감소했고,
 마지막 RSS 증가는 44.4 MiB, FD 변화는 -3, 종료 후 예산은 모두 0이었다.
 할당 표본 수집이 켜진 진단 결과이므로 최종 gate를 대신하지 않는다. 수정된 제품
-코드(`3f8811e`)의 20분 검증(run `37719704960`)은 표본 수집을 끈 상태로 별도 실행한다.
+코드(`3f8811e`)의 20분 검증(run `37719704960`)은 표본 수집을 끈 상태로 별도 실행했다.
 
 `3f8811e` 재측정은 Linux ARM/Windows가 통과했으나 macOS ARM·Intel/Linux x64는
 RSS 기준에 실패했다. macOS ARM 작업 로그에서 실제 1200.8초·813 cycle·32,520 왕복,
@@ -125,7 +130,18 @@ JSONL에 추가하도록 수정했다. 판정 뒤 전체 JSON을 한 번 저장�
 fallback의 20분 gate를 통과했다. macOS 26 ARM은 부하 단계와 ArtifactService 업로드가
 실패했고 마지막 정리 단계가 실행 상한 뒤 취소로 종료됐다. job log 다운로드도
 404여서 압축 프레임을 회수하지 못했으므로 macOS ARM의 원본 판정은 미확정이다.
-동일 제품/측정 코드와 기준으로 표준 macOS 14 ARM 이미지를 사용하는 진단을 진행한다.
+동일 제품/측정 코드와 기준의 macOS 14 ARM 진단(run `37728104757`)도 실행 상한을
+넘긴 뒤 취소로 종료됐다. artifact는 0개, 개별 job log는 404였고 전체 run log archive도
+빈 ZIP이어서 이 실행의 메모리 판정은 회수하지 못했다.
+
+수정 후 macOS 26 ARM의 2분 정상 측정(`5f86059`, run `37733406776`)은 실제 설치된
+VSIX의 확장 호스트에서 120.7초·92 cycle·3,680 왕복·151 SSE heartbeat를 수행했다.
+할당 표본 수집은 껐고 강제 GC·예열·기준 변경 없이 RSS +84.7 MiB, FD -3,
+종료 예산 모두 0을 원본 JSON과 동일한 JSONL에서 확인했다. 첫/마지막 settled
+표본의 heap 물리 공간은 48.7 → 125.4 MiB(+76.8), live heap은 42.1 → 60.2 MiB,
+external은 6.8 → 7.1 MiB, native/detached context는 1/0으로 유지됐다.
+이 표본에서는 V8 heap 물리 공간 증가가 RSS 증가의 대부분에 해당하며, 전체
+장시간 추세와 20분 gate 통과는 여전히 추가 확인이 필요하다.
 
 | 환경 | 생성/삭제 cycle | TCP/HTTP 왕복 | 호스트 FD/handle 변화 | 호스트 RSS 중앙값: 첫/마지막 5분 (MiB) | 호스트 평균 CPU |
 | --- | ---: | ---: | ---: | ---: | ---: |

@@ -17,6 +17,15 @@ assert.ok(process.env.RUNNER_TEMP, "RUNNER_TEMP must identify the disposable run
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const soakSeconds = Number(process.env.PM_TEST_RESOURCE_SOAK_SECONDS ?? 0);
 assert.ok(Number.isInteger(soakSeconds) && soakSeconds >= 0 && soakSeconds <= 3600, "Invalid resource soak duration.");
+const resourceReportPath = process.env.PM_TEST_RESOURCE_SOAK_REPORT ?? path.join(root, ".tmp", "resource-soak.json");
+if (process.argv[2]) {
+  const recovery = /^--resource-report-annotations=([0-3])$/.exec(process.argv[2]);
+  assert.ok(recovery && process.argv.length === 3, "Invalid report recovery argument.");
+  // Recovery runs after the app measurement in separate CI steps. It cannot
+  // install/activate VS Code or change the measured process's allocation/GC.
+  publishReportAnnotations(resourceReportPath, Number(recovery[1]));
+  process.exit(0);
+}
 const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const target = `${process.platform}-${process.arch}`;
 const vsix = path.join(root, `portmanager-${target}-${manifest.version}.vsix`);
@@ -69,7 +78,6 @@ const extensionPath = path.join(extensions, installed);
 // Bound the test runner as well as individual workload operations so a VS Code
 // startup/exit stall still uploads a useful CI log instead of waiting an hour.
 console.log("Packaged validation: run extension host tests");
-const resourceReportPath = process.env.PM_TEST_RESOURCE_SOAK_REPORT ?? path.join(root, ".tmp", "resource-soak.json");
 try { await runOwnedProcess(vscodeExecutablePath, [...profileArgs, "--disable-extensions", "--skip-welcome",
   "--skip-release-notes", "--no-sandbox", "--disable-gpu-sandbox", "--disable-updates", "--no-cached-data",
   "--disable-workspace-trust", `--extensionDevelopmentPath=${extensionPath}`,
@@ -88,7 +96,7 @@ finally {
   // separate artifact transport fails. Full samples remain in the JSON file.
   if (fs.existsSync(resourceReportPath)) {
     try {
-      const report = JSON.parse(fs.readFileSync(resourceReportPath, "utf8"));
+      const report = readResourceReport(resourceReportPath);
       const { status, error, scope, platform, arch, seconds, requestedSeconds, cycles, exchanges, profile } = report;
       console.log("Resource report summary:", JSON.stringify({ status, error, scope, platform, arch,
         seconds, requestedSeconds, cycles, exchanges, profile, cleanup: report.samples?.at(-1)?.resources,
@@ -96,13 +104,6 @@ finally {
       // ArtifactService can time out even when this job's ordinary logs remain
       // downloadable. Numeric samples contain no object values or snapshots;
       // retain the full report through that independent existing log transport.
-      if (!Array.isArray(report.samples) && report.samplesJournal) {
-        const journalPath = path.join(path.dirname(resourceReportPath), path.basename(report.samplesJournal));
-        const journal = fs.readFileSync(journalPath, "utf8");
-        // A forced exit may interrupt the last append. Keep complete records
-        // and retain the running status; incomplete data can never become a pass.
-        report.samples = journal.slice(0, journal.lastIndexOf("\n") + 1).split("\n").filter(Boolean).map(line => JSON.parse(line));
-      }
       const encoded = gzipSync(JSON.stringify(report)).toString("base64");
       const chunks = encoded.match(/.{1,8192}/g) ?? [];
       console.log(`PM_RESOURCE_REPORT_GZIP_BASE64_BEGIN ${chunks.length}`);
@@ -112,6 +113,43 @@ finally {
   }
 }
 console.log(`Verified installed ${manifest.publisher}.${manifest.name}@${manifest.version} (${target}).`);
+
+/** Recover only complete journal records without promoting an interrupted run. */
+function readResourceReport(reportPath) {
+  const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+  if (!Array.isArray(report.samples) && report.samplesJournal) {
+    const journalPath = path.join(path.dirname(reportPath), path.basename(report.samplesJournal));
+    const journal = fs.readFileSync(journalPath, "utf8");
+    report.samples = journal.slice(0, journal.lastIndexOf("\n") + 1).split("\n").filter(Boolean).map(line => JSON.parse(line));
+  }
+  return report;
+}
+
+/**
+ * Check annotations remain available when the artifact and job-log blobs do
+ * not. The runner truncates messages at 4096 characters and keeps only ten
+ * notices per step, so four independent steps each emit at most eight 4000-byte
+ * data frames plus the begin/end markers. Oversize reports are never truncated.
+ */
+function publishReportAnnotations(reportPath, segment) {
+  if (!fs.existsSync(reportPath)) {
+    console.log("Resource report annotations unavailable: no report was written.");
+    return;
+  }
+  const report = readResourceReport(reportPath);
+  const chunks = gzipSync(JSON.stringify(report)).toString("base64").match(/.{1,4000}/g) ?? [];
+  const notice = message => console.log(`::notice title=Port Manager resource trace ${segment + 1}/4::${message}`);
+  if (chunks.length > 32) {
+    if (segment === 0) notice(`Resource report annotations unavailable: ${chunks.length} frames exceed the 32-frame limit. The complete file is required.`);
+    return;
+  }
+  const first = segment * 8;
+  const end = Math.min(first + 8, chunks.length);
+  if (first >= chunks.length) return;
+  if (first === 0) notice(`PM_RESOURCE_REPORT_GZIP_BASE64_BEGIN ${chunks.length}`);
+  for (let index = first; index < end; index++) notice(`PM_RESOURCE_REPORT_GZIP_BASE64 ${index + 1}/${chunks.length} ${chunks[index]}`);
+  if (end === chunks.length) notice("PM_RESOURCE_REPORT_GZIP_BASE64_END");
+}
 
 /** Keeps external downloads and application lifecycle failures reviewable in CI. */
 async function withinBudget(work, milliseconds, operation) {
