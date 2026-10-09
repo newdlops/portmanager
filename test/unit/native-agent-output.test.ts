@@ -61,7 +61,10 @@ async function fixture(context: TestContext) {
   const socketPath = path.join(directory, "socket");
   fs.writeFileSync(path.join(directory, "lsof"), '#!/bin/sh\n/bin/cat "$PM_OUTPUT_DATA"\n', { mode: 0o755 });
   const data = path.join(directory, "data");
-  fs.writeFileSync(data, Array.from({ length: 2000 }, (_, index) => `p${1000000 + index}\ncfixture\nn127.0.0.1:${30000 + index}\n`).join(""));
+  // Output framing needs 2,000 distinct listeners, not 2,000 unrelated process
+  // metadata queries. A shared absent PID preserves the large payload while
+  // the separate metadata/concurrency suite covers process discovery itself.
+  fs.writeFileSync(data, Array.from({ length: 2000 }, (_, index) => `p2000000000\ncfixture\nn127.0.0.1:${30000 + index}\n`).join(""));
   const child = spawn(agent, ["--socket", socketPath, "--route-table", path.join(directory, "routes"),
     "--agent-main", path.join(root, "out/src/agent/agent-main.js"), "--dns-port", "0",
     "--controller-token-file", createTestAgentCredential(socketPath)], {

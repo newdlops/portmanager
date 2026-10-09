@@ -1324,8 +1324,15 @@ if (!fs.existsSync(nativeAgentPath)) {
     assert.equal(fs.existsSync(routeEntryPath), false);
   });
 
-  test("native agent removes hooked route files after the listener disappears", async (context) => {
-    const fixture = await startNativeAgent(context);
+  test("native agent expires a hooked route with no listener after registration grace", async (context) => {
+    const shimDirectory = path.join(projectRoot, ".tmp", "native-agent-tests",
+      `absent-listener-${process.pid}-${Date.now().toString(36)}`);
+    fs.mkdirSync(shimDirectory, { recursive: true });
+    fs.writeFileSync(path.join(shimDirectory, "lsof"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    context.after(() => fs.promises.rm(shimDirectory, { recursive: true, force: true }));
+    const fixture = await startNativeAgent(context, {
+      PATH: `${shimDirectory}${path.delimiter}${process.env.PATH ?? ""}`,
+    });
     if (fixture === undefined) {
       return;
     }
