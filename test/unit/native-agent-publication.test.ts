@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
-import { getRouteTablePathForLogicalPort } from "../../src/agent/route-table";
+import { getNetworkRouteTablePath, getRouteTablePathForLogicalPort } from "../../src/agent/route-table";
 import { createTestAgentCredential, testAgentAuthorization } from "./native-agent-test-authorization";
 
 const root = path.resolve(__dirname, "../../..");
@@ -71,7 +71,7 @@ async function fixture(context: TestContext, withGate = true) {
   let child: ChildProcess | undefined;
   context.after(async () => {
     for (const client of clients) client.socket.destroy();
-    for (const kind of ["routes", "dns"]) fs.rmSync(path.join(directory, `block-${kind}`), { force: true });
+    for (const kind of ["routes", "dns", "shards"]) fs.rmSync(path.join(directory, `block-${kind}`), { force: true });
     if (child && running(child)) {
       child.kill("SIGTERM");
       await until(() => !running(child!), 2500).catch(() => child!.kill("SIGKILL"));
@@ -112,12 +112,12 @@ async function fixture(context: TestContext, withGate = true) {
   return {
     directory, routes, scan, client, child, connect,
     shard: (port: number, network = "publication") => getRouteTablePathForLogicalPort(port, network, routes),
-    block(kind: "routes" | "dns") {
+    block(kind: "routes" | "dns" | "shards") {
       fs.rmSync(path.join(directory, `entered-${kind}`), { force: true });
       fs.writeFileSync(path.join(directory, `block-${kind}`), "");
     },
-    entered: (kind: "routes" | "dns") => until(() => fs.existsSync(path.join(directory, `entered-${kind}`))),
-    release(kind: "routes" | "dns") { fs.rmSync(path.join(directory, `block-${kind}`), { force: true }); },
+    entered: (kind: "routes" | "dns" | "shards") => until(() => fs.existsSync(path.join(directory, `entered-${kind}`))),
+    release(kind: "routes" | "dns" | "shards") { fs.rmSync(path.join(directory, `block-${kind}`), { force: true }); },
   };
 }
 
@@ -193,6 +193,24 @@ test("blocked route writes preserve flush receipts while status and DNS overtake
   await f.client.reply(flush);
   await until(() => fs.existsSync(f.shard(48512)) &&
     JSON.parse(fs.readFileSync(f.shard(48512), "utf8")).routes[0]?.actualPort === 48519 && !fs.existsSync(f.shard(48510)));
+});
+
+test("network aggregate remains current while endpoint writes stall without acknowledging an incomplete flush", gated, async context => {
+  const f = await fixture(context);
+  await f.client.reply(f.client.send("registerExistingProcess", registration(48514)));
+  await f.client.reply(f.client.send("flushRouteTables"));
+  const networkPath = getNetworkRouteTablePath("publication", f.routes);
+  f.block("shards");
+  await f.client.reply(f.client.send("registerExistingProcess", registration(48516)));
+  const flush = f.client.send("flushRouteTables");
+  await f.entered("shards");
+  const current = JSON.parse(fs.readFileSync(networkPath, "utf8")) as { routes: { logicalPort: number }[] };
+  assert.ok(current.routes.some(route => route.logicalPort === 48516), "bulk endpoint work must not starve the authoritative network snapshot");
+  assert.equal(f.client.messages.has(flush), false, "flush still waits for every endpoint publication");
+  assert.equal(fs.existsSync(f.shard(48516)), false);
+  f.release("shards");
+  await f.client.reply(flush);
+  assert.ok(fs.existsSync(f.shard(48516)));
 });
 
 test("blocked DNS commits keep old answers, fence stale revisions and let route flushes finish", gated, async context => {

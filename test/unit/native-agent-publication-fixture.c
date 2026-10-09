@@ -24,6 +24,13 @@ static ssize_t pm_test_publication_write(int fd, const void *bytes, size_t lengt
       strstr(target + strlen(root), "/routes") != NULL && strstr(target, ".tmp.") != NULL) {
     const char *kind = strstr(target, "-browser-dns.tsv") != NULL ? "dns" : "routes";
     char block[PATH_MAX], entered[PATH_MAX];
+    /* A separate shard gate lets the test prove aggregate visibility without
+     * making an incomplete flush receipt succeed. Normal route gates still
+     * stop both aggregate and endpoint writes at their actual write syscall. */
+    if (strcmp(kind, "routes") == 0 && strstr(target, "-port-") != NULL) {
+      snprintf(block, sizeof(block), "%s/block-shards", root);
+      if (access(block, F_OK) == 0) kind = "shards";
+    }
     snprintf(block, sizeof(block), "%s/block-%s", root, kind);
     snprintf(entered, sizeof(entered), "%s/entered-%s", root, kind);
     if (access(block, F_OK) == 0) {

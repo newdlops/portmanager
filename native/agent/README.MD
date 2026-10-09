@@ -90,6 +90,10 @@ managed child의 command/env 구성은 fork 전에 끝낸다. child는 chdir/ope
 `flushRouteTables`, noncompact allocation, `repairRoutingState`의 성공은 해당 사본 또는 이를 포함한 후속 사본의 파일 반영이 끝난 뒤 반환한다. repair 강제 재작성 세대는 병합해도 보존하고, 이전 사본 완료가 새 dirty revision을 지우지 않는다. 다른 daemon의 최신 generation은 쓰기 시작과 rename 직전에 확인한다. DNS는 FIFO로 게시하며 직전 완료가 control thread에 적용된 뒤 다음 작업의 revision을 비교한다. authoritative 문서도 rename 직전에 다시 검증하고, 실패 시 기존 파일과 UDP 답변을 유지한다.
 
 network aggregate의 중복 제거는 route identity로 정렬한 뒤 마지막 등장 위치를 선택하고 원래 순서로 복원한다. 기존 마지막 소유자 우선 규칙과 파일 순서를 보존하면서 O(n²) identity 비교가 대규모 표의 게시 기한을 반복해서 소진하는 일을 막는다.
+scoped generation의 기준인 network aggregate를 같은 불변 사본에서 개별 endpoint·
+Compose 파일보다 먼저 게시한다. 개별 쓰기가 느려도 전체 경로 표의 새 revision을
+가리지 않으며, flush 성공은 모든 파일과 삭제까지 끝난 뒤에만 반환한다.
+최초 큐 진입부터의 8초 기한과 rename 직전 generation 검사는 그대로 유지한다.
 
 route 게시는 진행 중인 사본과 최신 대기 사본을 합해 256MiB, DNS 게시는 진행 중인 작업을 포함해 최대 32개·사본 32MiB를 보관한다. route 한도는 기존 대규모 라우팅에서 metadata와 배열 여유 용량까지 포함한 사본을 수용한다. 응답 대기는 연결당 128개·전체 1,024개·payload 8MiB로 제한한다. 게시 기한은 최초 큐 진입부터 8초이며 병합으로 연장하지 않는다. 초과 시 성공을 알리지 않고, 반환된 파일 작업은 rename 전에 취소를 확인한다. route 실패는 1초 후 재시도하고 부분 게시·삭제 실패 시 이전 경로와 새 경로를 모두 보관해 남은 정리를 이어간다. 응답 연결이 닫혀도 접수한 작업은 계속 처리한다. 종료는 게시 worker를 기다리는 join을 하지 않는다. worker가 독점 소유한 사본/파일 상태는 작업 반환 시 정리하고, 커널 안에서 멈춘 호출은 standalone daemon 프로세스 종료로 회수한다. 작은 publication adapter는 이 실행·완료·소유권 경계만 담당한다.
 

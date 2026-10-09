@@ -3397,6 +3397,34 @@ static int pm_write_route_snapshot(pm_agent_state *state, pm_route_list routes) 
     return -1;
   }
 
+  /* Scoped aggregates own the generation and use the same immutable snapshot.
+   * Publish them before bulk endpoint I/O so a slow shard cannot starve
+   * the current network view. Receipts still wait for every file/deletion
+   * below, with the original queue deadline and rename generation guards. */
+  for (size_t network_index = 0; network_index < current_network_count; network_index++) {
+    char network_path[PM_TEXT];
+    pm_route_list network_routes = {0};
+
+    int built = pm_build_network_route_snapshot(&routes, current_networks[network_index], &network_routes);
+    pm_scoped_route_table_path(state->route_table_path, current_networks[network_index], network_path, sizeof(network_path));
+    if (built != 0 || pm_write_route_table_file_if_changed(state, network_path, network_routes.items, network_routes.count, sequence) != 0) {
+      result = -1;
+    }
+    free(network_routes.items);
+  }
+
+  for (size_t index = 0; index < state->written_network_count; index++) {
+    if (!pm_string_array_binary_contains(current_networks, current_network_count, state->written_network_ids[index])) {
+      char network_path[PM_TEXT];
+      pm_scoped_route_table_path(state->route_table_path, state->written_network_ids[index], network_path, sizeof(network_path));
+      if (pm_write_route_table_file_if_changed(state, network_path, NULL, 0, sequence) != 0) {
+        result = -1;
+      }
+    }
+  }
+  pm_dev_log("agent-publication", "snapshot aggregates sequence=%lu networks=%zu result=%d elapsed_ms=%lld", sequence,
+    current_network_count, result, pm_publication_now_ms() - publication_started_ms);
+
   for (size_t index = 0; index < routes.count;) {
     size_t end = index + 1;
     pm_route_list endpoint_routes = {0};
@@ -3462,30 +3490,6 @@ static int pm_write_route_snapshot(pm_agent_state *state, pm_route_list routes) 
   pm_string_array_sort(current_claims, current_claim_count);
   pm_dev_log("agent-publication", "snapshot endpoints sequence=%lu entries=%zu result=%d elapsed_ms=%lld", sequence,
     current_entry_count, result, pm_publication_now_ms() - publication_started_ms);
-
-  for (size_t network_index = 0; network_index < current_network_count; network_index++) {
-    char network_path[PM_TEXT];
-    pm_route_list network_routes = {0};
-
-    int built = pm_build_network_route_snapshot(&routes, current_networks[network_index], &network_routes);
-    pm_scoped_route_table_path(state->route_table_path, current_networks[network_index], network_path, sizeof(network_path));
-    if (built != 0 || pm_write_route_table_file_if_changed(state, network_path, network_routes.items, network_routes.count, sequence) != 0) {
-      result = -1;
-    }
-    free(network_routes.items);
-  }
-
-  for (size_t index = 0; index < state->written_network_count; index++) {
-    if (!pm_string_array_binary_contains(current_networks, current_network_count, state->written_network_ids[index])) {
-      char network_path[PM_TEXT];
-      pm_scoped_route_table_path(state->route_table_path, state->written_network_ids[index], network_path, sizeof(network_path));
-      if (pm_write_route_table_file_if_changed(state, network_path, NULL, 0, sequence) != 0) {
-        result = -1;
-      }
-    }
-  }
-  pm_dev_log("agent-publication", "snapshot aggregates sequence=%lu networks=%zu result=%d elapsed_ms=%lld", sequence,
-    current_network_count, result, pm_publication_now_ms() - publication_started_ms);
 
   if (endpoint_entries_complete) {
     for (size_t index = 0; index < state->written_entry_count; index++) {

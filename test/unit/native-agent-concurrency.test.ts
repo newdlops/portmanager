@@ -679,6 +679,7 @@ if (!fs.existsSync(nativeAgentPath)) {
   });
 
   test("native agent applies a complete registration after the client closes without reading", async (context) => {
+    preservePublicationFailureTrace(context, "send-only");
     const fixture = await startNativeAgent(context);
     if (fixture === undefined) {
       return;
@@ -952,6 +953,7 @@ if (!fs.existsSync(nativeAgentPath)) {
   });
 
   test("native agent serves concurrent hook-like clients while extension client receives events", async (context) => {
+    preservePublicationFailureTrace(context, "allocations");
     const fixture = await startNativeAgent(context);
     if (fixture === undefined) {
       return;
@@ -1389,6 +1391,25 @@ if (!fs.existsSync(nativeAgentPath)) {
 interface NativeAgentFixture {
   readonly socketPath: string;
   readonly routeTablePath: string;
+}
+
+/** Preserve only the bounded tail of publication phases through the shared
+ * native endpoint before cleanup. The tail is available even if a full-suite
+ * deadline aborts the assertion before it can report its own failure. */
+function preservePublicationFailureTrace(context: TestContext, scenario: string): void {
+  const directory = path.join(projectRoot, ".tmp", "native-agent-tests");
+  fs.mkdirSync(directory, { recursive: true });
+  const logPath = path.join(directory, `publication-${scenario}-${process.pid}-${Date.now().toString(36)}.log`);
+  const priorLogPath = process.env.PORT_MANAGER_DEV_LOG;
+  process.env.PORT_MANAGER_DEV_LOG = logPath;
+  context.after(() => {
+    if (fs.existsSync(logPath)) {
+      context.diagnostic(JSON.stringify({ scenario, publicationTrace: fs.readFileSync(logPath, "utf8").slice(-8192) }));
+    }
+    if (priorLogPath === undefined) delete process.env.PORT_MANAGER_DEV_LOG;
+    else process.env.PORT_MANAGER_DEV_LOG = priorLogPath;
+    fs.rmSync(logPath, { force: true });
+  });
 }
 
 interface RouteTable {
