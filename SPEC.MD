@@ -362,25 +362,33 @@ macOS와 Windows는 Linux network namespace와 같은 per-process 네트워크 �
 사용자 선택대로 소스와 기존 쓰기는 공유한다. 공유 코드 변경이 다른 네트워크의 다음
 실행에 영향을 주는 경로는 이 조건에 포함하지 않는다.
 
-현재 native hook은 협조적인 라우팅이며 강제 보안 경계가 아니다. 별도 macOS 커널
-정책 후보는 합성 테스트에서 직접 TCP, 타 네트워크 파일·Unix socket, 다른 PID의
+현재 native hook은 협조적인 라우팅이며 그 자체가 강제 보안 경계는 아니다. macOS의
+새 보호된 terminal 경로는 커널 정책과 network ID가 고정된 broker를 제품의 SDK
+terminal profile에 연결한다. 이 경로의 검증에서는 직접 TCP, 타 네트워크 파일·Unix socket, 다른 PID의
 신호와 환경 조회를 차단하고 승인된 broker FD 및 호스트 Node·Python 실행을 허용했다.
-이 후보는 아직 제품 attach 경로에 연결되지 않았다. 숫자 `127.x` 주소별 Seatbelt
+기존에 실행 중인 셸과 협조적 hook만 사용하는 경로는 이 커널 경계를 상속하지 않는다. 숫자 `127.x` 주소별 Seatbelt
 규칙이 지원되지 않으므로 TCP는 네트워크 ID가 고정된 broker에서 중계해야 한다.
 
-별도 native launcher 후보는 보호된 profile을 읽고 상속 FD·기존 권한 환경을 정리한
+제품의 native launcher는 보호된 profile을 읽고 상속 FD·기존 권한 환경을 정리한
 뒤, 실제 커널 거절과 broker transport를 확인한다. 표준 IO만 명시적으로 상속하는
 SETEXEC로 같은 PID를 유지하며, private socketpair의 record와 exec EOF로 시작을 확인한다.
 실제 PTY에서는 해당 terminal device만 허용하고 자기·자식 신호와 자기 scheduling만
 허용한다. 호스트 zsh·Node·Python, 다른 TTY 거절과 종료 신호를 무시하는 자식 회수를
 합성 테스트로 확인했다. controller 옵션을 쌍으로 지정하면 정책 확인 뒤 실제 fork
 PID·birth를 데몬에 등록하고 동일 tuple의 승인 후에만 private ACK로 exec를 허용한다.
-잘못된 응답·거절·기한·취소에는 실행하지 않는다. 이 launcher도 제품 attach·proxy 귀속·
-packaging에는 아직 연결하지 않았으며, stdout의 테스트용 ready 문구는 제품의 trusted
-확인 채널로 쓰지 않는다. 새 parent 전용 `--ready-file`을 제품 소비자에 연결해야 한다.
+잘못된 응답·거절·기한·취소에는 실행하지 않는다. `MacosNetworkRuntime`이 SDK terminal과
+외부 CLI의 실행·교체·해제를 같은 owner와 자원 예산으로 관리하며 native package에
+launcher와 broker를 포함한다. 시작 확인은 parent 전용 `--ready-file`의 소유권·PID/birth를
+검증하고, stdout의 ready 문구나 입력 명령의 echo는 실행 증거로 쓰지 않는다.
 namespace 미러의 nofollow 탐색에는 공통 부모의 directory 읽기만
 허용하고 기존 부모에 불필요한 mkdir를 시도하지 않는다. 타 namespace 파일과 키는 계속
 거절한다.
+
+종료 시에는 private ownership·completion record와 실제 자식 회수를 확인한 뒤
+예약을 반환한다. 정상 종료와 supervisor 강제 종료 후 회수는 별도로 검증한다.
+강제 종료 직후 같은 TTY 번호가 다시 배정되는 조건은 아직 확인되지 않았으므로
+그 조건까지 격리가 보장된다고 표시하지 않는다. 공유 소스의 쓰기와 기존 호스트
+런타임을 유지하는 조건 역시 완전한 악성 코드 sandbox 보장으로 확대하지 않는다.
 
 agent 소스의 RPC 권한은 별도로 분리한다. controller 키는 workload 환경에 넣지 않으며
 보호된 `.portmanager/security/agent-control/`에 저장한다. 네트워크 키는 stable ID별로
