@@ -755,6 +755,13 @@ void pm_tcp_proxy_forward(int client_fd, int target_fd) {
     }
     if (ready < 0 && errno == EINTR) continue;
     if (ready < 0) break;
+#if defined(__APPLE__)
+    /* Another socket may remain ready while backpressure disables this
+     * socket's filters. Probe that socket after every wakeup, not only a
+     * timeout: repeated unrelated readiness must not hide its TCP reset. */
+    if ((descriptors[0].events == 0 && pm_tcp_proxy_client_failed(client_fd))
+        || (descriptors[1].events == 0 && pm_tcp_proxy_client_failed(target_fd))) break;
+#endif
     if (ready == 0) {
       if (pm_tcp_proxy_client_failed(client_fd) || pm_tcp_proxy_client_failed(target_fd)) break;
       continue;

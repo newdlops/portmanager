@@ -10,6 +10,21 @@ import test from "node:test";
 const run = promisify(execFile);
 const root = path.resolve(__dirname, "../../..");
 
+test("native TCP backpressure checks a reset even while the opposite filter stays ready",
+  { skip: process.platform !== "darwin", timeout: 15_000 }, async t => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pm-tcp-reset-"));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    const executable = path.join(directory, "fixture");
+    await run("cc", ["-Wall", "-Wextra", "-Werror", "-O2", "-pthread",
+      path.join(root, "test/unit/native-tcp-reset-fixture.c"),
+      path.join(root, "native/shared/pm_dev_log.c"), "-o", executable], { timeout: 10_000 });
+    const { stdout } = await run(executable, [], { timeout: 2000 });
+    const result = JSON.parse(stdout) as { waits: number; backpressuredEvents: number; errorObserved: number };
+    assert.equal(result.backpressuredEvents, 1, "the other socket must have a ready event, rather than a timeout");
+    assert.equal(result.errorObserved, 1, "the disabled socket must still have its reset inspected");
+    assert.equal(result.waits, 2, "the pump must stop at the first backpressured wakeup after that reset");
+  });
+
 test("native TCP preparation has one deadline across addresses/EINTR and releases failed sockets",
   { skip: process.platform === "win32", timeout: 15_000 }, async t => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pm-tcp-setup-"));

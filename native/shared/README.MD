@@ -48,7 +48,9 @@ reset/error는 두 방향을 함께 정리해 다른 copy thread의 종료를 �
 macOS는 kqueue의 읽기/쓰기 필터를 분리해 상대의 upload FIN 뒤에도 응답을
 전달한다. 연결당 queue fd 하나를 worker가 소유하며 종료 시 닫고, RLIMIT admission은
 데이터 소켓 2개와 queue 1개를 함께 계산한다. Linux는 poll을 유지한다.
-I/O 관심이 없는 방향이 있을 때만 100ms 간격으로 socket error를 확인한다.
+I/O 관심이 없는 방향이 있을 때만 최대 100ms 간격으로 socket error를 확인한다.
+반대편 이벤트가 계속 준비돼 타임아웃이 발생하지 않아도 매 wakeup에서 그 방향의
+오류를 확인해, 다른 이벤트가 TCP reset 감지를 가리지 않게 한다.
 정상 FIN과 idle은 이 확인으로 종료하지 않고, 일반 양방향 idle 연결은 무기한 대기한다.
 
 주소 준비는 기본 5초의 monotonic 기한 하나를 DNS와 모든 주소의 connect/EINTR에
