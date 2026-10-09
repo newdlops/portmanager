@@ -108,6 +108,14 @@ steady state의 proxy helper 수는 증가하면 안 된다. 확장 호스트 FD
 예열 뒤 +8 이하, RSS는 +96 MiB 이하를 실패 기준으로 사용하며 전체 표본을
 보관해 추세를 검토한다. 이는 RSS 상한이나 임의 사용자 앱의 성능 보장이 아니다.
 process tree에는 daemon과 일반 VS Code 자식/일시적 discovery 명령도 기록한다.
+macOS setuid 시스템 명령은 실제 UID가 호출자여도 effective UID가 달라 FD 조회가
+거절될 수 있다. native 도구의 EPERM·PID·kernel UID와 조회 전후 동일한
+process unique-id/version이 확인된 자식만
+`descriptors: null`과 `descriptorUnavailable`로 기록하고 RSS/CPU 행은 보존한다.
+그 표본이 있으면 `descriptorTreeComplete`는 false이며 `peakTreeDescriptors`는
+null이다. `peakMeasuredTreeDescriptors`는 측정된 부분의 합계일 뿐 전체 합계가 아니다.
+확장 호스트와 daemon은 이 예외를 적용하지 않고 실제 FD 수를 반드시 측정한다.
+일반 live 프로세스의 측정 오류, 잘못된 PID/UID, 기한 초과는 계속 실패한다.
 
 로컬 rehearsal은 `PM_TEST_RESOURCE_SOAK_SECONDS=30 node
 out/test/integration/proxy-resource-soak.js`로 실행할 수 있다. 확장은 활성화하지

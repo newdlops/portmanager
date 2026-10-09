@@ -38,7 +38,7 @@ test("resource sampling excludes an actual unreaped child with no descriptors", 
   process.kill(childPid, 0); // A zombie still passes this existing liveness check.
   const samples = await processSamples(parent.pid!);
   assert.equal(samples.some(sample => sample.pid === childPid), false);
-  assert.ok(samples.find(sample => sample.pid === parent.pid)!.descriptors > 0);
+  assert.ok(samples.find(sample => sample.pid === parent.pid)!.descriptors! > 0);
 });
 
 test("resource sampling rejects descriptor failures for a live host", {
@@ -101,6 +101,58 @@ test("resource sampling retains a live product child named ps and rejects its de
   }), error => error === failure);
 });
 
+test("resource sampling reports a kernel-denied privileged descendant as unknown and keeps host counts strict", {
+  skip: process.platform !== "darwin", timeout: 15_000,
+}, async t => {
+  const child = spawn(process.execPath, ["-e", "process.title='ps';process.stdout.write('ready\\n');setInterval(()=>{},1000)"],
+    { stdio: ["ignore", "pipe", "ignore"] });
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) { const exited = once(child, "exit"); child.kill("SIGTERM"); await exited; }
+  });
+  await once(child.stdout!, "data");
+  const uid = process.getuid!();
+  const nativeFailure = (pid: number, record: object) => Object.assign(new Error("kernel FD access denied"), {
+    code: 1, signal: null, stderr: "", stdout: JSON.stringify({ pid, error: os.constants.errno.EPERM, ...record }),
+  });
+  const permittedBoundary = { effectiveUid: uid === 0 ? 1 : 0, realUid: uid,
+    processUniqueId: "18446744073709551615", identityVersion: 1 };
+  const samples = await processSamples(process.pid, undefined, async pid => {
+    if (pid === child.pid) throw nativeFailure(pid, permittedBoundary);
+    return 3;
+  });
+  const row = samples.find(sample => sample.pid === child.pid)!;
+  assert.equal(path.basename(row.command), "ps");
+  assert.equal(row.descriptors, null, "an inaccessible child is neither dropped nor counted as zero");
+  assert.equal(row.descriptorUnavailable?.reason, "privileged-real-owner");
+  assert.ok(row.rssKiB > 0);
+  assert.equal(samples.find(sample => sample.pid === process.pid)!.descriptors, 3);
+  for (const record of [
+    { ...permittedBoundary, pid: child.pid! + 1 },
+    { ...permittedBoundary, effectiveUid: uid },
+    { ...permittedBoundary, realUid: uid + 1 },
+    { ...permittedBoundary, fdCount: 0 },
+    { ...permittedBoundary, error: os.constants.errno.EIO },
+    { ...permittedBoundary, processUniqueId: undefined },
+    { ...permittedBoundary, processUniqueId: "18446744073709551616" },
+    { ...permittedBoundary, processUniqueId: "0" },
+    { ...permittedBoundary, identityVersion: -1 },
+    { ...permittedBoundary, identityVersion: 0x100000000 },
+  ]) {
+    const failure = nativeFailure(child.pid!, record);
+    await assert.rejects(processSamples(process.pid, undefined, async pid => {
+      if (pid === child.pid) throw failure;
+      return 3;
+    }), error => error === failure);
+  }
+  for (const requiredPid of [process.pid, child.pid!]) {
+    const failure = nativeFailure(requiredPid, permittedBoundary);
+    await assert.rejects(processSamples(process.pid, child.pid, async pid => {
+      if (pid === requiredPid) throw failure;
+      return 3;
+    }), error => error === failure, "host and daemon must have real measured FD counts");
+  }
+});
+
 test("resource sampling re-observes a clean no-match only when a live host subsequently has a real FD count", {
   skip: process.platform === "win32", timeout: 10_000,
 }, async () => {
@@ -113,7 +165,7 @@ test("resource sampling re-observes a clean no-match only when a live host subse
     return result.stdout.split("\n").filter(line => /^f\d/.test(line)).length;
   });
   assert.equal(hostQueries, 2);
-  assert.ok(samples.find(row => row.pid === process.pid)!.descriptors > 0);
+  assert.ok(samples.find(row => row.pid === process.pid)!.descriptors! > 0);
 });
 
 test("resource sampling rejects a repeated clean no-match for a live host", {

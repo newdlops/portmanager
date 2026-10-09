@@ -17,7 +17,13 @@ import type { ProxyResourceLimits } from "../../src/core/networks/proxy-resource
 import type { HostPortExposure, LogicalNetwork } from "../../src/shared/types";
 
 const execute = promisify(execFile);
-interface ProcessSample { pid: number; parent: number; command: string; rssKiB: number; cpuSeconds: number; descriptors: number }
+interface ProcessSample {
+  pid: number; parent: number; command: string; rssKiB: number; cpuSeconds: number;
+  /** null reports a proven privileged descendant, never an inferred zero. */
+  descriptors: number | null;
+  descriptorUnavailable?: { reason: "privileged-real-owner"; error: number; effectiveUid: number; realUid: number;
+    processUniqueId: string; identityVersion: number };
+}
 interface Sample {
   elapsedSeconds: number; phase: string; cycle: number; resources: ProxyResourceLimits;
   heapBytes: number; heapCapacityBytes: number; externalBytes: number; arrayBufferBytes: number;
@@ -26,6 +32,7 @@ interface Sample {
   nativeContexts: number; detachedContexts: number; globalHandleBytes: number;
   gc: { count: number; major: number; minor: number; durationMs: number };
   allocationSites?: ReturnType<typeof summarizeAllocations>;
+  descriptorMeasurement: { complete: boolean; measuredProcesses: number; unknownPids: number[] };
   eventLoopP99Ms: number; processes: ProcessSample[];
 }
 export interface ResourceSoakOptions {
@@ -156,6 +163,9 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
       arrayBufferBytes: memory.arrayBuffers, heapSpaces: getHeapSpaceStatistics(), heapCode: getHeapCodeStatistics(),
       nativeContexts: heap.number_of_native_contexts, detachedContexts: heap.number_of_detached_contexts,
       globalHandleBytes: heap.used_global_handles_size, gc: { ...gc }, allocationSites: allocations,
+      descriptorMeasurement: { complete: processes.every(row => row.descriptors !== null),
+        measuredProcesses: processes.filter(row => row.descriptors !== null).length,
+        unknownPids: processes.filter(row => row.descriptors === null).map(row => row.pid) },
       eventLoopP99Ms: lag.percentile(99) / 1e6, processes };
     samples.push(entry);
     fs.appendFileSync(journalPath, `${JSON.stringify(entry)}\n`);
@@ -250,6 +260,8 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
     assert.ok(proxyChildren(last) <= proxyChildren(first), "Proxy children accumulated after cleanup");
     const firstHost = first.processes.find(entry => entry.pid === process.pid)!;
     const lastHost = last.processes.find(entry => entry.pid === process.pid)!;
+    assert.ok(typeof firstHost.descriptors === "number" && typeof lastHost.descriptors === "number",
+      "Host FD growth requires actual measured counts.");
     assert.ok(lastHost.descriptors <= firstHost.descriptors + 8, "Host FD/handle count grew after warmup");
     // RSS includes allocator and V8 high-water retention. Keep a generous
     // failure threshold and retain every sample for trend review, rather than
@@ -336,6 +348,15 @@ export async function processSamples(hostPid: number, daemonPid?: number,
       // Exited but unreaped children still pass kill(pid, 0) while owning no
       // descriptors. Only an OS-confirmed exit/zombie may discard this error.
       if (await processHasCompleted(row.pid)) { completed.add(row.pid); return; }
+      // macOS setuid system commands can have our real UID but a privileged
+      // effective UID. Keep their RSS/CPU row and an explicit unknown FD count;
+      // this boundary never exempts the measured host or daemon from a count.
+      const privilege = privilegedDescriptorBoundary(error, row.pid);
+      if (row.pid !== hostPid && row.pid !== daemonPid && privilege !== undefined) {
+        row.descriptors = null;
+        row.descriptorUnavailable = privilege;
+        return;
+      }
       // lsof exit 1 with no output is its no-match result. A process may be
       // entering/exiting its descriptor table while still appearing in ps.
       // One re-observation must produce a real count or OS-confirmed exit;
@@ -365,6 +386,29 @@ export async function processSamples(hostPid: number, daemonPid?: number,
   }));
   // ps/PowerShell itself was a short-lived child of the measured host.
   return result.filter(row => !completed.has(row.pid) && processExists(row.pid));
+}
+
+/** Only the native kernel credential reply can establish an opaque descendant. */
+function privilegedDescriptorBoundary(error: unknown, pid: number): ProcessSample["descriptorUnavailable"] {
+  if (process.platform !== "darwin" || typeof process.getuid !== "function") return undefined;
+  const query = error as NodeJS.ErrnoException & { stdout?: unknown; stderr?: unknown; signal?: unknown };
+  if (query?.code as unknown !== 1 || query.signal || query.stderr !== "" || typeof query.stdout !== "string"
+      || query.stdout.length > 4096) return undefined;
+  try {
+    const record = JSON.parse(query.stdout) as { pid?: unknown; error?: unknown; fdCount?: unknown; effectiveUid?: unknown; realUid?: unknown;
+      processUniqueId?: unknown; identityVersion?: unknown };
+    const uid = process.getuid();
+    if (record.pid !== pid || record.error !== os.constants.errno.EPERM || record.fdCount !== undefined
+        || !Number.isSafeInteger(record.effectiveUid) || (record.effectiveUid as number) < 0
+        || record.effectiveUid === uid || record.realUid !== uid
+        || typeof record.processUniqueId !== "string" || !/^[1-9][0-9]{0,19}$/.test(record.processUniqueId)
+        || BigInt(record.processUniqueId) > 18446744073709551615n
+        || !Number.isSafeInteger(record.identityVersion) || (record.identityVersion as number) < 0
+        || (record.identityVersion as number) > 0xffffffff) return undefined;
+    return { reason: "privileged-real-owner", error: os.constants.errno.EPERM,
+      effectiveUid: record.effectiveUid as number, realUid: uid,
+      processUniqueId: record.processUniqueId, identityVersion: record.identityVersion as number };
+  } catch { return undefined; }
 }
 
 /** Permission failures never stand in for proof that a measured process exited. */
@@ -406,11 +450,16 @@ function summarize(samples: readonly Sample[], hostPid: number) {
   const last = settled[settled.length - 1];
   const host = (entry: Sample) => entry.processes.find(row => row.pid === hostPid)!;
   return { peakTreeRssKiB: Math.max(...samples.map(entry => entry.processes.reduce((sum, row) => sum + row.rssKiB, 0))),
-    peakTreeDescriptors: Math.max(...samples.map(entry => entry.processes.reduce((sum, row) => sum + row.descriptors, 0))),
+    peakTreeDescriptors: samples.some(entry => entry.processes.some(row => row.descriptors === null)) ? null
+      : Math.max(...samples.map(entry => entry.processes.reduce((sum, row) => sum + (row.descriptors ?? 0), 0))),
+    peakMeasuredTreeDescriptors: Math.max(...samples.map(entry => entry.processes.reduce((sum, row) => sum + (row.descriptors ?? 0), 0))),
+    descriptorTreeComplete: samples.every(entry => entry.processes.every(row => row.descriptors !== null)),
+    unknownDescriptorSamples: samples.filter(entry => entry.processes.some(row => row.descriptors === null)).length,
     peakEventLoopP99Ms: Math.max(...samples.map(entry => entry.eventLoopP99Ms)),
     settledSamples: settled.length,
     hostRssGrowthKiB: first && last ? host(last).rssKiB - host(first).rssKiB : undefined,
-    hostDescriptorGrowth: first && last ? host(last).descriptors - host(first).descriptors : undefined,
+    hostDescriptorGrowth: first && last && host(last).descriptors !== null && host(first).descriptors !== null
+      ? host(last).descriptors! - host(first).descriptors! : undefined,
     hostMeanCpuPercent: first && last && last.elapsedSeconds > first.elapsedSeconds
       ? 100 * (host(last).cpuSeconds - host(first).cpuSeconds) / (last.elapsedSeconds - first.elapsedSeconds) : undefined };
 }
