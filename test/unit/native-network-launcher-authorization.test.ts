@@ -316,11 +316,11 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   for (const name of ["forged", "denied", "silent", "timeout"]) {
     if (fs.existsSync(marker)) fs.unlinkSync(marker);
     const fakePath = path.join(security, `sockets/${name}.sock`);
-    let captured = false;
+    let captured = false, capturedAt: number | undefined;
     const fake = net.createServer(socket => {
       sockets.add(socket); socket.on("error", () => {}); socket.once("close", () => sockets.delete(socket));
       socket.once("data", bytes => {
-        captured = true;
+        captured = true; capturedAt ??= Date.now();
         if (name === "forged") socket.end('{"type":"response","id":"wrong","method":"registerProcessScope","ok":true,"payload":{"pid":1,"birth":1,"networkId":"network-a"}}\n');
         if (name === "denied") {
           const frame = JSON.parse(bytes.toString().split("\n")[0]) as { payload: Scope };
@@ -332,7 +332,11 @@ test("guarded exec waits for controller PID/birth registration and never widens 
       const started = Date.now();
       await assert.rejects(run(launcher, args(fakePath, ["/usr/bin/touch", marker]), { cwd: root, env: environment, timeout: 12_000 }), error =>
         (error as { code?: number; stdout?: string }).code === 125 && !/ready pid=/.test((error as { stdout?: string }).stdout ?? ""));
-      if (name === "timeout") assert.ok(Date.now() - started >= 7000 && Date.now() - started < 11_000, "controller wait must use the original bounded startup deadline");
+      if (name === "timeout") {
+        const elapsed = Date.now() - started;
+        assert.ok(elapsed >= 7000 && elapsed < 11_000,
+          `controller wait must use the original bounded startup deadline (elapsed=${elapsed}ms, requestDelay=${capturedAt === undefined ? "missing" : capturedAt - started}ms)`);
+      }
     } else {
       const waiting = spawn(launcher, args(fakePath, ["/usr/bin/touch", marker]), { cwd: root, env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(waiting);
       const exited = once(waiting, "exit"); let waitingOutput = ""; waiting.stdout!.on("data", bytes => waitingOutput += bytes.toString());
