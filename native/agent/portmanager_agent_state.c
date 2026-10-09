@@ -3345,6 +3345,7 @@ static int pm_write_route_snapshot(pm_agent_state *state, pm_route_list routes) 
   }
 
   sequence = ++state->route_table_sequence;
+  const long long publication_started_ms = pm_publication_now_ms();
 
   for (size_t index = 0; index < routes.count; index++) {
     pm_route_entry_path(
@@ -3385,6 +3386,8 @@ static int pm_write_route_snapshot(pm_agent_state *state, pm_route_list routes) 
     qsort(claim_items, claim_item_count, sizeof(pm_route_claim_item), pm_compare_route_claim_items);
   }
   pm_string_array_sort(current_networks, current_network_count);
+  pm_dev_log("agent-publication", "snapshot prepared sequence=%lu routes=%zu elapsed_ms=%lld", sequence,
+    routes.count, pm_publication_now_ms() - publication_started_ms);
 
   if (pm_route_table_generation_is_newer_for_publish(state, routes.items, routes.count, current_networks, current_network_count, sequence)) {
     pm_string_array_clear(&current_networks, &current_network_count, &current_network_capacity);
@@ -3457,6 +3460,8 @@ static int pm_write_route_snapshot(pm_agent_state *state, pm_route_list routes) 
   }
   pm_string_array_sort(current_entries, current_entry_count);
   pm_string_array_sort(current_claims, current_claim_count);
+  pm_dev_log("agent-publication", "snapshot endpoints sequence=%lu entries=%zu result=%d elapsed_ms=%lld", sequence,
+    current_entry_count, result, pm_publication_now_ms() - publication_started_ms);
 
   for (size_t network_index = 0; network_index < current_network_count; network_index++) {
     char network_path[PM_TEXT];
@@ -3479,6 +3484,8 @@ static int pm_write_route_snapshot(pm_agent_state *state, pm_route_list routes) 
       }
     }
   }
+  pm_dev_log("agent-publication", "snapshot aggregates sequence=%lu networks=%zu result=%d elapsed_ms=%lld", sequence,
+    current_network_count, result, pm_publication_now_ms() - publication_started_ms);
 
   if (endpoint_entries_complete) {
     for (size_t index = 0; index < state->written_entry_count; index++) {
@@ -3549,6 +3556,8 @@ static int pm_write_route_snapshot(pm_agent_state *state, pm_route_list routes) 
   if (result == 0) {
     state->route_table_refreshed_at = time(NULL);
   }
+  pm_dev_log("agent-publication", "snapshot complete sequence=%lu result=%d elapsed_ms=%lld", sequence,
+    result, pm_publication_now_ms() - publication_started_ms);
   return result;
 }
 

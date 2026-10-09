@@ -719,6 +719,8 @@ if (!fs.existsSync(nativeAgentPath)) {
       });
     });
 
+    context.diagnostic(JSON.stringify({ phase: "send-only-frame-closed",
+      routePublished: fs.existsSync(routeEntryPath) }));
     const table = await waitForRouteTable(routeEntryPath, (candidate) => {
       const route = candidate.routes[0] as { readonly logicalPort?: number; readonly actualPort?: number } | undefined;
       return route?.logicalPort === logicalPort && route.actualPort === actualPort;
@@ -960,12 +962,14 @@ if (!fs.existsSync(nativeAgentPath)) {
 
     const allocationCount = 10_000;
     const networkId = "network-native-stress";
+    const allocationStarted = performance.now();
     const allocationResults = await Promise.allSettled(
       Array.from({ length: allocationCount }, (_, index) =>
         requestOnce<{
           readonly allocationId: string;
           readonly requestedPort: number;
           readonly actualPort: number;
+          readonly expiresAt?: string;
         }>(socketPath, {
           id: `hook-${process.pid}-${index}`,
           method: "allocateRoute",
@@ -995,6 +999,10 @@ if (!fs.existsSync(nativeAgentPath)) {
     assert.equal(new Set(allocations.map((allocation) => allocation.allocationId)).size, allocationCount);
     assert.equal(new Set(allocations.map((allocation) => allocation.actualPort)).size, allocationCount);
     assert.equal(allocations.every((allocation) => allocation.actualPort >= 45000 && allocation.actualPort <= 65000), true);
+    const expiryTimes = allocations.map(allocation => Date.parse(allocation.expiresAt ?? "")).filter(Number.isFinite);
+    context.diagnostic(JSON.stringify({ phase: "allocations-complete", count: allocations.length,
+      allocationMs: performance.now() - allocationStarted, expiryValues: expiryTimes.length,
+      earliestRemainingLeaseMs: expiryTimes.length ? Math.min(...expiryTimes) - Date.now() : undefined }));
     await waitForRouteTableCount(getNetworkRouteTablePath(networkId, fixture.routeTablePath), allocationCount, 120_000);
   });
 
