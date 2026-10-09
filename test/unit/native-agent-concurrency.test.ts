@@ -512,11 +512,6 @@ if (!fs.existsSync(nativeAgentPath)) {
   });
 
   test("native agent does not synthesize detected processes from an invalidated listener cache", async (context) => {
-    const fixture = await startNativeAgent(context);
-    if (fixture === undefined) {
-      return;
-    }
-
     const stoppedServer = await openTcpServer();
     const unrelatedServer = await openTcpServer();
     context.after(async () => {
@@ -532,6 +527,22 @@ if (!fs.existsSync(nativeAgentPath)) {
     ) {
       throw new Error("Failed to read listener-cache test ports.");
     }
+
+    // This case tests cache invalidation using two real owned listeners. Keep
+    // its observation input deterministic instead of depending on an unrelated
+    // whole-host lsof scan, then verify both rows before mutating the registry.
+    const shimDirectory = path.join(projectRoot, ".tmp", "native-agent-tests",
+      `listener-cache-input-${process.pid}-${Date.now().toString(36)}`);
+    fs.mkdirSync(shimDirectory, { recursive: true });
+    fs.writeFileSync(path.join(shimDirectory, "lsof"), ["#!/bin/sh", "printf '%s\\n' " + [
+      `p${process.pid}`, "cnode", "f1", "PTCP", `n127.0.0.1:${stoppedAddress.port}`, "TST=LISTEN",
+      "f2", "PTCP", `n127.0.0.1:${unrelatedAddress.port}`, "TST=LISTEN",
+    ].map(value => `'${value}'`).join(" ")].join("\n"), { mode: 0o755 });
+    context.after(() => fs.promises.rm(shimDirectory, { recursive: true, force: true }));
+    const fixture = await startNativeAgent(context, {
+      PATH: `${shimDirectory}${path.delimiter}${process.env.PATH ?? ""}`,
+    });
+    if (fixture === undefined) return;
 
     const registered = await requestOnce<{ readonly id: string }>(fixture.socketPath, {
       id: `hook-${process.pid}-cached-listener-register`,
@@ -550,10 +561,12 @@ if (!fs.existsSync(nativeAgentPath)) {
     });
 
     // Populate the listener cache with both the managed and unrelated sockets.
-    await requestOnce(fixture.socketPath, {
+    const baseline = await requestOnce<{ readonly listeners: readonly { readonly port: number }[] }>(fixture.socketPath, {
       id: `hook-${process.pid}-cached-listener-refresh`,
       method: "refreshSnapshot",
     });
+    assert.equal(baseline.listeners.some(listener => listener.port === stoppedAddress.port), true);
+    assert.equal(baseline.listeners.some(listener => listener.port === unrelatedAddress.port), true);
 
     const extensionSocket = await connectSocket(fixture.socketPath);
     const messages = collectSocketMessages(extensionSocket);
