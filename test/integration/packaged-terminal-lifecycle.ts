@@ -9,6 +9,7 @@ import type { PortManagerNetworkService } from "../../src/extension/network-serv
 import type { LogicalNetworkRegistry } from "../../src/core/networks/logical-network-registry";
 import type { NativeProcessIdentity, NativeProcessLookupProvider } from "../../src/platform/process/native-process-lookup";
 import type { ProxyNetworkResources } from "../../src/platform/ports/proxy-network-resources";
+import { fixtureWitnessWriterSource, publishFixtureWitness } from "./fixture-witness";
 
 /** Real installed SDK terminals, private readiness and byte witnesses share the soak owner. */
 export async function preparePackagedTerminalLifecycle(service: PortManagerNetworkService, moduleRoot: string, reportPath: string) {
@@ -65,8 +66,8 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
     terminal.sendText(`${quote(node)} ${quote(file)}`, true);
     return file;
   };
-  const save = () => fs.writeFileSync(reportPath, JSON.stringify({ platform: process.platform, installedModuleRoot: moduleRoot,
-    networks: selected, cycles: records.length, records }, null, 2));
+  const save = () => publishFixtureWitness(reportPath, { platform: process.platform, installedModuleRoot: moduleRoot,
+    networks: selected, cycles: records.length, records });
   async function identity(terminal: vscode.Terminal): Promise<NativeProcessIdentity> {
     const supervisorPid = await terminal.processId;
     assert.ok(supervisorPid);
@@ -86,7 +87,7 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
   async function probe(terminal: vscode.Terminal, cycle: number, label: "A" | "B", negative: boolean): Promise<unknown> {
     const witness = path.join(workspace, `terminal-${cycle}-${label}.json`);
     const sharedSource = path.join(workspace, "terminal-shared-source.ts");
-    const program = `const fs=require('node:fs'),net=require('node:net');
+    const program = `const fs=require('node:fs'),net=require('node:net');${fixtureWitnessWriterSource()}
       const connect=(host,port)=>new Promise((resolve,reject)=>{const s=net.connect(port,host);let data='';s.setTimeout(2500,()=>s.destroy(new Error('deadline')));s.on('connect',()=>s.end('inside'));s.on('data',b=>data+=b);s.on('end',()=>resolve(data));s.on('error',reject)});
       (async()=>{const result={pid:process.pid,networkId:process.env.PORT_MANAGER_NETWORK_ID};
         result.value=await connect('127.0.0.1',4567);if(result.value!==${JSON.stringify(label + ":inside")})throw new Error('wrong scoped backend');
@@ -96,8 +97,8 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
           try{fs.readFileSync(${JSON.stringify(foreignFile)});throw new Error('foreign namespace permitted')}catch(e){if(!['EPERM','EACCES'].includes(e.code))throw e;result.foreignFile=e.code}
           process.env.PORT_MANAGER_NETWORK_ID=${JSON.stringify(selected[1].id)};process.env.PORT_MANAGER_HOOK='0';process.env.PORT_MANAGER_HOOK_DISABLED='1';
           try{await connect(${JSON.stringify(selected[1].host)},${ports[1]});throw new Error('forged scope permitted')}catch(e){if(!['EPERM','EACCES'].includes(e.code))throw e;result.forgedScope=e.code}
-        }fs.writeFileSync(${JSON.stringify(witness)},JSON.stringify(result));
-      })().catch(e=>fs.writeFileSync(${JSON.stringify(witness)},JSON.stringify({error:String(e),code:e.code})));`;
+        }publishWitness(${JSON.stringify(witness)},result);
+      })().catch(e=>publishWitness(${JSON.stringify(witness)},{error:String(e),code:e.code}));`;
     const programFile = sendProgram(terminal, program, `terminal-${cycle}-${label}.cjs`);
     const deadline = Date.now() + 10_000;
     while (!fs.existsSync(witness)) { assert.ok(Date.now() < deadline, "Actual installed terminal did not produce its byte witness."); await delay(20); }
@@ -179,7 +180,7 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
       const detachedIdentity = await identity(detached);
       assert.notEqual(detachedIdentity.pid, current.pid, "Detach must create a fresh host process.");
       const detachedWitness = path.join(workspace, `terminal-${cycle}-detached.json`);
-      const hostProgram = `const fs=require('node:fs'),net=require('node:net');const s=net.connect(${ports[1]},${JSON.stringify(selected[1].host)});let value='';s.on('connect',()=>s.end('host'));s.on('data',b=>value+=b);s.on('end',()=>fs.writeFileSync(${JSON.stringify(detachedWitness)},JSON.stringify({value,networkId:process.env.PORT_MANAGER_NETWORK_ID??null,foreignFile:fs.readFileSync(${JSON.stringify(foreignFile)},'utf8')})));s.on('error',e=>fs.writeFileSync(${JSON.stringify(detachedWitness)},JSON.stringify({error:String(e)})));`;
+      const hostProgram = `const fs=require('node:fs'),net=require('node:net');${fixtureWitnessWriterSource()}const s=net.connect(${ports[1]},${JSON.stringify(selected[1].host)});let value='';s.on('connect',()=>s.end('host'));s.on('data',b=>value+=b);s.on('end',()=>publishWitness(${JSON.stringify(detachedWitness)},{value,networkId:process.env.PORT_MANAGER_NETWORK_ID??null,foreignFile:fs.readFileSync(${JSON.stringify(foreignFile)},'utf8')}));s.on('error',e=>publishWitness(${JSON.stringify(detachedWitness)},{error:String(e)}));`;
       const hostProgramFile = sendProgram(detached, hostProgram, `terminal-${cycle}-detached.cjs`);
       const hostDeadline = Date.now() + 10_000;
       while (!fs.existsSync(detachedWitness)) { assert.ok(Date.now() < hostDeadline); await delay(20); }
@@ -197,7 +198,7 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
           terminals.add(closing);
           const parentIdentity = await identity(closing);
           const orphanWitness = path.join(workspace, `terminal-${cycle}-orphan-${forced}.json`);
-          const daemonProgram = `const c=require('node:child_process').spawn(${JSON.stringify(node)},['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore',env:{...process.env}});require('node:fs').writeFileSync(${JSON.stringify(orphanWitness)},JSON.stringify({pid:c.pid}));c.unref();`;
+          const daemonProgram = `${fixtureWitnessWriterSource()}const c=require('node:child_process').spawn(${JSON.stringify(node)},['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore',env:{...process.env}});publishWitness(${JSON.stringify(orphanWitness)},{pid:c.pid});c.unref();`;
           const daemonProgramFile = sendProgram(closing, daemonProgram, `terminal-${cycle}-orphan-${forced}.cjs`);
           const orphanDeadline = Date.now() + 10_000;
           while (!fs.existsSync(orphanWitness)) { assert.ok(Date.now() < orphanDeadline); await delay(20); }
