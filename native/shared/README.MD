@@ -24,6 +24,7 @@
 - `pm_network_namespace_key(...)`: stable network ID의 UTF-8 바이트를 lowercase hex로 인코딩; TS `network-identity.ts`와 동일하며 잘라내지 않는다.
 - `pm_agent_scope_client.h`: 보호된 controller key의 nofollow 읽기와 PID/birth/network tuple 등록을 위한 단일 nonblocking RPC. caller가 poll·절대 기한·취소를 소유하고, helper는 전체 JSON frame과 동일 tuple ACK를 검사한다. controller credential과 FD는 workload에 전달하지 않는다.
 - `pm_private_file.h`: 보호된 control-plane 경로의 nofollow parent descriptor와 0600·owned·single-link regular file 확인. 검증한 descriptor를 게시/읽기/cleanup에 사용해 경로를 다시 열지 않는다.
+- `pm_audit_identity.h`: macOS task-name right에서 audit token을 읽고 즉시 right를 반환한다. PID/birth/UID와 조회 전후 token을 확인한 뒤 kernel PID-version 신호를 사용하며 숫자 PID 신호로 fallback하지 않는다.
 
 ## 외부 의존성
 

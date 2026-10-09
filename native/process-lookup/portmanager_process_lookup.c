@@ -2,6 +2,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,7 @@
 #include <fcntl.h>
 #include <sys/sysmacros.h>
 #endif
+#include "../shared/pm_audit_identity.h"
 
 #define PM_TEXT_SIZE 4096
 #define PM_TTY_SIZE 128
@@ -698,6 +700,23 @@ static int pm_print_identity(int pid) {
 int main(int argc, char **argv) {
   pm_process_table table = {0};
   int result = 0;
+
+  if (argc >= 2 && strcmp(argv[1], "signal") == 0) {
+    if (argc != 5 || !pm_is_positive_pid_text(argv[2]) || !isdigit((unsigned char)argv[3][0])) return 2;
+    char *end; errno = 0; long pid = strtol(argv[2], &end, 10);
+    if (errno != 0 || *end != '\0' || pid <= 1 || pid > INT_MAX) return 2;
+    errno = 0; unsigned long long birth = strtoull(argv[3], &end, 10);
+    if (errno != 0 || *end != '\0' || birth == 0) return 2;
+    int number = strcmp(argv[4], "SIGTERM") == 0 ? SIGTERM : strcmp(argv[4], "SIGHUP") == 0 ? SIGHUP :
+      strcmp(argv[4], "SIGINT") == 0 ? SIGINT : strcmp(argv[4], "SIGKILL") == 0 ? SIGKILL : 0;
+    if (number == 0) return 2;
+    int sent = 0, error = ENOTSUP;
+#if defined(__APPLE__)
+    sent = pm_audit_signal_birth((pid_t)pid, birth, number) == 0; error = sent ? 0 : errno;
+#endif
+    printf("{\"pid\":%ld,\"birth\":%llu,\"signal\":\"%s\",\"sent\":%s,\"error\":%d}\n", pid, birth, argv[4], sent ? "true" : "false", error);
+    return sent ? 0 : 1;
+  }
 
   if (argc == 3 && strcmp(argv[1], "identity") == 0) {
     char *end; errno = 0;

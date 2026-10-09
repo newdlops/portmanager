@@ -1,14 +1,11 @@
 #ifndef PM_NETWORK_LAUNCH_MEMBERS_H
 #define PM_NETWORK_LAUNCH_MEMBERS_H
 
-#include <dlfcn.h>
-#include <mach/mach.h>
-#include <mach/task_info.h>
+#include "../shared/pm_audit_identity.h"
 #include <sys/proc.h>
 
 #define PM_LAUNCH_CENSUS_PIDS 16384
 typedef int (*pm_launch_sandbox_check_fn)(pid_t, const char *, int, ...);
-typedef int (*pm_launch_audit_signal_fn)(audit_token_t *, int);
 typedef struct { pid_t pid; unsigned long long birth; } pm_launch_process_identity;
 typedef struct {
   int directory, quiet, previous_count, previous_valid;
@@ -16,22 +13,11 @@ typedef struct {
   const char *denied_path;
   struct stat marker_identity;
   pm_launch_sandbox_check_fn check;
-  pm_launch_audit_signal_fn send_signal;
+  pm_audit_signal_fn send_signal;
   pid_t *pids;
   pm_launch_process_identity *current, *previous;
 } pm_launch_members;
 
-/* A task-name right only provides identity information, not a task kill right.
- * The public signal API checks the captured PID version inside the kernel. */
-static int pm_launch_audit_token(pid_t pid, audit_token_t *token) {
-  mach_port_t task = MACH_PORT_NULL;
-  if (task_name_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) { errno = EACCES; return -1; }
-  mach_msg_type_number_t size = TASK_AUDIT_TOKEN_COUNT;
-  kern_return_t result = task_info(task, TASK_AUDIT_TOKEN, (task_info_t)token, &size);
-  mach_port_deallocate(mach_task_self(), task);
-  if (result != KERN_SUCCESS || size != TASK_AUDIT_TOKEN_COUNT || token->val[5] != (unsigned int)pid) { errno = EACCES; return -1; }
-  return 0;
-}
 static int pm_launch_member_query(const pm_launch_members *members, pid_t pid) {
   int boxed = members->check(pid, NULL, 0);
   if (boxed < 0) return -1;
@@ -45,11 +31,11 @@ static int pm_launch_member_query(const pm_launch_members *members, pid_t pid) {
 }
 static int pm_launch_member_signal(const pm_launch_members *members, pid_t pid, int number) {
   audit_token_t before, after;
-  if (pm_launch_audit_token(pid, &before) != 0) return -1;
+  if (pm_audit_token_read(pid, &before) != 0) return -1;
   int owned = pm_launch_member_query(members, pid);
   if (owned < 0) return -1;
   if (!owned) { errno = EAGAIN; return -1; }
-  if (pm_launch_audit_token(pid, &after) != 0 || memcmp(&before, &after, sizeof(before)) != 0) { errno = EAGAIN; return -1; }
+  if (pm_audit_token_read(pid, &after) != 0 || memcmp(&before, &after, sizeof(before)) != 0) { errno = EAGAIN; return -1; }
   int error = members->send_signal(&before, number);
   if (error != 0) { errno = error; return -1; }
   return 0;
@@ -72,10 +58,10 @@ static void pm_launch_members_close(pm_launch_members *members) {
 static char *pm_launch_members_prepare(pm_launch_members *members, const pm_launch_options *options, char *profile) {
   memset(members, 0, sizeof(*members)); members->directory = -1;
   members->check = (pm_launch_sandbox_check_fn)dlsym(RTLD_DEFAULT, "sandbox_check");
-  members->send_signal = (pm_launch_audit_signal_fn)dlsym(RTLD_DEFAULT, "proc_signal_with_audittoken");
+  members->send_signal = (pm_audit_signal_fn)dlsym(RTLD_DEFAULT, "proc_signal_with_audittoken");
   const int *quiet = dlsym(RTLD_DEFAULT, "SANDBOX_CHECK_NO_REPORT");
   audit_token_t own;
-  if (members->check == NULL || members->send_signal == NULL || quiet == NULL || pm_launch_audit_token(getpid(), &own) != 0) {
+  if (members->check == NULL || members->send_signal == NULL || quiet == NULL || pm_audit_token_read(getpid(), &own) != 0) {
     errno = ENOTSUP; goto failed;
   }
   members->quiet = *quiet; members->denied_path = options->profile_path;
