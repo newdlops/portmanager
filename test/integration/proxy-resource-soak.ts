@@ -381,6 +381,17 @@ async function processHasCompleted(pid: number): Promise<boolean> {
 /** Descriptor queries remain strict for every live process. */
 async function readProcessDescriptors(pid: number): Promise<number> {
   if (process.platform === "linux") return fs.readdirSync(`/proc/${pid}/fd`).length;
+  if (process.platform === "darwin") {
+    const moduleRoot = process.env.PM_TEST_EXTENSION_PATH ?? path.resolve(__dirname, "../../..");
+    const helper = path.join(moduleRoot, "media/native/portmanager_process_lookup");
+    const result = await execute(helper, ["fd-count", String(pid)], { timeout: 5000, maxBuffer: 4096 });
+    const record = JSON.parse(result.stdout) as { pid?: unknown; birth?: unknown; fdCount?: unknown; error?: unknown };
+    assert.equal(record.pid, pid, "Descriptor reply must belong to the sampled PID.");
+    assert.ok(Number.isSafeInteger(record.birth) && (record.birth as number) > 0, "Descriptor sample requires a stable OS birth identity.");
+    assert.ok(Number.isSafeInteger(record.fdCount) && (record.fdCount as number) >= 0, "Descriptor sample requires an actual kernel count.");
+    assert.ok(record.error === undefined || record.error === 0, "A failed kernel descriptor query is not a zero count.");
+    return record.fdCount as number;
+  }
   const listing = await execute("lsof", ["-nP", "-a", "-p", String(pid), "-Ff"], { timeout: 5000 });
   return listing.stdout.split("\n").filter(line => /^f\d/.test(line)).length;
 }

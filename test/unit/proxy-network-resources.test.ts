@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import type { ChildProcess } from "node:child_process";
 import * as http from "node:http";
 import * as net from "node:net";
 import * as fs from "node:fs";
@@ -606,6 +607,7 @@ test("double close cannot return a live native child's capacity during shutdown"
   const helper = path.join(directory, "helper");
   fs.writeFileSync(helper, ["#!/usr/bin/env node", 'process.on("SIGTERM", () => {});',
     'process.stdout.write(["READY", process.argv[2], process.argv[3]].join("\\t") + "\\n");',
+    "setInterval(() => {}, 1000);",
     "process.stdin.resume();"].join("\n"), { mode: 0o755 });
   const resources = new ProxyNetworkResources({ budget: new ProxyResourceBudget({ nativeHelpers: 1 }) });
   const host = await openHost(t, resources, 1, helper);
@@ -614,14 +616,31 @@ test("double close cannot return a live native child's capacity during shutdown"
     await until(() => resources.budget.used.nativeHelpers === 0);
     fs.rmSync(directory, { recursive: true, force: true });
   });
-  const handles = (host.manager as unknown as { listeners: Map<string, { close(): Promise<void> }> }).listeners;
+  const handles = (host.manager as unknown as { listeners: Map<string, { child: ChildProcess; close(): Promise<void> }> }).listeners;
   const handle = handles.get(host.exposure.id)!;
+  const child = handle.child;
+  const signal = child.kill.bind(child);
+  let forceRequested = false;
+  // Let the production timeout request force-stop, but hold the actual signal
+  // until the real live-child accounting has been checked. The deadline stays500ms.
+  child.kill = requested => {
+    if (requested === "SIGKILL") { forceRequested = true; return true; }
+    return signal(requested);
+  };
+  t.after(() => { child.kill = signal; if (child.exitCode === null && child.signalCode === null) signal("SIGKILL"); });
   const first = handle.close();
   const second = handle.close();
   // Both calls run before the event loop can observe exit or the 500ms kill
   // timer. Awaiting the second call first made a busy host test an exited child.
   assert.equal(resources.budget.used.nativeHelpers, 1);
   await Promise.all([first, second]);
+  assert.equal(forceRequested, true);
+  assert.equal(child.exitCode, null);
+  assert.equal(child.signalCode, null);
+  process.kill(child.pid!, 0);
+  assert.equal(resources.budget.used.nativeHelpers, 1, "A force-stop request is not proof of child exit.");
+  child.kill = signal;
+  signal("SIGKILL");
   await until(() => resources.budget.used.nativeHelpers === 0);
   fs.rmSync(directory, { recursive: true, force: true });
 });
