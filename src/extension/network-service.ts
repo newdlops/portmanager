@@ -2952,6 +2952,7 @@ export class PortManagerNetworkService implements DisposableLike {
   async prepareGuardedTerminalOptions(networkId: string, cwd?: string): Promise<vscode.TerminalOptions> {
     const launch = await this.prepareGuardedShell(networkId, cwd);
     const network = this.resolveGuardedNetwork(networkId);
+    this.guardedRuntime!.beginTerminalHandoff(launch.id);
     this.pendingGuardedLaunches.set(launch.id, launch);
     return { name: `Port Manager: ${network.name}`, cwd: launch.cwd, shellPath: launch.shellPath,
       shellArgs: [...launch.shellArgs], env: { ...launch.env, PORT_MANAGER_GUARDED_SESSION_ID: launch.id },

@@ -13,6 +13,7 @@ import type { PortManagerNetworkService } from "../../src/extension/network-serv
 import { runResourceSoak } from "./proxy-resource-soak";
 import { preparePackagedTerminalLifecycle } from "./packaged-terminal-lifecycle";
 import { isolatePrivilegedCommands } from "./packaged-isolation";
+import { tracePackagedRuntime } from "./packaged-runtime-trace";
 
 /**
  * Runs inside the real extension host against a VSIX installed in a fresh CI
@@ -84,6 +85,7 @@ export async function run(): Promise<void> {
   // backdoor or additional public extension API is added to the product.
   const networkModule = require(path.join(extension.extensionPath, "out", "src", "extension", "network-service")) as typeof import("../../src/extension/network-service");
   const originalStart = networkModule.PortManagerNetworkService.prototype.start;
+  const restoreRuntimeTrace = tracePackagedRuntime(extension.extensionPath, process.env.PM_TEST_RESOURCE_SOAK_REPORT!);
   if (soakSeconds > 0) networkModule.PortManagerNetworkService.prototype.start = function () {
     networkService = this;
     serviceStarted = originalStart.call(this);
@@ -154,7 +156,10 @@ export async function run(): Promise<void> {
       homeEnvironmentUnchanged: process.env.HOME === originalHomeEnvironment,
         blockedGlobalMutationCommands: commandIsolation?.blocked,
       }, null, 2));
-    } finally { children.spawn = originalSpawn; children.spawnSync = originalSpawnSync; commandIsolation?.restore(); }
+    } finally {
+      children.spawn = originalSpawn; children.spawnSync = originalSpawnSync; commandIsolation?.restore();
+      restoreRuntimeTrace();
+    }
   }
 }
 

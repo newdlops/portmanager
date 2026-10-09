@@ -25,6 +25,18 @@
 
 `npm run test:packaged` → `scripts/test-packaged-extension.mjs` → `packaged-extension.ts`.
 
+`PM_TEST_RUNTIME_TRACE=1`은 설치된 runtime의 prepare/adopt/ready/close 호출을
+최근 128개 전이로 제한해 별도 JSON에 남긴다. 반환값·오류·기한은 바꾸지 않으며,
+진단이 끝나면 원래 메서드를 복원한다. 최종 자원 검증에서는 이 옵션을 끈다.
+
+테스트의 가용 포트 확인은 실제 listener 주소에 맞춘다. wildcard host exposure는
+`0.0.0.0`로 확인하며, 실제 bind 오류를 무시하거나 성공으로 바꾸지 않는다.
+
+실행기가 borrowed-network terminal에서 시작됐어도 부모에 이미 주입된 hook이 새
+GUI 환경을 다시 채우지 못하게 해당 검사 프로세스의 hook을 비활성화한다. GUI는
+정리된 환경으로 시작하며, 설치된 제품과 guarded fixture가 자기 네이티브 코드를
+별도로 사용한다. 사용자 daemon·셸 설정이나 HOME은 바꾸지 않는다.
+
 `Release packages`의 `resource_soak_seconds=1200`으로 20분 검증을 켠다.
 `validation_target`으로 한 환경만 재실행할 수 있다(기본값 `all`). fixture의
 VS Code 다운로드는 120초, 확장 활성화와 서비스 준비는 각 30초,

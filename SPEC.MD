@@ -432,6 +432,12 @@ permission과 PID 세대를 확인한 모든 소속 프로세스가 사라지고
 뒤에만 같은 owner tuple에 `cleaned: true`를 추가한 `<ready>.cleaned`를 게시한다.
 완료 기록을 게시할 수 없으면 supervisor는 소유권을 유지한다.
 
+VS Code profile/PTY 전달은 아직 PID가 없는 controller 소유 단계로 구분하며 최대
+60초 동안 같은 예약을 유지한다. 실제 PTY PID/birth를 확인한 뒤 네이티브 readiness는
+기존 10초 기한으로 검증한다. 반복 handoff나 PID 확인은 기한을 연장하지 않는다.
+취소·만료에도 동일한 자손 회수 증명이 필요하고, 포트·파일 권한이나 공통 예산을
+완화하지 않는다. 다른 terminal control 경로의 준비 기한은 그대로 유지한다.
+
 감독자의 갑작스러운 종료에는 `--recover-owner <ready>.owner`가 private 파일 정체성과
 감독자의 실제 종료를 검증하고 같은 kernel census·audit-token 신호로 잔여 자손을
 회수한다. 성공은 matching 완료 기록과 exit 0으로 확인하며 실패·timeout에는 lease,

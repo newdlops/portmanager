@@ -76,6 +76,8 @@ interface ShellOwner {
   readonly readyDirectory: string;
   readonly bootstrapDirectory: string;
   readonly preparedAt: number;
+  terminalHandoffAt?: number;
+  supervisorAdoptedAt?: number;
   supervisor?: { pid: number; birth: number };
   identity?: AuthenticatedProcessScope;
   monitoring?: Promise<void>;
@@ -86,6 +88,9 @@ interface ShellOwner {
 
 const STARTUP_MS = 10_000;
 const STOP_MS = 2_000;
+// VS Code's profile/PTY IPC can precede processId by tens of seconds. Keep
+// that bounded controller handoff separate from native readiness validation.
+const TERMINAL_HANDOFF_MS = 60_000;
 // A trusted supervisor must complete its descendant census before exit. Killing
 // that parent prematurely can leave guarded orphans without a cleanup owner.
 const SUPERVISOR_STOP_MS = 8_000;
@@ -171,10 +176,7 @@ export class MacosNetworkRuntime {
         bootstrapDirectory: bootstrap.directory, preparedAt: performance.now() };
       this.shells.set(id, owner);
       broker.sessions.add(id);
-      owner.expiry = setTimeout(() => {
-        if (owner.identity === undefined) void this.closeShell(id).catch(error => devLog("network-runtime", `unstarted launch retained: ${String(error)}`));
-      }, STARTUP_MS + STOP_MS);
-      owner.expiry.unref();
+      this.armShellExpiry(owner, STARTUP_MS + STOP_MS);
       return launch;
     } catch (error) {
       lease?.release();
@@ -186,21 +188,37 @@ export class MacosNetworkRuntime {
     }
   }
 
+  /** The trusted SDK caller owns delivery before a PTY process ID exists. */
+  beginTerminalHandoff(id: string): void {
+    this.assertAvailable();
+    const owner = this.requireShell(id);
+    if (owner.closing !== undefined) throw new Error("Terminal startup was canceled.");
+    if (owner.terminalHandoffAt !== undefined) return;
+    if (owner.supervisor !== undefined) throw new Error("Terminal supervisor was already adopted.");
+    owner.terminalHandoffAt = performance.now();
+    this.armShellExpiry(owner, TERMINAL_HANDOFF_MS);
+  }
+
   /** The PTY host's PID is stronger than any PID printed by the workload. */
   async adoptSupervisor(id: string, pid: number): Promise<void> {
     const owner = this.requireShell(id);
     const identity = await this.options.readIdentity(pid);
+    if (this.shells.get(id) !== owner || owner.closing !== undefined || this.disposed) throw new Error("Terminal startup was canceled.");
     if (identity === undefined || identity.pid !== pid) throw new Error("Terminal supervisor has no current OS identity.");
     if (owner.supervisor !== undefined && (owner.supervisor.pid !== pid || owner.supervisor.birth !== identity.birth)) {
       throw new Error("A prepared terminal cannot change its supervisor identity.");
     }
     owner.supervisor = identity;
+    if (owner.terminalHandoffAt !== undefined && owner.supervisorAdoptedAt === undefined) {
+      owner.supervisorAdoptedAt = performance.now();
+      this.armShellExpiry(owner, STARTUP_MS + STOP_MS);
+    }
   }
 
   /** Confirm private parent readiness, current birth and controller scope together. */
   async waitReady(id: string): Promise<AuthenticatedProcessScope> {
     const owner = this.requireShell(id);
-    const deadline = owner.preparedAt + STARTUP_MS;
+    const deadline = (owner.supervisorAdoptedAt ?? owner.preparedAt) + STARTUP_MS;
     try {
       while (performance.now() < deadline) {
         if (owner.closing !== undefined || owner.broker.exited || this.disposed) throw new Error("Terminal startup was canceled.");
@@ -522,6 +540,16 @@ export class MacosNetworkRuntime {
     const owner = this.shells.get(id);
     if (owner === undefined) throw new Error("Unknown guarded terminal owner.");
     return owner;
+  }
+
+  /** Expiry never releases a lease without the normal descendant proof. */
+  private armShellExpiry(owner: ShellOwner, milliseconds: number): void {
+    clearTimeout(owner.expiry);
+    owner.expiry = setTimeout(() => {
+      if (owner.identity === undefined) void this.closeShell(owner.launch.id)
+        .catch(error => devLog("network-runtime", `unstarted launch retained: ${String(error)}`));
+    }, milliseconds);
+    owner.expiry.unref();
   }
 
   private assertAvailable(): void {

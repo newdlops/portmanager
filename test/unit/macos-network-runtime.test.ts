@@ -89,6 +89,11 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
   assert.equal(resources.budget.used.nativeHelpers, 2);
   assert.equal(resources.budget.used.nativeScopeJobs, 65);
   assert.equal(resources.budget.used.nativeInventoryBytes, 589_824);
+  runtime.beginTerminalHandoff(launch.id);
+  // VS Code may create the PTY after returning its profile. This real delay
+  // exceeds the old unadopted expiry while the controller still owns launch.
+  await delay(13_000);
+  assert.equal(runtime.activeShells.length, 1, "SDK handoff must keep the prepared owner until the PTY supplies its PID.");
   terminal = spawn(launch.shellPath, [...launch.shellArgs], { cwd: launch.cwd, env: launch.env, stdio: ["pipe", "pipe", "pipe"] });
   let output = "", errors = "";
   terminal.stdout!.on("data", bytes => { output += bytes.toString(); });

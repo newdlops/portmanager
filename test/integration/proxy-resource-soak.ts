@@ -185,7 +185,7 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
           const network = options.service ? await within(options.service.createNetwork(name, "nativeHelper"), "create network")
             : registry.addNetwork({ id: name, name, status: "running", runtimeKind: "nativeHelper", createdAt: new Date().toISOString() });
           networks.push(network);
-          const rawPort = await availablePort();
+          const rawPort = await availablePort(options.service ? "0.0.0.0" : "127.0.0.1");
           // The real service chooses the raw native path for a wildcard bind;
           // all clients and fixture targets still use ordinary loopback.
           const exposure = options.service ? await within(options.service.createExposure({ networkId: network.id,
@@ -328,6 +328,12 @@ export async function processSamples(hostPid: number, daemonPid?: number,
       // Exited but unreaped children still pass kill(pid, 0) while owning no
       // descriptors. Only an OS-confirmed exit/zombie may discard this error.
       if (await processHasCompleted(row.pid)) { completed.add(row.pid); return; }
+      if (error instanceof Error) {
+        let observed: unknown;
+        try { observed = (await execute("ps", ["-p", String(row.pid), "-o", "stat=,ppid=,comm="], { timeout: 5000 })).stdout.trim(); }
+        catch (queryError) { observed = String(queryError); }
+        error.message += `\nSampling context: ${JSON.stringify({ sampled: row, observed })}`;
+      }
       throw error;
     }
   }));
@@ -392,16 +398,18 @@ async function within<T>(work: Promise<T>, operation = "exchange", milliseconds 
     timer = setTimeout(() => reject(new Error(`Soak ${operation} deadline exceeded`)), milliseconds);
   })]); } finally { clearTimeout(timer); }
 }
-async function listen(server: net.Server): Promise<number> {
-  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+async function listen(server: net.Server, host = "127.0.0.1"): Promise<number> {
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, host, resolve); });
   return (server.address() as net.AddressInfo).port;
 }
 async function close(server: net.Server): Promise<void> {
   await new Promise<void>(resolve => server.close(() => resolve()));
 }
-async function availablePort(): Promise<number> {
+async function availablePort(host = "127.0.0.1"): Promise<number> {
   const server = net.createServer();
-  const port = await listen(server);
+  // A loopback-only probe does not prove a wildcard exposure can bind the same
+  // port: another address may already own it. Probe the actual listener scope.
+  const port = await listen(server, host);
   await close(server);
   return port;
 }

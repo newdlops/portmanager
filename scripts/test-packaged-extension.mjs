@@ -17,6 +17,11 @@ import { downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath } from "
 const isolatedLocal = process.argv.includes("--isolated-local");
 assert.ok(process.env.CI === "true" || isolatedLocal, "Packaged activation requires CI or explicit --isolated-local.");
 if (!isolatedLocal) assert.ok(process.env.RUNNER_TEMP, "RUNNER_TEMP must identify the disposable runner.");
+// A borrowed-network hook in this launcher can repair a child's environment
+// after JS sanitizes it. Disable that inherited hook in this dedicated parent;
+// the fresh extension host and its guarded fixtures load their own native code.
+const inheritedRuntimeShim = process.env.PORT_MANAGER_RUNTIME_SHIM_DIR;
+process.env.PORT_MANAGER_HOOK_DISABLED = "1";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const soakSeconds = Number(process.env.PM_TEST_RESOURCE_SOAK_SECONDS ?? 0);
 assert.ok(Number.isInteger(soakSeconds) && soakSeconds >= 0 && soakSeconds <= 3600, "Invalid resource soak duration.");
@@ -96,6 +101,8 @@ for (const key of Object.keys(guiEnvironment)) {
   if (key.startsWith("PORT_MANAGER_") || key.startsWith("NEWDLOPS_PM_") || key.startsWith("DYLD_") ||
       ["LD_PRELOAD", "NODE_OPTIONS", "BASH_ENV", "ENV"].includes(key)) delete guiEnvironment[key];
 }
+if (inheritedRuntimeShim) guiEnvironment.PATH = guiEnvironment.PATH?.split(path.delimiter)
+  .filter(entry => entry !== inheritedRuntimeShim).join(path.delimiter);
 try { await runOwnedProcess(vscodeExecutablePath, [...profileArgs, "--disable-extensions", "--skip-welcome",
   "--skip-release-notes", "--no-sandbox", "--disable-gpu-sandbox", "--disable-updates", "--no-cached-data",
   "--disable-workspace-trust", `--extensionDevelopmentPath=${extensionPath}`,
