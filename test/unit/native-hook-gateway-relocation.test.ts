@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -39,7 +40,7 @@ interface AgentRoute {
 }
 
 /** Sends one NDJSON request and resolves with the response frame's payload. */
-function requestSnapshot(socketPath: string): Promise<readonly AgentRoute[]> {
+function requestSnapshot(socketPath: string, method = "listSnapshot"): Promise<readonly AgentRoute[]> {
   return new Promise((resolve, reject) => {
     const client = net.connect(socketPath);
     let buffer = "";
@@ -49,7 +50,7 @@ function requestSnapshot(socketPath: string): Promise<readonly AgentRoute[]> {
     }, 3000);
 
     client.on("connect", () =>
-      client.write(`${JSON.stringify({ id: `probe-${process.pid}`, method: "listSnapshot", payload: {} })}\n`),
+      client.write(`${JSON.stringify({ id: `probe-${process.pid}`, method, payload: {} })}\n`),
     );
     client.setEncoding("utf8");
     client.on("data", (chunk: string) => {
@@ -100,13 +101,6 @@ function cleanBinderEnvironment(overrides: Record<string, string>): NodeJS.Proce
   return { ...base, ...overrides };
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate() && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-}
-
 function reserveLoopbackPort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const probe = net.createServer();
@@ -124,6 +118,7 @@ interface Fixture {
   readonly socketPath: string;
   readonly baseRoutes: string;
   readonly agent: ChildProcess;
+  readonly binders: Set<ChildProcess>;
 }
 
 async function startFixture(): Promise<Fixture> {
@@ -134,9 +129,41 @@ async function startFixture(): Promise<Fixture> {
     env: cleanBinderEnvironment({}),
     stdio: ["ignore", "ignore", "pipe"],
   });
-  await waitFor(() => fs.existsSync(socketPath), 3000);
-  await new Promise((resolve) => setTimeout(resolve, 200));
-  return { dir, socketPath, baseRoutes, agent };
+  const fixture: Fixture = { dir, socketPath, baseRoutes, agent, binders: new Set() };
+  let startupError: Error | undefined;
+  agent.once("error", error => { startupError = error; });
+  const deadline = Date.now() + 3000;
+  try {
+    for (;;) {
+      if (startupError !== undefined) throw startupError;
+      assert.ok(agent.exitCode === null && agent.signalCode === null, "fixture agent exited before ready");
+      try {
+        await requestSnapshot(socketPath, "daemonStatus");
+        return fixture;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if ((code !== "ENOENT" && code !== "ECONNREFUSED") || Date.now() >= deadline) throw error;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    }
+  } catch (error) {
+    await closeFixture(fixture);
+    throw error;
+  }
+}
+
+/** Wait for real exit before deleting paths that a hook/agent can still publish. */
+async function stopChild(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, "exit");
+  child.kill("SIGKILL");
+  await exited;
+}
+
+async function closeFixture(fixture: Fixture): Promise<void> {
+  await Promise.all([...fixture.binders].map(stopChild));
+  await stopChild(fixture.agent);
+  await fs.promises.rm(fixture.dir, { recursive: true, force: true });
 }
 
 /**
@@ -145,7 +172,7 @@ async function startFixture(): Promise<Fixture> {
  * loaded) test host polls the agent, avoiding fixed-sleep flakiness.
  */
 function spawnBinder(fixture: Fixture, logicalPort: number): ChildProcess {
-  return spawn(
+  const child = spawn(
     process.execPath,
     [
       "-e",
@@ -166,6 +193,8 @@ function spawnBinder(fixture: Fixture, logicalPort: number): ChildProcess {
       stdio: "ignore",
     },
   );
+  fixture.binders.add(child);
+  return child;
 }
 
 /** Polls the agent snapshot until a route for the port appears or the deadline passes. */
@@ -192,16 +221,12 @@ test("scope-less server relocates off a claimed gateway port", async (t) => {
   }
 
   const fixture = await startFixture();
-  t.after(() => {
-    fixture.agent.kill("SIGKILL");
-    fs.rmSync(fixture.dir, { recursive: true, force: true });
-  });
+  t.after(() => closeFixture(fixture));
 
   const logicalPort = await reserveLoopbackPort();
   fs.writeFileSync(claimPathFor(fixture.baseRoutes, logicalPort), JSON.stringify({ expiresAtMs: Date.now() + 15_000 }));
 
-  const binder = spawnBinder(fixture, logicalPort);
-  t.after(() => binder.kill("SIGKILL"));
+  spawnBinder(fixture, logicalPort);
   const row = await pollForRoute(fixture.socketPath, logicalPort, 5000);
 
   assert.ok(row, "a route row should be registered for the claimed port");
@@ -216,15 +241,11 @@ test("scope-less server binds normally when no gateway claim exists", async (t) 
   }
 
   const fixture = await startFixture();
-  t.after(() => {
-    fixture.agent.kill("SIGKILL");
-    fs.rmSync(fixture.dir, { recursive: true, force: true });
-  });
+  t.after(() => closeFixture(fixture));
 
   const logicalPort = await reserveLoopbackPort();
   // No claim file: the bind must pass through and register no relocation route.
-  const binder = spawnBinder(fixture, logicalPort);
-  t.after(() => binder.kill("SIGKILL"));
+  spawnBinder(fixture, logicalPort);
 
   // Give the binder ample time to have bound, then confirm no route was created.
   await new Promise((resolve) => setTimeout(resolve, 1500));

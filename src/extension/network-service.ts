@@ -59,6 +59,7 @@ import {
 } from "../core/networks/router-verdict-cache";
 import { resolveProcessTreeNetworkLabel } from "../core/process-network-labels";
 import { SimpleEventEmitter } from "../shared/events";
+import { defaultProxyNetworkResources } from "../platform/ports/proxy-network-resources";
 import {
   ContainerNetworkRuntimeAdapter,
   type ContainerRuntimeTarget,
@@ -928,12 +929,15 @@ export class PortManagerNetworkService implements DisposableLike {
       storageDirectory: path.join(this.context.globalStorageUri.fsPath, "compose-overrides"),
       runCommand: runContainerCommand,
     });
+    // All proxy owners and their native children consume the same host budget.
+    const proxyResources = defaultProxyNetworkResources;
     this.proxyManager = new HostPortProxyManager(
       {
         resolve: (exposure) => this.resolveHostExposureTarget(exposure),
       },
       {
         nativeProxyPath: this.context.asAbsolutePath(getHostExposureProxyHelperRelativePath()),
+        resources: proxyResources,
       },
     );
     this.hostGatewayProxy = new HostPortProxyManager(
@@ -942,6 +946,7 @@ export class PortManagerNetworkService implements DisposableLike {
       },
       {
         nativeProxyPath: this.context.asAbsolutePath(getHostExposureProxyHelperRelativePath()),
+        resources: proxyResources,
       },
     );
     this.logicalPortRouter = new LogicalPortRouterManager(
@@ -950,6 +955,7 @@ export class PortManagerNetworkService implements DisposableLike {
       },
       {
         nativeRouterPath: this.context.asAbsolutePath(getTcpRouterHelperRelativePath()),
+        resources: proxyResources,
       },
     );
     this.processTracker = new ProcessTrackerManager({
@@ -958,6 +964,7 @@ export class PortManagerNetworkService implements DisposableLike {
     this.browserNetworkProxy = new BrowserNetworkProxyManager({
       resolve: (endpoint) => this.resolveBrowserNetworkProxyTarget(endpoint),
     }, {
+      resources: proxyResources,
       tlsCredentials: {
         getCredentials: () => readBrowserTlsCredentials(),
       },

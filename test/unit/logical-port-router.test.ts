@@ -153,7 +153,8 @@ test("treats v2 dash placeholders as unresolved attribution", () => {
   });
 });
 
-test("native logical router helper starts without inherited hook environment", async () => {
+// Executable shebang fixtures model POSIX native helpers; Windows uses Node.
+test("native logical router helper starts without inherited hook environment", { skip: process.platform === "win32" }, async () => {
   const logicalPort = 61234;
   const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pm-router-env-"));
   const routerPath = path.join(tempDirectory, "router.js");
@@ -227,9 +228,9 @@ test("native logical router pending route requests time out instead of blocking 
   const buildScript = fs.readFileSync(path.join(root, "scripts/build-native-hook.sh"), "utf8");
 
   assert.equal(routerSource.includes("PM_ROUTER_ROUTE_RESPONSE_TIMEOUT_MS 5000"), true);
-  assert.equal(routerSource.includes("clock_gettime(CLOCK_REALTIME, &deadline)"), true);
-  assert.equal(routerSource.includes("pthread_cond_timedwait(&route.condition, &pm_pending_mutex, &deadline)"), true);
-  assert.equal(routerSource.includes("if (!route.resolved || route.failed"), true);
+  assert.equal(routerSource.includes("pm_tcp_proxy_condition_init(&route.condition)"), true);
+  assert.equal(routerSource.includes("pm_tcp_proxy_condition_wait(&route.condition, &pm_pending_mutex, deadline)"), true);
+  assert.equal(routerSource.includes("finished >= deadline || !route.resolved || route.failed"), true);
   assert.equal(routerSource.includes("listener_list_t"), true);
   assert.equal(routerSource.includes("\"LISTEN\\t\""), true);
   assert.equal(routerSource.includes("\"READY\\tcontrol\\t%d\\n\""), true);
@@ -239,8 +240,8 @@ test("native logical router pending route requests time out instead of blocking 
   assert.equal(routerSource.includes("PM_ROUTER_BACKLOG 1024"), true);
   assert.equal(routerSource.includes("static void *pm_copy_thread"), false);
   assert.equal(routerSource.includes("static void pm_accept_ready_connections"), true);
-  assert.equal(routerSource.includes("flags | O_NONBLOCK"), true);
-  assert.equal(routerSource.includes("struct pollfd poll_fds[4]"), true);
+  assert.equal(routerSource.includes("pm_tcp_proxy_prepare_socket(fd)"), true);
+  assert.equal(routerSource.includes("pm_tcp_proxy_forward(connection->client_fd, target_fd)"), true);
   assert.match(buildScript, /-pthread "\$TCP_ROUTER_SOURCE_FILE"/);
 });
 
@@ -375,7 +376,7 @@ test("closes a logical router opened by a sync superseded during owner handoff",
   }
 });
 
-test("native logical router tunnels TLS responses after handshake", async () => {
+test("native logical router tunnels TLS responses after handshake", { skip: process.platform === "win32" }, async () => {
   const nativeRouterPath = path.resolve(__dirname, "../../../media/native/portmanager_tcp_router");
   if (!fs.existsSync(nativeRouterPath)) {
     return;
@@ -415,7 +416,7 @@ test("native logical router tunnels TLS responses after handshake", async () => 
   }
 });
 
-test("uses one shared native router process for many logical ports", async (context) => {
+test("uses one shared native router process for many logical ports", { skip: process.platform === "win32" }, async (context) => {
   const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pm-router-budget-"));
   const nativeRouterPath = path.join(tempDirectory, "native-router.js");
   const markerPath = path.join(tempDirectory, "native-router-started");
@@ -461,7 +462,7 @@ test("uses one shared native router process for many logical ports", async (cont
   }
 });
 
-test("keeps the native router process alive after all logical listeners close", async () => {
+test("keeps the native router process alive after all logical listeners close", { skip: process.platform === "win32" }, async () => {
   const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pm-router-idle-"));
   const nativeRouterPath = path.join(tempDirectory, "native-router.js");
   const markerPath = path.join(tempDirectory, "native-router-events");

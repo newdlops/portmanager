@@ -23,9 +23,9 @@
 
 #include "../shared/pm_peer_process.h"
 #include "../shared/pm_dev_log.h"
+#include "../shared/pm_tcp_proxy.h"
 
 #define PM_ROUTER_BACKLOG 1024
-#define PM_ROUTER_BUFFER_SIZE 65536
 #define PM_ROUTER_HOST_SIZE 256
 #define PM_ROUTER_LINE_SIZE 1024
 #define PM_ROUTER_ATTRIBUTION_SIZE 64
@@ -33,11 +33,6 @@
 #define PM_ROUTER_ROUTE_RESPONSE_TIMEOUT_ENV "PORT_MANAGER_ROUTER_RESPONSE_TIMEOUT_MS"
 /* Bumped whenever the CONNECT/READY wire format changes; see pm_send_route_request. */
 #define PM_ROUTER_CONTROL_PROTOCOL_VERSION 2
-#if defined(MSG_NOSIGNAL)
-#define PM_ROUTER_SEND_FLAGS MSG_NOSIGNAL
-#else
-#define PM_ROUTER_SEND_FLAGS 0
-#endif
 
 typedef struct pending_route {
   uint64_t id;
@@ -83,18 +78,7 @@ typedef struct line_buffer {
   size_t capacity;
 } line_buffer_t;
 
-typedef struct proxy_direction {
-  int source_fd;
-  int target_fd;
-  char *buffer;
-  size_t start;
-  size_t length;
-  int source_open;
-  int target_shutdown;
-} proxy_direction_t;
-
 static pthread_mutex_t pm_pending_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t pm_stdout_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pending_route_t *pm_pending_routes = NULL;
 static uint64_t pm_next_route_id = 1;
 /*
@@ -113,36 +97,8 @@ static int pm_listener_list_open_port(listener_list_t *listeners, int logical_po
 static void pm_listener_list_close_port(listener_list_t *listeners, int logical_port);
 static void pm_listener_list_free(listener_list_t *listeners);
 
-static int pm_write_all(int fd, const char *buffer, size_t length) {
-  size_t written = 0;
-
-  while (written < length) {
-    ssize_t result = write(fd, buffer + written, length - written);
-    if (result < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      return -1;
-    }
-
-    if (result == 0) {
-      return -1;
-    }
-
-    written += (size_t)result;
-  }
-
-  return 0;
-}
-
 static int pm_write_protocol_line(const char *line) {
-  int result;
-
-  pthread_mutex_lock(&pm_stdout_mutex);
-  result = pm_write_all(STDOUT_FILENO, line, strlen(line));
-  pthread_mutex_unlock(&pm_stdout_mutex);
-
-  return result;
+  return pm_tcp_proxy_control_write(line);
 }
 
 static uint64_t pm_allocate_route_id(void) {
@@ -306,29 +262,21 @@ static int pm_send_route_request(const accepted_connection_t *connection, uint64
   return pm_write_protocol_line(line);
 }
 
-static void pm_add_milliseconds(struct timespec *deadline, long timeout_ms) {
-  deadline->tv_sec += timeout_ms / 1000;
-  deadline->tv_nsec += (timeout_ms % 1000) * 1000000L;
-  if (deadline->tv_nsec >= 1000000000L) {
-    deadline->tv_sec += deadline->tv_nsec / 1000000000L;
-    deadline->tv_nsec = deadline->tv_nsec % 1000000000L;
-  }
-}
-
 static int pm_resolve_route(const accepted_connection_t *connection, char *host, size_t host_size, int *port) {
   pending_route_t route;
-  struct timespec deadline;
+  int64_t deadline;
 
   memset(&route, 0, sizeof(route));
   route.id = pm_allocate_route_id();
-  if (pthread_cond_init(&route.condition, NULL) != 0) {
+  if (pm_tcp_proxy_condition_init(&route.condition) != 0) {
     return -1;
   }
-  if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+  deadline = pm_tcp_proxy_now_ms();
+  if (deadline < 0) {
     pthread_cond_destroy(&route.condition);
     return -1;
   }
-  pm_add_milliseconds(&deadline, pm_route_response_timeout_ms);
+  deadline += pm_route_response_timeout_ms;
 
   pm_add_pending_route(&route);
   if (pm_send_route_request(connection, route.id) != 0) {
@@ -339,14 +287,15 @@ static int pm_resolve_route(const accepted_connection_t *connection, char *host,
 
   pthread_mutex_lock(&pm_pending_mutex);
   while (!route.resolved) {
-    if (pthread_cond_timedwait(&route.condition, &pm_pending_mutex, &deadline) == ETIMEDOUT) {
+    if (pm_tcp_proxy_condition_wait(&route.condition, &pm_pending_mutex, deadline) != 0) {
       break;
     }
   }
   pthread_mutex_unlock(&pm_pending_mutex);
 
   pm_remove_pending_route(&route);
-  if (!route.resolved || route.failed || route.port <= 0 || route.host[0] == '\0') {
+  int64_t finished = pm_tcp_proxy_now_ms();
+  if (finished < 0 || finished >= deadline || !route.resolved || route.failed || route.port <= 0 || route.host[0] == '\0') {
     pthread_cond_destroy(&route.condition);
     return -1;
   }
@@ -355,279 +304,6 @@ static int pm_resolve_route(const accepted_connection_t *connection, char *host,
   *port = route.port;
   pthread_cond_destroy(&route.condition);
   return 0;
-}
-
-static int pm_connect_target(const char *host, int port) {
-  struct addrinfo hints;
-  struct addrinfo *results = NULL;
-  struct addrinfo *cursor;
-  char port_text[16];
-  int fd = -1;
-
-  memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  snprintf(port_text, sizeof(port_text), "%d", port);
-
-  if (getaddrinfo(host, port_text, &hints, &results) != 0) {
-    return -1;
-  }
-
-  for (cursor = results; cursor != NULL; cursor = cursor->ai_next) {
-    fd = socket(cursor->ai_family, cursor->ai_socktype, cursor->ai_protocol);
-    if (fd < 0) {
-      continue;
-    }
-
-    if (connect(fd, cursor->ai_addr, cursor->ai_addrlen) == 0) {
-      break;
-    }
-
-    close(fd);
-    fd = -1;
-  }
-
-  freeaddrinfo(results);
-  return fd;
-}
-
-static int pm_socket_would_block(void) {
-  return errno == EAGAIN || errno == EWOULDBLOCK;
-}
-
-static int pm_set_nonblocking(int fd) {
-  int flags = fcntl(fd, F_GETFL, 0);
-
-  if (flags < 0) {
-    return -1;
-  }
-
-  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-static void pm_set_tcp_nodelay(int fd) {
-  int enabled = 1;
-
-#if defined(TCP_NODELAY)
-  (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
-#else
-  (void)fd;
-  (void)enabled;
-#endif
-}
-
-static void pm_proxy_direction_compact(proxy_direction_t *direction) {
-  if (direction->start == 0) {
-    return;
-  }
-
-  if (direction->length > 0) {
-    memmove(direction->buffer, direction->buffer + direction->start, direction->length);
-  }
-  direction->start = 0;
-}
-
-static int pm_proxy_direction_read(proxy_direction_t *direction) {
-  ssize_t count;
-  size_t available;
-
-  if (!direction->source_open || direction->length >= PM_ROUTER_BUFFER_SIZE) {
-    return 0;
-  }
-
-  if (direction->start + direction->length >= PM_ROUTER_BUFFER_SIZE) {
-    pm_proxy_direction_compact(direction);
-  }
-  available = PM_ROUTER_BUFFER_SIZE - direction->start - direction->length;
-  if (available == 0) {
-    return 0;
-  }
-
-  count = recv(direction->source_fd, direction->buffer + direction->start + direction->length, available, 0);
-  if (count > 0) {
-    direction->length += (size_t)count;
-    return 0;
-  }
-  if (count == 0) {
-    direction->source_open = 0;
-    return 0;
-  }
-  if (errno == EINTR || pm_socket_would_block()) {
-    return 0;
-  }
-
-  direction->source_open = 0;
-  return -1;
-}
-
-static int pm_proxy_direction_write(proxy_direction_t *direction) {
-  while (direction->length > 0) {
-    ssize_t count = send(
-      direction->target_fd,
-      direction->buffer + direction->start,
-      direction->length,
-      PM_ROUTER_SEND_FLAGS);
-
-    if (count > 0) {
-      direction->start += (size_t)count;
-      direction->length -= (size_t)count;
-      if (direction->length == 0) {
-        direction->start = 0;
-      }
-      continue;
-    }
-    if (count == 0) {
-      return -1;
-    }
-    if (errno == EINTR) {
-      continue;
-    }
-    if (pm_socket_would_block()) {
-      return 0;
-    }
-    return -1;
-  }
-
-  return 0;
-}
-
-static void pm_proxy_direction_shutdown_if_drained(proxy_direction_t *direction) {
-  if (!direction->source_open && direction->length == 0 && !direction->target_shutdown) {
-    shutdown(direction->target_fd, SHUT_WR);
-    direction->target_shutdown = 1;
-  }
-}
-
-/**
- * Proxies one TCP connection with a single nonblocking pump.
- *
- * The previous implementation used two extra copy threads per connection. That
- * multiplied scheduler and stack pressure during bursty browser/container
- * traffic. A bounded poll loop keeps both directions moving from the connection
- * worker itself while still honoring TCP half-close semantics.
- */
-static void pm_proxy_connection(int client_fd, int target_fd) {
-  proxy_direction_t forward;
-  proxy_direction_t backward;
-  char *forward_buffer = (char *)malloc(PM_ROUTER_BUFFER_SIZE);
-  char *backward_buffer = (char *)malloc(PM_ROUTER_BUFFER_SIZE);
-
-  if (forward_buffer == NULL || backward_buffer == NULL) {
-    free(forward_buffer);
-    free(backward_buffer);
-    return;
-  }
-  if (pm_set_nonblocking(client_fd) != 0 || pm_set_nonblocking(target_fd) != 0) {
-    free(forward_buffer);
-    free(backward_buffer);
-    return;
-  }
-
-  pm_set_tcp_nodelay(client_fd);
-  pm_set_tcp_nodelay(target_fd);
-  memset(&forward, 0, sizeof(forward));
-  memset(&backward, 0, sizeof(backward));
-  forward.source_fd = client_fd;
-  forward.target_fd = target_fd;
-  forward.buffer = forward_buffer;
-  forward.source_open = 1;
-  backward.source_fd = target_fd;
-  backward.target_fd = client_fd;
-  backward.buffer = backward_buffer;
-  backward.source_open = 1;
-
-  for (;;) {
-    struct pollfd poll_fds[4];
-    int poll_roles[4];
-    nfds_t poll_count = 0;
-    int ready;
-    int failed = 0;
-
-    if (forward.source_open && forward.length < PM_ROUTER_BUFFER_SIZE) {
-      poll_fds[poll_count].fd = forward.source_fd;
-      poll_fds[poll_count].events = POLLIN;
-      poll_fds[poll_count].revents = 0;
-      poll_roles[poll_count++] = 0;
-    }
-    if (forward.length > 0) {
-      poll_fds[poll_count].fd = forward.target_fd;
-      poll_fds[poll_count].events = POLLOUT;
-      poll_fds[poll_count].revents = 0;
-      poll_roles[poll_count++] = 1;
-    }
-    if (backward.source_open && backward.length < PM_ROUTER_BUFFER_SIZE) {
-      poll_fds[poll_count].fd = backward.source_fd;
-      poll_fds[poll_count].events = POLLIN;
-      poll_fds[poll_count].revents = 0;
-      poll_roles[poll_count++] = 2;
-    }
-    if (backward.length > 0) {
-      poll_fds[poll_count].fd = backward.target_fd;
-      poll_fds[poll_count].events = POLLOUT;
-      poll_fds[poll_count].revents = 0;
-      poll_roles[poll_count++] = 3;
-    }
-
-    if (poll_count == 0) {
-      break;
-    }
-
-    ready = poll(poll_fds, poll_count, -1);
-    if (ready < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      break;
-    }
-
-    for (nfds_t index = 0; index < poll_count; index++) {
-      short revents = poll_fds[index].revents;
-
-      if (revents == 0) {
-        continue;
-      }
-
-      switch (poll_roles[index]) {
-        case 0:
-          if ((revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0 &&
-              pm_proxy_direction_read(&forward) != 0) {
-            failed = 1;
-          }
-          break;
-        case 1:
-          if ((revents & (POLLHUP | POLLERR | POLLNVAL)) != 0 ||
-              ((revents & POLLOUT) != 0 && pm_proxy_direction_write(&forward) != 0)) {
-            failed = 1;
-          }
-          break;
-        case 2:
-          if ((revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0 &&
-              pm_proxy_direction_read(&backward) != 0) {
-            failed = 1;
-          }
-          break;
-        case 3:
-          if ((revents & (POLLHUP | POLLERR | POLLNVAL)) != 0 ||
-              ((revents & POLLOUT) != 0 && pm_proxy_direction_write(&backward) != 0)) {
-            failed = 1;
-          }
-          break;
-        default:
-          break;
-      }
-    }
-
-    pm_proxy_direction_shutdown_if_drained(&forward);
-    pm_proxy_direction_shutdown_if_drained(&backward);
-    if (failed) {
-      break;
-    }
-  }
-
-  shutdown(client_fd, SHUT_RDWR);
-  shutdown(target_fd, SHUT_RDWR);
-  free(forward_buffer);
-  free(backward_buffer);
 }
 
 /*
@@ -698,7 +374,12 @@ static void *pm_connection_thread(void *raw_connection) {
     return NULL;
   }
 
-  target_fd = pm_connect_target(host, port);
+  if (pm_tcp_proxy_client_failed(connection->client_fd)) {
+    close(connection->client_fd);
+    free(connection);
+    return NULL;
+  }
+  target_fd = pm_tcp_proxy_connect(host, port);
   if (target_fd < 0) {
     pm_dev_log("router", "resolve logical_port=%d net=%s -> target %s:%d but CONNECT FAILED",
                connection->local_port, pm_field_or_dash(connection->client_network_id), host, port);
@@ -710,7 +391,7 @@ static void *pm_connection_thread(void *raw_connection) {
   pm_dev_log("router", "route logical_port=%d pid=%s net=%s -> %s:%d (forwarding)",
              connection->local_port, pm_field_or_dash(connection->client_pid),
              pm_field_or_dash(connection->client_network_id), host, port);
-  pm_proxy_connection(connection->client_fd, target_fd);
+  pm_tcp_proxy_forward(connection->client_fd, target_fd);
   close(target_fd);
   close(connection->client_fd);
   free(connection);
@@ -731,7 +412,7 @@ static int pm_create_ipv4_listener(int port) {
   }
 
   pm_set_reuseaddr(fd);
-  if (pm_set_nonblocking(fd) != 0) {
+  if (pm_tcp_proxy_prepare_socket(fd) != 0) {
     close(fd);
     return -1;
   }
@@ -758,7 +439,7 @@ static int pm_create_ipv6_listener(int port) {
   }
 
   pm_set_reuseaddr(fd);
-  if (pm_set_nonblocking(fd) != 0) {
+  if (pm_tcp_proxy_prepare_socket(fd) != 0) {
     close(fd);
     return -1;
   }
@@ -856,6 +537,7 @@ static int pm_listener_list_add_fd(listener_list_t *listeners, int logical_port,
   listeners->items[listeners->count].fd = fd;
   listeners->items[listeners->count].logical_port = logical_port;
   listeners->count++;
+  pm_tcp_proxy_set_listener_count(listeners->count);
   return 0;
 }
 
@@ -899,6 +581,7 @@ static void pm_listener_list_close_port(listener_list_t *listeners, int logical_
     close(listeners->items[index].fd);
     memmove(&listeners->items[index], &listeners->items[index + 1], (listeners->count - index - 1) * sizeof(logical_listener_t));
     listeners->count--;
+    pm_tcp_proxy_set_listener_count(listeners->count);
   }
 }
 
@@ -943,6 +626,10 @@ static accepted_connection_t *pm_accept_connection(int listener_fd, int logical_
   if (client_fd < 0) {
     return NULL;
   }
+  if (pm_tcp_proxy_prepare_socket(client_fd) != 0) {
+    close(client_fd);
+    return NULL;
+  }
 
   connection = (accepted_connection_t *)calloc(1, sizeof(accepted_connection_t));
   if (connection == NULL) {
@@ -975,19 +662,17 @@ static accepted_connection_t *pm_accept_connection(int listener_fd, int logical_
 }
 
 static void pm_start_connection_thread(accepted_connection_t *connection) {
-  pthread_t thread;
-
-  if (pthread_create(&thread, NULL, pm_connection_thread, connection) != 0) {
+  if (pm_tcp_proxy_start_worker(pm_connection_thread, connection) != 0) {
     close(connection->client_fd);
     free(connection);
     return;
   }
 
-  pthread_detach(thread);
 }
 
 static void pm_accept_ready_connections(int listener_fd, int logical_port) {
-  for (;;) {
+  /* Return to control input even when new clients arrive faster than accept. */
+  for (int accepted = 0; accepted < 64; accepted++) {
     accepted_connection_t *connection = pm_accept_connection(listener_fd, logical_port);
 
     if (connection == NULL) {
@@ -1208,6 +893,8 @@ int main(int argc, char **argv) {
   }
 
   signal(SIGPIPE, SIG_IGN);
+  pm_tcp_proxy_initialize();
+  if (pm_tcp_proxy_control_start(STDOUT_FILENO) != 0) return 5;
   pm_load_route_response_timeout();
 #if PM_ROUTER_USE_KQUEUE
   pm_kqueue_fd = kqueue();

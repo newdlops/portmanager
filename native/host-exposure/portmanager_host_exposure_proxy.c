@@ -14,8 +14,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../shared/pm_tcp_proxy.h"
+
 #define PM_HOST_PROXY_BACKLOG 128
-#define PM_HOST_PROXY_BUFFER_SIZE 65536
 #define PM_HOST_PROXY_HOST_SIZE 256
 #define PM_HOST_PROXY_LINE_SIZE 1024
 #define PM_HOST_PROXY_MAX_LISTENERS 8
@@ -39,44 +40,13 @@ typedef struct accepted_connection {
   int remote_port;
 } accepted_connection_t;
 
-typedef struct copy_args {
-  int source_fd;
-  int target_fd;
-} copy_args_t;
-
 static pthread_mutex_t pm_pending_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t pm_stdout_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pending_route_t *pm_pending_routes = NULL;
 static uint64_t pm_next_route_id = 1;
-
-static int pm_write_all(int fd, const char *buffer, size_t length) {
-  size_t written = 0;
-
-  while (written < length) {
-    ssize_t result = write(fd, buffer + written, length - written);
-    if (result < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      return -1;
-    }
-    if (result == 0) {
-      return -1;
-    }
-    written += (size_t)result;
-  }
-
-  return 0;
-}
+static long pm_route_response_timeout_ms = PM_HOST_PROXY_ROUTE_RESPONSE_TIMEOUT_MS;
 
 static int pm_write_protocol_line(const char *line) {
-  int result;
-
-  pthread_mutex_lock(&pm_stdout_mutex);
-  result = pm_write_all(STDOUT_FILENO, line, strlen(line));
-  pthread_mutex_unlock(&pm_stdout_mutex);
-
-  return result;
+  return pm_tcp_proxy_control_write(line);
 }
 
 static uint64_t pm_allocate_route_id(void) {
@@ -209,29 +179,21 @@ static int pm_send_route_request(const accepted_connection_t *connection, uint64
   return pm_write_protocol_line(line);
 }
 
-static void pm_add_milliseconds(struct timespec *deadline, long timeout_ms) {
-  deadline->tv_sec += timeout_ms / 1000;
-  deadline->tv_nsec += (timeout_ms % 1000) * 1000000L;
-  if (deadline->tv_nsec >= 1000000000L) {
-    deadline->tv_sec += deadline->tv_nsec / 1000000000L;
-    deadline->tv_nsec = deadline->tv_nsec % 1000000000L;
-  }
-}
-
 static int pm_resolve_route(const accepted_connection_t *connection, char *host, size_t host_size, int *port) {
   pending_route_t route;
-  struct timespec deadline;
+  int64_t deadline;
 
   memset(&route, 0, sizeof(route));
   route.id = pm_allocate_route_id();
-  if (pthread_cond_init(&route.condition, NULL) != 0) {
+  if (pm_tcp_proxy_condition_init(&route.condition) != 0) {
     return -1;
   }
-  if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+  deadline = pm_tcp_proxy_now_ms();
+  if (deadline < 0) {
     pthread_cond_destroy(&route.condition);
     return -1;
   }
-  pm_add_milliseconds(&deadline, PM_HOST_PROXY_ROUTE_RESPONSE_TIMEOUT_MS);
+  deadline += pm_route_response_timeout_ms;
 
   pm_add_pending_route(&route);
   if (pm_send_route_request(connection, route.id) != 0) {
@@ -242,14 +204,15 @@ static int pm_resolve_route(const accepted_connection_t *connection, char *host,
 
   pthread_mutex_lock(&pm_pending_mutex);
   while (!route.resolved) {
-    if (pthread_cond_timedwait(&route.condition, &pm_pending_mutex, &deadline) == ETIMEDOUT) {
+    if (pm_tcp_proxy_condition_wait(&route.condition, &pm_pending_mutex, deadline) != 0) {
       break;
     }
   }
   pthread_mutex_unlock(&pm_pending_mutex);
 
   pm_remove_pending_route(&route);
-  if (!route.resolved || route.failed || route.port <= 0 || route.host[0] == '\0') {
+  int64_t finished = pm_tcp_proxy_now_ms();
+  if (finished < 0 || finished >= deadline || !route.resolved || route.failed || route.port <= 0 || route.host[0] == '\0') {
     pthread_cond_destroy(&route.condition);
     return -1;
   }
@@ -258,123 +221,6 @@ static int pm_resolve_route(const accepted_connection_t *connection, char *host,
   *port = route.port;
   pthread_cond_destroy(&route.condition);
   return 0;
-}
-
-static int pm_connect_target(const char *host, int port) {
-  struct addrinfo hints;
-  struct addrinfo *results = NULL;
-  struct addrinfo *cursor;
-  char port_text[16];
-  int fd = -1;
-
-  memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  snprintf(port_text, sizeof(port_text), "%d", port);
-
-  if (getaddrinfo(host, port_text, &hints, &results) != 0) {
-    return -1;
-  }
-
-  for (cursor = results; cursor != NULL; cursor = cursor->ai_next) {
-    fd = socket(cursor->ai_family, cursor->ai_socktype, cursor->ai_protocol);
-    if (fd < 0) {
-      continue;
-    }
-
-    if (connect(fd, cursor->ai_addr, cursor->ai_addrlen) == 0) {
-      break;
-    }
-
-    close(fd);
-    fd = -1;
-  }
-
-  freeaddrinfo(results);
-  return fd;
-}
-
-static int pm_send_all_socket(int fd, const char *buffer, size_t length) {
-  size_t sent = 0;
-
-  while (sent < length) {
-    ssize_t result = send(fd, buffer + sent, length - sent, 0);
-    if (result < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      return -1;
-    }
-    if (result == 0) {
-      return -1;
-    }
-    sent += (size_t)result;
-  }
-
-  return 0;
-}
-
-static void *pm_copy_thread(void *raw_args) {
-  copy_args_t *args = (copy_args_t *)raw_args;
-  char *buffer = (char *)malloc(PM_HOST_PROXY_BUFFER_SIZE);
-
-  if (buffer != NULL) {
-    for (;;) {
-      ssize_t count = recv(args->source_fd, buffer, PM_HOST_PROXY_BUFFER_SIZE, 0);
-      if (count < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        break;
-      }
-      if (count == 0) {
-        break;
-      }
-      if (pm_send_all_socket(args->target_fd, buffer, (size_t)count) != 0) {
-        break;
-      }
-    }
-  }
-
-  free(buffer);
-  shutdown(args->target_fd, SHUT_WR);
-  shutdown(args->source_fd, SHUT_RD);
-  free(args);
-  return NULL;
-}
-
-static void pm_proxy_connection(int client_fd, int target_fd) {
-  pthread_t client_to_target;
-  pthread_t target_to_client;
-  copy_args_t *forward = (copy_args_t *)calloc(1, sizeof(copy_args_t));
-  copy_args_t *backward = (copy_args_t *)calloc(1, sizeof(copy_args_t));
-
-  if (forward == NULL || backward == NULL) {
-    free(forward);
-    free(backward);
-    return;
-  }
-
-  forward->source_fd = client_fd;
-  forward->target_fd = target_fd;
-  backward->source_fd = target_fd;
-  backward->target_fd = client_fd;
-
-  if (pthread_create(&client_to_target, NULL, pm_copy_thread, forward) != 0) {
-    free(forward);
-    free(backward);
-    return;
-  }
-  if (pthread_create(&target_to_client, NULL, pm_copy_thread, backward) != 0) {
-    shutdown(client_fd, SHUT_RDWR);
-    shutdown(target_fd, SHUT_RDWR);
-    pthread_join(client_to_target, NULL);
-    free(backward);
-    return;
-  }
-
-  pthread_join(client_to_target, NULL);
-  pthread_join(target_to_client, NULL);
 }
 
 static void *pm_connection_thread(void *raw_connection) {
@@ -389,14 +235,19 @@ static void *pm_connection_thread(void *raw_connection) {
     return NULL;
   }
 
-  target_fd = pm_connect_target(host, port);
+  if (pm_tcp_proxy_client_failed(connection->client_fd)) {
+    close(connection->client_fd);
+    free(connection);
+    return NULL;
+  }
+  target_fd = pm_tcp_proxy_connect(host, port);
   if (target_fd < 0) {
     close(connection->client_fd);
     free(connection);
     return NULL;
   }
 
-  pm_proxy_connection(connection->client_fd, target_fd);
+  pm_tcp_proxy_forward(connection->client_fd, target_fd);
   close(target_fd);
   close(connection->client_fd);
   free(connection);
@@ -460,6 +311,10 @@ static int pm_create_listeners(const char *host, int port, int *listeners, int m
     if (fd < 0) {
       continue;
     }
+    if (pm_tcp_proxy_prepare_socket(fd) != 0) {
+      close(fd);
+      continue;
+    }
 
     pm_set_reuseaddr(fd);
     if (cursor->ai_family == AF_INET6) {
@@ -488,6 +343,10 @@ static accepted_connection_t *pm_accept_connection(int listener_fd) {
   int client_fd = accept(listener_fd, (struct sockaddr *)&remote_address, &remote_length);
 
   if (client_fd < 0) {
+    return NULL;
+  }
+  if (pm_tcp_proxy_prepare_socket(client_fd) != 0) {
+    close(client_fd);
     return NULL;
   }
 
@@ -521,15 +380,12 @@ static accepted_connection_t *pm_accept_connection(int listener_fd) {
 }
 
 static void pm_start_connection_thread(accepted_connection_t *connection) {
-  pthread_t thread;
-
-  if (pthread_create(&thread, NULL, pm_connection_thread, connection) != 0) {
+  if (pm_tcp_proxy_start_worker(pm_connection_thread, connection) != 0) {
     close(connection->client_fd);
     free(connection);
     return;
   }
 
-  pthread_detach(thread);
 }
 
 int main(int argc, char **argv) {
@@ -553,11 +409,22 @@ int main(int argc, char **argv) {
   }
 
   signal(SIGPIPE, SIG_IGN);
+  pm_tcp_proxy_initialize();
+  if (pm_tcp_proxy_control_start(STDOUT_FILENO) != 0) return 5;
+  {
+    const char *value = getenv("PORT_MANAGER_PROXY_ROUTE_TIMEOUT_MS");
+    char *end = NULL;
+    long parsed = value == NULL ? 0 : strtol(value, &end, 10);
+    if (value != NULL && end != value && *end == '\0' && parsed > 0 && parsed <= 600000) {
+      pm_route_response_timeout_ms = parsed;
+    }
+  }
   listener_count = pm_create_listeners(host, port, listeners, PM_HOST_PROXY_MAX_LISTENERS);
   if (listener_count == 0) {
     fprintf(stderr, "could not bind host exposure %s:%d\n", host, port);
     return 3;
   }
+  pm_tcp_proxy_set_listener_count((size_t)listener_count);
 
   if (pthread_create(&stdin_thread, NULL, pm_stdin_reader_thread, NULL) != 0) {
     fprintf(stderr, "could not start control reader\n");

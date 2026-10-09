@@ -7,6 +7,29 @@ import { buildNodeRuntimeEnvironment } from "./node-runtime";
 
 export type SupportedNativeArchitecture = "arm64" | "x64";
 
+interface HookPublicationRecord {
+  readonly source: string;
+  readonly target: string;
+}
+
+// A few current/previous VSIX paths suffice; old versions must not accumulate
+// metadata forever. No binary contents or open file descriptors are retained.
+const hookPublications = new Map<string, HookPublicationRecord>();
+const MAX_HOOK_PUBLICATIONS = 8;
+
+/** Inode/ctime also catch replacements and writes that preserve size and mtime. */
+function fileIdentity(stats: fs.Stats): string {
+  return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeMs}:${stats.ctimeMs}`;
+}
+
+function rememberHookPublication(key: string, source: string, target: string): void {
+  hookPublications.delete(key);
+  hookPublications.set(key, { source, target });
+  if (hookPublications.size > MAX_HOOK_PUBLICATIONS) {
+    hookPublications.delete(hookPublications.keys().next().value!);
+  }
+}
+
 /**
  * Terminal children outlive extension upgrades, so their preload path must not
  * point into a versioned VSIX directory. Keep the packaged suffix for the
@@ -25,16 +48,34 @@ export function getPersistentNativeHookLibraryPath(
  * code signature of an already mapped dylib. Atomic rename lets running
  * processes retain their old inode while new children load the current hook.
  * Publication errors propagate instead of exporting an ephemeral fallback.
+ * Repeated terminal-picker refreshes stat both files, then reuse an unchanged
+ * verified publication without allocating two whole-binary buffers each time.
  */
 export function preparePersistentNativeHookLibrary(packagedHookPath: string, runtimeDirectory?: string): string {
   const hookPath = getPersistentNativeHookLibraryPath(packagedHookPath, runtimeDirectory);
-  const contents = fs.readFileSync(packagedHookPath);
+  const sourceIdentity = fileIdentity(fs.statSync(packagedHookPath));
+  const publicationKey = `${packagedHookPath}\0${hookPath}`;
+  let targetIdentity: string | undefined;
   try {
-    if (!fs.lstatSync(hookPath).isSymbolicLink() && fs.readFileSync(hookPath).equals(contents)) {
+    const targetStats = fs.lstatSync(hookPath);
+    if (targetStats.isFile() && !targetStats.isSymbolicLink()) targetIdentity = fileIdentity(targetStats);
+    const previous = hookPublications.get(publicationKey);
+    if (targetIdentity !== undefined && previous?.source === sourceIdentity && previous.target === targetIdentity) {
+      rememberHookPublication(publicationKey, sourceIdentity, targetIdentity);
       return hookPath;
     }
   } catch {
-    // Missing or unreadable cached copies are replaced atomically below.
+    // Missing or unreadable copies need byte verification/publication below.
+  }
+  hookPublications.delete(publicationKey);
+  const contents = fs.readFileSync(packagedHookPath);
+  try {
+    if (targetIdentity !== undefined && fs.readFileSync(hookPath).equals(contents)) {
+      rememberHookPublication(publicationKey, sourceIdentity, targetIdentity);
+      return hookPath;
+    }
+  } catch {
+    // Preserve the original recovery behavior when the target cannot be read.
   }
 
   fs.mkdirSync(path.dirname(hookPath), { recursive: true });
@@ -42,6 +83,7 @@ export function preparePersistentNativeHookLibrary(packagedHookPath: string, run
   try {
     fs.writeFileSync(temporaryPath, contents, { mode: 0o700, flag: "wx" });
     fs.renameSync(temporaryPath, hookPath);
+    rememberHookPublication(publicationKey, sourceIdentity, fileIdentity(fs.lstatSync(hookPath)));
   } finally {
     fs.rmSync(temporaryPath, { force: true });
   }

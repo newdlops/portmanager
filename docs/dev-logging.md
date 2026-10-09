@@ -65,6 +65,9 @@ corrupting each other, and no descriptor leaks into a hooked child across
 
 | Component | Key lines |
 |-----------|-----------|
+| `tcp-control` (native TCP helpers) | `output disconnected` marks a failed control sink; the bounded FIFO is reclaimed and subsequent enqueues fail. Existing data pumps remain independent. |
+| `proxy-budget` (Node proxy owners) | `limit resource=… used=… max=… nodeDns=…/…`: shared capacity admission was refused. At most one record per resource per second; no hostnames, URLs, control payloads, or credentials are recorded. |
+| `tcp-proxy` (native TCP router / host exposure) | `wait client=fd/events target=fd/events forward=bytes/open backward=bytes/open`, `poll ready=… client=… target=…` for directions without I/O interest or socket termination events, and `socket failed fd=… error=…`. These trace backpressure and FIN/reset cleanup; payloads are never recorded. |
 | `router` (`portmanager_tcp_router`) | `attribute logical_port=… pid=… net=…` (source attribution per accepted connection), `route … -> host:port (forwarding)`, `resolve … -> REFUSE (no route)`, `… CONNECT FAILED`. This is the ground truth for "did the gateway demux this connection to the right per-network backend?" |
 | `hook` (`libportmanager_hook`) | Every existing `pm_debug` line is tee'd here — `connect address-only …`, `connect loopback-network …`, `connect blocked by … compose …`, `bind loopback-network …`, `child-url-route logical=… actual=… host=…`, route allocation, agent IPC, etc. |
 | `agent` (`portmanager_agent`) | `dispatch method=…` for every request except the high-frequency read-only polls (`listSnapshot`/`daemonStatus`/`refreshSnapshot`). |

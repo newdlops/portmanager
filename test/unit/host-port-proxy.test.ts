@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
 
 import { HostPortProxyManager, parseNativeHostProxyQueryLine } from "../../src/platform/ports/host-port-proxy";
@@ -73,7 +74,7 @@ test("resolves host exposure targets when each inbound connection starts", async
   await closeServer(target);
 });
 
-test("reuses host exposure target resolutions during short connection bursts", async () => {
+test("reuses host exposure target resolutions during short connection bursts", async context => {
   let resolveCalls = 0;
   const target = net.createServer((socket) => {
     socket.once("data", (chunk) => {
@@ -82,7 +83,6 @@ test("reuses host exposure target resolutions during short connection bursts", a
   });
 
   await listen(target, 0, "127.0.0.1");
-  const originalDateNow = Date.now;
   let nowMs = 1_000;
   const targetPort = getServerPort(target);
   const hostPort = await getAvailablePort();
@@ -103,7 +103,7 @@ test("reuses host exposure target resolutions during short connection bursts", a
   const exposure = createExposure({ hostPort, targetPort: 3004 });
 
   try {
-    Date.now = () => nowMs;
+    context.mock.method(performance, "now", () => nowMs);
     await proxy.open(exposure);
 
     assert.equal(await sendTcpMessage(exposure.hostPort, "127.0.0.1", "first"), "cached:first");
@@ -115,7 +115,6 @@ test("reuses host exposure target resolutions during short connection bursts", a
     assert.equal(await sendTcpMessage(exposure.hostPort, "127.0.0.1", "third"), "cached:third");
     assert.equal(resolveCalls, 2);
   } finally {
-    Date.now = originalDateNow;
     await proxy.dispose();
     await closeServer(target);
   }
@@ -145,9 +144,9 @@ test("native host exposure pending route requests time out instead of blocking f
   );
 
   assert.equal(hostProxySource.includes("PM_HOST_PROXY_ROUTE_RESPONSE_TIMEOUT_MS 5000"), true);
-  assert.equal(hostProxySource.includes("clock_gettime(CLOCK_REALTIME, &deadline)"), true);
-  assert.equal(hostProxySource.includes("pthread_cond_timedwait(&route.condition, &pm_pending_mutex, &deadline)"), true);
-  assert.equal(hostProxySource.includes("if (!route.resolved || route.failed"), true);
+  assert.equal(hostProxySource.includes("pm_tcp_proxy_condition_init(&route.condition)"), true);
+  assert.equal(hostProxySource.includes("pm_tcp_proxy_condition_wait(&route.condition, &pm_pending_mutex, deadline)"), true);
+  assert.equal(hostProxySource.includes("finished >= deadline || !route.resolved || route.failed"), true);
 });
 
 test("host exposure manager reclaims stale native helpers without blocking the event loop", () => {
