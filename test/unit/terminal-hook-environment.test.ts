@@ -2773,7 +2773,7 @@ test("native hook applies the per-network env file before main", () => {
   // Constructor-time injection lands ahead of every runtime's env snapshot
   // (CPython os.environ, JVM, Go), so per-network values reach any runtime
   // with zero app knowledge; the per-network file wins over the app's .env.
-  assert.equal(hook.includes('#define PM_NETWORK_ENV_DIR_RELATIVE ".portmanager/env"'), true);
+  assert.equal(hook.includes('#define PM_NETWORK_ENV_DIR_RELATIVE ".portmanager/namespaces"'), true);
   assert.equal(hook.includes('#define PM_NETWORK_ENV_APPLIED_ENV "PORT_MANAGER_NETWORK_ENV_APPLIED"'), true);
   assert.equal(hook.includes("pm_apply_network_env_file();"), true);
   // The repo file can never take over Port Manager's own contract or preload delivery.
@@ -2790,15 +2790,11 @@ test("attaching a window scaffolds the per-network env file", () => {
   // so the features are discoverable. Never overwrites. `.portmanager/` is
   // machine-local, so it is ignored via the repo-LOCAL .git/info/exclude —
   // the shared .gitignore stays untouched.
-  assert.equal(source.includes("ensureNetworkEnvFileScaffold(scope.networkId, scope.networkName);"), true);
-  assert.equal(source.includes('path.join(root, ".portmanager", "env")'), true);
-  assert.equal(source.includes('path.join(root, ".portmanager", "files", safeKey)'), true);
+  assert.equal(source.includes("ensureNetworkEnvFileScaffold(scope.networkId, scope.networkName, scope.namespaceNetworks);"), true);
+  assert.equal(source.includes("ensureNetworkNamespaceScaffold(root, networkId, networkName, knownNetworks);"), true);
   assert.equal(source.includes("ensureLocalGitExclude(root);"), true);
   assert.equal(source.includes('const excludePath = path.join(infoDirectory, "exclude");'), true);
   assert.equal(source.includes('const excludeEntry = ".portmanager/";'), true);
-  assert.equal(source.includes("if (!fs.existsSync(envFilePath)) {"), true);
-  // Auto-split: the app .env is seeded once as the network's own copy.
-  assert.equal(source.includes("fs.copyFileSync(originalDotenvPath, substituteDotenvPath);"), true);
 
   // The window-binding path alone never fires for individually attached
   // terminals, so the per-terminal attach script builder must scaffold too.
@@ -2806,7 +2802,7 @@ test("attaching a window scaffolds the per-network env file", () => {
     path.resolve(__dirname, "../../../src/extension/network-service.ts"),
     "utf8",
   );
-  assert.equal(networkService.includes("ensureNetworkEnvFileScaffold(networkId, networkName);"), true);
+  assert.equal(networkService.includes("ensureNetworkEnvFileScaffold(networkId, networkName, this.registry.getSnapshot().networks);"), true);
 });
 
 test("native hook substitutes per-network files exclusively at open", () => {

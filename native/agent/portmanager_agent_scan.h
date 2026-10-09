@@ -7,6 +7,8 @@
 /* A request owns references to immutable command observations. Registry state
  * stays exclusively on the control thread while subprocesses inspect the OS. */
 typedef struct pm_scan_context pm_scan_context;
+/* Set before any job: guarded workloads require system tools and a minimal env. */
+void pm_scan_set_trusted_tools(int enabled);
 pm_scan_context *pm_scan_context_create(void);
 void pm_scan_context_free(pm_scan_context *context);
 /* 1: pending, 0: complete (including command failure), -1: capacity/deadline failure. */

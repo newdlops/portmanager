@@ -344,6 +344,72 @@ macOS와 Windows는 Linux network namespace와 같은 per-process 네트워크 �
 
 ### 0.5 레거시 기능 상태
 
+보안 보완의 실행 조건은 호스트 파일·언어 런타임을 유지하고, 논리 네트워크 내부의
+코드가 다른 네트워크의 비공개 상태·소켓·제어 권한에 접근하지 못하게 하는 것이다.
+사용자 선택대로 소스와 기존 쓰기는 공유한다. 공유 코드 변경이 다른 네트워크의 다음
+실행에 영향을 주는 경로는 이 조건에 포함하지 않는다.
+
+현재 native hook은 협조적인 라우팅이며 강제 보안 경계가 아니다. 별도 macOS 커널
+정책 후보는 합성 테스트에서 직접 TCP, 타 네트워크 파일·Unix socket, 다른 PID의
+신호와 환경 조회를 차단하고 승인된 broker FD 및 호스트 Node·Python 실행을 허용했다.
+이 후보는 아직 제품 attach 경로에 연결되지 않았다. 숫자 `127.x` 주소별 Seatbelt
+규칙이 지원되지 않으므로 TCP는 네트워크 ID가 고정된 broker에서 중계해야 한다.
+
+별도 native launcher 후보는 보호된 profile을 읽고 상속 FD·기존 권한 환경을 정리한
+뒤, 실제 커널 거절과 broker transport를 확인한다. 표준 IO만 명시적으로 상속하는
+SETEXEC로 같은 PID를 유지하며, private socketpair의 record와 exec EOF로 시작을 확인한다.
+실제 PTY에서는 해당 terminal device만 허용하고 자기·자식 신호와 자기 scheduling만
+허용한다. 호스트 zsh·Node·Python, 다른 TTY 거절과 종료 신호를 무시하는 자식 회수를
+합성 테스트로 확인했다. controller 옵션을 쌍으로 지정하면 정책 확인 뒤 실제 fork
+PID·birth를 데몬에 등록하고 동일 tuple의 승인 후에만 private ACK로 exec를 허용한다.
+잘못된 응답·거절·기한·취소에는 실행하지 않는다. 이 launcher도 제품 attach·proxy 귀속·
+packaging에는 아직 연결하지 않았으며, stdout의 테스트용 ready 문구는 제품의 trusted
+확인 채널이 아니다. namespace 미러의 nofollow 탐색에는 공통 부모의 directory 읽기만
+허용하고 기존 부모에 불필요한 mkdir를 시도하지 않는다. 타 namespace 파일과 키는 계속
+거절한다.
+
+agent 소스의 RPC 권한은 별도로 분리한다. controller 키는 workload 환경에 넣지 않으며
+보호된 `.portmanager/security/agent-control/`에 저장한다. 네트워크 키는 stable ID별로
+구분하고 `authorizationNetworkId`·실제 kernel peer PID·프로세스 생성 시각에 묶는다.
+
+| 요청자 | 허용 범위 |
+| --- | --- |
+| 익명 | `daemonStatus` readiness만, snapshot 구독 불가 |
+| controller 키 | 관리 RPC, 전체 snapshot, respawn, 종료 |
+| 네트워크 키 | 자기 network의 할당/해제, 자기 PID가 실제 소유한 TCP endpoint의 등록, 자기 PID의 control channel |
+
+권한 검사는 scan·snapshot 구독보다 먼저 실행하고 지연된 요청도 다시 확인한다. 다른
+네트워크의 allocation은 route release로도 지울 수 없어야 한다. 살아 있는 PID의 scope는
+변경하지 않으며 PID 생성 시각으로 재사용을 구분한다. 등록 표는 최대 8,192개로 제한하고
+새 PID 등록 시 종료된 정체성을 회수한다. 생성된 셸 스크립트에는 key 경로만 남기고 key
+값은 기록하지 않는다. Node fallback은 실제 peer PID를 확인할 수 없으므로 workload RPC를
+거부한다. 강제 격리 연결은 `controllerAuthorizationVersion: 1`과
+`authenticatesNetworkPeers: true`를 확인해야 한다. 이 RPC 인증만으로 파일·직접 syscall·
+proxy 귀속 경계를 완성했다고 표시하지 않는다.
+
+`registerProcessScope`·`resolveProcessScope`는 controller 전용이다. 현재 PID/birth와
+controller-origin root·OS 조상을 확인하고 위조 env보다 우선하는 불변 scope를 제공한다.
+일반 workload token으로 만든 peer scope는 subtree root가 아니다. 관측된 자손은
+reparent 뒤에도 birth를 확인하고, controller route 등록도 scope의 networkId와 같아야
+한다. native의 `authenticatesProcessScopes: true`를 확인하며 Node fallback은 이 RPC를
+거절한다. scope 승인은 `--trusted-tools` daemon에서만 허용하며 `trustedQueryTools: true`
+를 보고한다. 조회 child는 시스템 PATH와 최소 환경만 사용해 공유 프로젝트의 lsof/ps나
+startup/preload가 daemon 권한으로 실행되지 않게 한다. workload runtime/PATH는 유지한다.
+native route 복구는 controller scope와 실제 listener port를 사용하고 미등록 PID의 env를
+추측하지 않는다. proxy 귀속은 현재 OS identity와 controller scope를 env·기존 cache·
+PID-only tracker보다 먼저 조회하고, 실패·tuple 불일치는 기존 힌트로 대체하지 않는다.
+daemon 재시작 root 재등록, 관측 전 orphan과 broker PID, 실제 attach/자원 검증은 남아 있다.
+
+제품 경로에 연결하기 전에 다음을 검증한다.
+
+- 전용 broker가 kernel peer PID와 불변 네트워크 ID를 사용하고 관리 RPC를 거부할 것
+- route 복구와 proxy 귀속이 위조 가능한 환경값 대신 인증된 프로세스 scope를 사용할 것
+- 시작 시 기존 FD를 정리하고 helper·대기 작업·전달 FD의 소유자, 기한, 한도, 취소와 종료를 관리할 것
+- 새 터미널이 실제 정책 적용 확인 이후에만 연결 성공을 표시할 것
+- 네트워크 전환·해제는 기존 정책을 느슨하게 하지 않는 새 터미널 흐름으로 처리할 것
+- 호스트 런타임, localhost 서버·클라이언트, DNS, 허용된 host access와 공유 소스 쓰기를 실제 attach에서 확인할 것
+- 커널 정책 적용 실패나 지원되지 않는 호출이 협조적인 hook 모드로 조용히 fallback하지 않을 것
+
 아래 1장 이후의 `logical port routing`, `managed process`, `native hook`, `rerun routed` 스펙은 현재 구현된 레거시 기능을 설명한다. 새 제품 방향에서는 이 기능들을 기본 사용자 흐름에서 숨기고, 향후 다음 중 하나로 정리한다.
 
 - Logical Network runtime adapter 내부 구현으로 흡수

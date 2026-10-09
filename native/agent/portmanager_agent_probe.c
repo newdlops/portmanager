@@ -17,7 +17,7 @@
 
 static void pm_agent_usage(void) {
   fprintf(stderr,
-          "Usage: portmanager_agent --socket <path> [--route-table <path>] [--agent-main <path>] [--dns-port <port>]\n"
+          "Usage: portmanager_agent --socket <path> [--route-table <path>] [--agent-main <path>] [--dns-port <port>] [--controller-token-file <path>] [--trusted-tools]\n"
           "       portmanager_agent --probe --socket <path> --agent-main <path>\n"
           "       portmanager_agent --lock-stale <path>\n");
 }
@@ -33,6 +33,7 @@ int pm_parse_agent_arguments(int argc, char **argv, pm_agent_arguments *argument
   arguments->dns_port = -1;
 
   for (int index = 1; index < argc; index++) {
+    if (strcmp(argv[index], "--trusted-tools") == 0) { arguments->trusted_tools = 1; continue; }
     char *value;
     if (strcmp(argv[index], "--probe") == 0) {
       arguments->probe_only = 1;
@@ -68,6 +69,10 @@ int pm_parse_agent_arguments(int argc, char **argv, pm_agent_arguments *argument
       }
       continue;
     }
+    if (strcmp(argv[index - 1], "--controller-token-file") == 0) {
+      if (pm_copy_cli_path(arguments->controller_token_path, sizeof(arguments->controller_token_path), value) != 0) return -1;
+      continue;
+    }
     if (strcmp(argv[index - 1], "--dns-port") == 0) {
       char *end = NULL;
       long port = strtol(value, &end, 10);
@@ -86,11 +91,11 @@ int pm_parse_agent_arguments(int argc, char **argv, pm_agent_arguments *argument
   if (arguments->lock_stale_mode) {
     return arguments->stale_lock_path[0] == '\0' || arguments->probe_only || arguments->socket_path[0] != '\0' ||
       arguments->route_table_path[0] != '\0' || arguments->agent_main_path[0] != '\0' ||
-      arguments->dns_port != -1 ? -1 : 0;
+      arguments->dns_port != -1 || arguments->controller_token_path[0] != '\0' || arguments->trusted_tools ? -1 : 0;
   }
   if (arguments->probe_only) {
     return arguments->socket_path[0] == '\0' || arguments->agent_main_path[0] == '\0' ||
-      arguments->route_table_path[0] != '\0' || arguments->dns_port != -1 ? -1 : 0;
+      arguments->route_table_path[0] != '\0' || arguments->dns_port != -1 || arguments->controller_token_path[0] != '\0' || arguments->trusted_tools ? -1 : 0;
   }
   if (arguments->socket_path[0] == '\0') {
     pm_agent_usage();

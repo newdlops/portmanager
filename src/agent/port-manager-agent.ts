@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { agentControllerTokenMatches, ensureAgentControllerToken, getAgentControllerTokenPath } from "./agent-authorization";
 import { ManagedProcessRegistry } from "../core/process-registry";
 import { PortRoutingService } from "../core/port-routing";
 import { SimpleEventEmitter } from "../shared/events";
@@ -78,6 +79,8 @@ const AGENT_SOCKET_LISTEN_BACKLOG = 16384;
 const SNAPSHOT_BROADCAST_DEBOUNCE_MS = 50;
 
 export interface PortManagerAgentOptions {
+  /** Private credential path; isolated launchers/tests can select their own. */
+  readonly controllerTokenPath?: string;
   /** Shared registry for managed and manually registered process rows. */
   readonly registry?: ManagedProcessRegistry;
   /** Low-level launcher used only for agent-owned child processes. */
@@ -418,6 +421,8 @@ export class PortManagerAgent implements DisposableLike {
 
   /** Node net server once listen() has been called. */
   private server: Server | undefined;
+  private readonly controllerTokenPath: string | undefined;
+  private controllerToken: string | undefined;
 
   /** Daemon-owned browser DNS responder; undefined when disabled by options. */
   private readonly browserDnsServer: BrowserDnsServer | undefined;
@@ -427,6 +432,7 @@ export class PortManagerAgent implements DisposableLike {
   private browserDnsRevision: string | undefined;
 
   constructor(options: PortManagerAgentOptions) {
+    this.controllerTokenPath = options.controllerTokenPath;
     this.registry =
       options.registry ??
       new ManagedProcessRegistry({
@@ -506,6 +512,8 @@ export class PortManagerAgent implements DisposableLike {
     if (this.server !== undefined) {
       throw new Error("Port Manager agent is already listening.");
     }
+
+    this.controllerToken = ensureAgentControllerToken(this.controllerTokenPath ?? getAgentControllerTokenPath(socketPath));
 
     this.server = createServer((socket) => this.attachClient(socket));
     this.server.on("error", (error) => {
@@ -1227,7 +1235,15 @@ export class PortManagerAgent implements DisposableLike {
       return;
     }
 
-    if (!client.wantsEvents && agentRequestIdWantsEvents(message.id)) {
+    const isController = this.controllerToken !== undefined && agentControllerTokenMatches(this.controllerToken, message.authorization);
+    if (!isController && (message.method !== "daemonStatus" || message.authorization !== undefined)) {
+      // Node net.Socket does not expose authenticated peer PID. Workload RPCs
+      // need the native transport rather than trusting a caller-supplied PID.
+      this.writeClientMessage(client, createErrorResponse(message, new Error("Agent authorization denied.")));
+      return;
+    }
+
+    if (isController && !client.wantsEvents && agentRequestIdWantsEvents(message.id)) {
       client.wantsEvents = true;
       /*
        * Opening several VS Code windows should create one daemon-owned snapshot
@@ -1267,6 +1283,9 @@ export class PortManagerAgent implements DisposableLike {
         return this.startManagedProcess(request.payload as AgentStartManagedProcessRequest);
       case "registerExistingProcess":
         return this.registerExistingProcess(request.payload as RegisteredProcessInput);
+      case "registerProcessScope":
+      case "resolveProcessScope":
+        throw new Error("Authenticated process scopes require the native agent; fallback execution is unavailable.");
       case "stopProcess": {
         const payload = request.payload as StopProcessPayload;
         return this.stopProcess(payload.id, payload.signal);
@@ -2611,6 +2630,10 @@ function buildDaemonStatus(options: {
   readonly browserDnsError?: string;
 }): AgentDaemonStatus {
   return {
+    controllerAuthorizationVersion: 1,
+    authenticatesNetworkPeers: false,
+    authenticatesProcessScopes: false,
+    trustedQueryTools: false,
     status: "running",
     pid: options.agentPid,
     startedAt: options.startedAt,

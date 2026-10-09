@@ -2328,6 +2328,7 @@ static int pm_recover_untracked_hooked_listener(
   pm_process *process;
   int requested_port;
   int same_port_recovery;
+  int controller_scoped;
 
   if (listener == NULL ||
       listener->pid <= 0 ||
@@ -2338,16 +2339,21 @@ static int pm_recover_untracked_hooked_listener(
     return 0;
   }
 
-  if (inspection == NULL || inspection->pid != listener->pid || !pm_inspect_hook_recovery_process(inspection)) {
+  network_id[0] = '\0';
+  controller_scoped = state->resolve_process_scope != NULL &&
+    state->resolve_process_scope(listener->pid, network_id, sizeof(network_id));
+  /* Guarded mode never guesses an unknown/orphaned PID's realm from env.
+   * Legacy recovery remains explicitly outside that security mode. */
+  if ((!controller_scoped && state->trusted_tools) || inspection == NULL || inspection->pid != listener->pid ||
+      (!controller_scoped && !pm_inspect_hook_recovery_process(inspection))) {
     return 0;
   }
-  network_id[0] = '\0';
-  (void)pm_process_text_first_value(inspection->environment, network_variables, sizeof(network_variables) / sizeof(network_variables[0]), network_id, sizeof(network_id));
+  if (!controller_scoped) (void)pm_process_text_first_value(inspection->environment, network_variables, sizeof(network_variables) / sizeof(network_variables[0]), network_id, sizeof(network_id));
   experimental_route_ownership_mode[0] = '\0';
   terminal_session_id[0] = '\0';
   terminal_group_id[0] = '\0';
-  (void)pm_process_text_first_value(inspection->environment, (const char *const[]){"PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE"}, 1, experimental_route_ownership_mode, sizeof(experimental_route_ownership_mode));
-  if (pm_scoped_route_ownership_mode(experimental_route_ownership_mode)) {
+  if (!controller_scoped) (void)pm_process_text_first_value(inspection->environment, (const char *const[]){"PORT_MANAGER_EXPERIMENTAL_ROUTE_OWNERSHIP_MODE"}, 1, experimental_route_ownership_mode, sizeof(experimental_route_ownership_mode));
+  if (!controller_scoped && pm_scoped_route_ownership_mode(experimental_route_ownership_mode)) {
     (void)pm_process_text_first_value(inspection->environment, terminal_session_variables, sizeof(terminal_session_variables) / sizeof(terminal_session_variables[0]), terminal_session_id, sizeof(terminal_session_id));
     (void)pm_process_text_first_value(inspection->environment, terminal_group_variables, sizeof(terminal_group_variables) / sizeof(terminal_group_variables[0]), terminal_group_id, sizeof(terminal_group_id));
   }
@@ -2357,7 +2363,7 @@ static int pm_recover_untracked_hooked_listener(
   }
 
   pm_copy(command, sizeof(command), listener->command[0] ? listener->command : listener->process_name);
-  if (pm_inspect_hook_recovery_command(inspection)) {
+  if (!controller_scoped && pm_inspect_hook_recovery_command(inspection)) {
     /* One full argv read per confirmed hooked PID preserves helper/debugger
      * exclusion and supplies port hints without probing unrelated listeners. */
     pm_copy(command, sizeof(command), inspection->command);
@@ -2366,16 +2372,16 @@ static int pm_recover_untracked_hooked_listener(
     return 0;
   }
 
-  same_port_recovery =
-    pm_loopback_address_only_mode(experimental_route_ownership_mode) &&
-    pm_hook_recovery_listener_matches_exported_loopback(listener, inspection->environment);
+  same_port_recovery = controller_scoped ||
+    (pm_loopback_address_only_mode(experimental_route_ownership_mode) &&
+    pm_hook_recovery_listener_matches_exported_loopback(listener, inspection->environment));
   requested_port = same_port_recovery
     ? listener->port
     : pm_infer_requested_port_from_environment(inspection->environment, listener->port);
   if (requested_port <= 0) {
     requested_port = pm_infer_requested_port_from_command(command, listener->port);
   }
-  if (!pm_process_text_first_value(inspection->environment, cwd_variables, sizeof(cwd_variables) / sizeof(cwd_variables[0]), cwd, sizeof(cwd))) {
+  if (controller_scoped || !pm_process_text_first_value(inspection->environment, cwd_variables, sizeof(cwd_variables) / sizeof(cwd_variables[0]), cwd, sizeof(cwd))) {
     pm_copy(cwd, sizeof(cwd), ".");
   }
   if (requested_port <= 0 ||
@@ -2950,18 +2956,20 @@ static int pm_read_route_table_generation(
   }
 
   buffer[count] = '\0';
-  if (pm_json_get_string(buffer, "writerId", writer_id, writer_id_size) != 0 || writer_id[0] == '\0') {
+  const char *generation = pm_json_object(buffer, "generation");
+  if (generation == NULL) generation = buffer; /* Older flat generation metadata. */
+  if (pm_json_get_string(generation, "writerId", writer_id, writer_id_size) != 0 || writer_id[0] == '\0') {
     return -1;
   }
 
   if (writer_started_ms != NULL) {
-    *writer_started_ms = pm_json_get_long(buffer, "writerStartedAtMs", 0);
+    *writer_started_ms = pm_json_get_long(generation, "writerStartedAtMs", 0);
   }
-  raw_sequence = pm_json_get_long(buffer, "sequence", 0);
+  raw_sequence = pm_json_get_long(generation, "sequence", 0);
   if (sequence != NULL && raw_sequence > 0) {
     *sequence = (unsigned long)raw_sequence;
   }
-  raw_pid = pm_json_get_long(buffer, "pid", 0);
+  raw_pid = pm_json_get_long(generation, "pid", 0);
   if (owner_pid != NULL && raw_pid > 0) {
     *owner_pid = (pid_t)raw_pid;
   }
@@ -4867,7 +4875,7 @@ static int pm_append_snapshot_from_listeners(
     goto cleanup;
   }
 
-  if (pm_buffer_appendf(payload, "{\"agentPid\":%ld,\"daemon\":{\"status\":\"running\",\"pid\":%ld,\"startedAt\":", (long)state->agent_pid, (long)state->agent_pid) != 0 ||
+  if (pm_buffer_appendf(payload, "{\"agentPid\":%ld,\"daemon\":{\"controllerAuthorizationVersion\":1,\"authenticatesNetworkPeers\":true,\"authenticatesProcessScopes\":%s,\"trustedQueryTools\":%s,\"status\":\"running\",\"pid\":%ld,\"startedAt\":", (long)state->agent_pid, state->trusted_tools ? "true" : "false", state->trusted_tools ? "true" : "false", (long)state->agent_pid) != 0 ||
       pm_json_append_string(payload, state->started_at) != 0 ||
       pm_buffer_append(payload, ",\"updatedAt\":") != 0 ||
       pm_json_append_string(payload, updated_at) != 0 ||
@@ -5035,7 +5043,7 @@ int pm_state_daemon_status(pm_agent_state *state, pm_buffer *payload) {
     return -1;
   }
 
-  if (pm_buffer_appendf(payload, "{\"status\":\"running\",\"pid\":%ld,\"startedAt\":", (long)state->agent_pid) != 0 ||
+  if (pm_buffer_appendf(payload, "{\"controllerAuthorizationVersion\":1,\"authenticatesNetworkPeers\":true,\"authenticatesProcessScopes\":%s,\"trustedQueryTools\":%s,\"status\":\"running\",\"pid\":%ld,\"startedAt\":", state->trusted_tools ? "true" : "false", state->trusted_tools ? "true" : "false", (long)state->agent_pid) != 0 ||
       pm_json_append_string(payload, state->started_at) != 0 ||
       pm_buffer_append(payload, ",\"updatedAt\":") != 0 ||
       pm_json_append_string(payload, updated_at) != 0 ||
@@ -5148,6 +5156,9 @@ static int pm_prepare_listener_metadata(pm_agent_state *state, pm_scan_context *
   char updated_at[PM_TIME];
   int pending = 0;
   pid_t previous_pid = 0;
+  /* Trusted mode uses controller scope plus the real listener coordinate;
+   * neither env nor argv is a source of route authority or port hints. */
+  if (state->trusted_tools) return 0;
   if (pm_hook_recovery_disabled()) return 0;
   pm_iso_now(updated_at, sizeof(updated_at));
   if (pm_scan_lsof(&listeners, updated_at) != 0) return 0;

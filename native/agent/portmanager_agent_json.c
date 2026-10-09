@@ -169,36 +169,29 @@ static const char *pm_skip_space(const char *cursor) {
 }
 
 static const char *pm_find_json_key(const char *json, const char *key) {
-  char needle[PM_SMALL];
-  const char *cursor;
-  size_t key_length;
-
-  if (json == NULL || key == NULL) {
-    return NULL;
-  }
-
-  key_length = strlen(key);
-  if (key_length + 3 >= sizeof(needle)) {
-    return NULL;
-  }
-
-  snprintf(needle, sizeof(needle), "\"%s\"", key);
-  cursor = json;
-
-  for (;;) {
-    const char *match = strstr(cursor, needle);
-    if (match == NULL) {
-      return NULL;
+  const char *cursor = pm_skip_space(json);
+  int depth = 0;
+  if (cursor == NULL || *cursor != '{' || key == NULL) return NULL;
+  /* Keys inside strings/nested objects must never act as outer credentials,
+   * methods, or PIDs. Stop at this object's closing brace, not its suffix. */
+  for (; *cursor != '\0'; cursor++) {
+    if (*cursor == '{' || *cursor == '[') { depth++; continue; }
+    if (*cursor == '}' || *cursor == ']') { if (--depth == 0) return NULL; continue; }
+    if (*cursor != '"') continue;
+    const char *start = ++cursor;
+    int escaped = 0;
+    while (*cursor != '\0' && *cursor != '"') {
+      if (*cursor == '\\') { escaped = 1; if (*++cursor == '\0') return NULL; }
+      cursor++;
     }
-
-    match += strlen(needle);
-    match = pm_skip_space(match);
-    if (match != NULL && *match == ':') {
-      return pm_skip_space(match + 1);
+    if (*cursor == '\0') return NULL;
+    const char *value = pm_skip_space(cursor + 1);
+    if (depth == 1 && !escaped && *value == ':' &&
+        (size_t)(cursor - start) == strlen(key) && memcmp(start, key, strlen(key)) == 0) {
+      return pm_skip_space(value + 1);
     }
-
-    cursor = match;
   }
+  return NULL;
 }
 
 static int pm_read_json_string(const char *cursor, char *out, size_t out_size) {
@@ -261,9 +254,8 @@ static int pm_read_json_string(const char *cursor, char *out, size_t out_size) {
       }
     }
 
-    if (length + 1 < out_size) {
-      out[length++] = ch;
-    }
+    if (ch == '\0' || length + 1 >= out_size) { out[0] = '\0'; return -1; }
+    out[length++] = ch;
   }
 
   out[length] = '\0';
@@ -358,6 +350,11 @@ const char *pm_json_payload(const char *json) {
   return pm_find_json_key(json, "payload");
 }
 
+const char *pm_json_object(const char *json, const char *key) {
+  const char *value = pm_find_json_key(json, key);
+  return value != NULL && *value == '{' ? value : NULL;
+}
+
 int pm_parse_request(const char *line, pm_request *request) {
   const char *payload;
 
@@ -369,6 +366,9 @@ int pm_parse_request(const char *line, pm_request *request) {
   if (pm_json_get_string(line, "method", request->method, sizeof(request->method)) != 0) {
     return -1;
   }
+
+  pm_json_get_string(line, "authorization", request->authorization, sizeof(request->authorization));
+  pm_json_get_string(line, "authorizationNetworkId", request->authorization_network_id, sizeof(request->authorization_network_id));
 
   payload = pm_json_payload(line);
   request->payload = payload == NULL ? "{}" : payload;

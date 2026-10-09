@@ -8,6 +8,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
 import { getRouteTablePathForLogicalPort } from "../../src/agent/route-table";
+import { createTestAgentCredential, testAgentAuthorization } from "./native-agent-test-authorization";
 
 const root = path.resolve(__dirname, "../../..");
 const agentPath = process.env.PORT_MANAGER_TEST_NATIVE_AGENT_PATH ?? path.join(root, "media/native/portmanager_agent");
@@ -57,7 +58,7 @@ async function channel(context: TestContext, socketPath: string) {
     socket, messages,
     send(method: string, payload?: unknown) {
       const id = `scan-test-${++sequence}`;
-      socket.write(`${JSON.stringify({ id, method, payload })}\n`);
+      socket.write(`${JSON.stringify({ id, method, payload, authorization: testAgentAuthorization(socketPath) })}\n`);
       return id;
     },
     async reply<T = unknown>(id: string, timeoutMs = 1500): Promise<T> {
@@ -76,7 +77,8 @@ async function fixture(context: TestContext, timeoutMs = 3000, script = gatedSca
   fs.writeFileSync(path.join(directory, "lsof"), script, { mode: 0o755 });
   let stderr = "";
   const child = spawn(agentPath, ["--socket", paths.socket, "--route-table", paths.routes,
-    "--agent-main", path.join(root, "out/src/agent/agent-main.js"), "--dns-port", "0"], {
+    "--agent-main", path.join(root, "out/src/agent/agent-main.js"), "--dns-port", "0",
+    "--controller-token-file", createTestAgentCredential(paths.socket)], {
     stdio: ["ignore", "ignore", "pipe"], env: {
       ...process.env, PATH: `${directory}:${process.env.PATH}`, PORT_MANAGER_AGENT_DISABLE_HOOK_RECOVERY: "1",
       PORT_MANAGER_AGENT_SCAN_TIMEOUT_MS: String(timeoutMs), PM_SCAN_DATA: paths.data, PM_SCAN_PIDS: paths.pids,
@@ -224,12 +226,14 @@ test("a registration during a scan fences out the old listener owner", async (co
 });
 
 test("a timed out scan discards partial output, retains the last snapshot and kills its process group", async (context) => {
-  const { paths, client, pids } = await fixture(context, 600);
+  // Both the seed observation and the deliberately blocked observation use
+  // the production budget; an overloaded host must not invalidate the seed.
+  const { paths, client, pids } = await fixture(context);
   fs.writeFileSync(paths.data, `p${process.pid}\ncfixture\nn127.0.0.1:48393\n`);
-  await client.reply(client.send("repairRoutingState"));
+  await client.reply(client.send("repairRoutingState"), 5000);
   fs.writeFileSync(paths.data, `p${process.pid}\ncpartial\nn127.0.0.1:48394\n`);
   fs.writeFileSync(paths.block, "");
-  await assert.rejects(client.reply(client.send("repairRoutingState"), 1500), /fresh listener scan/);
+  await assert.rejects(client.reply(client.send("repairRoutingState"), 5000), /fresh listener scan/);
   const snapshot = await client.reply<{ listeners: { port: number }[] }>(client.send("listSnapshot"));
   assert.equal(snapshot.listeners.some((row) => row.port === 48393), true);
   assert.equal(snapshot.listeners.some((row) => row.port === 48394), false);
@@ -237,23 +241,31 @@ test("a timed out scan discards partial output, retains the last snapshot and ki
 });
 
 test("abandoning a read-only scan cancels its subprocess before the command deadline", async (context) => {
-  const { paths, client, pids } = await fixture(context);
+  // Give process startup a separate budget, then retain the strict 500ms
+  // cancellation bound. A live wrapper must be witnessed before disconnect.
+  const commandDeadline = 8000;
+  const { paths, client, pids } = await fixture(context, commandDeadline);
   fs.writeFileSync(paths.block, "");
+  const started = performance.now();
   client.send("listSnapshot");
-  await until(() => fs.existsSync(paths.entered));
+  await until(() => fs.existsSync(paths.entered), 5000);
+  assert.ok(pids().some(alive), "cancellation must target a running scan");
   client.socket.destroy();
   await until(() => pids().every((pid) => !alive(pid)), 500);
+  assert.ok(performance.now() - started < commandDeadline, "disconnect must cancel before the command timeout");
 });
 
 test("a release scan timeout preserves its live route until a successful observation", async (context) => {
-  const { paths, client } = await fixture(context, 600);
+  // Keep the production scan budget: this case needs a successful new OS
+  // observation after the timeout, not a second subsecond scheduling race.
+  const { paths, client } = await fixture(context);
   const payload = { pid: process.pid, requestedPort: 48397, actualPort: 48398, host: "127.0.0.1", networkId: "release" };
   await client.reply(client.send("registerExistingProcess", { ...payload, name: "release", command: "release", cwd: root, source: "hooked" }));
   fs.writeFileSync(paths.block, "");
-  assert.equal(await client.reply(client.send("releaseProcessRoute", payload)), false);
+  assert.equal(await client.reply(client.send("releaseProcessRoute", payload), 5000), false);
   assert.equal((await client.reply<{ routeCount: number }>(client.send("daemonStatus"))).routeCount, 1);
   fs.writeFileSync(paths.release, "");
-  assert.equal(await client.reply(client.send("releaseProcessRoute", payload)), true);
+  assert.equal(await client.reply(client.send("releaseProcessRoute", payload), 5000), true);
   assert.equal((await client.reply<{ routeCount: number }>(client.send("daemonStatus"))).routeCount, 0);
 });
 

@@ -5,6 +5,8 @@ import test from "node:test";
 
 import {
   ACTUAL_LOOPBACK_HOST_ENV,
+  allocateNetworkIdWithUniqueAddresses,
+  assertNetworkAddressesAreUnique,
   browserLoopbackAddressForNetwork,
   GLOBAL_LOGICAL_NETWORK_ID,
   hostLocalGatewayLoopbackAddressForNetwork,
@@ -19,6 +21,49 @@ import {
   usesLoopbackAddressOnlyRouting,
 } from "../../src/core/networks/loopback-address";
 import { DEFAULT_PORT_MANAGER_SETTINGS } from "../../src/shared/default-settings";
+
+/** Actual UUID-shaped ids from the bounded isolation audit, not a mocked hash. */
+const COLLIDING_NETWORK_IDS = [
+  "network-00000000-0000-4000-8000-00000000130b",
+  "network-00000000-0000-4000-8000-0000000016a8",
+] as const;
+
+for (const [band, address, first, second] of [
+  ["browser", browserLoopbackAddressForNetwork, "network-00000000-0000-4000-8000-000000000f81", "network-00000000-0000-4000-8000-000000001130"],
+  ["host gateway", hostLocalGatewayLoopbackAddressForNetwork, "network-00000000-0000-4000-8000-00000000000b", "network-00000000-0000-4000-8000-0000000005a8"],
+] as const) {
+  test(`network allocation rejects an actual ${band} address collision`, () => {
+    assert.equal(address(first), address(second));
+    assert.notEqual(loopbackAddressForNetwork(first), loopbackAddressForNetwork(second));
+    assert.throws(() => assertNetworkAddressesAreUnique(second, [first]), /share a loopback address/);
+    let attempts = 0;
+    const candidates = [second, "network-unique-audit"];
+    assert.equal(allocateNetworkIdWithUniqueAddresses([first], () => candidates[attempts++]), "network-unique-audit");
+    assert.equal(attempts, 2);
+  });
+}
+
+test("network identity allocation retries actual loopback collisions before resource creation", () => {
+  const [existing, collision] = COLLIDING_NETWORK_IDS;
+  assert.equal(loopbackAddressForNetwork(existing), loopbackAddressForNetwork(collision));
+  const candidates = [collision, existing, GLOBAL_LOGICAL_NETWORK_ID, "network-unique-audit"];
+  let attempts = 0;
+  const id = allocateNetworkIdWithUniqueAddresses([existing], () => candidates[attempts++]);
+  assert.equal(id, "network-unique-audit");
+  assert.equal(attempts, 4);
+  assert.doesNotThrow(() => assertNetworkAddressesAreUnique(id, [existing]));
+  assert.throws(() => assertNetworkAddressesAreUnique(collision, [existing]), /share a loopback address/);
+});
+
+test("network identity allocation fails closed when its bounded candidates collide", () => {
+  const [existing, collision] = COLLIDING_NETWORK_IDS;
+  let attempts = 0;
+  assert.throws(() => allocateNetworkIdWithUniqueAddresses([existing], () => {
+    attempts++;
+    return collision;
+  }), /unique loopback addresses/);
+  assert.equal(attempts, 128);
+});
 
 test("loopback address routing maps network ids to stable non-default loopback hosts", () => {
   const first = loopbackAddressForNetwork("network-a");

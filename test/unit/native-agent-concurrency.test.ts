@@ -11,6 +11,7 @@ import {
   getRouteTablePathForLogicalPort,
 } from "../../src/agent/route-table";
 import { buildNodeRuntimeEnvironment } from "../../src/platform/process/node-runtime";
+import { createTestAgentCredential, testAgentAuthorization } from "./native-agent-test-authorization";
 
 /**
  * Black-box concurrency coverage for the native daemon.
@@ -211,7 +212,7 @@ test("native agent route tables carry TTL and refresh unchanged files", () => {
   assert.equal(unchangedBody.includes("pm_write_route_table_file(state, file_path, routes, count, sequence)"), true);
 });
 
-test("native agent recovers restarted hook routes from process environment", () => {
+test("native legacy recovery keeps environment hints outside controller-scoped recovery", () => {
   const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
   const header = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.h"), "utf8");
   const peerSource = fs.readFileSync(path.join(projectRoot, "native", "shared", "pm_peer_process.c"), "utf8");
@@ -268,7 +269,7 @@ test("native agent recovers restarted hook routes from process environment", () 
   assert.equal(listenerRecoveryBody.includes("pm_hook_recovery_listener_matches_exported_loopback"), true);
   assert.equal(source.includes("pm_is_non_default_loopback_host(normalized_exported_host)"), true);
   assert.equal(source.includes("requested_port == listener->port && !same_port_recovery"), true);
-  assert.equal(listenerRecoveryBody.includes("if (pm_inspect_hook_recovery_command(inspection))"), true);
+  assert.equal(listenerRecoveryBody.includes("if (!controller_scoped && pm_inspect_hook_recovery_command(inspection))"), true);
   assert.equal(listenerRecoveryBody.includes("pm_is_hook_recovery_helper_text(command)"), true);
   assert.ok(
     listenerRecoveryBody.indexOf("pm_inspect_hook_recovery_command(inspection)") <
@@ -340,7 +341,7 @@ if (!fs.existsSync(nativeAgentPath)) {
       `hook-${process.pid}-pipeline-after-2`,
     ];
     socket.write([
-      JSON.stringify({ id: shutdownId, method: "shutdownDaemon" }),
+      JSON.stringify({ id: shutdownId, method: "shutdownDaemon", authorization: testAgentAuthorization(fixture.socketPath) }),
       ...trailingIds.map((id) => JSON.stringify({ id, method: "daemonStatus" })),
       "",
     ].join("\n"));
@@ -400,7 +401,7 @@ if (!fs.existsSync(nativeAgentPath)) {
     context.after(() => socket.destroy());
 
     const startedAt = Date.now();
-    socket.write(`${JSON.stringify({ id: requestId, method: "daemonStatus" })}\n`);
+    socket.write(`${JSON.stringify({ id: requestId, method: "daemonStatus", authorization: testAgentAuthorization(fixture.socketPath) })}\n`);
     await waitForSocketMessage(
       messages,
       (message) => isMessageWithType(message, "response") && message.id === requestId && message.ok === true,
@@ -452,7 +453,7 @@ if (!fs.existsSync(nativeAgentPath)) {
     const messages = collectSocketMessages(extensionSocket);
     const subscriptionId = `extension-${process.pid}-fair-events`;
     context.after(() => extensionSocket.destroy());
-    extensionSocket.write(`${JSON.stringify({ id: subscriptionId, method: "daemonStatus" })}\n`);
+    extensionSocket.write(`${JSON.stringify({ id: subscriptionId, method: "daemonStatus", authorization: testAgentAuthorization(fixture.socketPath) })}\n`);
     await waitForSocketMessage(
       messages,
       (message) => isMessageWithType(message, "response") && message.id === subscriptionId && message.ok === true,
@@ -558,7 +559,7 @@ if (!fs.existsSync(nativeAgentPath)) {
     const messages = collectSocketMessages(extensionSocket);
     const subscriptionId = `extension-${process.pid}-cached-listener-events`;
     context.after(() => extensionSocket.destroy());
-    extensionSocket.write(`${JSON.stringify({ id: subscriptionId, method: "daemonStatus" })}\n`);
+    extensionSocket.write(`${JSON.stringify({ id: subscriptionId, method: "daemonStatus", authorization: testAgentAuthorization(fixture.socketPath) })}\n`);
     await waitForSocketMessage(
       messages,
       (message) => isMessageWithType(message, "response") && message.id === subscriptionId && message.ok === true,
@@ -686,6 +687,7 @@ if (!fs.existsSync(nativeAgentPath)) {
       socket.write(`${JSON.stringify({
         id: `hook-${process.pid}-send-only-register`,
         method: "registerExistingProcess",
+        authorization: testAgentAuthorization(fixture.socketPath),
         payload: {
           pid: process.pid,
           name: "send-only-fixture",
@@ -901,6 +903,7 @@ if (!fs.existsSync(nativeAgentPath)) {
     });
     const stderrChunks: Buffer[] = [];
     const duplicate = spawn(nativeAgentPath, [
+      "--controller-token-file", createTestAgentCredential(fixture.socketPath),
       "--socket",
       fixture.socketPath,
       "--route-table",
@@ -1446,6 +1449,7 @@ async function startNativeAgent(
   const routeTablePath = path.join(testDirectory, "routes.json");
   const stderrChunks: Buffer[] = [];
   const agent = spawn(nativeAgentPath, [
+    "--controller-token-file", createTestAgentCredential(socketPath),
     "--socket",
     socketPath,
     "--route-table",
@@ -1548,7 +1552,7 @@ async function openExtensionClient(socketPath: string): Promise<net.Socket> {
     });
   });
 
-  socket.write(`${JSON.stringify({ id: requestId, method: "refreshSnapshot" })}\n`);
+  socket.write(`${JSON.stringify({ id: requestId, method: "refreshSnapshot", authorization: testAgentAuthorization(socketPath) })}\n`);
   await ready;
   return socket;
 }
@@ -1615,7 +1619,7 @@ async function requestOnce<T = unknown>(
       clearTimeout(timer);
       reject(new Error(`Native agent connection closed before response: ${request.method}`));
     });
-    socket.write(`${JSON.stringify(request)}\n`);
+    socket.write(`${JSON.stringify({ ...request, authorization: testAgentAuthorization(socketPath) })}\n`);
   });
 }
 

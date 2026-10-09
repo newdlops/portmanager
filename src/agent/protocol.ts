@@ -31,6 +31,8 @@ export type AgentRequestMethod =
   | "shutdownDaemon"
   | "startManagedProcess"
   | "registerExistingProcess"
+  | "registerProcessScope"
+  | "resolveProcessScope"
   | "stopProcess"
   | "restartProcess"
   | "removeProcess"
@@ -46,6 +48,10 @@ export interface AgentRequestMessage<TPayload = unknown> {
   readonly id: AgentRequestId;
   /** Request method understood by the agent dispatcher. */
   readonly method: AgentRequestMethod;
+  /** Private controller or network capability; never include it in logs/events. */
+  readonly authorization?: string;
+  /** Realm of a workload capability; controller requests omit it. */
+  readonly authorizationNetworkId?: string;
   /** Method-specific data. Empty requests may omit it. */
   readonly payload?: TPayload;
 }
@@ -156,6 +162,16 @@ export interface ReleaseProcessRoutePayload {
   readonly processGroupId?: number;
 }
 
+/** OS identity acknowledged before guarded exec; environment has no authority. */
+export interface AuthenticatedProcessScope {
+  readonly pid: number;
+  /** macOS microsecond process creation time; callers must preserve this integer. */
+  readonly birth: number;
+  readonly networkId: string;
+}
+
+export type ResolveProcessScopePayload = Pick<AuthenticatedProcessScope, "pid" | "birth">;
+
 export type AgentRequestPayloadByMethod = {
   readonly daemonStatus: undefined;
   readonly listSnapshot: undefined;
@@ -165,6 +181,8 @@ export type AgentRequestPayloadByMethod = {
   readonly shutdownDaemon: undefined;
   readonly startManagedProcess: AgentStartManagedProcessRequest;
   readonly registerExistingProcess: RegisteredProcessInput;
+  readonly registerProcessScope: AuthenticatedProcessScope;
+  readonly resolveProcessScope: ResolveProcessScopePayload;
   readonly stopProcess: StopProcessPayload;
   readonly restartProcess: RestartProcessPayload;
   readonly removeProcess: RemoveProcessPayload;
@@ -183,6 +201,8 @@ export type AgentResponsePayloadByMethod = {
   readonly shutdownDaemon: boolean;
   readonly startManagedProcess: ManagedProcess;
   readonly registerExistingProcess: ManagedProcess;
+  readonly registerProcessScope: AuthenticatedProcessScope;
+  readonly resolveProcessScope: AuthenticatedProcessScope | null;
   readonly stopProcess: ManagedProcess | undefined;
   readonly restartProcess: ManagedProcess | undefined;
   readonly removeProcess: ManagedProcess | undefined;
@@ -299,6 +319,8 @@ function isAgentRequestMethod(value: unknown): value is AgentRequestMethod {
     value === "shutdownDaemon" ||
     value === "startManagedProcess" ||
     value === "registerExistingProcess" ||
+    value === "registerProcessScope" ||
+    value === "resolveProcessScope" ||
     value === "stopProcess" ||
     value === "restartProcess" ||
     value === "removeProcess" ||

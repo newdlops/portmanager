@@ -21,6 +21,7 @@
 - `pm_peer_read_environment_text(pid, names, ...)`: 한 프로세스에서 선택한 환경 항목만 exact-entry 형식으로 조회.
 - `pm_dev_log(...)`: opt-in 공용 진단 로그 기록.
 - `pm_tcp_proxy.{h,c}`: native router와 host exposure가 공유하는 TCP transport.
+- `pm_network_namespace_key(...)`: stable network ID의 UTF-8 바이트를 lowercase hex로 인코딩; TS `network-identity.ts`와 동일하며 잘라내지 않는다.
 
 ## 외부 의존성
 
@@ -30,7 +31,7 @@
 
 ## 주의사항
 
-- 환경 조회는 동일 uid 프로세스에서만 신뢰할 수 있다(sudo 프로세스 등은 스코프 미해석 → non-network로 취급될 수 있음).
+- 환경 조회는 협조적인 프로세스의 귀속을 위한 값이다. 동일 uid라도 악성 프로세스는 환경값을 위조할 수 있으므로 권한 증명으로 사용하지 않는다. sudo 프로세스 등은 스코프 미해석 → non-network로 취급될 수 있다.
 - pcblist_n의 XNU private 구조체 대신 공개 `proc_pidfdinfo` 경로를 쓴다. 연결당 프로세스 fd를 훑으므로 호출자(TypeScript)가 verdict를 캐시해 반복 조회를 피한다.
 - 네트워크 스코프 변수 목록과 우선순위는 `portmanager_process_lookup`과 의도적으로 일치시킨다. 변경 시 함께 맞춘다.
 

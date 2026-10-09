@@ -196,6 +196,9 @@ typedef struct {
   unsigned long next_process_id;
   unsigned long next_allocation_id;
   pid_t agent_pid;
+  /* Controller-origin identity resolver runs only on the control thread. */
+  int (*resolve_process_scope)(pid_t pid, char *network_id, size_t size);
+  int trusted_tools;
   /*
    * Browser DNS responder owned by the daemon (see portmanager_agent_dns.c).
    * fd is -1 while unbound; bound_port is 0 until a bind succeeds so
@@ -220,6 +223,8 @@ typedef struct {
 typedef struct {
   char id_raw[PM_SMALL];
   char method[PM_SMALL];
+  char authorization[129];
+  char authorization_network_id[128];
   const char *payload;
 } pm_request;
 
@@ -228,6 +233,8 @@ typedef struct {
   char socket_path[PM_TEXT];
   char route_table_path[PM_TEXT];
   char agent_main_path[PM_TEXT];
+  char controller_token_path[PM_TEXT];
+  int trusted_tools;
   char stale_lock_path[PM_TEXT];
   int probe_only;
   int lock_stale_mode;
@@ -307,6 +314,7 @@ int pm_json_get_int(const char *json, const char *key, int default_value);
 long pm_json_get_long(const char *json, const char *key, long default_value);
 int pm_json_get_raw(const char *json, const char *key, char *out, size_t out_size);
 const char *pm_json_payload(const char *json);
+const char *pm_json_object(const char *json, const char *key);
 int pm_parse_request(const char *line, pm_request *request);
 
 void pm_iso_now(char *buffer, size_t size);

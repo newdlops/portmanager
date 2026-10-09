@@ -245,6 +245,13 @@ celery-특화적이고 층이 틀려 되돌렸다. 정체성은 호스트명 층
 
 ## 14. per-network env 값 = 생성자 주입 (`.portmanager/env/<네트워크이름>.env`)
 
+2026-10-08 보안 보완에서 이름 기반 경로는 legacy 입력으로만 유지한다. 실제 저장과
+native 읽기는 `.portmanager/namespaces/id-<network-id UTF-8 hex>/environment.env`를
+사용한다. 표시 이름은 복수 네트워크에서 같을 수 있으며 경로·권한을 선택하지 않는다.
+legacy env/files는 현재 registry와 실제 파일 inode로 단일 소유자를 확인한 경우에만
+원본을 보존하며 복사한다. 애매한 설정은 attach 전에 오류로 드러내고 자동 적용하지 않는다.
+아래의 이름 기반 파일 설명은 이전 형식의 호환성 설명으로 해석한다.
+
 라우팅은 하나의 .env로 모든 네트워크를 커버하고(로컬호스트 URL은 connect()에서
 네트워크별 라우팅), 호스트명 가상화는 호스트명-파생 정체성을 가른다. 그러나
 네트워크별로 **값 자체**가 달라야 하는 것(자격증명 경로, 버킷명 등)은 앱-특화 설정
@@ -279,6 +286,13 @@ celery-특화적이고 층이 틀려 되돌렸다. 정체성은 호스트명 층
   `pm_network_env_apply_line` / `pm_find_network_env_file` (`portmanager_hook.c`).
 
 ## 15. per-network 파일 치환 (`.portmanager/files/<이름>/…`) — 대체 + 자동 상태 분할
+
+실제 mirror는 `.portmanager/namespaces/id-<network-id UTF-8 hex>/files/…`다.
+이름·Unicode 정규화·슬래시 치환으로 파일이 섞이지 않아야 한다. 새 디렉터리는 0700,
+dotenv 사본은 0600이며 완성된 파일만 원자적으로 게시한다. 기존 사본은 덮어쓰지 않고
+copy-up 실패는 공유 원본 읽기로 fallback하지 않는다. mirror의 leaf/parent symlink는
+open 경계에서 거부한다. 공유 소스와 기존 쓰기 동작은 사용자 선택대로 유지하므로,
+소스 변경을 통한 네트워크 간 간접 영향까지 악성 코드 격리로 보장한다고 표현하지 않는다.
 
 규칙(사용자 명세): **`.portmanager`에 대응 파일이 존재하면 프로세스는 그 파일과만
 소통하고 원본은 읽지 않는다** — 완전 대체, 쓰기 포함. 그리고 **`.pid`/`.lock`/log류

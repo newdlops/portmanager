@@ -30,6 +30,8 @@
 #include <sys/utsname.h>
 
 #include "../shared/pm_dev_log.h"
+#include "../shared/pm_network_namespace.h"
+#include "../network-broker/pm_network_broker_client.h"
 
 /*
  * Port Manager native socket hook.
@@ -76,6 +78,8 @@
 
 typedef int (*pm_bind_fn)(int, const struct sockaddr *, socklen_t);
 typedef int (*pm_connect_fn)(int, const struct sockaddr *, socklen_t);
+typedef int (*pm_listen_fn)(int, int);
+typedef int (*pm_accept_fn)(int, struct sockaddr *, socklen_t *);
 typedef int (*pm_getsockname_fn)(int, struct sockaddr *, socklen_t *);
 typedef int (*pm_getifaddrs_fn)(struct ifaddrs **);
 typedef int (*pm_execve_fn)(const char *, char *const [], char *const []);
@@ -137,6 +141,8 @@ typedef struct pm_cached_route {
 #if defined(__APPLE__)
 static pm_bind_fn pm_real_bind = bind;
 static pm_connect_fn pm_real_connect = connect;
+static pm_listen_fn pm_real_listen = listen;
+static pm_accept_fn pm_real_accept = accept;
 static pm_getsockname_fn pm_real_getsockname = getsockname;
 static pm_getifaddrs_fn pm_real_getifaddrs = getifaddrs;
 static pm_execve_fn pm_real_execve = execve;
@@ -151,6 +157,8 @@ static pm_kill_fn pm_real_kill = kill;
 #else
 static pm_bind_fn pm_real_bind = NULL;
 static pm_connect_fn pm_real_connect = NULL;
+static pm_listen_fn pm_real_listen = NULL;
+static pm_accept_fn pm_real_accept = NULL;
 static pm_getsockname_fn pm_real_getsockname = NULL;
 static pm_getifaddrs_fn pm_real_getifaddrs = NULL;
 static pm_execve_fn pm_real_execve = NULL;
@@ -757,7 +765,8 @@ static void pm_normalize_process_preload_env(void) {
  * environment snapshot (CPython os.environ, JVM, Go), so values set here are
  * visible to ANY runtime with zero app knowledge.
  *
- * A process attached to network <name> looks for `.portmanager/env/<name>.env`
+ * A process attached to network <id> looks for its canonical ID namespace's
+ * `environment.env`
  * from its cwd upward (nearest wins; <name> falls back to the network id) and
  * applies KEY=VALUE lines with OVERWRITE semantics — the per-network file beats
  * both inherited terminal env and the app's own .env (dotenv defaults never
@@ -771,7 +780,7 @@ static void pm_normalize_process_preload_env(void) {
  * interpolation, no multiline. See docs/per-network-env.md.
  * ============================================================================
  */
-#define PM_NETWORK_ENV_DIR_RELATIVE ".portmanager/env"
+#define PM_NETWORK_ENV_DIR_RELATIVE ".portmanager/namespaces"
 #define PM_NETWORK_ENV_APPLIED_ENV "PORT_MANAGER_NETWORK_ENV_APPLIED"
 
 static int pm_network_env_key_is_reserved(const char *key) {
@@ -851,20 +860,11 @@ static int pm_network_env_apply_line(char *line) {
   return setenv(key, value, 1) == 0 ? 1 : 0;
 }
 
-/* Finds `.portmanager/env/<network>.env` from cwd upward; 0 on success. */
+/* Finds the stable ID's `namespaces/<id-key>/environment.env`; 0 on success. */
 static int pm_find_network_env_file(const char *network, char *path, size_t size) {
   char directory[PM_MAX_PATH];
-  char file_name[256];
-  size_t out = 0;
-
-  /* The network name doubles as a file name: bytes verbatim, path separators mapped. */
-  for (const char *cursor = network; *cursor != '\0' && out + 5 < sizeof(file_name); cursor++) {
-    file_name[out++] = (*cursor == '/') ? '-' : *cursor;
-  }
-  if (out == 0) {
-    return -1;
-  }
-  memcpy(file_name + out, ".env", 5);
+  char key[PM_NETWORK_NAMESPACE_KEY_SIZE];
+  if (pm_network_namespace_key(network, key, sizeof(key)) != 0) return -1;
 
   if (getcwd(directory, sizeof(directory)) == NULL) {
     return -1;
@@ -874,8 +874,9 @@ static int pm_find_network_env_file(const char *network, char *path, size_t size
     struct stat file_stat;
     char *slash;
 
-    snprintf(path, size, "%s/%s/%s", directory, PM_NETWORK_ENV_DIR_RELATIVE, file_name);
-    if (stat(path, &file_stat) == 0 && S_ISREG(file_stat.st_mode)) {
+    int written = snprintf(path, size, "%s/%s/%s/environment.env", directory, PM_NETWORK_ENV_DIR_RELATIVE, key);
+    if (written > 0 && (size_t)written < size && lstat(path, &file_stat) == 0 &&
+        S_ISREG(file_stat.st_mode) && file_stat.st_uid == geteuid()) {
       return 0;
     }
     slash = strrchr(directory, '/');
@@ -907,10 +908,7 @@ static void pm_apply_network_env_file(void) {
   if (!pm_hook_enabled() || pm_network_scope_is_global()) {
     return;
   }
-  network = getenv("PORT_MANAGER_NETWORK_NAME");
-  if (network == NULL || network[0] == '\0') {
-    network = getenv("PORT_MANAGER_NETWORK_ID");
-  }
+  network = pm_current_network_id();
   if (network == NULL || network[0] == '\0') {
     return;
   }
@@ -937,8 +935,16 @@ static void pm_apply_network_env_file(void) {
   if (pm_find_network_env_file(stable_network, path, sizeof(path)) != 0) {
     return;
   }
-  file = fopen(path, "r");
+  int descriptor = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  struct stat env_stat;
+  if (descriptor < 0) return;
+  if (fstat(descriptor, &env_stat) != 0 || !S_ISREG(env_stat.st_mode) || env_stat.st_uid != geteuid()) {
+    close(descriptor);
+    return;
+  }
+  file = fdopen(descriptor, "r");
   if (file == NULL) {
+    close(descriptor);
     return;
   }
   while (fgets(line, sizeof(line), file) != NULL) {
@@ -964,10 +970,10 @@ static void pm_apply_network_env_file(void) {
  * `.portmanager`, the process talks ONLY to that counterpart — the original is
  * never read (or written). Layout mirrors the original path:
  *
- *   <root>/.portmanager/files/<network>/<path relative to root>
+ *   <root>/.portmanager/namespaces/<id-key>/files/<path relative to root>
  *
  * e.g. inside network "alphac", open("<root>/.env") opens
- * `<root>/.portmanager/files/alphac/.env` when that file exists; open modes are
+ * that ID's `files/.env` when it exists; open modes are
  * not special-cased, so writes land in the substitute too. <root> is the
  * nearest ancestor of the process cwd containing a `.portmanager` directory,
  * resolved ONCE in the constructor; per-open cost is a prefix compare plus one
@@ -1011,23 +1017,24 @@ static pm_unlink_fn pm_real_unlink = NULL;
 static pm_unlinkat_fn pm_real_unlinkat = NULL;
 #endif
 
+/* Internal window maintenance must bypass Linux's exported unlink wrapper. */
+static int pm_file_substitution_unlink_original(const char *path) {
+#if defined(__APPLE__)
+  return unlink(path);
+#else
+  if (pm_real_unlink == NULL) pm_real_unlink = (pm_unlink_fn)pm_resolve_symbol("unlink");
+  if (pm_real_unlink == NULL) { errno = ENOSYS; return -1; }
+  return pm_real_unlink(path);
+#endif
+}
+
 static int pm_file_substitution_build_context(const char *network, pm_file_substitution_context *context) {
   char directory[PM_MAX_PATH];
   char probe[PM_MAX_PATH];
-  char network_key[256];
-  size_t out = 0;
+  char network_key[PM_NETWORK_NAMESPACE_KEY_SIZE];
 
   memset(context, 0, sizeof(*context));
-  if (network == NULL || network[0] == '\0') {
-    return -1;
-  }
-  for (const char *cursor = network; *cursor != '\0' && out + 1 < sizeof(network_key); cursor++) {
-    network_key[out++] = (*cursor == '/') ? '-' : *cursor;
-  }
-  network_key[out] = '\0';
-  if (out == 0) {
-    return -1;
-  }
+  if (pm_network_namespace_key(network, network_key, sizeof(network_key)) != 0) return -1;
   if (getcwd(directory, sizeof(directory)) == NULL) {
     return -1;
   }
@@ -1037,14 +1044,14 @@ static int pm_file_substitution_build_context(const char *network, pm_file_subst
     char *slash;
 
     snprintf(probe, sizeof(probe), "%s/.portmanager", directory);
-    if (stat(probe, &probe_stat) == 0 && S_ISDIR(probe_stat.st_mode)) {
+    if (lstat(probe, &probe_stat) == 0 && S_ISDIR(probe_stat.st_mode) && probe_stat.st_uid == geteuid()) {
       int written = snprintf(
         context->prefix,
         sizeof(context->prefix),
-        "%s/.portmanager/%s/%s",
+        "%s/.portmanager/namespaces/%s/%s",
         directory,
-        PM_FILE_SUBSTITUTION_DIR,
-        network_key);
+        network_key,
+        PM_FILE_SUBSTITUTION_DIR);
       if (written <= 0 || (size_t)written >= sizeof(context->prefix)) {
         return -1;
       }
@@ -1082,10 +1089,7 @@ static void pm_file_substitution_init(void) {
   if (flag != NULL && strcmp(flag, "0") == 0) {
     return;
   }
-  network = getenv("PORT_MANAGER_NETWORK_NAME");
-  if (network == NULL || network[0] == '\0') {
-    network = getenv("PORT_MANAGER_NETWORK_ID");
-  }
+  network = pm_current_network_id();
   if (pm_file_substitution_build_context(network, &context) != 0) {
     return;
   }
@@ -1184,7 +1188,7 @@ static void pm_file_substitution_symlink_back(const char *original, const char *
         return;
       }
     }
-    unlink(original);
+    pm_file_substitution_unlink_original(original);
   }
   (void)symlink(substitute, original);
 }
@@ -1273,39 +1277,85 @@ static int pm_file_substitution_relative_is_dotenv(const char *relative) {
   return strcmp(basename, ".env") == 0 || strncmp(basename, ".env.", 5) == 0;
 }
 
-/* Byte copy used to materialize a network's own .env from the shared original. */
+/*
+ * Materialize dotenv privately and publish only a complete file. A sibling
+ * process may win copy-up concurrently, so link() claims the final name
+ * without truncating its value or following a destination symlink.
+ */
 static int pm_file_substitution_copy_file(const char *source, const char *destination) {
   char buffer[65536];
+  char temporary[PM_MAX_PATH];
+  struct stat source_stat;
   ssize_t got;
   int in;
   int out;
   int ok = 1;
+  int written;
 
-  in = open(source, O_RDONLY);
+#if defined(__APPLE__)
+  in = open(source, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+#else
+  if (pm_real_open == NULL) pm_real_open = (pm_open_fn)pm_resolve_symbol("open");
+  if (pm_real_open == NULL) { errno = ENOSYS; return -1; }
+  in = pm_real_open(source, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+#endif
   if (in < 0) {
     return -1;
   }
-  out = open(destination, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fstat(in, &source_stat) != 0 || !S_ISREG(source_stat.st_mode)) {
+    close(in);
+    return -1;
+  }
+  written = snprintf(temporary, sizeof(temporary), "%s.pm-copy-XXXXXX", destination);
+  if (written <= 0 || (size_t)written >= sizeof(temporary)) {
+    close(in);
+    return -1;
+  }
+  out = mkstemp(temporary);
   if (out < 0) {
     close(in);
     return -1;
   }
-  while ((got = read(in, buffer, sizeof(buffer))) > 0) {
-    if (write(out, buffer, (size_t)got) != got) {
-      ok = 0;
-      break;
-    }
-  }
-  if (got < 0) {
+  if (fchmod(out, 0600) != 0) {
     ok = 0;
   }
-  close(in);
-  close(out);
-  if (!ok) {
-    unlink(destination);
-    return -1;
+  while (ok) {
+    got = read(in, buffer, sizeof(buffer));
+    if (got < 0 && errno == EINTR) {
+      continue;
+    }
+    if (got <= 0) {
+      if (got < 0) ok = 0;
+      break;
+    }
+    size_t offset = 0;
+    while (offset < (size_t)got) {
+      ssize_t sent = write(out, buffer + offset, (size_t)got - offset);
+      if (sent < 0 && errno == EINTR) {
+        continue;
+      }
+      if (sent <= 0) {
+        ok = 0;
+        break;
+      }
+      offset += (size_t)sent;
+    }
   }
-  return 0;
+  close(in);
+  if (close(out) != 0) {
+    ok = 0;
+  }
+  if (ok && link(temporary, destination) != 0) {
+    struct stat destination_stat;
+
+    /* An already-published regular file belongs to the network, not copy-up. */
+    if (errno != EEXIST || lstat(destination, &destination_stat) != 0 ||
+        !S_ISREG(destination_stat.st_mode) || destination_stat.st_uid != geteuid()) {
+      ok = 0;
+    }
+  }
+  unlink(temporary);
+  return ok ? 0 : -1;
 }
 
 /* True when the original is absent or already one of our mirror windows. */
@@ -1325,22 +1375,75 @@ static int pm_file_substitution_original_is_virtual(const char *absolute) {
     return 0;
   }
   current[length] = '\0';
-  return strstr(current, "/.portmanager/" PM_FILE_SUBSTITUTION_DIR "/") != NULL;
+  const char *namespaced = strstr(current, "/.portmanager/namespaces/");
+  return strstr(current, "/.portmanager/" PM_FILE_SUBSTITUTION_DIR "/") != NULL ||
+    (namespaced != NULL && strstr(namespaced + strlen("/.portmanager/namespaces/"), "/files/") != NULL);
 }
 
 /*
  * mkdir -p for every mirror-side parent of a candidate path, starting right
  * after the root (which exists by definition) so the hook never depends on the
- * extension having scaffolded `files/<network>/` first.
+ * extension having scaffolded `namespaces/<id-key>/files/` first.
  */
-static void pm_file_substitution_make_parents(char *candidate) {
+static int pm_file_substitution_make_parents(char *candidate) {
   for (char *cursor = candidate + pm_file_substitution_root_length + 1; *cursor != '\0'; cursor++) {
     if (*cursor == '/') {
       *cursor = '\0';
-      (void)mkdir(candidate, 0755);
+      struct stat directory_stat;
+      /* Common namespace parents already exist and are read-only under the
+       * kernel policy. Do not attempt mkdir there merely to get EEXIST. */
+      int observed = lstat(candidate, &directory_stat);
+      if (observed != 0 && errno == ENOENT) {
+        int created = mkdir(candidate, 0700);
+        if (created == 0 || errno == EEXIST) observed = lstat(candidate, &directory_stat);
+      }
+      int valid = observed == 0 && S_ISDIR(directory_stat.st_mode) && directory_stat.st_uid == geteuid();
       *cursor = '/';
+      if (!valid) { errno = EACCES; return -1; }
     }
   }
+  return 0;
+}
+
+/* Walk from the workspace descriptor without following a mirror-side parent
+ * symlink. A rejected namespace must never fall back to the shared original. */
+static int pm_file_substitution_open_target(const char *target, int oflag, mode_t mode) {
+  char relative[PM_MAX_PATH];
+  int directory;
+  int result = -1;
+#if defined(__APPLE__)
+  pm_open_fn real_open = open;
+  pm_openat_fn real_openat = openat;
+#else
+  if (pm_real_open == NULL) pm_real_open = (pm_open_fn)pm_resolve_symbol("open");
+  if (pm_real_openat == NULL) pm_real_openat = (pm_openat_fn)pm_resolve_symbol("openat");
+  pm_open_fn real_open = pm_real_open;
+  pm_openat_fn real_openat = pm_real_openat;
+#endif
+  if (real_open == NULL || real_openat == NULL ||
+      strncmp(target, pm_file_substitution_root, pm_file_substitution_root_length) != 0 ||
+      target[pm_file_substitution_root_length] != '/') { errno = EACCES; return -1; }
+  snprintf(relative, sizeof(relative), "%s", target + pm_file_substitution_root_length + 1);
+  directory = real_open(pm_file_substitution_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (directory < 0) return -1;
+  char *component = relative;
+  char *slash;
+  while ((slash = strchr(component, '/')) != NULL) {
+    *slash = '\0';
+    int next = real_openat(directory, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (next < 0) goto done;
+    close(directory);
+    directory = next;
+    component = slash + 1;
+  }
+  result = real_openat(directory, component, oflag | O_NOFOLLOW, mode);
+done:
+  {
+    int saved_errno = errno;
+    close(directory);
+    errno = saved_errno;
+  }
+  return result;
 }
 
 /*
@@ -1379,21 +1482,24 @@ static const char *pm_file_substitution_target(const char *path, int oflag, char
     struct stat original_stat;
 
     if (lstat(absolute, &original_stat) == 0 && S_ISREG(original_stat.st_mode)) {
-      pm_file_substitution_make_parents(buffer);
+      if (pm_file_substitution_make_parents(buffer) != 0) return buffer;
       if (pm_file_substitution_copy_file(absolute, buffer) == 0) {
         pm_debug("file substitute env copy-up %s -> %s", absolute, buffer);
         pm_dev_log("hook", "file-substitute-env-copy %s -> %s pid=%d", absolute, buffer, (int)getpid());
         return buffer;
       }
-      return NULL;
+      // Keep failed copy-up scoped: opening the mirror will report the error
+      // rather than fall back to shared credentials in the original file.
+      return buffer;
     }
+    if (lstat(absolute, &original_stat) == 0 && S_ISLNK(original_stat.st_mode)) return buffer;
   }
   if (!pm_file_substitution_relative_is_state(relative) ||
       !pm_file_substitution_original_is_virtual(absolute)) {
     return NULL;
   }
   if ((oflag & O_CREAT) != 0) {
-    pm_file_substitution_make_parents(buffer);
+    if (pm_file_substitution_make_parents(buffer) != 0) return buffer;
     pm_file_substitution_symlink_back(absolute, buffer);
     pm_debug("file substitute create %s -> %s", absolute, buffer);
     pm_dev_log("hook", "file-substitute-create %s -> %s pid=%d", absolute, buffer, (int)getpid());
@@ -1440,7 +1546,7 @@ static int pm_file_substitution_unlink_target(const char *path, char *buffer, si
     if (length > 0) {
       current[length] = '\0';
       if (strcmp(current, buffer) == 0) {
-        unlink(absolute);
+        pm_file_substitution_unlink_original(absolute);
       }
     }
   }
@@ -1461,6 +1567,7 @@ static int pm_substitute_open_hook(const char *path, int oflag, ...) {
     va_end(arguments);
   }
   target = pm_file_substitution_target(path, oflag, substitute, sizeof(substitute));
+  if (target != NULL) return pm_file_substitution_open_target(target, oflag, mode);
 #if defined(__APPLE__)
   return open(target != NULL ? target : path, oflag, mode);
 #else
@@ -1486,6 +1593,7 @@ static int pm_substitute_openat_hook(int dirfd, const char *path, int oflag, ...
   /* Only cwd-relative or absolute paths are mapped; real dirfd bases pass through. */
   if (dirfd == AT_FDCWD || (path != NULL && path[0] == '/')) {
     target = pm_file_substitution_target(path, oflag, substitute, sizeof(substitute));
+    if (target != NULL) return pm_file_substitution_open_target(target, oflag, mode);
   }
 #if defined(__APPLE__)
   return openat(dirfd, target != NULL ? target : path, oflag, mode);
@@ -1557,6 +1665,8 @@ static void pm_ensure_symbols(void) {
   if (pm_real_connect == NULL) {
     pm_real_connect = (pm_connect_fn)pm_resolve_symbol("connect");
   }
+  if (pm_real_listen == NULL) pm_real_listen = (pm_listen_fn)pm_resolve_symbol("listen");
+  if (pm_real_accept == NULL) pm_real_accept = (pm_accept_fn)pm_resolve_symbol("accept");
 
   if (pm_real_getsockname == NULL) {
     pm_real_getsockname = (pm_getsockname_fn)pm_resolve_symbol("getsockname");
@@ -2296,6 +2406,14 @@ static int pm_agent_request(
   size_t response_size,
   int wait_for_response) {
   char socket_path[PM_MAX_PATH];
+  char authorization_prefix[512], authorization_network[256];
+  const char *token = getenv("PORT_MANAGER_AGENT_NETWORK_TOKEN");
+  const char *network_id = pm_current_network_id();
+  if (token == NULL || strlen(token) != 64 || strspn(token, "0123456789abcdef") != 64 || request[0] != '{') return -1;
+  pm_json_escape(network_id != NULL && network_id[0] != '\0' ? network_id : "network-global", authorization_network, sizeof(authorization_network));
+  int prefix_length = snprintf(authorization_prefix, sizeof(authorization_prefix),
+    "{\"authorization\":\"%s\",\"authorizationNetworkId\":\"%s\",", token, authorization_network);
+  if (prefix_length < 0 || (size_t)prefix_length >= sizeof(authorization_prefix)) return -1;
   struct sockaddr_un server_addr;
   int fd = -1;
   size_t request_len = strlen(request);
@@ -2355,6 +2473,14 @@ static int pm_agent_request(
     usleep(2000);
   }
 
+  size_t prefix_offset = 0;
+  while (prefix_offset < (size_t)prefix_length) {
+    written = write(fd, authorization_prefix + prefix_offset, (size_t)prefix_length - prefix_offset);
+    if (written < 0 && errno == EINTR) continue;
+    if (written <= 0) { close(fd); return -1; }
+    prefix_offset += (size_t)written;
+  }
+  request++; request_len--;
   while (request_len > 0) {
     written = write(fd, request, request_len);
     if (written < 0 && errno == EINTR) {
@@ -4345,6 +4471,56 @@ static int pm_bind_localhost_relocation(
   return 0;
 }
 
+/* Kernel mode precedes cooperative routing and opt-out env. The broker fixes
+ * the realm independently; changing env only loses access, never widens it. */
+static const char *pm_network_broker_path(void) {
+  const char *path = getenv("PORT_MANAGER_NETWORK_BROKER_SOCKET");
+  return pm_hook_depth == 0 && path != NULL && path[0] != '\0' ? path : NULL;
+}
+static int pm_network_broker_tcp_fd(int fd) {
+  int type; socklen_t size = sizeof(type);
+  struct sockaddr_storage local; socklen_t length = sizeof(local);
+  return pm_real_getsockname != NULL && getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &size) == 0 && type == SOCK_STREAM &&
+    pm_real_getsockname(fd, (struct sockaddr *)&local, &length) == 0 && (local.ss_family == AF_INET || local.ss_family == AF_INET6);
+}
+static int pm_network_broker_operation(int fd, int operation, const struct sockaddr *address, socklen_t length,
+    int backlog, unsigned int flags, struct sockaddr *peer, socklen_t *peer_length) {
+  pm_nb_request request;
+  memset(&request, 0, sizeof(request)); request.magic = PM_NB_MAGIC; request.version = PM_NB_VERSION;
+  request.operation = (uint16_t)operation; request.backlog = backlog; request.flags = flags;
+  if (address != NULL) {
+    if (length > sizeof(request.address)) { errno = EINVAL; return -1; }
+    request.address_length = length; memcpy(request.address, address, length);
+  }
+  pm_nb_response response;
+  int received = -1;
+  const char *path = pm_network_broker_path();
+  pm_hook_depth++;
+  int result = pm_nb_client_call(path, &request, fd, &response, &received);
+  int error = errno;
+  pm_hook_depth--;
+  if (result != 0) { errno = error; return -1; }
+  if (operation != PM_NB_ACCEPT) return response.result;
+  if (received < 0) { errno = EPROTO; return -1; }
+  if (!(flags & PM_NB_CLOEXEC) && fcntl(received, F_SETFD, 0) != 0) { error = errno; close(received); errno = error; return -1; }
+  if (peer != NULL && peer_length != NULL) {
+    socklen_t copy = *peer_length < response.address_length ? *peer_length : response.address_length;
+    memcpy(peer, response.address, copy); *peer_length = response.address_length;
+  }
+  return received;
+}
+static int pm_listen_hook(int fd, int backlog) {
+  pm_ensure_symbols();
+  if (pm_network_broker_path() != NULL && pm_network_broker_tcp_fd(fd)) return pm_network_broker_operation(fd, PM_NB_LISTEN, NULL, 0, backlog, 0, NULL, NULL);
+  if (pm_real_listen == NULL) { errno = ENOSYS; return -1; }
+  return pm_real_listen(fd, backlog);
+}
+static int pm_accept_hook(int fd, struct sockaddr *address, socklen_t *length) {
+  pm_ensure_symbols();
+  if (pm_network_broker_path() != NULL && pm_network_broker_tcp_fd(fd)) return pm_network_broker_operation(fd, PM_NB_ACCEPT, NULL, 0, 0, 0, address, length);
+  if (pm_real_accept == NULL) { errno = ENOSYS; return -1; }
+  return pm_real_accept(fd, address, length);
+}
 static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   struct sockaddr_storage rewritten;
   char host[128];
@@ -4360,6 +4536,10 @@ static int pm_bind_hook(int sockfd, const struct sockaddr *addr, socklen_t addrl
   if (pm_real_bind == NULL) {
     errno = ENOSYS;
     return -1;
+  }
+
+  if (pm_network_broker_path() != NULL && pm_is_supported_sockaddr(addr, addrlen) && pm_network_broker_tcp_fd(sockfd)) {
+    return pm_network_broker_operation(sockfd, PM_NB_BIND, addr, addrlen, 0, 0, NULL, NULL);
   }
 
   if (!pm_hook_enabled() || pm_hook_depth > 0 || !pm_is_supported_sockaddr(addr, addrlen)) {
@@ -4622,6 +4802,10 @@ static int pm_connect_hook(int sockfd, const struct sockaddr *addr, socklen_t ad
   if (pm_real_connect == NULL) {
     errno = ENOSYS;
     return -1;
+  }
+
+  if (pm_network_broker_path() != NULL && pm_is_supported_sockaddr(addr, addrlen) && pm_network_broker_tcp_fd(sockfd)) {
+    return pm_network_broker_operation(sockfd, PM_NB_CONNECT, addr, addrlen, 0, 0, NULL, NULL);
   }
 
   if (pm_should_block_docker_socket(addr, addrlen)) {
@@ -5460,9 +5644,11 @@ static void pm_control_dispatch_line(const char *line) {
 static int pm_control_connect(void) {
   char socket_path[PM_MAX_PATH];
   struct sockaddr_un address;
-  char hello[320];
+  char hello[768], network_json[256];
   size_t hello_length;
   const char *network_id;
+  const char *token = getenv("PORT_MANAGER_AGENT_NETWORK_TOKEN");
+  if (token == NULL || strlen(token) != 64 || strspn(token, "0123456789abcdef") != 64) return -1;
   int fd;
 
   pm_ensure_symbols();
@@ -5490,16 +5676,19 @@ static int pm_control_connect(void) {
   }
   pm_debug("control connected socket=%s", socket_path);
 
-  /* Register the network scope so the daemon routes a RESPAWN only to a
-   * same-network ancestor (network ids are [a-z0-9-], so JSON-safe unescaped). */
+  /* Authenticate this network scope; escape legacy ids before sending them so
+   * punctuation cannot alter the control protocol. */
   network_id = pm_current_network_id();
+  pm_json_escape(network_id, network_json, sizeof(network_json));
   hello_length = (size_t)snprintf(
     hello,
     sizeof(hello),
-    "{\"id\":\"hook-control-%ld\",\"method\":\"controlChannel\",\"payload\":{\"pid\":%ld,\"networkId\":\"%s\"}}\n",
+    "{\"id\":\"hook-control-%ld\",\"method\":\"controlChannel\",\"authorization\":\"%s\",\"authorizationNetworkId\":\"%s\",\"payload\":{\"pid\":%ld,\"networkId\":\"%s\"}}\n",
     (long)getpid(),
+    token,
+    network_json,
     (long)getpid(),
-    network_id != NULL ? network_id : "");
+    network_json);
   if (hello_length >= sizeof(hello) || write(fd, hello, hello_length) != (ssize_t)hello_length) {
     close(fd);
     return -1;
@@ -6177,10 +6366,7 @@ static int pm_file_substitution_context_for_envp(char *const envp[], pm_file_sub
   if (flag != NULL && strcmp(flag, "0") == 0) {
     return -1;
   }
-  network = pm_envp_value(envp, "PORT_MANAGER_NETWORK_NAME");
-  if (network == NULL || network[0] == '\0') {
-    network = pm_envp_network_id(envp);
-  }
+  network = pm_envp_network_id(envp);
   return pm_file_substitution_build_context(network, context);
 }
 
@@ -6785,6 +6971,8 @@ static int pm_uname_hook(struct utsname *buf) {
 
 PM_DYLD_INTERPOSE(pm_bind_hook, bind);
 PM_DYLD_INTERPOSE(pm_connect_hook, connect);
+PM_DYLD_INTERPOSE(pm_listen_hook, listen);
+PM_DYLD_INTERPOSE(pm_accept_hook, accept);
 PM_DYLD_INTERPOSE(pm_getsockname_hook, getsockname);
 PM_DYLD_INTERPOSE(pm_getifaddrs_hook, getifaddrs);
 PM_DYLD_INTERPOSE(pm_execve_hook, execve);
@@ -6810,6 +6998,8 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   return pm_connect_hook(sockfd, addr, addrlen);
 }
+int listen(int sockfd, int backlog) { return pm_listen_hook(sockfd, backlog); }
+int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) { return pm_accept_hook(sockfd, addr, addrlen); }
 
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
   return pm_getsockname_hook(sockfd, addr, addrlen);

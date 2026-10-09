@@ -43,6 +43,7 @@ import { selectHostDefaultGatewayExposure } from "../core/networks/host-default-
 import { LocalDnsRecoveryWithoutPrivilegesError } from "../shared/errors";
 import {
   ACTUAL_LOOPBACK_HOST_ENV,
+  allocateNetworkIdWithUniqueAddresses,
   browserLoopbackAddressForNetwork,
   GLOBAL_LOGICAL_NETWORK_ID,
   hostLocalGatewayLoopbackAddressForNetwork,
@@ -174,6 +175,7 @@ import {
   EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV,
   getAsdfShimLauncherRelativePath,
   ensureNetworkEnvFileScaffold,
+  buildAgentNetworkTokenShellExport,
   getHookLibraryRelativePath,
   getRuntimeCommandShimRelativePath,
   NETWORK_DNS_ALIAS_ENV,
@@ -583,6 +585,9 @@ interface HostLocalGatewayRedirect {
 export class PortManagerNetworkService implements DisposableLike {
   /** Pure domain store for networks, attachments, exposures, and terminal rows. */
   private readonly registry: LogicalNetworkRegistry;
+
+  /** Identities reserved while asynchronous OS creation has not reached the registry. */
+  private readonly creatingNetworkIds = new Set<string>();
 
   /** Cross-window durable state store shared by every VS Code extension host. */
   private readonly sharedNetworkStateStore: SharedLogicalNetworkStateStore;
@@ -2330,18 +2335,34 @@ export class PortManagerNetworkService implements DisposableLike {
     requireContainerLevelRuntime(runtime);
 
     const network: LogicalNetwork = {
-      id: createId("network"),
+      id: allocateNetworkIdWithUniqueAddresses(
+        [...this.registry.getSnapshot().networks.map(existing => existing.id), ...this.creatingNetworkIds],
+        () => createId("network"),
+      ),
       name,
       status: "running",
       runtimeKind: runtime.kind,
       createdAt: new Date().toISOString(),
     };
 
-    if (runtime.kind === "container") {
-      await this.containerRuntime.createNetwork(network, readContainerRuntimeSettings());
+    this.creatingNetworkIds.add(network.id);
+    let containerCreated = false;
+    try {
+      if (runtime.kind === "container") {
+        await this.containerRuntime.createNetwork(network, readContainerRuntimeSettings());
+        containerCreated = true;
+      }
+      return this.registry.addNetwork(network);
+    } catch (error) {
+      // A changed shared document can still reject admission after OS creation.
+      // Release only the container created by this attempt, never another row.
+      if (containerCreated) {
+        await this.containerRuntime.removeNetwork(network.id).catch(() => undefined);
+      }
+      throw error;
+    } finally {
+      this.creatingNetworkIds.delete(network.id);
     }
-
-    return this.registry.addNetwork(network);
   }
 
   /** Removes a network and closes any host exposures that belonged to it. */
@@ -3954,16 +3975,17 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     const signature = stringifyPersistedNetworkState(document.state);
-    this.sharedNetworkStateRevision = document.revision;
     if (signature === this.persistedNetworkStateSignature) {
+      this.sharedNetworkStateRevision = document.revision;
       return;
     }
 
     const previousComposeAttachments = this.registry.getSnapshot().composeAttachments;
-    this.persistedNetworkStateSignature = signature;
     this.applyingSharedNetworkState = true;
     try {
       this.registry.replacePersistedState(document.state);
+      this.sharedNetworkStateRevision = document.revision;
+      this.persistedNetworkStateSignature = signature;
     } finally {
       this.applyingSharedNetworkState = false;
     }
@@ -4083,6 +4105,7 @@ export class PortManagerNetworkService implements DisposableLike {
         : {
             networkId,
             networkName: this.registry.getNetwork(networkId)?.name,
+            namespaceNetworks: this.registry.getSnapshot().networks,
             networkDnsAlias: normalizeBrowserDnsHostname(this.registry.getNetwork(networkId)?.name ?? ""),
             composeRoutingFilePath: this.getComposeProjectRoutingFilePath(networkId),
             terminalAttachmentMarkerDirectoryPath: this.getTerminalAttachmentMarkerDirectoryPath(),
@@ -5883,6 +5906,29 @@ export class PortManagerNetworkService implements DisposableLike {
   private async resolveRouterClientVerdict(connection: LogicalPortRouterConnection): Promise<RouterClientVerdict> {
     const nativePid = connection.clientPid;
     const nativeStartTime = connection.clientStartTime;
+
+    // The native network hint and legacy cache come from mutable env/markers.
+    // A guarded daemon resolves a fresh OS identity before either can act as
+    // authority. Lookup/transport failure is not a reason to use those hints.
+    if (this.processService?.getSnapshot().daemon?.authenticatesProcessScopes === true) {
+      const client = nativePid === undefined ? await this.tcpConnectionProcessResolver.resolveClientProcess(connection) : undefined;
+      const pid = nativePid ?? client?.pid;
+      if (pid === undefined) return { processRows: [], clientCwd: client?.cwd };
+      const identity = await this.nativeProcessLookup.readProcessIdentity(pid);
+      if (identity === undefined || this.processService.resolveProcessScope === undefined) {
+        throw new Error("Authenticated router process identity is unavailable.");
+      }
+      if (process.platform === "darwin" && nativeStartTime !== undefined &&
+          nativeStartTime !== String(Math.floor(identity.birth / 1_000_000))) {
+        throw new Error("Router process identity changed before scope resolution.");
+      }
+      const scope = await this.processService.resolveProcessScope(identity);
+      if (scope === null) return { processRows: [], clientCwd: client?.cwd };
+      if (scope.pid !== identity.pid || scope.birth !== identity.birth || scope.networkId.length === 0) {
+        throw new Error("Authenticated router scope does not match its current process.");
+      }
+      return { networkId: scope.networkId, processRows: [] };
+    }
 
     // Native attribution carried the network id directly (fast path).
     if (connection.clientNetworkId !== undefined && nativePid !== undefined) {
@@ -8006,7 +8052,7 @@ export class PortManagerNetworkService implements DisposableLike {
   private buildTerminalRoutingScriptBody(networkId: string, networkName: string, settings: PortManagerSettings): string {
     // Per-terminal attach must scaffold too — the window-binding path alone
     // never fires for terminals attached individually (docs/per-network-env.md).
-    ensureNetworkEnvFileScaffold(networkId, networkName);
+    ensureNetworkEnvFileScaffold(networkId, networkName, this.registry.getSnapshot().networks);
     const hookLibraryPath = preparePersistentNativeHookLibrary(this.context.asAbsolutePath(getHookLibraryRelativePath()));
     const agentMainPath = this.context.asAbsolutePath(path.join("out", "src", "agent", "agent-main.js"));
     const nativeAgentPath = this.context.asAbsolutePath(path.join("media", "native", "portmanager_agent"));
@@ -8061,6 +8107,7 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("NEWDLOPS_PM_BORROWED_NETWORK_ID", networkId),
       buildLoopbackIdentityExportShell(loopbackHost, terminalLoopbackMode),
       shellExport("PORT_MANAGER_AGENT_SOCKET", getAgentSocketPath()),
+      buildAgentNetworkTokenShellExport(getAgentSocketPath(), networkId),
       shellExport("PORT_MANAGER_AGENT_MAIN", agentMainPath),
       shellExport("PORT_MANAGER_AGENT_EXECUTABLE", nativeAgentPath),
       shellExport("PORT_MANAGER_CONTAINER_MAP_HELPER", nativeContainerMapPath),
@@ -8169,6 +8216,7 @@ export class PortManagerNetworkService implements DisposableLike {
       EXPERIMENTAL_ROUTE_OWNERSHIP_MODE_ENV,
       ESCAPED_SERVER_RESPAWN_ENV,
       "PORT_MANAGER_AGENT_SOCKET",
+      "PORT_MANAGER_AGENT_NETWORK_TOKEN",
       "PORT_MANAGER_AGENT_MAIN",
       "PORT_MANAGER_AGENT_EXECUTABLE",
       "PORT_MANAGER_CONTAINER_MAP_HELPER",

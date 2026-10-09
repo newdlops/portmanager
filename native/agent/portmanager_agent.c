@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "portmanager_agent.h"
 #include "portmanager_agent_output.h"
 
@@ -15,6 +17,19 @@
 #include <unistd.h>
 
 #include "../shared/pm_dev_log.h"
+#include "../shared/pm_network_namespace.h"
+#include "portmanager_agent_authorization.h"
+
+static pm_authorization pm_auth;
+
+/* Registry policy consumes an OS-authenticated scope without reading env or
+ * exposing private authorization storage to its publication/scan adapters. */
+static int pm_resolve_authenticated_scope(pid_t pid, char *network_id, size_t size) {
+  pm_authenticated_scope *scope = pm_auth_controller_scope(&pm_auth, pid, pm_auth_process_birth(pid));
+  if (scope == NULL || strlen(scope->network_id) >= size) return 0;
+  memcpy(network_id, scope->network_id, strlen(scope->network_id) + 1);
+  return 1;
+}
 
 #define PM_CLIENT_BUFFER_INITIAL 2048
 /* Large enough for a respawnChild request carrying an escaped child's full
@@ -72,6 +87,9 @@ static size_t pm_pending_publication_bytes;
 
 typedef struct {
   int fd;
+  /* Kernel-authenticated connection owner; request payloads cannot choose it. */
+  pid_t peer_pid;
+  unsigned long long peer_birth;
   int wants_events;
   int is_control;
   int control_pid;
@@ -114,21 +132,22 @@ static size_t pm_control_entry_capacity = 0;
 static long long pm_monotonic_milliseconds(void);
 static void pm_disconnect_client(pm_client *client);
 
-static void pm_control_registry_set(int pid, int fd, pm_output_queue *output, const char *network_id) {
+static int pm_control_registry_set(int pid, int fd, pm_output_queue *output, const char *network_id) {
   for (size_t index = 0; index < pm_control_entry_count; index++) {
     if (pm_control_entries[index].pid == pid) {
+      if (strcmp(pm_control_entries[index].network_id, network_id) != 0) return -1;
       pm_control_entries[index].fd = fd;
       pm_control_entries[index].output = output;
       snprintf(pm_control_entries[index].network_id, sizeof(pm_control_entries[index].network_id), "%s",
                network_id != NULL ? network_id : "");
-      return;
+      return 0;
     }
   }
   if (pm_control_entry_count + 1 > pm_control_entry_capacity) {
     size_t next_capacity = pm_control_entry_capacity == 0 ? 32 : pm_control_entry_capacity * 2;
     pm_control_entry *next = (pm_control_entry *)realloc(pm_control_entries, next_capacity * sizeof(pm_control_entry));
     if (next == NULL) {
-      return;
+      return -1;
     }
     pm_control_entries = next;
     pm_control_entry_capacity = next_capacity;
@@ -139,13 +158,14 @@ static void pm_control_registry_set(int pid, int fd, pm_output_queue *output, co
   snprintf(pm_control_entries[pm_control_entry_count].network_id, sizeof(pm_control_entries[pm_control_entry_count].network_id), "%s",
            network_id != NULL ? network_id : "");
   pm_control_entry_count++;
+  return 0;
 }
 
 /* Only a same-network ancestor may receive a queued control push. */
 static pm_output_queue *pm_control_registry_output_for_pid(int pid, const char *want_network_id) {
   for (size_t index = 0; index < pm_control_entry_count; index++) {
     if (pm_control_entries[index].pid == pid) {
-      if (want_network_id == NULL || want_network_id[0] == '\0' ||
+      if (want_network_id != NULL && want_network_id[0] != '\0' &&
           strcmp(pm_control_entries[index].network_id, want_network_id) == 0) {
         return pm_control_entries[index].output;
       }
@@ -493,6 +513,30 @@ static int pm_dispatch(pm_agent_state *state, const pm_request *request, pm_buff
   if (strcmp(request->method, "daemonStatus") == 0) {
     return pm_state_daemon_status(state, payload);
   }
+  /* These methods have no network/anonymous authorization path. The launcher
+   * sends its own fork identity before the child receives permission to exec. */
+  if (strcmp(request->method, "registerProcessScope") == 0 || strcmp(request->method, "resolveProcessScope") == 0) {
+    if (!state->trusted_tools) {
+      snprintf(error, error_size, "Authenticated process scopes require trusted system query tools."); return -1;
+    }
+    long raw_pid = pm_json_get_long(request->payload, "pid", 0);
+    long raw_birth = pm_json_get_long(request->payload, "birth", 0);
+    char network_id[128]; network_id[0] = '\0';
+    if (raw_pid <= 1 || raw_pid > INT_MAX || raw_birth <= 0 ||
+        pm_auth_process_birth((pid_t)raw_pid) != (unsigned long long)raw_birth) {
+      snprintf(error, error_size, "Process scope requires a current PID and matching birth."); return -1;
+    }
+    if (strcmp(request->method, "registerProcessScope") == 0 &&
+        (pm_json_get_string(request->payload, "networkId", network_id, sizeof(network_id)) != 0 ||
+         pm_auth_register_controller_scope(&pm_auth, (pid_t)raw_pid, (unsigned long long)raw_birth, network_id) != 0)) {
+      snprintf(error, error_size, "Process scope registration denied."); return -1;
+    }
+    pm_authenticated_scope *scope = pm_auth_controller_scope(&pm_auth, (pid_t)raw_pid, (unsigned long long)raw_birth);
+    if (scope == NULL) return pm_buffer_append(payload, "null");
+    if (pm_buffer_appendf(payload, "{\"pid\":%ld,\"birth\":%llu,\"networkId\":", raw_pid, (unsigned long long)raw_birth) != 0 ||
+        pm_json_append_string(payload, scope->network_id) != 0) return -1;
+    return pm_buffer_append(payload, "}");
+  }
   if (strcmp(request->method, "refreshSnapshot") == 0) {
     return pm_state_refresh_snapshot(state, payload);
   }
@@ -532,6 +576,11 @@ static int pm_dispatch(pm_agent_state *state, const pm_request *request, pm_buff
     if (pm_parse_register_input(request->payload, &input) != 0) {
       snprintf(error, error_size, "Invalid registerExistingProcess payload.");
       return -1;
+    }
+    pm_authenticated_scope *scope = input.pid > 1 ?
+      pm_auth_controller_scope(&pm_auth, input.pid, pm_auth_process_birth(input.pid)) : NULL;
+    if (scope != NULL && strcmp(scope->network_id, input.network_id) != 0) {
+      snprintf(error, error_size, "Registered route differs from authenticated process scope."); return -1;
     }
     unsigned long before_revision = state->registration_revision;
     size_t before_pending = state->pending_count;
@@ -626,7 +675,13 @@ static int pm_handle_ready_line(pm_client *client, pm_agent_state *state, const 
     return send_result;
   }
 
-  if (client->fd >= 0 && pm_request_wants_events(&request) && !client->wants_events) {
+  int role = pm_auth_request(&pm_auth, state, &request, client->peer_pid, client->peer_birth);
+  if (role < 0) {
+    pm_buffer_free(&payload);
+    return pm_send_response(client, &request, 0, NULL, "Agent authorization denied.");
+  }
+
+  if (role == 2 && client->fd >= 0 && pm_request_wants_events(&request) && !client->wants_events) {
     client->wants_events = 1;
     /* The first subscription receives current in-memory state without waiting
      * for the five-minute listener poll or a later mutation. */
@@ -641,14 +696,20 @@ static int pm_handle_ready_line(pm_client *client, pm_agent_state *state, const 
   if (strcmp(request.method, "controlChannel") == 0) {
     int pid = pm_json_get_int(request.payload == NULL ? "" : request.payload, "pid", 0);
     char network_id[128];
+    char namespace_key[PM_NETWORK_NAMESPACE_KEY_SIZE];
     network_id[0] = '\0';
-    pm_json_get_string(request.payload == NULL ? "" : request.payload, "networkId", network_id, sizeof(network_id));
-    if (pid > 0) {
+    int valid_scope = pm_json_get_string(request.payload == NULL ? "" : request.payload, "networkId", network_id, sizeof(network_id)) == 0 &&
+      pm_network_namespace_key(network_id, namespace_key, sizeof(namespace_key)) == 0;
+    int accepted = valid_scope && pid > 0 && pid == client->peer_pid &&
+      kill(client->peer_pid, 0) == 0 && (!client->is_control || client->control_pid == pid);
+    if (accepted && pm_control_registry_set(pid, client->fd, client->output, network_id) == 0) {
       client->is_control = 1;
       client->control_pid = pid;
-      pm_control_registry_set(pid, client->fd, client->output, network_id);
+    } else {
+      accepted = 0;
     }
-    int send_result = pm_send_response(client, &request, 1, NULL, NULL);
+    int send_result = pm_send_response(client, &request, accepted, NULL,
+      accepted ? NULL : "Control channel must identify its live socket peer and an unchanged nonempty network scope.");
     pm_buffer_free(&payload);
     return send_result;
   }
@@ -668,7 +729,12 @@ static int pm_handle_ready_line(pm_client *client, pm_agent_state *state, const 
     parent_pids[0] = '\0';
     target_network_id[0] = '\0';
     pm_json_get_string(request.payload == NULL ? "" : request.payload, "parentPids", parent_pids, sizeof(parent_pids));
-    pm_json_get_string(request.payload == NULL ? "" : request.payload, "networkId", target_network_id, sizeof(target_network_id));
+    if (pm_json_get_string(request.payload == NULL ? "" : request.payload, "networkId", target_network_id, sizeof(target_network_id)) != 0 ||
+        target_network_id[0] == '\0') {
+      int send_result = pm_send_response(client, &request, 0, NULL, "Respawn requires an explicit network scope.");
+      pm_buffer_free(&payload);
+      return send_result;
+    }
     {
       char *saveptr = NULL;
       char *token = strtok_r(parent_pids, ",", &saveptr);
@@ -794,11 +860,13 @@ static int pm_handle_line(pm_client *client, pm_agent_state *state, const char *
   pm_request request;
   memset(&request, 0, sizeof(request));
   if (pm_parse_request(line, &request) != 0) return pm_handle_ready_line(client, state, line, snapshot_dirty);
+  int role = pm_auth_request(&pm_auth, state, &request, client->peer_pid, client->peer_birth);
+  if (role < 0) return pm_send_response(client, &request, 0, NULL, "Agent authorization denied.");
   int snapshot = strcmp(request.method, "listSnapshot") == 0 || strcmp(request.method, "refreshSnapshot") == 0;
   int mutation = strcmp(request.method, "repairRoutingState") == 0 || strcmp(request.method, "allocateRoute") == 0 ||
                  strcmp(request.method, "releaseProcessRoute") == 0;
   if (!snapshot && !mutation) return pm_handle_ready_line(client, state, line, snapshot_dirty);
-  if (pm_request_wants_events(&request) && !client->wants_events) {
+  if (role == 2 && pm_request_wants_events(&request) && !client->wants_events) {
     client->wants_events = 1;
     *snapshot_dirty = 1;
   }
@@ -844,12 +912,14 @@ static int pm_finish_client_scans(pm_client *client, pm_agent_state *state, int 
     pm_pending_scan *pending = *link;
     pm_request request;
     memset(&request, 0, sizeof(request));
-    int prepared = pm_parse_request(pending->line, &request) == 0
-      ? pm_state_prepare_request(state, &request, pending->context) : -1;
+    int authorized = pm_parse_request(pending->line, &request) == 0 &&
+      pm_auth_request(&pm_auth, state, &request, client->peer_pid, client->peer_birth) >= 0;
+    int prepared = authorized ? pm_state_prepare_request(state, &request, pending->context) : -1;
     if (prepared > 0) { link = &pending->next; continue; }
     int result = 0;
     if (prepared < 0) {
-      if (client->fd >= 0) result = pm_send_response(client, &request, 0, NULL, "Could not prepare a fresh listener scan within the request budget.");
+      if (client->fd >= 0) result = pm_send_response(client, &request, 0, NULL, authorized ?
+        "Could not prepare a fresh listener scan within the request budget." : "Agent authorization denied.");
     } else {
       pm_scan_use(pending->context);
       result = pm_handle_ready_line(client, state, pending->line, snapshot_dirty);
@@ -863,9 +933,33 @@ static int pm_finish_client_scans(pm_client *client, pm_agent_state *state, int 
   return 0;
 }
 
+/** Socket permissions are complemented by authenticated credentials before dispatch. */
+static int pm_read_socket_peer(int fd, pid_t *pid) {
+#if defined(__APPLE__)
+  uid_t uid;
+  gid_t gid;
+  socklen_t size = sizeof(*pid);
+  if (getpeereid(fd, &uid, &gid) != 0 || uid != geteuid() ||
+      getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, pid, &size) != 0 || size != sizeof(*pid) || *pid <= 0) return -1;
+  return 0;
+#elif defined(__linux__)
+  struct ucred peer;
+  socklen_t size = sizeof(peer);
+  if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &size) != 0 || size != sizeof(peer) ||
+      peer.uid != geteuid() || peer.pid <= 0) return -1;
+  *pid = peer.pid;
+  return 0;
+#else
+  (void)fd; (void)pid;
+  return -1;
+#endif
+}
+
 static int pm_add_client(pm_client **clients, size_t *count, size_t *capacity, int fd) {
   pm_client *next;
   size_t next_capacity;
+  pid_t peer_pid;
+  if (pm_read_socket_peer(fd, &peer_pid) != 0) return -1;
 
   if (*count + 1 > *capacity) {
     next_capacity = *capacity == 0 ? 16 : *capacity * 2;
@@ -881,6 +975,8 @@ static int pm_add_client(pm_client **clients, size_t *count, size_t *capacity, i
   if (output == NULL) return -1;
   (*clients)[*count].output = output;
   (*clients)[*count].fd = fd;
+  (*clients)[*count].peer_pid = peer_pid;
+  (*clients)[*count].peer_birth = pm_auth_process_birth(peer_pid);
   (*clients)[*count].wants_events = 0;
   (*clients)[*count].is_control = 0;
   (*clients)[*count].control_pid = 0;
@@ -1446,17 +1542,27 @@ int main(int argc, char **argv) {
     return pm_probe_daemon(arguments.socket_path, arguments.agent_main_path) == 0 ? 0 : 1;
   }
 
-  server_fd = pm_create_server(arguments.socket_path);
-  if (server_fd < 0) {
+  if (pm_auth_init(&pm_auth, arguments.controller_token_path, arguments.socket_path) != 0) {
+    fprintf(stderr, "Port Manager requires a private controller credential before startup.\n");
     return 1;
   }
 
+  server_fd = pm_create_server(arguments.socket_path);
+  if (server_fd < 0) {
+    free(pm_auth.scopes);
+    return 1;
+  }
+
+  pm_scan_set_trusted_tools(arguments.trusted_tools);
   pm_state_init(&state, arguments.route_table_path, arguments.agent_main_path);
+  state.trusted_tools = arguments.trusted_tools;
+  state.resolve_process_scope = arguments.trusted_tools ? pm_resolve_authenticated_scope : NULL;
   pm_dns_init(&state, arguments.dns_port);
   pm_event_loop(server_fd, &state);
   pm_dns_dispose(&state);
   pm_state_dispose(&state);
   close(server_fd);
   unlink(arguments.socket_path);
+  free(pm_auth.scopes);
   return 0;
 }

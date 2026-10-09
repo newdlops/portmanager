@@ -1,4 +1,6 @@
 import { SimpleEventEmitter } from "../../shared/events";
+import { assertNetworkAddressesAreUnique } from "./loopback-address";
+import { networkStorageKey } from "./network-identity";
 import type {
   ComposeAttachment,
   ContainerServiceCandidate,
@@ -61,6 +63,7 @@ export class LogicalNetworkRegistry implements DisposableLike {
 
   constructor(runtimes: readonly NetworkRuntimeDescriptor[], initialState?: LogicalNetworkRegistryState) {
     this.runtimes = [...runtimes];
+    validateNetworkIdentities(initialState?.networks ?? []);
 
     for (const network of initialState?.networks ?? []) {
       this.networks.set(network.id, network);
@@ -129,6 +132,9 @@ export class LogicalNetworkRegistry implements DisposableLike {
    * while networks, bindings, and compose routes must be host-global.
    */
   replacePersistedState(state: LogicalNetworkRegistryState): void {
+    // Validate before clearing: a conflicting cross-window document must not
+    // replace the last safe snapshot or start sharing another network's alias.
+    validateNetworkIdentities(state.networks);
     this.networks.clear();
     this.attachments.clear();
     this.exposures.clear();
@@ -198,9 +204,15 @@ export class LogicalNetworkRegistry implements DisposableLike {
 
   /** Creates a logical network row. Runtime startup happens before this call. */
   addNetwork(network: LogicalNetwork): LogicalNetwork {
+    networkStorageKey(network.id);
+    if (network.id.length === 0) {
+      throw new Error("Logical network identity must not be empty.");
+    }
     if (this.networks.has(network.id)) {
       throw new Error(`Logical network already exists: ${network.id}`);
     }
+
+    assertNetworkAddressesAreUnique(network.id, [...this.networks.keys()]);
 
     this.networks.set(network.id, network);
     this.emitChange();
@@ -730,6 +742,19 @@ function terminalWindowGroupKey(candidate: TerminalCandidate): string {
   }
 
   return `pid:${candidate.pid}`;
+}
+
+/** Reject unsafe saved identities before adopting any of their dependent state. */
+function validateNetworkIdentities(networks: readonly LogicalNetwork[]): void {
+  const ids: string[] = [];
+  for (const network of networks) {
+    networkStorageKey(network.id);
+    if (network.id.length === 0 || ids.includes(network.id)) {
+      throw new Error(`Invalid or duplicate logical network identity: ${network.id}`);
+    }
+    assertNetworkAddressesAreUnique(network.id, ids);
+    ids.push(network.id);
+  }
 }
 
 /**

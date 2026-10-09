@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { BrowserDnsSyncCoordinator, type BrowserDnsSyncBatch } from "../../src/extension/browser-dns-sync-coordinator";
+import { createTestAgentCredential, testAgentAuthorization } from "./native-agent-test-authorization";
 
 /**
  * Black-box coverage for the daemon-owned browser DNS responder.
@@ -464,6 +465,8 @@ async function startDnsAgent(context: TestContext, reuseDirectory?: string, dnsP
     path.join(projectRoot, "out", "src", "agent", "agent-main.js"),
     "--dns-port",
     String(dnsPort),
+    "--controller-token-file",
+    createTestAgentCredential(socketPath),
   ], { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, ...extraEnvironment, ...(dnsBindBlockPath === undefined ? {} : { PORT_MANAGER_AGENT_TEST_DNS_BIND_BLOCK_PATH: dnsBindBlockPath }) } });
   agent.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
 
@@ -578,7 +581,7 @@ async function requestOnce<T = unknown>(
         return;
       }
     });
-    socket.write(`${JSON.stringify(request)}\n`);
+    socket.write(`${JSON.stringify({ ...request, authorization: testAgentAuthorization(socketPath) })}\n`);
   });
 }
 

@@ -4,6 +4,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { getAgentSocketPath, getAgentStartupLockPath, removeStaleSocketFile } from "../agent/agent-socket";
+import { ensureAgentControllerToken, getAgentControllerTokenPath, readAgentControllerToken } from "../agent/agent-authorization";
 import { getDefaultRouteTablePath, ROUTE_TABLE_TTL_SECONDS_ENV } from "../agent/route-table";
 import { readPortManagerSettings } from "../config/vscode-settings";
 import { buildNodeRuntimeEnvironment } from "../platform/process/node-runtime";
@@ -22,6 +23,7 @@ import type {
   RegisteredProcessInput,
 } from "../shared/types";
 import type { PortManagerProcessService } from "./process-service";
+import type { AuthenticatedProcessScope, ResolveProcessScopePayload } from "../agent/protocol";
 
 /**
  * VS Code extension client for the single local Port Manager agent.
@@ -41,12 +43,15 @@ type AgentMethod =
   | "shutdownDaemon"
   | "startManagedProcess"
   | "registerExistingProcess"
+  | "registerProcessScope"
+  | "resolveProcessScope"
   | "stopProcess"
   | "restartProcess"
   | "removeProcess"
   | "respawnChild";
 
 interface AgentRequest {
+  readonly authorization: string;
   /** Correlates one line-delimited request with its response. */
   readonly id: string;
   /** Command understood by the agent server. */
@@ -441,6 +446,11 @@ export class LocalAgentClient implements PortManagerProcessService {
     return process;
   }
 
+  /** Resolve OS PID/birth against controller roots before reading untrusted env. */
+  async resolveProcessScope(input: ResolveProcessScopePayload): Promise<AuthenticatedProcessScope | null> {
+    return this.request<AuthenticatedProcessScope | null>("resolveProcessScope", input);
+  }
+
   /** Stops a process through the agent when it owns the child PID. */
   async stopProcess(id: string, settings: PortManagerSettings): Promise<ManagedProcess | undefined> {
     const process = await this.request<ManagedProcess | undefined>("stopProcess", {
@@ -507,6 +517,7 @@ export class LocalAgentClient implements PortManagerProcessService {
     if (this.disposed) {
       throw new Error("Port Manager agent client is disposed.");
     }
+    ensureAgentControllerToken(getAgentControllerTokenPath(getAgentSocketPath()));
 
     const generation = this.connectionGeneration;
     if (this.socket && !this.socket.destroyed) {
@@ -744,7 +755,8 @@ export class LocalAgentClient implements PortManagerProcessService {
     if (canRunNativeAgentBinary(nativeAgentPath)) {
       this.childProcess = spawn(
         nativeAgentPath,
-        ["--socket", socketPath, "--route-table", getDefaultRouteTablePath(), "--agent-main", agentMainPath],
+        ["--socket", socketPath, "--route-table", getDefaultRouteTablePath(), "--agent-main", agentMainPath,
+          "--controller-token-file", getAgentControllerTokenPath(socketPath), "--trusted-tools"],
         {
           detached: true,
           env: this.buildAgentEnvironment(),
@@ -767,7 +779,8 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Starts the previous Node daemon implementation as a compatibility fallback. */
   private startNodeAgentProcess(agentMainPath: string, socketPath: string, generation: number): void {
     this.assertConnectionGeneration(generation);
-    this.childProcess = spawn(process.execPath, [agentMainPath, "--socket", socketPath, "--route-table", getDefaultRouteTablePath()], {
+    this.childProcess = spawn(process.execPath, [agentMainPath, "--socket", socketPath, "--route-table", getDefaultRouteTablePath(),
+      "--controller-token-file", getAgentControllerTokenPath(socketPath)], {
       detached: true,
       env: this.buildAgentEnvironment(),
       stdio: "ignore",
@@ -1098,7 +1111,8 @@ export class LocalAgentClient implements PortManagerProcessService {
     }
 
     const id = `extension-${process.pid}-${this.nextRequestId++}`;
-    const request: AgentRequest = { id, method, payload: params };
+    const request: AgentRequest = { id, method, payload: params,
+      authorization: readAgentControllerToken(getAgentControllerTokenPath(getAgentSocketPath())) };
 
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
