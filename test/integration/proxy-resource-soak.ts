@@ -354,7 +354,11 @@ export async function processSamples(hostPid: number, daemonPid?: number,
         let observed: unknown;
         try { observed = (await execute("ps", ["-p", String(row.pid), "-o", "stat=,ppid=,comm="], { timeout: 5000 })).stdout.trim(); }
         catch (queryError) { observed = String(queryError); }
-        error.message += `\nSampling context: ${JSON.stringify({ sampled: row, observed, measurementPid })}`;
+        const diagnostic = error as Error & { stdout?: unknown; stderr?: unknown; signal?: unknown; code?: unknown };
+        error.message += `\nSampling context: ${JSON.stringify({ sampled: row, observed, measurementPid,
+          queryCode: diagnostic.code, querySignal: diagnostic.signal,
+          queryStdout: typeof diagnostic.stdout === "string" ? diagnostic.stdout.slice(0, 4096) : undefined,
+          queryStderr: typeof diagnostic.stderr === "string" ? diagnostic.stderr.slice(0, 2048) : undefined })}`;
       }
       throw error;
     }
