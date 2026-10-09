@@ -188,18 +188,24 @@ function runNativeAgentParserProbe(nativeAgentPath: string, hookLibraryPath?: st
   if (hookLibraryPath !== undefined) {
     environment[process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD"] = hookLibraryPath;
   }
-  const probe = spawnSync(nativeAgentPath, ["--probe"], {
-    env: environment,
-    encoding: "utf8",
-    timeout: 1_000,
-    maxBuffer: 256 * 1024,
-  });
-  const loaderError = /cannot be preloaded|wrong elf class|image not found|incompatible architecture|dyld:/i.test(
-    probe.stderr ?? "",
-  );
-  // The real agent's incomplete --probe contract exits exactly 1 after its
-  // parser. Requiring that value also rejects arbitrary executable files.
-  return probe.error === undefined && probe.signal === null && probe.status === 1 && !loaderError;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const probe = spawnSync(nativeAgentPath, ["--probe"], {
+      env: environment,
+      encoding: "utf8",
+      timeout: 1_000,
+      maxBuffer: 256 * 1024,
+    });
+    const loaderError = /cannot be preloaded|wrong elf class|image not found|incompatible architecture|dyld:/i.test(
+      probe.stderr ?? "",
+    );
+    // A cold loader timeout supplies no parser verdict. Retry it only once,
+    // with the same bound; loader/permission/contract failures remain final.
+    if (attempt === 0 && !loaderError && (probe.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT") continue;
+    // The real agent's incomplete --probe contract exits exactly 1 after its
+    // parser. Requiring that value also rejects arbitrary executable files.
+    return probe.error === undefined && probe.signal === null && probe.status === 1 && !loaderError;
+  }
+  return false;
 }
 
 function currentNativeArchitecture(): SupportedNativeArchitecture {

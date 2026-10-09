@@ -30,7 +30,8 @@
 - `node-process-table.ts`
 - `node-process-environment.ts`
 - `native-process-lookup.ts`: `identity <pid>`는 전체 표·env 조회 없이 OS PID/birth를 읽는다. 기존 inspect/capture의 env networkId는 보안 권한을 대신하지 않음
-- `native-executable.ts`
+- `native-executable.ts`: native parser probe의 순수 timeout만 같은 1초 한도로 한 번
+  재확인한다. 두 번째도 실패하거나 loader·권한·exit 계약 오류가 있으면 실패로 유지한다.
 - `network-file-scaffold.ts`: 0700 디렉터리, 0600 파일, 원자적 미교체 게시 및 symlink 거부
 - `network-terminal-control.ts` / `network-terminal-client.ts`: private host-side lazy terminal launch and controller-driven replacement; key and control FD never enter the guarded child.
 - `macos-network-runtime.ts`: protected artifact/profile publication, fixed-id broker ownership, trusted readiness and shared native reservations; PTY/UI stays with the extension adapter.
