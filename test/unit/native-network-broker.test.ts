@@ -33,7 +33,7 @@ test("fixed-scope broker performs TCP operations for a kernel-restricted process
   const hookPath = path.join(root, "hook.dylib");
   const log = path.join(root, "broker.log");
   execFileSync("cc", ["-Wall", "-Wextra", "-Werror", "-O2", path.join(source, "native/network-broker/portmanager_network_broker.c"),
-    path.join(source, "native/shared/pm_dev_log.c"), "-o", brokerPath]);
+    path.join(source, "native/shared/pm_dev_log.c"), path.join(source, "native/agent/portmanager_agent_json.c"), "-o", brokerPath]);
   execFileSync("cc", ["-Wall", "-Wextra", "-Werror", "-O2", path.join(source, "test/unit/native-network-broker-fixture.c"), "-o", fixturePath]);
   execFileSync("cc", ["-Wall", "-Wextra", "-O2", "-dynamiclib", path.join(source, "native/hook/portmanager_hook.c"),
     path.join(source, "native/shared/pm_dev_log.c"), "-o", hookPath]);
@@ -157,7 +157,7 @@ test("broker bounds malformed requests, cancellation and slow clients without re
   const socketPath = path.join(directory, "a.sock");
   const brokerPath = path.join(root, "broker"), fixturePath = path.join(root, "client");
   execFileSync("cc", ["-Wall", "-Wextra", "-Werror", "-O2", path.join(source, "native/network-broker/portmanager_network_broker.c"),
-    path.join(source, "native/shared/pm_dev_log.c"), "-o", brokerPath]);
+    path.join(source, "native/shared/pm_dev_log.c"), path.join(source, "native/agent/portmanager_agent_json.c"), "-o", brokerPath]);
   execFileSync("cc", ["-Wall", "-Wextra", "-Werror", "-O2", path.join(source, "test/unit/native-network-broker-fixture.c"), "-o", fixturePath]);
   const inheritedPath = path.join(root, "synthetic-private-parent-file");
   fs.writeFileSync(inheritedPath, "fixture", { mode: 0o600 });

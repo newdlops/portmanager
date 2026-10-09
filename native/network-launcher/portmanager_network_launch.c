@@ -27,6 +27,7 @@
 #define PM_LAUNCH_PROFILE_BYTES (128 * 1024)
 #define PM_LAUNCH_START_MS 8000
 #define PM_LAUNCH_STOP_MS 2000
+#define PM_LAUNCH_SCOPE_REFRESH_MS 1000
 enum { PM_LAUNCH_POLICY_READY = 1, PM_LAUNCH_EXEC_FAILED = 2, PM_LAUNCH_AUTHORIZED = 3, PM_LAUNCH_EXEC_START = 4 };
 typedef struct { unsigned int magic, phase; int error, reserved; } pm_launch_record;
 typedef struct {
@@ -324,23 +325,52 @@ static void pm_launch_kill_owned(pid_t pid, unsigned long long birth, int number
   if (getpgid(pid) == pid) (void)kill(-pid, number);
   else (void)kill(pid, number);
 }
-static int pm_launch_supervise(pid_t child, unsigned long long birth, int startup_ok) {
+static int pm_launch_supervise(const pm_launch_options *options, pid_t child, unsigned long long birth, int startup_ok) {
   int status; long long stopping = 0;
+  pm_scope_client refresh; memset(&refresh, 0, sizeof(refresh)); refresh.fd = -1;
+  long long next_refresh = pm_nb_client_now() + PM_LAUNCH_SCOPE_REFRESH_MS, refresh_deadline = 0;
   if (!startup_ok) { pm_launch_kill_owned(child, birth, SIGKILL); stopping = pm_nb_client_now(); }
   for (;;) {
     pid_t done = waitpid(child, &status, WNOHANG);
     if (done == child) {
       pm_dev_log("network-launcher", "child exited pid=%ld status=%d", (long)child, status); break;
     }
-    if (done < 0 && errno != EINTR) return 125;
+    if (done < 0 && errno != EINTR) { pm_scope_close(&refresh); return 125; }
     if (pm_launch_signal != 0) {
       pm_dev_log("network-launcher", "forward signal child_pid=%ld signal=%d", (long)child, (int)pm_launch_signal);
       pm_launch_kill_owned(child, birth, pm_launch_signal); pm_launch_signal = 0;
       if (stopping == 0) stopping = pm_nb_client_now();
     }
-    if (stopping != 0 && pm_nb_client_now() - stopping >= PM_LAUNCH_STOP_MS) pm_launch_kill_owned(child, birth, SIGKILL);
-    (void)poll(NULL, 0, 20);
+    long long now = pm_nb_client_now();
+    if (stopping != 0) {
+      pm_scope_close(&refresh);
+      if (now - stopping >= PM_LAUNCH_STOP_MS) pm_launch_kill_owned(child, birth, SIGKILL);
+    } else if (options->agent_path != NULL) {
+      /* A replacement daemon has an empty scope table. Refresh the still-owned
+       * child without blocking job control or trusting mutable workload env.
+       * The kernel policy stays installed during outages; each broker operation
+       * independently requires a fresh controller acknowledgement. */
+      if (refresh.fd >= 0 && now >= refresh_deadline) {
+        pm_dev_log("network-launcher", "scope refresh expired child_pid=%ld", (long)child);
+        pm_scope_close(&refresh); next_refresh = now + PM_LAUNCH_SCOPE_REFRESH_MS;
+      }
+      if (refresh.fd < 0 && now >= next_refresh) {
+        next_refresh = now + PM_LAUNCH_SCOPE_REFRESH_MS;
+        if (pm_launch_begin_scope(options, &refresh, child, birth) == 0) refresh_deadline = now + PM_LAUNCH_START_MS;
+        else pm_dev_log("network-launcher", "scope refresh failed child_pid=%ld errno=%d", (long)child, errno);
+      }
+    }
+    struct pollfd descriptor = { .fd = refresh.fd, .events = pm_scope_events(&refresh) };
+    int ready = poll(&descriptor, 1, 20);
+    if (ready > 0 && refresh.fd >= 0) {
+      int result = pm_scope_progress(&refresh, descriptor.revents);
+      if (result != 0) {
+        if (result < 0) pm_dev_log("network-launcher", "scope refresh rejected child_pid=%ld errno=%d", (long)child, errno);
+        pm_scope_close(&refresh); next_refresh = pm_nb_client_now() + PM_LAUNCH_SCOPE_REFRESH_MS;
+      }
+    }
   }
+  pm_scope_close(&refresh);
   if (!startup_ok) return 125;
   return WIFEXITED(status) ? WEXITSTATUS(status) : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 125;
 }
@@ -407,7 +437,7 @@ int main(int argc, char **argv) {
     pm_dev_log("network-launcher", "policy ready child_pid=%ld birth=%llu", (long)child, birth);
     if (options.announce) { printf("ready pid=%ld birth=%llu\n", (long)child, birth); fflush(stdout); }
   } else pm_dev_log("network-launcher", "startup rejected child_pid=%ld errno=%d", (long)child, errno);
-  int result = pm_launch_supervise(child, birth, accepted);
+  int result = pm_launch_supervise(&options, child, birth, accepted);
   if (foreground > 0) (void)tcsetpgrp(0, foreground);
   return result;
 }

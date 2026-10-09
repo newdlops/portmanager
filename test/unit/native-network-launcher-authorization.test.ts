@@ -17,7 +17,7 @@ interface Reply { ok: boolean; payload?: unknown; error?: string }
 
 /** Real isolated agent plus deliberately delayed/forged replies: no product daemon is used. */
 test("guarded exec waits for controller PID/birth registration and never widens inherited scope", {
-  skip: process.platform !== "darwin", timeout: 60_000,
+  skip: process.platform !== "darwin", timeout: 90_000,
 }, async context => {
   const source = path.resolve(__dirname, "../../..");
   const root = fs.mkdtempSync("/private/tmp/pm-launch-auth-");
@@ -32,7 +32,7 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   const compile = (inputs: string[], output: string, extra: string[] = []) => execFileSync("cc", ["-O2", ...extra,
     ...inputs.map(input => path.join(source, input)), "-o", output], { timeout: 30_000 });
   compile(["native/network-launcher/portmanager_network_launch.c", "native/agent/portmanager_agent_json.c", "native/shared/pm_dev_log.c"], launcher, ["-Wall", "-Wextra", "-Werror"]);
-  compile(["native/network-broker/portmanager_network_broker.c", "native/shared/pm_dev_log.c"], broker, ["-Wall", "-Wextra", "-Werror"]);
+  compile(["native/network-broker/portmanager_network_broker.c", "native/agent/portmanager_agent_json.c", "native/shared/pm_dev_log.c"], broker, ["-Wall", "-Wextra", "-Werror"]);
   compile(["native/hook/portmanager_hook.c", "native/shared/pm_dev_log.c"], hook, ["-dynamiclib"]);
   compile(["native/process-lookup/portmanager_process_lookup.c"], identity, ["-Wall", "-Wextra", "-Werror"]);
   compile(["portmanager_agent.c", "portmanager_agent_probe.c", "portmanager_agent_state.c", "portmanager_agent_json.c",
@@ -73,11 +73,12 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   const agentSocket = path.join(security, "sockets/agent.sock"), brokerSocket = path.join(security, "sockets/a.sock");
   const nativeAgent = spawn(agent, ["--socket", agentSocket, "--route-table", path.join(security, "routes.json"), "--dns-port", "0", "--controller-token-file", tokenPath, "--trusted-tools"],
     { env: environment, stdio: ["ignore", "ignore", "pipe"] }); children.push(nativeAgent);
-  const nativeBroker = spawn(broker, ["--socket", brokerSocket, "--network-id", "network-a", "--loopback-host", "127.0.0.1"],
-    { env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(nativeBroker);
-  await once(nativeBroker.stdout!, "data");
   const startupDeadline = Date.now() + 5000;
   while (!fs.existsSync(agentSocket)) { assert.ok(Date.now() < startupDeadline, "fixture agent did not start"); await delay(10); }
+  const nativeBroker = spawn(broker, ["--socket", brokerSocket, "--network-id", "network-a", "--loopback-host", "127.0.0.1",
+    "--agent-socket", agentSocket, "--controller-token-file", tokenPath],
+    { env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(nativeBroker);
+  await once(nativeBroker.stdout!, "data");
   async function request(method: string, payload: unknown, authorization = token, authorizationNetworkId?: string, endpoint = agentSocket): Promise<Reply> {
     const socket = net.createConnection(endpoint); sockets.add(socket); socket.once("close", () => sockets.delete(socket));
     return new Promise((resolve, reject) => {
@@ -93,6 +94,9 @@ test("guarded exec waits for controller PID/birth registration and never widens 
       });
     });
   }
+  const brokerIdentity = inspect(nativeBroker.pid!);
+  assert.deepEqual((await request("resolveProcessScope", brokerIdentity)).payload, { ...brokerIdentity, networkId: "network-a" },
+    "the broker itself must be attributed before sockets can be observed prior to FD handoff");
   assert.equal(((await request("daemonStatus", {})).payload as { authenticatesProcessScopes?: boolean }).authenticatesProcessScopes, true);
   assert.equal(((await request("daemonStatus", {})).payload as { trustedQueryTools?: boolean }).trustedQueryTools, true);
   const legacySocket = path.join(security, "sockets/legacy.sock");
@@ -122,7 +126,7 @@ test("guarded exec waits for controller PID/birth registration and never widens 
       release = async () => {
         const accepted = await request("registerProcessScope", frame.payload);
         assert.equal(accepted.ok, true);
-        socket.end(JSON.stringify({ ...accepted, type: "response", id: "launch-scope", method: "registerProcessScope" }) + "\n");
+        socket.end(JSON.stringify({ ...accepted, type: "response", id: "scope-register", method: "registerProcessScope" }) + "\n");
       };
     });
   }); servers.push(delayed); delayed.listen(delayedSocket); await once(delayed, "listening");
@@ -179,6 +183,100 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   assert.deepEqual((await request("resolveProcessScope", descendantIdentity)).payload, { ...descendantIdentity, networkId: "network-a" }, "an observed detached descendant retains its birth-bound scope after root exit");
   assert.equal((await request("resolveProcessScope", offeredIdentity)).ok, false, "an exited root identity cannot be replayed");
 
+  // This child deliberately becomes an orphan before it performs any TCP work.
+  // Its parent has exited before the first scope lookup: ancestry alone cannot
+  // recover it, and its forged environment must not supply the missing identity.
+  const orphanReady = path.join(root, "orphan-ready.js"), triggers = [1, 2].map(index => path.join(root, `orphan-go-${index}.js`));
+  const results = [1, 2].map(index => path.join(root, `orphan-result-${index}.js`));
+  const echo = net.createServer(socket => {
+    sockets.add(socket); socket.on("error", () => {}); socket.once("close", () => sockets.delete(socket));
+    socket.once("data", bytes => { assert.equal(bytes.toString(), "fixture"); socket.end("ok"); });
+  }); servers.push(echo); echo.listen(0, "127.0.0.1"); await once(echo, "listening");
+  const echoPort = (echo.address() as net.AddressInfo).port;
+  const orphanCode = `
+    const fs=require('fs'),net=require('net'); let attempt=0,busy=false;
+    const triggers=${JSON.stringify(triggers)},results=${JSON.stringify(results)};
+    setInterval(()=>{
+      if(process.ppid!==1)return;
+      fs.writeFileSync(${JSON.stringify(orphanReady)},'orphan');
+      if(busy||attempt>=triggers.length||!fs.existsSync(triggers[attempt]))return;
+      busy=true;
+      const socket=net.connect(${echoPort},'127.0.0.1',()=>socket.write('fixture'));
+      socket.on('error',error=>{fs.writeFileSync(results[attempt],error.code);attempt++;busy=false;});
+      socket.on('data',bytes=>{fs.writeFileSync(results[attempt],bytes);attempt++;busy=false;socket.end();});
+    },20);
+  `;
+  const shortParent = spawn(launcher, args(agentSocket, [process.execPath, "-e", `
+    const cp=require('child_process');
+    const child=cp.spawn(process.execPath,['-e',${JSON.stringify(orphanCode)}],{detached:true,stdio:'ignore',
+      env:{...process.env,PORT_MANAGER_NETWORK_ID:'network-b',PORT_MANAGER_HOOK_DISABLED:'1'}});
+    console.log('ORPHAN_PID='+child.pid);child.unref();setTimeout(()=>process.exit(0),50);
+  `]), { cwd: root, env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(shortParent);
+  let shortOutput = ""; shortParent.stdout!.on("data", bytes => shortOutput += bytes.toString());
+  const shortExit = once(shortParent, "exit");
+  async function until(predicate: () => boolean, message: string, milliseconds = 5000) {
+    const deadline = Date.now() + milliseconds;
+    while (!predicate()) { assert.ok(Date.now() < deadline, message); await delay(10); }
+  }
+  await until(() => /ORPHAN_PID=\d+/.test(shortOutput), "orphan fixture did not start");
+  const earlyOrphan = inspect(Number(/ORPHAN_PID=(\d+)/.exec(shortOutput)![1])); orphaned.push(earlyOrphan);
+  assert.equal((await shortExit)[0], 0);
+  await until(() => fs.existsSync(orphanReady), "child must be orphaned before scope observation");
+  assert.equal((await request("resolveProcessScope", earlyOrphan)).payload, null,
+    "no previously observed ancestry may accidentally satisfy the orphan test");
+  fs.writeFileSync(triggers[0], "go");
+  await until(() => fs.existsSync(results[0]), "orphan TCP request did not finish");
+  assert.equal(fs.readFileSync(results[0], "utf8"), "ok");
+  assert.deepEqual((await request("resolveProcessScope", earlyOrphan)).payload, { ...earlyOrphan, networkId: "network-a" },
+    "the fixed broker must register the actual orphan PID/birth before opening TCP");
+
+  const idle = spawn(launcher, args(agentSocket, [process.execPath, "-e", "setInterval(()=>{},1000)"]),
+    { cwd: root, env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(idle);
+  let idleOutput = ""; idle.stdout!.on("data", bytes => idleOutput += bytes.toString());
+  await until(() => /ready pid=\d+ birth=\d+/.test(idleOutput), "idle guarded process did not start");
+  const idleMatch = /ready pid=(\d+) birth=(\d+)/.exec(idleOutput)!;
+  const idleIdentity = { pid: Number(idleMatch[1]), birth: Number(idleMatch[2]) };
+  const agentExit = once(nativeAgent, "exit"); nativeAgent.kill("SIGTERM"); await agentExit;
+  await delay(150);
+  const replacement = spawn(agent, ["--socket", agentSocket, "--route-table", path.join(security, "routes.json"), "--dns-port", "0",
+    "--controller-token-file", tokenPath, "--trusted-tools"], { env: environment, stdio: ["ignore", "ignore", "pipe"] }); children.push(replacement);
+  await until(() => fs.existsSync(agentSocket), "replacement controller did not start");
+  assert.equal((await request("resolveProcessScope", brokerIdentity)).payload, null);
+  assert.equal((await request("resolveProcessScope", earlyOrphan)).payload, null);
+  const refreshDeadline = Date.now() + 5000;
+  while ((await request("resolveProcessScope", idleIdentity)).payload === null) {
+    assert.ok(Date.now() < refreshDeadline, "supervisor must re-register an idle child after controller replacement"); await delay(20);
+  }
+  assert.deepEqual((await request("resolveProcessScope", idleIdentity)).payload, { ...idleIdentity, networkId: "network-a" });
+  assert.equal(idle.exitCode, null, "kernel-guarded idle program must survive controller replacement");
+  fs.writeFileSync(triggers[1], "go");
+  await until(() => fs.existsSync(results[1]), "broker request after replacement did not finish");
+  assert.equal(fs.readFileSync(results[1], "utf8"), "ok");
+  for (const identity of [earlyOrphan, brokerIdentity]) {
+    assert.deepEqual((await request("resolveProcessScope", identity)).payload, { ...identity, networkId: "network-a" });
+  }
+  const idleExit = once(idle, "exit"); idle.kill("SIGTERM"); await idleExit;
+
+  const refreshSocketPath = path.join(security, "sockets/refresh-silent.sock");
+  let refreshCount = 0, refreshPending = false, refreshClosed = false;
+  const silentRefresh = net.createServer(socket => {
+    sockets.add(socket); socket.on("error", () => {}); socket.once("close", () => sockets.delete(socket));
+    socket.once("data", async bytes => {
+      const frame = JSON.parse(bytes.toString().split("\n")[0]) as { payload: Scope };
+      if (refreshCount++ === 0) {
+        const accepted = await request("registerProcessScope", frame.payload); assert.equal(accepted.ok, true);
+        socket.end(JSON.stringify({ ...accepted, type: "response", id: "scope-register", method: "registerProcessScope" }) + "\n");
+      } else { refreshPending = true; socket.once("close", () => refreshClosed = true); }
+    });
+  }); servers.push(silentRefresh); silentRefresh.listen(refreshSocketPath); await once(silentRefresh, "listening");
+  const refreshing = spawn(launcher, args(refreshSocketPath, [process.execPath, "-e", "setInterval(()=>{},1000)"]),
+    { cwd: root, env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(refreshing);
+  await until(() => refreshPending, "supervisor must use a bounded asynchronous renewal after startup");
+  const refreshingExit = once(refreshing, "exit"), refreshStop = Date.now(); refreshing.kill("SIGTERM");
+  await Promise.race([refreshingExit, delay(1000).then(() => { throw new Error("pending refresh blocked child shutdown"); })]);
+  assert.ok(Date.now() - refreshStop < 1000);
+  await until(() => refreshClosed, "supervisor exit must close its pending controller FD");
+
   for (const name of ["forged", "denied", "silent", "timeout"]) {
     if (fs.existsSync(marker)) fs.unlinkSync(marker);
     const fakePath = path.join(security, `sockets/${name}.sock`);
@@ -190,7 +288,7 @@ test("guarded exec waits for controller PID/birth registration and never widens 
         if (name === "forged") socket.end('{"type":"response","id":"wrong","method":"registerProcessScope","ok":true,"payload":{"pid":1,"birth":1,"networkId":"network-a"}}\n');
         if (name === "denied") {
           const frame = JSON.parse(bytes.toString().split("\n")[0]) as { payload: Scope };
-          socket.end(JSON.stringify({ type: "response", id: "launch-scope", method: "registerProcessScope", ok: false, payload: frame.payload }) + "\n");
+          socket.end(JSON.stringify({ type: "response", id: "scope-register", method: "registerProcessScope", ok: false, payload: frame.payload }) + "\n");
         }
       });
     }); servers.push(fake); fake.listen(fakePath); await once(fake, "listening");

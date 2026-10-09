@@ -2,6 +2,7 @@
 #include "pm_network_broker_protocol.h"
 #include "../shared/pm_network_namespace.h"
 #include "../shared/pm_dev_log.h"
+#include "../shared/pm_agent_scope_client.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -22,13 +23,13 @@
 #include <libproc.h>
 #endif
 
-/* Each slot owns one control fd, one received TCP fd and, during accept,
- * one returned fd. Memory, descriptors, waiting work and shutdown are bounded. */
+/* Each slot owns one control fd, one received TCP fd and one controller or
+ * returned accept fd in disjoint phases. Memory, work and shutdown are bounded. */
 #define PM_NB_MAX_CLIENTS 64
 #define PM_NB_DEADLINE_MS 8000
 #define PM_NB_ACCEPT_BUDGET 16
 #define PM_NB_RECEIVE_BUDGET 16
-enum pm_nb_phase { PM_NB_RECEIVE, PM_NB_CONNECTING, PM_NB_ACCEPTING, PM_NB_SEND, PM_NB_FD_ACKNOWLEDGEMENT };
+enum pm_nb_phase { PM_NB_RECEIVE, PM_NB_AUTHORIZING, PM_NB_CONNECTING, PM_NB_ACCEPTING, PM_NB_SEND, PM_NB_FD_ACKNOWLEDGEMENT };
 typedef struct {
   int control, socket, returned, original_flags, changed_flags;
   pid_t pid;
@@ -36,12 +37,15 @@ typedef struct {
   long long deadline;
   enum pm_nb_phase phase;
   size_t received, sent;
-  int rights_sent;
+  int rights_sent, authorizing_broker;
   pm_nb_request request;
   pm_nb_response response;
+  pm_scope_client authorization;
 } pm_nb_client;
 typedef struct {
   char network_id[128], socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+  const char *agent_path, *controller_path;
+  char controller_token[65];
   struct in_addr host;
   int server;
   struct stat socket_identity;
@@ -113,10 +117,13 @@ static void pm_nb_release(pm_nb_client *client) {
   if (client->socket >= 0) close(client->socket);
   if (client->returned >= 0) close(client->returned);
   if (client->control >= 0) close(client->control);
+  pm_scope_close(&client->authorization);
   memset(client, 0, sizeof(*client));
   client->control = client->socket = client->returned = -1;
+  client->authorization.fd = -1;
 }
 static void pm_nb_reply(pm_nb_client *client, int error) {
+  pm_scope_close(&client->authorization);
   pm_dev_log("network-broker", "reply op=%u peer_pid=%ld errno=%d", client->request.operation, (long)client->pid, error);
   memset(&client->response, 0, sizeof(client->response));
   client->response.magic = PM_NB_MAGIC; client->response.version = PM_NB_VERSION;
@@ -310,7 +317,12 @@ static int pm_nb_receive_one(pm_nb_server *server, pm_nb_client *client) {
   if (count <= 0) { pm_nb_release(client); return 0; }
   if (invalid) { pm_nb_reply(client, EPROTO); return 0; }
   client->received += (size_t)count;
-  if (client->received == sizeof(client->request)) pm_nb_execute(server, client);
+  if (client->received == sizeof(client->request)) {
+    if (server->agent_path == NULL) pm_nb_execute(server, client);
+    else if (pm_scope_begin(&client->authorization, server->agent_path, server->controller_token,
+        getpid(), pm_nb_birth(getpid()), server->network_id) != 0) pm_nb_reply(client, errno);
+    else { client->authorizing_broker = 1; client->phase = PM_NB_AUTHORIZING; }
+  }
   return 1;
 }
 static void pm_nb_receive(pm_nb_server *server, pm_nb_client *client) {
@@ -362,18 +374,20 @@ static void pm_nb_admit(pm_nb_server *server) {
 }
 static void pm_nb_loop(pm_nb_server *server) {
   while (pm_nb_running) {
-    struct pollfd descriptors[1 + 2 * PM_NB_MAX_CLIENTS];
+    struct pollfd descriptors[1 + 3 * PM_NB_MAX_CLIENTS];
     memset(descriptors, 0, sizeof(descriptors));
     descriptors[0] = (struct pollfd){ .fd = server->server, .events = POLLIN };
     for (size_t index = 0; index < PM_NB_MAX_CLIENTS; index++) {
       pm_nb_client *client = &server->clients[index];
-      descriptors[1 + index * 2] = (struct pollfd){ .fd = client->control,
+      descriptors[1 + index * 3] = (struct pollfd){ .fd = client->control,
         .events = client->phase == PM_NB_SEND ? POLLOUT : POLLIN };
-      descriptors[2 + index * 2] = (struct pollfd){ .fd = client->socket,
+      descriptors[2 + index * 3] = (struct pollfd){ .fd = client->socket,
         .events = client->phase == PM_NB_CONNECTING ? POLLOUT : client->phase == PM_NB_ACCEPTING ? POLLIN : 0 };
-      if (client->phase != PM_NB_CONNECTING && client->phase != PM_NB_ACCEPTING) descriptors[2 + index * 2].fd = -1;
+      if (client->phase != PM_NB_CONNECTING && client->phase != PM_NB_ACCEPTING) descriptors[2 + index * 3].fd = -1;
+      descriptors[3 + index * 3] = (struct pollfd){ .fd = client->phase == PM_NB_AUTHORIZING ? client->authorization.fd : -1,
+        .events = pm_scope_events(&client->authorization) };
     }
-    int ready = poll(descriptors, 1 + 2 * PM_NB_MAX_CLIENTS, 50);
+    int ready = poll(descriptors, 1 + 3 * PM_NB_MAX_CLIENTS, 50);
     if (ready < 0 && errno != EINTR) break;
     if (descriptors[0].revents & POLLIN) pm_nb_admit(server);
     long long now = pm_nb_now();
@@ -381,11 +395,12 @@ static void pm_nb_loop(pm_nb_server *server) {
       pm_nb_client *client = &server->clients[index];
       if (client->control < 0) continue;
       if (now >= client->deadline || pm_nb_birth(client->pid) != client->birth) { pm_nb_release(client); continue; }
-      short control = descriptors[1 + index * 2].revents, socket_ready = descriptors[2 + index * 2].revents;
+      short control = descriptors[1 + index * 3].revents, socket_ready = descriptors[2 + index * 3].revents;
+      short authorization_ready = descriptors[3 + index * 3].revents;
       if (control & (POLLERR | POLLNVAL)) { pm_nb_release(client); continue; }
       if (client->phase == PM_NB_RECEIVE && control & (POLLIN | POLLHUP)) pm_nb_receive(server, client);
       if (client->control < 0) continue;
-      if (client->phase == PM_NB_CONNECTING || client->phase == PM_NB_ACCEPTING) {
+      if (client->phase == PM_NB_AUTHORIZING || client->phase == PM_NB_CONNECTING || client->phase == PM_NB_ACCEPTING) {
         if (control & (POLLIN | POLLHUP)) {
           char byte;
           ssize_t count = recv(client->control, &byte, 1, 0);
@@ -394,7 +409,16 @@ static void pm_nb_loop(pm_nb_server *server) {
            * extra bytes are invalid. Never retain a slot after disconnection. */
           if (count >= 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) { pm_nb_release(client); continue; }
         }
-        if (socket_ready & (POLLIN | POLLOUT | POLLERR | POLLHUP)) {
+        if (client->phase == PM_NB_AUTHORIZING && authorization_ready != 0) {
+          int authorized = pm_scope_progress(&client->authorization, authorization_ready);
+          if (authorized < 0) pm_nb_reply(client, errno);
+          else if (authorized > 0 && client->authorizing_broker) {
+            client->authorizing_broker = 0;
+            if (pm_scope_begin(&client->authorization, server->agent_path, server->controller_token,
+                client->pid, client->birth, server->network_id) != 0) pm_nb_reply(client, errno);
+          } else if (authorized > 0) pm_nb_execute(server, client);
+        }
+        if ((client->phase == PM_NB_CONNECTING || client->phase == PM_NB_ACCEPTING) && socket_ready & (POLLIN | POLLOUT | POLLERR | POLLHUP)) {
           if (client->phase == PM_NB_ACCEPTING) pm_nb_accept_tcp(client);
           else {
             int error = 0; socklen_t size = sizeof(error);
@@ -444,6 +468,29 @@ static int pm_nb_bind_control(pm_nb_server *server) {
       chmod(leaf, 0600) != 0 || listen(server->server, 64) != 0 || lstat(leaf, &server->socket_identity) != 0) return -1;
   return 0;
 }
+/* The host router can observe a just-connected socket before its FD is handed
+ * to the workload. Pin the broker's own fixed realm before accepting work. */
+static int pm_nb_register_broker(pm_nb_server *server) {
+  if (server->agent_path == NULL) return 0;
+  pm_scope_client registration;
+  if (pm_scope_begin(&registration, server->agent_path, server->controller_token,
+      getpid(), pm_nb_birth(getpid()), server->network_id) != 0) return -1;
+  long long deadline = pm_nb_now() + PM_NB_DEADLINE_MS;
+  while (pm_nb_running) {
+    long long remaining = deadline - pm_nb_now();
+    if (remaining <= 0) { errno = ETIMEDOUT; break; }
+    struct pollfd descriptor = { .fd = registration.fd, .events = pm_scope_events(&registration) };
+    int ready = poll(&descriptor, 1, remaining > 50 ? 50 : (int)remaining);
+    if (ready < 0 && errno == EINTR) continue;
+    if (ready < 0) break;
+    if (ready == 0) continue;
+    int result = pm_scope_progress(&registration, descriptor.revents);
+    if (result == 1) return 0;
+    if (result < 0) break;
+  }
+  int error = pm_nb_running ? errno : EINTR;
+  pm_scope_close(&registration); errno = error; return -1;
+}
 int main(int argc, char **argv) {
 #if defined(__APPLE__)
   /* The broker needs only standard IO at launch. Do not retain control-plane
@@ -454,19 +501,27 @@ int main(int argc, char **argv) {
   pm_nb_server server;
   memset(&server, 0, sizeof(server)); server.server = -1;
   /* Initial zeroed slots must not close the parent's stdin. */
-  for (size_t index = 0; index < PM_NB_MAX_CLIENTS; index++) server.clients[index].control = server.clients[index].socket = server.clients[index].returned = -1;
+  for (size_t index = 0; index < PM_NB_MAX_CLIENTS; index++) {
+    server.clients[index].control = server.clients[index].socket = server.clients[index].returned = -1;
+    server.clients[index].authorization.fd = -1;
+  }
   const char *host = NULL;
   for (int index = 1; index < argc; index += 2) {
     if (index + 1 >= argc) return 2;
     if (strcmp(argv[index], "--socket") == 0 && strlen(argv[index + 1]) < sizeof(server.socket_path)) strcpy(server.socket_path, argv[index + 1]);
     else if (strcmp(argv[index], "--network-id") == 0 && strlen(argv[index + 1]) < sizeof(server.network_id)) strcpy(server.network_id, argv[index + 1]);
     else if (strcmp(argv[index], "--loopback-host") == 0) host = argv[index + 1];
+    else if (strcmp(argv[index], "--agent-socket") == 0) server.agent_path = argv[index + 1];
+    else if (strcmp(argv[index], "--controller-token-file") == 0) server.controller_path = argv[index + 1];
     else return 2;
   }
   char key[PM_NETWORK_NAMESPACE_KEY_SIZE];
   if (server.socket_path[0] != '/' || pm_network_namespace_key(server.network_id, key, sizeof(key)) != 0 ||
       host == NULL || inet_pton(AF_INET, host, &server.host) != 1 || (ntohl(server.host.s_addr) >> 24) != 127) return 2;
+  if ((server.agent_path == NULL) != (server.controller_path == NULL)) return 2;
+  if (server.controller_path != NULL && pm_scope_read_key(server.controller_path, server.controller_token) != 0) return 1;
   signal(SIGTERM, pm_nb_stop); signal(SIGINT, pm_nb_stop); signal(SIGHUP, pm_nb_stop); signal(SIGPIPE, SIG_IGN);
+  if (pm_nb_register_broker(&server) != 0) { pm_dev_log("network-broker", "scope startup rejected errno=%d", errno); return 1; }
   if (pm_nb_bind_control(&server) != 0) { pm_dev_log("network-broker", "startup failed errno=%d", errno); if (server.server >= 0) close(server.server); return 1; }
   puts("ready"); fflush(stdout);
   pm_nb_loop(&server);

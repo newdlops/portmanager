@@ -14,6 +14,7 @@ workload가 임의 명령·PID·network id를 보내는 관리 프로토콜은 �
 - 고정 범위 broker가 승인한 socket만 받아 transport 준비 확인
 - 별도 socketpair의 고정 크기 record와 exec의 CLOEXEC EOF로 시작 결과 확인
 - 선택한 controller 연결이 실제 fork PID·생성 시각을 등록하기 전까지 guard 대기
+- 실행 중인 자식의 scope를 주기적으로 재등록해 교체된 데몬에서도 idle 프로세스 귀속 복구
 - 시작 기한, 신호 전달, 소유한 PID/birth/process group의 종료 관리
 
 ## 주요 진입점
@@ -46,6 +47,12 @@ controller 키 읽기와 RPC FD 생성은 fork 이후 부모에서만 일어나�
 controller 옵션과 daemon의 `--trusted-tools`가 필요하다. mutable PATH로 조회하는
 daemon은 scope 승인을 거절해 프로그램 실행을 허용하지 않는다.
 
+실행 중 supervisor는 1초 간격으로 실제 소유한 자식의 동일 tuple을 다시 등록한다.
+한 번에 controller FD 하나와 2048-byte 요청/응답 buffer만 사용하며, 각 시도는 8초
+기한의 nonblocking poll로 처리한다. 지연·거절·접속 실패 후 재시도하며 job control과
+종료를 막지 않는다. 데몬 부재에도 적용된 커널 정책은 유지되고, broker의 각 TCP 작업은
+별도로 새 승인을 요구한다. 자식 종료나 중지 시작 시 pending controller FD를 닫는다.
+
 실제 TTY에서는 trusted parent의 stdin device만 정책에 추가한다. 다른 `/dev/tty*`
 읽기는 기본 host-read allowlist에서 제외하며, `/dev/tty`는 해당 세션의 kernel alias다.
 셸은 자기·자식에게만 신호를 보내고 자기 scheduling만 조정할 수 있다. 다른 sandbox의
@@ -54,7 +61,8 @@ daemon은 scope 승인을 거절해 프로그램 실행을 허용하지 않는�
 ## 외부 의존성
 
 macOS `sandbox-exec`, libproc, POSIX fork/exec/pipes/poll/process groups,
-`native/network-broker/pm_network_broker_client.h`, 공유 `pm_dev_log.c`.
+`native/network-broker/pm_network_broker_client.h`, 공유 `pm_agent_scope_client.h`와
+`pm_dev_log.c`, agent JSON codec `portmanager_agent_json.c`.
 
 ## 상태와 주의사항
 
@@ -64,10 +72,11 @@ macOS `sandbox-exec`, libproc, POSIX fork/exec/pipes/poll/process groups,
 PID 등록과 controller-origin ancestry 조회는 별도 agent API에 연결했다. 실제 terminal
 readiness 전달, shell bootstrap과 SIP preload 복구,
 DNS/host access 및 공유 resource-budget 통합은 별도 연결해야 한다. 관측된 자손은
-reparent 뒤에도 birth에 묶어 기억하지만, 관측 전 사라진 조상이나 daemon 재시작의
-등록 복구까지 이 후보만으로 보장하지 않는다.
+reparent 뒤에도 birth에 묶어 기억한다. 관측 전 orphan은 고정 broker가 실제 peer를
+등록하며, 데몬 재시작 뒤 idle 자식은 supervisor가 재등록한다. 실제 합성 커널 실행에서
+두 복구 경로와 pending 재등록 중 종료를 검증한다.
 native route 복구와 확장 proxy 귀속은 API 사용을 연결했다. proxy는 현재 OS birth와
 scope tuple을 확인한 뒤에만 network로 분류하며, 조회 실패·불일치에 env/cache/tracker로
 대체하지 않는다. 미등록 host process는 env에서 network를 만들지 않는 host 정책에
-남는다. 관측 전 orphan과 broker 자체 PID 등록을 포함한 실제 attach 검증은 남아 있다.
+남는다. 이 메커니즘을 실제 제품 terminal attach에 연결한 검증은 남아 있다.
 Linux 및 다른 macOS 버전의 실행 지원은 확인하지 않았다.

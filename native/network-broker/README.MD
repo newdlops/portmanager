@@ -9,6 +9,7 @@ network id, PID, 파일 경로, 실행 명령 또는 agent 관리 method가 없�
 ## 책임
 
 - 실제 Unix peer UID/PID와 kernel 생성 시각 확인
+- controller가 broker 자신의 PID·birth와 실제 요청자 PID·birth를 고정 network id로 승인한 뒤 TCP 작업 수행
 - localhost/wildcard를 고정된 네트워크 loopback으로 바인드·연결
 - 다른 loopback alias와 호스트 인터페이스 연결 거부
 - TCP socket FD의 type/local endpoint 확인과 bind/connect/listen/accept 중개
@@ -21,11 +22,20 @@ network id, PID, 파일 경로, 실행 명령 또는 agent 관리 method가 없�
 - `pm_network_broker_protocol.h`: 160-byte request와 148-byte response 형식
 - `pm_network_broker_client.h`: 기한 있는 Unix transport와 FD 수신 검증
 
-서버는 동시에 64개 client를 받는다. slot은 control/받은 TCP/accept 결과 FD를 각각
-최대 하나씩 소유하며, 각 요청은 최초 accept에서 8초 후 만료한다. deadline은 부분
+서버는 동시에 64개 client를 받는다. slot은 control/받은 TCP/승인 RPC 또는 accept 결과
+FD를 각각 최대 하나씩 소유한다. 승인 FD와 accept 결과 FD는 서로 다른 phase에서만
+존재하므로 retained 한도는 slot당 3개다. 각 요청은 최초 accept에서 8초 후 만료한다. deadline은 부분
 프레임·재시도로 늘어나지 않는다. connection 대기와 blocking accept는 poll로 처리하며
 원래 nonblocking 호출은 EINPROGRESS/EAGAIN을 유지한다. 취소·만료·shutdown은 소유한
 모든 복사본/미전달 FD를 닫고, 잠시 변경한 원래 socket flags를 복원한다.
+
+`--agent-socket`와 `--controller-token-file`은 쌍으로 지정한다. 보호된 key를 읽고
+broker 자신의 scope 등록을 승인받기 전에는 endpoint와 readiness를 게시하지 않는다.
+각 요청은 broker의 scope를 새로 등록하고 실제 kernel peer PID·birth를 등록한 뒤에만
+TCP syscall을 수행한다. 데몬 교체와 관측 전 orphan에도 환경값이나 과거 ancestry를
+사용하지 않는다. 한 slot의 controller 요청/응답 buffer는 각각 2048 bytes이고,
+두 등록은 순차적으로 같은 단일 FD와 최초 8초 기한을 공유한다. 부분 JSON·잘못된 tuple·
+거절·취소에는 TCP를 실행하지 않는다. 승인 대기가 다른 client나 shutdown을 막지 않는다.
 
 160-byte 요청 하나만 받으며 대기 중 추가 데이터나 write EOF(`SHUT_WR` 포함)는 취소다.
 새 socket/accept FD를 전달하면 수신자가 전체 응답을 확인해 보내는 한 byte ACK까지
@@ -47,7 +57,7 @@ macOS broker는 시작 시 0/1/2 이외의 상속 FD를 닫는다. workload laun
 ## 외부 의존성
 
 POSIX Unix/TCP sockets, SCM_RIGHTS, poll, fcntl, getifaddrs, macOS libproc.
-별도 link helper는 기존 `native/shared/pm_dev_log.c`뿐이다.
+공유 `pm_agent_scope_client.h`, `pm_dev_log.c`, agent JSON codec `portmanager_agent_json.c`를 사용한다.
 
 ## 상태와 남은 연결
 
@@ -64,7 +74,6 @@ client/기본 IPv6 server, 설치된 Python client가 통과했다. Node/Python 
 중복/20개/253개 rights와 잘못된 FD, accept 취소/flags 복원, 64 client 포화,
 부분 frame의 절대 기한, 미확인 FD 전달 중 shutdown을 실제 별도 프로세스로 검증한다.
 
-trusted route/Compose/host-access 정책, 인증된 PID 귀속, launcher의 상속 FD 정리,
-실제 셸 attach와 terminal replacement가 필요하다. 프로토콜은
+trusted route/Compose/host-access 정책과 실제 셸 attach·terminal replacement 연결이 필요하다. 프로토콜은
 TCP만 다루며 UDP/DNS와 다른 런타임의 호환성은 별도 검증한다. 커널 정책 없이 같은 UID의
 호스트 프로그램을 막는 경계로 사용하지 않는다. 공유 소스 쓰기는 사용자 선택대로 유지한다.

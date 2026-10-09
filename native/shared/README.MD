@@ -22,6 +22,7 @@
 - `pm_dev_log(...)`: opt-in 공용 진단 로그 기록.
 - `pm_tcp_proxy.{h,c}`: native router와 host exposure가 공유하는 TCP transport.
 - `pm_network_namespace_key(...)`: stable network ID의 UTF-8 바이트를 lowercase hex로 인코딩; TS `network-identity.ts`와 동일하며 잘라내지 않는다.
+- `pm_agent_scope_client.h`: 보호된 controller key의 nofollow 읽기와 PID/birth/network tuple 등록을 위한 단일 nonblocking RPC. caller가 poll·절대 기한·취소를 소유하고, helper는 전체 JSON frame과 동일 tuple ACK를 검사한다. controller credential과 FD는 workload에 전달하지 않는다.
 
 ## 외부 의존성
 

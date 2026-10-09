@@ -398,7 +398,11 @@ startup/preload가 daemon 권한으로 실행되지 않게 한다. workload runt
 native route 복구는 controller scope와 실제 listener port를 사용하고 미등록 PID의 env를
 추측하지 않는다. proxy 귀속은 현재 OS identity와 controller scope를 env·기존 cache·
 PID-only tracker보다 먼저 조회하고, 실패·tuple 불일치는 기존 힌트로 대체하지 않는다.
-daemon 재시작 root 재등록, 관측 전 orphan과 broker PID, 실제 attach/자원 검증은 남아 있다.
+고정 broker는 endpoint 게시 전 자신의 PID/birth를 등록하고 각 TCP 요청 전에 자신과
+실제 peer의 동일 tuple 승인을 다시 요구한다. supervisor는 소유한 idle 자식을 주기적으로
+재등록한다. 합성 커널 실행에서 관측 전 orphan과 데몬 교체 후 두 복구 경로를 확인했다.
+controller 대기는 단일 nonblocking FD·고정 frame·절대 기한 안에서 처리하고, 취소·종료
+시 회수한다. 실제 제품 attach와 공유 helper/자원 한도에 연결한 검증은 남아 있다.
 
 제품 경로에 연결하기 전에 다음을 검증한다.
 
