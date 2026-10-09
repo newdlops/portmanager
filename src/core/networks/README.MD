@@ -14,6 +14,8 @@ Logical Network, Terminal Attachment, Host Port Exposure의 순수 도메인 상
 - Network snapshot 생성
 - 상태 변경 이벤트 발행
 - logical route 후보를 작업 디렉터리 범위로 좁히는 순수 선택 로직
+- 보호된 runtime의 현재 허용 경로 유지와 즉시 철회: 동일한 좌표는 조회 중에도 유지하고,
+  변경·삭제된 좌표는 바로 제외하며 이전 resolver token의 재게시를 거절한다.
 - hookless host-machine localhost 요청의 기본 gateway 후보 선택
 - 브라우저 DNS의 관리자 권한 갱신 여부 판정: 별칭 → loopback 매핑과 root 소유 상태(lo0, resolver, hosts, TLS)가 실제로 어긋났을 때만 drift로 본다
 - router 귀속 캐시의 PID/시작 시각 정체성, TTL과 실제 항목 상한 유지

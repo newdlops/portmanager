@@ -53,7 +53,7 @@ import {
   resolveTerminalLoopbackAddressRoutingMode,
   usesLoopbackAddressOnlyRouting,
 } from "../core/networks/loopback-address";
-import { selectNonNetworkOwnerRoute } from "../core/networks/logical-route-selection";
+import { GuardedRoutePolicyCache, selectNonNetworkOwnerRoute } from "../core/networks/logical-route-selection";
 import {
   ROUTER_NON_NETWORK_VERDICT,
   RouterVerdictCache,
@@ -589,6 +589,7 @@ interface HostLocalGatewayRedirect {
 export class PortManagerNetworkService implements DisposableLike {
   /** Trusted parents of guarded terminals share the proxy budget and die on disposal. */
   private guardedRuntime: MacosNetworkRuntime | undefined;
+  private readonly guardedRoutePolicies = new GuardedRoutePolicyCache();
   /** Async owners must finish before callers can claim that terminal/proxy resources are gone. */
   private disposal: Promise<void> | undefined;
   /** Serialize profile writes so attach/detach cannot overwrite a newer selection. */
@@ -3105,12 +3106,13 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /** Host fallback < attached Compose < authenticated active application route. */
-  private async collectGuardedRoutes(networkId: string): Promise<readonly NetworkRuntimeRoute[]> {
+  private collectGuardedRouteInputs(networkId: string): readonly NetworkRuntimeRoute[] {
     const routes = new Map<number, NetworkRuntimeRoute>();
     const snapshot = this.registry.getSnapshot();
+    if (networkId !== GLOBAL_LOGICAL_NETWORK_ID && this.registry.getNetwork(networkId) === undefined) return [];
     for (const binding of snapshot.hostAccessBindings) {
       if (binding.networkId !== networkId || binding.status !== "active" || binding.protocol !== "tcp") continue;
-      const host = binding.hostAddress === "localhost" ? "127.0.0.1" : await defaultProxyNetworkResources.resolveListenHost(binding.hostAddress);
+      const host = binding.hostAddress === "localhost" ? "127.0.0.1" : binding.hostAddress;
       routes.set(binding.logicalPort, { port: binding.logicalPort, targetHost: host, targetPort: binding.hostPort });
     }
     for (const attachment of snapshot.composeAttachments) {
@@ -3128,12 +3130,28 @@ export class PortManagerNetworkService implements DisposableLike {
     return [...routes.values()];
   }
 
-  /** Clear removed routes immediately; one serialized publication gathers current policy. */
+  private async collectGuardedRoutes(networkId: string): Promise<readonly NetworkRuntimeRoute[]> {
+    for (;;) {
+      const policy = this.guardedRoutePolicies.capture(networkId, this.collectGuardedRouteInputs(networkId), host => net.isIP(host) !== 0);
+      const routes: NetworkRuntimeRoute[] = [];
+      for (const input of policy.inputs) routes.push({ ...input,
+        targetHost: net.isIP(input.targetHost) !== 0 ? input.targetHost : await defaultProxyNetworkResources.resolveListenHost(input.targetHost) });
+      // Re-capture after the wait, including terminal preparation before the
+      // runtime exists. Removed or changed authority invalidates the old token.
+      this.guardedRoutePolicies.capture(networkId, this.collectGuardedRouteInputs(networkId), host => net.isIP(host) !== 0);
+      if (this.guardedRoutePolicies.publish(policy, routes)) return routes;
+    }
+  }
+
+  /** Publish known current authority atomically; resolve only the remaining coordinates. */
   private refreshGuardedRuntimeRoutes(): void {
     if (this.guardedRuntime === undefined) return;
     this.guardedRouteGeneration++;
     const ids = [...new Set(this.guardedRuntime.activeShells.map(shell => shell.networkId))];
-    for (const id of ids) this.guardedRuntime.updateRoutes(id, []);
+    for (const id of ids) {
+      const policy = this.guardedRoutePolicies.capture(id, this.collectGuardedRouteInputs(id), host => net.isIP(host) !== 0);
+      this.guardedRuntime.updateRoutes(id, this.guardedRoutePolicies.currentRoutes(policy));
+    }
     if (this.guardedRouteRefresh !== undefined) return;
     this.guardedRouteRefresh = (async () => {
       let observed: number;
@@ -4197,6 +4215,7 @@ export class PortManagerNetworkService implements DisposableLike {
     const guardedDisposal = (async () => {
       await this.externalTerminalControl?.dispose();
       await this.guardedRuntime?.dispose();
+      this.guardedRoutePolicies.clear();
     })();
     this.pendingGuardedLaunches.clear();
     this.browserProxyDisposed = true;

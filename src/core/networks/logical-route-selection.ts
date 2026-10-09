@@ -1,6 +1,75 @@
 import * as path from "node:path";
 import type { LogicalPortRoute } from "../../shared/types";
 
+export interface GuardedRouteCoordinate {
+  readonly port: number;
+  readonly targetHost: string;
+  readonly targetPort: number;
+}
+
+interface GuardedRoutePolicySnapshot {
+  readonly networkId: string;
+  readonly inputs: readonly GuardedRouteCoordinate[];
+  readonly byPort: ReadonlyMap<number, GuardedRouteCoordinate>;
+  readonly isLiteral: (host: string) => boolean;
+  readonly resolved: Map<number, GuardedRouteCoordinate>;
+}
+
+/** Keeps only currently authorized coordinates during asynchronous resolution.
+ * Unrelated events reuse a policy; a removal or change creates a new token so
+ * an older resolver cannot restore a revoked route. */
+export class GuardedRoutePolicyCache {
+  private readonly policies = new Map<string, GuardedRoutePolicySnapshot>();
+
+  capture(networkId: string, inputs: readonly GuardedRouteCoordinate[], isLiteral: (host: string) => boolean): GuardedRoutePolicySnapshot {
+    const previous = this.policies.get(networkId);
+    if (previous !== undefined && inputs.length === previous.inputs.length &&
+        inputs.every((input, index) => sameRouteCoordinate(input, previous.inputs[index]))) return previous;
+    const resolved = new Map<number, GuardedRouteCoordinate>();
+    for (const input of inputs) {
+      if (isLiteral(input.targetHost)) resolved.set(input.port, { ...input });
+      else {
+        const prior = previous?.byPort.get(input.port);
+        const known = previous?.resolved.get(input.port);
+        if (prior !== undefined && known !== undefined && sameRouteCoordinate(input, prior)) resolved.set(input.port, { ...known });
+      }
+    }
+    const captured = inputs.map(input => ({ ...input }));
+    const current = { networkId, inputs: captured, byPort: new Map(captured.map(input => [input.port, input])), isLiteral, resolved };
+    this.policies.set(networkId, current);
+    return current;
+  }
+
+  currentRoutes(policy: GuardedRoutePolicySnapshot): readonly GuardedRouteCoordinate[] {
+    if (this.policies.get(policy.networkId) !== policy) return [];
+    return policy.inputs.flatMap(input => {
+      const route = policy.resolved.get(input.port);
+      return route === undefined ? [] : [{ ...route }];
+    });
+  }
+
+  publish(policy: GuardedRoutePolicySnapshot, routes: readonly GuardedRouteCoordinate[]): boolean {
+    if (this.policies.get(policy.networkId) !== policy) return false;
+    const resolved = new Map<number, GuardedRouteCoordinate>();
+    for (const route of routes) {
+      const input = policy.byPort.get(route.port);
+      if (input === undefined || input.targetPort !== route.targetPort || resolved.has(route.port)) return false;
+      if (policy.isLiteral(input.targetHost) && route.targetHost !== input.targetHost) return false;
+      resolved.set(route.port, { ...route });
+    }
+    if (resolved.size !== policy.inputs.length) return false;
+    policy.resolved.clear();
+    for (const [port, route] of resolved) policy.resolved.set(port, route);
+    return true;
+  }
+
+  clear(): void { this.policies.clear(); }
+}
+
+function sameRouteCoordinate(first: GuardedRouteCoordinate, second: GuardedRouteCoordinate): boolean {
+  return first.port === second.port && first.targetHost === second.targetHost && first.targetPort === second.targetPort;
+}
+
 /**
  * Selects active routes whose recorded process cwd matches the client cwd.
  *
