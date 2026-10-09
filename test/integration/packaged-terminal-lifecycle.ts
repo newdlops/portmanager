@@ -147,7 +147,13 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
         console.log("Installed terminal lifecycle: first guarded PTY and byte witness ready.");
         const visualHold = Number(process.env.PM_TEST_TERMINAL_VISUAL_HOLD_SECONDS ?? 0);
         assert.ok(Number.isInteger(visualHold) && visualHold >= 0 && visualHold <= 10);
-        if (visualHold > 0) await delay(visualHold * 1000);
+        if (visualHold > 0) {
+          // A SDK-created PTY can execute while its panel remains hidden.
+          // Show only this explicitly requested visual-QA terminal; the
+          // normal resource gate retains its original UI behavior.
+          terminal.show(true);
+          await delay(visualHold * 1000);
+        }
       }
       const peak = resources.budget.used;
       const replacement = await service.replaceGuardedTerminal(terminal, selected[1].id);
