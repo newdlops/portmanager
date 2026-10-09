@@ -40,16 +40,32 @@ export async function run(): Promise<void> {
   let serviceStarted: Promise<void> | undefined;
   const children = require("node:child_process") as typeof import("node:child_process");
   const originalSpawn = children.spawn;
+  const originalSpawnSync = children.spawnSync;
+  const nativeParserProbes: unknown[] = [];
   const ownedAgents = new Set<ChildProcess>();
   const commandIsolation = isolatedLocal ? isolatePrivilegedCommands() : undefined;
+  if (isolatedLocal) children.spawnSync = ((...args: unknown[]) => {
+    const started = Date.now();
+    const result = Reflect.apply(originalSpawnSync, children, args);
+    if (nativeParserProbes.length < 16 && args[0] === path.join(extension.extensionPath, "media/native/portmanager_agent") &&
+        Array.isArray(args[1]) && args[1].length === 1 && args[1][0] === "--probe") {
+      nativeParserProbes.push({ arch: process.arch, milliseconds: Date.now() - started,
+        status: result.status, signal: result.signal, error: result.error?.code,
+        stderr: String(result.stderr ?? "").slice(0, 2048) });
+    }
+    return result;
+  }) as typeof children.spawnSync;
   if (isolatedLocal) children.spawn = ((...args: unknown[]) => {
     const executable = args[0];
-    if (executable === path.join(extension.extensionPath, "media/native/portmanager_agent")) {
+    const nativeAgent = executable === path.join(extension.extensionPath, "media/native/portmanager_agent");
+    const nodeAgent = executable === process.execPath && Array.isArray(args[1]) &&
+      args[1][0] === path.join(extension.extensionPath, "out/src/agent/agent-main.js");
+    if (nativeAgent || nodeAgent) {
       const argv = args[1] as string[];
       const socket = argv[argv.indexOf("--socket") + 1];
       assert.ok(path.resolve(socket).startsWith(`${path.resolve(os.tmpdir())}${path.sep}`), "Fixture may only start a private daemon.");
       assert.ok(!argv.includes("--dns-port"));
-      args[1] = [...argv, "--dns-port", "0"];
+      if (nativeAgent) args[1] = [...argv, "--dns-port", "0"];
       const child = Reflect.apply(originalSpawn, children, args) as ChildProcess;
       ownedAgents.add(child);
       const recordPath = process.env.PM_TEST_PRIVATE_AGENT_RECORD;
@@ -57,7 +73,7 @@ export async function run(): Promise<void> {
         const identity = JSON.parse(execFileSync(path.join(extension.extensionPath, "media/native/portmanager_process_lookup"),
           ["identity", String(child.pid)], { encoding: "utf8", timeout: 3000 }));
         assert.equal(identity.pid, child.pid);
-        fs.writeFileSync(recordPath, JSON.stringify({ ...identity, socketPath: socket,
+        fs.writeFileSync(recordPath, JSON.stringify({ ...identity, runtime: nativeAgent ? "native" : "node", socketPath: socket,
           tokenFilePath: argv[argv.indexOf("--controller-token-file") + 1], extensionPath: extension.extensionPath }), { mode: 0o600 });
       }
       return child;
@@ -105,7 +121,8 @@ export async function run(): Promise<void> {
   assert.ok(status.agentMainPath, "Daemon must report its package entrypoint.");
   assert.ok(fs.realpathSync(status.agentMainPath).startsWith(`${fs.realpathSync(extension.extensionPath)}${path.sep}`), "Daemon must belong to the installed VSIX.");
   const daemonCommand = execFileSync("ps", ["-p", String(status.pid), "-o", "args="], { encoding: "utf8", timeout: 3_000 }).trim();
-  assert.ok(daemonCommand.includes("/media/native/portmanager_agent"), "Activation must use the native runtime.");
+  assert.ok(daemonCommand.includes("/media/native/portmanager_agent"),
+    `Activation must use the native runtime. ${JSON.stringify({ arch: process.arch, nativeParserProbes })}`);
   assert.equal(status.browserDnsRunning, true, status.browserDnsError);
   assert.equal(await request<boolean>("flushRouteTables"), true);
   console.log(JSON.stringify({ extension: extension.id, version: status.version, platform: process.platform,
@@ -133,10 +150,11 @@ export async function run(): Promise<void> {
         privateHome: os.homedir(), privateSocket: path.join(os.tmpdir(), `newdlops-portmanager-agent-${process.getuid!()}.sock`),
         ownedDaemonPids: [...ownedAgents].map(child => child.pid),
         ownedDaemonsExited: [...ownedAgents].every(child => child.exitCode !== null || child.signalCode !== null),
+        nativeParserProbes,
       homeEnvironmentUnchanged: process.env.HOME === originalHomeEnvironment,
         blockedGlobalMutationCommands: commandIsolation?.blocked,
       }, null, 2));
-    } finally { children.spawn = originalSpawn; commandIsolation?.restore(); }
+    } finally { children.spawn = originalSpawn; children.spawnSync = originalSpawnSync; commandIsolation?.restore(); }
   }
 }
 

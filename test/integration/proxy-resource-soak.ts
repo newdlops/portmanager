@@ -298,7 +298,8 @@ function summarizeAllocations(profile: HeapProfiler.SamplingHeapProfile) {
 }
 
 /** OS counters are sampled infrequently; short-lived measurement commands are excluded. */
-async function processSamples(hostPid: number, daemonPid?: number): Promise<ProcessSample[]> {
+export async function processSamples(hostPid: number, daemonPid?: number,
+  readDescriptors: (pid: number) => Promise<number> = readProcessDescriptors): Promise<ProcessSample[]> {
   let rows: ProcessSample[];
   if (process.platform === "win32") {
     const script = "Get-CimInstance Win32_Process | ForEach-Object { $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; if ($p) { [PSCustomObject]@{pid=$_.ProcessId;parent=$_.ParentProcessId;command=$_.Name;rssKiB=[math]::Round($p.WorkingSet64/1024);cpuSeconds=$p.CPU;descriptors=$p.HandleCount} } } | ConvertTo-Json -Compress";
@@ -319,21 +320,41 @@ async function processSamples(hostPid: number, daemonPid?: number): Promise<Proc
     for (const row of rows) if (selected.has(row.parent) && !selected.has(row.pid)) { selected.add(row.pid); changed = true; }
   }
   const result = rows.filter(row => selected.has(row.pid));
+  const completed = new Set<number>();
   if (process.platform !== "win32") await Promise.all(result.map(async row => {
     try {
-      if (process.platform === "linux") row.descriptors = fs.readdirSync(`/proc/${row.pid}/fd`).length;
-      else {
-        const listing = await execute("lsof", ["-nP", "-a", "-p", String(row.pid), "-Ff"], { timeout: 5000 });
-        row.descriptors = listing.stdout.split("\n").filter(line => /^f\d/.test(line)).length;
-      }
+      row.descriptors = await readDescriptors(row.pid);
     } catch (error) {
-      // A child may exit between the process table and descriptor query.
-      try { process.kill(row.pid, 0); } catch { return; }
+      // Exited but unreaped children still pass kill(pid, 0) while owning no
+      // descriptors. Only an OS-confirmed exit/zombie may discard this error.
+      if (await processHasCompleted(row.pid)) { completed.add(row.pid); return; }
       throw error;
     }
   }));
   // ps/PowerShell itself was a short-lived child of the measured host.
-  return result.filter(row => { try { process.kill(row.pid, 0); return true; } catch { return false; } });
+  return result.filter(row => !completed.has(row.pid) && processExists(row.pid));
+}
+
+/** Permission failures never stand in for proof that a measured process exited. */
+function processExists(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
+}
+
+/** A failed state query retains the descriptor failure for every live process. */
+async function processHasCompleted(pid: number): Promise<boolean> {
+  if (!processExists(pid)) return true;
+  try {
+    const status = await execute("ps", ["-p", String(pid), "-o", "stat="], { timeout: 5000 });
+    return status.stdout.trim().startsWith("Z") || !processExists(pid);
+  } catch { return !processExists(pid); }
+}
+
+/** Descriptor queries remain strict for every live process. */
+async function readProcessDescriptors(pid: number): Promise<number> {
+  if (process.platform === "linux") return fs.readdirSync(`/proc/${pid}/fd`).length;
+  const listing = await execute("lsof", ["-nP", "-a", "-p", String(pid), "-Ff"], { timeout: 5000 });
+  return listing.stdout.split("\n").filter(line => /^f\d/.test(line)).length;
 }
 
 function summarize(samples: readonly Sample[], hostPid: number) {
