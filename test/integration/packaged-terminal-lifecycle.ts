@@ -54,6 +54,17 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
   fs.writeFileSync(foreignFile, "synthetic fixture", { mode: 0o600 });
   const records: unknown[] = [];
   const terminals = new Set<vscode.Terminal>();
+  const scripts = new Set<string>();
+  // sendText can arrive before the interactive shell enables line editing.
+  // Keep its PTY input below the canonical line buffer instead of pasting a
+  // multi-kilobyte quoted program; the same code runs from the shared fixture.
+  const sendProgram = (terminal: vscode.Terminal, program: string, name: string): string => {
+    const file = path.join(workspace, name);
+    fs.writeFileSync(file, program, { mode: 0o600 });
+    scripts.add(file);
+    terminal.sendText(`${quote(node)} ${quote(file)}`, true);
+    return file;
+  };
   const save = () => fs.writeFileSync(reportPath, JSON.stringify({ platform: process.platform, installedModuleRoot: moduleRoot,
     networks: selected, cycles: records.length, records }, null, 2));
   async function identity(terminal: vscode.Terminal): Promise<NativeProcessIdentity> {
@@ -87,7 +98,7 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
           try{await connect(${JSON.stringify(selected[1].host)},${ports[1]});throw new Error('forged scope permitted')}catch(e){if(!['EPERM','EACCES'].includes(e.code))throw e;result.forgedScope=e.code}
         }fs.writeFileSync(${JSON.stringify(witness)},JSON.stringify(result));
       })().catch(e=>fs.writeFileSync(${JSON.stringify(witness)},JSON.stringify({error:String(e),code:e.code})));`;
-    terminal.sendText(`${quote(node)} -e ${quote(program)}`, true);
+    const programFile = sendProgram(terminal, program, `terminal-${cycle}-${label}.cjs`);
     const deadline = Date.now() + 10_000;
     while (!fs.existsSync(witness)) { assert.ok(Date.now() < deadline, "Actual installed terminal did not produce its byte witness."); await delay(20); }
     const result = JSON.parse(fs.readFileSync(witness, "utf8"));
@@ -96,6 +107,7 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
     assert.equal(result.value, `${label}:inside`);
     assert.equal(fs.readFileSync(sharedSource, "utf8"), "export const shared = true;\n");
     fs.unlinkSync(witness);
+    fs.unlinkSync(programFile); scripts.delete(programFile);
     return result;
   }
   return {
@@ -162,11 +174,12 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
       assert.notEqual(detachedIdentity.pid, current.pid, "Detach must create a fresh host process.");
       const detachedWitness = path.join(workspace, `terminal-${cycle}-detached.json`);
       const hostProgram = `const fs=require('node:fs'),net=require('node:net');const s=net.connect(${ports[1]},${JSON.stringify(selected[1].host)});let value='';s.on('connect',()=>s.end('host'));s.on('data',b=>value+=b);s.on('end',()=>fs.writeFileSync(${JSON.stringify(detachedWitness)},JSON.stringify({value,networkId:process.env.PORT_MANAGER_NETWORK_ID??null,foreignFile:fs.readFileSync(${JSON.stringify(foreignFile)},'utf8')})));s.on('error',e=>fs.writeFileSync(${JSON.stringify(detachedWitness)},JSON.stringify({error:String(e)})));`;
-      detached.sendText(`${quote(node)} -e ${quote(hostProgram)}`, true);
+      const hostProgramFile = sendProgram(detached, hostProgram, `terminal-${cycle}-detached.cjs`);
       const hostDeadline = Date.now() + 10_000;
       while (!fs.existsSync(detachedWitness)) { assert.ok(Date.now() < hostDeadline); await delay(20); }
       assert.deepEqual(JSON.parse(fs.readFileSync(detachedWitness, "utf8")), { value: "B:host", networkId: null, foreignFile: "synthetic fixture" });
       fs.unlinkSync(detachedWitness);
+      fs.unlinkSync(hostProgramFile); scripts.delete(hostProgramFile);
       detached.dispose(); terminals.delete(detached);
       await gone(detachedIdentity);
       if (cycle === 1) {
@@ -179,7 +192,7 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
           const parentIdentity = await identity(closing);
           const orphanWitness = path.join(workspace, `terminal-${cycle}-orphan-${forced}.json`);
           const daemonProgram = `const c=require('node:child_process').spawn(${JSON.stringify(node)},['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore',env:{...process.env}});require('node:fs').writeFileSync(${JSON.stringify(orphanWitness)},JSON.stringify({pid:c.pid}));c.unref();`;
-          closing.sendText(`${quote(node)} -e ${quote(daemonProgram)}`, true);
+          const daemonProgramFile = sendProgram(closing, daemonProgram, `terminal-${cycle}-orphan-${forced}.cjs`);
           const orphanDeadline = Date.now() + 10_000;
           while (!fs.existsSync(orphanWitness)) { assert.ok(Date.now() < orphanDeadline); await delay(20); }
           const orphanPid = JSON.parse(fs.readFileSync(orphanWitness, "utf8")).pid as number;
@@ -192,6 +205,7 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
           await gone(parentIdentity);
           await gone(orphan);
           fs.unlinkSync(orphanWitness);
+          fs.unlinkSync(daemonProgramFile); scripts.delete(daemonProgramFile);
           records.push({ abruptClose: forced, supervisor: parentIdentity, orphan, reclaimed: true });
         }
       }
@@ -202,6 +216,8 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
     },
     async close(): Promise<void> {
       for (const terminal of terminals) terminal.dispose();
+      for (const file of scripts) fs.rmSync(file, { force: true });
+      scripts.clear();
       for (const binding of bindings) service.removeHostAccessBinding(binding.id);
       for (const row of selected) registry.removeNetwork(row.id);
       for (const client of clients) client.destroy();

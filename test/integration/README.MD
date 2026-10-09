@@ -37,6 +37,11 @@ GUI 환경을 다시 채우지 못하게 해당 검사 프로세스의 hook을 �
 정리된 환경으로 시작하며, 설치된 제품과 guarded fixture가 자기 네이티브 코드를
 별도로 사용한다. 사용자 daemon·셸 설정이나 HOME은 바꾸지 않는다.
 
+실제 SDK 터미널에 보내는 입력은 fixture `.cjs`를 실행하는 짧은 명령이다.
+같은 프로그램·byte witness·10초 판정을 사용하며, 셸의 line editing 준비 전에
+긴 quoted 프로그램이 PTY의 canonical 입력 버퍼에 걸리는 일을 피한다. fixture
+프로그램은 확인 뒤 삭제하고, 실패 시에도 테스트 종료에서 남은 파일을 정리한다.
+
 `Release packages`의 `resource_soak_seconds=1200`으로 20분 검증을 켠다.
 `validation_target`으로 한 환경만 재실행할 수 있다(기본값 `all`). fixture의
 VS Code 다운로드는 120초, 확장 활성화와 서비스 준비는 각 30초,
