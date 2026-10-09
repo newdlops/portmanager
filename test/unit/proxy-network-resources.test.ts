@@ -617,9 +617,11 @@ test("double close cannot return a live native child's capacity during shutdown"
   const handles = (host.manager as unknown as { listeners: Map<string, { close(): Promise<void> }> }).listeners;
   const handle = handles.get(host.exposure.id)!;
   const first = handle.close();
-  await handle.close();
+  const second = handle.close();
+  // Both calls run before the event loop can observe exit or the 500ms kill
+  // timer. Awaiting the second call first made a busy host test an exited child.
   assert.equal(resources.budget.used.nativeHelpers, 1);
-  await first;
+  await Promise.all([first, second]);
   await until(() => resources.budget.used.nativeHelpers === 0);
   fs.rmSync(directory, { recursive: true, force: true });
 });

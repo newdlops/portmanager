@@ -24,6 +24,11 @@
 
 ## 주요 진입점
 
+- 보호된 zsh의 `ZDOTDIR` bootstrap과 macOS `.zsh_sessions`는 해당 네트워크의
+  workspace namespace 아래에 둔다. `.zshenv`에서 per-network `HISTFILE`을 먼저
+  지정해 시스템 zshrc가 기록을 초기화할 때도 공유 호스트 history를 쓰지 않는다.
+  broker/launcher/hook과 controller credentials는 기존 보호 경로에 유지한다.
+
 - `shell-profile.ts`: PM이 소유한 shell profile 경계의 설치·마이그레이션·복구
 - `node-process-launcher.ts`
 - `node-runtime.ts`

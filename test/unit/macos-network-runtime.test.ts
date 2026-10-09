@@ -94,7 +94,8 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
   // exceeds the old unadopted expiry while the controller still owns launch.
   await delay(13_000);
   assert.equal(runtime.activeShells.length, 1, "SDK handoff must keep the prepared owner until the PTY supplies its PID.");
-  terminal = spawn(launch.shellPath, [...launch.shellArgs], { cwd: launch.cwd, env: launch.env, stdio: ["pipe", "pipe", "pipe"] });
+  terminal = spawn(launch.shellPath, [...launch.shellArgs], { cwd: launch.cwd,
+    env: { ...launch.env, TERM_SESSION_ID: "pm-runtime-history-fixture", TERM_PROGRAM: "Apple_Terminal" }, stdio: ["pipe", "pipe", "pipe"] });
   let output = "", errors = "";
   terminal.stdout!.on("data", bytes => { output += bytes.toString(); });
   terminal.stderr!.on("data", bytes => { errors += bytes.toString(); });
@@ -104,6 +105,10 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
     throw new Error(`Fixture supervisor adoption failed (exit=${terminal.exitCode}, signal=${terminal.signalCode}): ${errors}\n${diagnostic}`, { cause: error });
   }
   const identity = await runtime.waitReady(launch.id);
+  const sessions = path.join(launch.env.ZDOTDIR!, ".zsh_sessions");
+  const historyDeadline = Date.now() + 5000;
+  while (!fs.existsSync(sessions)) { assert.ok(Date.now() < historyDeadline, `Missing scoped macOS session storage: ${errors}`); await delay(10); }
+  assert.ok(!errors.includes("Operation not permitted"), errors);
   assert.equal(identity.networkId, "runtime-a");
   assert.notEqual(identity.pid, terminal.pid);
   const program = `const net=require('node:net');const s=net.connect(4567,'127.0.0.1');let value='';s.on('connect',()=>s.end('runtime-echo'));s.on('data',b=>value+=b);s.on('end',()=>{if(value!=='runtime-echo')process.exit(2);require('node:fs').writeFileSync('runtime-success.json',JSON.stringify({value,networkId:process.env.PORT_MANAGER_NETWORK_ID}))});s.on('error',()=>process.exit(3));`;

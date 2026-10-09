@@ -71,7 +71,7 @@ fs.writeFileSync(path.join(userData, "User", "settings.json"), JSON.stringify({
 }));
 console.log(isolatedLocal ? `Packaged validation: isolated local profile ${temporaryRoot}` : "Packaged validation: download VS Code");
 const vscodeExecutablePath = isolatedLocal
-  ? "/Applications/Visual Studio Code.app/Contents/MacOS/Code"
+  ? process.env.PM_TEST_VSCODE_EXECUTABLE ?? "/Applications/Visual Studio Code.app/Contents/MacOS/Code"
   : await withinBudget(downloadAndUnzipVSCode("stable"), 120_000, "VS Code download");
 fs.accessSync(vscodeExecutablePath, fs.constants.X_OK);
 const [cli, ...cliArgs] = resolveCliArgsFromVSCodeExecutablePath(vscodeExecutablePath);

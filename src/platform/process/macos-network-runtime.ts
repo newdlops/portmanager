@@ -141,6 +141,7 @@ export class MacosNetworkRuntime {
     const broker = await this.ensureBroker(scope);
     if (this.disposed || generation !== this.generation || broker.exited) throw new Error("Network shell preparation was canceled.");
     let lease: ProxyResourceLease | undefined;
+    let bootstrapDirectory: string | undefined;
     const id = randomUUID();
     const readyDirectory = path.join(this.stateDirectory, "security", "sessions", id);
     try {
@@ -159,6 +160,7 @@ export class MacosNetworkRuntime {
       const namespaceDirectories = workspaces.map(directory => networkNamespacePaths(directory, scope.id).directory);
       writePrivateAtomic(profilePath, buildMacosNetworkSandboxProfile({ networkId: scope.id, namespaceDirectories,
         sharedWorkspaceDirectories: workspaces, agentSocketPath: broker.endpoint }));
+      bootstrapDirectory = path.join(networkNamespacePaths(workspaces[0], scope.id).directory, "shell-startup", id);
       const bootstrap = this.prepareBootstrap(scope, workspaces, shell, id);
       const artifacts = this.prepareArtifacts();
       const env = buildNodeRuntimeEnvironment();
@@ -182,7 +184,7 @@ export class MacosNetworkRuntime {
       lease?.release();
       fs.rmSync(readyDirectory, { recursive: true, force: true });
       fs.rmSync(path.join(this.stateDirectory, "security", "profiles", id + ".sb"), { force: true });
-      fs.rmSync(path.join(this.stateDirectory, "runtime", "shells", id), { recursive: true, force: true });
+      if (bootstrapDirectory !== undefined) fs.rmSync(bootstrapDirectory, { recursive: true, force: true });
       if (broker.sessions.size === 0) await this.closeBroker(broker);
       throw error;
     }
@@ -513,11 +515,13 @@ export class MacosNetworkRuntime {
 
   /** Profiles remain host-readable; PM bootstrap runs last with fixed values. */
   private prepareBootstrap(scope: NetworkRuntimeScope, workspaces: readonly string[], shell: string, id: string): { directory: string; common: string; bashrc: string } {
-    const directory = path.join(this.stateDirectory, "runtime", "shells", id);
+    const namespace = networkNamespacePaths(workspaces[0], scope.id).directory;
+    // macOS /etc/zshrc writes .zsh_sessions beneath ZDOTDIR. Session files
+    // belong to this network; trusted broker/launcher bytes stay protected.
+    const directory = path.join(namespace, "shell-startup", id);
     ensurePrivateDirectory(directory);
     const originalZdotdir = process.env.ZDOTDIR ?? os.homedir();
     const common = path.join(directory, "network.sh");
-    const namespace = networkNamespacePaths(workspaces[0], scope.id).directory;
     const artifacts = this.prepareArtifacts();
     const exports: Record<string, string> = { ...scope.bootstrapEnvironment,
       PORT_MANAGER_NETWORK_ID: scope.id, PORT_MANAGER_NETWORK_NAME: scope.name,
@@ -528,7 +532,7 @@ export class MacosNetworkRuntime {
       DYLD_INSERT_LIBRARIES: artifacts.hook, HISTFILE: path.join(namespace, "shell-history") };
     if (Object.keys(exports).some(key => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key))) throw new Error("Invalid bootstrap environment key.");
     writePrivateAtomic(common, Object.entries(exports).map(([key, value]) => `export ${key}=${shellQuote(value)}`).join("\n") + "\n");
-    writePrivateAtomic(path.join(directory, ".zshenv"), `unset ZDOTDIR\n[ ! -f ${shellQuote(path.join(originalZdotdir, ".zshenv"))} ] || . ${shellQuote(path.join(originalZdotdir, ".zshenv"))}\nexport ZDOTDIR=${shellQuote(directory)}\n`);
+    writePrivateAtomic(path.join(directory, ".zshenv"), `unset ZDOTDIR\n[ ! -f ${shellQuote(path.join(originalZdotdir, ".zshenv"))} ] || . ${shellQuote(path.join(originalZdotdir, ".zshenv"))}\nexport ZDOTDIR=${shellQuote(directory)}\nexport HISTFILE=${shellQuote(path.join(namespace, "shell-history"))}\n`);
     writePrivateAtomic(path.join(directory, ".zshrc"), `[ ! -f ${shellQuote(path.join(originalZdotdir, ".zshrc"))} ] || . ${shellQuote(path.join(originalZdotdir, ".zshrc"))}\n. ${shellQuote(common)}\n`);
     const bashrc = path.join(directory, "bashrc");
     writePrivateAtomic(bashrc, `[ ! -f ${shellQuote(path.join(os.homedir(), ".bashrc"))} ] || . ${shellQuote(path.join(os.homedir(), ".bashrc"))}\n. ${shellQuote(common)}\n`);
