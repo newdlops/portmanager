@@ -424,12 +424,13 @@ PID-only tracker보다 먼저 조회하고, 실패·tuple 불일치는 기존 �
 실제 peer의 동일 tuple 승인을 다시 요구한다. supervisor는 소유한 idle 자식을 주기적으로
 재등록한다. 합성 커널 실행에서 관측 전 orphan과 데몬 교체 후 두 복구 경로를 확인했다.
 controller 대기는 단일 nonblocking FD·고정 frame·절대 기한 안에서 처리하고, 취소·종료
-시 회수한다. 실제 제품 attach와 공유 helper/자원 한도에 연결한 검증은 남아 있다.
+시 회수한다. 현재 제품의 실제 terminal attach와 공유 helper/자원 한도에 연결한
+검증을 완료했다. 후보 단계의 합성 결과와 제품 검증 결과는 별도로 기록한다.
 
 launcher의 `--ready-file`은 controller와 함께 쓰며, 보호된 session 폴더에 supervisor와
 child의 PID/birth/network tuple을 정책 승인·exec 성공 뒤 원자 게시한다. writer FD는
-앱에 전달하지 않고 종료 시 자기 inode만 삭제한다. TS 소비자의 독립적인 PID/birth
-대조가 제품 연결에 필요하다. broker의 `--routes`는 고정 network의 보호된 JSONL
+앱에 전달하지 않고 종료 시 자기 inode만 삭제한다. 제품의 TS 소비자는 독립적인
+PID/birth 대조 후 준비 완료를 승인한다. broker의 `--routes`는 고정 network의 보호된 JSONL
 snapshot(64 KiB·512 port)에서 승인된 Host Access·Compose 목적지를 local connect에만
 적용한다. 직접 다른 realm으로 요청하거나 설정된 snapshot이 잘못되면 우회하지 않는다.
 
@@ -451,9 +452,10 @@ VS Code profile/PTY 전달은 아직 PID가 없는 controller 소유 단계로 �
 회수한다. 성공은 matching 완료 기록과 exit 0으로 확인하며 실패·timeout에는 lease,
 표식과 profile을 유지한다. v1에서 owner 없이 exec ACK 전 부모가 죽었다면 앱은 실행되지
 않았지만, private ready가 있다면 계약 위반으로 처리한다. TS 소비자와 실제 terminal
-닫기·SDK 종료 경로에 이 증명을 연결한 검증은 별도로 완료해야 한다.
+닫기·SDK 종료 경로는 matching 완료 기록과 실제 자손 소멸을 확인한 뒤 예약을 반환한다.
+설치된 VSIX 검증에서 일반 SDK 닫기와 supervisor 강제 종료 후 orphan 회수를 각각 확인했다.
 
-제품 경로에 연결하기 전에 다음을 검증한다.
+제품 경로와 설치된 패키지의 회귀 검증에서는 다음 조건을 계속 확인한다.
 
 - 전용 broker가 kernel peer PID와 불변 네트워크 ID를 사용하고 관리 RPC를 거부할 것
 - route 복구와 proxy 귀속이 위조 가능한 환경값 대신 인증된 프로세스 scope를 사용할 것
