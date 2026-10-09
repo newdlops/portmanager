@@ -49,6 +49,21 @@ test("resource sampling rejects descriptor failures for a live host", {
     error => error === failure);
 });
 
+test("resource sampling preserves a live native descriptor error reply in its diagnostics", {
+  skip: process.platform === "win32", timeout: 10_000,
+}, async () => {
+  const reply = JSON.stringify({ pid: process.pid, error: 1 });
+  const failure = Object.assign(new Error("native descriptor query denied"), {
+    code: 1, signal: null, stdout: reply, stderr: "",
+  });
+  await assert.rejects(processSamples(process.pid, undefined, async () => { throw failure; }), error => {
+    assert.equal(error, failure);
+    assert.match(failure.message, /queryCode/);
+    assert.ok(failure.message.includes(JSON.stringify(reply)), "retain the structured native error without replacing it with zero");
+    return true;
+  });
+});
+
 test("resource sampling excludes its actual process-table child before descriptor queries", {
   skip: process.platform === "win32", timeout: 10_000,
 }, async () => {
