@@ -80,11 +80,9 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
   const priorZdotdir = process.env.ZDOTDIR;
   process.env.ZDOTDIR = path.join(root, "empty-profiles");
   fs.mkdirSync(process.env.ZDOTDIR, { mode: 0o700 });
-  let launch;
-  try {
-    launch = await runtime.prepareShell({ id: "runtime-a", name: "Runtime A", loopbackHost: "127.0.0.1",
+  context.after(() => { if (priorZdotdir === undefined) delete process.env.ZDOTDIR; else process.env.ZDOTDIR = priorZdotdir; });
+  const launch = await runtime.prepareShell({ id: "runtime-a", name: "Runtime A", loopbackHost: "127.0.0.1",
       workspaceDirectories: [workspace], routes: [{ port: 4567, targetHost: "127.0.0.1", targetPort: echoPort }] }, workspace, "/bin/zsh");
-  } finally { if (priorZdotdir === undefined) delete process.env.ZDOTDIR; else process.env.ZDOTDIR = priorZdotdir; }
   assert.equal(resources.budget.used.nativeHelpers, 2);
   assert.equal(resources.budget.used.nativeScopeJobs, 65);
   terminal = spawn(launch.shellPath, [...launch.shellArgs], { cwd: launch.cwd, env: launch.env, stdio: ["pipe", "pipe", "pipe"] });
@@ -117,8 +115,9 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
       workspaceDirectories: [workspace], routes: [{ port: 4567, targetHost: "127.0.0.1", targetPort: echoPort }] }, cwd, "/bin/zsh"),
     observe: async launch => { observed.set(launch.id, await runtime.waitReady(launch.id)); },
     close: id => runtime.closeShell(id),
-  });
+  }, resources);
   const descriptor = await control.start();
+  assert.equal(resources.budget.used.listeners, 1);
   const privateProfiles = path.join(root, "empty-profiles");
   const cli = spawn(process.execPath, [path.join(source, "out/src/cli/portmanager-cli.js"), "terminal",
     descriptor.socketPath, descriptor.tokenFilePath, "runtime-external-a", workspace], {
@@ -140,13 +139,17 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
   assert.equal(observed.get(switched.id)?.networkId, "runtime-external-b");
   assert.equal(await control.detach(switched.id), true);
   assert.equal(runtime.activeShells.length, 0);
-  assert.ok(Object.values(resources.budget.used).every(value => value === 0));
+  assert.equal(resources.budget.used.nativeHelpers, 0);
+  assert.equal(resources.budget.used.listeners, 1);
+  assert.equal(resources.budget.used.connections, 1);
+  assert.equal(resources.budget.used.controlBytes, 136 * 1024);
   // Detached shell is a fresh host child, while the controller connection
   // remains owned by the trusted CLI and never by either guarded shell.
   cli.stdin!.write("exit\n");
   await once(cli, "exit");
   await control.dispose();
   control = undefined;
+  assert.ok(Object.values(resources.budget.used).every(value => value === 0));
 });
 
 function quote(value: string): string { return "'" + value.replace(/'/g, "'\\''") + "'"; }

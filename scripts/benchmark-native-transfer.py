@@ -161,7 +161,7 @@ try:
         'scope': 'real loopback TCP echo, direct versus standalone production native host helper; no installed extension, hook or daemon',
         'payloadRateDefinition': 'returned and byte-checked payload MiB/s; echo sends the same bytes in both directions',
         'secondsPerSample': options.seconds, 'rounds': options.rounds, 'connections': [1, 8],
-        'source': 'same route/64KiB buffer/32 worker cap; immediate sends, bounded four-chunk bursts, Darwin kqueue and retained EAGAIN buffers',
+        'source': 'same route/64KiB buffer/32 worker cap; caller-supplied forwarding variants with exact sources and flags in build-inputs.json',
         'binaries': {label: hashlib.sha256((directory / ('host-' + label)).read_bytes()).hexdigest() for label in helpers},
         'summary': summary, 'samples': samples}
     (directory / 'result.json').write_text(json.dumps(result, indent=2) + '\n')

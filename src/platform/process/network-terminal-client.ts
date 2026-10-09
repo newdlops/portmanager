@@ -14,6 +14,7 @@ export async function runNetworkTerminalClient(args: readonly string[]): Promise
   const [socketPath, tokenPath, networkId, cwd] = args;
   const token = readTerminalControlToken(tokenPath);
   const socket = net.createConnection(socketPath);
+  let currentCwd = cwd;
   let child: ChildProcess | undefined, buffer = "", changing = false, finished = false;
   const stopped = new Promise<void>((resolve, reject) => {
     const finish = (error?: Error) => {
@@ -25,6 +26,7 @@ export async function runNetworkTerminalClient(args: readonly string[]): Promise
     };
     const launch = (plan: NetworkShellLaunch) => {
       changing = false;
+      currentCwd = plan.cwd;
       const environment = { ...buildNodeRuntimeEnvironment(), ...plan.env };
       delete environment.ELECTRON_RUN_AS_NODE;
       const launched = spawn(plan.shellPath, [...plan.shellArgs], { cwd: plan.cwd, env: environment, stdio: "inherit" });
@@ -52,7 +54,7 @@ export async function runNetworkTerminalClient(args: readonly string[]): Promise
           else if (message.type === "detach") {
             changing = true;
             const environment = buildNodeRuntimeEnvironment(); delete environment.ELECTRON_RUN_AS_NODE;
-            const detached = spawn(process.env.SHELL ?? "/bin/zsh", ["-i"], { cwd, env: environment, stdio: "inherit" });
+            const detached = spawn(process.env.SHELL ?? "/bin/zsh", ["-i"], { cwd: currentCwd, env: environment, stdio: "inherit" });
             child = detached;
             detached.once("error", finish); detached.once("exit", code => { process.exitCode = code ?? 1; finish(); });
           } else if (message.type === "error") finish(new Error(message.message ?? "Guarded terminal startup failed."));

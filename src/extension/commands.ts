@@ -524,9 +524,9 @@ export class PortManagerCommandController implements DisposableLike {
   }
 
   /**
-   * Opens a new integrated terminal and makes its first shell command attach to
-   * the selected network. Preparing the script first avoids leaving behind a
-   * terminal that looks connected when runtime or network validation failed.
+   * Opens a selected network through the guarded owner on macOS. Other runtimes
+   * prepare their bootstrap before terminal creation, so startup failures do
+   * not leave a terminal presented as attached without routing.
    */
   private async openNetworkTerminal(argument: unknown): Promise<void> {
     const network = await this.resolveNetworkArgument(argument, "Open Terminal in Logical Network");

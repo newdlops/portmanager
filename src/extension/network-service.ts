@@ -589,6 +589,8 @@ interface HostLocalGatewayRedirect {
 export class PortManagerNetworkService implements DisposableLike {
   /** Trusted parents of guarded terminals share the proxy budget and die on disposal. */
   private guardedRuntime: MacosNetworkRuntime | undefined;
+  /** Async owners must finish before callers can claim that terminal/proxy resources are gone. */
+  private disposal: Promise<void> | undefined;
   private readonly guardedTerminals = new Map<vscode.Terminal, { launch: NetworkShellLaunch; ready: Promise<void> }>();
   private readonly pendingGuardedLaunches = new Map<string, NetworkShellLaunch>();
   private guardedRouteRefresh: Promise<void> | undefined;
@@ -4183,8 +4185,11 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Releases listeners and event subscriptions. */
   dispose(): void {
-    void this.externalTerminalControl?.dispose();
-    void this.guardedRuntime?.dispose();
+    if (this.disposal !== undefined) return;
+    const guardedDisposal = (async () => {
+      await this.externalTerminalControl?.dispose();
+      await this.guardedRuntime?.dispose();
+    })();
     this.pendingGuardedLaunches.clear();
     this.browserProxyDisposed = true;
     this.browserProxyProcessCommandTextInFlight.clear();
@@ -4232,14 +4237,20 @@ export class PortManagerNetworkService implements DisposableLike {
     this.browserNetworkProxyOwnershipGeneration += 1;
     this.registry.dispose();
     this.localChangeEvents.clear();
-    void this.proxyManager.dispose();
-    void this.hostGatewayProxy.dispose();
-    void this.browserNetworkProxy.dispose();
+    const proxyDisposals = [this.proxyManager.dispose(), this.hostGatewayProxy.dispose(), this.browserNetworkProxy.dispose()];
     this.logicalPortRouter.dispose();
     this.processTracker.dispose();
     releaseControlPlaneOwnerLease();
     releaseLogicalRouterOwnerLease();
     releaseBrowserNetworkProxyOwnerLease();
+    this.disposal = Promise.all([guardedDisposal, ...proxyDisposals]).then(() => undefined);
+    void this.disposal.catch(error => devLog("network-runtime", `service cleanup failed: ${formatError(error)}`));
+  }
+
+  /** Wait for owned native parents and listeners as well as synchronous subscriptions. */
+  async disposeAsync(): Promise<void> {
+    this.dispose();
+    await this.disposal;
   }
 
   /** Reads persisted logical network state from VS Code global storage. */
@@ -8561,7 +8572,8 @@ export class PortManagerNetworkService implements DisposableLike {
       asdfShimLauncherPath,
       runtimeCommandShimPath,
     );
-    const preloadVariable = process.platform === "darwin" ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
+    // macOS detachment above requires a fresh trusted shell because its kernel policy cannot be relaxed.
+    const preloadVariable = "LD_PRELOAD";
     const variables = [
       "PORT_MANAGER_HOOK",
       "PORT_MANAGER_HOOK_DISABLED",
@@ -8614,13 +8626,6 @@ export class PortManagerNetworkService implements DisposableLike {
       shellExport("PORT_MANAGER_HOOK_DISABLED", "1"),
       shellExport("PORT_MANAGER_HOOK_DAEMON_STARTED", "0"),
     ];
-
-    if (process.platform === "darwin") {
-      commands.push(
-        `if [ -n "\${PORT_MANAGER_PREV_BASH_ENV:-}" ]; then export BASH_ENV="\${PORT_MANAGER_PREV_BASH_ENV}"; else unset BASH_ENV; fi`,
-        "unset PORT_MANAGER_PREV_BASH_ENV",
-      );
-    }
 
     commands.push(shellRemovePathListEntry(preloadVariable, hookLibraryPath));
 

@@ -59,7 +59,7 @@ test("open-terminal prepares routing before creation and queues attachment befor
   assert.equal(body.includes("terminal.dispose()"), true);
 });
 
-test("open-terminal sends the selected network script to a new workspace terminal", async () => {
+test("open-terminal delegates macOS launch to the guarded owner and otherwise attaches a workspace terminal", async () => {
   const events: string[] = [];
   const sent: Array<{ readonly text: string; readonly addNewLine?: boolean }> = [];
   const terminalOptions: Array<{ readonly name?: string; readonly cwd?: { readonly fsPath: string } }> = [];
@@ -91,20 +91,30 @@ test("open-terminal sends the selected network script to a new workspace termina
     processService: {} as never,
     networkService: {
       getSnapshot: () => ({ networks: [network] }),
+      openGuardedNetworkTerminal: async (networkId: string) => {
+        assert.equal(networkId, network.id);
+        events.push("guarded");
+      },
       createTerminalRoutingScript: async (networkId: string) => {
         assert.equal(networkId, network.id);
         events.push("script");
         return ". /tmp/attach-beta.sh";
       },
     } as never,
-    treeProvider: {} as never,
+    treeProvider: { refresh: () => events.push("refresh") } as never,
   }) as unknown as { openNetworkTerminal(argument: unknown): Promise<void> };
 
   await controller.openNetworkTerminal(network);
 
-  assert.deepEqual(events, ["script", "create", "send", "show"]);
-  assert.deepEqual(terminalOptions, [{ name: "Port Manager: Beta Network", cwd: workspaceUri }]);
-  assert.deepEqual(sent, [{ text: ". /tmp/attach-beta.sh", addNewLine: true }]);
+  if (process.platform === "darwin") {
+    assert.deepEqual(events, ["guarded", "refresh"]);
+    assert.deepEqual(terminalOptions, []);
+    assert.deepEqual(sent, []);
+  } else {
+    assert.deepEqual(events, ["script", "create", "send", "show"]);
+    assert.deepEqual(terminalOptions, [{ name: "Port Manager: Beta Network", cwd: workspaceUri }]);
+    assert.deepEqual(sent, [{ text: ". /tmp/attach-beta.sh", addNewLine: true }]);
+  }
 });
 
 function createVscodeFixture(input: {

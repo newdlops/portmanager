@@ -328,3 +328,22 @@ benchmark 결과는 standalone native helper의 측정이다. Borrowed Network �
 kernel/broker 경계의 성능 측정을 뜻하지 않는다. 사용자의 실제 서비스와 VS Code는
 이번 측정·반영 과정에서 재시작하지 않았다.
 <!-- native-transfer-benchmark:end -->
+
+## 로컬 설치본 터미널·자원 검증
+
+`scripts/test-packaged-extension.mjs --isolated-local`은 이 Mac에 설치된 VS Code를
+별도 user-data/extensions/workspace/temp 디렉터리에서 실행한다. HOME은 바꾸지
+않고 테스트 시작 전에 `os.homedir()`만 private storage로 지정한다. 네이티브 agent
+spawn의 기존 경계에서 독립 DNS 포트 0을 전달하며, 설치된 제품 파일은 변경하지 않는다.
+
+macOS soak는 `packaged-terminal-lifecycle.ts`로 실제 SDK PTY의 취소·연결·전환·해제·
+종료를 반복한다. 기존 lo0 alias 두 개를 이용하며 시스템 alias/resolver 설정을
+변경하지 않는다. 실제 Node의 반환 바이트와 파일 기록으로 Host Access, public DNS,
+타 네트워크 TCP/namespace 거부, env 위조·hook opt-out의 scope 변경 거부, 공유 소스
+쓰기 및 fresh host shell의 detach를 검사한다. 출력에 명령이 보이는 것만으로 성공을
+판정하지 않는다. kernel 내부의 descendant/orphan 정리는 네이티브 별도 증명이 필요하다.
+
+원래 1200초, 일반 GC, RSS 증가 96MiB 이하와 FD 증가 8 이하 기준을 유지한다.
+마지막에는 `disposeAsync()`로 실제 native parent와 listener 종료까지 기다리고 모든
+공유 budget 차원의 0을 요구한다. fixture의 관리 client를 먼저 닫아 자동 재연결을
+막고, private agent에 인증된 shutdown을 요청한 뒤 실제 종료를 확인한다.

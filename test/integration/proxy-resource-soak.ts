@@ -34,6 +34,8 @@ export interface ResourceSoakOptions {
   reportPath: string;
   /** Supplied only inside the disposable real extension host. */
   service?: PortManagerNetworkService;
+  /** Actual installed terminal churn shares this run's host, service and budget. */
+  exerciseTerminals?: (cycle: number) => Promise<void>;
 }
 
 /**
@@ -200,6 +202,9 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
         }
         routerPort = await availablePort();
         await within(router.open(routerPort), "open logical router");
+        if (options.exerciseTerminals && (cycle === 1 || cycle % 10 === 0)) {
+          await within(options.exerciseTerminals(cycle), "guarded terminal lifecycle", 30_000);
+        }
         if (cycle === 1 || cycle % 5 === 0) await sample("active");
         for (let burst = 0; burst < 4; burst++) {
           await Promise.all(endpoints.flatMap(endpoint => [
@@ -256,9 +261,12 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
     await within(sentinel.dispose(), "close SSE sentinel").catch(error => { failure ??= error; });
     for (const socket of liveSockets) socket.destroy();
     await within(Promise.all([close(echoServer), close(httpServer)]), "close fixture backends").catch(error => { failure ??= error; });
+    if (options.service) await within(options.service.disposeAsync(), "dispose installed service", 30_000).catch(error => { failure ??= error; });
     lag.disable();
-    const cleanedBaseline = { ...baseline, listeners: baseline.listeners - 1, connections: baseline.connections - 1,
-      upstreams: baseline.upstreams - 1, httpRequests: baseline.httpRequests - 1 };
+    const cleanedBaseline = options.service
+      ? Object.fromEntries(Object.keys(baseline).map(key => [key, 0])) as unknown as ProxyResourceLimits
+      : { ...baseline, listeners: baseline.listeners - 1, connections: baseline.connections - 1,
+        upstreams: baseline.upstreams - 1, httpRequests: baseline.httpRequests - 1 };
     await until(() => equalResources(resources.budget.used, cleanedBaseline), 10_000).catch(error => { failure ??= error; });
     await sample("after-cleanup").catch(error => { failure ??= error; });
     gcObserver.disconnect();
@@ -357,10 +365,10 @@ async function until(condition: () => boolean, milliseconds = 5000): Promise<voi
     await delay(20);
   }
 }
-async function within<T>(work: Promise<T>, operation = "exchange"): Promise<T> {
+async function within<T>(work: Promise<T>, operation = "exchange", milliseconds = 10_000): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try { return await Promise.race([work, new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(`Soak ${operation} deadline exceeded`)), 10_000);
+    timer = setTimeout(() => reject(new Error(`Soak ${operation} deadline exceeded`)), milliseconds);
   })]); } finally { clearTimeout(timer); }
 }
 async function listen(server: net.Server): Promise<number> {

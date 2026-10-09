@@ -7,7 +7,9 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
+import net from "node:net";
+import os from "node:os";
 import { gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath } from "@vscode/test-electron";
@@ -33,12 +35,16 @@ const vsix = path.join(root, `portmanager-${target}-${manifest.version}.vsix`);
 assert.ok(fs.existsSync(vsix), `Missing native target package: ${vsix}`);
 // macOS Unix sockets have a short path limit; the runner's default TMPDIR can
 // consume most of it before the daemon's socket basename is appended.
-const temporaryRoot = fs.mkdtempSync("/tmp/pm-vsix-");
+const temporaryRoot = fs.realpathSync(fs.mkdtempSync("/tmp/pm-vsix-"));
 const userData = path.join(temporaryRoot, "user");
 const extensions = path.join(temporaryRoot, "extensions");
 const runtimeTemp = path.join(temporaryRoot, "tmp");
 const workspace = path.join(temporaryRoot, "workspace");
 const privateHome = path.join(runtimeTemp, "home");
+const agentRecordPath = path.join(runtimeTemp, "owned-agent.json");
+const originalHome = os.homedir();
+const originalSharedSocket = path.join(os.tmpdir(), `newdlops-portmanager-agent-${process.getuid?.()}.sock`);
+const sharedSocketBefore = socketIdentity(originalSharedSocket);
 for (const directory of [userData, extensions, runtimeTemp, workspace]) fs.mkdirSync(directory);
 if (isolatedLocal) fs.mkdirSync(privateHome, { mode: 0o700 });
 fs.mkdirSync(path.join(userData, "User"));
@@ -95,9 +101,11 @@ try { await runOwnedProcess(vscodeExecutablePath, [...profileArgs, "--disable-ex
   "--disable-workspace-trust", `--extensionDevelopmentPath=${extensionPath}`,
   `--extensionTestsPath=${path.join(root, "out", "test", "integration", "packaged-extension.js")}`, workspace], {
     ...guiEnvironment,
-    ...(isolatedLocal ? { PM_TEST_EXECUTION_ENVIRONMENT: "isolated-local", PM_TEST_PRIVATE_HOME: privateHome } : {}),
+    ...(isolatedLocal ? { PM_TEST_EXECUTION_ENVIRONMENT: "isolated-local", PM_TEST_PRIVATE_HOME: privateHome, ZDOTDIR: privateHome } : {}),
     PM_TEST_EXTENSION_PATH: extensionPath,
     PM_TEST_EXTENSION_VERSION: manifest.version,
+    PM_TEST_NODE_EXECUTABLE: process.execPath,
+    PM_TEST_PRIVATE_AGENT_RECORD: agentRecordPath,
     PM_TEST_RESOURCE_SOAK_SECONDS: process.env.PM_TEST_RESOURCE_SOAK_SECONDS ?? "0",
     PM_TEST_RESOURCE_SOAK_REPORT: resourceReportPath,
     TMPDIR: runtimeTemp,
@@ -105,6 +113,11 @@ try { await runOwnedProcess(vscodeExecutablePath, [...profileArgs, "--disable-ex
     TEMP: runtimeTemp,
   }, (soakSeconds + 180) * 1000); }
 finally {
+  if (isolatedLocal) {
+    await stopOwnedDaemon();
+    assert.deepEqual(socketIdentity(originalSharedSocket), sharedSocketBefore, "The user's shared daemon socket changed during isolated validation.");
+    assert.equal(os.homedir(), originalHome);
+  }
   // Preserve the failure and cleanup counters in the job log even if the
   // separate artifact transport fails. Full samples remain in the JSON file.
   if (fs.existsSync(resourceReportPath)) {
@@ -126,6 +139,38 @@ finally {
   }
 }
 console.log(`Verified installed ${manifest.publisher}.${manifest.name}@${manifest.version} (${target}).`);
+
+/** A failed GUI startup still leaves only this fixture's authenticated daemon eligible for shutdown. */
+async function stopOwnedDaemon() {
+  if (!fs.existsSync(agentRecordPath)) return;
+  const record = JSON.parse(fs.readFileSync(agentRecordPath, "utf8"));
+  assert.equal(record.extensionPath, extensionPath);
+  assert.ok(path.dirname(record.socketPath) === runtimeTemp && record.tokenFilePath.startsWith(`${privateHome}${path.sep}`));
+  const helper = path.join(extensionPath, "media/native/portmanager_process_lookup");
+  const readIdentity = () => {
+    try { return JSON.parse(execFileSync(helper, ["identity", String(record.pid)], { encoding: "utf8", timeout: 3000,
+      env: { ...guiEnvironment, PORT_MANAGER_HOOK_DISABLED: "1" } })); } catch { return undefined; }
+  };
+  const current = () => { const identity = readIdentity(); return identity?.pid === record.pid && identity.birth === record.birth; };
+  if (!current()) return;
+  const authorization = fs.readFileSync(record.tokenFilePath, "utf8").trim();
+  await new Promise(resolve => {
+    const socket = net.createConnection(record.socketPath);
+    const timer = setTimeout(() => { socket.destroy(); resolve(); }, 3000);
+    socket.once("error", () => { clearTimeout(timer); resolve(); });
+    socket.once("close", () => { clearTimeout(timer); resolve(); });
+    socket.once("connect", () => socket.end(JSON.stringify({ id: "owned-final-cleanup", method: "shutdownDaemon", authorization }) + "\n"));
+  });
+  const deadline = Date.now() + 5000;
+  while (current() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(current(), false, "Private daemon did not exit after authenticated shutdown.");
+}
+
+/** Inode identity detects replacement without reading credentials or process environments. */
+function socketIdentity(socketPath) {
+  const stat = fs.lstatSync(socketPath, { throwIfNoEntry: false });
+  return stat ? { device: stat.dev, inode: stat.ino, socket: stat.isSocket() } : undefined;
+}
 
 /** Recover only complete journal records without promoting an interrupted run. */
 function readResourceReport(reportPath) {

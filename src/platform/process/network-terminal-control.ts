@@ -57,7 +57,14 @@ export class NetworkTerminalControl {
       this.send(client, { type: "launch", launch });
       await this.owner.observe(launch);
       return true;
-    } catch (error) { await this.owner.close(launch.id); throw error; }
+    } catch (error) {
+      await this.owner.close(launch.id);
+      if (!client.socket.destroyed) {
+        this.send(client, { type: "error", message: error instanceof Error ? error.message : String(error) });
+        client.socket.end();
+      }
+      throw error;
+    }
   }
 
   async detach(id: string): Promise<boolean> {

@@ -205,7 +205,10 @@ test("a control reader that closes before delivery produces a failed respawn ack
   const pushed = healthy.send("respawnChild", {
     parentPids: String(process.pid), networkId: "control-fail", line: "x".repeat(120_000),
   });
-  await delay(40);
+  // A later reply on the same NDJSON connection proves the push was dispatched.
+  // A wall-clock delay alone can close the reader before request admission on
+  // a busy host, which tests the different "no channel" failure instead.
+  await healthy.reply(healthy.send("daemonStatus"), 500);
   assert.equal(healthy.messages.some(row => row.id === pushed), false);
   control.socket.destroy();
   await assert.rejects(healthy.reply(pushed), /Control channel closed before command delivery/);
