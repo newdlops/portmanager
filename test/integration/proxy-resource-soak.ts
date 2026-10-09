@@ -336,11 +336,25 @@ export async function processSamples(hostPid: number, daemonPid?: number,
       // Exited but unreaped children still pass kill(pid, 0) while owning no
       // descriptors. Only an OS-confirmed exit/zombie may discard this error.
       if (await processHasCompleted(row.pid)) { completed.add(row.pid); return; }
+      // lsof exit 1 with no output is its no-match result. A process may be
+      // entering/exiting its descriptor table while still appearing in ps.
+      // One re-observation must produce a real count or OS-confirmed exit;
+      // persistent failures and permission/time-limit errors remain failures.
+      const queryError = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string; signal?: string | null };
+      if (queryError.code as unknown === 1 && queryError.stdout === "" && queryError.stderr === "" && !queryError.signal) {
+        await delay(50);
+        if (await processHasCompleted(row.pid)) { completed.add(row.pid); return; }
+        try { row.descriptors = await readDescriptors(row.pid); return; }
+        catch (retryError) {
+          if (await processHasCompleted(row.pid)) { completed.add(row.pid); return; }
+          error = retryError;
+        }
+      }
       if (error instanceof Error) {
         let observed: unknown;
         try { observed = (await execute("ps", ["-p", String(row.pid), "-o", "stat=,ppid=,comm="], { timeout: 5000 })).stdout.trim(); }
         catch (queryError) { observed = String(queryError); }
-        error.message += `\nSampling context: ${JSON.stringify({ sampled: row, observed })}`;
+        error.message += `\nSampling context: ${JSON.stringify({ sampled: row, observed, measurementPid })}`;
       }
       throw error;
     }

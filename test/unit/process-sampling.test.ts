@@ -85,3 +85,30 @@ test("resource sampling retains a live product child named ps and rejects its de
     return 1;
   }), error => error === failure);
 });
+
+test("resource sampling re-observes a clean no-match only when a live host subsequently has a real FD count", {
+  skip: process.platform === "win32", timeout: 10_000,
+}, async () => {
+  const noMatch = Object.assign(new Error("lsof selected no process"), { code: 1, stdout: "", stderr: "", signal: null });
+  let hostQueries = 0;
+  const samples = await processSamples(process.pid, undefined, async pid => {
+    if (pid === process.pid && hostQueries++ === 0) throw noMatch;
+    if (process.platform === "linux") return fs.readdirSync(`/proc/${pid}/fd`).length;
+    const result = await execute("lsof", ["-nP", "-a", "-p", String(pid), "-Ff"], { timeout: 5000 });
+    return result.stdout.split("\n").filter(line => /^f\d/.test(line)).length;
+  });
+  assert.equal(hostQueries, 2);
+  assert.ok(samples.find(row => row.pid === process.pid)!.descriptors > 0);
+});
+
+test("resource sampling rejects a repeated clean no-match for a live host", {
+  skip: process.platform === "win32", timeout: 10_000,
+}, async () => {
+  const noMatch = Object.assign(new Error("persistent live no-match"), { code: 1, stdout: "", stderr: "", signal: null });
+  let hostQueries = 0;
+  await assert.rejects(processSamples(process.pid, undefined, async pid => {
+    if (pid === process.pid) { hostQueries++; throw noMatch; }
+    return 1;
+  }), error => error === noMatch);
+  assert.equal(hostQueries, 2);
+});
