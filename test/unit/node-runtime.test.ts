@@ -18,6 +18,7 @@ test("daemon runtime environment disables native socket hook variables", () => {
   const environment = buildNodeRuntimeEnvironment({
     PORT_MANAGER_HOOK: "1",
     PORT_MANAGER_NETWORK_ID: "network-a",
+    PORT_MANAGER_NETWORK_BROKER_SOCKET: "/tmp/network-a-broker.sock",
     PORT_MANAGER_ROUTE_TABLE_NETWORK_ID: "network-a",
     PORT_MANAGER_ROUTES_FILE: "/tmp/routes-network-a.json",
     PORT_MANAGER_GLOBAL_ROUTES_FILE: "/tmp/routes.json",
@@ -30,6 +31,9 @@ test("daemon runtime environment disables native socket hook variables", () => {
     BASH_ENV: "/tmp/portmanager-bash-env.sh",
     DYLD_INSERT_LIBRARIES: "/tmp/libportmanager_hook.dylib",
     LD_PRELOAD: "/tmp/libportmanager_hook.so",
+    DYLD_LIBRARY_PATH: "/workspace/untrusted-libraries",
+    LD_LIBRARY_PATH: "/workspace/untrusted-libraries",
+    LD_AUDIT: "/workspace/audit.so",
     PATH: "/usr/bin",
   });
 
@@ -37,6 +41,7 @@ test("daemon runtime environment disables native socket hook variables", () => {
   assert.equal(environment.PORT_MANAGER_HOOK_DISABLED, "1");
   assert.equal(environment.PORT_MANAGER_HOOK, undefined);
   assert.equal(environment.PORT_MANAGER_NETWORK_ID, undefined);
+  assert.equal(environment.PORT_MANAGER_NETWORK_BROKER_SOCKET, undefined);
   assert.equal(environment.PORT_MANAGER_ROUTE_TABLE_NETWORK_ID, undefined);
   assert.equal(environment.PORT_MANAGER_ROUTES_FILE, undefined);
   assert.equal(environment.PORT_MANAGER_GLOBAL_ROUTES_FILE, undefined);
@@ -49,12 +54,16 @@ test("daemon runtime environment disables native socket hook variables", () => {
   assert.equal(environment.BASH_ENV, undefined);
   assert.equal(environment.DYLD_INSERT_LIBRARIES, undefined);
   assert.equal(environment.LD_PRELOAD, undefined);
+  assert.equal(environment.DYLD_LIBRARY_PATH, undefined);
+  assert.equal(environment.LD_LIBRARY_PATH, undefined);
+  assert.equal(environment.LD_AUDIT, undefined);
   assert.equal(environment.PATH, "/usr/bin");
 });
 
 test("current daemon process can disable an already loaded hook", () => {
   const environment: NodeJS.ProcessEnv = {
     PORT_MANAGER_HOOK: "1",
+    PORT_MANAGER_NETWORK_BROKER_SOCKET: "/tmp/network-a-broker.sock",
     PORT_MANAGER_BORROWED_NETWORK_ID: "network-a",
     PORT_MANAGER_ROUTE_TABLE_NETWORK_ID: "network-a",
     PORT_MANAGER_ROUTES_FILE: "/tmp/routes-network-a.json",
@@ -66,6 +75,7 @@ test("current daemon process can disable an already loaded hook", () => {
 
   assert.equal(environment.PORT_MANAGER_HOOK_DISABLED, "1");
   assert.equal(environment.PORT_MANAGER_HOOK, undefined);
+  assert.equal(environment.PORT_MANAGER_NETWORK_BROKER_SOCKET, undefined);
   assert.equal(environment.PORT_MANAGER_BORROWED_NETWORK_ID, undefined);
   assert.equal(environment.PORT_MANAGER_ROUTE_TABLE_NETWORK_ID, undefined);
   assert.equal(environment.PORT_MANAGER_ROUTES_FILE, undefined);

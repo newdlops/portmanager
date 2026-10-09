@@ -53,6 +53,8 @@ static pm_scan_job *pm_scan_jobs;
 static pm_scan_context *pm_scan_current;
 static size_t pm_scan_job_count;
 static size_t pm_scan_output_bytes;
+static int pm_scan_trusted_tools;
+void pm_scan_set_trusted_tools(int enabled) { pm_scan_trusted_tools = enabled != 0; }
 
 static long long pm_scan_now(void) {
   struct timespec now;
@@ -215,7 +217,11 @@ static void pm_scan_spawn(pm_scan_job *job) {
       posix_spawnattr_setpgroup(&attributes, 0) != 0 ||
       posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK) != 0) goto failed;
   char *argv[] = {"sh", "-c", job->command, NULL};
-  error = posix_spawn(&job->pid, "/bin/sh", &actions, &attributes, argv, environ);
+  /* No project PATH, startup files, preload, or exported shell functions enter
+   * the trusted query child. Workload runtime environment is independent. */
+  char *trusted_environment[] = {"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C", "PORT_MANAGER_HOOK_DISABLED=1", NULL};
+  error = posix_spawn(&job->pid, "/bin/sh", &actions, &attributes, argv,
+    pm_scan_trusted_tools ? trusted_environment : environ);
   if (error != 0) goto failed;
   posix_spawnattr_destroy(&attributes);
   posix_spawn_file_actions_destroy(&actions);

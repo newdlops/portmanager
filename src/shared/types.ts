@@ -806,6 +806,8 @@ export interface AgentDaemonStatus {
   readonly authenticatesNetworkPeers?: boolean;
   /** Native daemon can acknowledge and resolve controller-origin PID/birth scope. */
   readonly authenticatesProcessScopes?: boolean;
+  /** Query subprocesses use system tools and a minimal environment. */
+  readonly trustedQueryTools?: boolean;
   /** Current extension-side view of the local daemon lifecycle. */
   readonly status: AgentDaemonState;
   /** PID of the single local agent process when connected. */

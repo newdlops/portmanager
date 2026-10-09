@@ -276,6 +276,8 @@ static void pm_nb_execute(pm_nb_server *server, pm_nb_client *client) {
     pm_nb_reply(client, result == 0 ? 0 : errno); return;
   }
   if (request->backlog != 0 || pm_nb_begin_nonblocking(client) != 0) { pm_nb_reply(client, EINVAL); return; }
+  pm_dev_log("network-broker", "accept started peer_pid=%ld original_flags=%d broker_flags=%d", (long)client->pid,
+    client->original_flags, fcntl(client->socket, F_GETFL, 0));
   /* accept itself validates listening state. SO_ACCEPTCONN is not a portable
    * getsockopt query on Darwin; using it would reject a valid shared listener. */
   pm_nb_accept_tcp(client);

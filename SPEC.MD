@@ -327,8 +327,13 @@ controller-origin root·OS 조상을 확인하고 위조 env보다 우선하는 
 일반 workload token으로 만든 peer scope는 subtree root가 아니다. 관측된 자손은
 reparent 뒤에도 birth를 확인하고, controller route 등록도 scope의 networkId와 같아야
 한다. native의 `authenticatesProcessScopes: true`를 확인하며 Node fallback은 이 RPC를
-거절한다. daemon 재시작의 root 재등록, 관측 전 orphan 처리, 실제 recovery/proxy의
-API 사용은 제품 연결 전에 검증해야 한다.
+거절한다. scope 승인은 `--trusted-tools` daemon에서만 허용하며 `trustedQueryTools: true`
+를 보고한다. 조회 child는 시스템 PATH와 최소 환경만 사용해 공유 프로젝트의 lsof/ps나
+startup/preload가 daemon 권한으로 실행되지 않게 한다. workload runtime/PATH는 유지한다.
+native route 복구는 controller scope와 실제 listener port를 사용하고 미등록 PID의 env를
+추측하지 않는다. proxy 귀속은 현재 OS identity와 controller scope를 env·기존 cache·
+PID-only tracker보다 먼저 조회하고, 실패·tuple 불일치는 기존 힌트로 대체하지 않는다.
+daemon 재시작 root 재등록, 관측 전 orphan과 broker PID, 실제 attach/자원 검증은 남아 있다.
 
 제품 경로에 연결하기 전에 다음을 검증한다.
 

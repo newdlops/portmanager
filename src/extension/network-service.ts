@@ -5900,6 +5900,29 @@ export class PortManagerNetworkService implements DisposableLike {
     const nativePid = connection.clientPid;
     const nativeStartTime = connection.clientStartTime;
 
+    // The native network hint and legacy cache come from mutable env/markers.
+    // A guarded daemon resolves a fresh OS identity before either can act as
+    // authority. Lookup/transport failure is not a reason to use those hints.
+    if (this.processService?.getSnapshot().daemon?.authenticatesProcessScopes === true) {
+      const client = nativePid === undefined ? await this.tcpConnectionProcessResolver.resolveClientProcess(connection) : undefined;
+      const pid = nativePid ?? client?.pid;
+      if (pid === undefined) return { processRows: [], clientCwd: client?.cwd };
+      const identity = await this.nativeProcessLookup.readProcessIdentity(pid);
+      if (identity === undefined || this.processService.resolveProcessScope === undefined) {
+        throw new Error("Authenticated router process identity is unavailable.");
+      }
+      if (process.platform === "darwin" && nativeStartTime !== undefined &&
+          nativeStartTime !== String(Math.floor(identity.birth / 1_000_000))) {
+        throw new Error("Router process identity changed before scope resolution.");
+      }
+      const scope = await this.processService.resolveProcessScope(identity);
+      if (scope === null) return { processRows: [], clientCwd: client?.cwd };
+      if (scope.pid !== identity.pid || scope.birth !== identity.birth || scope.networkId.length === 0) {
+        throw new Error("Authenticated router scope does not match its current process.");
+      }
+      return { networkId: scope.networkId, processRows: [] };
+    }
+
     // Native attribution carried the network id directly (fast path).
     if (connection.clientNetworkId !== undefined && nativePid !== undefined) {
       this.routerVerdictCache.store(nativePid, nativeStartTime, connection.clientNetworkId);

@@ -43,8 +43,17 @@ test("guarded exec waits for controller PID/birth registration and never widens 
     assert.equal(result.pid, pid); assert.ok(Number.isSafeInteger(result.birth) && result.birth > 0);
     return { pid: result.pid, birth: result.birth };
   };
-  const environment: NodeJS.ProcessEnv = { ...process.env, PORT_MANAGER_HOOK_DISABLED: "1", PORT_MANAGER_AGENT_DISABLE_HOOK_RECOVERY: "1" };
+  const environment: NodeJS.ProcessEnv = { ...process.env, PORT_MANAGER_HOOK_DISABLED: "1", PORT_MANAGER_AGENT_DISABLE_HOOK_RECOVERY: "0" };
   delete environment.DYLD_INSERT_LIBRARIES; delete environment.LD_PRELOAD; delete environment.BASH_ENV; delete environment.ENV;
+  const poison = path.join(root, "poison-bin"), poisonMarker = path.join(root, "poisoned-tool.js");
+  fs.mkdirSync(poison, { mode: 0o700 });
+  for (const tool of ["lsof", "ps"]) fs.writeFileSync(path.join(poison, tool),
+    `#!/bin/sh\n/usr/bin/touch '${poisonMarker}'\nexit 1\n`, { mode: 0o700 });
+  environment.PATH = `${poison}:${environment.PATH}`;
+  // Witness that the deliberately shadowed tools really run without the
+  // daemon's trusted child environment, then clear only this fixture marker.
+  await run("/bin/sh", ["-c", "lsof; ps; exit 0"], { env: environment, timeout: 3000 });
+  assert.equal(fs.existsSync(poisonMarker), true); fs.unlinkSync(poisonMarker);
   context.after(async () => {
     for (const socket of sockets) socket.destroy();
     for (const child of children.reverse()) {
@@ -62,15 +71,15 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   const tokenPath = path.join(security, "agent-control/controller.key"), token = ensureAgentControllerToken(tokenPath);
   const tokenA = ensureAgentNetworkToken("fixture", "network-a", tokenPath), tokenB = ensureAgentNetworkToken("fixture", "network-b", tokenPath);
   const agentSocket = path.join(security, "sockets/agent.sock"), brokerSocket = path.join(security, "sockets/a.sock");
-  const nativeAgent = spawn(agent, ["--socket", agentSocket, "--route-table", path.join(security, "routes.json"), "--dns-port", "0", "--controller-token-file", tokenPath],
+  const nativeAgent = spawn(agent, ["--socket", agentSocket, "--route-table", path.join(security, "routes.json"), "--dns-port", "0", "--controller-token-file", tokenPath, "--trusted-tools"],
     { env: environment, stdio: ["ignore", "ignore", "pipe"] }); children.push(nativeAgent);
   const nativeBroker = spawn(broker, ["--socket", brokerSocket, "--network-id", "network-a", "--loopback-host", "127.0.0.1"],
     { env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(nativeBroker);
   await once(nativeBroker.stdout!, "data");
   const startupDeadline = Date.now() + 5000;
   while (!fs.existsSync(agentSocket)) { assert.ok(Date.now() < startupDeadline, "fixture agent did not start"); await delay(10); }
-  async function request(method: string, payload: unknown, authorization = token, authorizationNetworkId?: string): Promise<Reply> {
-    const socket = net.createConnection(agentSocket); sockets.add(socket); socket.once("close", () => sockets.delete(socket));
+  async function request(method: string, payload: unknown, authorization = token, authorizationNetworkId?: string, endpoint = agentSocket): Promise<Reply> {
+    const socket = net.createConnection(endpoint); sockets.add(socket); socket.once("close", () => sockets.delete(socket));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { socket.destroy(); reject(new Error("fixture controller response timed out")); }, 5000);
       socket.once("error", error => { clearTimeout(timer); reject(error); });
@@ -78,13 +87,22 @@ test("guarded exec waits for controller PID/birth registration and never widens 
       let response = "";
       socket.on("data", bytes => {
         response += bytes.toString();
-        if (response.length > 4096) { clearTimeout(timer); socket.destroy(); reject(new Error("unexpected fixture response size")); return; }
+        if (response.length > (method === "repairRoutingState" ? 4 * 1024 * 1024 : 4096)) { clearTimeout(timer); socket.destroy(); reject(new Error("unexpected fixture response size")); return; }
         if (!response.includes("\n")) return;
         clearTimeout(timer); socket.destroy(); resolve(JSON.parse(response.split("\n")[0]) as Reply);
       });
     });
   }
   assert.equal(((await request("daemonStatus", {})).payload as { authenticatesProcessScopes?: boolean }).authenticatesProcessScopes, true);
+  assert.equal(((await request("daemonStatus", {})).payload as { trustedQueryTools?: boolean }).trustedQueryTools, true);
+  const legacySocket = path.join(security, "sockets/legacy.sock");
+  const legacy = spawn(agent, ["--socket", legacySocket, "--route-table", path.join(security, "legacy-routes.json"), "--dns-port", "0", "--controller-token-file", tokenPath],
+    { env: environment, stdio: ["ignore", "ignore", "pipe"] }); children.push(legacy);
+  const legacyDeadline = Date.now() + 5000;
+  while (!fs.existsSync(legacySocket)) { assert.ok(Date.now() < legacyDeadline); await delay(10); }
+  assert.equal(((await request("daemonStatus", {}, token, undefined, legacySocket)).payload as { authenticatesProcessScopes?: boolean }).authenticatesProcessScopes, false);
+  assert.equal((await request("registerProcessScope", { ...inspect(process.pid), networkId: "network-a" }, token, undefined, legacySocket)).ok, false,
+    "an agent using mutable project PATH must never approve guarded execution");
   const own = networkNamespacePaths(root, "network-a"); fs.mkdirSync(own.filesDirectory, { recursive: true, mode: 0o700 });
   const profilePath = path.join(security, "profiles/a.sb");
   fs.writeFileSync(profilePath, buildMacosNetworkSandboxProfile({ networkId: "network-a", namespaceDirectories: [own.directory], sharedWorkspaceDirectories: [root], agentSocketPath: brokerSocket }), { mode: 0o600 });
@@ -109,9 +127,12 @@ test("guarded exec waits for controller PID/birth registration and never widens 
     });
   }); servers.push(delayed); delayed.listen(delayedSocket); await once(delayed, "listening");
   const guarded = spawn(launcher, args(delayedSocket, [process.execPath, "-e", `
-    const fs=require('fs'),cp=require('child_process');
+    const fs=require('fs'),cp=require('child_process'),net=require('net');
     fs.writeFileSync(${JSON.stringify(marker)},'entered');
     fs.writeFileSync(${JSON.stringify(state)},'own-state');
+    process.env.PORT_MANAGER_NETWORK_ID='network-b'; process.env.PORT_MANAGER_HOOK_DISABLED='1';
+    process.env.PORT='1'; process.env.PORT_MANAGER_NETWORK_LOOPBACK_HOST='127.255.255.254';
+    net.createServer().listen(0,'127.0.0.1',function(){console.log('LISTEN_PORT='+this.address().port)});
     const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000);setTimeout(()=>process.exit(0),30000)'],{detached:true,stdio:'ignore',env:{...process.env,PORT_MANAGER_NETWORK_ID:'network-b'}});
     console.log('DESC_PID='+child.pid); child.unref(); setInterval(()=>{},1000);
   `]), { cwd: root, env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(guarded);
@@ -126,13 +147,22 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   assert.equal(output, "", "no readiness may be announced before controller acknowledgement");
   await release();
   const runDeadline = Date.now() + 5000;
-  while (!/DESC_PID=\d+/.test(output) || !output.includes("ready pid=")) {
+  while (!/DESC_PID=\d+/.test(output) || !/LISTEN_PORT=\d+/.test(output) || !output.includes("ready pid=")) {
     assert.equal(guarded.exitCode, null, `guard exited; stdout=${output}; stderr=${errors}`);
     assert.ok(Date.now() < runDeadline, `stdout=${output}; stderr=${errors}`); await delay(10);
   }
   assert.equal(fs.readFileSync(marker, "utf8"), "entered");
   assert.equal(fs.readFileSync(path.join(own.filesDirectory, "nested/state.pid"), "utf8"), "own-state", "kernel execution must preserve automatic nested state splitting");
   assert.deepEqual((await request("resolveProcessScope", offeredIdentity)).payload, offered);
+  const actualPort = Number(/LISTEN_PORT=(\d+)/.exec(output)![1]);
+  const repaired = await request("repairRoutingState", {});
+  assert.equal(repaired.ok, true, repaired.error);
+  const routes = (repaired.payload as { routes: Array<{ networkId?: string; actualPort: number; logicalPort: number }> }).routes;
+  const recovered = routes.find(route => route.actualPort === actualPort);
+  assert.ok(recovered, `missing scoped listener ${actualPort}`);
+  assert.equal(recovered.networkId, "network-a", "native repair must use pre-exec controller identity, never the forged network-b env");
+  assert.equal(recovered.logicalPort, actualPort, "broker same-port recovery must ignore the forged PORT hint");
+  assert.equal(fs.existsSync(poisonMarker), false, "trusted lsof/ps must not execute shadowed project tools");
   assert.equal((await request("registerProcessScope", { ...offered, networkId: "network-b" })).ok, false);
   assert.equal((await request("resolveProcessScope", { ...offeredIdentity, birth: offeredIdentity.birth + 1 })).ok, false);
   for (const method of ["registerProcessScope", "resolveProcessScope"]) {

@@ -93,6 +93,7 @@ int main(int argc, char **argv) {
   }
 #endif
   int fd = socket(AF_INET, SOCK_STREAM, 0), returned = -1, result = -1;
+  const char *phase = "operation";
   if (fd < 0) return 3;
   if (argc == 5 && (strcmp(argv[1], "connect") == 0 || strcmp(argv[1], "connect-nonblocking") == 0)) {
     int nonblocking = strcmp(argv[1], "connect-nonblocking") == 0;
@@ -171,27 +172,33 @@ int main(int argc, char **argv) {
     result = result < 0 && errno == EINVAL && returned < 0 ? 0 : -1;
     close(regular);
   } else if (argc == 3 && (strcmp(argv[1], "cancel-accept") == 0 || strcmp(argv[1], "cancel-accept-halfclose") == 0)) {
+    phase = "bind";
     result = invoke(argv[2], PM_NB_BIND, fd, "127.0.0.1", 0, &returned);
+    phase = "listen";
     if (result == 0) result = invoke(argv[2], PM_NB_LISTEN, fd, NULL, 0, &returned);
     int original = fcntl(fd, F_GETFL, 0), control = control_socket(argv[2]);
     pm_nb_request request = request_for(PM_NB_ACCEPT);
+    phase = "accept-send";
     if (result == 0 && control >= 0) result = send_raw(control, &request, fd, 1); else result = -1;
     long long deadline = pm_nb_client_now() + 1500;
+    phase = "accept-enter";
     while (result == 0 && !(fcntl(fd, F_GETFL, 0) & O_NONBLOCK) && pm_nb_client_now() < deadline) usleep(5000);
-    if (result == 0 && !(fcntl(fd, F_GETFL, 0) & O_NONBLOCK)) result = -1;
+    if (result == 0 && !(fcntl(fd, F_GETFL, 0) & O_NONBLOCK)) { result = -1; errno = ETIMEDOUT; }
     if (strcmp(argv[1], "cancel-accept") == 0) {
       close(control); control = -1;
     } else {
       if (result == 0 && shutdown(control, SHUT_WR) != 0) result = -1;
     }
     deadline = pm_nb_client_now() + 1500;
+    if (result == 0) phase = "accept-restored";
     while (result == 0 && fcntl(fd, F_GETFL, 0) != original && pm_nb_client_now() < deadline) usleep(5000);
     if (result == 0 && fcntl(fd, F_GETFL, 0) != original) result = -1;
     if (control >= 0) close(control);
   }
   int error = errno;
+  int final_flags = fcntl(fd, F_GETFL, 0);
   close(fd);
   if (result == 0) { puts("allowed"); return 0; }
-  printf("failed errno=%d\n", error);
+  printf("failed errno=%d phase=%s flags=%d\n", error, phase, final_flags);
   return error == EACCES || error == EPERM ? 1 : 3;
 }

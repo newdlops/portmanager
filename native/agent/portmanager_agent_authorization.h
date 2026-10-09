@@ -28,6 +28,7 @@ typedef struct {
   char controller_token[65];
   pm_authenticated_scope *scopes;
   size_t count;
+  int has_controller_scopes;
 } pm_authorization;
 
 static unsigned long long pm_auth_process_birth(pid_t pid) {
@@ -187,6 +188,7 @@ static pm_authenticated_scope *pm_auth_exact_scope(pm_authorization *auth, pid_t
 /* Only controller-origin scope can authorize descendants. Ordinary network
  * tokens retain their existing exact-peer binding and do not create roots. */
 static pm_authenticated_scope *pm_auth_controller_scope(pm_authorization *auth, pid_t pid, unsigned long long birth) {
+  if (!auth->has_controller_scopes) return NULL;
   if (birth == 0 || pm_auth_process_birth(pid) != birth) return NULL;
   pid_t current = pid;
   unsigned long long current_birth = birth;
@@ -222,6 +224,7 @@ static int pm_auth_register_controller_scope(pm_authorization *auth, pid_t pid, 
   pm_authenticated_scope *scope = pm_auth_exact_scope(auth, pid, birth);
   if (scope == NULL) return -1;
   scope->controller_scope = 1;
+  auth->has_controller_scopes = 1;
   return 0;
 }
 

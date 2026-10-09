@@ -87,4 +87,10 @@ test("direct identity lookup preserves exact birth, rejects mismatches and toler
   assert.deepEqual(await provider.readProcessIdentity(11), { pid: 11, birth });
   assert.equal(await provider.readProcessIdentity(12), undefined);
   assert.deepEqual(calls, [["identity", "10"], ["identity", "11"], ["identity", "12"]]);
+  const separated = new NativeProcessLookupProvider({ commandRunner: async (_file, args) => {
+    if (args[0] === "inspect") throw new Error("legacy inspection unavailable");
+    return { stdout: JSON.stringify({ pid: 11, birth }) };
+  } });
+  assert.equal(await separated.inspectProcess(11), undefined);
+  assert.deepEqual(await separated.readProcessIdentity(11), { pid: 11, birth }, "a legacy env/TTY failure must not disable the independent identity query");
 });

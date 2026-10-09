@@ -62,7 +62,7 @@ export class NativeProcessLookupProvider {
 
   /** Direct OS identity query without a process-table or environment scan. */
   async readProcessIdentity(pid: number): Promise<NativeProcessIdentity | undefined> {
-    if (this.disabled || process.platform === "win32" || !isPositiveInteger(pid)) return undefined;
+    if (process.platform === "win32" || !isPositiveInteger(pid)) return undefined;
     try {
       const { stdout } = await this.runCommand(this.helperPath, ["identity", String(pid)]);
       const identity = parseNativeProcessIdentity(toText(stdout));

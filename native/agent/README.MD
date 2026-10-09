@@ -61,8 +61,20 @@ controller-origin scope로 취급한다. 네트워크 키의 일반 peer 등록�
 않는다. 충돌한 일반 peer 등록이나 꽉 찬 표가 확인된 controller 조상을 지우지 않는다.
 미확인 정체성은 `null`이며 제품의 강제 경로에서 env 추측으로 대체해서는 안 된다.
 이 표는 daemon 메모리에만 있으므로 restart 등록 복구와 관측 전 orphan 처리는 남아 있다.
-native status/snapshot은 `authenticatesProcessScopes: true`를 제공하고 Node fallback은
-false를 제공하며 이 두 RPC를 controller에게도 거절한다.
+`--trusted-tools`로 시작한 native status/snapshot만 `authenticatesProcessScopes: true`와
+`trustedQueryTools: true`를 제공한다. 이 옵션이 없거나 Node fallback이면 scope RPC를
+controller에게도 거절한다. 확장 호스트가 native daemon을 새로 시작할 때는 이 옵션을
+명시한다.
+
+trusted 조회 child는 `/bin/sh`와 시스템 PATH(`/usr/bin:/bin:/usr/sbin:/sbin`), `LC_ALL=C`,
+hook 비활성화만 상속한다. 공유 프로젝트의 lsof/ps, shell startup·exported function,
+preload 환경이 daemon 권한으로 실행되어서는 안 된다. workload의 호스트 runtime/PATH는
+이와 독립적이며 변경하지 않는다. 별도 legacy/test daemon만 이전 조회 환경을 사용한다.
+
+trusted mode의 자동 route 복구는 controller scope와 실제 OS listener port를 사용한다.
+환경변수의 networkId·PORT·loopback·session 정보를 권한 근거로 쓰지 않으며 미등록 PID는
+복구하지 않는다. legacy env 복구는 trusted mode 밖에서만 유지한다. 현재 API의
+daemon restart root 재등록과 관측 전 orphan 처리에는 추가 연결이 필요하다.
 
 키 읽기는 directory FD의 `openat`/`O_NOFOLLOW`로 parent/leaf symlink를 거부하고 소유자와
 0700 디렉터리·0600 파일을 확인한다. `--controller-token-file`로 별도 private 경로를 지정할 수

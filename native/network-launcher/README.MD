@@ -43,7 +43,8 @@ controller 키 읽기와 RPC FD 생성은 fork 이후 부모에서만 일어나�
 키와 FD가 전달되지 않는다. 부분·잘못된 응답, 거절, 원래 시작 기한 8초, 시작 중 취소는
 프로그램 실행과 readiness 없이 종료한다. controller 없이 쓰는 경로는 독립적인 커널
 검증용 후보다. 제품 연결에는 native daemon의 `authenticatesProcessScopes: true`와
-controller 옵션이 필요하다.
+controller 옵션과 daemon의 `--trusted-tools`가 필요하다. mutable PATH로 조회하는
+daemon은 scope 승인을 거절해 프로그램 실행을 허용하지 않는다.
 
 실제 TTY에서는 trusted parent의 stdin device만 정책에 추가한다. 다른 `/dev/tty*`
 읽기는 기본 host-read allowlist에서 제외하며, `/dev/tty`는 해당 세션의 kernel alias다.
@@ -61,8 +62,12 @@ macOS `sandbox-exec`, libproc, POSIX fork/exec/pipes/poll/process groups,
 커널 적용과 broker transport의 시작 확인이며, 생성된 profile 전체의 보안 검증을
 대체하지 않는다. 정책 생성은 trusted controller의 책임이다.
 PID 등록과 controller-origin ancestry 조회는 별도 agent API에 연결했다. 실제 terminal
-readiness 전달, proxy/route 복구의 해당 API 사용, shell bootstrap과 SIP preload 복구,
+readiness 전달, shell bootstrap과 SIP preload 복구,
 DNS/host access 및 공유 resource-budget 통합은 별도 연결해야 한다. 관측된 자손은
 reparent 뒤에도 birth에 묶어 기억하지만, 관측 전 사라진 조상이나 daemon 재시작의
 등록 복구까지 이 후보만으로 보장하지 않는다.
+native route 복구와 확장 proxy 귀속은 API 사용을 연결했다. proxy는 현재 OS birth와
+scope tuple을 확인한 뒤에만 network로 분류하며, 조회 실패·불일치에 env/cache/tracker로
+대체하지 않는다. 미등록 host process는 env에서 network를 만들지 않는 host 정책에
+남는다. 관측 전 orphan과 broker 자체 PID 등록을 포함한 실제 attach 검증은 남아 있다.
 Linux 및 다른 macOS 버전의 실행 지원은 확인하지 않았다.

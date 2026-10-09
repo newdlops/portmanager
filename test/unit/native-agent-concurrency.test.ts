@@ -212,7 +212,7 @@ test("native agent route tables carry TTL and refresh unchanged files", () => {
   assert.equal(unchangedBody.includes("pm_write_route_table_file(state, file_path, routes, count, sequence)"), true);
 });
 
-test("native agent recovers restarted hook routes from process environment", () => {
+test("native legacy recovery keeps environment hints outside controller-scoped recovery", () => {
   const source = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent_state.c"), "utf8");
   const header = fs.readFileSync(path.join(projectRoot, "native", "agent", "portmanager_agent.h"), "utf8");
   const peerSource = fs.readFileSync(path.join(projectRoot, "native", "shared", "pm_peer_process.c"), "utf8");
@@ -269,7 +269,7 @@ test("native agent recovers restarted hook routes from process environment", () 
   assert.equal(listenerRecoveryBody.includes("pm_hook_recovery_listener_matches_exported_loopback"), true);
   assert.equal(source.includes("pm_is_non_default_loopback_host(normalized_exported_host)"), true);
   assert.equal(source.includes("requested_port == listener->port && !same_port_recovery"), true);
-  assert.equal(listenerRecoveryBody.includes("if (pm_inspect_hook_recovery_command(inspection))"), true);
+  assert.equal(listenerRecoveryBody.includes("if (!controller_scoped && pm_inspect_hook_recovery_command(inspection))"), true);
   assert.equal(listenerRecoveryBody.includes("pm_is_hook_recovery_helper_text(command)"), true);
   assert.ok(
     listenerRecoveryBody.indexOf("pm_inspect_hook_recovery_command(inspection)") <

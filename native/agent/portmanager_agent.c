@@ -22,6 +22,15 @@
 
 static pm_authorization pm_auth;
 
+/* Registry policy consumes an OS-authenticated scope without reading env or
+ * exposing private authorization storage to its publication/scan adapters. */
+static int pm_resolve_authenticated_scope(pid_t pid, char *network_id, size_t size) {
+  pm_authenticated_scope *scope = pm_auth_controller_scope(&pm_auth, pid, pm_auth_process_birth(pid));
+  if (scope == NULL || strlen(scope->network_id) >= size) return 0;
+  memcpy(network_id, scope->network_id, strlen(scope->network_id) + 1);
+  return 1;
+}
+
 #define PM_CLIENT_BUFFER_INITIAL 2048
 /* Large enough for a respawnChild request carrying an escaped child's full
  * argv+env (base64), which reaches tens of KB in deep shell/yarn chains. */
@@ -507,6 +516,9 @@ static int pm_dispatch(pm_agent_state *state, const pm_request *request, pm_buff
   /* These methods have no network/anonymous authorization path. The launcher
    * sends its own fork identity before the child receives permission to exec. */
   if (strcmp(request->method, "registerProcessScope") == 0 || strcmp(request->method, "resolveProcessScope") == 0) {
+    if (!state->trusted_tools) {
+      snprintf(error, error_size, "Authenticated process scopes require trusted system query tools."); return -1;
+    }
     long raw_pid = pm_json_get_long(request->payload, "pid", 0);
     long raw_birth = pm_json_get_long(request->payload, "birth", 0);
     char network_id[128]; network_id[0] = '\0';
@@ -1541,7 +1553,10 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  pm_scan_set_trusted_tools(arguments.trusted_tools);
   pm_state_init(&state, arguments.route_table_path, arguments.agent_main_path);
+  state.trusted_tools = arguments.trusted_tools;
+  state.resolve_process_scope = arguments.trusted_tools ? pm_resolve_authenticated_scope : NULL;
   pm_dns_init(&state, arguments.dns_port);
   pm_event_loop(server_fd, &state);
   pm_dns_dispose(&state);

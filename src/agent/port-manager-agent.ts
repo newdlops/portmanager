@@ -2633,6 +2633,7 @@ function buildDaemonStatus(options: {
     controllerAuthorizationVersion: 1,
     authenticatesNetworkPeers: false,
     authenticatesProcessScopes: false,
+    trustedQueryTools: false,
     status: "running",
     pid: options.agentPid,
     startedAt: options.startedAt,
