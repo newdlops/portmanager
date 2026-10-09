@@ -156,6 +156,8 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   assert.equal(fs.existsSync(marker), false, "guard must not run the program while controller registration is pending");
   assert.equal(output, "", "no readiness may be announced before controller acknowledgement");
   assert.equal(fs.existsSync(readyFile), false, "private readiness cannot be published before registration and exec");
+  assert.equal(fs.existsSync(readyFile + ".owner"), true, "private ownership must precede the exec acknowledgement");
+  assert.equal(fs.existsSync(readyFile + ".cleaned"), false);
   await release();
   const runDeadline = Date.now() + 5000;
   while (!/DESC_PID=\d+/.test(output) || !/LISTEN_PORT=\d+/.test(output) || !output.includes("ready pid=")) {
@@ -190,6 +192,8 @@ test("guarded exec waits for controller PID/birth registration and never widens 
     "controller route recovery cannot overwrite an authenticated child with its forged env network");
   const exit = once(guarded, "exit"); guarded.kill("SIGTERM"); await exit;
   assert.equal(fs.existsSync(readyFile), false, "supervisor must remove its own readiness inode on exit");
+  const ownerRecord = JSON.parse(fs.readFileSync(readyFile + ".owner", "utf8"));
+  assert.deepEqual(JSON.parse(fs.readFileSync(readyFile + ".cleaned", "utf8")), { ...ownerRecord, cleaned: true });
   assert.equal((await request("resolveProcessScope", descendantIdentity)).ok, false, "terminal shutdown must finish its detached descendant before returning");
   assert.equal((await request("resolveProcessScope", offeredIdentity)).ok, false, "an exited root identity cannot be replayed");
 

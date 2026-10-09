@@ -425,6 +425,20 @@ child의 PID/birth/network tuple을 정책 승인·exec 성공 뒤 원자 게시
 snapshot(64 KiB·512 port)에서 승인된 Host Access·Compose 목적지를 local connect에만
 적용한다. 직접 다른 realm으로 요청하거나 설정된 snapshot이 잘못되면 우회하지 않는다.
 
+launcher의 종료 계약은 `--lifecycle-version`의 `1`로 확인한다. private ready를 요청한
+실행은 exec ACK 전에 `<ready>.owner`에 PID/birth/network와 실행 표식의 경로·inode를
+기록한다. root나 supervisor PID의 소멸만으로 회수 완료를 판단하지 않는다. kernel
+permission과 PID 세대를 확인한 모든 소속 프로세스가 사라지고 두 번의 census가 안정된
+뒤에만 같은 owner tuple에 `cleaned: true`를 추가한 `<ready>.cleaned`를 게시한다.
+완료 기록을 게시할 수 없으면 supervisor는 소유권을 유지한다.
+
+감독자의 갑작스러운 종료에는 `--recover-owner <ready>.owner`가 private 파일 정체성과
+감독자의 실제 종료를 검증하고 같은 kernel census·audit-token 신호로 잔여 자손을
+회수한다. 성공은 matching 완료 기록과 exit 0으로 확인하며 실패·timeout에는 lease,
+표식과 profile을 유지한다. v1에서 owner 없이 exec ACK 전 부모가 죽었다면 앱은 실행되지
+않았지만, private ready가 있다면 계약 위반으로 처리한다. TS 소비자와 실제 terminal
+닫기·SDK 종료 경로에 이 증명을 연결한 검증은 별도로 완료해야 한다.
+
 제품 경로에 연결하기 전에 다음을 검증한다.
 
 - 전용 broker가 kernel peer PID와 불변 네트워크 ID를 사용하고 관리 RPC를 거부할 것

@@ -96,6 +96,42 @@ identity buffer 두 개 524,288 bytes(합계 589,824 bytes)를 할당한다. 완
 inode만 삭제하고 모든 buffer/FD를 반환한다. 다른 터미널/호스트 프로세스와 PID 세대
 불일치가 신호 대상이 되지 않는지는 실제 disposable 프로세스로 검증한다.
 
+## 종료 증명과 감독자 복구
+
+제품 소비자는 실행 전에 `--lifecycle-version`의 출력 `1`과 성공 종료를 확인한다.
+이 버전에서 `--ready-file <path>`를 사용하면 guard에 exec ACK를 보내기 전에
+`<path>.owner`를 게시한다. 소유 기록은 2048 bytes 미만의 private 0600 single-link
+JSON이며 supervisor와 child의 PID/birth, network ID, profile·표식 경로와 표식
+device/inode를 담는다. 준비 실패에는 앱을 실행하지 않는다. 임의 stdout이나 부모
+PID의 소멸은 실행 승인 또는 회수 완료의 증거가 아니다.
+
+```json
+{"version":1,"supervisorPid":123,"supervisorBirth":1791500000000000,"pid":124,"birth":1791500000000010,"networkId":"network-a","markerPath":"/workspace/.portmanager/security/profiles/.scope-example","profilePath":"/workspace/.portmanager/security/profiles/example.sb","markerDev":1,"markerIno":42}
+```
+
+두 번의 안정된 kernel membership census로 모든 소속 프로세스의 종료를 확인한 뒤에만
+`<path>.cleaned`를 원자 게시한다. 이 파일은 같은 canonical 소유 기록에 `cleaned: true`
+필드만 추가하며 2080 bytes 미만이다. 소비자는 파일의 private parent/owner/mode/nlink,
+launch tuple과 표식 정체성까지 대조한 뒤 lease를 해제한다. 완료 기록 게시가 실패하면
+supervisor는 자원 소유권을 유지하고 재시도한다. 기록·표식·profile을 먼저 삭제하지 않는다.
+owner와 완료 기록의 최종 삭제는 확인을 마친 trusted 소비자의 책임이다.
+
+감독자가 갑자기 종료되면 `--recover-owner <path>.owner`로 복구한다. 아직 같은 PID/birth의
+감독자가 살아 있으면 내부 `EBUSY`로 거절한다. owner·표식·profile의 private 경로와 파일
+정체성을 확인한 뒤 같은 census와 audit-token 신호를 사용해 남은 소속 프로세스를 회수한다.
+정확히 일치하는 기존 완료 기록은 반복 호출에 사용할 수 있다. 새 회수도 완료 기록 게시
+후에만 `{"cleaned":true,"version":1}`을 출력하고 exit 0을 반환한다. 잘못된 CLI 경로 형식은
+exit 2, 검증·지원 API·게시 실패나 중단은 exit 125이며 성공 JSON을 출력하지 않는다.
+실패 또는 호출자 timeout만으로 lease를 해제해서는 안 된다. TERM/INT/HUP은 확인 대기를
+중단하지만 미확인 표식과 소유 기록은 남긴다. 회수에 성공하는 고정 시간 제한은 없다.
+
+v1 확인 후 부모가 exec ACK 전에 죽고 owner도 없으면 앱 실행은 승인되지 않았다.
+guard는 private ACK channel의 EOF에 종료한다. 이 경우 private ready가 나타난다면
+계약 위반으로 취급해 소유권을 유지한다. 오래된 binary의 owner 부재는 이 증거가 아니다.
+owner가 있으면 시작 도중의 죽음도 복구 경로로 확인한다. 회수 helper는 같은
+589,824-byte census peak와 표식 parent FD 하나를 사용한다. owner/완료 파일의 IO FD는
+짧게 열고 닫으며 workload에 상속하지 않는다.
+
 ## 외부 의존성
 
 macOS `sandbox-exec`, libproc, POSIX fork/exec/pipes/poll/process groups,

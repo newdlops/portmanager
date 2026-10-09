@@ -177,6 +177,7 @@ static int pm_launch_record_write(unsigned int phase, int error) {
 #include "pm_network_launch_authorization.h"
 #include "pm_network_launch_readiness.h"
 #include "pm_network_launch_members.h"
+#include "pm_network_launch_receipt.h"
 
 /* The guard blocks before executing application code. Only the supervisor's
  * private socket can release it; this descriptor disappears on SETEXEC. */
@@ -393,6 +394,13 @@ static int pm_launch_supervise(const pm_launch_options *options, pm_launch_membe
   return WIFEXITED(status) ? WEXITSTATUS(status) : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 125;
 }
 int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "--lifecycle-version") == 0) { puts("1"); return 0; }
+  if (argc == 3 && strcmp(argv[1], "--recover-owner") == 0) {
+    if (pm_launch_close_inherited(-1) != 0) return 125;
+    signal(SIGTERM, pm_launch_on_signal); signal(SIGINT, pm_launch_on_signal);
+    signal(SIGHUP, pm_launch_on_signal); signal(SIGPIPE, SIG_IGN);
+    return pm_launch_recover_owner(argv[2]);
+  }
   pm_launch_options options;
   if (pm_launch_parse(argc, argv, &options) != 0) return 2;
   if (options.guard) return pm_launch_guard(&options, argv);
@@ -447,8 +455,10 @@ int main(int argc, char **argv) {
   signal(SIGTTOU, SIG_IGN);
   if (foreground > 0) (void)tcsetpgrp(0, child);
   long long deadline = pm_nb_client_now() + PM_LAUNCH_START_MS;
+  pm_launch_receipt receipt;
+  int recorded = pm_launch_owner_prepare(&receipt, &options, &members, child, birth) == 0;
   pm_launch_record policy;
-  int accepted = birth != 0 && pm_launch_record_read(ready[0], &policy, deadline) == 0 && policy.phase == PM_LAUNCH_POLICY_READY;
+  int accepted = recorded && birth != 0 && pm_launch_record_read(ready[0], &policy, deadline) == 0 && policy.phase == PM_LAUNCH_POLICY_READY;
   if (accepted) accepted = pm_launch_member_query(&members, child) == 1;
   if (accepted && options.agent_path != NULL) accepted = pm_launch_register_scope(&options, child, birth, deadline) == 0;
   if (accepted) {
@@ -464,6 +474,10 @@ int main(int argc, char **argv) {
     if (options.announce) { printf("ready pid=%ld birth=%llu\n", (long)child, birth); fflush(stdout); }
   } else pm_dev_log("network-launcher", "startup rejected child_pid=%ld errno=%d", (long)child, errno);
   int result = pm_launch_supervise(&options, &members, child, birth, accepted);
+  while (pm_launch_receipt_publish(&receipt) != 0) {
+    pm_dev_log("network-launcher", "cleanup complete but receipt publication failed errno=%d; retaining ownership", errno);
+    (void)poll(NULL, 0, 1000);
+  }
   pm_launch_remove_ready(&published);
   pm_launch_members_close(&members);
   if (foreground > 0) (void)tcsetpgrp(0, foreground);

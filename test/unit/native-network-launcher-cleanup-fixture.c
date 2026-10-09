@@ -120,6 +120,7 @@ int main(int argc, char **argv) {
     if (access(argv[5], F_OK) != 0) return 2;
     /* The sentinel is written by the protected system shell after exec. */
   }
+  if (strcmp(mode, "linger") == 0) sleep(30);
   /* Root exits naturally while the escaped, signal-ignoring worker is alive. */
   return 0;
 }
