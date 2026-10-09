@@ -14,10 +14,15 @@ import { buildNodeRuntimeEnvironment } from "../../src/platform/process/node-run
 import { NetworkTerminalControl } from "../../src/platform/process/network-terminal-control";
 import type { AuthenticatedProcessScope } from "../../src/agent/protocol";
 
-/** Production owner, broker, launcher, real kernel and installed Node cooperate. */
-test("guarded runtime preserves host TCP access, trusted readiness and returns every reservation", {
+/** SDK handoff and external CLI each own a complete independent fixture. The
+ * deliberate SDK delay cannot consume the CLI scenario's own deadline. */
+for (const scenario of ["sdk", "cli"] as const) {
+test(scenario === "sdk" ? "guarded runtime preserves host TCP access, trusted readiness and returns every reservation"
+  : "external CLI switches and detaches guarded shells through the same owner and budget", {
   skip: process.platform !== "darwin", timeout: 30_000,
 }, async context => {
+  const started = performance.now();
+  let stage = "setup";
   const source = path.resolve(__dirname, "../../..");
   const artifactDirectory = path.join(source, "media/native");
   const root = fs.mkdtempSync("/private/tmp/pm-runtime-");
@@ -69,6 +74,12 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
   echo.on("connection", socket => { echoClients.add(socket); socket.on("error", () => {}); socket.once("close", () => echoClients.delete(socket)); });
   await new Promise<void>(resolve => echo.listen(0, "127.0.0.1", resolve));
   const echoPort = (echo.address() as net.AddressInfo).port;
+  context.after(() => {
+    const trace = path.join(root, "runtime-dev.log");
+    context.diagnostic(JSON.stringify({ scenario, stage, elapsedMs: performance.now() - started,
+      resources: resources.budget.used,
+      nativeTrace: fs.existsSync(trace) ? fs.readFileSync(trace, "utf8").slice(-4096) : undefined }));
+  });
   context.after(async () => {
     await control?.dispose();
     await runtime.dispose();
@@ -84,12 +95,15 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
   process.env.ZDOTDIR = path.join(root, "empty-profiles");
   fs.mkdirSync(process.env.ZDOTDIR, { mode: 0o700 });
   context.after(() => { if (priorZdotdir === undefined) delete process.env.ZDOTDIR; else process.env.ZDOTDIR = priorZdotdir; });
+  if (scenario === "sdk") {
+  stage = "sdk-prepare";
   const launch = await runtime.prepareShell({ id: "runtime-a", name: "Runtime A", loopbackHost: "127.0.0.1",
       workspaceDirectories: [workspace], routes: [{ port: 4567, targetHost: "127.0.0.1", targetPort: echoPort }] }, workspace, "/bin/zsh");
   assert.equal(resources.budget.used.nativeHelpers, 2);
   assert.equal(resources.budget.used.nativeScopeJobs, 65);
   assert.equal(resources.budget.used.nativeInventoryBytes, 589_824);
   runtime.beginTerminalHandoff(launch.id);
+  stage = "sdk-delayed-handoff";
   // VS Code may create the PTY after returning its profile. This real delay
   // exceeds the old unadopted expiry while the controller still owns launch.
   await delay(13_000);
@@ -99,18 +113,21 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
   let output = "", errors = "";
   terminal.stdout!.on("data", bytes => { output += bytes.toString(); });
   terminal.stderr!.on("data", bytes => { errors += bytes.toString(); });
+  stage = "sdk-adopt";
   try { await runtime.adoptSupervisor(launch.id, terminal.pid!); }
   catch (error) {
     const diagnostic = fs.existsSync(path.join(root, "runtime-dev.log")) ? fs.readFileSync(path.join(root, "runtime-dev.log"), "utf8") : "";
     throw new Error(`Fixture supervisor adoption failed (exit=${terminal.exitCode}, signal=${terminal.signalCode}): ${errors}\n${diagnostic}`, { cause: error });
   }
   const identity = await runtime.waitReady(launch.id);
+  stage = "sdk-history";
   const sessions = path.join(launch.env.ZDOTDIR!, ".zsh_sessions");
   const historyDeadline = Date.now() + 5000;
   while (!fs.existsSync(sessions)) { assert.ok(Date.now() < historyDeadline, `Missing scoped macOS session storage: ${errors}`); await delay(10); }
   assert.ok(!errors.includes("Operation not permitted"), errors);
   assert.equal(identity.networkId, "runtime-a");
   assert.notEqual(identity.pid, terminal.pid);
+  stage = "sdk-host-tcp";
   const program = `const net=require('node:net');const s=net.connect(4567,'127.0.0.1');let value='';s.on('connect',()=>s.end('runtime-echo'));s.on('data',b=>value+=b);s.on('end',()=>{if(value!=='runtime-echo')process.exit(2);require('node:fs').writeFileSync('runtime-success.json',JSON.stringify({value,networkId:process.env.PORT_MANAGER_NETWORK_ID}))});s.on('error',()=>process.exit(3));`;
   terminal.stdin!.write(`${quote(process.execPath)} -e ${quote(program)}\n`);
   const responseDeadline = Date.now() + 5000;
@@ -120,14 +137,19 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
     await delay(10);
   }
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(workspace, "runtime-success.json"), "utf8")), { value: "runtime-echo", networkId: "runtime-a" });
+  stage = "sdk-close";
   await runtime.closeShell(launch.id);
   assert.deepEqual(Object.values(resources.budget.used), Object.values(resources.budget.used).map(() => 0));
   assert.equal(runtime.activeShells.length, 0);
+  stage = "sdk-complete";
+  return;
+  }
 
   // The external CLI uses the same owner/budget rather than creating an
   // independent controller in a sourced script. Private readiness is the only
   // execution witness; echoed command text cannot satisfy these assertions.
   const observed = new Map<string, AuthenticatedProcessScope>();
+  stage = "cli-control";
   control = new NetworkTerminalControl(path.join(security, "terminal-control"), {
     prepare: (networkId, cwd) => runtime.prepareShell({ id: networkId, name: networkId, loopbackHost: "127.0.0.1",
       workspaceDirectories: [workspace], routes: [{ port: 4567, targetHost: "127.0.0.1", targetPort: echoPort }] }, cwd, "/bin/zsh"),
@@ -146,15 +168,18 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
     if (cli.exitCode === null && cli.signalCode === null) { const exited = once(cli, "exit"); cli.kill("SIGTERM"); await exited; }
   });
   const readyDeadline = Date.now() + 10_000;
+  stage = "cli-readiness";
   while (observed.size === 0) { assert.equal(cli.exitCode, null); assert.ok(Date.now() < readyDeadline); await delay(10); }
   const original = runtime.activeShells.find(shell => shell.networkId === "runtime-external-a")!;
   assert.ok(original);
+  stage = "cli-replace";
   assert.equal(await control.replace(original.id, "runtime-external-b", workspace), true);
   assert.equal(runtime.activeShells.length, 1);
   assert.equal(runtime.activeShells[0].networkId, "runtime-external-b");
   assert.equal(resources.budget.used.nativeHelpers, 2);
   const switched = runtime.activeShells[0];
   assert.equal(observed.get(switched.id)?.networkId, "runtime-external-b");
+  stage = "cli-detach";
   assert.equal(await control.detach(switched.id), true);
   assert.equal(runtime.activeShells.length, 0);
   assert.equal(resources.budget.used.nativeHelpers, 0);
@@ -164,10 +189,13 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
   // Detached shell is a fresh host child, while the controller connection
   // remains owned by the trusted CLI and never by either guarded shell.
   cli.stdin!.write("exit\n");
+  stage = "cli-exit";
   await once(cli, "exit");
   await control.dispose();
   control = undefined;
   assert.ok(Object.values(resources.budget.used).every(value => value === 0));
+  stage = "cli-complete";
 });
+}
 
 function quote(value: string): string { return "'" + value.replace(/'/g, "'\\''") + "'"; }
