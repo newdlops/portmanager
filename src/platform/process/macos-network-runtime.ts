@@ -81,6 +81,7 @@ interface ShellOwner {
   monitoring?: Promise<void>;
   expiry?: ReturnType<typeof setTimeout>;
   closing?: Promise<void>;
+  recovery?: ChildProcess;
 }
 
 const STARTUP_MS = 10_000;
@@ -93,6 +94,11 @@ const BROKER_SCOPE_BYTES = BROKER_SLOTS * (2048 + 2048 + 160 + 148);
 const SUPERVISOR_INVENTORY_BYTES = 589_824;
 const MAX_ROUTE_ROWS = 512;
 const MAX_ROUTE_BYTES = 64 * 1024;
+
+interface LaunchOwnershipRecord {
+  version: number; supervisorPid: number; supervisorBirth: number; pid: number; birth: number;
+  networkId: string; profilePath: string; markerPath: string; markerDev: number; markerIno: number;
+}
 
 /**
  * Owns the trusted native parents of kernel-restricted shells. Prepared shells
@@ -109,6 +115,7 @@ export class MacosNetworkRuntime {
   private generation = 0;
   private disposed = false;
   private artifactPaths: { broker: string; launcher: string; hook: string } | undefined;
+  private lifecycleVerification: Promise<void> | undefined;
 
   constructor(private readonly options: MacosNetworkRuntimeOptions) {
     this.stateDirectory = options.stateDirectory ?? path.join(os.homedir(), ".portmanager");
@@ -125,6 +132,7 @@ export class MacosNetworkRuntime {
       throw new Error("Guarded terminals require an absolute supported shell and workspace.");
     }
     const canonicalCwd = fs.realpathSync(cwd);
+    await this.verifyLauncherLifecycle();
     const broker = await this.ensureBroker(scope);
     if (this.disposed || generation !== this.generation || broker.exited) throw new Error("Network shell preparation was canceled.");
     let lease: ProxyResourceLease | undefined;
@@ -335,6 +343,7 @@ export class MacosNetworkRuntime {
         if (identity !== undefined && identity.birth === ready.supervisorBirth) await this.stopIdentity(identity);
       }
     }
+    await this.confirmDescendantCleanup(owner);
     owner.lease.release();
     owner.broker.sessions.delete(owner.launch.id);
     this.shells.delete(owner.launch.id);
@@ -343,6 +352,61 @@ export class MacosNetworkRuntime {
     fs.rmSync(owner.bootstrapDirectory, { recursive: true, force: true });
     fs.rmSync(path.join(this.stateDirectory, "security", "profiles", owner.launch.id + ".sb"), { force: true });
     if (owner.broker.sessions.size === 0) await this.closeBroker(owner.broker);
+  }
+
+  /** A vanished supervisor still owns its reservation until its private census receipt matches. */
+  private async confirmDescendantCleanup(owner: ShellOwner): Promise<void> {
+    const record = readPrivateJson(owner.readyPath + ".owner", 2048) as LaunchOwnershipRecord | undefined;
+    if (record === undefined) {
+      // Lifecycle v1 publishes intent before guard ACK. With no intent and no
+      // readiness, the trusted guard could not exec the workload at all.
+      if (owner.identity !== undefined || readPrivateJson(owner.readyPath, 2048) !== undefined) throw new Error("Supervisor ownership proof is absent; reservation retained.");
+      return;
+    }
+    const profile = path.join(this.stateDirectory, "security", "profiles", owner.launch.id + ".sb");
+    if (record === null || typeof record !== "object" || Array.isArray(record) || Object.keys(record).length !== 10 ||
+        record.version !== 1 || record.networkId !== owner.launch.networkId || record.profilePath !== profile ||
+        path.dirname(record.markerPath ?? "") !== path.dirname(profile) || !/^\.scope-[a-f0-9]{32}$/.test(path.basename(record.markerPath ?? "")) ||
+        ![record.supervisorPid, record.supervisorBirth, record.pid, record.birth, record.markerDev, record.markerIno]
+          .every(value => Number.isSafeInteger(value) && value > 0) ||
+        owner.supervisor !== undefined && (record.supervisorPid !== owner.supervisor.pid || record.supervisorBirth !== owner.supervisor.birth) ||
+        owner.identity !== undefined && (record.pid !== owner.identity.pid || record.birth !== owner.identity.birth)) {
+      throw new Error("Supervisor ownership record does not match this launch; reservation retained.");
+    }
+    const receiptMatches = () => {
+      const receipt = readPrivateJson(owner.readyPath + ".cleaned", 2080) as Record<string, unknown> | undefined;
+      return receipt !== undefined && receipt.cleaned === true && Object.keys(receipt).length === Object.keys(record).length + 1 &&
+        Object.entries(record).every(([key, value]) => receipt[key] === value);
+    };
+    if (receiptMatches()) return;
+    if (await this.isCurrent({ pid: record.supervisorPid, birth: record.supervisorBirth })) {
+      throw new Error("Supervisor is still completing its census; reservation retained.");
+    }
+    // Reuse the reserved helper/inventory slot only after the original parent
+    // is proven gone. Keep this child on timeout so retries never duplicate it.
+    if (owner.recovery === undefined) {
+      owner.recovery = spawn(owner.launch.shellPath, ["--recover-owner", owner.readyPath + ".owner"], {
+        env: buildNodeRuntimeEnvironment(), stdio: "ignore", detached: true,
+      });
+      owner.recovery.on("error", () => {});
+    }
+    const deadline = performance.now() + SUPERVISOR_STOP_MS;
+    while (owner.recovery.exitCode === null && owner.recovery.signalCode === null && performance.now() < deadline) await delay(20);
+    if (owner.recovery.exitCode !== 0 || !receiptMatches()) throw new Error("Descendant recovery has not produced a complete census proof; reservation retained.");
+  }
+
+  /** Refuse cached older launchers before they can create an unprovable owner. */
+  private verifyLauncherLifecycle(): Promise<void> {
+    this.lifecycleVerification ??= (async () => {
+      const lease = this.options.resources.budget.acquire({ nativeHelpers: 1 });
+      try {
+        const result = await promisify(execFile)(this.prepareArtifacts().launcher, ["--lifecycle-version"], {
+          env: buildNodeRuntimeEnvironment(), timeout: 2000, maxBuffer: 4096,
+        });
+        if (result.stdout.trim() !== "1") throw new Error("Guarded launch requires private cleanup lifecycle version 1.");
+      } finally { lease.release(); }
+    })();
+    return this.lifecycleVerification;
   }
 
   private async closeBroker(owner: BrokerOwner): Promise<void> {
@@ -364,7 +428,9 @@ export class MacosNetworkRuntime {
       throw new Error("Supervisor signal was not verified; its reservation remains held.");
     }
     const deadline = performance.now() + SUPERVISOR_STOP_MS;
-    while (performance.now() < deadline && await this.isCurrent(identity)) await delay(20);
+    // Identity probes create short-lived helper PIDs. Leave enough space for
+    // the native supervisor's two full census snapshots to settle between them.
+    while (performance.now() < deadline && await this.isCurrent(identity)) await delay(200);
     if (await this.isCurrent(identity)) {
       throw new Error("Shell supervisor has not completed descendant cleanup; its reservation remains held.");
     }

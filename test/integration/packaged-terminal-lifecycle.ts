@@ -68,7 +68,7 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
     while (Date.now() < deadline) {
       const current = await lookup.readProcessIdentity(original.pid);
       if (current === undefined || current.birth !== original.birth) return;
-      await delay(20);
+      await delay(200);
     }
     throw new Error("Previous actual PTY supervisor survived terminal replacement/close.");
   }
@@ -173,6 +173,27 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
         await service.detachVscodeWindowTerminalsFromNetwork();
         assert.equal(service.getGuardedDefaultNetworkId(), undefined);
         assert.equal(vscode.workspace.getConfiguration("terminal.integrated").inspect<string>("defaultProfile.osx")?.workspaceValue, priorProfile);
+        for (const forced of [false, true]) {
+          const closing = await service.openGuardedNetworkTerminal(selected[0].id, workspace);
+          terminals.add(closing);
+          const parentIdentity = await identity(closing);
+          const orphanWitness = path.join(workspace, `terminal-${cycle}-orphan-${forced}.json`);
+          const daemonProgram = `const c=require('node:child_process').spawn(${JSON.stringify(node)},['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore',env:{...process.env}});require('node:fs').writeFileSync(${JSON.stringify(orphanWitness)},JSON.stringify({pid:c.pid}));c.unref();`;
+          closing.sendText(`${quote(node)} -e ${quote(daemonProgram)}`, true);
+          const orphanDeadline = Date.now() + 10_000;
+          while (!fs.existsSync(orphanWitness)) { assert.ok(Date.now() < orphanDeadline); await delay(20); }
+          const orphanPid = JSON.parse(fs.readFileSync(orphanWitness, "utf8")).pid as number;
+          const orphan = await lookup.readProcessIdentity(orphanPid);
+          assert.ok(orphan, "Actual installed terminal must leave a real detached child before close.");
+          if (forced) assert.equal(await lookup.signalProcess(parentIdentity, "SIGKILL"), true);
+          // User-style SDK close and a deliberately vanished trusted parent
+          // must both use the installed owner's census/receipt recovery path.
+          closing.dispose(); terminals.delete(closing);
+          await gone(parentIdentity);
+          await gone(orphan);
+          fs.unlinkSync(orphanWitness);
+          records.push({ abruptClose: forced, supervisor: parentIdentity, orphan, reclaimed: true });
+        }
       }
       const deadline = Date.now() + 10_000;
       while (JSON.stringify(resources.budget.used) !== JSON.stringify(before)) { assert.ok(Date.now() < deadline, "Terminal close retained a shared reservation."); await delay(20); }

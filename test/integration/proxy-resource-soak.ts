@@ -203,7 +203,7 @@ export async function runResourceSoak(options: ResourceSoakOptions): Promise<voi
         routerPort = await availablePort();
         await within(router.open(routerPort), "open logical router");
         if (options.exerciseTerminals && (cycle === 1 || cycle % 10 === 0)) {
-          await within(options.exerciseTerminals(cycle), "guarded terminal lifecycle", 30_000);
+          await within(options.exerciseTerminals(cycle), "guarded terminal lifecycle", 60_000);
         }
         if (cycle === 1 || cycle % 5 === 0) await sample("active");
         for (let burst = 0; burst < 4; burst++) {
