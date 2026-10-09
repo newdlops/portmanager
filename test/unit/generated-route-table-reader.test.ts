@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import type { FSWatcher } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -118,7 +120,7 @@ async function waitFor(condition: () => boolean): Promise<void> {
   }
 }
 
-test("one heartbeat reads only its changed shard among many networks", async (context) => {
+test("one heartbeat notification reads only its changed shard among many networks", async (context) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pm-watch-incremental-"));
   const tables: string[] = [];
   for (let index = 0; index < 24; index++) {
@@ -131,7 +133,14 @@ test("one heartbeat reads only its changed shard among many networks", async (co
   }
   let reads = 0, directoryReads = 0, signals = 0;
   const readPaths: string[] = [];
-  const watcher = new GeneratedRouteTableWatcher({ onChanged: () => { signals++; }, fileSystem: {
+  let notify: ((filename: string | null) => void) | undefined;
+  const watcher = new GeneratedRouteTableWatcher({ onChanged: () => { signals++; },
+    watchDirectory: (_directory, changed) => {
+      notify = changed;
+      const handle = new EventEmitter() as unknown as FSWatcher;
+      handle.close = () => { handle.removeAllListeners(); };
+      return handle;
+    }, fileSystem: {
     readDirectory: (target) => { directoryReads++; return fs.readdir(target, { withFileTypes: true }); },
     readTextFile: async (target) => { const text = await fs.readFile(target, "utf8"); reads++; readPaths.push(target); return text; },
   } });
@@ -143,11 +152,17 @@ test("one heartbeat reads only its changed shard among many networks", async (co
   const shard = path.join(directory, "network-0-port-3000.json");
   await fs.writeFile(`${shard}.tmp`, JSON.stringify({ expiresAtMs: Date.now() + 60_000, routes: [route(50_000)] }));
   await fs.rename(`${shard}.tmp`, shard);
+  // The read budget concerns one named notification. Delayed OS notifications
+  // from initial fixture creation belong to the separate real-watch tests.
+  notify!(path.basename(shard));
   await waitFor(() => reads > 0);
   await new Promise((resolve) => setTimeout(resolve, 100));
-  // fs.watch may report both replacement and metadata events for the same
-  // atomic rename. Neither event may reread any of the 215 unchanged files.
+  // Repeated notifications for this atomic replacement cannot reread any
+  // of the 215 unchanged files.
+  notify!(path.basename(shard));
+  await waitFor(() => reads === 2);
   assert.deepEqual([...new Set(readPaths)], [shard]);
+  assert.equal(reads, 2);
   assert.equal(directoryReads, 0);
   assert.equal(signals, 1);
 });

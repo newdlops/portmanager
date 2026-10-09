@@ -142,6 +142,13 @@ function isTcpPort(value: unknown): value is number {
 export interface GeneratedRouteTableWatcherOptions extends GeneratedRouteTableReaderOptions {
   /** Signals changed routing content; the caller owns reconciliation and lease checks. */
   readonly onChanged: () => void;
+  /** Keep notification delivery separate from disk reads for bounded policy tests. */
+  readonly watchDirectory?: (directory: string, changed: (filename: string | null) => void) => Pick<FSWatcher, "on" | "close">;
+}
+
+/** Production notifications retain Node's nonpersistent directory watch behavior. */
+function watchRouteDirectory(directory: string, changed: (filename: string | null) => void): FSWatcher {
+  return watch(directory, { persistent: false }, (_event, filename) => changed(filename === null ? null : String(filename)));
 }
 
 /**
@@ -153,7 +160,7 @@ export class GeneratedRouteTableWatcher {
   /** The current owner's network tables define the accepted shard filenames. */
   private tablePaths: readonly string[] = [];
   /** One OS watcher per directory, recreated by setPaths after a watch error. */
-  private readonly watchers = new Map<string, FSWatcher>();
+  private readonly watchers = new Map<string, Pick<FSWatcher, "on" | "close">>();
   /** Fixed burst window, independent of the owner's low-frequency polling timer. */
   private timer: ReturnType<typeof setTimeout> | undefined;
   /** Signals arriving during an async read require one more observation. */
@@ -202,7 +209,7 @@ export class GeneratedRouteTableWatcher {
     for (const directory of directories) {
       if (this.watchers.has(directory)) continue;
       try {
-        const watcher = watch(directory, { persistent: false }, (_event, filename) => {
+        const watcher = (this.options.watchDirectory ?? watchRouteDirectory)(directory, (filename) => {
           if (filename === null) {
             this.fullRead = true;
             this.scheduleRead();

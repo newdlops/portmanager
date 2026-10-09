@@ -56,3 +56,7 @@ Logical Network의 durable 상태는 여러 VS Code 창이 동시에 읽고 갱�
 `browser-tls-trust.ts`는 TreeView 렌더 경로에서 subprocess를 실행하지 않는다. 인증서 stat signature와 짧은 TTL의 마지막 결과만 동기적으로 반환하고, service가 비동기 `security verify-cert`를 수행한 뒤 UI를 갱신한다. 임의 CA를 검증 명령에 root로 주입하지 않아야 하며, 실제 기본 Keychain trust만 성공으로 인정한다.
 `browser-dns-verifier.ts`는 `/etc/resolver` 파일 존재를 성공으로 간주하지 않고 macOS system resolver가 single-label과 `.pm` alias 모두를 정확한 주소로 반환할 때만 준비 완료로 판단한다. `browser-tls-certificate.ts`도 hostname marker와 별개로 실제 signed leaf를 검사한다.
 `generated-route-table-reader.ts`는 생성 파일의 조회·파싱·변경 관찰을 담당하는 adapter다. 경로와 만료 유예 정책은 호출자가 주며, 폴더당 한 번 열거하고 최대 8개 파일을 병렬로 읽는다. snapshot reader는 파일 내용을 캐시하지 않고 network table → port shard 순서를 유지하며 손상·소실·만료된 파일 하나가 정상 파일까지 버리게 하지 않는다. `GeneratedRouteTableWatcher`만 파일별 관측을 보관한다. 이름이 알려진 이벤트는 변경 파일만 읽고, 초기화·이벤트 이름 누락·watch 재연결은 전체를 읽는다. 생성·교체·삭제를 50ms 고정 구간으로 합치고 라우팅 내용이 바뀔 때만 callback을 보낸다. heartbeat는 관측의 TTL만 갱신하며 만료 시각에 별도 wakeup으로 route 소실을 알린다. owner loss/dispose 뒤 늦게 끝난 읽기는 버린다. callback 뒤 실제 route 적용은 새 full snapshot으로 하며, 재동기화와 lease 판단은 extension에 남겨 둔다.
+
+watcher의 `watchDirectory` 경계는 알림 전달과 파일 읽기를 분리한다. 기본 구현은 기존
+nonpersistent `fs.watch`이며, 읽기 예산 검사는 실제 파일을 원자 교체한 뒤 명명된 알림을
+직접 전달한다. 실제 OS 감시의 생성·교체·삭제 동작은 별도 검사에서 유지한다.
