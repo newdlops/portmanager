@@ -1,4 +1,5 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -12,7 +13,7 @@ import type { ProxyResourceLease } from "../../core/networks/proxy-resource-budg
 import type { ProxyNetworkResources } from "../ports/proxy-network-resources";
 import { devLog } from "../dev-log";
 import { buildMacosNetworkSandboxProfile } from "./macos-network-sandbox";
-import { ensureNetworkNamespaceScaffold, networkNamespacePaths } from "./network-file-scaffold";
+import { ensureNetworkNamespaceScaffold, networkNamespacePaths, type NamespaceNetworkIdentity } from "./network-file-scaffold";
 import { buildNodeRuntimeEnvironment } from "./node-runtime";
 import { readNativeBinaryArchitectures } from "./native-executable";
 
@@ -31,6 +32,7 @@ export interface NetworkRuntimeScope {
   readonly routes: readonly NetworkRuntimeRoute[];
   /** Shell/SIP shims are prepared by the controller; fixed scope exports win. */
   readonly bootstrapEnvironment?: Readonly<Record<string, string>>;
+  readonly knownNetworks?: readonly NamespaceNetworkIdentity[];
 }
 
 export interface MacosNetworkRuntimeOptions {
@@ -42,6 +44,7 @@ export interface MacosNetworkRuntimeOptions {
   readonly ensureController: () => Promise<void>;
   readonly resolveScope: (identity: { pid: number; birth: number }) => Promise<AuthenticatedProcessScope | null>;
   readonly readIdentity: (pid: number) => Promise<{ pid: number; birth: number } | undefined>;
+  readonly onShellClosed?: (id: string) => void;
 }
 
 /** A real terminal/PTY owner launches this command and then supplies its PID. */
@@ -74,6 +77,8 @@ interface ShellOwner {
   readonly preparedAt: number;
   supervisor?: { pid: number; birth: number };
   identity?: AuthenticatedProcessScope;
+  monitoring?: Promise<void>;
+  expiry?: ReturnType<typeof setTimeout>;
   closing?: Promise<void>;
 }
 
@@ -130,7 +135,8 @@ export class MacosNetworkRuntime {
       if (!workspaces.includes(canonicalCwd) && !workspaces.some(directory => canonicalCwd.startsWith(directory + path.sep))) {
         throw new Error("Terminal cwd must belong to its explicitly shared workspace.");
       }
-      for (const directory of workspaces) ensureNetworkNamespaceScaffold(directory, scope.id, scope.name);
+      for (const directory of workspaces) ensureNetworkNamespaceScaffold(directory, scope.id, scope.name,
+        scope.knownNetworks ?? [{ id: scope.id, name: scope.name }]);
       const namespaceDirectories = workspaces.map(directory => networkNamespacePaths(directory, scope.id).directory);
       writePrivateAtomic(profilePath, buildMacosNetworkSandboxProfile({ networkId: scope.id, namespaceDirectories,
         sharedWorkspaceDirectories: workspaces, agentSocketPath: broker.endpoint }));
@@ -151,6 +157,10 @@ export class MacosNetworkRuntime {
         bootstrapDirectory: bootstrap.directory, preparedAt: performance.now() };
       this.shells.set(id, owner);
       broker.sessions.add(id);
+      owner.expiry = setTimeout(() => {
+        if (owner.identity === undefined) void this.closeShell(id).catch(error => devLog("network-runtime", `unstarted launch retained: ${String(error)}`));
+      }, STARTUP_MS + STOP_MS);
+      owner.expiry.unref();
       return launch;
     } catch (error) {
       lease?.release();
@@ -197,6 +207,8 @@ export class MacosNetworkRuntime {
             throw new Error("Terminal readiness is not authenticated by the current daemon.");
           }
           owner.identity = scope;
+          clearTimeout(owner.expiry);
+          owner.monitoring ??= this.monitorShell(owner);
           return scope;
         }
         if (owner.supervisor !== undefined && !(await this.isCurrent(owner.supervisor))) throw new Error("Terminal supervisor exited before readiness.");
@@ -291,20 +303,36 @@ export class MacosNetworkRuntime {
   }
 
   private async closeShellOwner(owner: ShellOwner): Promise<void> {
+    clearTimeout(owner.expiry);
+    if (owner.supervisor === undefined) {
+      // Copy-script/profile cancellation can happen before private readiness.
+      // Find only a launcher carrying this exact controller-created nonce.
+      const output = await promisify(execFile)("/bin/ps", ["-Ao", "pid=,args="], {
+        env: buildNodeRuntimeEnvironment(), timeout: 2000, maxBuffer: 4 * 1024 * 1024,
+      });
+      const row = output.stdout.split("\n").find(line => line.includes(owner.readyPath) && line.includes(owner.launch.shellPath));
+      const pid = row === undefined ? undefined : Number(/^\s*(\d+)/.exec(row)?.[1]);
+      if (pid !== undefined && Number.isSafeInteger(pid)) {
+        const identity = await this.options.readIdentity(pid);
+        if (identity === undefined) throw new Error("Prepared launcher is live but its identity is unavailable; reservation retained.");
+        owner.supervisor = identity;
+      }
+    }
     if (owner.supervisor !== undefined) {
       await this.stopIdentity(owner.supervisor);
     } else {
       // A PTY adapter must adopt its PID even if readiness fails. A handle
       // canceled before terminal creation has no native process to reclaim.
-      const ready = readPrivateJson(owner.readyPath, 2048) as { supervisorPid?: number } | undefined;
+      const ready = readPrivateJson(owner.readyPath, 2048) as { supervisorPid?: number; supervisorBirth?: number } | undefined;
       if (ready?.supervisorPid !== undefined) {
         const identity = await this.options.readIdentity(ready.supervisorPid);
-        if (identity !== undefined) await this.stopIdentity(identity);
+        if (identity !== undefined && identity.birth === ready.supervisorBirth) await this.stopIdentity(identity);
       }
     }
     owner.lease.release();
     owner.broker.sessions.delete(owner.launch.id);
     this.shells.delete(owner.launch.id);
+    this.options.onShellClosed?.(owner.launch.id);
     fs.rmSync(owner.readyDirectory, { recursive: true, force: true });
     fs.rmSync(owner.bootstrapDirectory, { recursive: true, force: true });
     fs.rmSync(path.join(this.stateDirectory, "security", "profiles", owner.launch.id + ".sb"), { force: true });
@@ -345,6 +373,19 @@ export class MacosNetworkRuntime {
     try { process.kill(identity.pid, 0); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
     throw new Error("Live supervisor identity could not be verified; reservation remains held.");
+  }
+
+  /** External clients need the same natural-exit accounting as PTY adapters. */
+  private async monitorShell(owner: ShellOwner): Promise<void> {
+    try {
+      while (this.shells.get(owner.launch.id) === owner && owner.closing === undefined) {
+        await delay(250, undefined, { ref: false });
+        if (owner.supervisor !== undefined && !(await this.isCurrent(owner.supervisor))) {
+          await this.closeShell(owner.launch.id);
+          return;
+        }
+      }
+    } catch (error) { devLog("network-runtime", `supervisor monitor retained reservation: ${String(error)}`); }
   }
 
   private prepareArtifacts(): { broker: string; launcher: string; hook: string } {
@@ -405,7 +446,7 @@ export class MacosNetworkRuntime {
 }
 
 /** Walk existing parents instead of following an attacker-supplied symlink. */
-function ensurePrivateDirectory(directory: string): void {
+export function ensurePrivateDirectory(directory: string): void {
   if (!path.isAbsolute(directory) || path.normalize(directory) !== directory) throw new Error("Runtime path is not canonical.");
   const components = directory.split(path.sep).filter(Boolean);
   let current = path.parse(directory).root;
@@ -422,7 +463,7 @@ function ensurePrivateDirectory(directory: string): void {
 }
 
 /** Fresh inode + atomic rename preserves already mapped code and complete policy. */
-function writePrivateAtomic(file: string, value: string | Buffer, mode = 0o600): void {
+export function writePrivateAtomic(file: string, value: string | Buffer, mode = 0o600): void {
   ensurePrivateDirectory(path.dirname(file));
   const prior = fs.lstatSync(file, { throwIfNoEntry: false });
   if (prior !== undefined && (!prior.isFile() || prior.isSymbolicLink() || prior.uid !== process.getuid?.() || prior.nlink !== 1)) throw new Error("Runtime file has an unsafe owner or identity.");
@@ -431,7 +472,7 @@ function writePrivateAtomic(file: string, value: string | Buffer, mode = 0o600):
   finally { fs.rmSync(temporary, { force: true }); }
 }
 
-function readPrivateBytes(file: string, limit: number): Buffer {
+export function readPrivateBytes(file: string, limit: number): Buffer {
   const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try {
     const stat = fs.fstatSync(fd);

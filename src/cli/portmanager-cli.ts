@@ -16,6 +16,7 @@ import { buildReroutableCommand } from "../core/terminal-conflict-parser";
 import { buildInjectedCommand, buildPortManagerEnvironment } from "../platform/process/port-injection";
 import { canRunNativeAgentBinary } from "../platform/process/native-executable";
 import { buildNodeRuntimeEnvironment } from "../platform/process/node-runtime";
+import { runNetworkTerminalClient } from "../platform/process/network-terminal-client";
 import { DEFAULT_PORT_MANAGER_SETTINGS } from "../shared/default-settings";
 import { isKnownPortManagerPackageVersion, readPortManagerPackageVersion } from "../shared/package-version";
 import type {
@@ -111,6 +112,7 @@ if (require.main === module) {
 /** Runs the selected CLI command and maps failures to process exit codes. */
 async function main(args: readonly string[]): Promise<void> {
   try {
+    if (args[0] === "terminal") { await runNetworkTerminalClient(args.slice(1)); return; }
     const parsed = parseCli(args);
 
     if (parsed.command === "help") {

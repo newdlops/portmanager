@@ -11,6 +11,7 @@ import { ProxyNetworkResources } from "../../src/platform/ports/proxy-network-re
 import { MacosNetworkRuntime } from "../../src/platform/process/macos-network-runtime";
 import { NativeProcessLookupProvider } from "../../src/platform/process/native-process-lookup";
 import { buildNodeRuntimeEnvironment } from "../../src/platform/process/node-runtime";
+import { NetworkTerminalControl } from "../../src/platform/process/network-terminal-control";
 import type { AuthenticatedProcessScope } from "../../src/agent/protocol";
 
 /** Production owner, broker, launcher, real kernel and installed Node cooperate. */
@@ -59,12 +60,14 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
       assert.equal(status.authenticatesProcessScopes, true);
     }, resolveScope: identity => request<AuthenticatedProcessScope | null>("resolveProcessScope", identity),
     readIdentity: pid => lookup.readProcessIdentity(pid) });
+  let control: NetworkTerminalControl | undefined;
   const echo = net.createServer({ allowHalfOpen: true }, socket => socket.pipe(socket));
   const echoClients = new Set<net.Socket>();
   echo.on("connection", socket => { echoClients.add(socket); socket.on("error", () => {}); socket.once("close", () => echoClients.delete(socket)); });
   await new Promise<void>(resolve => echo.listen(0, "127.0.0.1", resolve));
   const echoPort = (echo.address() as net.AddressInfo).port;
   context.after(async () => {
+    await control?.dispose();
     await runtime.dispose();
     if (terminal !== undefined && terminal.exitCode === null && terminal.signalCode === null) terminal.kill("SIGKILL");
     for (const socket of echoClients) socket.destroy();
@@ -104,6 +107,46 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
   await runtime.closeShell(launch.id);
   assert.deepEqual(Object.values(resources.budget.used), Object.values(resources.budget.used).map(() => 0));
   assert.equal(runtime.activeShells.length, 0);
+
+  // The external CLI uses the same owner/budget rather than creating an
+  // independent controller in a sourced script. Private readiness is the only
+  // execution witness; echoed command text cannot satisfy these assertions.
+  const observed = new Map<string, AuthenticatedProcessScope>();
+  control = new NetworkTerminalControl(path.join(security, "terminal-control"), {
+    prepare: (networkId, cwd) => runtime.prepareShell({ id: networkId, name: networkId, loopbackHost: "127.0.0.1",
+      workspaceDirectories: [workspace], routes: [{ port: 4567, targetHost: "127.0.0.1", targetPort: echoPort }] }, cwd, "/bin/zsh"),
+    observe: async launch => { observed.set(launch.id, await runtime.waitReady(launch.id)); },
+    close: id => runtime.closeShell(id),
+  });
+  const descriptor = await control.start();
+  const privateProfiles = path.join(root, "empty-profiles");
+  const cli = spawn(process.execPath, [path.join(source, "out/src/cli/portmanager-cli.js"), "terminal",
+    descriptor.socketPath, descriptor.tokenFilePath, "runtime-external-a", workspace], {
+    env: { ...environment, ZDOTDIR: privateProfiles }, cwd: workspace, stdio: ["pipe", "pipe", "pipe"],
+  });
+  cli.on("error", () => {}); cli.stdout!.on("data", () => {}); cli.stderr!.on("data", () => {});
+  context.after(async () => {
+    if (cli.exitCode === null && cli.signalCode === null) { const exited = once(cli, "exit"); cli.kill("SIGTERM"); await exited; }
+  });
+  const readyDeadline = Date.now() + 10_000;
+  while (observed.size === 0) { assert.equal(cli.exitCode, null); assert.ok(Date.now() < readyDeadline); await delay(10); }
+  const original = runtime.activeShells.find(shell => shell.networkId === "runtime-external-a")!;
+  assert.ok(original);
+  assert.equal(await control.replace(original.id, "runtime-external-b", workspace), true);
+  assert.equal(runtime.activeShells.length, 1);
+  assert.equal(runtime.activeShells[0].networkId, "runtime-external-b");
+  assert.equal(resources.budget.used.nativeHelpers, 2);
+  const switched = runtime.activeShells[0];
+  assert.equal(observed.get(switched.id)?.networkId, "runtime-external-b");
+  assert.equal(await control.detach(switched.id), true);
+  assert.equal(runtime.activeShells.length, 0);
+  assert.ok(Object.values(resources.budget.used).every(value => value === 0));
+  // Detached shell is a fresh host child, while the controller connection
+  // remains owned by the trusted CLI and never by either guarded shell.
+  cli.stdin!.write("exit\n");
+  await once(cli, "exit");
+  await control.dispose();
+  control = undefined;
 });
 
 function quote(value: string): string { return "'" + value.replace(/'/g, "'\\''") + "'"; }

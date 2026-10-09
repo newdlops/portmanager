@@ -180,10 +180,10 @@ export class PortManagerCommandController implements DisposableLike {
       context.subscriptions.push(vscode.window.registerTerminalProfileProvider("portManager.logicalNetworkTerminal", {
         provideTerminalProfile: async (token) => {
           const selectedId = this.dependencies.networkService.getGuardedDefaultNetworkId();
-          const network = selectedId === undefined ? await this.resolveNetworkArgument(undefined, "Open Terminal in Logical Network")
-            : this.dependencies.networkService.getSnapshot().networks.find(row => row.id === selectedId);
-          if (network === undefined || token.isCancellationRequested) return undefined;
-          const options = await this.dependencies.networkService.prepareGuardedTerminalOptions(network.id);
+          const network = selectedId === undefined ? await this.resolveNetworkArgument(undefined, "Open Terminal in Logical Network") : undefined;
+          const networkId = selectedId ?? network?.id;
+          if (networkId === undefined || token.isCancellationRequested) return undefined;
+          const options = await this.dependencies.networkService.prepareGuardedTerminalOptions(networkId);
           token.onCancellationRequested(() => { void this.dependencies.networkService.cancelGuardedTerminalOptions(options); });
           if (token.isCancellationRequested) { await this.dependencies.networkService.cancelGuardedTerminalOptions(options); return undefined; }
           return new vscode.TerminalProfile(options);

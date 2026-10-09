@@ -31,6 +31,7 @@
 
 한 **확장 호스트와 그 proxy 자식 helper**가 `defaultProxyNetworkResources`를
 공유한다. Host Exposure, Host Gateway, Browser Proxy, Logical Router를 모두 포함하며,
+보호된 네트워크 broker/supervisor와 private terminal control도 같은 객체를 사용한다.
 서비스 재생성으로 아직 끝나지 않은 작업의 예산을 초기화하지 않는다. 별도 확장
 호스트/daemon, 사용자 앱과 OS kernel backlog는 이 회계 범위 밖이다. 내장 호출자와
 테스트는 `resources` 옵션으로 같은 객체를 주입할 수 있다.
@@ -40,13 +41,14 @@
 | 리스너 용량 | 256 | Node close/실패, native CLOSED/실패/exit |
 | 클라이언트 연결 용량 | 1,024 | Node socket close, native helper exit |
 | upstream socket 용량 | 1,024 | 실제 close; HTTP 유휴 풀도 포함 |
-| native helper | 8 | 실제 exit 또는 spawn 실패 |
+| native helper | 16 | 실제 exit 또는 spawn 실패 |
 | DNS 작업 용량 | 32 | OS callback 또는 native helper exit |
 | 실제 route resolver 작업 | 64 | 원래 Promise의 완료·실패 |
 | HTTP 활성 요청 | 256 | upstream request close 뒤 Agent 정리 |
 | HTTP 대기 요청 | 256 | admission·취소·만료 |
 | 보관하는 유휴 HTTP socket | 64 | 재사용·close·30초 경과 |
-| 부모→native 제어 payload | 512KiB | write callback; helper별 64KiB |
+| 제어 payload | 2MiB | write callback 또는 native owner exit; proxy helper별 64KiB |
+| native PID 승인 대기 | 512 | broker/supervisor의 실제 종료 |
 
 native helper는 시작 전에 연결/upstream 용량을 각 기본 32개(요청 상한이 더
 작으면 그 값), DNS 용량을 기본 2개 예약한다. native env로 전달해 실제

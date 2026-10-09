@@ -183,11 +183,19 @@ target을 만들지 않는다. 이미 연결된 TCP 데이터 흐름은 control 
 
 확장 호스트 하나와 그 proxy 자식 helper는 **한 공통 자원 예산**을 사용한다.
 Host Exposure·Host Gateway·Browser Proxy·Logical Router의 기본 전체 상한은
-listener 용량 256, client/upstream 용량 각각 1,024, native helper 8,
+listener 용량 256, client/upstream 용량 각각 1,024, native helper 16,
 DNS 작업 용량 32, 실제 route resolver 작업 64, HTTP 활성/대기 각각 256,
-유휴 HTTP socket 64다. 이 회계는 별도 확장 호스트/daemon·사용자 앱·kernel
+유휴 HTTP socket 64, native PID 승인 대기 512, 제어 payload 2MiB다. 보호된 네트워크의
+broker·supervisor·private terminal control도 같은 예산을 사용한다. 이 회계는 별도 확장 호스트/daemon·사용자 앱·kernel
 backlog를 포함하지 않는다. 다중 자원 admission은 원자적이며 실패·취소·종료
 경합에서 lease를 두 번 반환해도 추가 용량을 만들면 안 된다.
+
+보호된 broker는 시작 전 client 64, TCP handle 128, PID 승인 작업 64와
+wire buffer 281,856 bytes를 보수적으로 예약한다. supervisor는 helper 1, 승인 작업 1,
+4KiB를 예약하며 실제 PID/birth의 종료 확인 후 반환한다. terminal control은 listener 1과
+연결당 request 8KiB·대기 output 128KiB를 예약하며 실제 socket close에 반환한다.
+SCM_RIGHTS의 일시적 최대 512 FD와 정책 읽기 65,538 bytes·8KiB bitmap은 native
+프로세스의 별도 고정 경계다. RSS 96MiB·FD 8의 장시간 검증 기준은 변경하지 않는다.
 
 native는 시작 전에 worker/upstream 용량 각 기본 32와 DNS 용량 기본 2를
 예약하고 같은 상한을 child env로 전달한다. 예약은 유휴 helper에도 보수적으로
