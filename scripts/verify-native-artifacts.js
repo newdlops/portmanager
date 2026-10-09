@@ -36,7 +36,8 @@ const commonHelpers = [
   "portmanager_tty_input",
 ];
 const expected = target.startsWith("darwin-")
-  ? ["libportmanager_hook.dylib", "portmanager_asdf_shim", "portmanager_process_scope_shim", ...commonHelpers]
+  ? ["libportmanager_hook.dylib", "portmanager_asdf_shim", "portmanager_process_scope_shim",
+    "portmanager_network_broker", "portmanager_network_launch", ...commonHelpers]
   : ["libportmanager_hook.so", ...commonHelpers];
 const expectedArchitectures = target.endsWith("-arm64") ? ["arm64", "aarch64"] : ["x86_64", "x86-64"];
 

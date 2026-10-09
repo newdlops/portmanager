@@ -132,6 +132,9 @@ import {
   type ProcessTableRow,
 } from "../platform/process/node-process-table";
 import { getProcessLookupHelperRelativePath, NativeProcessLookupProvider } from "../platform/process/native-process-lookup";
+import { MacosNetworkRuntime, type NetworkShellLaunch, type NetworkRuntimeRoute } from "../platform/process/macos-network-runtime";
+import { getAgentControllerTokenPath } from "../agent/agent-authorization";
+import { buildNodeRuntimeEnvironment } from "../platform/process/node-runtime";
 import { NodeProcessEnvironmentProvider } from "../platform/process/node-process-environment";
 import { NodeTerminalCandidateProvider } from "../platform/process/node-terminal-candidate-provider";
 import { ELECTRON_RUN_AS_NODE } from "../platform/process/node-runtime";
@@ -583,6 +586,12 @@ interface HostLocalGatewayRedirect {
  * false impression that a terminal was moved into a network.
  */
 export class PortManagerNetworkService implements DisposableLike {
+  /** Trusted parents of guarded terminals share the proxy budget and die on disposal. */
+  private guardedRuntime: MacosNetworkRuntime | undefined;
+  private readonly guardedTerminals = new Map<vscode.Terminal, { launch: NetworkShellLaunch; ready: Promise<void> }>();
+  private readonly pendingGuardedLaunches = new Map<string, NetworkShellLaunch>();
+  private guardedRouteRefresh: Promise<void> | undefined;
+  private guardedRouteGeneration = 0;
   /** Pure domain store for networks, attachments, exposures, and terminal rows. */
   private readonly registry: LogicalNetworkRegistry;
 
@@ -1009,6 +1018,7 @@ export class PortManagerNetworkService implements DisposableLike {
     this.vscodeWindowTerminalBinding = this.loadVscodeWindowTerminalBinding();
     this.disposables.push(
       this.registry.onDidChange(() => {
+        this.refreshGuardedRuntimeRoutes();
         this.saveState();
         this.notifyRoutingActivity();
         this.invalidateRouterVerdictsOnAttachmentChange();
@@ -1046,6 +1056,7 @@ export class PortManagerNetworkService implements DisposableLike {
     if (this.processService !== undefined) {
       this.disposables.push(
         this.processService.onDidChange(() => {
+          this.refreshGuardedRuntimeRoutes();
           this.notifyRoutingActivity();
           if (!this.suppressRoutingRepairSideEffects) {
             if (this.ownsControlPlaneLease || this.ownsLogicalRouterLease) {
@@ -1075,13 +1086,19 @@ export class PortManagerNetworkService implements DisposableLike {
       }),
       this.watchOwnerLeaseFiles(),
       vscode.window.onDidOpenTerminal((terminal) => {
+        void this.adoptGuardedTerminal(terminal).catch(error => devLog("network-runtime", `terminal startup failed: ${formatError(error)}`));
         this.scheduleVscodeTerminalTitleRefresh(terminal);
         this.notifyRoutingActivity();
         if (this.ownsControlPlaneLease) {
           void this.refreshTerminals();
         }
       }),
-      vscode.window.onDidCloseTerminal(() => {
+      vscode.window.onDidCloseTerminal((terminal) => {
+        const owner = this.guardedTerminals.get(terminal);
+        if (owner !== undefined) {
+          this.guardedTerminals.delete(terminal);
+          void this.guardedRuntime?.closeShell(owner.launch.id).catch(error => devLog("network-runtime", `terminal exit cleanup failed: ${formatError(error)}`));
+        }
         this.notifyRoutingActivity();
         if (this.ownsControlPlaneLease) {
           void this.refreshTerminals();
@@ -2694,6 +2711,18 @@ export class PortManagerNetworkService implements DisposableLike {
 
     await this.ensureNetworkComposeRoutingArtifacts(networkId);
 
+
+    if (process.platform === "darwin" && runtime.kind === "nativeHelper" && terminalWindow.source === "vscode") {
+      const processRows = await this.listProcessRowsForTerminalControl();
+      const current = await findMatchingVscodeTerminal(terminalWindow, processRows);
+      if (current === undefined) throw new Error("The selected terminal no longer has a live PTY owner.");
+      const replacement = await this.replaceGuardedTerminal(current, networkId);
+      const owner = this.guardedTerminals.get(replacement)!;
+      const attachment = this.registry.getSnapshot().attachments.find(row => row.id === `guarded-${owner.launch.id}`);
+      if (attachment === undefined) throw new Error("Guarded terminal readiness did not create an attachment.");
+      return attachment;
+    }
+
     if (runtime.kind === "container") {
       await this.containerRuntime.createNetwork(network, readContainerRuntimeSettings());
       const attachCommand = await this.containerRuntime.buildAttachCommand(network.id);
@@ -2849,7 +2878,174 @@ export class PortManagerNetworkService implements DisposableLike {
       await this.processService?.start();
     }
     await this.ensureNetworkComposeRoutingArtifacts(networkId);
+    if (process.platform === "darwin") {
+      const launch = await this.prepareGuardedShell(networkId);
+      // This command runs from an ordinary host shell. A guarded child cannot
+      // reopen the private controller/profile paths to change its own scope.
+      return `export ZDOTDIR=${shellQuote(launch.env.ZDOTDIR!)}; exec ${shellQuote(launch.shellPath)} ${launch.shellArgs.map(shellQuote).join(" ")}`;
+    }
     return this.buildTerminalRoutingScript(network, settings);
+  }
+
+  /** A trusted PTY parent replaces env-only attach on macOS. */
+  async openGuardedNetworkTerminal(networkId: string, cwd?: string): Promise<vscode.Terminal> {
+    const options = await this.prepareGuardedTerminalOptions(networkId, cwd);
+    const terminal = vscode.window.createTerminal(options);
+    try {
+      await this.adoptGuardedTerminal(terminal);
+      terminal.show();
+      return terminal;
+    } catch (error) {
+      terminal.dispose();
+      throw error;
+    }
+  }
+
+  /** Native terminal profiles use the same guarded startup as the command. */
+  async prepareGuardedTerminalOptions(networkId: string, cwd?: string): Promise<vscode.TerminalOptions> {
+    const launch = await this.prepareGuardedShell(networkId, cwd);
+    const network = requireNetwork(this.registry.getNetwork(networkId), networkId);
+    this.pendingGuardedLaunches.set(launch.id, launch);
+    return { name: `Port Manager: ${network.name}`, cwd: launch.cwd, shellPath: launch.shellPath,
+      shellArgs: [...launch.shellArgs], env: { ...launch.env, PORT_MANAGER_GUARDED_SESSION_ID: launch.id },
+      strictEnv: true, iconPath: new vscode.ThemeIcon("terminal") };
+  }
+
+  /** The profile provider follows this window's selection without another picker. */
+  getGuardedDefaultNetworkId(): string | undefined {
+    return this.vscodeWindowTerminalBinding?.status === "attached" ? this.vscodeWindowTerminalBinding.networkId : undefined;
+  }
+
+  /** A canceled profile has not created a PTY; return only its unadopted reservation. */
+  async cancelGuardedTerminalOptions(options: vscode.TerminalOptions): Promise<void> {
+    const id = options.env?.PORT_MANAGER_GUARDED_SESSION_ID;
+    if (typeof id !== "string" || !this.pendingGuardedLaunches.has(id)) return;
+    this.pendingGuardedLaunches.delete(id);
+    await this.guardedRuntime?.closeShell(id);
+  }
+
+  /** A switch creates a fresh policy/process and preserves the old terminal on startup failure. */
+  async replaceGuardedTerminal(terminal: vscode.Terminal, networkId: string): Promise<vscode.Terminal> {
+    const options = terminal.creationOptions;
+    const cwd = "cwd" in options && typeof options.cwd === "string" ? options.cwd : undefined;
+    const replacement = await this.openGuardedNetworkTerminal(networkId, cwd);
+    const previous = this.guardedTerminals.get(terminal);
+    if (previous !== undefined) {
+      await this.guardedRuntime!.closeShell(previous.launch.id);
+      this.registry.removeAttachment(`guarded-${previous.launch.id}`);
+    }
+    this.guardedTerminals.delete(terminal);
+    terminal.dispose();
+    return replacement;
+  }
+
+  private async adoptGuardedTerminal(terminal: vscode.Terminal): Promise<void> {
+    const previous = this.guardedTerminals.get(terminal);
+    if (previous !== undefined) return previous.ready;
+    const options = terminal.creationOptions;
+    const id = "env" in options ? options.env?.PORT_MANAGER_GUARDED_SESSION_ID : undefined;
+    if (typeof id !== "string") return;
+    const launch = this.pendingGuardedLaunches.get(id);
+    if (launch === undefined) return;
+    this.pendingGuardedLaunches.delete(id);
+    const ready = (async () => {
+      const pid = await terminal.processId;
+      if (pid === undefined) throw new Error("Guarded terminal has no PTY supervisor PID.");
+      await this.guardedRuntime!.adoptSupervisor(id, pid);
+      const identity = await this.guardedRuntime!.waitReady(id);
+      this.registry.addAttachment({ id: `guarded-${id}`, networkId: launch.networkId, rootPid: identity.pid,
+        processGroupId: identity.pid, terminalWindowId: `vscode:${pid}`, terminalTitle: terminal.name, mode: "isolated", status: "attached",
+        attachedAt: new Date().toISOString() });
+      this.localChangeEvents.emit();
+    })().catch(async error => {
+      terminal.dispose();
+      await this.guardedRuntime!.closeShell(id);
+      throw error;
+    });
+    this.guardedTerminals.set(terminal, { launch, ready });
+    await ready;
+  }
+
+  private async prepareGuardedShell(networkId: string, cwd?: string): Promise<NetworkShellLaunch> {
+    const network = requireNetwork(this.registry.getNetwork(networkId), networkId);
+    requireNativeHelperRuntime(requireRuntime(this.registry.getSnapshot().runtimes, network.runtimeKind));
+    if (process.platform !== "darwin") throw new Error("Guarded host-runtime terminals currently require macOS.");
+    const workspaceDirectories = (vscode.workspace.workspaceFolders ?? []).filter(folder => folder.uri.scheme === "file").map(folder => folder.uri.fsPath);
+    cwd ??= workspaceDirectories[0] ?? os.homedir();
+    if (workspaceDirectories.length === 0) workspaceDirectories.push(cwd);
+    const settings = readPortManagerSettings();
+    await this.ensureTerminalRoutingHostReadyForNetwork(network, resolveTerminalLoopbackAddressRoutingMode(settings));
+    await this.ensureNetworkComposeRoutingArtifacts(networkId);
+    const routes = await this.collectGuardedRoutes(networkId);
+    const shimDirectory = prepareRuntimeShimLauncherDirectory(this.context.globalStorageUri.fsPath,
+      this.context.asAbsolutePath(getAsdfShimLauncherRelativePath()), this.context.asAbsolutePath(getRuntimeCommandShimRelativePath()));
+    return this.getGuardedRuntime().prepareShell({ id: network.id, name: network.name,
+      loopbackHost: loopbackAddressForNetwork(networkId), workspaceDirectories, routes,
+      bootstrapEnvironment: { ...(shimDirectory === undefined ? {} : { PATH: `${shimDirectory}${path.delimiter}${process.env.PATH ?? ""}`,
+        PORT_MANAGER_RUNTIME_SHIM_DIR: shimDirectory }), PORT_MANAGER_RUNTIME_SHIM_READY: "1" } }, cwd);
+  }
+
+  private getGuardedRuntime(): MacosNetworkRuntime {
+    if (this.guardedRuntime !== undefined) return this.guardedRuntime;
+    const processService = this.processService;
+    if (processService?.resolveProcessScope === undefined) throw new Error("Guarded terminal startup requires an authenticated native controller.");
+    this.guardedRuntime = new MacosNetworkRuntime({ artifactDirectory: this.context.asAbsolutePath(path.join("media", "native")),
+      resources: defaultProxyNetworkResources, agentSocketPath: getAgentSocketPath(),
+      controllerTokenFilePath: getAgentControllerTokenPath(getAgentSocketPath()),
+      ensureController: async () => {
+        await processService.start();
+        const daemon = processService.getSnapshot().daemon;
+        if (daemon.authenticatesProcessScopes !== true || daemon.trustedQueryTools !== true) {
+          throw new Error("Guarded terminal startup requires the native authenticated controller with trusted query tools.");
+        }
+      }, resolveScope: identity => processService.resolveProcessScope!(identity),
+      readIdentity: pid => this.nativeProcessLookup.readProcessIdentity(pid) });
+    return this.guardedRuntime;
+  }
+
+  /** Host fallback < attached Compose < authenticated active application route. */
+  private async collectGuardedRoutes(networkId: string): Promise<readonly NetworkRuntimeRoute[]> {
+    const routes = new Map<number, NetworkRuntimeRoute>();
+    const snapshot = this.registry.getSnapshot();
+    for (const binding of snapshot.hostAccessBindings) {
+      if (binding.networkId !== networkId || binding.status !== "active" || binding.protocol !== "tcp") continue;
+      const host = binding.hostAddress === "localhost" ? "127.0.0.1" : await defaultProxyNetworkResources.resolveListenHost(binding.hostAddress);
+      routes.set(binding.logicalPort, { port: binding.logicalPort, targetHost: host, targetPort: binding.hostPort });
+    }
+    for (const attachment of snapshot.composeAttachments) {
+      if (attachment.networkId !== networkId || attachment.status !== "attached") continue;
+      for (const port of attachment.ports) {
+        if (port.protocol !== "tcp") continue;
+        const host = port.actualHostAddress === "localhost" || port.actualHostAddress === "0.0.0.0" ? "127.0.0.1" : port.actualHostAddress;
+        routes.set(port.logicalPort, { port: port.logicalPort, targetHost: host, targetPort: port.actualHostPort });
+      }
+    }
+    for (const route of this.processService?.getSnapshot().routes ?? []) {
+      if (route.networkId !== networkId || !isLiveListenRoute(route)) continue;
+      routes.set(route.logicalPort, { port: route.logicalPort, targetHost: route.host, targetPort: route.actualPort });
+    }
+    return [...routes.values()];
+  }
+
+  /** Clear removed routes immediately; one serialized publication gathers current policy. */
+  private refreshGuardedRuntimeRoutes(): void {
+    if (this.guardedRuntime === undefined) return;
+    this.guardedRouteGeneration++;
+    const ids = [...new Set(this.guardedRuntime.activeShells.map(shell => shell.networkId))];
+    for (const id of ids) this.guardedRuntime.updateRoutes(id, []);
+    if (this.guardedRouteRefresh !== undefined) return;
+    this.guardedRouteRefresh = (async () => {
+      let observed: number;
+      do {
+        observed = this.guardedRouteGeneration;
+        const currentIds = [...new Set(this.guardedRuntime!.activeShells.map(shell => shell.networkId))];
+        for (const id of currentIds) {
+          const routes = await this.collectGuardedRoutes(id);
+          if (observed === this.guardedRouteGeneration) this.guardedRuntime?.updateRoutes(id, routes);
+        }
+      } while (observed !== this.guardedRouteGeneration && !this.browserProxyDisposed);
+    })().catch(error => devLog("network-runtime", `route publication failed closed: ${formatError(error)}`))
+      .finally(() => { this.guardedRouteRefresh = undefined; });
   }
 
   /** Returns the shell snippet that removes Port Manager routing variables from a custom terminal shell. */
@@ -2863,6 +3059,20 @@ export class PortManagerNetworkService implements DisposableLike {
 
     if (attachment === undefined) {
       return undefined;
+    }
+    const guarded = [...this.guardedTerminals].find(([, owner]) => `guarded-${owner.launch.id}` === attachmentId);
+    if (guarded !== undefined) {
+      const [terminal, owner] = guarded;
+      await this.guardedRuntime!.closeShell(owner.launch.id);
+      this.guardedTerminals.delete(terminal);
+      this.registry.removeAttachment(attachmentId);
+      const options = terminal.creationOptions;
+      terminal.dispose();
+      const environment = buildNodeRuntimeEnvironment();
+      delete environment.ELECTRON_RUN_AS_NODE;
+      vscode.window.createTerminal({ name: "Port Manager: detached", shellPath: process.env.SHELL ?? "/bin/zsh",
+        cwd: "cwd" in options ? options.cwd : undefined, strictEnv: true, env: environment }).show();
+      return attachment;
     }
 
     const network = this.registry.getNetwork(attachment.networkId);
@@ -3867,6 +4077,8 @@ export class PortManagerNetworkService implements DisposableLike {
 
   /** Releases listeners and event subscriptions. */
   dispose(): void {
+    void this.guardedRuntime?.dispose();
+    this.pendingGuardedLaunches.clear();
     this.browserProxyDisposed = true;
     this.browserProxyProcessCommandTextInFlight.clear();
     this.browserProxyProcessCommandTextCache.clear();
@@ -4097,6 +4309,13 @@ export class PortManagerNetworkService implements DisposableLike {
   private applyVscodeWindowTerminalEnvironment(): void {
     const binding = this.vscodeWindowTerminalBinding;
     const networkId = binding?.status === "attached" ? binding.networkId : undefined;
+    if (process.platform === "darwin") {
+      // Env inheritance cannot enforce the kernel boundary. Selected networks
+      // start through the contributed native profile instead of a raw shell.
+      applyTerminalHookEnvironment(this.context, undefined);
+      void this.configureGuardedDefaultProfile(networkId).catch(error => devLog("network-runtime", `default profile update failed: ${formatError(error)}`));
+      return;
+    }
 
     applyTerminalHookEnvironment(
       this.context,
@@ -4112,6 +4331,25 @@ export class PortManagerNetworkService implements DisposableLike {
             composeLogicalPorts: this.getComposeLogicalPortsForNetwork(networkId),
           },
     );
+  }
+
+  /** Store and restore only the profile value this window owns. */
+  private async configureGuardedDefaultProfile(networkId: string | undefined): Promise<void> {
+    if (vscode.workspace.workspaceFolders === undefined || vscode.workspace.workspaceFolders.length === 0) return;
+    const configuration = vscode.workspace.getConfiguration("terminal.integrated");
+    const profile = "Port Manager: Logical Network";
+    const key = "portManager.previousTerminalProfile.osx.v1";
+    const current = configuration.get<string>("defaultProfile.osx");
+    if (networkId !== undefined) {
+      if (current === profile) return;
+      if (this.context.workspaceState.get(key) === undefined) await this.context.workspaceState.update(key, { value: current });
+      await configuration.update("defaultProfile.osx", profile, vscode.ConfigurationTarget.Workspace);
+    } else {
+      const saved = this.context.workspaceState.get<{ value?: string }>(key);
+      if (saved === undefined) return;
+      if (current === profile) await configuration.update("defaultProfile.osx", saved.value, vscode.ConfigurationTarget.Workspace);
+      await this.context.workspaceState.update(key, undefined);
+    }
   }
 
   /**
@@ -4164,6 +4402,15 @@ export class PortManagerNetworkService implements DisposableLike {
     network: LogicalNetwork,
     settings: PortManagerSettings,
   ): Promise<number> {
+    if (process.platform === "darwin") {
+      let replaced = 0;
+      for (const terminal of [...vscode.window.terminals]) {
+        await this.replaceGuardedTerminal(terminal, network.id);
+        replaced++;
+      }
+      await this.refreshTerminals().catch(() => []);
+      return replaced;
+    }
     const injectedTerminalCount = sendCommandToOpenVscodeTerminals(
       this.buildTerminalRoutingScript(network, settings),
     );

@@ -91,6 +91,8 @@ case "$TARGET_SYSTEM" in
     cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$TTY_INPUT_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tty_input"
     cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS -pthread "$TCP_ROUTER_SOURCE_FILE" "$PEER_PROCESS_SOURCE_FILE" "$DEV_LOG_SOURCE_FILE" "$TCP_PROXY_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tcp_router"
     cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS -pthread "$HOST_EXPOSURE_PROXY_SOURCE_FILE" "$TCP_PROXY_SOURCE_FILE" "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_host_exposure_proxy"
+    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS -pthread "$ROOT_DIR/native/network-broker/portmanager_network_broker.c" "$ROOT_DIR/native/agent/portmanager_agent_json.c" "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_network_broker"
+    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS -pthread "$ROOT_DIR/native/network-launcher/portmanager_network_launch.c" "$ROOT_DIR/native/agent/portmanager_agent_json.c" "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_network_launch"
     cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$PROCESS_LOOKUP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_lookup"
     cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$PROCESS_TRACKER_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_tracker"
     cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$CONTAINER_MAP_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_container_map"
@@ -106,6 +108,8 @@ case "$TARGET_SYSTEM" in
       codesign --force --sign - "$OUTPUT_DIR/portmanager_tty_input" >/dev/null
       codesign --force --sign - "$OUTPUT_DIR/portmanager_tcp_router" >/dev/null
       codesign --force --sign - "$OUTPUT_DIR/portmanager_host_exposure_proxy" >/dev/null
+      codesign --force --sign - "$OUTPUT_DIR/portmanager_network_broker" >/dev/null
+      codesign --force --sign - "$OUTPUT_DIR/portmanager_network_launch" >/dev/null
       codesign --force --sign - "$OUTPUT_DIR/portmanager_process_lookup" >/dev/null
       codesign --force --sign - "$OUTPUT_DIR/portmanager_process_tracker" >/dev/null
       codesign --force --sign - "$OUTPUT_DIR/portmanager_container_map" >/dev/null

@@ -7,13 +7,16 @@ export const DEFAULT_PROXY_RESOURCE_LIMITS = {
   listeners: 256,
   connections: 1024,
   upstreams: 1024,
-  nativeHelpers: 8,
+  // Eight proxy helpers plus guarded broker/supervisor ownership share this cap.
+  nativeHelpers: 16,
+  nativeScopeJobs: 512,
   dnsJobs: 32,
   routeJobs: 64,
   httpRequests: 256,
   queuedHttpRequests: 256,
   idleSockets: 64,
-  controlBytes: 512 * 1024,
+  // Native authorization slots reserve their bounded request/reply storage too.
+  controlBytes: 2 * 1024 * 1024,
 } as const;
 
 export type ProxyResource = keyof typeof DEFAULT_PROXY_RESOURCE_LIMITS;

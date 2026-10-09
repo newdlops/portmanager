@@ -97,7 +97,8 @@
     "onCommand:portManager.repairLocalDns",
     "onCommand:portManager.renewBrowserTlsCertificate",
     "onCommand:portManager.openOwnerUi",
-    "onCommand:portManager.openSettings"
+    "onCommand:portManager.openSettings",
+    "onTerminalProfile:portManager.logicalNetworkTerminal"
   ],
   "main": "./out/src/extension/activate.js",
   "bin": {
@@ -1073,6 +1074,15 @@
           "description": "Signal used to stop managed processes on POSIX platforms."
         }
       }
+    },
+    "terminal": {
+      "profiles": [
+        {
+          "id": "portManager.logicalNetworkTerminal",
+          "title": "Port Manager: Logical Network",
+          "icon": "terminal"
+        }
+      ]
     }
   },
   "devDependencies": {

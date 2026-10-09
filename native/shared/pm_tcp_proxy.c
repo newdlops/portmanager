@@ -766,10 +766,10 @@ void pm_tcp_proxy_forward(int client_fd, int target_fd) {
     if (descriptors[0].events == 0 && (descriptors[0].revents & POLLHUP) != 0) suppress_client_hup = 1;
     if (descriptors[1].events == 0 && (descriptors[1].revents & POLLHUP) != 0) suppress_target_hup = 1;
     int failed = 0;
-    /* Drain at most four existing-buffer chunks per direction per wakeup.
+    /* Drain at most sixteen existing-buffer chunks per direction per wakeup.
      * Nonblocking calls stop at backpressure; this amortizes readiness waits without
      * expanding memory or monopolizing a worker indefinitely. */
-    for (int burst = 0; burst < 4; burst++) {
+    for (int burst = 0; burst < 16; burst++) {
       size_t before_forward = forward.length, before_backward = backward.length;
       int forward_open = forward.source_open, backward_open = backward.source_open;
       if ((descriptors[0].revents & (POLLIN | POLLHUP)) != 0 && pm_read_direction(&forward) != 0) { failed = 1; break; }

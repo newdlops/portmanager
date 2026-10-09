@@ -43,7 +43,7 @@ TCP transport는 target 정책을 알지 못한다. helper당 기본 256개의 c
 막히면 읽기를 제한하며, FIN 뒤에도 반대 방향과 이미 받은 바이트를 보존한다.
 reset/error는 두 방향을 함께 정리해 다른 copy thread의 종료를 기다리지 않는다.
 새로 읽은 바이트는 nonblocking send로 즉시 전달하고, wakeup당 방향별 최대
-4개의 64KiB chunk를 처리한다. EAGAIN은 버퍼를 보존하고 다음 쓰기 준비를 기다린다.
+16개의 64KiB chunk를 처리한다. EAGAIN은 버퍼를 보존하고 다음 쓰기 준비를 기다린다.
 macOS는 kqueue의 읽기/쓰기 필터를 분리해 상대의 upload FIN 뒤에도 응답을
 전달한다. 연결당 queue fd 하나를 worker가 소유하며 종료 시 닫고, RLIMIT admission은
 데이터 소켓 2개와 queue 1개를 함께 계산한다. Linux는 poll을 유지한다.

@@ -16,7 +16,17 @@ import { runResourceSoak } from "./proxy-resource-soak";
  * activation failures, fallback runtimes, and a daemon from the wrong build.
  */
 export async function run(): Promise<void> {
-  assert.equal(process.env.CI, "true");
+  const isolatedLocal = process.env.PM_TEST_EXECUTION_ENVIRONMENT === "isolated-local";
+  assert.ok(process.env.CI === "true" || isolatedLocal, "Packaged activation requires CI or explicit local isolation.");
+  if (isolatedLocal) {
+    const privateHome = process.env.PM_TEST_PRIVATE_HOME!;
+    assert.ok(path.isAbsolute(privateHome) && fs.realpathSync(privateHome).startsWith(`${fs.realpathSync(os.tmpdir())}${path.sep}`));
+    assert.equal(fs.lstatSync(privateHome).mode & 0o077, 0);
+    // Storage indirection is installed before loading or activating any product
+    // module. HOME, ordinary GC and every installed module byte stay unchanged.
+    os.homedir = () => privateHome;
+    process.env.PORT_MANAGER_BROWSER_DNS_PORT = "0";
+  }
   const extension = vscode.extensions.getExtension<PortManagerExtensionApi>("newdlops.portmanager");
   assert.ok(extension, "Installed extension is not discoverable.");
   assert.equal(fs.realpathSync(extension.extensionPath), fs.realpathSync(process.env.PM_TEST_EXTENSION_PATH!));
@@ -99,7 +109,11 @@ function request<T>(method: string): Promise<T> {
       else resolve(payload!);
     };
     socket.once("error", finish);
-    socket.once("connect", () => socket.write(`${JSON.stringify({ id, method })}\n`));
+    socket.once("connect", () => {
+      const auth = require(path.join(process.env.PM_TEST_EXTENSION_PATH!, "out", "src", "agent", "agent-authorization")) as typeof import("../../src/agent/agent-authorization");
+      const authorization = auth.readAgentControllerToken(auth.getAgentControllerTokenPath(socketPath));
+      socket.write(`${JSON.stringify({ id, method, authorization })}\n`);
+    });
     socket.on("data", (chunk: Buffer) => {
       buffer += chunk.toString("utf8");
       if (buffer.length > 1024 * 1024) return finish(new Error("Unexpectedly large daemon response"));

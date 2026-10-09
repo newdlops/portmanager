@@ -12,13 +12,14 @@ import { gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath } from "@vscode/test-electron";
 
-assert.equal(process.env.CI, "true", "Packaged activation requires a disposable CI runner.");
-assert.ok(process.env.RUNNER_TEMP, "RUNNER_TEMP must identify the disposable runner.");
+const isolatedLocal = process.argv.includes("--isolated-local");
+assert.ok(process.env.CI === "true" || isolatedLocal, "Packaged activation requires CI or explicit --isolated-local.");
+if (!isolatedLocal) assert.ok(process.env.RUNNER_TEMP, "RUNNER_TEMP must identify the disposable runner.");
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const soakSeconds = Number(process.env.PM_TEST_RESOURCE_SOAK_SECONDS ?? 0);
 assert.ok(Number.isInteger(soakSeconds) && soakSeconds >= 0 && soakSeconds <= 3600, "Invalid resource soak duration.");
 const resourceReportPath = process.env.PM_TEST_RESOURCE_SOAK_REPORT ?? path.join(root, ".tmp", "resource-soak.json");
-if (process.argv[2]) {
+if (process.argv[2] && !isolatedLocal) {
   const recovery = /^--resource-report-annotations=([0-3])$/.exec(process.argv[2]);
   assert.ok(recovery && process.argv.length === 3, "Invalid report recovery argument.");
   // Recovery runs after the app measurement in separate CI steps. It cannot
@@ -37,7 +38,9 @@ const userData = path.join(temporaryRoot, "user");
 const extensions = path.join(temporaryRoot, "extensions");
 const runtimeTemp = path.join(temporaryRoot, "tmp");
 const workspace = path.join(temporaryRoot, "workspace");
+const privateHome = path.join(runtimeTemp, "home");
 for (const directory of [userData, extensions, runtimeTemp, workspace]) fs.mkdirSync(directory);
+if (isolatedLocal) fs.mkdirSync(privateHome, { mode: 0o700 });
 fs.mkdirSync(path.join(userData, "User"));
 fs.writeFileSync(path.join(userData, "User", "settings.json"), JSON.stringify({
   "security.workspace.trust.enabled": false,
@@ -55,8 +58,11 @@ fs.writeFileSync(path.join(userData, "User", "settings.json"), JSON.stringify({
     "portManager.containerEventsWatch": false,
   } : {}),
 }));
-console.log("Packaged validation: download VS Code");
-const vscodeExecutablePath = await withinBudget(downloadAndUnzipVSCode("stable"), 120_000, "VS Code download");
+console.log(isolatedLocal ? `Packaged validation: isolated local profile ${temporaryRoot}` : "Packaged validation: download VS Code");
+const vscodeExecutablePath = isolatedLocal
+  ? "/Applications/Visual Studio Code.app/Contents/MacOS/Code"
+  : await withinBudget(downloadAndUnzipVSCode("stable"), 120_000, "VS Code download");
+fs.accessSync(vscodeExecutablePath, fs.constants.X_OK);
 const [cli, ...cliArgs] = resolveCliArgsFromVSCodeExecutablePath(vscodeExecutablePath);
 const profileArgs = ["--user-data-dir", userData, "--extensions-dir", extensions];
 console.log("Packaged validation: install VSIX");
@@ -78,11 +84,18 @@ const extensionPath = path.join(extensions, installed);
 // Bound the test runner as well as individual workload operations so a VS Code
 // startup/exit stall still uploads a useful CI log instead of waiting an hour.
 console.log("Packaged validation: run extension host tests");
+const guiEnvironment = { ...process.env };
+delete guiEnvironment.ELECTRON_RUN_AS_NODE;
+for (const key of Object.keys(guiEnvironment)) {
+  if (key.startsWith("PORT_MANAGER_") || key.startsWith("NEWDLOPS_PM_") || key.startsWith("DYLD_") ||
+      ["LD_PRELOAD", "NODE_OPTIONS", "BASH_ENV", "ENV"].includes(key)) delete guiEnvironment[key];
+}
 try { await runOwnedProcess(vscodeExecutablePath, [...profileArgs, "--disable-extensions", "--skip-welcome",
   "--skip-release-notes", "--no-sandbox", "--disable-gpu-sandbox", "--disable-updates", "--no-cached-data",
   "--disable-workspace-trust", `--extensionDevelopmentPath=${extensionPath}`,
   `--extensionTestsPath=${path.join(root, "out", "test", "integration", "packaged-extension.js")}`, workspace], {
-    ...process.env,
+    ...guiEnvironment,
+    ...(isolatedLocal ? { PM_TEST_EXECUTION_ENVIRONMENT: "isolated-local", PM_TEST_PRIVATE_HOME: privateHome } : {}),
     PM_TEST_EXTENSION_PATH: extensionPath,
     PM_TEST_EXTENSION_VERSION: manifest.version,
     PM_TEST_RESOURCE_SOAK_SECONDS: process.env.PM_TEST_RESOURCE_SOAK_SECONDS ?? "0",
