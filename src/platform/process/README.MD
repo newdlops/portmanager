@@ -38,6 +38,13 @@
 - `shell-integration-verifier.ts`
 - `node-terminal-candidate-provider.ts`
 
+guarded runtime은 private 완료 기록과 복구 helper의 성공 종료를 함께 확인한 뒤
+소유권을 반환한다. timeout 중 살아 있는 helper는 같은 예약으로 유지하며 중복
+실행하지 않는다. 실패 종료가 확인된 helper만 다음 종료 요청에서 다시 시작할 수
+있다. 그 사이 lease·profile·표식을 보존하고, 불일치하는 완료 기록은 성공으로
+처리하지 않는다. 실제 테스트에서 기록 문제를 고친 뒤 분리된 자손을 회수하며
+다른 네트워크는 실행과 자원 예약을 유지하는지 확인한다.
+
 ## 외부 의존성
 
 - `child_process`

@@ -378,7 +378,9 @@ export class MacosNetworkRuntime {
       return receipt !== undefined && receipt.cleaned === true && Object.keys(receipt).length === Object.keys(record).length + 1 &&
         Object.entries(record).every(([key, value]) => receipt[key] === value);
     };
-    if (receiptMatches()) {
+    const retryExitedRecovery = owner.recovery !== undefined && owner.recovery.exitCode !== 0 &&
+      (owner.recovery.exitCode !== null || owner.recovery.signalCode !== null);
+    if (receiptMatches() && !retryExitedRecovery) {
       if (owner.recovery !== undefined) await this.waitForRecoveryExit(owner.recovery);
       return;
     }
@@ -387,6 +389,9 @@ export class MacosNetworkRuntime {
     }
     // Reuse the reserved helper/inventory slot only after the original parent
     // is proven gone. Keep this child on timeout so retries never duplicate it.
+    // A terminated failed child owns no live process. A later caller may retry
+    // with the same reservation after repairing its private-record obstruction.
+    if (retryExitedRecovery) owner.recovery = undefined;
     if (owner.recovery === undefined) {
       owner.recovery = spawn(owner.launch.shellPath, ["--recover-owner", owner.readyPath + ".owner"], {
         env: buildNodeRuntimeEnvironment(), stdio: "ignore", detached: true,
