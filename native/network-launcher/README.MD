@@ -48,6 +48,12 @@ nofollow로 확인한 뒤 정책·PID 승인·exec EOF가 모두 성공하면 su
 {"supervisorPid":123,"supervisorBirth":1791500000000000,"pid":124,"birth":1791500000000010,"networkId":"network-a"}
 ```
 
+ready·owner·완료 기록은 Darwin `renameatx_np(..., RENAME_EXCL)`로 미교체 게시한다.
+기존 파일은 덮어쓰지 않으며 공개되는 순간부터 link 수가 1이어야 한다. hardlink 후
+임시 이름을 삭제하는 방식은 그 사이 strict reader에 link 수 2인 파일을 노출하므로
+사용하지 않는다. 실제 publisher를 해당 syscall 직전에 멈춘 재현 검사에서 게시 전
+ENOENT, 게시 후 private 0600 single-link와 기존 파일 보존을 확인한다.
+
 소비자는 알려진 PTY supervisor PID와 독립적으로 조회한 두 PID의 OS birth를 대조한다.
 stdout 문구는 승인 채널로 사용하지 않는다. ready parent descriptor 하나가 종료까지
 유지되며, 재등록 controller FD 하나와 함께 helper FD 예산에 포함해야 한다.

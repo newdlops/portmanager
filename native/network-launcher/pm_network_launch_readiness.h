@@ -54,17 +54,9 @@ static int pm_launch_publish_ready(pm_launch_readiness *ready, const pm_launch_o
   if (pm_launch_signal != 0) { errno = EINTR; goto rejected; }
   if (fchmod(fd, 0600) != 0 || pm_private_regular(fd, &ready->identity) != 0) goto rejected;
   close(fd); fd = -1;
-  /* linkat is an atomic no-replace publication. After deleting the temporary
-   * name, the public record has a single link and exact private permissions. */
-  if (linkat(ready->directory, temporary, ready->directory, ready->leaf, 0) != 0) goto rejected;
-  if (unlinkat(ready->directory, temporary, 0) != 0) {
-    int error = errno; struct stat current;
-    if (fstatat(ready->directory, ready->leaf, &current, AT_SYMLINK_NOFOLLOW) == 0 &&
-        current.st_dev == ready->identity.st_dev && current.st_ino == ready->identity.st_ino) {
-      (void)unlinkat(ready->directory, ready->leaf, 0);
-    }
-    errno = error; goto rejected;
-  }
+  /* Exclusive rename keeps nlink == 1 at every visible instant. link/unlink
+   * exposes a two-link record that the concurrent strict reader must reject. */
+  if (renameatx_np(ready->directory, temporary, ready->directory, ready->leaf, RENAME_EXCL) != 0) goto rejected;
   temporary_owned = 0;
   pm_buffer_free(&record); return 0;
 rejected:

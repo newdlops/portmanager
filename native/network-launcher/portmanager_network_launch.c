@@ -19,6 +19,7 @@
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <libproc.h>
+#include <sys/stdio.h>
 #endif
 
 /* The supervisor starts exactly one guarded child. Its private pipe is never

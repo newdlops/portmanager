@@ -34,12 +34,9 @@ static int pm_launch_record_publish(const char *path, const char *data, size_t l
   struct stat identity;
   if (fchmod(fd, 0600) != 0 || pm_private_regular(fd, &identity) != 0) goto done;
   close(fd); fd = -1;
-  if (linkat(directory, temporary, directory, leaf, 0) != 0) goto done;
-  if (unlinkat(directory, temporary, 0) != 0) {
-    int error = errno; struct stat current;
-    if (fstatat(directory, leaf, &current, AT_SYMLINK_NOFOLLOW) == 0 && current.st_dev == identity.st_dev && current.st_ino == identity.st_ino) (void)unlinkat(directory, leaf, 0);
-    errno = error; goto done;
-  }
+  /* The strict reader requires one link; never expose the temporary name as
+   * a second link to an otherwise complete public ownership/cleanup record. */
+  if (renameatx_np(directory, temporary, directory, leaf, RENAME_EXCL) != 0) goto done;
   owned = 0;
   result = 0;
 done:
