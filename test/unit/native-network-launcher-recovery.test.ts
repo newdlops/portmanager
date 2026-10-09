@@ -69,8 +69,17 @@ test("private ownership and completion records recover abrupt supervisor death w
     "--network-id", scope.networkId, "--agent-socket", controlPath, "--controller-token-file", tokenPath, "--ready-file", ready, "--", ...command];
   const alive = (expected: Identity) => {
     try { const now = JSON.parse(execFileSync(identity, ["identity", String(expected.pid)], { env: environment, encoding: "utf8", timeout: 2000 })) as Identity;
-      return now.pid === expected.pid && now.birth === expected.birth;
-    } catch { return false; }
+      const matches = now.pid === expected.pid && now.birth === expected.birth;
+      if (!matches) context.diagnostic(JSON.stringify({ expectedIdentity: expected, actualIdentity: now }));
+      return matches;
+    } catch (error) {
+      const failure = error as { status?: number; stdout?: Buffer | string };
+      if (failure.status === 1) {
+        context.diagnostic(JSON.stringify({ absentIdentity: expected, response: failure.stdout?.toString() }));
+        return false;
+      }
+      throw error; // Timeout/spawn/signal failure is not proof that a process disappeared.
+    }
   };
   async function until(predicate: () => boolean, message: string) {
     const deadline = Date.now() + 5000;
@@ -83,7 +92,11 @@ test("private ownership and completion records recover abrupt supervisor death w
   const ready = path.join(security, "sessions/crash.json"), ownerPath = ready + ".owner", cleanedPath = ready + ".cleaned";
   const report = path.join(root, "orphan.js"), ticks = path.join(root, "ticks.js");
   const crashed = spawn(launcher, args(a, ready, [fixture, "orphan", report, ticks, "linger"]), { cwd: root, env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(crashed);
-  await until(() => fs.existsSync(ready) && fs.existsSync(report), "crash workload did not start");
+  let rootOutput = "", rootErrors = "";
+  crashed.stdout!.on("data", bytes => { rootOutput += bytes.toString(); });
+  crashed.stderr!.on("data", bytes => { rootErrors += bytes.toString(); });
+  context.after(() => context.diagnostic(JSON.stringify({ rootOutput, rootErrors, supervisorExit: crashed.exitCode, supervisorSignal: crashed.signalCode })));
+  await until(() => fs.existsSync(ready) && fs.existsSync(report) && rootOutput.includes("root-lingering"), "crash workload did not reach its deliberate hold");
   const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
   const rootIdentity = JSON.parse(fs.readFileSync(ready, "utf8")) as Identity, orphan = JSON.parse(fs.readFileSync(report, "utf8")) as Identity;
   assert.equal(fs.statSync(ownerPath).mode & 0o777, 0o600); assert.equal(fs.statSync(ownerPath).nlink, 1);

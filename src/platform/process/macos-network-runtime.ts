@@ -378,7 +378,10 @@ export class MacosNetworkRuntime {
       return receipt !== undefined && receipt.cleaned === true && Object.keys(receipt).length === Object.keys(record).length + 1 &&
         Object.entries(record).every(([key, value]) => receipt[key] === value);
     };
-    if (receiptMatches()) return;
+    if (receiptMatches()) {
+      if (owner.recovery !== undefined) await this.waitForRecoveryExit(owner.recovery);
+      return;
+    }
     if (await this.isCurrent({ pid: record.supervisorPid, birth: record.supervisorBirth })) {
       throw new Error("Supervisor is still completing its census; reservation retained.");
     }
@@ -390,9 +393,15 @@ export class MacosNetworkRuntime {
       });
       owner.recovery.on("error", () => {});
     }
+    await this.waitForRecoveryExit(owner.recovery);
+    if (!receiptMatches()) throw new Error("Descendant recovery has not produced a complete census proof; reservation retained.");
+  }
+
+  /** Receipt publication precedes helper exit; its reserved slot still belongs to the live child. */
+  private async waitForRecoveryExit(child: ChildProcess): Promise<void> {
     const deadline = performance.now() + SUPERVISOR_STOP_MS;
-    while (owner.recovery.exitCode === null && owner.recovery.signalCode === null && performance.now() < deadline) await delay(20);
-    if (owner.recovery.exitCode !== 0 || !receiptMatches()) throw new Error("Descendant recovery has not produced a complete census proof; reservation retained.");
+    while (child.exitCode === null && child.signalCode === null && performance.now() < deadline) await delay(20);
+    if (child.exitCode !== 0) throw new Error("Descendant recovery helper has not completed; reservation retained.");
   }
 
   /** Refuse cached older launchers before they can create an unprovable owner. */
