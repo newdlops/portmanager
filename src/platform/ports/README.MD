@@ -49,6 +49,7 @@
 | 보관하는 유휴 HTTP socket | 64 | 재사용·close·30초 경과 |
 | 제어 payload | 2MiB | write callback 또는 native owner exit; proxy helper별 64KiB |
 | native PID 승인 대기 | 512 | broker/supervisor의 실제 종료 |
+| native 자식 조사 메모리 | 9MiB | supervisor별 589,824 bytes를 시작 전 예약; 실제 회수 증명 후 반환 |
 
 native helper는 시작 전에 연결/upstream 용량을 각 기본 32개(요청 상한이 더
 작으면 그 값), DNS 용량을 기본 2개 예약한다. native env로 전달해 실제

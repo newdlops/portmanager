@@ -343,6 +343,13 @@ macOS soak는 `packaged-terminal-lifecycle.ts`로 실제 SDK PTY의 취소·연�
 쓰기 및 fresh host shell의 detach를 검사한다. 출력에 명령이 보이는 것만으로 성공을
 판정하지 않는다. kernel 내부의 descendant/orphan 정리는 네이티브 별도 증명이 필요하다.
 
+첫 cycle은 window network default를 선택한 뒤 일반 New Terminal 명령으로
+contributed profile을 실행한다. private READY의 실제 등록을 기다린 뒤 통신을
+검사하고, window detach가 원래 workspace profile 값을 복원했는지도 확인한다.
+로컬 fixture는 기존 exec adapter 경계에서 lo0/PF/Keychain 쓰기를 거부한다.
+private HOME 경로만으로 전역 OS 설정이 분리된다고 가정하지 않는다. 이 제한에서
+일반 조회·실제 native 실행은 그대로이며 privileged 설치 동작의 통과를 주장하지 않는다.
+
 원래 1200초, 일반 GC, RSS 증가 96MiB 이하와 FD 증가 8 이하 기준을 유지한다.
 마지막에는 `disposeAsync()`로 실제 native parent와 listener 종료까지 기다리고 모든
 공유 budget 차원의 0을 요구한다. fixture의 관리 client를 먼저 닫아 자동 재연결을

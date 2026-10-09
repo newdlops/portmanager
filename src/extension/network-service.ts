@@ -591,6 +591,8 @@ export class PortManagerNetworkService implements DisposableLike {
   private guardedRuntime: MacosNetworkRuntime | undefined;
   /** Async owners must finish before callers can claim that terminal/proxy resources are gone. */
   private disposal: Promise<void> | undefined;
+  /** Serialize profile writes so attach/detach cannot overwrite a newer selection. */
+  private guardedProfileUpdate: Promise<void> = Promise.resolve();
   private readonly guardedTerminals = new Map<vscode.Terminal, { launch: NetworkShellLaunch; ready: Promise<void> }>();
   private readonly pendingGuardedLaunches = new Map<string, NetworkShellLaunch>();
   private guardedRouteRefresh: Promise<void> | undefined;
@@ -2857,7 +2859,10 @@ export class PortManagerNetworkService implements DisposableLike {
     this.syncVscodeWindowProcessAttachment();
 
     let injectedTerminalCount: number;
-    try { injectedTerminalCount = await this.injectRoutingIntoOpenVscodeTerminals(network, settings); }
+    try {
+      await this.guardedProfileUpdate;
+      injectedTerminalCount = await this.injectRoutingIntoOpenVscodeTerminals(network, settings);
+    }
     catch (error) {
       this.vscodeWindowTerminalBinding = { ...binding, status: "error", errorMessage: formatError(error) };
       this.saveVscodeWindowTerminalBinding();
@@ -2884,6 +2889,7 @@ export class PortManagerNetworkService implements DisposableLike {
     this.vscodeWindowTerminalBinding = undefined;
     this.saveVscodeWindowTerminalBinding();
     this.applyVscodeWindowTerminalEnvironment();
+    await this.guardedProfileUpdate;
     this.syncVscodeWindowProcessAttachment();
 
     let detachedTerminalCount = 0;
@@ -3052,6 +3058,7 @@ export class PortManagerNetworkService implements DisposableLike {
         }
       }, resolveScope: identity => processService.resolveProcessScope!(identity),
       readIdentity: pid => this.nativeProcessLookup.readProcessIdentity(pid),
+      signalProcess: (identity, signal) => this.nativeProcessLookup.signalProcess(identity, signal),
       onShellClosed: id => {
         this.registry.removeAttachment(`guarded-${id}`);
         this.registry.removeAttachment(`external-guarded-${id}`);
@@ -4431,7 +4438,10 @@ export class PortManagerNetworkService implements DisposableLike {
       // Env inheritance cannot enforce the kernel boundary. Selected networks
       // start through the contributed native profile instead of a raw shell.
       applyTerminalHookEnvironment(this.context, undefined);
-      void this.configureGuardedDefaultProfile(this.getGuardedDefaultNetworkId()).catch(error => devLog("network-runtime", `default profile update failed: ${formatError(error)}`));
+      const selected = this.getGuardedDefaultNetworkId();
+      this.guardedProfileUpdate = this.guardedProfileUpdate.catch(() => undefined)
+        .then(() => this.configureGuardedDefaultProfile(selected));
+      void this.guardedProfileUpdate.catch(error => devLog("network-runtime", `default profile update failed: ${formatError(error)}`));
       return;
     }
 
@@ -4460,7 +4470,8 @@ export class PortManagerNetworkService implements DisposableLike {
     const current = configuration.get<string>("defaultProfile.osx");
     if (networkId !== undefined) {
       if (current === profile) return;
-      if (this.context.workspaceState.get(key) === undefined) await this.context.workspaceState.update(key, { value: current });
+      if (this.context.workspaceState.get(key) === undefined) await this.context.workspaceState.update(key,
+        { value: configuration.inspect<string>("defaultProfile.osx")?.workspaceValue });
       await configuration.update("defaultProfile.osx", profile, vscode.ConfigurationTarget.Workspace);
     } else {
       const saved = this.context.workspaceState.get<{ value?: string }>(key);

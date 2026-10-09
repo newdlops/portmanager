@@ -28,6 +28,9 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
   fs.mkdirSync(path.join(security, "agent-control"), { recursive: true, mode: 0o700 });
   fs.mkdirSync(path.join(security, "sockets"), { recursive: true, mode: 0o700 });
   const tokenPath = path.join(security, "agent-control/controller.key");
+  const priorDevLog = process.env.PORT_MANAGER_DEV_LOG;
+  process.env.PORT_MANAGER_DEV_LOG = path.join(root, "runtime-dev.log");
+  context.after(() => { if (priorDevLog === undefined) delete process.env.PORT_MANAGER_DEV_LOG; else process.env.PORT_MANAGER_DEV_LOG = priorDevLog; });
   const token = ensureAgentControllerToken(tokenPath);
   const socketPath = path.join(security, "sockets/agent.sock");
   const environment = buildNodeRuntimeEnvironment();
@@ -59,7 +62,7 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
       const status = await request<{ authenticatesProcessScopes: boolean }>("daemonStatus");
       assert.equal(status.authenticatesProcessScopes, true);
     }, resolveScope: identity => request<AuthenticatedProcessScope | null>("resolveProcessScope", identity),
-    readIdentity: pid => lookup.readProcessIdentity(pid) });
+    readIdentity: pid => lookup.readProcessIdentity(pid), signalProcess: (identity, signal) => lookup.signalProcess(identity, signal) });
   let control: NetworkTerminalControl | undefined;
   const echo = net.createServer({ allowHalfOpen: true }, socket => socket.pipe(socket));
   const echoClients = new Set<net.Socket>();
@@ -85,11 +88,16 @@ test("guarded runtime preserves host TCP access, trusted readiness and returns e
       workspaceDirectories: [workspace], routes: [{ port: 4567, targetHost: "127.0.0.1", targetPort: echoPort }] }, workspace, "/bin/zsh");
   assert.equal(resources.budget.used.nativeHelpers, 2);
   assert.equal(resources.budget.used.nativeScopeJobs, 65);
+  assert.equal(resources.budget.used.nativeInventoryBytes, 589_824);
   terminal = spawn(launch.shellPath, [...launch.shellArgs], { cwd: launch.cwd, env: launch.env, stdio: ["pipe", "pipe", "pipe"] });
   let output = "", errors = "";
   terminal.stdout!.on("data", bytes => { output += bytes.toString(); });
   terminal.stderr!.on("data", bytes => { errors += bytes.toString(); });
-  await runtime.adoptSupervisor(launch.id, terminal.pid!);
+  try { await runtime.adoptSupervisor(launch.id, terminal.pid!); }
+  catch (error) {
+    const diagnostic = fs.existsSync(path.join(root, "runtime-dev.log")) ? fs.readFileSync(path.join(root, "runtime-dev.log"), "utf8") : "";
+    throw new Error(`Fixture supervisor adoption failed (exit=${terminal.exitCode}, signal=${terminal.signalCode}): ${errors}\n${diagnostic}`, { cause: error });
+  }
   const identity = await runtime.waitReady(launch.id);
   assert.equal(identity.networkId, "runtime-a");
   assert.notEqual(identity.pid, terminal.pid);

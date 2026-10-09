@@ -41,6 +41,8 @@ export interface NativeProcessIdentity {
   readonly birth: number;
 }
 
+export type NativeProcessSignal = "SIGTERM" | "SIGHUP" | "SIGINT" | "SIGKILL";
+
 /**
  * Thin adapter around the optional C process lookup helper.
  *
@@ -71,6 +73,24 @@ export class NativeProcessLookupProvider {
       // A single exited PID is not evidence that the entire helper is broken.
       return undefined;
     }
+  }
+
+  /** Kernel PID-version verification closes the check-then-kill PID reuse race. */
+  async signalProcess(identity: NativeProcessIdentity, signal: NativeProcessSignal): Promise<boolean> {
+    if (process.platform !== "darwin" || !isPositiveInteger(identity.pid) ||
+        !Number.isSafeInteger(identity.birth) || identity.birth <= 0) throw new Error("A current macOS process identity is required for signaling.");
+    let stdout: string | Buffer;
+    try { stdout = (await this.runCommand(this.helperPath, ["signal", String(identity.pid), String(identity.birth), signal])).stdout; }
+    catch (error) {
+      const output = (error as { stdout?: unknown }).stdout;
+      if (typeof output !== "string" && !Buffer.isBuffer(output)) throw error;
+      stdout = output;
+    }
+    const reply = JSON.parse(toText(stdout)) as { pid?: unknown; birth?: unknown; signal?: unknown; sent?: unknown };
+    if (reply.pid !== identity.pid || reply.birth !== identity.birth || reply.signal !== signal || typeof reply.sent !== "boolean") {
+      throw new Error("Native signal reply does not match the requested process generation.");
+    }
+    return reply.sent;
   }
 
   /** Returns native process-table rows, or undefined when fallback should run. */

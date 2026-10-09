@@ -10,6 +10,8 @@ export const DEFAULT_PROXY_RESOURCE_LIMITS = {
   // Eight proxy helpers plus guarded broker/supervisor ownership share this cap.
   nativeHelpers: 16,
   nativeScopeJobs: 512,
+  // Sixteen supervisors each reserve their 589824-byte shutdown census peak.
+  nativeInventoryBytes: 9 * 1024 * 1024,
   dnsJobs: 32,
   routeJobs: 64,
   httpRequests: 256,
@@ -47,7 +49,7 @@ export class ProxyResourceBudget {
     for (const resource of Object.keys(effective) as ProxyResource[]) {
       const value = limits[resource];
       if (value !== undefined) {
-        const maximum = resource === "controlBytes" ? 16 * 1024 * 1024 : 65536;
+        const maximum = resource === "controlBytes" || resource === "nativeInventoryBytes" ? 16 * 1024 * 1024 : 65536;
         if (!Number.isSafeInteger(value) || value < 0 || value > maximum) {
           throw new RangeError(`Invalid proxy resource limit: ${resource}.`);
         }

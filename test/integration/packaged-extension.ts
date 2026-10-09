@@ -12,6 +12,7 @@ import type { AgentDaemonStatus } from "../../src/shared/types";
 import type { PortManagerNetworkService } from "../../src/extension/network-service";
 import { runResourceSoak } from "./proxy-resource-soak";
 import { preparePackagedTerminalLifecycle } from "./packaged-terminal-lifecycle";
+import { isolatePrivilegedCommands } from "./packaged-isolation";
 
 /**
  * Runs inside the real extension host against a VSIX installed in a fresh CI
@@ -40,6 +41,7 @@ export async function run(): Promise<void> {
   const children = require("node:child_process") as typeof import("node:child_process");
   const originalSpawn = children.spawn;
   const ownedAgents = new Set<ChildProcess>();
+  const commandIsolation = isolatedLocal ? isolatePrivilegedCommands() : undefined;
   if (isolatedLocal) children.spawn = ((...args: unknown[]) => {
     const executable = args[0];
     if (executable === path.join(extension.extensionPath, "media/native/portmanager_agent")) {
@@ -132,8 +134,9 @@ export async function run(): Promise<void> {
         ownedDaemonPids: [...ownedAgents].map(child => child.pid),
         ownedDaemonsExited: [...ownedAgents].every(child => child.exitCode !== null || child.signalCode !== null),
       homeEnvironmentUnchanged: process.env.HOME === originalHomeEnvironment,
+        blockedGlobalMutationCommands: commandIsolation?.blocked,
       }, null, 2));
-    } finally { children.spawn = originalSpawn; }
+    } finally { children.spawn = originalSpawn; commandIsolation?.restore(); }
   }
 }
 

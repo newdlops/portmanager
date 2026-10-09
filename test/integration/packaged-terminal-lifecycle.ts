@@ -101,10 +101,33 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
   return {
     async exercise(cycle: number): Promise<void> {
       const before = resources.budget.used;
+      const priorProfile = vscode.workspace.getConfiguration("terminal.integrated").inspect<string>("defaultProfile.osx")?.workspaceValue;
+      if (cycle === 1) {
+        await service.attachVscodeWindowTerminalsToNetwork(selected[0].id);
+        assert.equal(service.getGuardedDefaultNetworkId(), selected[0].id);
+        assert.equal(vscode.workspace.getConfiguration("terminal.integrated").get("defaultProfile.osx"), "Port Manager: Logical Network");
+      }
       const canceled = await service.prepareGuardedTerminalOptions(selected[0].id, workspace);
       await service.cancelGuardedTerminalOptions(canceled);
       assert.deepEqual(resources.budget.used, before, "Canceled SDK profile retained a reservation.");
-      let terminal = await service.openGuardedNetworkTerminal(selected[0].id, workspace);
+      let terminal: vscode.Terminal;
+      if (cycle === 1) {
+        const profileTerminal = new Promise<vscode.Terminal>((resolve, reject) => {
+          const timer = setTimeout(() => { subscription.dispose(); reject(new Error("Default guarded profile did not create a terminal.")); }, 10_000);
+          const subscription = vscode.window.onDidOpenTerminal(opened => {
+            const creation = opened.creationOptions;
+            if (!("env" in creation) || typeof creation.env?.PORT_MANAGER_GUARDED_SESSION_ID !== "string") return;
+            clearTimeout(timer); subscription.dispose(); resolve(opened);
+          });
+        });
+        await vscode.commands.executeCommand("workbench.action.terminal.new");
+        terminal = await profileTerminal;
+        const session = (terminal.creationOptions as vscode.TerminalOptions).env!.PORT_MANAGER_GUARDED_SESSION_ID;
+        const deadline = Date.now() + 10_000;
+        while (!service.getSnapshot().attachments.some(row => row.id === `guarded-${session}` && row.status === "attached")) {
+          assert.ok(Date.now() < deadline, "Default profile did not authenticate its actual PTY."); await delay(20);
+        }
+      } else terminal = await service.openGuardedNetworkTerminal(selected[0].id, workspace);
       terminals.add(terminal);
       const original = await identity(terminal);
       const a = await probe(terminal, cycle, "A", cycle === 1);
@@ -146,6 +169,11 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
       fs.unlinkSync(detachedWitness);
       detached.dispose(); terminals.delete(detached);
       await gone(detachedIdentity);
+      if (cycle === 1) {
+        await service.detachVscodeWindowTerminalsFromNetwork();
+        assert.equal(service.getGuardedDefaultNetworkId(), undefined);
+        assert.equal(vscode.workspace.getConfiguration("terminal.integrated").inspect<string>("defaultProfile.osx")?.workspaceValue, priorProfile);
+      }
       const deadline = Date.now() + 10_000;
       while (JSON.stringify(resources.budget.used) !== JSON.stringify(before)) { assert.ok(Date.now() < deadline, "Terminal close retained a shared reservation."); await delay(20); }
       records.push({ cycle, a, b, peak, supervisor: original, replacement: current, detached: detachedIdentity, settled: resources.budget.used });

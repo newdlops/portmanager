@@ -44,6 +44,7 @@ export interface MacosNetworkRuntimeOptions {
   readonly ensureController: () => Promise<void>;
   readonly resolveScope: (identity: { pid: number; birth: number }) => Promise<AuthenticatedProcessScope | null>;
   readonly readIdentity: (pid: number) => Promise<{ pid: number; birth: number } | undefined>;
+  readonly signalProcess: (identity: { pid: number; birth: number }, signal: "SIGTERM") => Promise<boolean>;
   readonly onShellClosed?: (id: string) => void;
 }
 
@@ -84,8 +85,12 @@ interface ShellOwner {
 
 const STARTUP_MS = 10_000;
 const STOP_MS = 2_000;
+// A trusted supervisor must complete its descendant census before exit. Killing
+// that parent prematurely can leave guarded orphans without a cleanup owner.
+const SUPERVISOR_STOP_MS = 8_000;
 const BROKER_SLOTS = 64;
 const BROKER_SCOPE_BYTES = BROKER_SLOTS * (2048 + 2048 + 160 + 148);
+const SUPERVISOR_INVENTORY_BYTES = 589_824;
 const MAX_ROUTE_ROWS = 512;
 const MAX_ROUTE_BYTES = 64 * 1024;
 
@@ -126,7 +131,8 @@ export class MacosNetworkRuntime {
     const id = randomUUID();
     const readyDirectory = path.join(this.stateDirectory, "security", "sessions", id);
     try {
-      lease = this.options.resources.budget.acquire({ nativeHelpers: 1, nativeScopeJobs: 1, controlBytes: 4096 });
+      lease = this.options.resources.budget.acquire({ nativeHelpers: 1, nativeScopeJobs: 1,
+        nativeInventoryBytes: SUPERVISOR_INVENTORY_BYTES, controlBytes: 4096 });
       ensurePrivateDirectory(readyDirectory);
       const readyPath = path.join(readyDirectory, "ready.json");
       const profilePath = path.join(this.stateDirectory, "security", "profiles", id + ".sb");
@@ -354,14 +360,13 @@ export class MacosNetworkRuntime {
 
   private async stopIdentity(identity: { pid: number; birth: number }): Promise<void> {
     if (!(await this.isCurrent(identity))) return;
-    try { process.kill(identity.pid, "SIGTERM"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
-    const deadline = performance.now() + STOP_MS;
+    if (!(await this.options.signalProcess(identity, "SIGTERM")) && await this.isCurrent(identity)) {
+      throw new Error("Supervisor signal was not verified; its reservation remains held.");
+    }
+    const deadline = performance.now() + SUPERVISOR_STOP_MS;
     while (performance.now() < deadline && await this.isCurrent(identity)) await delay(20);
     if (await this.isCurrent(identity)) {
-      try { process.kill(identity.pid, "SIGKILL"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
-      const finalDeadline = performance.now() + STOP_MS;
-      while (performance.now() < finalDeadline && await this.isCurrent(identity)) await delay(20);
-      if (await this.isCurrent(identity)) throw new Error("Shell supervisor has not exited; its reservation remains held.");
+      throw new Error("Shell supervisor has not completed descendant cleanup; its reservation remains held.");
     }
   }
 
