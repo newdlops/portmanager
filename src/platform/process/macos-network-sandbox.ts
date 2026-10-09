@@ -54,6 +54,9 @@ export function buildMacosNetworkSandboxProfile(scope: MacosNetworkSandboxScope)
     ...namespaceParents.map(directory => `(allow file-read-data (require-all (vnode-type DIRECTORY) (literal ${profileString(directory)})))`),
     "(allow file-read-data file-write-data (literal \"/dev/null\"))",
     "(allow mach-lookup (global-name \"com.apple.logd\") (global-name \"com.apple.system.logger\") (global-name \"com.apple.system.opendirectoryd.libinfo\"))",
+    // libc's system DNS client uses this canonical Unix endpoint. Granting
+    // that service preserves host DNS without allowing raw IP or other Unix peers.
+    "(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))",
   ];
   if (scope.agentSocketPath !== undefined) {
     if (!path.isAbsolute(scope.agentSocketPath) || path.normalize(scope.agentSocketPath) !== scope.agentSocketPath ||

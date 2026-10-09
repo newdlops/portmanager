@@ -80,6 +80,7 @@ test("macOS kernel policy rejects raw cross-network access with the hook disable
   await probe(true, "read", own.envFilePath);
   await probe(true, "write", path.join(own.filesDirectory, "state.pid"));
   await probe(true, "brokered-tcp", ownSocket);
+  await probe(true, "unix", "/var/run/mDNSResponder");
   await probe(true, "socket-only");
   await probe(true, "child-signal");
   await probe(true, "priority", "0");

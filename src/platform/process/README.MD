@@ -52,3 +52,11 @@
 권한 경계로 강제하지 않으므로 제품 전체를 악성 코드에 대한 보안 sandbox로 표현하지 않는다.
 사용자 선택대로 소스는 공유하고 기존 쓰기를 유지한다. 공유 코드 변경이 다른 네트워크의
 다음 실행에 미치는 영향은 이 경계에 포함되지 않으며, 전면적인 악성 코드 격리를 보장할 수 없다.
+
+커널 후보는 시스템 DNS client가 사용하는 canonical Unix endpoint
+`/private/var/run/mDNSResponder`만 추가 허용한다. Apple의
+[DNS client](https://github.com/apple-oss-distributions/mDNSResponder/blob/main/mDNSShared/dnssd_clientstub.c)와
+[IPC 정의](https://github.com/apple-oss-distributions/mDNSResponder/blob/main/mDNSShared/dnssd_ipc.h)를 확인하고,
+현재 Mac에서 Node·Python의 일반 도메인 조회를 격리 전후로 비교했다. `/var/run` literal이나
+Mach 이름만 허용한 후보는 실패하고 canonical endpoint 후보는 성공했다. raw IP와
+다른 Unix socket에 대한 기존 거절은 유지되며, 일반 UDP 전송을 허용하지 않는다.
