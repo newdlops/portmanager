@@ -25,6 +25,7 @@ workload가 임의 명령·PID·network id를 보내는 관리 프로토콜은 �
 --profile <private SBPL file> --broker <fixed Unix endpoint>
 --hook <protected dylib> --network-id <stable id>
 [--agent-socket <agent endpoint> --controller-token-file <private key>]
+[--ready-file <private session record>]
 [--announce-ready] -- <program> <args...>
 ```
 
@@ -36,6 +37,20 @@ FD inventory는 정책 적용 전에만 사용한다. 프로그램 교체는 mac
 `POSIX_SPAWN_SETEXEC | POSIX_SPAWN_CLOEXEC_DEFAULT`와 표준 IO의 명시적 상속으로
 처리해, guard 안에서 process-info 권한을 추가로 허용하지 않는다.
 기존 커널 정책을 해제하거나 다른 네트워크로 완화하는 기능은 없다.
+
+`--ready-file`은 controller 옵션과 함께 사용한다. 대상은 보호된
+`.portmanager/security/sessions/` 아래의 아직 없는 파일이어야 한다. 부모 descriptor를
+nofollow로 확인한 뒤 정책·PID 승인·exec EOF가 모두 성공하면 supervisor만 private
+0600 JSON을 atomic no-replace로 게시한다. 앱은 writer/directory FD를 상속하지 않는다.
+기존 파일·symlink·공개 parent는 exec 전에 거부하고 종료 시 같은 inode만 삭제한다.
+
+```json
+{"supervisorPid":123,"supervisorBirth":1791500000000000,"pid":124,"birth":1791500000000010,"networkId":"network-a"}
+```
+
+소비자는 알려진 PTY supervisor PID와 독립적으로 조회한 두 PID의 OS birth를 대조한다.
+stdout 문구는 승인 채널로 사용하지 않는다. ready parent descriptor 하나가 종료까지
+유지되며, 재등록 controller FD 하나와 함께 helper FD 예산에 포함해야 한다.
 
 controller 옵션은 쌍으로 지정한다. guard가 정책 적용을 확인하면 부모가 직접 생성한
 PID·birth·고정 network id를 `registerProcessScope`로 등록하고 응답의 method/id/ok 및
@@ -69,8 +84,8 @@ macOS `sandbox-exec`, libproc, POSIX fork/exec/pipes/poll/process groups,
 새 실행 후보이며 아직 제품 attach/packaging에 연결하지 않았다. guard probe는
 커널 적용과 broker transport의 시작 확인이며, 생성된 profile 전체의 보안 검증을
 대체하지 않는다. 정책 생성은 trusted controller의 책임이다.
-PID 등록과 controller-origin ancestry 조회는 별도 agent API에 연결했다. 실제 terminal
-readiness 전달, shell bootstrap과 SIP preload 복구,
+PID 등록과 controller-origin ancestry 조회 및 parent 전용 readiness 파일은 native API에
+연결했다. 실제 terminal 소비자, shell bootstrap과 SIP preload 복구,
 DNS/host access 및 공유 resource-budget 통합은 별도 연결해야 한다. 관측된 자손은
 reparent 뒤에도 birth에 묶어 기억한다. 관측 전 orphan은 고정 broker가 실제 peer를
 등록하며, 데몬 재시작 뒤 idle 자식은 supervisor가 재등록한다. 실제 합성 커널 실행에서

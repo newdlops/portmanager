@@ -63,6 +63,7 @@ test("broker scope approval bounds pending work, rejects forged replies and clos
       if (selected === "nul") { socket.end(JSON.stringify(reply(frame)) + "\0\n"); return; }
       if (selected === "number-prefix") { socket.end((JSON.stringify(reply(frame)) + "\n").replace(`"pid":${frame.payload.pid}`, `"pid":${frame.payload.pid}garbage`)); return; }
       if (selected === "unfinished") { socket.end(JSON.stringify(reply(frame)).slice(0, -1) + "\n"); return; }
+      if (selected === "duplicate") { socket.end(JSON.stringify(reply(frame)).replace('"ok":true', '"ok":true,"ok":false') + "\n"); return; }
       socket.end(JSON.stringify(response) + "\n");
     });
   });
@@ -100,7 +101,7 @@ test("broker scope approval bounds pending work, rejects forged replies and clos
     const request = Buffer.alloc(160); request.writeUInt32LE(0x504d4e42); request.writeUInt16LE(1, 4); request.writeUInt16LE(1, 6);
     request.writeInt32LE(2, 12); request.writeInt32LE(1, 16); socket.write(request); return socket;
   }
-  for (const rejected of ["deny", "wrong-id", "wrong-birth", "nested", "oversize", "nul", "number-prefix", "unfinished"]) {
+  for (const rejected of ["deny", "wrong-id", "wrong-birth", "nested", "oversize", "nul", "number-prefix", "unfinished", "duplicate"]) {
     mode = rejected; const socket = await open(); let bytes = Buffer.alloc(0);
     socket.on("data", chunk => bytes = Buffer.concat([bytes, chunk]));
     await Promise.race([once(socket, "close"), delay(3000).then(() => { throw new Error(`${rejected} reply did not finish`); })]);
@@ -128,7 +129,10 @@ test("broker scope approval bounds pending work, rejects forged replies and clos
   const batch = await Promise.all(Array.from({ length: 64 }, () => open()));
   await until(() => pending === 64, "all bounded authorization slots must be exercised");
   assert.equal(descriptorCount(), baseline + 128, "64 pending requests have exactly two owned FDs apiece");
-  const excess = await open(); await once(excess, "close");
+  const excess = await open();
+  // A full broker may close before the fixture's write reaches it. EPIPE/reset
+  // are valid transport rejection; once(..., "close") would reject on error.
+  await new Promise<void>(resolve => { if (excess.closed) resolve(); else excess.once("close", () => resolve()); });
   assert.ok(descriptorCount() <= baseline + 128, "admission above the slot limit must not allocate a controller FD");
   for (const socket of batch) socket.destroy();
   await until(() => pending === 0 && descriptorCount() === baseline, "bounded batch did not drain");

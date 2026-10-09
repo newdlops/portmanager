@@ -364,7 +364,8 @@ SETEXEC로 같은 PID를 유지하며, private socketpair의 record와 exec EOF�
 PID·birth를 데몬에 등록하고 동일 tuple의 승인 후에만 private ACK로 exec를 허용한다.
 잘못된 응답·거절·기한·취소에는 실행하지 않는다. 이 launcher도 제품 attach·proxy 귀속·
 packaging에는 아직 연결하지 않았으며, stdout의 테스트용 ready 문구는 제품의 trusted
-확인 채널이 아니다. namespace 미러의 nofollow 탐색에는 공통 부모의 directory 읽기만
+확인 채널로 쓰지 않는다. 새 parent 전용 `--ready-file`을 제품 소비자에 연결해야 한다.
+namespace 미러의 nofollow 탐색에는 공통 부모의 directory 읽기만
 허용하고 기존 부모에 불필요한 mkdir를 시도하지 않는다. 타 namespace 파일과 키는 계속
 거절한다.
 
@@ -403,6 +404,13 @@ PID-only tracker보다 먼저 조회하고, 실패·tuple 불일치는 기존 �
 재등록한다. 합성 커널 실행에서 관측 전 orphan과 데몬 교체 후 두 복구 경로를 확인했다.
 controller 대기는 단일 nonblocking FD·고정 frame·절대 기한 안에서 처리하고, 취소·종료
 시 회수한다. 실제 제품 attach와 공유 helper/자원 한도에 연결한 검증은 남아 있다.
+
+launcher의 `--ready-file`은 controller와 함께 쓰며, 보호된 session 폴더에 supervisor와
+child의 PID/birth/network tuple을 정책 승인·exec 성공 뒤 원자 게시한다. writer FD는
+앱에 전달하지 않고 종료 시 자기 inode만 삭제한다. TS 소비자의 독립적인 PID/birth
+대조가 제품 연결에 필요하다. broker의 `--routes`는 고정 network의 보호된 JSONL
+snapshot(64 KiB·512 port)에서 승인된 Host Access·Compose 목적지를 local connect에만
+적용한다. 직접 다른 realm으로 요청하거나 설정된 snapshot이 잘못되면 우회하지 않는다.
 
 제품 경로에 연결하기 전에 다음을 검증한다.
 

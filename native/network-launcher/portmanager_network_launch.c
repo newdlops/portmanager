@@ -33,6 +33,7 @@ typedef struct { unsigned int magic, phase; int error, reserved; } pm_launch_rec
 typedef struct {
   const char *profile_path, *broker_path, *hook_path, *network_id;
   const char *agent_path, *controller_path;
+  const char *ready_path;
   int command_index, guard, announce;
 } pm_launch_options;
 static volatile sig_atomic_t pm_launch_signal;
@@ -80,12 +81,14 @@ static int pm_launch_parse(int argc, char **argv, pm_launch_options *options) {
     else if (strcmp(argument, "--network-id") == 0 && options->network_id == NULL) options->network_id = argv[++index];
     else if (strcmp(argument, "--agent-socket") == 0 && options->agent_path == NULL) options->agent_path = argv[++index];
     else if (strcmp(argument, "--controller-token-file") == 0 && options->controller_path == NULL) options->controller_path = argv[++index];
+    else if (strcmp(argument, "--ready-file") == 0 && options->ready_path == NULL) options->ready_path = argv[++index];
     else return -1;
   }
   char key[PM_NETWORK_NAMESPACE_KEY_SIZE];
   return options->command_index > 0 && options->command_index < argc && options->profile_path != NULL &&
     options->broker_path != NULL && options->hook_path != NULL && options->network_id != NULL &&
     (options->agent_path == NULL) == (options->controller_path == NULL) &&
+    (options->ready_path == NULL || options->agent_path != NULL) &&
     pm_network_namespace_key(options->network_id, key, sizeof(key)) == 0 ? 0 : -1;
 }
 /* A descriptor-rooted walk rejects symlinks without a check/open race. The
@@ -172,6 +175,7 @@ static int pm_launch_record_write(unsigned int phase, int error) {
 }
 
 #include "pm_network_launch_authorization.h"
+#include "pm_network_launch_readiness.h"
 
 /* The guard blocks before executing application code. Only the supervisor's
  * private socket can release it; this descriptor disappears on SETEXEC. */
@@ -389,6 +393,7 @@ int main(int argc, char **argv) {
   if (runtime < 0) return 125; close(runtime);
   runtime = pm_launch_open_private(options.hook_path, "/.portmanager/runtime/", 1);
   if (runtime < 0) return 125; close(runtime);
+  if (pm_launch_check_ready(&options) != 0) { pm_dev_log("network-launcher", "readiness destination rejected errno=%d", errno); return 125; }
   char *profile = pm_launch_read_profile(options.profile_path);
   if (profile == NULL) return 125;
   profile = pm_launch_terminal_profile(profile);
@@ -433,11 +438,15 @@ int main(int argc, char **argv) {
     accepted = write(ready[0], &authorized, sizeof(authorized)) == sizeof(authorized) && pm_launch_wait_ready(ready[0], deadline) == 0;
   }
   close(ready[0]);
+  pm_launch_readiness published;
+  memset(&published, 0, sizeof(published)); published.directory = -1;
+  if (accepted) accepted = pm_launch_publish_ready(&published, &options, child, birth) == 0;
   if (accepted) {
     pm_dev_log("network-launcher", "policy ready child_pid=%ld birth=%llu", (long)child, birth);
     if (options.announce) { printf("ready pid=%ld birth=%llu\n", (long)child, birth); fflush(stdout); }
   } else pm_dev_log("network-launcher", "startup rejected child_pid=%ld errno=%d", (long)child, errno);
   int result = pm_launch_supervise(&options, child, birth, accepted);
+  pm_launch_remove_ready(&published);
   if (foreground > 0) (void)tcsetpgrp(0, foreground);
   return result;
 }

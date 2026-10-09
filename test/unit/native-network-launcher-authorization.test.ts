@@ -24,7 +24,7 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   const children: ChildProcess[] = [], orphaned: Array<{ pid: number; birth: number }> = [];
   const sockets = new Set<net.Socket>(), servers: net.Server[] = [];
   const runtime = path.join(root, ".portmanager/runtime"), security = path.join(root, ".portmanager/security");
-  for (const directory of [runtime, path.join(security, "profiles"), path.join(security, "sockets"), path.join(security, "agent-control")]) {
+  for (const directory of [runtime, path.join(security, "profiles"), path.join(security, "sockets"), path.join(security, "agent-control"), path.join(security, "sessions")]) {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   }
   const launcher = path.join(runtime, "launch"), broker = path.join(runtime, "broker"), hook = path.join(runtime, "hook.dylib");
@@ -50,10 +50,6 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   for (const tool of ["lsof", "ps"]) fs.writeFileSync(path.join(poison, tool),
     `#!/bin/sh\n/usr/bin/touch '${poisonMarker}'\nexit 1\n`, { mode: 0o700 });
   environment.PATH = `${poison}:${environment.PATH}`;
-  // Witness that the deliberately shadowed tools really run without the
-  // daemon's trusted child environment, then clear only this fixture marker.
-  await run("/bin/sh", ["-c", "lsof; ps; exit 0"], { env: environment, timeout: 3000 });
-  assert.equal(fs.existsSync(poisonMarker), true); fs.unlinkSync(poisonMarker);
   context.after(async () => {
     for (const socket of sockets) socket.destroy();
     for (const child of children.reverse()) {
@@ -68,6 +64,10 @@ test("guarded exec waits for controller PID/birth registration and never widens 
     for (const server of servers) if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
     fs.rmSync(root, { recursive: true, force: true });
   });
+  // Witness that the deliberately shadowed tools really run without the
+  // daemon's trusted child environment, then clear only this fixture marker.
+  await run("/bin/sh", ["-c", "lsof; ps; exit 0"], { env: environment, timeout: 10_000 });
+  assert.equal(fs.existsSync(poisonMarker), true); fs.unlinkSync(poisonMarker);
   const tokenPath = path.join(security, "agent-control/controller.key"), token = ensureAgentControllerToken(tokenPath);
   const tokenA = ensureAgentNetworkToken("fixture", "network-a", tokenPath), tokenB = ensureAgentNetworkToken("fixture", "network-b", tokenPath);
   const agentSocket = path.join(security, "sockets/agent.sock"), brokerSocket = path.join(security, "sockets/a.sock");
@@ -110,8 +110,10 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   const own = networkNamespacePaths(root, "network-a"); fs.mkdirSync(own.filesDirectory, { recursive: true, mode: 0o700 });
   const profilePath = path.join(security, "profiles/a.sb");
   fs.writeFileSync(profilePath, buildMacosNetworkSandboxProfile({ networkId: "network-a", namespaceDirectories: [own.directory], sharedWorkspaceDirectories: [root], agentSocketPath: brokerSocket }), { mode: 0o600 });
-  const args = (controlSocket: string, command: string[]) => ["--profile", profilePath, "--broker", brokerSocket, "--hook", hook,
-    "--network-id", "network-a", "--agent-socket", controlSocket, "--controller-token-file", tokenPath, "--announce-ready", "--", ...command];
+  const args = (controlSocket: string, command: string[], readyFile?: string) => ["--profile", profilePath, "--broker", brokerSocket, "--hook", hook,
+    "--network-id", "network-a", "--agent-socket", controlSocket, "--controller-token-file", tokenPath, "--announce-ready",
+    ...(readyFile ? ["--ready-file", readyFile] : []), "--", ...command];
+  const readyFile = path.join(security, "sessions/guarded.json");
   const marker = path.join(root, "program-entered.js"), state = path.join(root, "nested/state.pid");
   const delayedSocket = path.join(security, "sockets/delayed.sock");
   let offered: Scope | undefined, release: (() => Promise<void>) | undefined;
@@ -134,12 +136,16 @@ test("guarded exec waits for controller PID/birth registration and never widens 
     const fs=require('fs'),cp=require('child_process'),net=require('net');
     fs.writeFileSync(${JSON.stringify(marker)},'entered');
     fs.writeFileSync(${JSON.stringify(state)},'own-state');
+    for(const action of [()=>fs.readFileSync(${JSON.stringify(readyFile)}),()=>fs.writeFileSync(${JSON.stringify(readyFile)},'forged')]) {
+      let denied=false;try{action()}catch(error){denied=['EPERM','EACCES'].includes(error.code)}
+      if(!denied)throw Error('workload accessed private readiness file');
+    }
     process.env.PORT_MANAGER_NETWORK_ID='network-b'; process.env.PORT_MANAGER_HOOK_DISABLED='1';
     process.env.PORT='1'; process.env.PORT_MANAGER_NETWORK_LOOPBACK_HOST='127.255.255.254';
     net.createServer().listen(0,'127.0.0.1',function(){console.log('LISTEN_PORT='+this.address().port)});
     const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000);setTimeout(()=>process.exit(0),30000)'],{detached:true,stdio:'ignore',env:{...process.env,PORT_MANAGER_NETWORK_ID:'network-b'}});
     console.log('DESC_PID='+child.pid); child.unref(); setInterval(()=>{},1000);
-  `]), { cwd: root, env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(guarded);
+  `], readyFile), { cwd: root, env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(guarded);
   let output = "", errors = "";
   guarded.stdout!.on("data", bytes => output += bytes.toString());
   guarded.stderr!.on("data", bytes => errors += bytes.toString());
@@ -149,6 +155,7 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   await delay(150);
   assert.equal(fs.existsSync(marker), false, "guard must not run the program while controller registration is pending");
   assert.equal(output, "", "no readiness may be announced before controller acknowledgement");
+  assert.equal(fs.existsSync(readyFile), false, "private readiness cannot be published before registration and exec");
   await release();
   const runDeadline = Date.now() + 5000;
   while (!/DESC_PID=\d+/.test(output) || !/LISTEN_PORT=\d+/.test(output) || !output.includes("ready pid=")) {
@@ -156,6 +163,8 @@ test("guarded exec waits for controller PID/birth registration and never widens 
     assert.ok(Date.now() < runDeadline, `stdout=${output}; stderr=${errors}`); await delay(10);
   }
   assert.equal(fs.readFileSync(marker, "utf8"), "entered");
+  assert.deepEqual(JSON.parse(fs.readFileSync(readyFile, "utf8")), { supervisorPid: guarded.pid, supervisorBirth: inspect(guarded.pid!).birth, ...offered });
+  const readyStat = fs.statSync(readyFile); assert.equal(readyStat.mode & 0o777, 0o600); assert.equal(readyStat.nlink, 1);
   assert.equal(fs.readFileSync(path.join(own.filesDirectory, "nested/state.pid"), "utf8"), "own-state", "kernel execution must preserve automatic nested state splitting");
   assert.deepEqual((await request("resolveProcessScope", offeredIdentity)).payload, offered);
   const actualPort = Number(/LISTEN_PORT=(\d+)/.exec(output)![1]);
@@ -180,6 +189,7 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   assert.equal((await request("registerExistingProcess", { pid: descendantPid, networkId: "network-b", requestedPort: 31001, actualPort: 31001, source: "registered", host: "127.0.0.1" })).ok, false,
     "controller route recovery cannot overwrite an authenticated child with its forged env network");
   const exit = once(guarded, "exit"); guarded.kill("SIGTERM"); await exit;
+  assert.equal(fs.existsSync(readyFile), false, "supervisor must remove its own readiness inode on exit");
   assert.deepEqual((await request("resolveProcessScope", descendantIdentity)).payload, { ...descendantIdentity, networkId: "network-a" }, "an observed detached descendant retains its birth-bound scope after root exit");
   assert.equal((await request("resolveProcessScope", offeredIdentity)).ok, false, "an exited root identity cannot be replayed");
 
@@ -230,7 +240,8 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   assert.deepEqual((await request("resolveProcessScope", earlyOrphan)).payload, { ...earlyOrphan, networkId: "network-a" },
     "the fixed broker must register the actual orphan PID/birth before opening TCP");
 
-  const idle = spawn(launcher, args(agentSocket, [process.execPath, "-e", "setInterval(()=>{},1000)"]),
+  const idleReadyFile = path.join(security, "sessions/idle.json");
+  const idle = spawn(launcher, args(agentSocket, [process.execPath, "-e", "setInterval(()=>{},1000)"], idleReadyFile),
     { cwd: root, env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(idle);
   let idleOutput = ""; idle.stdout!.on("data", bytes => idleOutput += bytes.toString());
   await until(() => /ready pid=\d+ birth=\d+/.test(idleOutput), "idle guarded process did not start");
@@ -255,7 +266,21 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   for (const identity of [earlyOrphan, brokerIdentity]) {
     assert.deepEqual((await request("resolveProcessScope", identity)).payload, { ...identity, networkId: "network-a" });
   }
+  fs.renameSync(idleReadyFile, path.join(security, "sessions/retained-idle.json"));
+  fs.writeFileSync(idleReadyFile, "replacement", { mode: 0o600 });
   const idleExit = once(idle, "exit"); idle.kill("SIGTERM"); await idleExit;
+  assert.equal(fs.readFileSync(idleReadyFile, "utf8"), "replacement", "cleanup must preserve a replacement record with a different inode");
+
+  const publicParent = path.join(security, "sessions/public"); fs.mkdirSync(publicParent, { mode: 0o755 });
+  const redirected = path.join(security, "sessions/redirected"); fs.symlinkSync(path.join(security, "sessions"), redirected);
+  const existingRecord = path.join(security, "sessions/existing.json"); fs.writeFileSync(existingRecord, "preserve", { mode: 0o600 });
+  for (const invalid of [existingRecord, path.join(publicParent, "public.json"), path.join(redirected, "redirect.json"), path.join(root, "outside.json")]) {
+    if (fs.existsSync(marker)) fs.unlinkSync(marker);
+    await assert.rejects(run(launcher, args(agentSocket, ["/usr/bin/touch", marker], invalid), { cwd: root, env: environment, timeout: 3000 }),
+      error => (error as { code?: number; stdout?: string }).code === 125 && !/ready pid=/.test((error as { stdout?: string }).stdout ?? ""));
+    assert.equal(fs.existsSync(marker), false, "an invalid readiness destination must be rejected before workload exec");
+  }
+  assert.equal(fs.readFileSync(existingRecord, "utf8"), "preserve");
 
   const refreshSocketPath = path.join(security, "sockets/refresh-silent.sock");
   let refreshCount = 0, refreshPending = false, refreshClosed = false;

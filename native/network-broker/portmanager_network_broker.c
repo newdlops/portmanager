@@ -22,6 +22,7 @@
 #if defined(__APPLE__)
 #include <libproc.h>
 #endif
+#include "pm_network_broker_routes.h"
 
 /* Each slot owns one control fd, one received TCP fd and one controller or
  * returned accept fd in disjoint phases. Memory, work and shutdown are bounded. */
@@ -45,6 +46,7 @@ typedef struct {
 typedef struct {
   char network_id[128], socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
   const char *agent_path, *controller_path;
+  const char *routes_path;
   char controller_token[65];
   struct in_addr host;
   int server;
@@ -180,6 +182,11 @@ static int pm_nb_host_interface(const struct sockaddr *address) {
 static int pm_nb_target(const pm_nb_server *server, struct sockaddr_storage *target, int binding) {
   struct sockaddr *address = (struct sockaddr *)target;
   if (pm_nb_logical_localhost(address) || pm_nb_is_own(server, address)) {
+    if (!binding && server->routes_path != NULL) {
+      int routed = pm_nb_routes_apply(server->routes_path, server->network_id, target);
+      if (routed < 0) return errno;
+      if (routed > 0) return 0;
+    }
     if (address->sa_family == AF_INET) ((struct sockaddr_in *)address)->sin_addr = server->host;
     else {
       struct in6_addr *v6 = &((struct sockaddr_in6 *)address)->sin6_addr;
@@ -264,6 +271,7 @@ static void pm_nb_execute(pm_nb_server *server, pm_nb_client *client) {
         request->flags != 0 || request->backlog != 0) { pm_nb_reply(client, EINVAL); return; }
     validation = pm_nb_target(server, &target, request->operation == PM_NB_BIND);
     if (validation != 0) { pm_nb_reply(client, validation); return; }
+    if (pm_nb_now() >= client->deadline) { pm_nb_reply(client, ETIMEDOUT); return; }
     if (request->operation == PM_NB_BIND) {
       int result = bind(client->socket, (struct sockaddr *)&target, request->address_length);
       pm_nb_reply(client, result == 0 ? 0 : errno); return;
@@ -513,6 +521,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[index], "--loopback-host") == 0) host = argv[index + 1];
     else if (strcmp(argv[index], "--agent-socket") == 0) server.agent_path = argv[index + 1];
     else if (strcmp(argv[index], "--controller-token-file") == 0) server.controller_path = argv[index + 1];
+    else if (strcmp(argv[index], "--routes") == 0) server.routes_path = argv[index + 1];
     else return 2;
   }
   char key[PM_NETWORK_NAMESPACE_KEY_SIZE];
@@ -520,6 +529,9 @@ int main(int argc, char **argv) {
       host == NULL || inet_pton(AF_INET, host, &server.host) != 1 || (ntohl(server.host.s_addr) >> 24) != 127) return 2;
   if ((server.agent_path == NULL) != (server.controller_path == NULL)) return 2;
   if (server.controller_path != NULL && pm_scope_read_key(server.controller_path, server.controller_token) != 0) return 1;
+  if (server.routes_path != NULL && pm_nb_routes_lookup(server.routes_path, server.network_id, 0, NULL) < 0) {
+    pm_dev_log("network-broker", "route startup rejected errno=%d", errno); return 1;
+  }
   signal(SIGTERM, pm_nb_stop); signal(SIGINT, pm_nb_stop); signal(SIGHUP, pm_nb_stop); signal(SIGPIPE, SIG_IGN);
   if (pm_nb_register_broker(&server) != 0) { pm_dev_log("network-broker", "scope startup rejected errno=%d", errno); return 1; }
   if (pm_nb_bind_control(&server) != 0) { pm_dev_log("network-broker", "startup failed errno=%d", errno); if (server.server >= 0) close(server.server); return 1; }

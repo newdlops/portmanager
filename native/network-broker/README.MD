@@ -21,6 +21,7 @@ network id, PID, 파일 경로, 실행 명령 또는 agent 관리 method가 없�
 - `portmanager_network_broker.c`: nonblocking poll 서버와 고정 범위 정책
 - `pm_network_broker_protocol.h`: 160-byte request와 148-byte response 형식
 - `pm_network_broker_client.h`: 기한 있는 Unix transport와 FD 수신 검증
+- `pm_network_broker_routes.h`: controller가 게시한 고정 network의 private 목적지 snapshot
 
 서버는 동시에 64개 client를 받는다. slot은 control/받은 TCP/승인 RPC 또는 accept 결과
 FD를 각각 최대 하나씩 소유한다. 승인 FD와 accept 결과 FD는 서로 다른 phase에서만
@@ -36,6 +37,28 @@ TCP syscall을 수행한다. 데몬 교체와 관측 전 orphan에도 환경값�
 사용하지 않는다. 한 slot의 controller 요청/응답 buffer는 각각 2048 bytes이고,
 두 등록은 순차적으로 같은 단일 FD와 최초 8초 기한을 공유한다. 부분 JSON·잘못된 tuple·
 거절·취소에는 TCP를 실행하지 않는다. 승인 대기가 다른 client나 shutdown을 막지 않는다.
+64 slot의 wire buffer 예산은 기존 request/response 160+148와 scope 2048+2048를 합쳐
+281,856 bytes다. helper 소유자는 scope buffer만 계산한 256 KiB에 기존 frame 예산도
+포함해야 한다. JSON은 전체 frame, depth 8, object당 16개 고유한 literal key를 확인한다.
+
+`--routes FILE`을 지정하면 `.portmanager/security/broker-routes/` 아래의 private
+0600 regular file을 시작 때와 각 local connect 때 descriptor로 읽는다. 이 JSONL 파일은
+64 KiB·512개의 고유 logical port 이내이고 첫 줄의 network id는 broker의 고정 id와 같다.
+controller는 완성된 새 파일을 rename으로 교체한다.
+
+```jsonl
+{"version":1,"networkId":"network-a"}
+{"logicalPort":3000,"targetHost":"127.0.0.1","targetPort":5432}
+```
+
+각 줄은 newline으로 끝나며 목적지는 숫자 IPv4/IPv6와 1..65535 port만 받는다.
+localhost 또는 자기 alias로 connect한 해당 logical port만 승인된 목적지로 바뀐다.
+bind는 계속 자기 alias/요청 port를 사용한다. 직접 보낸 다른 alias·호스트 interface는
+이 파일의 entry가 있어도 거절한다. entry가 없으면 기존 자기 alias 동작을 유지한다.
+설정된 파일 부재·잘못된 id·부분/중복 row·symlink/hardlink·권한·한도·읽는 중 변경은
+local connect를 거절하며 이전 snapshot을 캐시해 우회하지 않는다. IPv6 caller의 IPv4
+목적지는 mapped address로 전달하고 다른 family 변경은 EAFNOSUPPORT다. 읽기 buffer는
+최대 65,538 bytes, 중복 port bitmap은 8 KiB이며 한 turn의 임시 file/parent FD만 사용한다.
 
 160-byte 요청 하나만 받으며 대기 중 추가 데이터나 write EOF(`SHUT_WR` 포함)는 취소다.
 새 socket/accept FD를 전달하면 수신자가 전체 응답을 확인해 보내는 한 byte ACK까지
@@ -74,6 +97,7 @@ client/기본 IPv6 server, 설치된 Python client가 통과했다. Node/Python 
 중복/20개/253개 rights와 잘못된 FD, accept 취소/flags 복원, 64 client 포화,
 부분 frame의 절대 기한, 미확인 FD 전달 중 shutdown을 실제 별도 프로세스로 검증한다.
 
-trusted route/Compose/host-access 정책과 실제 셸 attach·terminal replacement 연결이 필요하다. 프로토콜은
+trusted route/Compose/host-access snapshot의 TS 게시와 실제 셸 attach·terminal replacement
+연결이 필요하다. 프로토콜은
 TCP만 다루며 UDP/DNS와 다른 런타임의 호환성은 별도 검증한다. 커널 정책 없이 같은 UID의
 호스트 프로그램을 막는 경계로 사용하지 않는다. 공유 소스 쓰기는 사용자 선택대로 유지한다.

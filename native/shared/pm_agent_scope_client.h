@@ -120,11 +120,19 @@ static const char *pm_scope_json_value(const char *cursor, int depth) {
   if (*cursor == '"') return pm_scope_json_string(cursor);
   if (*cursor == '{' || *cursor == '[') {
     int object = *cursor == '{'; char close = object ? '}' : ']';
+    const char *keys[16]; size_t lengths[16]; int count = 0;
     cursor = pm_scope_space(cursor + 1);
     if (*cursor == close) return cursor + 1;
     for (;;) {
       if (object) {
+        const char *key = cursor;
         cursor = pm_scope_json_string(cursor); if (cursor == NULL) return NULL;
+        size_t length = (size_t)(cursor - key);
+        /* Private protocol keys are canonical ASCII literals. Reject duplicate
+         * or escaped aliases instead of accepting parser-dependent meanings. */
+        if (count == 16 || memchr(key, '\\', length) != NULL) return NULL;
+        for (int index = 0; index < count; index++) if (lengths[index] == length && memcmp(keys[index], key, length) == 0) return NULL;
+        keys[count] = key; lengths[count++] = length;
         cursor = pm_scope_space(cursor); if (*cursor++ != ':') return NULL;
       }
       cursor = pm_scope_json_value(cursor, depth + 1); if (cursor == NULL) return NULL;
