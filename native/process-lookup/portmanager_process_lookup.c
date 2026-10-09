@@ -767,13 +767,32 @@ static int pm_print_descriptor_count(int pid, unsigned long long expected_birth)
   if (birth != 0) printf(",\"birth\":%llu", birth);
   if (error == 0) printf(",\"fdCount\":%zu", count);
 #if defined(__APPLE__)
-  /* macOS ps temporarily runs setuid-root. Its real owner can observe short
+  /* macOS ps temporarily runs setuid-root. Its real owner can observe public
    * credential metadata but cannot enumerate its descriptors. Preserve EPERM
    * and an absent count; callers can report this explicit privilege boundary. */
   if (error == EPERM) {
-    struct proc_bsdshortinfo info;
-    if (proc_pidinfo(pid, PROC_PIDT_SHORTBSDINFO, 0, &info, sizeof(info)) == sizeof(info) && info.pbsi_pid == (uint32_t)pid) {
-      printf(",\"effectiveUid\":%u,\"realUid\":%u", info.pbsi_uid, info.pbsi_ruid);
+    struct kinfo_proc before, after;
+    int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
+    size_t before_size = sizeof(before), after_size = sizeof(after);
+    if (sysctl(mib, 4, &before, &before_size, NULL, 0) == 0 && before_size == sizeof(before) &&
+        before.kp_proc.p_pid == pid && before.kp_proc.p_starttime.tv_sec > 0 && before.kp_proc.p_stat != SZOMB) {
+      unsigned long long observed_birth = (unsigned long long)before.kp_proc.p_starttime.tv_sec * 1000000 +
+        before.kp_proc.p_starttime.tv_usec;
+      unsigned long long unused_birth = 0;
+      int repeated_error = pm_fd_measurement_identity(pid, &unused_birth);
+      if (repeated_error == EPERM && sysctl(mib, 4, &after, &after_size, NULL, 0) == 0 &&
+          after_size == sizeof(after) && after.kp_proc.p_pid == pid && after.kp_proc.p_stat != SZOMB &&
+          after.kp_proc.p_starttime.tv_sec == before.kp_proc.p_starttime.tv_sec &&
+          after.kp_proc.p_starttime.tv_usec == before.kp_proc.p_starttime.tv_usec &&
+          after.kp_eproc.e_ucred.cr_uid == before.kp_eproc.e_ucred.cr_uid &&
+          after.kp_eproc.e_pcred.p_ruid == before.kp_eproc.e_pcred.p_ruid &&
+          (birth == 0 || birth == observed_birth)) {
+        if (expected_birth != 0 && expected_birth != observed_birth) error = ESTALE;
+        else {
+          if (birth == 0) printf(",\"birth\":%llu", observed_birth);
+          printf(",\"effectiveUid\":%u,\"realUid\":%u", before.kp_eproc.e_ucred.cr_uid, before.kp_eproc.e_pcred.p_ruid);
+        }
+      }
     }
   }
 #endif

@@ -47,5 +47,7 @@ table, vnode, argv/env는 조회하지 않는다. 같은 UID와 조회 전후 bi
 종료·권한·identity·미지원 오류 exit 1, 잘못된 인자 exit 2다. 실패에는 `fdCount`를
 내보내지 않는다. Linux는 현재 ENOTSUP이며 기존 측정 방식을 유지한다.
 macOS의 setuid 시스템 도구처럼 effective UID가 다르면 EPERM 결과에 kernel의
-`effectiveUid`와 `realUid`를 추가할 수 있다. 이것은 관찰 가능한 권한 경계이며
+`birth`, `effectiveUid`와 `realUid`를 추가할 수 있다. public `KERN_PROC_PID`의
+조회 전후 birth·UID가 같고 그 사이에도 EPERM이 유지된 경우에만 추가한다.
+이것은 관찰 가능한 권한 경계이며
 descriptor 조회 성공이나 0개라는 뜻이 아니다.
