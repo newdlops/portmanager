@@ -113,15 +113,25 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
   }
   return {
     async exercise(cycle: number): Promise<void> {
+      const started = Date.now();
+      // The first cycle includes SDK profile adoption and two recovery paths.
+      // Identify which await exhausted its existing budget without tracing
+      // the installed product or changing the measured later cycles.
+      const stage = (name: string) => {
+        if (cycle === 1) console.log(`Installed terminal stage: ${name} elapsedMs=${Date.now() - started}`);
+      };
+      stage("begin");
       const before = resources.budget.used;
       const priorProfile = vscode.workspace.getConfiguration("terminal.integrated").inspect<string>("defaultProfile.osx")?.workspaceValue;
       if (cycle === 1) {
         await service.attachVscodeWindowTerminalsToNetwork(selected[0].id);
+        stage("default profile configured");
         assert.equal(service.getGuardedDefaultNetworkId(), selected[0].id);
         assert.equal(vscode.workspace.getConfiguration("terminal.integrated").get("defaultProfile.osx"), "Port Manager: Logical Network");
       }
       const canceled = await service.prepareGuardedTerminalOptions(selected[0].id, workspace);
       await service.cancelGuardedTerminalOptions(canceled);
+      stage("canceled profile reclaimed");
       assert.deepEqual(resources.budget.used, before, "Canceled SDK profile retained a reservation.");
       let terminal: vscode.Terminal;
       if (cycle === 1) {
@@ -134,7 +144,9 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
           });
         });
         await vscode.commands.executeCommand("workbench.action.terminal.new");
+        stage("SDK new terminal command returned");
         terminal = await profileTerminal;
+        stage("SDK profile terminal opened");
         const session = (terminal.creationOptions as vscode.TerminalOptions).env!.PORT_MANAGER_GUARDED_SESSION_ID;
         const deadline = Date.now() + 10_000;
         while (!service.getSnapshot().attachments.some(row => row.id === `guarded-${session}` && row.status === "attached")) {
@@ -143,7 +155,9 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
       } else terminal = await service.openGuardedNetworkTerminal(selected[0].id, workspace);
       terminals.add(terminal);
       const original = await identity(terminal);
+      stage("A supervisor identified");
       const a = await probe(terminal, cycle, "A", cycle === 1);
+      stage("A byte witness complete");
       if (cycle === 1) {
         console.log("Installed terminal lifecycle: first guarded PTY and byte witness ready.");
         const visualHold = Number(process.env.PM_TEST_TERMINAL_VISUAL_HOLD_SECONDS ?? 0);
@@ -157,10 +171,14 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
         }
       }
       const peak = resources.budget.used;
+      stage("replace requested");
       const replacement = await service.replaceGuardedTerminal(terminal, selected[1].id);
+      stage("replacement created");
       terminals.delete(terminal); terminal = replacement; terminals.add(terminal);
       await gone(original);
+      stage("A supervisor reclaimed");
       const b = await probe(terminal, cycle, "B", false);
+      stage("B byte witness complete");
       const current = await identity(terminal);
       const detachedReady = new Promise<vscode.Terminal>((resolve, reject) => {
         const timer = setTimeout(() => { subscription.dispose(); reject(new Error("Fresh host terminal was not created.")); }, 10_000);
@@ -172,12 +190,15 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
       const creation = terminal.creationOptions;
       const session = "env" in creation ? creation.env?.PORT_MANAGER_GUARDED_SESSION_ID : undefined;
       assert.equal(typeof session, "string");
+      stage("detach requested");
       assert.ok(await service.detachTerminal(`guarded-${session}`));
+      stage("detach returned");
       terminals.delete(terminal);
       await gone(current);
       const detached = await detachedReady;
       terminals.add(detached);
       const detachedIdentity = await identity(detached);
+      stage("host supervisor identified");
       assert.notEqual(detachedIdentity.pid, current.pid, "Detach must create a fresh host process.");
       const detachedWitness = path.join(workspace, `terminal-${cycle}-detached.json`);
       const hostProgram = `const fs=require('node:fs'),net=require('node:net');${fixtureWitnessWriterSource()}const s=net.connect(${ports[1]},${JSON.stringify(selected[1].host)});let value='';s.on('connect',()=>s.end('host'));s.on('data',b=>value+=b);s.on('end',()=>publishWitness(${JSON.stringify(detachedWitness)},{value,networkId:process.env.PORT_MANAGER_NETWORK_ID??null,foreignFile:fs.readFileSync(${JSON.stringify(foreignFile)},'utf8')}));s.on('error',e=>publishWitness(${JSON.stringify(detachedWitness)},{error:String(e)}));`;
@@ -185,16 +206,21 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
       const hostDeadline = Date.now() + 10_000;
       while (!fs.existsSync(detachedWitness)) { assert.ok(Date.now() < hostDeadline); await delay(20); }
       assert.deepEqual(JSON.parse(fs.readFileSync(detachedWitness, "utf8")), { value: "B:host", networkId: null, foreignFile: "synthetic fixture" });
+      stage("host byte witness complete");
       fs.unlinkSync(detachedWitness);
       fs.unlinkSync(hostProgramFile); scripts.delete(hostProgramFile);
       detached.dispose(); terminals.delete(detached);
       await gone(detachedIdentity);
+      stage("host supervisor reclaimed");
       if (cycle === 1) {
         await service.detachVscodeWindowTerminalsFromNetwork();
+        stage("default profile restored");
         assert.equal(service.getGuardedDefaultNetworkId(), undefined);
         assert.equal(vscode.workspace.getConfiguration("terminal.integrated").inspect<string>("defaultProfile.osx")?.workspaceValue, priorProfile);
         for (const forced of [false, true]) {
+          stage(`orphan ${forced} open requested`);
           const closing = await service.openGuardedNetworkTerminal(selected[0].id, workspace);
+          stage(`orphan ${forced} terminal opened`);
           terminals.add(closing);
           const parentIdentity = await identity(closing);
           const orphanWitness = path.join(workspace, `terminal-${cycle}-orphan-${forced}.json`);
@@ -205,12 +231,14 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
           const orphanPid = JSON.parse(fs.readFileSync(orphanWitness, "utf8")).pid as number;
           const orphan = await lookup.readProcessIdentity(orphanPid);
           assert.ok(orphan, "Actual installed terminal must leave a real detached child before close.");
+          stage(`orphan ${forced} child identified`);
           if (forced) assert.equal(await lookup.signalProcess(parentIdentity, "SIGKILL"), true);
           // User-style SDK close and a deliberately vanished trusted parent
           // must both use the installed owner's census/receipt recovery path.
           closing.dispose(); terminals.delete(closing);
           await gone(parentIdentity);
           await gone(orphan);
+          stage(`orphan ${forced} reclaimed`);
           fs.unlinkSync(orphanWitness);
           fs.unlinkSync(daemonProgramFile); scripts.delete(daemonProgramFile);
           records.push({ abruptClose: forced, supervisor: parentIdentity, orphan, reclaimed: true });
@@ -220,6 +248,7 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
       while (JSON.stringify(resources.budget.used) !== JSON.stringify(before)) { assert.ok(Date.now() < deadline, "Terminal close retained a shared reservation."); await delay(20); }
       records.push({ cycle, a, b, peak, supervisor: original, replacement: current, detached: detachedIdentity, settled: resources.budget.used });
       save();
+      stage("complete");
     },
     async close(): Promise<void> {
       for (const terminal of terminals) terminal.dispose();
