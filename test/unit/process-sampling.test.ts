@@ -115,7 +115,7 @@ test("resource sampling reports a kernel-denied privileged descendant as unknown
     code: 1, signal: null, stderr: "", stdout: JSON.stringify({ pid, error: os.constants.errno.EPERM, ...record }),
   });
   const permittedBoundary = { effectiveUid: uid === 0 ? 1 : 0, realUid: uid,
-    processUniqueId: "18446744073709551615", identityVersion: 1 };
+    birth: Date.now() * 1000 };
   const samples = await processSamples(process.pid, undefined, async pid => {
     if (pid === child.pid) throw nativeFailure(pid, permittedBoundary);
     return 3;
@@ -132,11 +132,11 @@ test("resource sampling reports a kernel-denied privileged descendant as unknown
     { ...permittedBoundary, realUid: uid + 1 },
     { ...permittedBoundary, fdCount: 0 },
     { ...permittedBoundary, error: os.constants.errno.EIO },
-    { ...permittedBoundary, processUniqueId: undefined },
-    { ...permittedBoundary, processUniqueId: "18446744073709551616" },
-    { ...permittedBoundary, processUniqueId: "0" },
-    { ...permittedBoundary, identityVersion: -1 },
-    { ...permittedBoundary, identityVersion: 0x100000000 },
+    { ...permittedBoundary, birth: undefined },
+    { ...permittedBoundary, birth: 0 },
+    { ...permittedBoundary, birth: -1 },
+    { ...permittedBoundary, birth: Number.MAX_SAFE_INTEGER + 1 },
+    { ...permittedBoundary, birth: "1" },
   ]) {
     const failure = nativeFailure(child.pid!, record);
     await assert.rejects(processSamples(process.pid, undefined, async pid => {

@@ -110,7 +110,7 @@ steady state의 proxy helper 수는 증가하면 안 된다. 확장 호스트 FD
 process tree에는 daemon과 일반 VS Code 자식/일시적 discovery 명령도 기록한다.
 macOS setuid 시스템 명령은 실제 UID가 호출자여도 effective UID가 달라 FD 조회가
 거절될 수 있다. native 도구의 EPERM·PID·kernel UID와 조회 전후 동일한
-process unique-id/version이 확인된 자식만
+프로세스 birth가 확인된 자식만
 `descriptors: null`과 `descriptorUnavailable`로 기록하고 RSS/CPU 행은 보존한다.
 그 표본이 있으면 `descriptorTreeComplete`는 false이며 `peakTreeDescriptors`는
 null이다. `peakMeasuredTreeDescriptors`는 측정된 부분의 합계일 뿐 전체 합계가 아니다.

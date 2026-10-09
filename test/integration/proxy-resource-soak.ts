@@ -22,7 +22,7 @@ interface ProcessSample {
   /** null reports a proven privileged descendant, never an inferred zero. */
   descriptors: number | null;
   descriptorUnavailable?: { reason: "privileged-real-owner"; error: number; effectiveUid: number; realUid: number;
-    processUniqueId: string; identityVersion: number };
+    birth: number };
 }
 interface Sample {
   elapsedSeconds: number; phase: string; cycle: number; resources: ProxyResourceLimits;
@@ -396,18 +396,15 @@ function privilegedDescriptorBoundary(error: unknown, pid: number): ProcessSampl
       || query.stdout.length > 4096) return undefined;
   try {
     const record = JSON.parse(query.stdout) as { pid?: unknown; error?: unknown; fdCount?: unknown; effectiveUid?: unknown; realUid?: unknown;
-      processUniqueId?: unknown; identityVersion?: unknown };
+      birth?: unknown };
     const uid = process.getuid();
     if (record.pid !== pid || record.error !== os.constants.errno.EPERM || record.fdCount !== undefined
         || !Number.isSafeInteger(record.effectiveUid) || (record.effectiveUid as number) < 0
         || record.effectiveUid === uid || record.realUid !== uid
-        || typeof record.processUniqueId !== "string" || !/^[1-9][0-9]{0,19}$/.test(record.processUniqueId)
-        || BigInt(record.processUniqueId) > 18446744073709551615n
-        || !Number.isSafeInteger(record.identityVersion) || (record.identityVersion as number) < 0
-        || (record.identityVersion as number) > 0xffffffff) return undefined;
+        || !Number.isSafeInteger(record.birth) || (record.birth as number) <= 0) return undefined;
     return { reason: "privileged-real-owner", error: os.constants.errno.EPERM,
       effectiveUid: record.effectiveUid as number, realUid: uid,
-      processUniqueId: record.processUniqueId, identityVersion: record.identityVersion as number };
+      birth: record.birth as number };
   } catch { return undefined; }
 }
 
