@@ -59,6 +59,7 @@ async function connect(context: TestContext, socketPath: string) {
 async function fixture(context: TestContext) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pm-output-"));
   const socketPath = path.join(directory, "socket");
+  const developmentLog = path.join(directory, "development.log");
   fs.writeFileSync(path.join(directory, "lsof"), '#!/bin/sh\n/bin/cat "$PM_OUTPUT_DATA"\n', { mode: 0o755 });
   const data = path.join(directory, "data");
   // Output framing needs 2,000 distinct listeners, not 2,000 unrelated process
@@ -69,7 +70,8 @@ async function fixture(context: TestContext) {
     "--agent-main", path.join(root, "out/src/agent/agent-main.js"), "--dns-port", "0",
     "--controller-token-file", createTestAgentCredential(socketPath)], {
     stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, PATH: `${directory}:${process.env.PATH}`,
-      PORT_MANAGER_AGENT_DISABLE_HOOK_RECOVERY: "1", PM_OUTPUT_DATA: data },
+      PORT_MANAGER_AGENT_DISABLE_HOOK_RECOVERY: "1", PM_OUTPUT_DATA: data,
+      ...(process.env.PM_OUTPUT_TRACE === "1" ? { PORT_MANAGER_DEV_LOG: developmentLog } : {}) },
   });
   let stderr = "";
   child.stderr!.on("data", chunk => { stderr += chunk.toString(); });
@@ -91,7 +93,14 @@ async function fixture(context: TestContext) {
       await delay(5);
     }
   }
-  const snapshot = await healthy.reply(healthy.send("listSnapshot"));
+  let snapshot;
+  try { snapshot = await healthy.reply(healthy.send("listSnapshot")); }
+  catch (error) {
+    if (error instanceof Error && fs.existsSync(developmentLog)) {
+      error.message += `\nFixture diagnostic: ${fs.readFileSync(developmentLog, "utf8").slice(-4096)}`;
+    }
+    throw error;
+  }
   assert.equal(snapshot.listeners.length, 2000);
   assert.ok(Buffer.byteLength(JSON.stringify(snapshot)) > 900_000);
   return { socketPath, healthy, child, running };

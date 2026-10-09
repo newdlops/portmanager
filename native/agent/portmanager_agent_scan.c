@@ -227,6 +227,7 @@ static void pm_scan_spawn(pm_scan_job *job) {
   posix_spawn_file_actions_destroy(&actions);
   close(descriptors[1]);
   job->fd = descriptors[0];
+  pm_dev_log("agent-scan", "command started pid=%ld command=%s", (long)job->pid, job->command);
   return;
 failed:
   if (attributes_ready) posix_spawnattr_destroy(&attributes);
@@ -295,7 +296,11 @@ int pm_scan_poll(void) {
         if (result < 0) job->failed = 1;
       }
     }
-    if ((job->pid == 0 && job->failed) || (job->exited && job->fd < 0)) job->done = 1;
+    if (!job->done && ((job->pid == 0 && job->failed) || (job->exited && job->fd < 0))) {
+      job->done = 1;
+      pm_dev_log("agent-scan", "command completed pid=%ld bytes=%zu status=%d failed=%d command=%s",
+        (long)job->pid, job->length, job->status, job->failed, job->command);
+    }
     if (job->done && job->references == 0) {
       *link = job->next; pm_scan_free_job(job); continue;
     }
