@@ -766,6 +766,17 @@ static int pm_print_descriptor_count(int pid, unsigned long long expected_birth)
   printf("{\"pid\":%d", pid);
   if (birth != 0) printf(",\"birth\":%llu", birth);
   if (error == 0) printf(",\"fdCount\":%zu", count);
+#if defined(__APPLE__)
+  /* macOS ps temporarily runs setuid-root. Its real owner can observe short
+   * credential metadata but cannot enumerate its descriptors. Preserve EPERM
+   * and an absent count; callers can report this explicit privilege boundary. */
+  if (error == EPERM) {
+    struct proc_bsdshortinfo info;
+    if (proc_pidinfo(pid, PROC_PIDT_SHORTBSDINFO, 0, &info, sizeof(info)) == sizeof(info) && info.pbsi_pid == (uint32_t)pid) {
+      printf(",\"effectiveUid\":%u,\"realUid\":%u", info.pbsi_uid, info.pbsi_ruid);
+    }
+  }
+#endif
   printf(",\"error\":%d}\n", error);
   return error == 0 ? 0 : 1;
 }
