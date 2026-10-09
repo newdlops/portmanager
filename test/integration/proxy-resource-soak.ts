@@ -299,19 +299,24 @@ function summarizeAllocations(profile: HeapProfiler.SamplingHeapProfile) {
 
 /** OS counters are sampled infrequently; short-lived measurement commands are excluded. */
 export async function processSamples(hostPid: number, daemonPid?: number,
-  readDescriptors: (pid: number) => Promise<number> = readProcessDescriptors): Promise<ProcessSample[]> {
+  readDescriptors: (pid: number) => Promise<number> = readProcessDescriptors,
+  observeTableQuery?: (pid: number, snapshotPids: readonly number[]) => void): Promise<ProcessSample[]> {
   let rows: ProcessSample[];
+  let measurementPid: number | undefined;
   if (process.platform === "win32") {
     const script = "Get-CimInstance Win32_Process | ForEach-Object { $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; if ($p) { [PSCustomObject]@{pid=$_.ProcessId;parent=$_.ParentProcessId;command=$_.Name;rssKiB=[math]::Round($p.WorkingSet64/1024);cpuSeconds=$p.CPU;descriptors=$p.HandleCount} } } | ConvertTo-Json -Compress";
     const result = await execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 });
     rows = JSON.parse(result.stdout);
   } else {
-    const result = await execute("ps", ["-axo", "pid=,ppid=,rss=,time=,comm="], { timeout: 5000 });
+    const query = execute("ps", ["-axo", "pid=,ppid=,rss=,time=,comm="], { timeout: 5000 });
+    measurementPid = query.child.pid;
+    const result = await query;
     rows = result.stdout.trim().split("\n").map(line => {
       const [pid, parent, rss, time, ...command] = line.trim().split(/\s+/);
       return { pid: Number(pid), parent: Number(parent), command: command.join(" "),
         rssKiB: Number(rss), cpuSeconds: cpuTime(time), descriptors: 0 };
     });
+    if (measurementPid !== undefined) observeTableQuery?.(measurementPid, rows.map(row => row.pid));
   }
   const selected = new Set([hostPid, ...(daemonPid ? [daemonPid] : [])]);
   let changed = true;
@@ -319,7 +324,10 @@ export async function processSamples(hostPid: number, daemonPid?: number,
     changed = false;
     for (const row of rows) if (selected.has(row.parent) && !selected.has(row.pid)) { selected.add(row.pid); changed = true; }
   }
-  const result = rows.filter(row => selected.has(row.pid));
+  // ps reports its own PID. That command has already completed by this point;
+  // querying it can race a reused PID or a not-yet-reaped measurement child.
+  // Exclude only the exact child we spawned, never a product process named ps.
+  const result = rows.filter(row => selected.has(row.pid) && row.pid !== measurementPid);
   const completed = new Set<number>();
   if (process.platform !== "win32") await Promise.all(result.map(async row => {
     try {

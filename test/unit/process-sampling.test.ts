@@ -48,3 +48,40 @@ test("resource sampling rejects descriptor failures for a live host", {
   await assert.rejects(processSamples(process.pid, undefined, async () => { throw failure; }),
     error => error === failure);
 });
+
+test("resource sampling excludes its actual process-table child before descriptor queries", {
+  skip: process.platform === "win32", timeout: 10_000,
+}, async () => {
+  const queried: number[] = [];
+  let measurementPid: number | undefined;
+  const samples = await processSamples(process.pid, undefined, async pid => {
+    queried.push(pid); return 1;
+  }, (pid, snapshotPids) => {
+    measurementPid = pid;
+    assert.ok(snapshotPids.includes(pid), "the actual ps snapshot must include its own command");
+  });
+  assert.ok(measurementPid !== undefined && measurementPid !== process.pid);
+  assert.ok(queried.includes(process.pid));
+  assert.equal(queried.includes(measurementPid!), false);
+  assert.equal(samples.some(row => row.pid === measurementPid), false);
+});
+
+test("resource sampling retains a live product child named ps and rejects its descriptor failure", {
+  skip: process.platform === "win32", timeout: 10_000,
+}, async t => {
+  const child = spawn(process.execPath, ["-e", "process.title='ps';process.stdout.write('ready\\n');setInterval(()=>{},1000)"],
+    { stdio: ["ignore", "pipe", "ignore"] });
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) { const exited = once(child, "exit"); child.kill("SIGTERM"); await exited; }
+  });
+  await once(child.stdout, "data");
+  const observed = await processSamples(process.pid, undefined, async () => 1);
+  const row = observed.find(sample => sample.pid === child.pid);
+  assert.ok(row, "the independent product child must remain in the process sample");
+  assert.equal(path.basename(row.command), "ps");
+  const failure = new Error("live product ps descriptor failure");
+  await assert.rejects(processSamples(process.pid, undefined, async pid => {
+    if (pid === child.pid) throw failure;
+    return 1;
+  }), error => error === failure);
+});
