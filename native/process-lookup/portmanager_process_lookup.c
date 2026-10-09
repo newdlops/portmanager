@@ -13,6 +13,7 @@
 #if defined(__APPLE__)
 #include <libproc.h>
 #include <sys/param.h>
+#include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/user.h>
 #elif defined(__linux__)
@@ -697,9 +698,97 @@ static int pm_print_identity(int pid) {
   return 0;
 }
 
+/* Descriptor measurements never enumerate vnode metadata or read argv/env.
+ * Check the target identity on both sides of the kernel descriptor snapshot;
+ * an exited or reused PID is an error, never a fabricated zero measurement. */
+#if defined(__APPLE__)
+static int pm_fd_measurement_identity(int pid, unsigned long long *birth) {
+  struct proc_bsdinfo info;
+  errno = 0;
+  int result = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info));
+  if (result != sizeof(info)) return errno != 0 ? errno : EIO;
+  if (info.pbi_uid != geteuid()) return EPERM;
+  if (info.pbi_status == SZOMB) return ESRCH;
+  *birth = (unsigned long long)info.pbi_start_tvsec * 1000000 + info.pbi_start_tvusec;
+  return *birth == 0 ? EIO : 0;
+}
+
+static int pm_measure_descriptor_count(int pid, unsigned long long expected_birth,
+                                       unsigned long long *birth, size_t *count) {
+  int error = pm_fd_measurement_identity(pid, birth);
+  if (error != 0) return error;
+  if (expected_birth != 0 && expected_birth != *birth) return ESTALE;
+  errno = 0;
+  int needed = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
+  if (needed < 0 || (needed == 0 && errno != 0)) return errno != 0 ? errno : EIO;
+  const size_t row_size = sizeof(struct proc_fdinfo), maximum_rows = 1048576;
+  if ((size_t)needed % row_size != 0 || (size_t)needed / row_size > maximum_rows - 32) return EOVERFLOW;
+  size_t rows = (size_t)needed / row_size + 32;
+  if (rows < 64) rows = 64;
+  error = EAGAIN;
+  for (int attempt = 0; attempt < 4; attempt++) {
+    size_t capacity = rows * row_size;
+    struct proc_fdinfo *descriptors = malloc(capacity);
+    if (descriptors == NULL) return ENOMEM;
+    errno = 0;
+    int bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, descriptors, (int)capacity);
+    int query_error = errno;
+    free(descriptors);
+    if (bytes < 0 || (bytes == 0 && query_error != 0)) return query_error != 0 ? query_error : EIO;
+    if ((size_t)bytes > capacity || (size_t)bytes % row_size != 0) return EIO;
+    if ((size_t)bytes < capacity) {
+      *count = (size_t)bytes / row_size;
+      error = 0;
+      break;
+    }
+    /* A full buffer may have truncated newly opened descriptors. Grow within
+     * a fixed bound rather than reporting the truncated count as complete. */
+    if (rows > maximum_rows / 2) return EOVERFLOW;
+    rows *= 2;
+  }
+  if (error != 0) return error;
+  unsigned long long after = 0;
+  error = pm_fd_measurement_identity(pid, &after);
+  if (error != 0) return error;
+  return after == *birth ? 0 : ESTALE;
+}
+#endif
+
+static int pm_print_descriptor_count(int pid, unsigned long long expected_birth) {
+  unsigned long long birth = 0;
+  size_t count = 0;
+  int error = ENOTSUP;
+#if defined(__APPLE__)
+  error = pm_measure_descriptor_count(pid, expected_birth, &birth, &count);
+#else
+  (void)expected_birth;
+#endif
+  printf("{\"pid\":%d", pid);
+  if (birth != 0) printf(",\"birth\":%llu", birth);
+  if (error == 0) printf(",\"fdCount\":%zu", count);
+  printf(",\"error\":%d}\n", error);
+  return error == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
   pm_process_table table = {0};
   int result = 0;
+
+  if (argc >= 2 && strcmp(argv[1], "fd-count") == 0) {
+    if ((argc != 3 && argc != 4) || !isdigit((unsigned char)argv[2][0])) return 2;
+    char *end;
+    errno = 0;
+    long pid = strtol(argv[2], &end, 10);
+    if (errno != 0 || *end != '\0' || pid <= 1 || pid > INT_MAX) return 2;
+    unsigned long long birth = 0;
+    if (argc == 4) {
+      if (!isdigit((unsigned char)argv[3][0])) return 2;
+      errno = 0;
+      birth = strtoull(argv[3], &end, 10);
+      if (errno != 0 || *end != '\0' || birth == 0) return 2;
+    }
+    return pm_print_descriptor_count((int)pid, birth);
+  }
 
   if (argc >= 2 && strcmp(argv[1], "signal") == 0) {
     if (argc != 5 || !pm_is_positive_pid_text(argv[2]) || !isdigit((unsigned char)argv[3][0])) return 2;

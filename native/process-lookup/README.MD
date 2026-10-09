@@ -20,6 +20,7 @@ Logical Network 라우터가 로컬 클라이언트 프로세스를 터미널 at
   - `portmanager_process_lookup inspect <pid>`
   - `portmanager_process_lookup capture <pid>`
   - `portmanager_process_lookup identity <pid>`
+  - `portmanager_process_lookup fd-count <pid> [expected-birth]`
   - `portmanager_process_lookup signal <pid> <birth> SIGTERM|SIGHUP|SIGINT|SIGKILL`
 
 ## 외부 의존성
@@ -38,3 +39,10 @@ UID, 조회 전후 audit token을 확인하고 kernel PID-version 신호를 호�
 `{pid,birth,signal,sent,error}`이며 성공 exit 0, 거절/미지원 exit 1, 잘못된 인자 exit 2다.
 다른 플랫폼이나 API가 없는 OS에서는 숫자 PID kill로 fallback하지 않는다. TypeScript
 호출자도 신호 실패를 shell kill로 대체하면 안 된다.
+
+`fd-count`는 macOS `PROC_PIDLISTFDS`로 실제 열린 descriptor만 센다. 전체 process
+table, vnode, argv/env는 조회하지 않는다. 같은 UID와 조회 전후 birth를 확인하며
+선택한 expected-birth가 다르면 거절한다. 꽉 찬 버퍼는 정해진 한도 안에서 늘리고
+끝까지 꽉 차면 실패한다. 결과는 `{pid,birth?,fdCount?,error}`이며 성공 exit 0,
+종료·권한·identity·미지원 오류 exit 1, 잘못된 인자 exit 2다. 실패에는 `fdCount`를
+내보내지 않는다. Linux는 현재 ENOTSUP이며 기존 측정 방식을 유지한다.
