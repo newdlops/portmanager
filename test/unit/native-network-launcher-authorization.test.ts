@@ -190,12 +190,12 @@ test("guarded exec waits for controller PID/birth registration and never widens 
     "controller route recovery cannot overwrite an authenticated child with its forged env network");
   const exit = once(guarded, "exit"); guarded.kill("SIGTERM"); await exit;
   assert.equal(fs.existsSync(readyFile), false, "supervisor must remove its own readiness inode on exit");
-  assert.deepEqual((await request("resolveProcessScope", descendantIdentity)).payload, { ...descendantIdentity, networkId: "network-a" }, "an observed detached descendant retains its birth-bound scope after root exit");
+  assert.equal((await request("resolveProcessScope", descendantIdentity)).ok, false, "terminal shutdown must finish its detached descendant before returning");
   assert.equal((await request("resolveProcessScope", offeredIdentity)).ok, false, "an exited root identity cannot be replayed");
 
   // This child deliberately becomes an orphan before it performs any TCP work.
-  // Its parent has exited before the first scope lookup: ancestry alone cannot
-  // recover it, and its forged environment must not supply the missing identity.
+  // Its intermediate parent exits while the registered workload root stays
+  // alive. Ancestry alone cannot recover it after reparenting to PID 1.
   const orphanReady = path.join(root, "orphan-ready.js"), triggers = [1, 2].map(index => path.join(root, `orphan-go-${index}.js`));
   const results = [1, 2].map(index => path.join(root, `orphan-result-${index}.js`));
   const echo = net.createServer(socket => {
@@ -216,11 +216,17 @@ test("guarded exec waits for controller PID/birth registration and never widens 
       socket.on('data',bytes=>{fs.writeFileSync(results[attempt],bytes);attempt++;busy=false;socket.end();});
     },20);
   `;
+  const orphanPidFile = path.join(root, "orphan-pid.js");
+  const intermediateCode = `
+    const cp=require('child_process'),fs=require('fs');
+    const child=cp.spawn(process.execPath,['-e',${JSON.stringify(orphanCode)}],{detached:true,stdio:'ignore'});
+    fs.writeFileSync(${JSON.stringify(orphanPidFile)},String(child.pid));child.unref();setTimeout(()=>process.exit(0),50);
+  `;
   const shortParent = spawn(launcher, args(agentSocket, [process.execPath, "-e", `
     const cp=require('child_process');
-    const child=cp.spawn(process.execPath,['-e',${JSON.stringify(orphanCode)}],{detached:true,stdio:'ignore',
+    const child=cp.spawn(process.execPath,['-e',${JSON.stringify(intermediateCode)}],{detached:true,stdio:'ignore',
       env:{...process.env,PORT_MANAGER_NETWORK_ID:'network-b',PORT_MANAGER_HOOK_DISABLED:'1'}});
-    console.log('ORPHAN_PID='+child.pid);child.unref();setTimeout(()=>process.exit(0),50);
+    child.unref();setInterval(()=>{},1000);
   `]), { cwd: root, env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(shortParent);
   let shortOutput = ""; shortParent.stdout!.on("data", bytes => shortOutput += bytes.toString());
   const shortExit = once(shortParent, "exit");
@@ -228,9 +234,8 @@ test("guarded exec waits for controller PID/birth registration and never widens 
     const deadline = Date.now() + milliseconds;
     while (!predicate()) { assert.ok(Date.now() < deadline, message); await delay(10); }
   }
-  await until(() => /ORPHAN_PID=\d+/.test(shortOutput), "orphan fixture did not start");
-  const earlyOrphan = inspect(Number(/ORPHAN_PID=(\d+)/.exec(shortOutput)![1])); orphaned.push(earlyOrphan);
-  assert.equal((await shortExit)[0], 0);
+  await until(() => fs.existsSync(orphanPidFile), "orphan fixture did not start");
+  const earlyOrphan = inspect(Number(fs.readFileSync(orphanPidFile, "utf8"))); orphaned.push(earlyOrphan);
   await until(() => fs.existsSync(orphanReady), "child must be orphaned before scope observation");
   assert.equal((await request("resolveProcessScope", earlyOrphan)).payload, null,
     "no previously observed ancestry may accidentally satisfy the orphan test");
@@ -266,6 +271,8 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   for (const identity of [earlyOrphan, brokerIdentity]) {
     assert.deepEqual((await request("resolveProcessScope", identity)).payload, { ...identity, networkId: "network-a" });
   }
+  shortParent.kill("SIGTERM"); await shortExit;
+  assert.equal((await request("resolveProcessScope", earlyOrphan)).ok, false, "the unobserved-ancestry orphan must also be reclaimed before supervisor exit");
   fs.renameSync(idleReadyFile, path.join(security, "sessions/retained-idle.json"));
   fs.writeFileSync(idleReadyFile, "replacement", { mode: 0o600 });
   const idleExit = once(idle, "exit"); idle.kill("SIGTERM"); await idleExit;
@@ -298,9 +305,9 @@ test("guarded exec waits for controller PID/birth registration and never widens 
     { cwd: root, env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(refreshing);
   await until(() => refreshPending, "supervisor must use a bounded asynchronous renewal after startup");
   const refreshingExit = once(refreshing, "exit"), refreshStop = Date.now(); refreshing.kill("SIGTERM");
-  await Promise.race([refreshingExit, delay(1000).then(() => { throw new Error("pending refresh blocked child shutdown"); })]);
+  await until(() => refreshClosed, "stop must promptly close pending controller FD before descendant census", 1000);
   assert.ok(Date.now() - refreshStop < 1000);
-  await until(() => refreshClosed, "supervisor exit must close its pending controller FD");
+  await Promise.race([refreshingExit, delay(5000).then(() => { throw new Error("descendant cleanup did not finish after refresh cancellation"); })]);
 
   for (const name of ["forged", "denied", "silent", "timeout"]) {
     if (fs.existsSync(marker)) fs.unlinkSync(marker);

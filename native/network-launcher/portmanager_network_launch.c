@@ -176,6 +176,7 @@ static int pm_launch_record_write(unsigned int phase, int error) {
 
 #include "pm_network_launch_authorization.h"
 #include "pm_network_launch_readiness.h"
+#include "pm_network_launch_members.h"
 
 /* The guard blocks before executing application code. Only the supervisor's
  * private socket can release it; this descriptor disappears on SETEXEC. */
@@ -326,29 +327,42 @@ static void pm_launch_kill_owned(pid_t pid, unsigned long long birth, int number
   /* Only our still-unreaped fork child enters here. It cannot reuse its PID;
    * a missing initial libproc observation must not leave that child running. */
   if (birth != 0 && pm_launch_birth(pid) != birth) return;
-  if (getpgid(pid) == pid) (void)kill(-pid, number);
-  else (void)kill(pid, number);
+  (void)kill(pid, number);
 }
-static int pm_launch_supervise(const pm_launch_options *options, pid_t child, unsigned long long birth, int startup_ok) {
-  int status; long long stopping = 0;
+static int pm_launch_supervise(const pm_launch_options *options, pm_launch_members *members, pid_t child, unsigned long long birth, int startup_ok) {
+  int status = 0, reaped = 0, cleanup_error = 0; long long stopping = 0;
   pm_scope_client refresh; memset(&refresh, 0, sizeof(refresh)); refresh.fd = -1;
   long long next_refresh = pm_nb_client_now() + PM_LAUNCH_SCOPE_REFRESH_MS, refresh_deadline = 0;
   if (!startup_ok) { pm_launch_kill_owned(child, birth, SIGKILL); stopping = pm_nb_client_now(); }
   for (;;) {
-    pid_t done = waitpid(child, &status, WNOHANG);
-    if (done == child) {
-      pm_dev_log("network-launcher", "child exited pid=%ld status=%d", (long)child, status); break;
+    pid_t done = reaped ? 0 : waitpid(child, &status, WNOHANG);
+    if (!reaped && done == child) {
+      reaped = 1; stopping = pm_nb_client_now() - PM_LAUNCH_STOP_MS;
+      pm_dev_log("network-launcher", "root exited; cleaning members pid=%ld status=%d", (long)child, status);
     }
-    if (done < 0 && errno != EINTR) { pm_scope_close(&refresh); return 125; }
+    if (done < 0 && errno != EINTR) {
+      pm_dev_log("network-launcher", "wait failed pid=%ld errno=%d; retaining ownership", (long)child, errno);
+      if (stopping == 0) stopping = pm_nb_client_now();
+    }
     if (pm_launch_signal != 0) {
       pm_dev_log("network-launcher", "forward signal child_pid=%ld signal=%d", (long)child, (int)pm_launch_signal);
-      pm_launch_kill_owned(child, birth, pm_launch_signal); pm_launch_signal = 0;
+      pm_scope_close(&refresh);
+      if (!reaped) pm_launch_kill_owned(child, birth, pm_launch_signal);
+      (void)pm_launch_members_sweep(members, pm_launch_signal); pm_launch_signal = 0;
       if (stopping == 0) stopping = pm_nb_client_now();
     }
     long long now = pm_nb_client_now();
     if (stopping != 0) {
       pm_scope_close(&refresh);
-      if (now - stopping >= PM_LAUNCH_STOP_MS) pm_launch_kill_owned(child, birth, SIGKILL);
+      if (now - stopping >= PM_LAUNCH_STOP_MS) {
+        if (!reaped) pm_launch_kill_owned(child, birth, SIGKILL);
+        int cleaned = pm_launch_members_sweep(members, SIGKILL);
+        if (cleaned == 1 && reaped) break;
+        if (cleaned < 0 && errno != cleanup_error) {
+          cleanup_error = errno;
+          pm_dev_log("network-launcher", "member cleanup uncertain errno=%d; retaining supervisor and TTY", errno);
+        }
+      }
     } else if (options->agent_path != NULL) {
       /* A replacement daemon has an empty scope table. Refresh the still-owned
        * child without blocking job control or trusting mutable workload env.
@@ -398,8 +412,11 @@ int main(int argc, char **argv) {
   if (profile == NULL) return 125;
   profile = pm_launch_terminal_profile(profile);
   if (profile == NULL) return 125;
+  pm_launch_members members;
+  profile = pm_launch_members_prepare(&members, &options, profile);
+  if (profile == NULL) return 125;
   char **arguments = calloc((size_t)argc + 16, sizeof(char *));
-  if (arguments == NULL) { free(profile); return 125; }
+  if (arguments == NULL) { free(profile); pm_launch_members_close(&members); return 125; }
   int index = 0;
   arguments[index++] = "/usr/bin/sandbox-exec"; arguments[index++] = "-p"; arguments[index++] = profile;
   arguments[index++] = self; arguments[index++] = "--guard";
@@ -410,8 +427,8 @@ int main(int argc, char **argv) {
   arguments[index++] = "--";
   for (int position = options.command_index; position < argc; position++) arguments[index++] = argv[position];
   int ready[2];
-  if (socketpair(AF_UNIX, SOCK_STREAM, 0, ready) != 0) { free(arguments); free(profile); return 125; }
-  if (fcntl(ready[0], F_SETFD, FD_CLOEXEC) != 0) { close(ready[0]); close(ready[1]); free(arguments); free(profile); return 125; }
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, ready) != 0) { free(arguments); free(profile); pm_launch_members_close(&members); return 125; }
+  if (fcntl(ready[0], F_SETFD, FD_CLOEXEC) != 0) { close(ready[0]); close(ready[1]); free(arguments); free(profile); pm_launch_members_close(&members); return 125; }
   pm_launch_clean_environment();
   signal(SIGCHLD, SIG_DFL);
   signal(SIGTERM, pm_launch_on_signal); signal(SIGINT, pm_launch_on_signal);
@@ -423,7 +440,7 @@ int main(int argc, char **argv) {
     execv(arguments[0], arguments); _exit(125);
   }
   close(ready[1]); free(arguments); free(profile);
-  if (child < 0) { close(ready[0]); return 125; }
+  if (child < 0) { close(ready[0]); pm_launch_members_close(&members); return 125; }
   (void)setpgid(child, child);
   unsigned long long birth = pm_launch_birth(child);
   pid_t foreground = isatty(0) ? tcgetpgrp(0) : -1;
@@ -432,6 +449,7 @@ int main(int argc, char **argv) {
   long long deadline = pm_nb_client_now() + PM_LAUNCH_START_MS;
   pm_launch_record policy;
   int accepted = birth != 0 && pm_launch_record_read(ready[0], &policy, deadline) == 0 && policy.phase == PM_LAUNCH_POLICY_READY;
+  if (accepted) accepted = pm_launch_member_query(&members, child) == 1;
   if (accepted && options.agent_path != NULL) accepted = pm_launch_register_scope(&options, child, birth, deadline) == 0;
   if (accepted) {
     pm_launch_record authorized = { .magic = PM_LAUNCH_MAGIC, .phase = PM_LAUNCH_AUTHORIZED };
@@ -445,8 +463,9 @@ int main(int argc, char **argv) {
     pm_dev_log("network-launcher", "policy ready child_pid=%ld birth=%llu", (long)child, birth);
     if (options.announce) { printf("ready pid=%ld birth=%llu\n", (long)child, birth); fflush(stdout); }
   } else pm_dev_log("network-launcher", "startup rejected child_pid=%ld errno=%d", (long)child, errno);
-  int result = pm_launch_supervise(&options, child, birth, accepted);
+  int result = pm_launch_supervise(&options, &members, child, birth, accepted);
   pm_launch_remove_ready(&published);
+  pm_launch_members_close(&members);
   if (foreground > 0) (void)tcsetpgrp(0, foreground);
   return result;
 }
