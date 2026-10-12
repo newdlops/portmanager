@@ -41,6 +41,12 @@ const expected = target.startsWith("darwin-")
   : ["libportmanager_hook.so", ...commonHelpers];
 const expectedArchitectures = target.endsWith("-arm64") ? ["arm64", "aarch64"] : ["x86_64", "x86-64"];
 
+const unexpected = fs.readdirSync(nativeDirectory).filter(name =>
+  /^(?:libportmanager_hook\.|portmanager_)/.test(name) && !expected.includes(name));
+if (unexpected.length > 0) {
+  throw new Error(`Unexpected native artifacts for ${target}: ${unexpected.join(", ")}.`);
+}
+
 for (const name of expected) {
   const artifactPath = path.join(nativeDirectory, name);
   fs.accessSync(artifactPath, fs.constants.R_OK | fs.constants.X_OK);

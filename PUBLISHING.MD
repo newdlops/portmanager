@@ -60,7 +60,8 @@ macOS may cross-compile its two architectures with `-arch`; Linux packages must
 run on a matching architecture. macOS artifacts target macOS 11.0 by default
 (`PORT_MANAGER_MACOS_DEPLOYMENT_TARGET` can change the declared baseline) and
 are ad-hoc signed after compilation. The build removes the opposite platform's
-hook and verifies every expected helper with `file`, `otool`, and `codesign`.
+hook and helpers, rejects unexpected native files, and verifies every expected
+helper with `file`, `otool`, and `codesign`.
 The Apple Silicon hook includes both `arm64` and `arm64e` slices so a system
 child that permits preload injection can use its own ABI. Helpers remain
 `arm64`; verification checks both hook slices and every slice's minimum OS.

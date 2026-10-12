@@ -124,7 +124,8 @@ case "$TARGET_SYSTEM" in
     fi
     ;;
   Linux)
-    rm -f "$OUTPUT_DIR/libportmanager_hook.dylib" "$OUTPUT_DIR/portmanager_asdf_shim" "$OUTPUT_DIR/portmanager_process_scope_shim"
+    rm -f "$OUTPUT_DIR/libportmanager_hook.dylib" "$OUTPUT_DIR/portmanager_asdf_shim" "$OUTPUT_DIR/portmanager_process_scope_shim" \
+      "$OUTPUT_DIR/portmanager_network_broker" "$OUTPUT_DIR/portmanager_network_launch"
     cc -Wall -Wextra -O2 -fPIC -shared "$HOOK_SOURCE_FILE" "$DEV_LOG_SOURCE_FILE" -ldl -o "$OUTPUT_DIR/libportmanager_hook.so"
     cc -Wall -Wextra -O2 "$TTY_INPUT_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tty_input"
     cc -Wall -Wextra -O2 -pthread "$TCP_ROUTER_SOURCE_FILE" "$PEER_PROCESS_SOURCE_FILE" "$DEV_LOG_SOURCE_FILE" "$TCP_PROXY_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tcp_router"
