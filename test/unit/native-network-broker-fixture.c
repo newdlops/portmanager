@@ -177,6 +177,9 @@ int main(int argc, char **argv) {
     phase = "listen";
     if (result == 0) result = invoke(argv[2], PM_NB_LISTEN, fd, NULL, 0, &returned);
     int original = fcntl(fd, F_GETFL, 0), control = control_socket(argv[2]);
+    /* Darwin's rights GC may change its private FMARK bit after SCM_RIGHTS.
+     * Require the socket's public I/O modes, including nonblocking, to return. */
+    const int status_mask = O_ACCMODE | O_NONBLOCK | O_APPEND | O_ASYNC | O_SYNC;
     pm_nb_request request = request_for(PM_NB_ACCEPT);
     phase = "accept-send";
     if (result == 0 && control >= 0) result = send_raw(control, &request, fd, 1); else result = -1;
@@ -191,8 +194,8 @@ int main(int argc, char **argv) {
     }
     deadline = pm_nb_client_now() + 1500;
     if (result == 0) phase = "accept-restored";
-    while (result == 0 && fcntl(fd, F_GETFL, 0) != original && pm_nb_client_now() < deadline) usleep(5000);
-    if (result == 0 && fcntl(fd, F_GETFL, 0) != original) result = -1;
+    while (result == 0 && (fcntl(fd, F_GETFL, 0) & status_mask) != (original & status_mask) && pm_nb_client_now() < deadline) usleep(5000);
+    if (result == 0 && (fcntl(fd, F_GETFL, 0) & status_mask) != (original & status_mask)) result = -1;
     if (control >= 0) close(control);
   }
   int error = errno;

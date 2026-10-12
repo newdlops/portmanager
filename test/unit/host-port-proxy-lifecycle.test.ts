@@ -223,8 +223,11 @@ for (const mode of modes) {
       const first = await f.client();
       const started = performance.now();
       first.resume();
-      await closed(first);
+      // A deliberate deadline refusal may arrive as FIN or ECONNRESET on
+      // Linux. Both must close the socket without ever opening the target.
+      await closed(first, true);
       assert.ok(performance.now() - started < 1000);
+      assert.equal(f.acceptedTargets, 0);
       const second = await f.client();
       const response = collect(second);
       second.end("fresh");
@@ -403,13 +406,20 @@ function collect(socket: net.Socket): Promise<Buffer> {
   });
 }
 
-async function closed(socket: net.Socket): Promise<void> {
+async function closed(socket: net.Socket, allowReset = false): Promise<void> {
   if (socket.closed) return;
+  const closing = new Promise<void>((resolve, reject) => {
+    const onError = (error: NodeJS.ErrnoException) => {
+      if (!allowReset || error.code !== "ECONNRESET") reject(error);
+    };
+    socket.on("error", onError);
+    socket.once("close", () => { socket.off("error", onError); resolve(); });
+  });
   // These clients deliberately allow half-close. A refusal/timeout arrives
   // as FIN, so acknowledge it rather than waiting with our write half open.
   socket.once("end", () => socket.end());
   socket.resume();
-  await once(socket, "close");
+  await closing;
 }
 
 function listen(server: net.Server, port: number): Promise<void> {

@@ -84,8 +84,14 @@ case "$TARGET_SYSTEM" in
   Darwin)
     MACOS_DEPLOYMENT_TARGET="${PORT_MANAGER_MACOS_DEPLOYMENT_TARGET:-11.0}"
     DARWIN_TARGET_FLAGS="-arch $TARGET_ARCH -mmacosx-version-min=$MACOS_DEPLOYMENT_TARGET"
+    DARWIN_HOOK_FLAGS="$DARWIN_TARGET_FLAGS"
+    # System children can use arm64e when the OS permits preload injection.
+    # Keep arm64 for ordinary runtimes and supply both slices in the hook only.
+    if [ "$TARGET_ARCH" = "arm64" ]; then
+      DARWIN_HOOK_FLAGS="$DARWIN_HOOK_FLAGS -arch arm64e"
+    fi
     rm -f "$OUTPUT_DIR/libportmanager_hook.so"
-    cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS -dynamiclib "$HOOK_SOURCE_FILE" "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/libportmanager_hook.dylib"
+    cc -Wall -Wextra -O2 $DARWIN_HOOK_FLAGS -dynamiclib "$HOOK_SOURCE_FILE" "$DEV_LOG_SOURCE_FILE" -o "$OUTPUT_DIR/libportmanager_hook.dylib"
     cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$ASDF_SHIM_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_asdf_shim"
     cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$PROCESS_SCOPE_SHIM_SOURCE_FILE" "$PEER_PROCESS_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_process_scope_shim"
     cc -Wall -Wextra -O2 $DARWIN_TARGET_FLAGS "$TTY_INPUT_SOURCE_FILE" -o "$OUTPUT_DIR/portmanager_tty_input"

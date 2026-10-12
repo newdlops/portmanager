@@ -318,6 +318,11 @@ static int pm_send_response(pm_client *client, const pm_request *request, int ok
 
   if (result == 0) {
     result = pm_output_send(client->output, message.data, message.length, pm_monotonic_milliseconds());
+    /* Small hook replies should reach a writable peer before a large accept
+     * burst delays the output cursor. This never polls or waits: EAGAIN leaves
+     * the bounded queue and its original expiry responsible for the response. */
+    if (result == 0 && message.length <= PM_CLIENT_READ_CHUNK &&
+        pm_output_flush(client->output, PM_CLIENT_READ_CHUNK) < 0) result = -1;
   }
 
   pm_buffer_free(&message);

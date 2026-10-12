@@ -51,7 +51,13 @@ for (const name of expected) {
   }
 
   if (target.startsWith("darwin-")) {
-    const loadCommands = execFileSync("otool", ["-l", artifactPath], { encoding: "utf8" });
+    const slices = execFileSync("lipo", ["-archs", artifactPath], { encoding: "utf8" }).trim().split(/\s+/);
+    const requiredSlice = target === "darwin-arm64" ? "arm64" : "x86_64";
+    if (!slices.includes(requiredSlice) ||
+        (target === "darwin-arm64" && name === "libportmanager_hook.dylib" && !slices.includes("arm64e"))) {
+      throw new Error(`${name} is missing a required ${target} slice: ${slices.join(", ")}.`);
+    }
+    const loadCommands = execFileSync("otool", ["-arch", "all", "-l", artifactPath], { encoding: "utf8" });
     const minVersions = [...loadCommands.matchAll(/\bminos\s+([0-9.]+)/g)].map((match) => match[1]);
     const deploymentTarget = process.env.PORT_MANAGER_MACOS_DEPLOYMENT_TARGET ?? "11.0";
     if (minVersions.length === 0 || minVersions.some((version) => compareVersions(version, deploymentTarget) > 0)) {

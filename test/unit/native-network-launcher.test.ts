@@ -52,7 +52,8 @@ test("protected launcher confirms kernel policy, drops inherited authority and s
     execFileSync("cc", ["-Wall", "-Wextra", "-Werror", "-O2", path.join(source, input), ...dependencies,
       path.join(source, "native/shared/pm_dev_log.c"), "-o", output]);
   }
-  execFileSync("cc", ["-Wall", "-Wextra", "-O2", "-dynamiclib", path.join(source, "native/hook/portmanager_hook.c"),
+  execFileSync("cc", ["-Wall", "-Wextra", "-O2", "-dynamiclib",
+    ...(process.arch === "arm64" ? ["-arch", "arm64", "-arch", "arm64e"] : []), path.join(source, "native/hook/portmanager_hook.c"),
     path.join(source, "native/shared/pm_dev_log.c"), "-o", hookPath]);
   const socketPath = path.join(sockets, "a.sock");
   const environment: NodeJS.ProcessEnv = { ...process.env, PORT_MANAGER_DEV_LOG: log,

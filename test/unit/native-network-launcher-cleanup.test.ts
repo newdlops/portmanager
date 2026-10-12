@@ -38,7 +38,8 @@ test("supervisor reclaims escaped and churning descendants before returning or r
   compile(["native/network-broker/portmanager_network_broker.c", "native/agent/portmanager_agent_json.c", "native/shared/pm_dev_log.c"], broker);
   compile(["test/unit/native-network-launcher-cleanup-fixture.c"], fixture);
   compile(["native/process-lookup/portmanager_process_lookup.c"], identity);
-  compile(["native/hook/portmanager_hook.c", "native/shared/pm_dev_log.c"], hook, ["-dynamiclib", "-Wno-unused-function"]);
+  compile(["native/hook/portmanager_hook.c", "native/shared/pm_dev_log.c"], hook, ["-dynamiclib", "-Wno-unused-function",
+    ...(process.arch === "arm64" ? ["-arch", "arm64", "-arch", "arm64e"] : [])]);
   const environment: NodeJS.ProcessEnv = { ...process.env, PORT_MANAGER_HOOK_DISABLED: "1", PORT_MANAGER_DEV_LOG: log };
   delete environment.DYLD_INSERT_LIBRARIES; delete environment.LD_PRELOAD; delete environment.BASH_ENV; delete environment.ENV;
   assert.equal((await run(fixture, ["generation"], { env: environment, timeout: 3000 })).stdout.trim(), "generation-ok");

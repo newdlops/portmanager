@@ -35,7 +35,8 @@ test("fixed-scope broker performs TCP operations for a kernel-restricted process
   execFileSync("cc", ["-Wall", "-Wextra", "-Werror", "-O2", path.join(source, "native/network-broker/portmanager_network_broker.c"),
     path.join(source, "native/shared/pm_dev_log.c"), path.join(source, "native/agent/portmanager_agent_json.c"), "-o", brokerPath]);
   execFileSync("cc", ["-Wall", "-Wextra", "-Werror", "-O2", path.join(source, "test/unit/native-network-broker-fixture.c"), "-o", fixturePath]);
-  execFileSync("cc", ["-Wall", "-Wextra", "-O2", "-dynamiclib", path.join(source, "native/hook/portmanager_hook.c"),
+  execFileSync("cc", ["-Wall", "-Wextra", "-O2", "-dynamiclib",
+    ...(process.arch === "arm64" ? ["-arch", "arm64", "-arch", "arm64e"] : []), path.join(source, "native/hook/portmanager_hook.c"),
     path.join(source, "native/shared/pm_dev_log.c"), "-o", hookPath]);
   // Use the existing host loopback as this synthetic realm. Policy decisions
   // against other aliases do not require adding or changing real lo0 aliases.
