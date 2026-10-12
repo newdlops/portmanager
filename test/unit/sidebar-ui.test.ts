@@ -571,6 +571,15 @@ test("root rows list networks directly and keep presentation groups out of drag 
     "Maintenance",
   ]);
   assert.equal(systemGroups.every((item) => item.collapsibleState === 1), true);
+  const healthRows = provider.getChildren(systemGroups[0] as never) as Array<{
+    label: string; command?: { command: string }; contextValue: string;
+  }>;
+  const daemonActions = healthRows.filter((item) => /^portManager\.(start|restart|stop)Daemon$/.test(item.command?.command ?? ""));
+  assert.deepEqual(daemonActions.map((item) => [item.label, item.command?.command, item.contextValue]), [
+    ["Start Daemon", "portManager.startDaemon", "action"],
+    ["Restart Daemon", "portManager.restartDaemon", "action"],
+    ["Stop Daemon", "portManager.stopDaemon", "action"],
+  ], "daemon commands hidden from the palette must remain reachable from System → Health");
   const activityRows = provider.getChildren(systemGroups[3] as never) as Array<{ label: string }>;
   assert.deepEqual(activityRows.map((item) => item.label), ["No activity"]);
 
@@ -811,7 +820,9 @@ test("sidebar empty summaries and daemon fallback tooltips remain explicit", () 
     systemGroups.map((item) => item.description),
     ["Running", "Unsupported", "No terminals or runtimes", "No activity", "3 actions"],
   );
-  const healthRows = provider.getChildren(systemGroups[0] as never) as Array<{ label: string; tooltip: { value: string } }>;
+  const healthRows = provider.getChildren(systemGroups[0] as never) as Array<{
+    label: string; tooltip: { value: string }; command?: { command: string };
+  }>;
   assert.deepEqual(
     healthRows.map((item) => item.label),
     [
@@ -819,6 +830,9 @@ test("sidebar empty summaries and daemon fallback tooltips remain explicit", () 
       "Make This Window Owner",
       "This Window PID",
       "Status",
+      "Start Daemon",
+      "Restart Daemon",
+      "Stop Daemon",
       "Version",
       "PID",
       "Listeners",
@@ -831,6 +845,8 @@ test("sidebar empty summaries and daemon fallback tooltips remain explicit", () 
   );
   const status = healthRows.find((item) => item.label === "Status");
   assert.equal(status?.tooltip.value, "Status\n\nrunning");
+  assert.equal(healthRows.find((item) => item.label === "Start Daemon")?.command?.command, "portManager.startDaemon",
+    "worker windows retain a usable daemon start entry point");
   const browserRows = provider.getChildren(systemGroups[1] as never) as Array<{ label: string }>;
   assert.deepEqual(browserRows.map((item) => item.label), ["Browser DNS"]);
   const activityRows = provider.getChildren(systemGroups[3] as never) as Array<{ tooltip: { value: string } }>;

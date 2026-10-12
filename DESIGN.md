@@ -38,6 +38,10 @@ ownership themselves. The view toolbar holds the primary actions; raw network
 creation lives in its overflow menu. Command titles omit the "Port Manager:"
 prefix because `category` already renders it in the Command Palette.
 
+Daemon start, restart, and stop remain explicit leaf actions in **System →
+Health**, beside its status. Start also reconnects an already-running daemon
+from a worker window; restart and stop use the command's owner-transfer gate.
+
 ## State at a glance
 
 Descriptions use `<state>[ · <count>…]`. A network reads `This window`,

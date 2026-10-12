@@ -1050,6 +1050,11 @@ function buildSystemGroupItems(
     ...buildOwnerUiActionRows(snapshot.controlPlane),
     new DaemonStatusTreeItem("This Window PID", String(snapshot.controlPlane?.currentPid ?? process.pid), "window"),
     new DaemonStatusTreeItem("Status", daemon.status, daemon.status === "running" ? "pass" : "warning"),
+    // Keep the daemon entry points beside its status; the old Actions section
+    // is no longer rendered and these commands are hidden in the palette.
+    new ActionTreeItem("Start Daemon", "portManager.startDaemon", "server-process"),
+    new ActionTreeItem("Restart Daemon", "portManager.restartDaemon", "debug-restart", undefined, undefined, ownerAction),
+    new ActionTreeItem("Stop Daemon", "portManager.stopDaemon", "debug-disconnect", undefined, undefined, ownerAction),
     new DaemonStatusTreeItem(
       "Version",
       formatDaemonVersionDescription(daemon),

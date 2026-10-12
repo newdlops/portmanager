@@ -262,7 +262,9 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.openHostPortExposureUrl", (argument) =>
       this.openHostPortExposureUrl(argument),
     );
-    this.registerCommand(context, "portManager.startDaemon", () => this.startDaemon(), ownerCommand);
+    // Connecting to the singleton is serialized by the agent client. Waiting
+    // for owner startup first also waits for unrelated Docker recovery.
+    this.registerCommand(context, "portManager.startDaemon", () => this.startDaemon());
     this.registerCommand(context, "portManager.restartDaemon", () => this.restartDaemon(), ownerCommand);
     this.registerCommand(context, "portManager.stopDaemon", () => this.stopDaemon(), ownerCommand);
     this.registerCommand(context, "portManager.showDaemonStatus", () => this.showDaemonStatus());
@@ -1277,7 +1279,7 @@ export class PortManagerCommandController implements DisposableLike {
         "Restart Daemon",
       );
 
-      if (selection === "Restart Daemon") {
+      if (selection === "Restart Daemon" && (await this.ensureControlPlaneOwnerForCommand())) {
         await this.restartDaemon({ skipConfirmation: true });
       }
       return;
@@ -2056,7 +2058,9 @@ export class PortManagerCommandController implements DisposableLike {
     const profileOptions: ManagedShellProfileOptions = {
       preludeLine: buildShellProfileSourceLine(profilePreludeScriptPath),
       postludeLine: buildShellProfileSourceLine(profilePostludeScriptPath),
-      legacyLines: [legacySourceLine, buildShellProfileSourceLine(hookScriptPath)],
+      legacyPreludeLines: [buildShellProfileSourceLine(profilePreludeScriptPath, { legacy: true })],
+      legacyPostludeLines: [buildShellProfileSourceLine(profilePostludeScriptPath, { legacy: true })],
+      legacyLines: [legacySourceLine, buildShellProfileSourceLine(hookScriptPath, { legacy: true }), buildShellProfileSourceLine(hookScriptPath)],
     };
 
     await fs.mkdir(hookDirectory, { recursive: true });
@@ -4631,8 +4635,13 @@ pm() {
     return 1
   fi
 
+  unset __pm_guarded_terminal_client
   . "$__pm_attach_script"
   __pm_status=$?
+  if [ "\${__pm_guarded_terminal_client:-}" = "1" ]; then
+    unset __pm_guarded_terminal_client __pm_networks_file __pm_choice __pm_row __pm_network_id __pm_network_name __pm_attach_script
+    return $__pm_status
+  fi
   if [ "$__pm_status" -eq 0 ]; then
     __pm_load_native_hook
     __pm_runtime_shim_check
@@ -4817,8 +4826,13 @@ ${browserTlsRepairCall}  __pm_current_id="$(__pm_current_network_id 2>/dev/null 
       __pm_network_name="$(printf '%s\n' "$__pm_row" | awk -F '	' '{ print $2 }')"
       __pm_attach_script="$(printf '%s\n' "$__pm_row" | awk -F '	' '{ print $3 }')"
       if [ -n "$__pm_attach_script" ] && [ -f "$__pm_attach_script" ]; then
+        unset __pm_guarded_terminal_client
         . "$__pm_attach_script"
         __pm_status=$?
+        if [ "\${__pm_guarded_terminal_client:-}" = "1" ]; then
+          unset __pm_guarded_terminal_client __pm_current_id __pm_networks_file __pm_row __pm_network_name __pm_attach_script
+          return $__pm_status
+        fi
         if [ "$__pm_status" -eq 0 ]; then
           __pm_load_native_hook
           __pm_runtime_shim_check

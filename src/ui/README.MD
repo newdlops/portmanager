@@ -12,6 +12,7 @@ Port Manager의 VS Code 사용자 인터페이스를 담당한다.
 - 네트워크 명령을 인라인 버튼과 그룹화된 context menu로 노출 (action row 없음)
 - 레거시 관리형 프로세스 UI를 기본 화면에서 숨김
 - Tree item context value와 command 연결
+- `System → Health`에서 데몬 시작·재시작·종료와 현재 실행 상태 제공
 
 ## 주요 진입점
 
