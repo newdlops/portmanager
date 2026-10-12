@@ -4,8 +4,32 @@ All notable changes to Port Manager are documented in this file.
 
 ## Unreleased
 
+## 0.0.8267
+
+- Hand terminal foreground control from the guarded shell to its existing supervisor's host menu and back. Fix real TTY menus failing with `setRawMode EIO` or `read EIO`, and preserve Enter/Ctrl+C cancellation, shell job control, and scope isolation without starting another native helper.
+
+## 0.0.8266
+
+- Restore the terminal `pm` network selector, help, status, version, doctor and route commands inside guarded shells, and restore the `Port Manager: <network>` terminal title.
+- Keep the current shell on menu cancellation or failed replacement. Host-side keyboard input or a VS Code profile's Quick Pick selects scope; workload menu markers never carry controller authority. Preserve the terminal startup timeout and guarded profile fixes.
+
+## 0.0.8265
+
+- Restore Start, Restart, and Stop Daemon actions beside status in System → Health after the former Actions section was removed. Start remains available from worker windows without taking ownership.
+
+## 0.0.8264
+
+- Migrate complete older PM profile blocks to guarded source lines so an existing install does not reopen protected host startup files from a network shell.
+
+## 0.0.8263
+
+- Start guarded terminals from the approved broker route snapshot without blocking on forced legacy Compose recovery or Docker discovery.
+- Let Start Daemon connect from any window without waiting for the control-plane owner's full startup recovery. Restart and stop still require ownership.
+
 ## 0.0.8262
 
+- Preserve the original shell when `pm <name>` fails or its guarded child exits, bound external terminal preparation to 30 seconds, and report premature controller disconnects. Explicit terminal working directories are shared even when the controller window belongs to another project.
+- Bootstrap guarded shells without reopening protected host PM profiles. Provide local `pm current` and `pm detach` commands; network changes use the original prompt or trusted VS Code UI.
 - Keep the process owner alive when a command cannot spawn, including a missing working directory, and preserve the original launch error.
 - Prevent delayed startup failures and canceled terminal switches from closing a replacement shell. Terminal disposal now waits for socket closure before returning its resource budget.
 - Retry macOS launcher verification after transient resource, executable, or artifact failures instead of retaining a rejected verification promise until the window reloads.
