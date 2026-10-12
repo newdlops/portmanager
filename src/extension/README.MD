@@ -13,7 +13,7 @@ VS Code 확장의 활성화 지점과 명령 등록을 담당한다.
 - Logical Network service 조립과 VS Code global state persistence
 - Logical Network 생성 시 Linux namespace/Borrowed Network runtime 선택 조정
 - 선택된 터미널에 network namespace attach 명령 또는 native hook 환경 주입
-- 보호된 VS Code profile의 `pm` 메뉴 요청을 기존 Quick Pick과 scoped 터미널 전환으로 연결
+- 기존 호스트 셸의 `pm` 메뉴·네트워크 전환·터미널 제목을 유지
 - VS Code 터미널 listen 실패 감지와 라우팅 재실행 제안은 legacy recovery path로 유지
 
 ## 주요 진입점
@@ -38,7 +38,9 @@ VS Code 확장의 활성화 지점과 명령 등록을 담당한다.
 ## 주의사항
 
 이 모듈은 여러 계층을 조립할 수 있지만 도메인 판단 로직을 직접 구현하지 않는다.
-보호 터미널 시작은 broker에 현재 승인된 목적지를 직접 전달하므로 레거시 Compose override/TSV 복구를 기다리지 않는다. Docker의 강제 조회는 기존 복구·갱신 경로에서 수행한다. `Start Daemon`은 singleton client의 시작 직렬화를 사용하고 전체 owner startup을 기다리지 않는다. 재시작·종료의 owner 확인은 유지한다.
+macOS 기본 실행은 사용자 호스트 셸에 협조적 native hook을 주입한다. 커널 보호 셸 시제품은 기본 profile·`pm`·attach에 연결하지 않는다. 이전 버전이 지정한 `Port Manager: Logical Network` 기본 profile만 저장된 사용자 값으로 복구하며, 이후 사용자가 고른 다른 profile은 보존한다. XDG cache/data/state와 TMPDIR을 덮어쓰지 않는다.
+일반 터미널 스크립트 생성은 기존 Compose projection을 재사용하고 강제 Docker 조회를 기다리지 않는다. 실제 attach·명시적 복구와 owner 갱신은 기존 reconciliation을 유지한다. `Start Daemon`은 singleton client의 시작 직렬화를 사용하고 전체 owner startup을 기다리지 않는다. 재시작·종료의 owner 확인은 유지한다.
+package-bin 셸 래퍼와 native runtime resolver는 stamp metadata로 모든 PM shim 세대를 건너뛴다. 셸 래퍼는 PATH마다 `cd`/`pwd`·`sed` 프로세스를 만들지 않고 builtin으로 헤더를 확인한다. native resolver는 실제 실행 파일의 논리 경로를 보존해 `.venv/bin/python`의 가상환경과 설치된 모듈을 유지한다.
 DNS publisher는 registry 이벤트뿐 아니라 browser URL/proxy 갱신에서도 durable shared-state의 레코드·revision·경로를 함께 사용한다. 새 revision과 fence rejection 뒤의 최신 문서는 이전 실패의 backoff를 기다리지 않고 즉시 전송하며, 동일 revision의 실패는 계속 backoff한다. TCP browser listener 준비는 DNS push 완료를 기다리지 않는다. 두 경로를 직렬화하면 이미 정상 해석된 주소에서도 새 포트 연결이 늦어진다.
 Browser route listener는 연결 첫 바이트로 HTTP/TLS/raw를 구분하므로 프로젝트 설정 파일로 프로토콜을 추측하지 않는다. 기존 route hint 파일 조회는 결과가 사용되지 않아 제거했고, 필요한 route shard와 managed-process 명령 조회는 동시에 수행한다. 공유 dev log의 `ts-browser-proxy` 항목으로 준비 시간과 bind 시간을 따로 확인할 수 있다.
 Browser bind retry와 route-file watcher는 같은 proxy sync coalescer로 들어온다. 자동 재시도도 lease를 확인하고 최신 route/endpoint 상태로 준비한 뒤 owner 정보를 게시한다. 생성 route 파일 watcher는 browser owner만 유지하며, 내용이 같은 heartbeat와 관련 없는 파일을 걸러낸다. owner demotion/dispose에서 watcher와 retry를 함께 해제해 이전 창의 지연 작업이 새 창의 listener를 침범하지 않게 한다.

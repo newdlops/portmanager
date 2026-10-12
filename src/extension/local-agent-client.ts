@@ -756,7 +756,9 @@ export class LocalAgentClient implements PortManagerProcessService {
       this.childProcess = spawn(
         nativeAgentPath,
         ["--socket", socketPath, "--route-table", getDefaultRouteTablePath(), "--agent-main", agentMainPath,
-          "--controller-token-file", getAgentControllerTokenPath(socketPath), "--trusted-tools"],
+          // Host terminals use cooperative hook/environment recovery. The
+          // controller-only scope mode belongs to the inactive guarded fixture.
+          "--controller-token-file", getAgentControllerTokenPath(socketPath)],
         {
           detached: true,
           env: this.buildAgentEnvironment(),

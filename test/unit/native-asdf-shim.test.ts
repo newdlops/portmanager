@@ -23,6 +23,31 @@ const projectRoot = path.resolve(__dirname, "../../..");
 const launcherPath = path.join(projectRoot, "media/native/portmanager_asdf_shim");
 const hookPath = path.join(projectRoot, "media/native/libportmanager_hook.dylib");
 
+/** Python finds pyvenv.cfg relative to the original executable spelling. The
+ * kernel may follow its symlink; the PATH adapter must preserve that spelling. */
+test("runtime launcher preserves virtual-environment identity and installed modules", {
+  skip: process.platform !== "darwin", timeout: 15_000,
+}, context => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pm-venv-identity-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const clean: NodeJS.ProcessEnv = { PATH: "/opt/homebrew/bin:/usr/bin:/bin", HOME: root, PORT_MANAGER_HOOK_DISABLED: "1" };
+  const python = fs.existsSync("/opt/homebrew/bin/python3") ? "/opt/homebrew/bin/python3" : "/usr/bin/python3";
+  const venv = path.join(root, ".venv");
+  const create = spawnSync(python, ["-m", "venv", "--without-pip", venv], { env: clean, encoding: "utf8", timeout: 10_000 });
+  assert.equal(create.status, 0, create.stderr);
+  const executable = path.join(venv, "bin", "python3");
+  const baseline = spawnSync(executable, ["-c", "import sys,sysconfig,json;print(json.dumps({'prefix':sys.prefix,'site':sysconfig.get_path('purelib')}))"], { env: clean, encoding: "utf8" });
+  assert.equal(baseline.status, 0, baseline.stderr);
+  const expected = JSON.parse(baseline.stdout) as { prefix: string; site: string };
+  fs.writeFileSync(path.join(expected.site, "pm_venv_fixture.py"), "value = 'installed-in-venv'\n");
+  const result = spawnSync(launcherPath, ["-c", "import sys,pm_venv_fixture,json;print(json.dumps({'prefix':sys.prefix,'value':pm_venv_fixture.value}))"], {
+    cwd: root, env: { ...clean, PATH: `${path.join(venv, "bin")}:${clean.PATH}`, PORT_MANAGER_ASDF_TOOL_NAME: "python3" },
+    encoding: "utf8", timeout: 5000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { prefix: expected.prefix, value: "installed-in-venv" });
+});
+
 test("runtime launcher resolves the real runtime as the next PATH entry, manager agnostic", () => {
   const source = fs.readFileSync(sourcePath, "utf8");
 

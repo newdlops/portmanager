@@ -1907,7 +1907,8 @@ test("stale routing repair reuses readable compose overrides", () => {
   assert.equal(windowAttachBody.includes("await this.ensureNetworkComposeRoutingArtifacts(networkId);"), true);
   assert.equal(windowAttachBody.includes("await this.reloadSharedNetworkState();"), true);
   assert.equal(windowAttachBody.includes("startControlPlaneOwnerIfAvailable"), false);
-  assert.equal(scriptBody.includes("await this.ensureNetworkComposeRoutingArtifacts(networkId);"), true);
+  assert.equal(scriptBody.includes("await this.ensureNetworkComposeRoutingArtifacts(networkId);"), false,
+    "source generation reuses the current projection rather than waiting for Docker on each pm");
   assert.equal(helperBody.includes("private async reconcileComposeOverrideFileForAttachment("), true);
   assert.equal(helperBody.includes("recoverToStorageDirectory: true"), true);
   assert.equal(helperBody.includes("buildMutationlessComposeOverrideRecoveryState(attachment)"), true);

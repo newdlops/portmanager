@@ -357,19 +357,35 @@ macOS와 Windows는 Linux network namespace와 같은 per-process 네트워크 �
 
 ### 0.5 레거시 기능 상태
 
-보안 보완의 실행 조건은 호스트 파일·언어 런타임을 유지하고, 논리 네트워크 내부의
-코드가 다른 네트워크의 비공개 상태·소켓·제어 권한에 접근하지 못하게 하는 것이다.
-사용자 선택대로 소스와 기존 쓰기는 공유한다. 공유 코드 변경이 다른 네트워크의 다음
-실행에 영향을 주는 경로는 이 조건에 포함하지 않는다.
+macOS 기본 실행은 기존 호스트 셸에 Native Socket Hook을 주입하는 협조적 라우팅이다.
+`pm`과 terminal attach는 셸을 교체하지 않으며, 기존 메뉴·제목·사용자 profile과
+Docker 소켓 접근을 유지한다. XDG 저장소·캐시·상태 및 TMPDIR을 임의로 변경하지 않는다.
+같은 폴더를 여러 논리 네트워크에서 실행할 때 소스와 기존 `node_modules`·`.venv`는
+공유한다. 네트워크 전환만으로 의존성 저장소·설치 호환성 설정을 바꾸거나 모듈을
+재설치하지 않는다. 의존성을 실제로 변경한 경우의 설치 동작은 원래 패키지 관리자에 맡긴다.
+runtime resolver는 가상환경의 실행 파일 symlink 경로를 유지하고, 모듈·런타임 디렉터리는
+파일 미러 대상으로 취급하지 않는다. 이전 버전이 강제로 지정한 PM terminal profile은
+저장된 사용자 값으로 복구한다. 별도의 보호 실행 모드나 설정을 기본 기능에 추가하지 않는다.
+기본 native daemon도 협조적 훅·환경 및 실제 listener 주소로 실행 중인 서버의 라우트를
+복구한다. 보호 셸의 controller-only 식별 옵션을 기본 daemon에 적용해 호스트 서버를
+라우팅에서 제외하지 않는다. UI 명령은 유효한 control owner lease를 확보하면 필요한
+작업을 바로 수행하며, 관계없는 Docker·Compose 초기화 완료를 기다리지 않는다.
+
+#### 비활성 커널 보호 셸 시제품
+
+아래 kernel launcher·broker·보호 profile은 내부 시제품과 테스트에만 남아 있다.
+기본 `pm`, VS Code terminal profile, terminal attach에는 연결하지 않는다.
+시제품의 실행 조건은 호스트 파일·언어 런타임과 공유 소스 쓰기를 유지하면서,
+다른 네트워크의 비공개 상태·소켓·제어 권한 접근을 제한하는 것이다.
 
 현재 native hook은 협조적인 라우팅이며 그 자체가 강제 보안 경계는 아니다. macOS의
-새 보호된 terminal 경로는 커널 정책과 network ID가 고정된 broker를 제품의 SDK
-terminal profile에 연결한다. 이 경로의 검증에서는 직접 TCP, 타 네트워크 파일·Unix socket, 다른 PID의
+보호 terminal 시제품은 커널 정책과 network ID가 고정된 broker를 별도 SDK
+fixture에 연결한다. 이 경로의 검증에서는 직접 TCP, 타 네트워크 파일·Unix socket, 다른 PID의
 신호와 환경 조회를 차단하고 승인된 broker FD 및 호스트 Node·Python 실행을 허용했다.
 기존에 실행 중인 셸과 협조적 hook만 사용하는 경로는 이 커널 경계를 상속하지 않는다. 숫자 `127.x` 주소별 Seatbelt
 규칙이 지원되지 않으므로 TCP는 네트워크 ID가 고정된 broker에서 중계해야 한다.
 
-제품의 native launcher는 보호된 profile을 읽고 상속 FD·기존 권한 환경을 정리한
+시제품의 native launcher는 보호된 profile을 읽고 상속 FD·기존 권한 환경을 정리한
 뒤, 실제 커널 거절과 broker transport를 확인한다. 표준 IO만 명시적으로 상속하는
 SETEXEC로 같은 PID를 유지하며, private socketpair의 record와 exec EOF로 시작을 확인한다.
 실제 PTY에서는 해당 terminal device만 허용하고 자기·자식 신호와 자기 scheduling만
@@ -383,6 +399,13 @@ launcher와 broker를 포함한다. 시작 확인은 parent 전용 `--ready-file
 namespace 미러의 nofollow 탐색에는 공통 부모의 directory 읽기만
 허용하고 기존 부모에 불필요한 mkdir를 시도하지 않는다. 타 namespace 파일과 키는 계속
 거절한다.
+
+보호 터미널은 여러 확장 세대의 PATH를 상속해도 현재 runtime shim만 사용하며,
+다른 PM shim의 stamp metadata를 확인해 보호된 호스트 래퍼를 건너뛴다. 의존성
+설치도 고정 broker 연결 훅을 유지한다. 사용자 cache/data/state/temp 환경과
+호스트 HOME 및 설정 읽기는 유지한다.
+공개 OS build 정보와 macOS trustd 인증서 검증을 허용해 일반 host runtime의
+초기화 및 HTTPS 설치를 지원한다. 다른 namespace·controller 키·raw IP 거절은 유지한다.
 
 종료 시에는 private ownership·completion record와 실제 자식 회수를 확인한 뒤
 예약을 반환한다. 정상 종료와 supervisor 강제 종료 후 회수는 별도로 검증한다.
@@ -424,7 +447,7 @@ PID-only tracker보다 먼저 조회하고, 실패·tuple 불일치는 기존 �
 실제 peer의 동일 tuple 승인을 다시 요구한다. supervisor는 소유한 idle 자식을 주기적으로
 재등록한다. 합성 커널 실행에서 관측 전 orphan과 데몬 교체 후 두 복구 경로를 확인했다.
 controller 대기는 단일 nonblocking FD·고정 frame·절대 기한 안에서 처리하고, 취소·종료
-시 회수한다. 현재 제품의 실제 terminal attach와 공유 helper/자원 한도에 연결한
+시 회수한다. 시제품의 terminal attach와 공유 helper/자원 한도에 연결한
 검증을 완료했다. 후보 단계의 합성 결과와 제품 검증 결과는 별도로 기록한다.
 
 launcher의 `--ready-file`은 controller와 함께 쓰며, 보호된 session 폴더에 supervisor와
@@ -447,7 +470,7 @@ VS Code profile/PTY 전달은 아직 PID가 없는 controller 소유 단계로 �
 취소·만료에도 동일한 자손 회수 증명이 필요하고, 포트·파일 권한이나 공통 예산을
 완화하지 않는다. 다른 terminal control 경로의 준비 기한은 그대로 유지한다.
 
-외부 `pm <name>` 연결은 원래 셸을 유지한 자식 client에서 수행한다. 준비 응답이
+시제품의 외부 `pm <name>` 연결은 원래 셸을 유지한 자식 client에서 수행한다. 준비 응답이
 30초 안에 오지 않거나 controller가 연결을 끊으면 오류를 표시하고 원래 프롬프트로
 복귀한다. 보호된 셸은 자기 namespace에서 bootstrap하고 전역 PM profile을 다시
 읽지 않는다. namespace bootstrap이 `Port Manager: <network>` 제목과 `pm` 명령을
@@ -480,7 +503,7 @@ workload는 이 supervisor를 signal하거나 acknowledgement를 읽고 쓰지 �
 닫기·SDK 종료 경로는 matching 완료 기록과 실제 자손 소멸을 확인한 뒤 예약을 반환한다.
 설치된 VSIX 검증에서 일반 SDK 닫기와 supervisor 강제 종료 후 orphan 회수를 각각 확인했다.
 
-제품 경로와 설치된 패키지의 회귀 검증에서는 다음 조건을 계속 확인한다.
+비활성 시제품의 회귀 검증에서는 다음 조건을 계속 확인한다.
 
 - 전용 broker가 kernel peer PID와 불변 네트워크 ID를 사용하고 관리 RPC를 거부할 것
 - route 복구와 proxy 귀속이 위조 가능한 환경값 대신 인증된 프로세스 scope를 사용할 것

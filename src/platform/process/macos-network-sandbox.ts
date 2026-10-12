@@ -42,7 +42,9 @@ export function buildMacosNetworkSandboxProfile(scope: MacosNetworkSandboxScope)
     "(allow process-exec process-fork)",
     "(deny process-info*)",
     "(deny sysctl-read (sysctl-name \"kern.procargs\") (sysctl-name \"kern.procargs2\"))",
-    "(allow sysctl-read (sysctl-name-regex #\"^hw[.]\") (sysctl-name \"kern.osrelease\") (sysctl-name \"kern.ostype\") (sysctl-name \"kern.osversion\") (sysctl-name \"kern.osproductversion\") (sysctl-name \"kern.hostname\") (sysctl-name \"kern.maxfilesperproc\"))",
+    // uname/libuv needs the public kernel build string as well as osrelease.
+    // Denying it aborts Node versions that initialize node:os through a fast API.
+    "(allow sysctl-read (sysctl-name-regex #\"^hw[.]\") (sysctl-name \"kern.osrelease\") (sysctl-name \"kern.ostype\") (sysctl-name \"kern.osversion\") (sysctl-name \"kern.version\") (sysctl-name \"kern.osproductversion\") (sysctl-name \"kern.hostname\") (sysctl-name \"kern.maxfilesperproc\"))",
     "(allow signal (target self) (target children))",
     "(allow process-info-pidinfo (target self))",
     "(allow system-sched (target self))",
@@ -54,6 +56,9 @@ export function buildMacosNetworkSandboxProfile(scope: MacosNetworkSandboxScope)
     ...namespaceParents.map(directory => `(allow file-read-data (require-all (vnode-type DIRECTORY) (literal ${profileString(directory)})))`),
     "(allow file-read-data file-write-data (literal \"/dev/null\"))",
     "(allow mach-lookup (global-name \"com.apple.logd\") (global-name \"com.apple.system.logger\") (global-name \"com.apple.system.opendirectoryd.libinfo\"))",
+    // Native TLS clients validate server certificates through these trustd
+    // services. This permits trust evaluation; network sockets stay brokered.
+    "(allow mach-lookup (global-name \"com.apple.trustd\") (global-name \"com.apple.trustd.agent\"))",
     // libc's system DNS client uses this canonical Unix endpoint. Granting
     // that service preserves host DNS without allowing raw IP or other Unix peers.
     "(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))",

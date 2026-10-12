@@ -1100,6 +1100,8 @@ static void pm_file_substitution_init(void) {
 }
 
 /* Builds the substitute candidate for a path; 0 when inside the root. */
+static int pm_file_substitution_relative_is_excluded(const char *relative);
+
 static int pm_file_substitution_candidate_for_context(
   const char *path,
   char *absolute,
@@ -1116,6 +1118,10 @@ static int pm_file_substitution_candidate_for_context(
       path == NULL || path[0] == '\0') {
     return -1;
   }
+  /* Runtime/module trees are always shared infrastructure, even if an old
+   * mirror exists. Reject them before getcwd, path construction and mirror stat
+   * so thousands of module reads keep the host's original directory semantics. */
+  if (pm_file_substitution_relative_is_excluded(path)) return -1;
   if (path[0] == '/') {
     if (strlen(path) >= absolute_size) {
       return -1;

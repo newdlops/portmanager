@@ -59,7 +59,7 @@ test("open-terminal prepares routing before creation and queues attachment befor
   assert.equal(body.includes("terminal.dispose()"), true);
 });
 
-test("open-terminal delegates macOS launch to the guarded owner and otherwise attaches a workspace terminal", async () => {
+test("open-terminal attaches the user's existing host shell on every platform", async () => {
   const events: string[] = [];
   const sent: Array<{ readonly text: string; readonly addNewLine?: boolean }> = [];
   const terminalOptions: Array<{ readonly name?: string; readonly cwd?: { readonly fsPath: string } }> = [];
@@ -91,10 +91,7 @@ test("open-terminal delegates macOS launch to the guarded owner and otherwise at
     processService: {} as never,
     networkService: {
       getSnapshot: () => ({ networks: [network] }),
-      openGuardedNetworkTerminal: async (networkId: string) => {
-        assert.equal(networkId, network.id);
-        events.push("guarded");
-      },
+      openGuardedNetworkTerminal: async () => { throw new Error("Normal terminal startup must not install a kernel policy."); },
       createTerminalRoutingScript: async (networkId: string) => {
         assert.equal(networkId, network.id);
         events.push("script");
@@ -106,15 +103,9 @@ test("open-terminal delegates macOS launch to the guarded owner and otherwise at
 
   await controller.openNetworkTerminal(network);
 
-  if (process.platform === "darwin") {
-    assert.deepEqual(events, ["guarded", "refresh"]);
-    assert.deepEqual(terminalOptions, []);
-    assert.deepEqual(sent, []);
-  } else {
-    assert.deepEqual(events, ["script", "create", "send", "show"]);
-    assert.deepEqual(terminalOptions, [{ name: "Port Manager: Beta Network", cwd: workspaceUri }]);
-    assert.deepEqual(sent, [{ text: ". /tmp/attach-beta.sh", addNewLine: true }]);
-  }
+  assert.deepEqual(events, ["script", "create", "send", "show"]);
+  assert.deepEqual(terminalOptions, [{ name: "Port Manager: Beta Network", cwd: workspaceUri }]);
+  assert.deepEqual(sent, [{ text: ". /tmp/attach-beta.sh", addNewLine: true }]);
 });
 
 function createVscodeFixture(input: {

@@ -104,6 +104,18 @@ test("native env and file readers use stable identities even when display names 
   assert.equal(run("read", "network-a", "same", "worker.pid"), "state-a");
   assert.equal(run("read", "network-b", "same", "worker.pid"), "state-b");
   assert.throws(() => run("read", "network-c", "same", "worker.pid"), "a clean network must not read another network's symlink window");
+  // Even pre-existing mirrors cannot replace module/runtime infrastructure.
+  // These paths must retain normal symlinks and avoid mirror lookup on each IO.
+  for (const infrastructure of ["node_modules", ".venv", "venv", ".git", "__pycache__"]) {
+    const original = path.join(directory, infrastructure, "fixture.txt");
+    const mirror = path.join(networkNamespacePaths(directory, "network-a").filesDirectory, infrastructure, "fixture.txt");
+    fs.mkdirSync(path.dirname(original), { recursive: true });
+    fs.mkdirSync(path.dirname(mirror), { recursive: true });
+    fs.writeFileSync(original, "host-infrastructure");
+    fs.writeFileSync(mirror, "incorrect-mirror");
+    assert.equal(run("read", "network-a", "same", `${infrastructure}/fixture.txt`), "host-infrastructure");
+    assert.equal(run("read", "network-a", "same", original), "host-infrastructure");
+  }
   const privateEnv = path.join(networkNamespacePaths(directory, "network-a").filesDirectory, ".env");
   fs.unlinkSync(privateEnv);
   fs.symlinkSync(path.join(networkNamespacePaths(directory, "network-b").filesDirectory, ".env"), privateEnv);

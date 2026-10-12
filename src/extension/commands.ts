@@ -176,20 +176,6 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.openNetworkTerminal", (argument) =>
       this.openNetworkTerminal(argument),
     ownerCommand);
-    if (process.platform === "darwin") {
-      context.subscriptions.push(vscode.window.registerTerminalProfileProvider("portManager.logicalNetworkTerminal", {
-        provideTerminalProfile: async (token) => {
-          const selectedId = this.dependencies.networkService.getGuardedDefaultNetworkId();
-          const network = selectedId === undefined ? await this.resolveNetworkArgument(undefined, "Open Terminal in Logical Network") : undefined;
-          const networkId = selectedId ?? network?.id;
-          if (networkId === undefined || token.isCancellationRequested) return undefined;
-          const options = await this.dependencies.networkService.prepareGuardedTerminalOptions(networkId);
-          token.onCancellationRequested(() => { void this.dependencies.networkService.cancelGuardedTerminalOptions(options); });
-          if (token.isCancellationRequested) { await this.dependencies.networkService.cancelGuardedTerminalOptions(options); return undefined; }
-          return new vscode.TerminalProfile(options);
-        },
-      }));
-    }
     this.registerCommand(context, "portManager.attachTerminalToNetwork", (argument) =>
       this.attachTerminalToNetwork(argument),
     ownerCommand);
@@ -526,8 +512,8 @@ export class PortManagerCommandController implements DisposableLike {
   }
 
   /**
-   * Opens a selected network through the guarded owner on macOS. Other runtimes
-   * prepare their bootstrap before terminal creation, so startup failures do
+   * Opens the user's normal host terminal and attaches its routing environment.
+   * Prepare the bootstrap before terminal creation, so startup failures do
    * not leave a terminal presented as attached without routing.
    */
   private async openNetworkTerminal(argument: unknown): Promise<void> {
@@ -536,11 +522,6 @@ export class PortManagerCommandController implements DisposableLike {
       return;
     }
 
-    if (process.platform === "darwin") {
-      await this.dependencies.networkService.openGuardedNetworkTerminal(network.id);
-      this.dependencies.treeProvider.refresh();
-      return;
-    }
     const script = await this.dependencies.networkService.createTerminalRoutingScript(network.id);
     const workspaceFolder = getPrimaryWorkspaceFolder();
     const terminal = vscode.window.createTerminal({

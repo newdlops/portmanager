@@ -6,6 +6,28 @@ Port Manager extension은 개발 서버를 논리 포트와 네트워크 별칭 
 
 이 문서는 2026-06-29 기준 읽기 전용 코드 탐색 결과를 정리한다. 코드 수정 없이 `browser-network-proxy`, logical/host TCP router, native hook/agent, route table, snapshot/sync 경로를 확인했다.
 
+## 2026-10-12 터미널 호환성 및 실행 비용 복구
+
+기본 macOS 실행을 기존 호스트 셸과 협조적 hook으로 복구했다. `pm`에서 controller의
+보호 셸 시작을 기다리지 않으며, 스크립트 생성은 기존 Compose projection을 재사용한다.
+프로젝트 저장소·캐시·TMPDIR 환경을 변경하지 않고 `.venv/bin/python`의 논리 경로도 보존한다.
+
+모듈·런타임 경로는 cwd 계산과 미러 `stat` 전에 제외한다. 실제 native hook 소스를
+컴파일한 같은-process fixture에서 모듈 파일 10,000회 open/read/close를 비교했다.
+워밍업 두 회 뒤 다섯 회의 중앙값은 기존 hook 1,026ms, 수정 hook 456ms,
+직접 호스트 읽기 358ms였다. macOS의 동시 작업 부하는 측정에 영향을 주므로 이 수치를
+전체 앱 시작 시간의 보장으로 해석하지 않는다.
+
+실제 생성된 셸 library와 attach 스크립트로 `pm` 연결은 193ms였다. 셸 PID와 제목,
+도움말, 기존 React 모듈, pnpm 10.34.5와 원래 v10 저장소, Docker 서버 조회를 확인했으며
+프로젝트 의존성을 설치하거나 `node_modules` metadata를 변경하지 않았다.
+
+추가로 임시 프로젝트에 local 의존성을 한 번 설치하고 같은 폴더를 두 network ID에서
+다시 사용했다. 두 실행 모두 재설치 요청 없이 metadata 해시와 설치된 모듈 inode를
+유지했다. 구버전의 네트워크별 `XDG_DATA_HOME`만 넣으면 저장소 불일치로 modules purge를
+요청했으며, 비TTY 거절로 실제 삭제 전에 중단됐다. 사용자 `vcm`의 새 호스트 터미널도
+원래 `~/Library/pnpm/store/v10`과 동일 metadata를 읽고 기존 React 모듈을 해석했다.
+
 ## 핵심 결론
 
 현재 구조는 기능적으로 reverse proxy에 가깝지만 nginx식 고성능 프록시 구조는 아니다.

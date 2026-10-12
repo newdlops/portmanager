@@ -21,6 +21,8 @@
 #define PM_MAX_PATH 4096
 #define PM_MAX_TEXT 512
 #define PM_RUNTIME_SHIM_DIR_ENV "PORT_MANAGER_RUNTIME_SHIM_DIR"
+/* Metadata stays visible even when a different generation's wrappers are protected. */
+#define PM_RUNTIME_SHIM_STAMP_FILE ".portmanager-shim-stamp"
 
 #if defined(__APPLE__)
 #define PM_PRELOAD_ENV "DYLD_INSERT_LIBRARIES"
@@ -584,6 +586,15 @@ static int pm_candidate_is_shell_wrapper(const char *path) {
   return strcmp(base_name, "sh") == 0 || strcmp(base_name, "dash") == 0;
 }
 
+/* A stamp needs only stat, never a read of a host-only wrapper's contents. */
+static int pm_directory_is_runtime_shim(const char *directory) {
+  char stamp_path[PM_MAX_PATH];
+  struct stat stamp;
+  int length = snprintf(stamp_path, sizeof(stamp_path), "%s/%s", directory, PM_RUNTIME_SHIM_STAMP_FILE);
+  return length > 0 && (size_t)length < sizeof(stamp_path) &&
+    stat(stamp_path, &stamp) == 0 && S_ISREG(stamp.st_mode);
+}
+
 /*
  * Resolves the real runtime by finding the next PATH entry of this launcher's
  * own name, skipping this launcher's own directory and file. This is runtime
@@ -624,6 +635,11 @@ static int pm_resolve_tool(const char *tool_name, const char *self_path, char *b
     if (shim_directory != NULL && shim_directory[0] != '\0' && pm_same_directory(directory, shim_directory)) {
       goto next_path_entry;
     }
+    /* A protected old shim can pass X_OK but fail header reads and exec.
+     * Skip every marked PM directory before probing a real runtime candidate. */
+    if (pm_directory_is_runtime_shim(directory)) {
+      goto next_path_entry;
+    }
 
     snprintf(candidate, sizeof(candidate), "%s/%s", directory, tool_name);
     if (pm_candidate_is_current_shim(candidate, self_path)) {
@@ -639,7 +655,11 @@ static int pm_resolve_tool(const char *tool_name, const char *self_path, char *b
        * still resolves.
        */
       if (!pm_candidate_is_shell_wrapper(candidate)) {
-        return pm_realpath_or_copy(candidate, buffer, size);
+        /* The executable's logical path is runtime identity: resolving a
+         * .venv/bin/python symlink first loses pyvenv.cfg and installed modules.
+         * File identity checks above already prevent re-entering this shim. */
+        int length = snprintf(buffer, size, "%s", candidate);
+        return length > 0 && (size_t)length < size ? 0 : -1;
       }
       if (fallback[0] == '\0') {
         snprintf(fallback, sizeof(fallback), "%s", candidate);
@@ -654,7 +674,8 @@ next_path_entry:
   }
 
   if (fallback[0] != '\0') {
-    return pm_realpath_or_copy(fallback, buffer, size);
+    int length = snprintf(buffer, size, "%s", fallback);
+    return length > 0 && (size_t)length < size ? 0 : -1;
   }
 
   return -1;
@@ -699,8 +720,6 @@ static void pm_resolve_self_path(const char *tool_name, const char *argv0, char 
  */
 #define PM_RUNTIME_SHIM_DEPTH_ENV "PORT_MANAGER_RUNTIME_SHIM_DEPTH"
 #define PM_RUNTIME_SHIM_DEPTH_LIMIT 24
-/* Marker file the extension writes into every generated runtime-shim directory. */
-#define PM_RUNTIME_SHIM_STAMP_FILE ".portmanager-shim-stamp"
 
 static int pm_next_runtime_shim_depth(void) {
   const char *value = getenv(PM_RUNTIME_SHIM_DEPTH_ENV);

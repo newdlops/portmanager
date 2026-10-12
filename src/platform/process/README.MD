@@ -38,16 +38,19 @@
 - `native-executable.ts`: native parser probe의 순수 timeout만 같은 1초 한도로 한 번
   재확인한다. 두 번째도 실패하거나 loader·권한·exit 계약 오류가 있으면 실패로 유지한다.
 - `network-file-scaffold.ts`: 0700 디렉터리, 0600 파일, 원자적 미교체 게시 및 symlink 거부
-- `network-terminal-control.ts` / `network-terminal-client.ts`: private host-side lazy terminal launch and controller-driven replacement; key and control FD never enter the guarded child.
+- `network-terminal-control.ts` / `network-terminal-client.ts`: 비활성 커널 보호 셸 시제품의 private host-side terminal launch와 controller-driven replacement. 기본 `pm`·attach에서는 사용하지 않는다. key와 control FD는 guarded child에 전달하지 않는다.
   `pm` 메뉴의 번호·이름 선택과 유지보수 명령은 호스트의 입력에서 읽는다. namespace의
   고정 표식은 UI 열기만 요청하고 내용은 실행하지 않는다. 취소·잘못된 선택·준비 실패는
   현재 셸을 유지하며, 메뉴 입력 handle은 CLI 종료 시 함께 닫는다.
   실제 TTY는 기존 supervisor의 private foreground acknowledgement를 확인한 뒤
   입력하고 완료 후 보호 셸에 반환한다. 별도 native helper를 시작하지 않는다.
-- `macos-network-runtime.ts`: protected artifact/profile publication, fixed-id broker ownership, trusted readiness and shared native reservations; PTY/UI stays with the extension adapter.
+- `macos-network-runtime.ts`: 비활성 커널 보호 셸 시제품의 protected artifact/profile publication, fixed-id broker ownership, trusted readiness와 shared native reservations. PTY/UI는 extension adapter가 담당한다.
   namespace bootstrap은 네트워크 제목, `pm` 도움말·상태·버전·진단·route 목록을 제공한다.
   직접 VS Code profile은 메뉴 요청을 trusted Quick Pick으로 전달한다. 진단용 route 파일은
   해당 네트워크의 승인된 목적지만 포함하고 broker policy 갱신과 함께 바뀐다.
+  사용자 HOME, XDG 저장소·캐시와 TMPDIR 환경은 그대로 유지한다.
+  후보 kernel policy는 `uname`의 공개 `kern.version`
+  조회와 native TLS의 `com.apple.trustd`/`com.apple.trustd.agent` 인증서 검증도 허용한다.
   VS Code profile delivery has a bounded 60-second handoff reservation. Once its
   actual PTY PID/birth is adopted, native readiness retains its 10-second limit;
   cancellation and expiry still require descendant cleanup before lease release.

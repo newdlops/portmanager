@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import test from "node:test";
 import ts from "typescript";
 import { browserNetworkProxyEndpointId } from "../../src/platform/ports/browser-network-proxy";
@@ -36,6 +37,46 @@ interface ClientRunner {
 }
 const Client = extract<ClientRunner>("local-agent-client.ts", "LocalAgentClient",
   ["connectionGeneration", "disposed", "refreshInFlight", "refresh"]);
+
+test("owner commands continue while unrelated Compose startup is still pending", async () => {
+  let owner: { pid: number } | undefined;
+  const pid = 4242;
+  const calls: string[] = [];
+  let release!: () => void;
+  const startupGate = new Promise<void>(resolve => { release = resolve; });
+  interface OwnerRunner {
+    ownsControlPlaneLease: boolean;
+    controlPlaneOwnerStartupInFlight?: Promise<boolean>;
+    takeControlPlaneOwnership(): Promise<boolean>;
+    startControlPlaneOwnerIfAvailable(): Promise<boolean>;
+  }
+  const Service = extract<OwnerRunner>("network-service.ts", "PortManagerNetworkService", [
+    "controlPlaneOwnerStartupInFlight", "startControlPlaneOwnerIfAvailable",
+    "startControlPlaneOwnerIfAvailableExclusive", "takeControlPlaneOwnership",
+  ], [], {
+    process: { pid }, readControlPlaneOwner: () => owner,
+    writeControlPlaneOwnerLease: () => { owner = { pid }; return true; },
+    tryAcquireControlPlaneOwnerLease: () => owner?.pid === pid,
+    devLog: () => {}, formatError: String,
+  });
+  const service = Object.assign(new Service(), {
+    ownsControlPlaneLease: false, localChangeEvents: { emit: () => {} },
+    startControlPlaneOwnerWatchers: async () => { calls.push("watchers"); },
+    startControlPlaneOwnerServices: async () => { calls.push("services"); await startupGate; },
+    demoteControlPlaneOwner: () => { throw new Error("Unexpected lease loss"); },
+  });
+  try {
+    assert.equal(await Promise.race([service.takeControlPlaneOwnership(), nextTurn().then(() => false)]), true,
+      "DNS and terminal commands must not wait for Compose startup");
+    assert.deepEqual(calls, ["watchers", "services"]);
+    assert.equal(await Promise.race([service.startControlPlaneOwnerIfAvailable(), nextTurn().then(() => false)]), true,
+      "later owner operations must also use the valid lease immediately");
+    assert.deepEqual(calls, ["watchers", "services"], "the startup pass remains single-flight");
+  } finally {
+    release();
+    await service.controlPlaneOwnerStartupInFlight;
+  }
+});
 
 test("concurrent missing targets share one refresh and immediately observe the next server", async () => {
   const Service = extract<{
