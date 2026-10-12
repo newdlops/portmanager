@@ -4,6 +4,20 @@ All notable changes to Port Manager are documented in this file.
 
 ## Unreleased
 
+## 0.0.8270
+
+- Restore cooperative native daemon recovery for host-shell servers so existing listeners regain their network routes and browser HTTPS entrypoints after daemon replacement.
+- Let UI commands proceed once their window holds the control owner lease, while unrelated Docker/Compose startup continues in the background.
+
+## 0.0.8269
+
+- Restore the original macOS host shell and cooperative PM hook for `pm`, terminal attachment, and new VS Code terminals. Remove the forced protected terminal profile and restore the previous default profile. Keep existing menus and terminal titles without replacing the shell or restricting Docker's host socket.
+- Preserve the user's package stores, caches, temporary directories, and virtual-environment executable paths. Bypass file mirrors for module/runtime directories and remove subprocesses from package-command PATH lookup to reduce startup and module-read overhead.
+
+## 0.0.8268
+
+- Fix guarded `uv`/`pnpm` commands selecting unreadable host Port Manager shims from inherited PATH. Skip every marked PM shim generation, retain broker routing during dependency installs, provide per-network XDG state and temporary directories, and allow public OS information and native TLS certificate verification. Validate real `uv sync` and `pnpm install` downloads in an isolated temporary project.
+
 ## 0.0.8267
 
 - Hand terminal foreground control from the guarded shell to its existing supervisor's host menu and back. Fix real TTY menus failing with `setRawMode EIO` or `read EIO`, and preserve Enter/Ctrl+C cancellation, shell job control, and scope isolation without starting another native helper.
