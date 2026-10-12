@@ -439,7 +439,12 @@ export class MacosNetworkRuntime {
         });
         if (result.stdout.trim() !== "1") throw new Error("Guarded launch requires private cleanup lifecycle version 1.");
       } finally { lease.release(); }
-    })();
+    })().catch(error => {
+      // A full shared budget, transient exec failure or missing artifact may
+      // recover without a window reload. Cache only successful verification.
+      this.lifecycleVerification = undefined;
+      throw error;
+    });
     return this.lifecycleVerification;
   }
 

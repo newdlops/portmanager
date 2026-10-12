@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
+import * as os from "node:os";
 import * as path from "node:path";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
@@ -13,6 +14,30 @@ import { NativeProcessLookupProvider } from "../../src/platform/process/native-p
 import { buildNodeRuntimeEnvironment } from "../../src/platform/process/node-runtime";
 import { NetworkTerminalControl } from "../../src/platform/process/network-terminal-control";
 import type { AuthenticatedProcessScope } from "../../src/agent/protocol";
+
+test("guarded terminal preparation retries lifecycle verification after temporary budget exhaustion", {
+  skip: process.platform !== "darwin", timeout: 10_000,
+}, async context => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pm-runtime-admission-")));
+  const resources = new ProxyNetworkResources();
+  const controllerFailure = new Error("fixture controller was reached");
+  let controllerAttempts = 0;
+  const runtime = new MacosNetworkRuntime({ artifactDirectory: path.resolve(__dirname, "../../../media/native"),
+    stateDirectory: path.join(root, ".portmanager"), resources,
+    agentSocketPath: path.join(root, "agent.sock"), controllerTokenFilePath: path.join(root, "controller.key"),
+    ensureController: async () => { controllerAttempts++; throw controllerFailure; },
+    resolveScope: async () => null, readIdentity: async () => undefined, signalProcess: async () => false });
+  const occupied = resources.budget.acquire({ nativeHelpers: resources.budget.limits.nativeHelpers });
+  context.after(async () => { occupied.release(); await runtime.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+  const scope = { id: "retry-admission", name: "Retry", loopbackHost: "127.0.0.1", workspaceDirectories: [root], routes: [] };
+  await assert.rejects(runtime.prepareShell(scope, root, "/bin/zsh"), { code: "EPMRESOURCE" });
+  occupied.release();
+  // Reaching the controller proves a fresh real launcher verification passed;
+  // no broker or application is started by this fixture.
+  await assert.rejects(runtime.prepareShell(scope, root, "/bin/zsh"), error => error === controllerFailure);
+  assert.equal(controllerAttempts, 1);
+  assert.ok(Object.values(resources.budget.used).every(value => value === 0));
+});
 
 /** SDK handoff and external CLI each own a complete independent fixture. The
  * deliberate SDK delay cannot consume the CLI scenario's own deadline. */

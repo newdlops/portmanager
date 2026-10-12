@@ -14,7 +14,13 @@ export interface NetworkTerminalControlOwner {
   observe(launch: NetworkShellLaunch): Promise<void>;
   close(id: string): Promise<void>;
 }
-interface ClientOwner { socket: net.Socket; launch?: NetworkShellLaunch; preparing: boolean; generation: number }
+interface ClientOwner {
+  socket: net.Socket; launch?: NetworkShellLaunch; preparing: boolean;
+  /** Latest requested UI action, including preparation that may still fail. */
+  generation: number;
+  /** Advances only when an action actually starts retiring the current shell. */
+  readinessGeneration: number;
+}
 
 /**
  * A private host-side launch seam keeps lazily sourced external commands under
@@ -49,17 +55,23 @@ export class NetworkTerminalControl {
     if (client === undefined) return false;
     const generation = ++client.generation;
     const launch = await this.owner.prepare(networkId, cwd);
+    let readinessGeneration: number | undefined;
     try {
       if (this.disposed || client.socket.destroyed || client.generation !== generation) throw new Error("Terminal switch was canceled.");
+      readinessGeneration = ++client.readinessGeneration;
       this.send(client, { type: "changing" });
       await this.owner.close(id);
+      // Closing an old supervisor can outlive a newer switch, detach or socket
+      // cancellation. Only the latest UI action may install the next owner.
+      if (this.disposed || client.socket.destroyed || client.generation !== generation) throw new Error("Terminal switch was canceled.");
       client.launch = launch;
       this.send(client, { type: "launch", launch });
       await this.owner.observe(launch);
       return true;
     } catch (error) {
       await this.owner.close(launch.id);
-      if (!client.socket.destroyed) {
+      if (!this.disposed && !client.socket.destroyed && (readinessGeneration === undefined
+        ? client.generation === generation : client.readinessGeneration === readinessGeneration)) {
         this.send(client, { type: "error", message: error instanceof Error ? error.message : String(error) });
         client.socket.end();
       }
@@ -70,9 +82,11 @@ export class NetworkTerminalControl {
   async detach(id: string): Promise<boolean> {
     const client = [...this.clients].find(row => row.launch?.id === id);
     if (client === undefined) return false;
-    client.generation++;
+    const generation = ++client.generation;
+    client.readinessGeneration++;
     this.send(client, { type: "changing" });
     await this.owner.close(id);
+    if (this.disposed || client.socket.destroyed || client.generation !== generation) return false;
     client.launch = undefined;
     this.send(client, { type: "detach" });
     return true;
@@ -83,8 +97,12 @@ export class NetworkTerminalControl {
     await this.starting?.catch(() => undefined);
     await Promise.allSettled([...this.clients].map(async client => {
       client.generation++;
+      client.readinessGeneration++;
+      // destroy() initiates close; the budget lease belongs to the socket until
+      // its actual close event, which can follow the server's close callback.
+      const closed = new Promise<void>(resolve => client.socket.once("close", () => resolve()));
       client.socket.destroy();
-      if (client.launch !== undefined) await this.owner.close(client.launch.id);
+      await Promise.all([closed, client.launch === undefined ? undefined : this.owner.close(client.launch.id)]);
     }));
     if (this.server !== undefined) await new Promise<void>(resolve => this.server!.close(() => resolve()));
     if (this.descriptor !== undefined) {
@@ -116,7 +134,7 @@ export class NetworkTerminalControl {
     if (this.disposed || this.clients.size >= 32) { socket.destroy(); return; }
     const lease = this.resources?.budget.tryAcquire({ connections: 1, controlBytes: (8 + 128) * 1024 });
     if (this.resources !== undefined && lease === undefined) { socket.destroy(); return; }
-    const client: ClientOwner = { socket, preparing: false, generation: 0 };
+    const client: ClientOwner = { socket, preparing: false, generation: 0, readinessGeneration: 0 };
     this.clients.add(client);
     const deadline = performance.now() + 10_000;
     let buffer = Buffer.alloc(0), requested = false;
@@ -125,6 +143,7 @@ export class NetworkTerminalControl {
     socket.once("close", () => {
       clearTimeout(timer);
       client.generation++;
+      client.readinessGeneration++;
       this.clients.delete(client);
       lease?.release();
       if (client.launch !== undefined) void this.owner.close(client.launch.id).catch(() => {});
@@ -144,7 +163,11 @@ export class NetworkTerminalControl {
         const supplied = Buffer.from(request.token), expected = Buffer.from(this.token);
         if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new Error("Unauthorized terminal launch.");
         client.preparing = true;
+        const readinessGeneration = client.readinessGeneration;
         void this.prepare(client, request.networkId, request.cwd).catch(error => {
+          // Replacing/detaching deliberately cancels the previous readiness
+          // check; its late rejection must not close the replacement channel.
+          if (this.disposed || socket.destroyed || client.readinessGeneration !== readinessGeneration) return;
           this.send(client, { type: "error", message: error instanceof Error ? error.message : String(error) }); socket.end();
         });
       } catch { socket.destroy(); }

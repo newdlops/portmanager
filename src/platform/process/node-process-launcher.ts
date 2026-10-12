@@ -57,36 +57,20 @@ export class NodeProcessLauncher implements ProcessLauncher {
     });
 
     return new Promise<ProcessLaunchResult>((resolve, reject) => {
-      let settled = false;
-
-      const pid = child.pid;
-
-      if (pid === undefined) {
-        reject(new Error(`Failed to spawn process for command: ${request.command}`));
-        return;
-      }
-
-      this.childrenByPid.set(pid, child);
-      this.attachLifecycleHandlers(child, pid);
-
+      // Failed spawn has no PID and reports its error asynchronously. Install
+      // the handler first so invalid cwd/shell errors reject without killing
+      // the daemon through an unhandled ChildProcess error event.
+      child.on("error", reject);
       child.once("spawn", () => {
-        if (settled) {
+        const pid = child.pid;
+        if (pid === undefined) {
+          reject(new Error(`Failed to spawn process for command: ${request.command}`));
           return;
         }
 
-        settled = true;
+        this.childrenByPid.set(pid, child);
+        this.attachLifecycleHandlers(child, pid);
         resolve({ pid, command });
-      });
-
-      child.once("error", (error) => {
-        this.childrenByPid.delete(pid);
-
-        if (settled) {
-          return;
-        }
-
-        settled = true;
-        reject(error);
       });
     });
   }
