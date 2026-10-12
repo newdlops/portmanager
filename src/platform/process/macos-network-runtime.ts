@@ -33,6 +33,9 @@ export interface NetworkRuntimeScope {
   /** Shell/SIP shims are prepared by the controller; fixed scope exports win. */
   readonly bootstrapEnvironment?: Readonly<Record<string, string>>;
   readonly knownNetworks?: readonly NamespaceNetworkIdentity[];
+  /** The host client owns text input; native VS Code profiles use its picker. */
+  readonly terminalMenu?: "host" | "vscode";
+  readonly packageVersion?: string;
 }
 
 export interface MacosNetworkRuntimeOptions {
@@ -46,6 +49,8 @@ export interface MacosNetworkRuntimeOptions {
   readonly readIdentity: (pid: number) => Promise<{ pid: number; birth: number } | undefined>;
   readonly signalProcess: (identity: { pid: number; birth: number }, signal: "SIGTERM") => Promise<boolean>;
   readonly onShellClosed?: (id: string) => void;
+  /** A workload may ask to display UI, but cannot select a replacement scope. */
+  readonly onShellMenuRequested?: (id: string) => Promise<void>;
 }
 
 /** A real terminal/PTY owner launches this command and then supplies its PID. */
@@ -56,6 +61,10 @@ export interface NetworkShellLaunch {
   readonly shellArgs: readonly string[];
   readonly env: NodeJS.ProcessEnv;
   readonly cwd: string;
+  readonly networkName?: string;
+  readonly menuRequestPath?: string;
+  /** Protected supervisor acknowledgement, never a workload-readable file. */
+  readonly terminalForegroundPath?: string;
 }
 
 interface BrokerOwner {
@@ -84,6 +93,7 @@ interface ShellOwner {
   expiry?: ReturnType<typeof setTimeout>;
   closing?: Promise<void>;
   recovery?: ChildProcess;
+  menuPending?: boolean;
 }
 
 const STARTUP_MS = 10_000;
@@ -173,7 +183,10 @@ export class MacosNetworkRuntime {
         "--", ...(path.basename(shell) === "sh"
           ? ["/bin/sh", "-c", `. ${shellQuote(bootstrap.common)}; export ENV=${shellQuote(bootstrap.common)}; exec ${shellQuote(shell)} -i`]
           : [shell, ...(path.basename(shell) === "bash" ? ["--noprofile", "--rcfile", bootstrap.bashrc, "-i"] : ["-i"])])];
-      const launch: NetworkShellLaunch = { id, networkId: scope.id, shellPath: artifacts.launcher, shellArgs: args, env, cwd: canonicalCwd };
+      const launch: NetworkShellLaunch = { id, networkId: scope.id, networkName: scope.name,
+        menuRequestPath: scope.terminalMenu === "host" ? path.join(bootstrap.directory, "menu.request") : undefined,
+        terminalForegroundPath: readyPath + ".tty",
+        shellPath: artifacts.launcher, shellArgs: args, env, cwd: canonicalCwd };
       const owner: ShellOwner = { launch, broker, lease, readyPath, readyDirectory,
         bootstrapDirectory: bootstrap.directory, preparedAt: performance.now() };
       this.shells.set(id, owner);
@@ -258,7 +271,14 @@ export class MacosNetworkRuntime {
   /** Update only controller policy; child input never selects the route file. */
   updateRoutes(networkId: string, routes: readonly NetworkRuntimeRoute[]): void {
     const broker = this.brokers.get(networkId);
-    if (broker !== undefined && !broker.exited) writePrivateAtomic(broker.routesPath, serializeRoutes(networkId, routes));
+    if (broker !== undefined && !broker.exited) {
+      writePrivateAtomic(broker.routesPath, serializeRoutes(networkId, routes));
+      for (const owner of this.shells.values()) {
+        if (owner.launch.networkId !== networkId) continue;
+        try { this.writeShellRoutes(owner.bootstrapDirectory, networkId, owner.launch.networkName ?? networkId, routes); }
+        catch (error) { devLog("network-runtime", `shell diagnostic snapshot failed: ${String(error)}`); }
+      }
+    }
   }
 
   /** Switch adapters close the previous owner before launching a fresh shell. */
@@ -438,6 +458,10 @@ export class MacosNetworkRuntime {
           env: buildNodeRuntimeEnvironment(), timeout: 2000, maxBuffer: 4096,
         });
         if (result.stdout.trim() !== "1") throw new Error("Guarded launch requires private cleanup lifecycle version 1.");
+        const menu = await promisify(execFile)(this.prepareArtifacts().launcher, ["--terminal-menu-version"], {
+          env: buildNodeRuntimeEnvironment(), timeout: 2000, maxBuffer: 4096,
+        });
+        if (menu.stdout.trim() !== "1") throw new Error("Guarded pm menus require terminal foreground handoff version 1.");
       } finally { lease.release(); }
     })().catch(error => {
       // A full shared budget, transient exec failure or missing artifact may
@@ -490,6 +514,18 @@ export class MacosNetworkRuntime {
     try {
       while (this.shells.get(owner.launch.id) === owner && owner.closing === undefined) {
         await delay(250, undefined, { ref: false });
+        // The marker carries no network, command, path or PID. Only a choice
+        // made in trusted UI can change scope; cancel leaves this shell alive.
+        const request = path.join(owner.bootstrapDirectory, "menu.request");
+        if (owner.launch.menuRequestPath === undefined && !owner.menuPending &&
+            this.options.onShellMenuRequested !== undefined && fs.lstatSync(request, { throwIfNoEntry: false })?.isFile()) {
+          owner.menuPending = true;
+          void this.options.onShellMenuRequested(owner.launch.id).catch(error =>
+            devLog("network-runtime", `terminal menu failed: ${String(error)}`)).finally(() => {
+            try { fs.rmSync(request, { force: true }); } catch { /* A changed marker is never followed. */ }
+            owner.menuPending = false;
+          });
+        }
         if (owner.supervisor !== undefined && !(await this.isCurrent(owner.supervisor))) {
           await this.closeShell(owner.launch.id);
           return;
@@ -528,7 +564,11 @@ export class MacosNetworkRuntime {
     const originalZdotdir = process.env.ZDOTDIR ?? os.homedir();
     const common = path.join(directory, "network.sh");
     const artifacts = this.prepareArtifacts();
+    // Set this before user profiles run so their managed PM blocks do not read
+    // protected host control files or launch an Electron helper in this scope.
+    const guardedSession = `export PORT_MANAGER_GUARDED_SESSION_ID=${shellQuote(id)}\n`;
     const exports: Record<string, string> = { ...scope.bootstrapEnvironment,
+      PORT_MANAGER_GUARDED_SESSION_ID: id,
       PORT_MANAGER_NETWORK_ID: scope.id, PORT_MANAGER_NETWORK_NAME: scope.name,
       PORT_MANAGER_NETWORK_LOOPBACK_HOST: scope.loopbackHost, PORT_MANAGER_ACTUAL_LOOPBACK_HOST: scope.loopbackHost,
       PORT_MANAGER_NETWORK_BROKER_SOCKET: this.brokers.get(scope.id)!.endpoint,
@@ -536,13 +576,100 @@ export class MacosNetworkRuntime {
       PORT_MANAGER_DYLD_INSERT_LIBRARIES: artifacts.hook,
       DYLD_INSERT_LIBRARIES: artifacts.hook, HISTFILE: path.join(namespace, "shell-history") };
     if (Object.keys(exports).some(key => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key))) throw new Error("Invalid bootstrap environment key.");
-    writePrivateAtomic(common, Object.entries(exports).map(([key, value]) => `export ${key}=${shellQuote(value)}`).join("\n") + "\n");
-    writePrivateAtomic(path.join(directory, ".zshenv"), `unset ZDOTDIR\n[ ! -f ${shellQuote(path.join(originalZdotdir, ".zshenv"))} ] || . ${shellQuote(path.join(originalZdotdir, ".zshenv"))}\nexport ZDOTDIR=${shellQuote(directory)}\nexport HISTFILE=${shellQuote(path.join(namespace, "shell-history"))}\n`);
-    writePrivateAtomic(path.join(directory, ".zshrc"), `[ ! -f ${shellQuote(path.join(originalZdotdir, ".zshrc"))} ] || . ${shellQuote(path.join(originalZdotdir, ".zshrc"))}\n. ${shellQuote(common)}\n`);
+    // Profile-installed PM title output is skipped in a guarded shell. Write
+    // it from this scope's bootstrap instead; strip OSC terminators from names.
+    const terminalTitle = `Port Manager: ${scope.name.replace(/[\u0000-\u001f\u007f-\u009f]/g, "")}`;
+    const routesFile = path.join(directory, "routes.txt");
+    this.writeShellRoutes(directory, scope.id, scope.name, scope.routes);
+    const networks = [...(scope.knownNetworks ?? [])];
+    if (!networks.some(network => network.id === scope.id)) networks.unshift({ id: scope.id, name: scope.name });
+    const menuRows = networks.map((network, index) => `${network.id === scope.id ? "*" : " "} ${index + 1}) ${network.name} [${network.id}]`);
+    writePrivateAtomic(common, Object.entries(exports).map(([key, value]) => `export ${key}=${shellQuote(value)}`).join("\n") + `
+printf '\\033]0;%s\\007' ${shellQuote(terminalTitle)} 2>/dev/null || true
+# Only the trusted parent reads a network selection. This marker requests its
+# menu without exposing controller credentials or accepting a workload choice.
+__pm_open_menu() {
+  if [ ! -t 0 ]; then
+    printf '%s\\n' ${menuRows.map(shellQuote).join(" ")}
+    printf '%s\\n' 'Run pm in an interactive terminal to select a network.' >&2
+    return 1
+  fi
+  __pm_menu_monitor=0
+  case "$-" in *m*) __pm_menu_monitor=1; set +m ;; esac
+  : > ${shellQuote(path.join(directory, "menu.request"))} || {
+    [ "$__pm_menu_monitor" != "1" ] || set -m
+    unset __pm_menu_monitor
+    return 1
+  }
+  ${scope.terminalMenu === "host" ? "" : `printf '%s\\n' ${menuRows.map(shellQuote).join(" ")} >&2
+  printf '%s\\n' 'Select a network in the Port Manager menu in VS Code.' >&2`}
+  while [ -e ${shellQuote(path.join(directory, "menu.request"))} ]; do
+    command sleep 0.1 || break
+  done
+  [ "$__pm_menu_monitor" != "1" ] || set -m
+  unset __pm_menu_monitor
+  if [ -f ${shellQuote(path.join(directory, "menu.command"))} ]; then
+    IFS= read -r __pm_menu_command < ${shellQuote(path.join(directory, "menu.command"))}
+    case "$__pm_menu_command" in current|status|version|doctor|routes|help) pm "$__pm_menu_command" ;; esac
+    unset __pm_menu_command
+  fi
+  if [ -f ${shellQuote(path.join(directory, "menu.output"))} ]; then
+    while IFS= read -r __pm_menu_line; do printf '%s\\n' "$__pm_menu_line"; done < ${shellQuote(path.join(directory, "menu.output"))}
+    unset __pm_menu_line
+  fi
+}
+
+pm() {
+  case "\${*:-menu}" in
+    current|--current|"$PORT_MANAGER_NETWORK_ID"|"$PORT_MANAGER_NETWORK_NAME")
+      printf 'Port Manager shell network: %s [%s]\\n' "$PORT_MANAGER_NETWORK_NAME" "$PORT_MANAGER_NETWORK_ID" ;;
+    status)
+      pm current
+      pm version
+      printf '%s\\n' 'Routing: guarded native broker' ;;
+    detach|off|none)
+      printf '\\033]0;%s\\007' 'Port Manager: detached' 2>/dev/null || true
+      printf '%s\\n' 'Leaving the network shell.' >&2
+      exit 0 ;;
+    version|--version|-v)
+      printf 'Port Manager version: %s\\n' ${shellQuote(scope.packageVersion ?? "unknown")} ;;
+    routes)
+      while IFS= read -r __pm_line; do printf '%s\\n' "$__pm_line"; done < ${shellQuote(routesFile)}
+      unset __pm_line ;;
+    doctor)
+      printf 'Network: %s [%s]\\n' "$PORT_MANAGER_NETWORK_NAME" "$PORT_MANAGER_NETWORK_ID"
+      printf '%s\\n' 'Routing mode: guarded native broker'
+      printf 'Hook env: %s\\n' "\${PORT_MANAGER_HOOK:-unset}"
+      printf 'Network loopback host: %s\\n' "$PORT_MANAGER_NETWORK_LOOPBACK_HOST"
+      printf 'Broker: %s\\n' "$PORT_MANAGER_NETWORK_BROKER_SOCKET"
+      printf 'Workspace: %s\\n' "$PWD"
+      pm routes ;;
+    help|--help|-h)
+      printf '%s\\n' 'Usage: pm [current|status|version|doctor|routes|repair|clean|detach|network-number|network-name|network-id]'
+      printf '%s\\n' 'Run pm to choose a logical network.' 'pm current/status: show this shell network.' 'pm version: show the Port Manager version.' 'pm doctor: inspect this shell routing.' 'pm routes: show routes for this network.' 'pm repair/clean: open the host maintenance menu.' 'pm detach (or exit): leave this network shell.' ;;
+    menu|repair|clean|${networks.flatMap((network, index) => [shellQuote(String(index + 1)), shellQuote(network.id), shellQuote(network.name)]).join("|")})
+      __pm_open_menu ;;
+    *)
+      printf 'Port Manager network not found: %s\\n' "$*" >&2
+      return 1 ;;
+  esac
+}
+`);
+    writePrivateAtomic(path.join(directory, ".zshenv"), `${guardedSession}unset ZDOTDIR\n[ ! -f ${shellQuote(path.join(originalZdotdir, ".zshenv"))} ] || . ${shellQuote(path.join(originalZdotdir, ".zshenv"))}\nexport ZDOTDIR=${shellQuote(directory)}\nexport HISTFILE=${shellQuote(path.join(namespace, "shell-history"))}\n`);
+    writePrivateAtomic(path.join(directory, ".zshrc"), `${guardedSession}[ ! -f ${shellQuote(path.join(originalZdotdir, ".zshrc"))} ] || . ${shellQuote(path.join(originalZdotdir, ".zshrc"))}\n. ${shellQuote(common)}\n`);
     const bashrc = path.join(directory, "bashrc");
-    writePrivateAtomic(bashrc, `[ ! -f ${shellQuote(path.join(os.homedir(), ".bashrc"))} ] || . ${shellQuote(path.join(os.homedir(), ".bashrc"))}\n. ${shellQuote(common)}\n`);
+    writePrivateAtomic(bashrc, `${guardedSession}[ ! -f ${shellQuote(path.join(os.homedir(), ".bashrc"))} ] || . ${shellQuote(path.join(os.homedir(), ".bashrc"))}\n. ${shellQuote(common)}\n`);
     void shell;
     return { directory, common, bashrc };
+  }
+
+  /** Diagnostic bytes expose only this controller-approved route snapshot. */
+  private writeShellRoutes(directory: string, id: string, name: string, routes: readonly NetworkRuntimeRoute[]): void {
+    writePrivateAtomic(path.join(directory, "routes.txt"), [
+      `Port Manager routes: ${name} [${id}]`,
+      ...routes.map(route => `  ${route.port} -> ${route.targetHost}:${route.targetPort}`),
+      ...(routes.length === 0 ? ["  no routes"] : []),
+    ].join("\n") + "\n");
   }
 
   private requireShell(id: string): ShellOwner {

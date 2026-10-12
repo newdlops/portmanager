@@ -447,6 +447,31 @@ VS Code profile/PTY 전달은 아직 PID가 없는 controller 소유 단계로 �
 취소·만료에도 동일한 자손 회수 증명이 필요하고, 포트·파일 권한이나 공통 예산을
 완화하지 않는다. 다른 terminal control 경로의 준비 기한은 그대로 유지한다.
 
+외부 `pm <name>` 연결은 원래 셸을 유지한 자식 client에서 수행한다. 준비 응답이
+30초 안에 오지 않거나 controller가 연결을 끊으면 오류를 표시하고 원래 프롬프트로
+복귀한다. 보호된 셸은 자기 namespace에서 bootstrap하고 전역 PM profile을 다시
+읽지 않는다. namespace bootstrap이 `Port Manager: <network>` 제목과 `pm` 명령을
+복구한다. `current/status/version/doctor/routes/help`는 자기 scope의 bootstrap·승인된
+route snapshot으로 동작하며, route 변경은 진단 snapshot에도 반영한다.
+`pm`의 네트워크 선택·유지보수 메뉴는 현재 셸을 유지한 채 신뢰된 호스트 client의
+기존 번호 목록 또는 VS Code profile의 Quick Pick에서 처리한다. workload의 표식은
+메뉴를 열도록 요청할 뿐이며 내용에 있는 네트워크·명령·경로·PID는 실행하지 않는다.
+키보드/Quick Pick으로 사용자가 선택한 scope만 private controller가 새 정책으로
+준비한다. 취소와 준비 실패는 현재 셸을 보존하며, `pm detach`/`exit`는 셸을 종료한다.
+workload는 controller 키나 전환 RPC를 상속하지 않는다.
+실제 TTY의 메뉴 입력은 기존 supervisor의 foreground handoff version 1로 처리한다.
+호스트 client가 SIGUSR1/SIGUSR2를 보내면 supervisor가 기존 부모/보호 셸의 process
+group으로 전환하고 private readiness 옆에 원자적 acknowledgement를 게시한다.
+workload는 이 supervisor를 signal하거나 acknowledgement를 읽고 쓰지 못한다.
+메뉴 대기 동안만 shell job control을 잠시 내려 sleep이 foreground를 다시 가져가지
+않게 하며, 취소·완료 후 원래 값을 복구한다. 추가 native helper나 scope 권한을
+예약·상속하지 않는다.
+
+보호 셸 시작은 승인된 Host Access·Compose 목적지를 broker snapshot으로 직접 전달하며,
+레거시 Compose override/TSV의 강제 복구나 전체 Docker 조회 완료를 기다리지 않는다.
+`Start Daemon`은 어떤 창에서든 singleton client를 통해 시작·재연결하고 owner의 전체
+복구 작업과 독립적으로 응답한다. 데몬 재시작·종료에는 기존 owner 확인을 유지한다.
+
 감독자의 갑작스러운 종료에는 `--recover-owner <ready>.owner`가 private 파일 정체성과
 감독자의 실제 종료를 검증하고 같은 kernel census·audit-token 신호로 잔여 자손을
 회수한다. 성공은 matching 완료 기록과 exit 0으로 확인하며 실패·timeout에는 lease,

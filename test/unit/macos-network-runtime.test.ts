@@ -13,6 +13,7 @@ import { MacosNetworkRuntime } from "../../src/platform/process/macos-network-ru
 import { NativeProcessLookupProvider } from "../../src/platform/process/native-process-lookup";
 import { buildNodeRuntimeEnvironment } from "../../src/platform/process/node-runtime";
 import { NetworkTerminalControl } from "../../src/platform/process/network-terminal-control";
+import { buildShellProfileSourceLine } from "../../src/platform/process/shell-profile";
 import type { AuthenticatedProcessScope } from "../../src/agent/protocol";
 
 test("guarded terminal preparation retries lifecycle verification after temporary budget exhaustion", {
@@ -119,6 +120,11 @@ test(scenario === "sdk" ? "guarded runtime preserves host TCP access, trusted re
   const priorZdotdir = process.env.ZDOTDIR;
   process.env.ZDOTDIR = path.join(root, "empty-profiles");
   fs.mkdirSync(process.env.ZDOTDIR, { mode: 0o700 });
+  // User startup still runs, but its managed PM blocks must not read the
+  // controller's protected host files from inside the new kernel scope.
+  const hostProfile = path.join(security, "host-profile.sh");
+  fs.writeFileSync(hostProfile, "printf '__HOST_PROFILE_SHOULD_NOT_RUN__\\n' >&2\n");
+  fs.writeFileSync(path.join(process.env.ZDOTDIR, ".zshrc"), buildShellProfileSourceLine(hostProfile) + "\n");
   context.after(() => { if (priorZdotdir === undefined) delete process.env.ZDOTDIR; else process.env.ZDOTDIR = priorZdotdir; });
   if (scenario === "sdk") {
   stage = "sdk-prepare";
@@ -152,6 +158,9 @@ test(scenario === "sdk" ? "guarded runtime preserves host TCP access, trusted re
   assert.ok(!errors.includes("Operation not permitted"), errors);
   assert.equal(identity.networkId, "runtime-a");
   assert.notEqual(identity.pid, terminal.pid);
+  while (!output.includes("\x1b]0;Port Manager: Runtime A\x07")) {
+    assert.ok(Date.now() < historyDeadline, errors); await delay(10);
+  }
   stage = "sdk-host-tcp";
   const program = `const net=require('node:net');const s=net.connect(4567,'127.0.0.1');let value='';s.on('connect',()=>s.end('runtime-echo'));s.on('data',b=>value+=b);s.on('end',()=>{if(value!=='runtime-echo')process.exit(2);require('node:fs').writeFileSync('runtime-success.json',JSON.stringify({value,networkId:process.env.PORT_MANAGER_NETWORK_ID}))});s.on('error',()=>process.exit(3));`;
   terminal.stdin!.write(`${quote(process.execPath)} -e ${quote(program)}\n`);
@@ -174,9 +183,13 @@ test(scenario === "sdk" ? "guarded runtime preserves host TCP access, trusted re
   // independent controller in a sourced script. Private readiness is the only
   // execution witness; echoed command text cannot satisfy these assertions.
   const observed = new Map<string, AuthenticatedProcessScope>();
+  const networksFile = path.join(root, "networks.tsv");
+  fs.writeFileSync(networksFile, "runtime-external-a\truntime-external-a\tunused\t4567 -> fixture\nruntime-external-b\truntime-external-b\tunused\t4567 -> fixture\n");
   stage = "cli-control";
   control = new NetworkTerminalControl(path.join(security, "terminal-control"), {
     prepare: (networkId, cwd) => runtime.prepareShell({ id: networkId, name: networkId, loopbackHost: "127.0.0.1",
+      terminalMenu: "host", packageVersion: "fixture-version",
+      knownNetworks: [{ id: "runtime-external-a", name: "runtime-external-a" }, { id: "runtime-external-b", name: "runtime-external-b" }],
       workspaceDirectories: [workspace], routes: [{ port: 4567, targetHost: "127.0.0.1", targetPort: echoPort }] }, cwd, "/bin/zsh"),
     observe: async launch => { observed.set(launch.id, await runtime.waitReady(launch.id)); },
     close: id => runtime.closeShell(id),
@@ -186,9 +199,10 @@ test(scenario === "sdk" ? "guarded runtime preserves host TCP access, trusted re
   const privateProfiles = path.join(root, "empty-profiles");
   const cli = spawn(process.execPath, [path.join(source, "out/src/cli/portmanager-cli.js"), "terminal",
     descriptor.socketPath, descriptor.tokenFilePath, "runtime-external-a", workspace], {
-    env: { ...environment, ZDOTDIR: privateProfiles }, cwd: workspace, stdio: ["pipe", "pipe", "pipe"],
+    env: { ...environment, ZDOTDIR: privateProfiles, PORT_MANAGER_NETWORKS_FILE: networksFile }, cwd: workspace, stdio: ["pipe", "pipe", "pipe"],
   });
-  cli.on("error", () => {}); cli.stdout!.on("data", () => {}); cli.stderr!.on("data", () => {});
+  let cliErrors = "", cliOutput = "";
+  cli.on("error", () => {}); cli.stdout!.on("data", bytes => { cliOutput += bytes; }); cli.stderr!.on("data", bytes => { cliErrors += bytes; });
   context.after(async () => {
     if (cli.exitCode === null && cli.signalCode === null) { const exited = once(cli, "exit"); cli.kill("SIGTERM"); await exited; }
   });
@@ -197,13 +211,45 @@ test(scenario === "sdk" ? "guarded runtime preserves host TCP access, trusted re
   while (observed.size === 0) { assert.equal(cli.exitCode, null); assert.ok(Date.now() < readyDeadline); await delay(10); }
   const original = runtime.activeShells.find(shell => shell.networkId === "runtime-external-a")!;
   assert.ok(original);
+  cli.stdin!.write("pm current > current.txt; pm help > help.txt; pm version > version.txt; pm doctor > doctor.txt; pm routes > routes.txt; pm runtime-external-b 2> switch.txt; printf '%s\\n' \"$?\" > switch-status.txt\n");
+  const commandDeadline = Date.now() + 3000;
+  while (!fs.existsSync(path.join(workspace, "switch-status.txt"))) { assert.ok(Date.now() < commandDeadline); await delay(10); }
+  assert.match(fs.readFileSync(path.join(workspace, "current.txt"), "utf8"), /runtime-external-a/);
+  assert.equal(fs.readFileSync(path.join(workspace, "switch-status.txt"), "utf8").trim(), "1");
+  assert.match(fs.readFileSync(path.join(workspace, "switch.txt"), "utf8"), /interactive terminal/);
+  assert.match(fs.readFileSync(path.join(workspace, "help.txt"), "utf8"), /version\|doctor\|routes\|repair\|clean/);
+  assert.match(fs.readFileSync(path.join(workspace, "version.txt"), "utf8"), /fixture-version/);
+  assert.match(fs.readFileSync(path.join(workspace, "doctor.txt"), "utf8"), /guarded native broker/);
+  assert.match(fs.readFileSync(path.join(workspace, "routes.txt"), "utf8"), /4567 -> 127.0.0.1:/);
+  assert.ok(cliOutput.includes("\x1b]0;Port Manager: runtime-external-a\x07"));
+  // Menu acknowledgements and supervisor signals remain outside workload
+  // authority, even when application code disables every cooperative hook.
+  const supervisorPid = JSON.parse(fs.readFileSync(original.terminalForegroundPath!.slice(0, -4), "utf8")).supervisorPid;
+  fs.writeFileSync(original.terminalForegroundPath!, JSON.stringify({ supervisorPid, active: false }), { mode: 0o600 });
+  const ttyProbe = `const fs=require('node:fs');const result={};for(const [name,action] of Object.entries({read:()=>fs.readFileSync(${JSON.stringify(original.terminalForegroundPath)}),write:()=>fs.writeFileSync(${JSON.stringify(original.terminalForegroundPath)},'forged'),signal:()=>process.kill(${supervisorPid},'SIGUSR1')})){try{action();result[name]='allowed'}catch(error){result[name]=error.code}}fs.writeFileSync('tty-denial.json',JSON.stringify(result));`;
+  cli.stdin!.write(`PORT_MANAGER_HOOK_DISABLED=1 ${quote(process.execPath)} -e ${quote(ttyProbe)}\n`);
+  const denialDeadline = Date.now() + 3000;
+  while (!fs.existsSync(path.join(workspace, "tty-denial.json"))) { assert.ok(Date.now() < denialDeadline); await delay(10); }
+  const denial = JSON.parse(fs.readFileSync(path.join(workspace, "tty-denial.json"), "utf8"));
+  for (const action of ["read", "write", "signal"]) assert.match(denial[action], /^(EPERM|EACCES)$/);
+  assert.doesNotMatch(cliErrors, /HOST_PROFILE_SHOULD_NOT_RUN|operation not permitted/);
   stage = "cli-replace";
-  assert.equal(await control.replace(original.id, "runtime-external-b", workspace), true);
+  // Even a marker naming B does nothing until the host receives user input.
+  cli.stdin!.write(`printf '%s' 'runtime-external-b' > ${quote(original.menuRequestPath!)}; while [ -e ${quote(original.menuRequestPath!)} ]; do sleep 0.1; done\n`);
+  const menuDeadline = Date.now() + 5000;
+  while (!cliErrors.includes("Select Port Manager network")) { assert.ok(Date.now() < menuDeadline, cliErrors); await delay(10); }
+  assert.equal(runtime.activeShells[0].id, original.id);
+  cli.stdin!.write("2\n");
+  const switchDeadline = Date.now() + 5000;
+  while (!runtime.activeShells.some(shell => shell.networkId === "runtime-external-b" && observed.has(shell.id))) {
+    assert.ok(Date.now() < switchDeadline, cliErrors); await delay(10);
+  }
   assert.equal(runtime.activeShells.length, 1);
   assert.equal(runtime.activeShells[0].networkId, "runtime-external-b");
   assert.equal(resources.budget.used.nativeHelpers, 2);
   const switched = runtime.activeShells[0];
   assert.equal(observed.get(switched.id)?.networkId, "runtime-external-b");
+  assert.ok(cliOutput.includes("\x1b]0;Port Manager: runtime-external-b\x07"));
   stage = "cli-detach";
   assert.equal(await control.detach(switched.id), true);
   assert.equal(runtime.activeShells.length, 0);

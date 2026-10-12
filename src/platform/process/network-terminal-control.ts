@@ -49,7 +49,7 @@ export class NetworkTerminalControl {
     return this.starting;
   }
 
-  /** Only the trusted UI invokes replacement; a workload has no switch RPC. */
+  /** Trusted VS Code UI or host-side terminal input selects the replacement. */
   async replace(id: string, networkId: string, cwd: string): Promise<boolean> {
     const client = [...this.clients].find(row => row.launch?.id === id);
     if (client === undefined) return false;
@@ -149,19 +149,34 @@ export class NetworkTerminalControl {
       if (client.launch !== undefined) void this.owner.close(client.launch.id).catch(() => {});
     });
     socket.on("data", bytes => {
-      if (requested || buffer.length + bytes.length > 8192 || performance.now() >= deadline) { socket.destroy(); return; }
+      if (buffer.length + bytes.length > 8192 || (!requested && performance.now() >= deadline)) { socket.destroy(); return; }
       buffer = Buffer.concat([buffer, bytes]);
       const end = buffer.indexOf(10);
       if (end < 0) return;
       if (end !== buffer.length - 1) { socket.destroy(); return; }
-      requested = true;
-      clearTimeout(timer);
       try {
-        const request = JSON.parse(buffer.subarray(0, end).toString("utf8")) as { token?: unknown; networkId?: unknown; cwd?: unknown };
+        const request = JSON.parse(buffer.subarray(0, end).toString("utf8")) as { token?: unknown; networkId?: unknown; cwd?: unknown; type?: unknown };
+        buffer = Buffer.alloc(0);
+        if (requested) {
+          if (client.launch === undefined || client.preparing ||
+              (request.type !== "replace" && request.type !== "detach") ||
+              Object.keys(request).some(key => !["type", "networkId"].includes(key)) ||
+              (request.type === "replace" && typeof request.networkId !== "string") ||
+              (request.type === "detach" && request.networkId !== undefined)) throw new Error("Invalid terminal menu action.");
+          client.preparing = true;
+          const launch = client.launch;
+          void (request.type === "replace" ? this.replace(launch.id, request.networkId as string, launch.cwd)
+            : this.detach(launch.id)).catch(error => {
+              if (!socket.destroyed) this.send(client, { type: "request-error", message: error instanceof Error ? error.message : String(error) });
+            }).finally(() => { client.preparing = false; });
+          return;
+        }
         if (typeof request.token !== "string" || typeof request.networkId !== "string" || typeof request.cwd !== "string" ||
             !path.isAbsolute(request.cwd) || Object.keys(request).some(key => !["token", "networkId", "cwd"].includes(key))) throw new Error("Invalid terminal request.");
         const supplied = Buffer.from(request.token), expected = Buffer.from(this.token);
         if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new Error("Unauthorized terminal launch.");
+        requested = true;
+        clearTimeout(timer);
         client.preparing = true;
         const readinessGeneration = client.readinessGeneration;
         void this.prepare(client, request.networkId, request.cwd).catch(error => {

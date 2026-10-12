@@ -9,6 +9,7 @@
 - TCP 포트 가용성 확인
 - 포트 점유 프로세스 조회
 - child process 실행과 종료
+- macOS 보호 터미널의 bootstrap, 외부 CLI 준비 기한과 원래 셸 복귀
 - 플랫폼별 명령 차이 흡수
 - Git worktree 조회·생성 및 안전한 재사용
 - opt-in 개발 로그의 bounded file sink 제공
@@ -17,6 +18,7 @@
 
 - `ports/node-port-scanner.ts`
 - `process/node-process-launcher.ts`
+- `process/macos-network-runtime.ts`, `process/network-terminal-client.ts`
 - `network/container-runtime.ts`
 - `workspace/git-worktree.ts`
 - `dev-log.ts`
