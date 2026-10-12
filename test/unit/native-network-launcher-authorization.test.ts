@@ -73,8 +73,7 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   const agentSocket = path.join(security, "sockets/agent.sock"), brokerSocket = path.join(security, "sockets/a.sock");
   const nativeAgent = spawn(agent, ["--socket", agentSocket, "--route-table", path.join(security, "routes.json"), "--dns-port", "0", "--controller-token-file", tokenPath, "--trusted-tools"],
     { env: environment, stdio: ["ignore", "ignore", "pipe"] }); children.push(nativeAgent);
-  const startupDeadline = Date.now() + 5000;
-  while (!fs.existsSync(agentSocket)) { assert.ok(Date.now() < startupDeadline, "fixture agent did not start"); await delay(10); }
+  await waitForAgent(nativeAgent, agentSocket);
   const nativeBroker = spawn(broker, ["--socket", brokerSocket, "--network-id", "network-a", "--loopback-host", "127.0.0.1",
     "--agent-socket", agentSocket, "--controller-token-file", tokenPath],
     { env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(nativeBroker);
@@ -94,6 +93,22 @@ test("guarded exec waits for controller PID/birth registration and never widens 
       });
     });
   }
+  /** A socket pathname precedes listen(); probe the isolated daemon instead of racing bind(). */
+  async function waitForAgent(child: ChildProcess, endpoint: string): Promise<void> {
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      assert.equal(child.exitCode, null, "fixture agent exited before readiness");
+      assert.equal(child.signalCode, null, "fixture agent was killed before readiness");
+      assert.ok(Date.now() < deadline, "fixture agent did not start");
+      try {
+        assert.equal((await request("daemonStatus", {}, token, undefined, endpoint)).ok, true);
+        return;
+      } catch (error) {
+        if (!["ENOENT", "ECONNREFUSED"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+        await delay(10);
+      }
+    }
+  }
   const brokerIdentity = inspect(nativeBroker.pid!);
   assert.deepEqual((await request("resolveProcessScope", brokerIdentity)).payload, { ...brokerIdentity, networkId: "network-a" },
     "the broker itself must be attributed before sockets can be observed prior to FD handoff");
@@ -102,8 +117,7 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   const legacySocket = path.join(security, "sockets/legacy.sock");
   const legacy = spawn(agent, ["--socket", legacySocket, "--route-table", path.join(security, "legacy-routes.json"), "--dns-port", "0", "--controller-token-file", tokenPath],
     { env: environment, stdio: ["ignore", "ignore", "pipe"] }); children.push(legacy);
-  const legacyDeadline = Date.now() + 5000;
-  while (!fs.existsSync(legacySocket)) { assert.ok(Date.now() < legacyDeadline); await delay(10); }
+  await waitForAgent(legacy, legacySocket);
   assert.equal(((await request("daemonStatus", {}, token, undefined, legacySocket)).payload as { authenticatesProcessScopes?: boolean }).authenticatesProcessScopes, false);
   assert.equal((await request("registerProcessScope", { ...inspect(process.pid), networkId: "network-a" }, token, undefined, legacySocket)).ok, false,
     "an agent using mutable project PATH must never approve guarded execution");

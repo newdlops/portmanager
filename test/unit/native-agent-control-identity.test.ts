@@ -53,13 +53,22 @@ test("native control registration authenticates its socket PID and keeps its net
     fs.rmSync(directory, { recursive: true, force: true });
   });
   const deadline = performance.now() + 3000;
-  while (!fs.existsSync(socketPath)) {
+  let socket: net.Socket;
+  // bind() creates the pathname before listen(); only a connection proves readiness.
+  for (;;) {
     assert.ok(child.exitCode === null && child.signalCode === null, diagnostics);
     assert.ok(performance.now() < deadline, "isolated daemon startup timed out");
-    await delay(5);
+    socket = net.createConnection(socketPath);
+    sockets.push(socket);
+    try {
+      await once(socket, "connect");
+      break;
+    } catch (error) {
+      socket.destroy();
+      if (!["ENOENT", "ECONNREFUSED"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+      await delay(5);
+    }
   }
-  const socket = net.createConnection(socketPath);
-  sockets.push(socket);
   let input = "", sequence = 0;
   const replies = new Map<string, Response>();
   const events: unknown[] = [];
@@ -75,7 +84,6 @@ test("native control registration authenticates its socket PID and keeps its net
       input = input.slice(newline + 1);
     }
   });
-  await once(socket, "connect");
   async function request(method: string, payload: unknown, authorization: string | undefined = controllerToken,
     authorizationNetworkId?: string): Promise<Response> {
     const id = `${authorization === controllerToken ? "audit-control" : "extension-forged"}-${++sequence}`;

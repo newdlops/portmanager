@@ -249,6 +249,14 @@ test(scenario === "sdk" ? "guarded runtime preserves host TCP access, trusted re
   assert.equal(resources.budget.used.nativeHelpers, 2);
   const switched = runtime.activeShells[0];
   assert.equal(observed.get(switched.id)?.networkId, "runtime-external-b");
+  // Controller readiness and the shell's stdout arrive on independent pipes.
+  // Keep the title assertion, giving stdout its own bounded delivery deadline.
+  const titleDeadline = Date.now() + 3000;
+  while (!cliOutput.includes("\x1b]0;Port Manager: runtime-external-b\x07")) {
+    assert.equal(cli.exitCode, null, cliErrors);
+    assert.ok(Date.now() < titleDeadline, `Missing switched terminal title: ${cliErrors}`);
+    await delay(10);
+  }
   assert.ok(cliOutput.includes("\x1b]0;Port Manager: runtime-external-b\x07"));
   stage = "cli-detach";
   assert.equal(await control.detach(switched.id), true);
