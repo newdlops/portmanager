@@ -79,6 +79,15 @@ daemon은 scope 승인을 거절해 프로그램 실행을 허용하지 않는�
 셸은 자기·자식에게만 신호를 보내고 자기 scheduling만 조정할 수 있다. 다른 sandbox의
 프로세스 신호·우선순위와 다른 TTY의 접근은 합성 프로세스/PTY로 별도 검증한다.
 
+`--terminal-menu-version`의 `1`은 호스트 `pm` 입력의 foreground handoff 계약이다.
+호스트 client의 SIGUSR1/SIGUSR2에만 기존 supervisor가 부모/보호 셸 process group으로
+TTY를 넘기고 `<ready-file>.tty`에 private 0600 acknowledgement를 원자적으로 게시한다.
+scope·PID·명령을 workload에서 받지 않으며 추가 helper나 controller FD를 만들지 않는다.
+호스트는 자신의 supervisor PID와 완료 상태를 확인한 뒤 입력을 시작/종료한다.
+메뉴 대기 동안 셸은 monitor 옵션을 잠시 내리고 완료 후 복구해, sleep의 job control이
+호스트 입력을 빼앗지 않게 한다. 실제 PTY에서 번호 선택, Enter/Ctrl+C 취소, 해제와
+예산 반환을 확인하고 guarded 프로세스의 ack 읽기·쓰기·supervisor signal 거절을 검증한다.
+
 `pm_network_launch_members.h`는 실행마다 128-bit 임의 이름의 private 표식 파일을 만들고
 그 파일의 읽기만 정책에 추가한다. 내용은 고정 문자열이며 제어 권한·키·명령을 담지
 않는다. 이미 거절되는 profile 경로와 함께 실제 kernel permission을 조회하므로, 부모가

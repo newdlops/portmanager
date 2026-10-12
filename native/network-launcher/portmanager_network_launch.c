@@ -39,6 +39,10 @@ typedef struct {
 } pm_launch_options;
 static volatile sig_atomic_t pm_launch_signal;
 static void pm_launch_on_signal(int number) { pm_launch_signal = number; }
+/* The trusted host temporarily reads the same TTY for pm's menu. The guarded
+ * child cannot signal this supervisor, and no new scope travels on this seam. */
+static volatile sig_atomic_t pm_launch_menu_signal;
+static void pm_launch_on_menu_signal(int number) { pm_launch_menu_signal = number; }
 
 /* Inventory is bounded and single-threaded. macOS has no public closefrom in
  * this SDK; a failed inventory exits rather than carrying unknown authority. */
@@ -331,8 +335,8 @@ static void pm_launch_kill_owned(pid_t pid, unsigned long long birth, int number
   if (birth != 0 && pm_launch_birth(pid) != birth) return;
   (void)kill(pid, number);
 }
-static int pm_launch_supervise(const pm_launch_options *options, pm_launch_members *members, pid_t child, unsigned long long birth, int startup_ok) {
-  int status = 0, reaped = 0, cleanup_error = 0; long long stopping = 0;
+static int pm_launch_supervise(const pm_launch_options *options, pm_launch_members *members, pid_t child, unsigned long long birth, int startup_ok, pid_t foreground) {
+  int status = 0, reaped = 0, cleanup_error = 0, menu_active = 0; long long stopping = 0;
   pm_scope_client refresh; memset(&refresh, 0, sizeof(refresh)); refresh.fd = -1;
   long long next_refresh = pm_nb_client_now() + PM_LAUNCH_SCOPE_REFRESH_MS, refresh_deadline = 0;
   if (!startup_ok) { pm_launch_kill_owned(child, birth, SIGKILL); stopping = pm_nb_client_now(); }
@@ -346,12 +350,24 @@ static int pm_launch_supervise(const pm_launch_options *options, pm_launch_membe
       pm_dev_log("network-launcher", "wait failed pid=%ld errno=%d; retaining ownership", (long)child, errno);
       if (stopping == 0) stopping = pm_nb_client_now();
     }
+    /* Ctrl+C in a foreground host maintenance command belongs to that command.
+     * Ordinary shell interrupts arrive at the guarded child's own group. */
+    if (pm_launch_signal == SIGINT && menu_active) pm_launch_signal = 0;
     if (pm_launch_signal != 0) {
       pm_dev_log("network-launcher", "forward signal child_pid=%ld signal=%d", (long)child, (int)pm_launch_signal);
       pm_scope_close(&refresh);
       if (!reaped) pm_launch_kill_owned(child, birth, pm_launch_signal);
       (void)pm_launch_members_sweep(members, pm_launch_signal); pm_launch_signal = 0;
       if (stopping == 0) stopping = pm_nb_client_now();
+    }
+    if (pm_launch_menu_signal != 0) {
+      int active = pm_launch_menu_signal == SIGUSR1;
+      pm_launch_menu_signal = 0;
+      if (!reaped && stopping == 0 && foreground > 0 && tcsetpgrp(0, active ? foreground : child) == 0) {
+        menu_active = active;
+        if (pm_launch_publish_tty(options, active) != 0)
+          pm_dev_log("network-launcher", "TTY menu acknowledgement failed errno=%d", errno);
+      }
     }
     long long now = pm_nb_client_now();
     if (stopping != 0) {
@@ -396,6 +412,7 @@ static int pm_launch_supervise(const pm_launch_options *options, pm_launch_membe
 }
 int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--lifecycle-version") == 0) { puts("1"); return 0; }
+  if (argc == 2 && strcmp(argv[1], "--terminal-menu-version") == 0) { puts("1"); return 0; }
   if (argc == 3 && strcmp(argv[1], "--recover-owner") == 0) {
     if (pm_launch_close_inherited(-1) != 0) return 125;
     signal(SIGTERM, pm_launch_on_signal); signal(SIGINT, pm_launch_on_signal);
@@ -442,6 +459,7 @@ int main(int argc, char **argv) {
   signal(SIGCHLD, SIG_DFL);
   signal(SIGTERM, pm_launch_on_signal); signal(SIGINT, pm_launch_on_signal);
   signal(SIGHUP, pm_launch_on_signal); signal(SIGQUIT, pm_launch_on_signal); signal(SIGPIPE, SIG_IGN);
+  signal(SIGUSR1, pm_launch_on_menu_signal); signal(SIGUSR2, pm_launch_on_menu_signal);
   pid_t child = fork();
   if (child == 0) {
     close(ready[0]);
@@ -474,7 +492,7 @@ int main(int argc, char **argv) {
     pm_dev_log("network-launcher", "policy ready child_pid=%ld birth=%llu", (long)child, birth);
     if (options.announce) { printf("ready pid=%ld birth=%llu\n", (long)child, birth); fflush(stdout); }
   } else pm_dev_log("network-launcher", "startup rejected child_pid=%ld errno=%d", (long)child, errno);
-  int result = pm_launch_supervise(&options, &members, child, birth, accepted);
+  int result = pm_launch_supervise(&options, &members, child, birth, accepted, foreground);
   while (pm_launch_receipt_publish(&receipt) != 0) {
     pm_dev_log("network-launcher", "cleanup complete but receipt publication failed errno=%d; retaining ownership", errno);
     (void)poll(NULL, 0, 1000);

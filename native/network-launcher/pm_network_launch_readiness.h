@@ -68,6 +68,28 @@ rejected:
     pm_buffer_free(&record); errno = error; return -1;
   }
 }
+/* A private, bounded acknowledgement prevents the host from opening its TTY
+ * reader before tcsetpgrp completes. App code cannot publish this record. */
+static int pm_launch_publish_tty(const pm_launch_options *options, int active) {
+  if (options->ready_path == NULL) { errno = EINVAL; return -1; }
+  char path[PATH_MAX], leaf[NAME_MAX + 1], temporary[NAME_MAX + 1];
+  if (snprintf(path, sizeof(path), "%s.tty", options->ready_path) >= (int)sizeof(path)) { errno = ENAMETOOLONG; return -1; }
+  int directory = pm_private_parent(path, "/.portmanager/security/sessions/", leaf, sizeof(leaf));
+  if (directory < 0) return -1;
+  snprintf(temporary, sizeof(temporary), ".tty-%ld-%08x.tmp", (long)getpid(), arc4random());
+  int fd = openat(directory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (fd < 0) { close(directory); return -1; }
+  char record[128];
+  int length = snprintf(record, sizeof(record), "{\"supervisorPid\":%ld,\"active\":%s}\n", (long)getpid(), active ? "true" : "false");
+  struct stat identity;
+  int result = length > 0 && length < (int)sizeof(record) && write(fd, record, (size_t)length) == length &&
+    fchmod(fd, 0600) == 0 && pm_private_regular(fd, &identity) == 0;
+  int error = errno; close(fd);
+  if (result) { result = renameat(directory, temporary, directory, leaf) == 0; error = errno; }
+  if (!result) (void)unlinkat(directory, temporary, 0);
+  close(directory); errno = error; return result ? 0 : -1;
+}
+
 static void pm_launch_remove_ready(pm_launch_readiness *ready) {
   if (ready->directory < 0) return;
   struct stat current;
