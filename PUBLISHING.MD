@@ -7,7 +7,7 @@ This document is the release checklist for publishing `newdlops.portmanager` to 
 - Publisher ID: `newdlops`
 - Extension name: `portmanager`
 - Marketplace extension ID: `newdlops.portmanager`
-- Display name: `Port Manager`
+- Display name: `Logical Network`
 - Repository: `https://github.com/newdlops/portmanager`
 - Initial version: `0.0.1`
 - Release channel: general release
@@ -204,7 +204,7 @@ After publishing, verify the Marketplace page:
 
 - Extension ID is `newdlops.portmanager`.
 - Publisher is `newdlops`.
-- Display name is `Port Manager`.
+- Display name is `Logical Network`.
 - README and CHANGELOG render correctly.
 - Repository, issue, and homepage links point to `newdlops/portmanager`.
 - Command list, settings, categories, and icon match `package.json`.
