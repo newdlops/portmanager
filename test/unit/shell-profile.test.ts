@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   buildShellProfilePostludeScript,
   buildShellProfilePreludeScript,
+  buildShellProfileSourceLine,
   getManagedShellProfilePlans,
   migrateExistingManagedShellProfiles,
   restoreShellProfileContent,
@@ -21,6 +22,58 @@ const profileOptions: ManagedShellProfileOptions = {
   postludeLine: '. "/home/user/.portmanager/portmanager-profile-post.sh"',
   legacyLines: ['. "/home/user/.portmanager/portmanager-hook.sh"'],
 };
+
+test("managed profile sources are skipped inside a guarded shell", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pm-profile-guard-"));
+  try {
+    const file = path.join(root, "profile ' quoted.sh");
+    fs.writeFileSync(file, "printf '__HOST_PROFILE__\\n'\n");
+    const line = buildShellProfileSourceLine(file);
+    const host = spawnSync("/bin/sh", ["-c", line], { encoding: "utf8", env: { ...process.env, PORT_MANAGER_GUARDED_SESSION_ID: "" } });
+    assert.equal(host.status, 0, host.stderr);
+    assert.equal(host.stdout.trim(), "__HOST_PROFILE__");
+    fs.unlinkSync(file);
+    const guarded = spawnSync("/bin/sh", ["-c", line], { encoding: "utf8", env: { ...process.env, PORT_MANAGER_GUARDED_SESSION_ID: "fixture" } });
+    assert.equal(guarded.status, 0, guarded.stderr);
+    assert.equal(guarded.stderr, "");
+    assert.equal(guarded.stdout, "");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("background migration replaces older complete PM blocks without touching the user body", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pm-profile-upgrade-"));
+  try {
+    const prelude = path.join(root, "protected-pre.sh"), postlude = path.join(root, "protected-post.sh");
+    const legacy: ManagedShellProfileOptions = {
+      preludeLine: buildShellProfileSourceLine(prelude, { legacy: true }),
+      postludeLine: buildShellProfileSourceLine(postlude, { legacy: true }), legacyLines: [],
+    };
+    const guarded: ManagedShellProfileOptions = {
+      preludeLine: buildShellProfileSourceLine(prelude), postludeLine: buildShellProfileSourceLine(postlude),
+      legacyPreludeLines: [legacy.preludeLine], legacyPostludeLines: [legacy.postludeLine], legacyLines: [],
+    };
+    const body = "export USER_PROFILE=kept\n# untouched source text\r\nexport USER_LAST=1";
+    const profile = path.join(root, ".zshrc");
+    fs.writeFileSync(profile, rewriteManagedShellProfile(body, legacy));
+    assert.deepEqual(await migrateExistingManagedShellProfiles([{ filePath: profile }], guarded), [profile]);
+    const migrated = fs.readFileSync(profile, "utf8");
+    assert.equal(migrated, rewriteManagedShellProfile(body, guarded));
+    assert.equal(restoreShellProfileContent(migrated, guarded), body);
+    assert.deepEqual(await migrateExistingManagedShellProfiles([{ filePath: profile }], guarded), []);
+    // The protected files are deliberately absent: an upgraded guarded shell
+    // must never attempt to source either historical host entry.
+    const result = spawnSync("/bin/sh", ["-c", '. "$1"; printf "%s" "$USER_PROFILE"', "fixture", profile], {
+      encoding: "utf8", env: { ...process.env, PORT_MANAGER_GUARDED_SESSION_ID: "fixture" },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stderr, "");
+    assert.equal(result.stdout, "kept");
+    const historical = `# >>> Port Manager profile prelude >>>\n${legacy.preludeLine}\n# <<< Port Manager profile prelude <<<\n${body}\n# >>> Port Manager profile activation >>>\n${legacy.postludeLine}\n# <<< Port Manager profile activation <<<\n`;
+    assert.equal(restoreShellProfileContent(rewriteManagedShellProfile(historical, guarded), guarded), body + "\n");
+    const foreign = "# >>> Port Manager profile prelude >>>\n. '/unrecognized-pre.sh'\n# <<< Port Manager profile prelude <<<\n";
+    assert.equal(restoreShellProfileContent(rewriteManagedShellProfile(foreign, guarded), guarded), foreign);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 test("zsh profiles bracket both login and interactive startup files", () => {
   assert.deepEqual(getManagedShellProfilePlans("/bin/zsh", "/home/user"), [

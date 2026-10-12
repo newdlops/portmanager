@@ -26,6 +26,9 @@ export interface ManagedShellProfileOptions {
   readonly postludeLine: string;
   /** Exact historical PM lines that are safe to remove during migration. */
   readonly legacyLines: readonly string[];
+  /** Old source lines are owned only inside a complete prelude/activation block. */
+  readonly legacyPreludeLines?: readonly string[];
+  readonly legacyPostludeLines?: readonly string[];
 }
 
 export interface ShellProfilePreludeOptions {
@@ -84,9 +87,10 @@ export function getKnownManagedShellProfilePlans(homeDirectory: string): readonl
   );
 }
 
-/** Builds one safely quoted POSIX source record for a managed profile block. */
-export function buildShellProfileSourceLine(filePath: string): string {
-  return `. ${shellSingleQuote(filePath)}`;
+/** Guarded shells bootstrap locally; their kernel policy denies host PM state. */
+export function buildShellProfileSourceLine(filePath: string, options: { readonly legacy?: boolean } = {}): string {
+  const source = `. ${shellSingleQuote(filePath)}`;
+  return options.legacy ? source : `if [ -z "\${PORT_MANAGER_GUARDED_SESSION_ID:-}" ]; then ${source}; fi`;
 }
 
 /**
@@ -249,13 +253,13 @@ export function hasManagedShellProfileEvidence(content: string, options: Managed
   return lines.some((line) => options.legacyLines.includes(line)) || hasExactManagedBlock(
     lines,
     PROFILE_PRELUDE_START,
-    options.preludeLine,
+    [options.preludeLine, ...(options.legacyPreludeLines ?? [])],
     PROFILE_PRELUDE_END,
     true,
   ) || hasExactManagedBlock(
     lines,
     PROFILE_POSTLUDE_START,
-    options.postludeLine,
+    [options.postludeLine, ...(options.legacyPostludeLines ?? [])],
     PROFILE_POSTLUDE_END,
     false,
   );
@@ -266,22 +270,24 @@ function removeManagedBlocks(
   options: ManagedShellProfileOptions,
 ): { readonly records: ProfileLineRecord[]; readonly originalFinalNewline?: boolean } {
   const result: ProfileLineRecord[] = [];
+  const preludeLines = new Set([options.preludeLine, ...(options.legacyPreludeLines ?? [])]);
+  const postludeLines = new Set([options.postludeLine, ...(options.legacyPostludeLines ?? [])]);
   let originalFinalNewline: boolean | undefined;
   for (let index = 0; index < records.length; index++) {
     const line = records[index].content;
     const next = records[index + 1]?.content;
     const metadata = records[index + 2]?.content;
     const exactPreludeLength =
-      line === PROFILE_PRELUDE_START && next === options.preludeLine && metadata === PROFILE_PRELUDE_END
+      line === PROFILE_PRELUDE_START && next !== undefined && preludeLines.has(next) && metadata === PROFILE_PRELUDE_END
         ? 3
         : line === PROFILE_PRELUDE_START &&
-            next === options.preludeLine &&
+            next !== undefined && preludeLines.has(next) &&
             (metadata === `${PROFILE_FINAL_NEWLINE_PREFIX}present` || metadata === `${PROFILE_FINAL_NEWLINE_PREFIX}absent`) &&
             records[index + 3]?.content === PROFILE_PRELUDE_END
           ? 4
           : 0;
     const isExactPostlude =
-      line === PROFILE_POSTLUDE_START && next === options.postludeLine && metadata === PROFILE_POSTLUDE_END;
+      line === PROFILE_POSTLUDE_START && next !== undefined && postludeLines.has(next) && metadata === PROFILE_POSTLUDE_END;
     if (exactPreludeLength > 0) {
       if (exactPreludeLength === 4) {
         originalFinalNewline = metadata === `${PROFILE_FINAL_NEWLINE_PREFIX}present`;
@@ -299,14 +305,14 @@ function removeManagedBlocks(
 function hasExactManagedBlock(
   lines: readonly string[],
   startMarker: string,
-  sourceLine: string,
+  sourceLines: readonly string[],
   endMarker: string,
   allowFinalNewlineMetadata: boolean,
 ): boolean {
   return lines.some(
     (line, index) =>
       line === startMarker &&
-      lines[index + 1] === sourceLine &&
+      sourceLines.includes(lines[index + 1]) &&
       (lines[index + 2] === endMarker ||
         (allowFinalNewlineMetadata &&
           (lines[index + 2] === `${PROFILE_FINAL_NEWLINE_PREFIX}present` ||
