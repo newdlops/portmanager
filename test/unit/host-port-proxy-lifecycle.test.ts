@@ -214,7 +214,10 @@ for (const mode of modes) {
     { skip: mode.skip, timeout: 10_000 }, async t => {
       let calls = 0;
       let late: (() => void) | undefined;
-      const f = await fixture(t, { ...mode.options, resolveTimeoutMs: 60 }, undefined, exposure => {
+      // Helper transport and controller lookup deadlines can expire in either
+      // order. Exercise per-connection expiry without sharing the old lookup;
+      // coalescing beyond the cache TTL is covered separately above.
+      const f = await fixture(t, { ...mode.options, resolveTimeoutMs: 60, targetCacheTtlMs: 0 }, undefined, exposure => {
         calls++;
         if (calls > 1) return { host: exposure.targetAddress, port: exposure.targetPort };
         return new Promise(resolve => { late = () => resolve({ host: exposure.targetAddress, port: exposure.targetPort }); });
