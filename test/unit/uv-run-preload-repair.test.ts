@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import { NATIVE_SH_C_PRELOAD_PREAMBLE, UV_RUN_PRELOAD_TRAMPOLINE } from "../../src/extension/uv-run-preload-repair";
+import {
+  buildUvRunPreloadRepairFunctions,
+  NATIVE_SH_C_PRELOAD_PREAMBLE,
+  UV_RUN_PRELOAD_TRAMPOLINE,
+} from "../../src/extension/uv-run-preload-repair";
 
 /** terminal-hook-environment imports VS Code types only; an empty module stands in for it. */
 function loadTerminalHookEnvironment(): typeof import("../../src/extension/terminal-hook-environment") {
@@ -23,6 +28,31 @@ test("uv run trampoline is the native hook's sh -c preload repair", () => {
   assert.notEqual(literal, undefined, "PM_SH_C_PREAMBLE must stay a single string literal");
   assert.equal(NATIVE_SH_C_PRELOAD_PREAMBLE, JSON.parse(literal!), "the uv run repair must not drift from the native sh -c repair");
   assert.equal(UV_RUN_PRELOAD_TRAMPOLINE, `${NATIVE_SH_C_PRELOAD_PREAMBLE}exec "$@"`);
+});
+
+/*
+ * Checked on the predicate itself: whether dyld then ignores a stale DYLD value
+ * for a hardened binary depends on SIP, which is off on CI macOS runners.
+ */
+test("uv run preload repair stays off without a readable hook library or with the hook disabled", context => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pm-uv-run-enabled-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const library = path.join(root, "libfixture-preload.dylib");
+  fs.writeFileSync(library, "");
+  const enabled = (env: NodeJS.ProcessEnv) =>
+    spawnSync("/bin/sh", ["-c", `${buildUvRunPreloadRepairFunctions()}\n__pm_uv_preload_repair_enabled`], {
+      env: { PATH: "/usr/bin:/bin", ...env },
+    }).status === 0;
+
+  assert.equal(enabled({ PORT_MANAGER_DYLD_INSERT_LIBRARIES: library, PORT_MANAGER_HOOK: "1" }), true);
+  assert.equal(
+    enabled({ PORT_MANAGER_DYLD_INSERT_LIBRARIES: path.join(root, "missing.dylib"), PORT_MANAGER_HOOK: "1" }),
+    false,
+    "a hint left by an upgraded extension must not reach dyld, which aborts the child before main()",
+  );
+  assert.equal(enabled({ PORT_MANAGER_DYLD_INSERT_LIBRARIES: library, PORT_MANAGER_HOOK: "0" }), false);
+  assert.equal(enabled({ PORT_MANAGER_DYLD_INSERT_LIBRARIES: library, PORT_MANAGER_HOOK_DISABLED: "1" }), false);
+  assert.equal(enabled({}), false);
 });
 
 /** A hardened uv strips DYLD_* from itself and its children; the shim must hand the hook to the command uv runs. */
@@ -118,7 +148,6 @@ test("uv shim restores the preload for commands run by a preload-dropping uv", {
     ["uvx", ["ruff", "check"], hardenedTools, {}],
     ["uv", ["run", "python", "-c", "pass"], plainTools, {}],
     ["uv", ["run", "python", "-c", "pass"], hardenedTools, { PORT_MANAGER_HOOK: "0" }],
-    ["uv", ["run", "python", "-c", "pass"], hardenedTools, { PORT_MANAGER_DYLD_INSERT_LIBRARIES: path.join(root, "missing.dylib") }],
   ] as const) {
     const untouched = runShim(command, [...args], tools, extraEnv);
     assert.deepEqual(untouched.forwarded, args, `${command} ${args.join(" ")} must reach the real tool untouched`);

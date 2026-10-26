@@ -1,7 +1,8 @@
 /* Stand-ins for a preload-dropping uv and the runtime it launches.
  *
  * Named `uv`/`uvx` and signed with the hardened runtime, dyld strips DYLD_* from
- * this process exactly like the official uv build. It records its argv
+ * this process exactly like the official uv build (with SIP enabled; CI runners
+ * without SIP keep it, and the repair restores it either way). It records its argv
  * (NUL-separated) to $PM_FIXTURE_ARGS_FILE and then, like `uv run`, executes the
  * command — which starts at the inserted /bin/sh trampoline when the shim
  * rewrote the invocation. Under any other name it reports the preload, PATH and
