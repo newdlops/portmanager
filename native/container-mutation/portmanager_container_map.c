@@ -46,6 +46,31 @@ static int pm_starts_with(const char *value, const char *prefix) {
   return strncmp(value, prefix, prefix_length) == 0;
 }
 
+/** Docker container ids are lowercase hexadecimal; names never qualify. */
+static int pm_is_container_id_text(const char *value) {
+  if (value == NULL || value[0] == '\0') {
+    return 0;
+  }
+
+  for (const char *cursor = value; *cursor != '\0'; cursor++) {
+    if (!((*cursor >= '0' && *cursor <= '9') || (*cursor >= 'a' && *cursor <= 'f'))) {
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
+/*
+ * Routing rows also keep names in the id columns (a service name such as
+ * `rabbitmq`, or an empty field). A prefix test against those would map
+ * `rabbitmqctl` or any token to the clone, so both sides must be ids.
+ */
+static int pm_container_ids_share_prefix(const char *token, const char *row_id) {
+  return pm_is_container_id_text(token) && pm_is_container_id_text(row_id) &&
+         (pm_starts_with(row_id, token) || pm_starts_with(token, row_id));
+}
+
 static int pm_token_matches_mapping(
   const char *token,
   const char *original_id,
@@ -67,12 +92,7 @@ static int pm_token_matches_mapping(
    */
   if (
     token_length >= 4 &&
-    (
-      pm_starts_with(original_id, token) ||
-      pm_starts_with(token, original_id) ||
-      pm_starts_with(attached_id, token) ||
-      pm_starts_with(token, attached_id)
-    )
+    (pm_container_ids_share_prefix(token, original_id) || pm_container_ids_share_prefix(token, attached_id))
   ) {
     return 1;
   }

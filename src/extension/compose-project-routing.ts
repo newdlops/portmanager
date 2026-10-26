@@ -697,6 +697,16 @@ __port_manager_compose_routing_file_matches_context() {
   return 1
 }
 
+# Docker container ids are lowercase hexadecimal. Routing rows also keep names (a
+# service name, or nothing) in the id columns; a prefix test against those would
+# map rabbitmqctl, or any token, to the clone.
+__port_manager_is_container_id() {
+  case "$1" in
+    ""|*[!0-9a-f]*) return 1 ;;
+  esac
+  return 0
+}
+
 __port_manager_container_target_scan_file_for_runtime() {
   __pm_scan_file="$1"
   __pm_scan_runtime="$2"
@@ -719,19 +729,23 @@ __port_manager_container_target_scan_file_for_runtime() {
     __pm_matched=0
     if [ "\${__pm_scan_token}" = "\${__pm_original_name}" ] || [ "\${__pm_scan_token}" = "\${__pm_attached_name}" ] || [ "\${__pm_scan_token}" = "\${__pm_service_name}" ]; then
       __pm_matched=1
-    elif [ "\${__pm_scan_token_length}" -ge 4 ]; then
-      case "\${__pm_project}" in
-        "\${__pm_scan_token}"*) __pm_matched=1 ;;
-      esac
-      case "\${__pm_scan_token}" in
-        "\${__pm_project}"*) __pm_matched=1 ;;
-      esac
-      case "\${__pm_attached_id}" in
-        "\${__pm_scan_token}"*) __pm_matched=1 ;;
-      esac
-      case "\${__pm_scan_token}" in
-        "\${__pm_attached_id}"*) __pm_matched=1 ;;
-      esac
+    elif [ "\${__pm_scan_token_length}" -ge 4 ] && __port_manager_is_container_id "\${__pm_scan_token}"; then
+      if __port_manager_is_container_id "\${__pm_project}"; then
+        case "\${__pm_project}" in
+          "\${__pm_scan_token}"*) __pm_matched=1 ;;
+        esac
+        case "\${__pm_scan_token}" in
+          "\${__pm_project}"*) __pm_matched=1 ;;
+        esac
+      fi
+      if __port_manager_is_container_id "\${__pm_attached_id}"; then
+        case "\${__pm_attached_id}" in
+          "\${__pm_scan_token}"*) __pm_matched=1 ;;
+        esac
+        case "\${__pm_scan_token}" in
+          "\${__pm_attached_id}"*) __pm_matched=1 ;;
+        esac
+      fi
     fi
 
     if [ "\${__pm_matched}" = "1" ]; then
@@ -1244,18 +1258,133 @@ __port_manager_rewrite_container_name_filter() {
   return 0
 }
 
+# Which arguments of a container command name containers; mirrors
+# pm_container_command_grammars in native/docker-shim/portmanager_docker_shim.c.
+# Option values (exec -u rabbitmq), the command exec runs inside the container,
+# rename's new name and local cp paths keep the user's spelling even when they
+# equal a service or container name.
+__port_manager_container_argument_kind() {
+  case "$1" in
+    attach|commit|diff|exec|export|logs|port|rename|top) printf 'first\\n' ;;
+    inspect|kill|pause|restart|rm|start|stats|stop|unpause|update|wait) printf 'all\\n' ;;
+    cp) printf 'copy\\n' ;;
+    *) printf 'none\\n' ;;
+  esac
+}
+
+__port_manager_container_option_takes_value() {
+  case "$1:$2" in
+    attach:--detach-keys) return 0 ;;
+    commit:-a|commit:--author|commit:-c|commit:--change|commit:-m|commit:--message|commit:-f|commit:--format|commit:--iidfile|commit:--config) return 0 ;;
+    diff:--format) return 0 ;;
+    exec:-e|exec:--env|exec:--env-file|exec:-u|exec:--user|exec:-w|exec:--workdir|exec:--detach-keys|exec:--preserve-fd|exec:--preserve-fds) return 0 ;;
+    export:-o|export:--output) return 0 ;;
+    inspect:-f|inspect:--format|inspect:--type|inspect:-t) return 0 ;;
+    kill:-s|kill:--signal|kill:--cidfile) return 0 ;;
+    logs:--since|logs:--until|logs:-n|logs:--tail) return 0 ;;
+    pause:--cidfile|pause:--filter) return 0 ;;
+    restart:-s|restart:--signal|restart:-t|restart:--time|restart:--timeout|restart:--cidfile|restart:--filter) return 0 ;;
+    rm:-t|rm:--time|rm:--cidfile|rm:--filter) return 0 ;;
+    start:--detach-keys|start:--checkpoint|start:--checkpoint-dir|start:--filter) return 0 ;;
+    stats:--format|stats:-i|stats:--interval) return 0 ;;
+    stop:-s|stop:--signal|stop:-t|stop:--time|stop:--timeout|stop:--cidfile|stop:--filter) return 0 ;;
+    unpause:--cidfile|unpause:--filter) return 0 ;;
+    update:--blkio-weight|update:--cpu-period|update:--cpu-quota|update:--cpu-rt-period|update:--cpu-rt-runtime|update:-c|update:--cpu-shares|update:--cpus|update:--cpuset-cpus|update:--cpuset-mems|update:-m|update:--memory|update:--memory-reservation|update:--memory-swap|update:--pids-limit|update:--restart) return 0 ;;
+    wait:--condition|wait:-i|wait:--interval) return 0 ;;
+  esac
+  return 1
+}
+
 __port_manager_run_runtime_with_container_routing() {
   __pm_runtime="$1"
   shift
   __pm_args=""
   __pm_filter_next=0
   __pm_rewrite_name_filters=0
+  # Docker's grammar is walked alongside the rewrite: global options, the command
+  # (or "container <command>"), then that command's options and positionals.
+  # "--" ends options, --name=value carries its value, a listed option consumes
+  # the next argument, and in a short cluster such as -itu root the value option
+  # takes the rest of the cluster or the next argument. Unlisted options are flags.
+  __pm_phase=global
+  __pm_skip_value=0
+  __pm_options_ended=0
+  __pm_container_command=""
+  __pm_container_kind=none
 
   if __port_manager_runtime_command_uses_container_name_filters "$@"; then
     __pm_rewrite_name_filters=1
   fi
 
   for __pm_arg in "$@"; do
+    __pm_reference=0
+    if [ "\${__pm_skip_value}" = "1" ]; then
+      __pm_skip_value=0
+    elif [ "\${__pm_phase}" = "global" ]; then
+      case "\${__pm_arg}" in
+        --config|--context|-c|--host|-H|--log-level|-l|--tlscacert|--tlscert|--tlskey) __pm_skip_value=1 ;;
+        -*) ;;
+        container) __pm_phase=group ;;
+        *)
+          __pm_container_command="\${__pm_arg}"
+          __pm_container_kind="$(__port_manager_container_argument_kind "\${__pm_arg}")"
+          __pm_phase=arguments
+          ;;
+      esac
+    elif [ "\${__pm_phase}" = "group" ]; then
+      case "\${__pm_arg}" in
+        -*) ;;
+        *)
+          __pm_container_command="\${__pm_arg}"
+          __pm_container_kind="$(__port_manager_container_argument_kind "\${__pm_arg}")"
+          __pm_phase=arguments
+          ;;
+      esac
+    elif [ "\${__pm_container_kind}" != "none" ]; then
+      if [ "\${__pm_options_ended}" = "0" ] && [ "\${__pm_arg}" = "--" ]; then
+        __pm_options_ended=1
+      elif [ "\${__pm_options_ended}" = "0" ] && [ "\${__pm_arg#-}" != "\${__pm_arg}" ] && [ "\${__pm_arg}" != "-" ]; then
+        case "\${__pm_arg}" in
+          --*=*) ;;
+          --*)
+            if __port_manager_container_option_takes_value "\${__pm_container_command}" "\${__pm_arg}"; then
+              __pm_skip_value=1
+            fi
+            ;;
+          *)
+            __pm_cluster="\${__pm_arg#-}"
+            while [ -n "\${__pm_cluster}" ]; do
+              __pm_cluster_rest="\${__pm_cluster#?}"
+              if __port_manager_container_option_takes_value "\${__pm_container_command}" "-\${__pm_cluster%"\${__pm_cluster_rest}"}"; then
+                [ -n "\${__pm_cluster_rest}" ] || __pm_skip_value=1
+                break
+              fi
+              __pm_cluster="\${__pm_cluster_rest}"
+            done
+            ;;
+        esac
+      else
+        case "\${__pm_container_kind}" in
+          copy)
+            # CONTAINER:PATH as Docker reads it: a colon with a slash-free name before it.
+            __pm_copy_container="\${__pm_arg%%:*}"
+            if [ "\${__pm_copy_container}" != "\${__pm_arg}" ] && [ -n "\${__pm_copy_container}" ]; then
+              case "\${__pm_copy_container}" in
+                */*) ;;
+                *) __pm_reference=1 ;;
+              esac
+            fi
+            ;;
+          first)
+            # What follows is the in-container command, a new name, a port or ps options.
+            __pm_reference=1
+            __pm_container_kind=none
+            ;;
+          *) __pm_reference=1 ;;
+        esac
+      fi
+    fi
+
     if [ "\${__pm_filter_next}" = "1" ]; then
       __pm_filter_next=0
       __pm_mapped="$(__port_manager_rewrite_container_name_filter "\${__pm_runtime}" "\${__pm_arg}" "$@")"
@@ -1287,14 +1416,8 @@ __port_manager_run_runtime_with_container_routing() {
             __pm_arg="-f=\${__pm_mapped}"
           fi
           ;;
-        *)
-          __pm_mapped="$(__port_manager_container_target_for_runtime "\${__pm_runtime}" "\${__pm_arg}" "$@")"
-          if [ -n "\${__pm_mapped}" ]; then
-            __pm_arg="\${__pm_mapped}"
-          fi
-          ;;
       esac
-    else
+    elif [ "\${__pm_reference}" = "1" ]; then
       __pm_mapped="$(__port_manager_container_target_for_runtime "\${__pm_runtime}" "\${__pm_arg}" "$@")"
       if [ -n "\${__pm_mapped}" ]; then
         __pm_arg="\${__pm_mapped}"

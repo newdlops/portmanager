@@ -28,6 +28,8 @@
 #define PM_MAX_RUNTIME 32
 
 #define PM_RUNTIME_SHIM_DIR_ENV "PORT_MANAGER_RUNTIME_SHIM_DIR"
+/* Every Port Manager shim generation carries this file; none of them is the real runtime. */
+#define PM_RUNTIME_SHIM_STAMP_FILE ".portmanager-shim-stamp"
 #define PM_COMPOSE_ROUTING_FILE_ENV "PORT_MANAGER_COMPOSE_ROUTING_FILE"
 #define PM_COMPOSE_ROUTING_FILE_PREFIX "compose-project-routing-"
 #define PM_COMPOSE_ROUTING_FILE_SUFFIX ".tsv"
@@ -224,6 +226,25 @@ static int pm_candidate_is_current_shim(const char *candidate, const char *self_
   return pm_is_executable_file(candidate) && pm_same_file(candidate, self_path);
 }
 
+/*
+ * Another extension generation (VS Code global storage, ~/.portmanager) can sit
+ * on PATH with its own docker alias. Treating it as the real runtime rewrites
+ * the same argv twice and runs whatever routing rules that generation shipped.
+ */
+static int pm_directory_is_runtime_shim(const char *directory) {
+  char stamp_path[PM_MAX_PATH];
+  struct stat stat_buffer;
+  int length;
+
+  if (directory == NULL || directory[0] == '\0') {
+    return 0;
+  }
+
+  length = snprintf(stamp_path, sizeof(stamp_path), "%s/%s", directory, PM_RUNTIME_SHIM_STAMP_FILE);
+  return length > 0 && (size_t)length < sizeof(stamp_path) &&
+         stat(stamp_path, &stat_buffer) == 0 && S_ISREG(stat_buffer.st_mode);
+}
+
 /** Builds the PATH passed to Docker so nested runtime calls do not re-enter this shim. */
 static char *pm_path_without_shim_directory(const char *runtime, const char *self_path) {
   const char *path_env = getenv("PATH");
@@ -263,6 +284,10 @@ static char *pm_path_without_shim_directory(const char *runtime, const char *sel
 
     if (!skip_directory && shim_directory != NULL && shim_directory[0] != '\0' &&
         pm_same_directory(directory, shim_directory)) {
+      skip_directory = 1;
+    }
+
+    if (!skip_directory && pm_directory_is_runtime_shim(directory)) {
       skip_directory = 1;
     }
 
@@ -389,6 +414,10 @@ static int pm_find_runtime_from_invocation_path(const char *runtime, char **argv
   }
 
   if (shim_directory != NULL && shim_directory[0] != '\0' && pm_same_directory(invocation_directory, shim_directory)) {
+    return -1;
+  }
+
+  if (pm_directory_is_runtime_shim(invocation_directory)) {
     return -1;
   }
 
@@ -2243,6 +2272,33 @@ static int pm_has_prefix(const char *value, const char *prefix) {
   return strncmp(value, prefix, prefix_length) == 0;
 }
 
+/** Docker container ids are lowercase hexadecimal; names never qualify. */
+static int pm_is_container_id_text(const char *value) {
+  if (value == NULL || value[0] == '\0') {
+    return 0;
+  }
+
+  for (const char *cursor = value; *cursor != '\0'; cursor++) {
+    if (!((*cursor >= '0' && *cursor <= '9') || (*cursor >= 'a' && *cursor <= 'f'))) {
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
+/*
+ * Docker resolves unique prefixes of container ids, so a short or full hash can
+ * match a stored id of a different length. Routing rows also keep names in the
+ * id columns (a service name such as `rabbitmq`, or an empty field); a prefix
+ * test against those would map `rabbitmqctl` or any token to the clone, so
+ * both sides must be ids.
+ */
+static int pm_container_ids_share_prefix(const char *token, const char *row_id) {
+  return pm_is_container_id_text(token) && pm_is_container_id_text(row_id) &&
+         (pm_has_prefix(row_id, token) || pm_has_prefix(token, row_id));
+}
+
 /**
  * Captures small Docker metadata queries without entering the shell.
  *
@@ -2704,10 +2760,8 @@ static int pm_container_target_scan_file(const char *file_path, void *context) {
         strcmp(search->token, row.service_name) == 0) {
       matched = 1;
     } else if (search->token_length >= 4 &&
-               (pm_has_prefix(row.project_or_original_id, search->token) ||
-                pm_has_prefix(search->token, row.project_or_original_id) ||
-                pm_has_prefix(row.attached_id, search->token) ||
-                pm_has_prefix(search->token, row.attached_id))) {
+               (pm_container_ids_share_prefix(search->token, row.project_or_original_id) ||
+                pm_container_ids_share_prefix(search->token, row.attached_id))) {
       matched = 1;
     }
 
@@ -3136,15 +3190,175 @@ static char *pm_rewrite_inline_container_name_filter(
 }
 
 /** Creates argv for execv, rewriting only tokens that uniquely identify cloned containers. */
+/*
+ * Which arguments of a container command name containers. Only those positions
+ * are mapped to the attached clone: an option value (`exec -u rabbitmq`), the
+ * command `exec` runs inside the container, the new name given to `rename` or a
+ * local `cp` path keeps the user's spelling even when it equals a service or
+ * container name.
+ */
+typedef enum {
+  PM_CONTAINER_ARGUMENTS_FIRST, /* exec CONTAINER COMMAND..., logs CONTAINER: the first positional only */
+  PM_CONTAINER_ARGUMENTS_ALL,   /* rm/stop/inspect CONTAINER...: every positional */
+  PM_CONTAINER_ARGUMENTS_COPY,  /* cp SRC DEST: only CONTAINER:PATH positionals */
+} pm_container_argument_kind;
+
+typedef struct {
+  const char *command;
+  pm_container_argument_kind kind;
+  /* Docker and Podman options that consume the next argument, as "|-o|--option|". */
+  const char *value_options;
+} pm_container_command_grammar;
+
+static const pm_container_command_grammar pm_container_command_grammars[] = {
+  {"attach", PM_CONTAINER_ARGUMENTS_FIRST, "|--detach-keys|"},
+  {"commit", PM_CONTAINER_ARGUMENTS_FIRST, "|-a|--author|-c|--change|-m|--message|-f|--format|--iidfile|--config|"},
+  {"cp", PM_CONTAINER_ARGUMENTS_COPY, "||"},
+  {"diff", PM_CONTAINER_ARGUMENTS_FIRST, "|--format|"},
+  {"exec", PM_CONTAINER_ARGUMENTS_FIRST, "|-e|--env|--env-file|-u|--user|-w|--workdir|--detach-keys|--preserve-fd|--preserve-fds|"},
+  {"export", PM_CONTAINER_ARGUMENTS_FIRST, "|-o|--output|"},
+  {"inspect", PM_CONTAINER_ARGUMENTS_ALL, "|-f|--format|--type|-t|"},
+  {"kill", PM_CONTAINER_ARGUMENTS_ALL, "|-s|--signal|--cidfile|"},
+  {"logs", PM_CONTAINER_ARGUMENTS_FIRST, "|--since|--until|-n|--tail|"},
+  {"pause", PM_CONTAINER_ARGUMENTS_ALL, "|--cidfile|--filter|"},
+  {"port", PM_CONTAINER_ARGUMENTS_FIRST, "||"},
+  {"rename", PM_CONTAINER_ARGUMENTS_FIRST, "||"},
+  {"restart", PM_CONTAINER_ARGUMENTS_ALL, "|-s|--signal|-t|--time|--timeout|--cidfile|--filter|"},
+  {"rm", PM_CONTAINER_ARGUMENTS_ALL, "|-t|--time|--cidfile|--filter|"},
+  {"start", PM_CONTAINER_ARGUMENTS_ALL, "|--detach-keys|--checkpoint|--checkpoint-dir|--filter|"},
+  {"stats", PM_CONTAINER_ARGUMENTS_ALL, "|--format|-i|--interval|"},
+  {"stop", PM_CONTAINER_ARGUMENTS_ALL, "|-s|--signal|-t|--time|--timeout|--cidfile|--filter|"},
+  {"top", PM_CONTAINER_ARGUMENTS_FIRST, "||"},
+  {"unpause", PM_CONTAINER_ARGUMENTS_ALL, "|--cidfile|--filter|"},
+  {"update", PM_CONTAINER_ARGUMENTS_ALL,
+   "|--blkio-weight|--cpu-period|--cpu-quota|--cpu-rt-period|--cpu-rt-runtime|-c|--cpu-shares|--cpus|"
+   "--cpuset-cpus|--cpuset-mems|-m|--memory|--memory-reservation|--memory-swap|--pids-limit|--restart|"},
+  {"wait", PM_CONTAINER_ARGUMENTS_ALL, "|--condition|-i|--interval|"},
+  {NULL, PM_CONTAINER_ARGUMENTS_ALL, NULL},
+};
+
+static const pm_container_command_grammar *pm_container_command_grammar_for(const char *command) {
+  for (int index = 0; pm_container_command_grammars[index].command != NULL; index++) {
+    if (strcmp(pm_container_command_grammars[index].command, command) == 0) {
+      return &pm_container_command_grammars[index];
+    }
+  }
+  return NULL;
+}
+
+static int pm_container_option_takes_value(const pm_container_command_grammar *grammar, const char *option, size_t length) {
+  char lookup[64];
+
+  if (length == 0 || length + 3 > sizeof(lookup)) {
+    return 0;
+  }
+
+  lookup[0] = '|';
+  memcpy(lookup + 1, option, length);
+  lookup[length + 1] = '|';
+  lookup[length + 2] = '\0';
+  return strstr(grammar->value_options, lookup) != NULL;
+}
+
+/** `CONTAINER:PATH` as Docker reads it: a colon with a slash-free name before it. */
+static int pm_is_container_path_argument(const char *arg) {
+  const char *colon = strchr(arg, ':');
+  return colon != NULL && colon != arg && memchr(arg, '/', (size_t)(colon - arg)) == NULL;
+}
+
+/**
+ * Sets references[index] for every argv entry that names a container.
+ *
+ * `--` ends the options, `--name=value` carries its own value, and a long or
+ * short option listed by the command consumes the next argument. In a short
+ * cluster such as `-itu root` the value option ends the cluster and takes the
+ * rest of it or the next argument. An option missing from the table counts as a
+ * flag, so its value can at worst be mapped as before this table existed.
+ */
+static void pm_mark_container_reference_arguments(int argc, char **argv, int command_index, unsigned char *references) {
+  const pm_container_command_grammar *grammar;
+  int subcommand_index = command_index;
+  int options_ended = 0;
+  int skip_value = 0;
+
+  if (command_index < 0 || command_index >= argc) {
+    return;
+  }
+
+  if (strcmp(argv[command_index], "container") == 0) {
+    subcommand_index = -1;
+    for (int index = command_index + 1; index < argc; index++) {
+      if (argv[index][0] != '-') {
+        subcommand_index = index;
+        break;
+      }
+    }
+    if (subcommand_index < 0) {
+      return;
+    }
+  }
+
+  grammar = pm_container_command_grammar_for(argv[subcommand_index]);
+  if (grammar == NULL) {
+    return;
+  }
+
+  for (int index = subcommand_index + 1; index < argc; index++) {
+    const char *arg = argv[index];
+
+    if (skip_value) {
+      skip_value = 0;
+      continue;
+    }
+
+    if (!options_ended && strcmp(arg, "--") == 0) {
+      options_ended = 1;
+      continue;
+    }
+
+    if (!options_ended && arg[0] == '-' && arg[1] != '\0') {
+      if (arg[1] == '-') {
+        skip_value = strchr(arg, '=') == NULL && pm_container_option_takes_value(grammar, arg, strlen(arg));
+      } else {
+        for (const char *cursor = arg + 1; *cursor != '\0'; cursor++) {
+          const char option[3] = {'-', *cursor, '\0'};
+
+          if (pm_container_option_takes_value(grammar, option, 2)) {
+            skip_value = cursor[1] == '\0';
+            break;
+          }
+        }
+      }
+      continue;
+    }
+
+    if (grammar->kind == PM_CONTAINER_ARGUMENTS_COPY) {
+      references[index] = (unsigned char)pm_is_container_path_argument(arg);
+      continue;
+    }
+
+    references[index] = 1;
+    if (grammar->kind == PM_CONTAINER_ARGUMENTS_FIRST) {
+      /* What follows is the in-container command, a new name, a port or ps options. */
+      return;
+    }
+  }
+}
+
 static char **pm_rewrite_container_args(const char *runtime, const char *real_runtime_path, int argc, char **argv) {
   char **next_argv = calloc((size_t)argc + 1, sizeof(char *));
+  unsigned char *references = calloc((size_t)argc + 1, sizeof(unsigned char));
   int command_index = pm_first_command_index(argc, argv);
   int rewrite_name_filters = pm_runtime_command_uses_container_name_filters(argc, argv, command_index);
   int rewrite_next_filter = 0;
 
-  if (next_argv == NULL) {
+  if (next_argv == NULL || references == NULL) {
+    free(next_argv);
+    free(references);
     return NULL;
   }
+
+  pm_mark_container_reference_arguments(argc, argv, command_index, references);
 
   next_argv[0] = (char *)real_runtime_path;
   for (int index = 1; index < argc; index++) {
@@ -3170,13 +3384,14 @@ static char **pm_rewrite_container_args(const char *runtime, const char *real_ru
       }
     }
 
-    if (target == NULL) {
+    if (target == NULL && references[index]) {
       target = pm_container_target_for_token(runtime, real_runtime_path, argv[index], argc, argv);
     }
 
     next_argv[index] = target == NULL ? argv[index] : target;
   }
   next_argv[argc] = NULL;
+  free(references);
   return next_argv;
 }
 

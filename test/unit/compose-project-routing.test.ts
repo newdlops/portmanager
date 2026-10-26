@@ -4466,6 +4466,252 @@ test(
   },
 );
 
+/*
+ * Only arguments that name containers are mapped. A container or service name
+ * used as an option value, inside the command `exec` runs, as rename's new name
+ * or as a local cp path stays as typed: mapping every token turned
+ * `docker exec -u rabbitmq <id> rabbitmqctl …` into a clone name for the user and
+ * the in-container command.
+ */
+const CONTAINER_ARGUMENT_POSITION_CASES: ReadonlyArray<readonly [readonly string[], readonly string[]]> = [
+  [
+    ["exec", "-u", "postgres", "workspace-postgres-1", "psql", "-U", "postgres", "postgres"],
+    ["exec", "-u", "postgres", "network-a-app-postgres-1", "psql", "-U", "postgres", "postgres"],
+  ],
+  [["exec", "-itu", "postgres", "postgres", "sh"], ["exec", "-itu", "postgres", "network-a-app-postgres-1", "sh"]],
+  [
+    ["exec", "--user=postgres", "-e", "PGUSER=postgres", "-upostgres", "abc123", "postgres", "--version"],
+    ["exec", "--user=postgres", "-e", "PGUSER=postgres", "-upostgres", "network-a-app-postgres-1", "postgres", "--version"],
+  ],
+  [
+    ["container", "exec", "-w", "postgres", "postgres", "postgres"],
+    ["container", "exec", "-w", "postgres", "network-a-app-postgres-1", "postgres"],
+  ],
+  [["logs", "--since", "10m", "-f", "postgres"], ["logs", "--since", "10m", "-f", "network-a-app-postgres-1"]],
+  [["rename", "workspace-postgres-1", "postgres"], ["rename", "network-a-app-postgres-1", "postgres"]],
+  [["cp", "./postgres", "postgres:/tmp/postgres"], ["cp", "./postgres", "network-a-app-postgres-1:/tmp/postgres"]],
+  [["stop", "-t", "5", "postgres", "abc123"], ["stop", "-t", "5", "network-a-app-postgres-1", "network-a-app-postgres-1"]],
+  [
+    ["--context", "default", "inspect", "--format", "postgres", "postgres"],
+    ["--context", "default", "inspect", "--format", "postgres", "network-a-app-postgres-1"],
+  ],
+];
+
+/** Generated rows can keep names in the id columns (observed: original id `rabbitmq`). */
+function createNameIdContainerRoutingRows(projectDir: string): string {
+  return serializeComposeProjectRoutingRows([
+    {
+      networkId: "network-a",
+      runtime: "docker",
+      workingDirectory: projectDir,
+      attachedProjectName: "network-a-app-1234",
+      containerMappings: [
+        {
+          serviceName: "postgres",
+          originalContainerId: "postgres",
+          originalContainerName: "postgres",
+          attachedContainerId: "network-a-app-postgres-1",
+          attachedContainerName: "network-a-app-postgres-1",
+        },
+      ],
+    },
+  ]);
+}
+
+// Exact names still map; a longer word that only starts with a name or a name-like id does not.
+const NAME_ID_PREFIX_CASES: ReadonlyArray<readonly [readonly string[], readonly string[]]> = [
+  [["logs", "postgres"], ["logs", "network-a-app-postgres-1"]],
+  [["logs", "postgresql"], ["logs", "postgresql"]],
+  [["kill", "network-a-app-postgres-10"], ["kill", "network-a-app-postgres-10"]],
+];
+
+function runShellDockerWrapper(routingRows: string, args: readonly string[], shell = "sh"): string[] {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-container-arguments-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const binDir = path.join(tempDir, "bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(routingFile, routingRows.split("__PROJECT_DIR__").join(projectDir), "utf8");
+  fs.writeFileSync(path.join(binDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync(
+      shell,
+      [
+        "-c",
+        [
+          buildComposeProjectRoutingShell(routingFile),
+          "export PORT_MANAGER_NETWORK_ID=network-a",
+          `export PATH=${shellQuote(binDir)}:$PATH`,
+          `cd ${shellQuote(projectDir)}`,
+          `docker ${args.map(shellQuote).join(" ")}`,
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+    return output.split("\n").filter(line => line !== "").map(line => line.slice(1, -1));
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+function runNativeDockerShim(routingRows: string, args: readonly string[], extraPathDirectories: readonly string[] = []): string[] {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-container-arguments-"));
+  const projectDir = path.join(tempDir, "workspace", "app");
+  const shimDir = path.join(tempDir, "shim");
+  const realBinDir = path.join(tempDir, "real-bin");
+  const routingFile = path.join(tempDir, "routes.tsv");
+
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(shimDir, { recursive: true });
+  fs.mkdirSync(realBinDir, { recursive: true });
+  fs.writeFileSync(routingFile, routingRows.split("__PROJECT_DIR__").join(projectDir), "utf8");
+  fs.symlinkSync(getNativeDockerShimPath(), path.join(shimDir, "docker"));
+  fs.writeFileSync(path.join(realBinDir, "docker"), "#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n", {
+    encoding: "utf8",
+    mode: 0o700,
+  });
+
+  try {
+    const output = execFileSync("docker", [...args], {
+      cwd: projectDir,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: [shimDir, ...extraPathDirectories, realBinDir, process.env.PATH ?? ""].join(path.delimiter),
+        PORT_MANAGER_RUNTIME_SHIM_DIR: shimDir,
+        PORT_MANAGER_COMPOSE_ROUTING_FILE: routingFile,
+        PORT_MANAGER_NETWORK_ID: "network-a",
+        PORT_MANAGER_BORROWED_NETWORK_ID: "",
+        NEWDLOPS_PM_NETWORK_ID: "",
+        NEWDLOPS_PM_BORROWED_NETWORK_ID: "",
+      },
+    });
+    return output.split("\n").filter(line => line !== "").map(line => line.slice(1, -1));
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+test("docker wrapper maps only the arguments that name containers", () => {
+  // The same functions are sourced into zsh terminals, where pattern and expansion rules differ.
+  for (const shell of fs.existsSync("/bin/zsh") ? ["sh", "/bin/zsh"] : ["sh"]) {
+    for (const [args, expected] of CONTAINER_ARGUMENT_POSITION_CASES) {
+      assert.deepEqual(runShellDockerWrapper(createContainerRoutingRows("__PROJECT_DIR__"), args, shell), expected, `${shell}: ${args.join(" ")}`);
+    }
+    for (const [args, expected] of NAME_ID_PREFIX_CASES) {
+      assert.deepEqual(runShellDockerWrapper(createNameIdContainerRoutingRows("__PROJECT_DIR__"), args, shell), expected, `${shell}: ${args.join(" ")}`);
+    }
+  }
+});
+
+test(
+  "native docker PATH shim maps only the arguments that name containers",
+  { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
+  () => {
+    for (const [args, expected] of CONTAINER_ARGUMENT_POSITION_CASES) {
+      assert.deepEqual(runNativeDockerShim(createContainerRoutingRows("__PROJECT_DIR__"), args), expected, args.join(" "));
+    }
+    for (const [args, expected] of NAME_ID_PREFIX_CASES) {
+      assert.deepEqual(runNativeDockerShim(createNameIdContainerRoutingRows("__PROJECT_DIR__"), args), expected, args.join(" "));
+    }
+  },
+);
+
+test(
+  "native docker PATH shim never runs another Port Manager shim generation as the real runtime",
+  { skip: canRunNativeDockerShim() ? false : "native docker shim is not runnable on this platform" },
+  context => {
+    const otherGeneration = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-other-shim-generation-"));
+    context.after(() => fs.rmSync(otherGeneration, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(otherGeneration, ".portmanager-shim-stamp"), "older-generation\n");
+    fs.writeFileSync(path.join(otherGeneration, "docker"), "#!/bin/sh\nprintf '<__WRONG_GENERATION__>\\n'\n", { mode: 0o700 });
+
+    assert.deepEqual(
+      runNativeDockerShim(createContainerRoutingRows("__PROJECT_DIR__"), ["exec", "postgres", "true"], [otherGeneration]),
+      ["exec", "network-a-app-postgres-1", "true"],
+    );
+  },
+);
+
+test("docker shim and shell wrapper share one container argument grammar", () => {
+  const nativeSource = fs.readFileSync(path.resolve(__dirname, "../../../native/docker-shim/portmanager_docker_shim.c"), "utf8");
+  const tableStart = nativeSource.indexOf("pm_container_command_grammars[] = {");
+  const table = nativeSource.slice(tableStart, nativeSource.indexOf("{NULL,", tableStart));
+  const nativeGrammar = new Map<string, string>();
+  for (const entry of table.matchAll(/\{"([a-z]+)", PM_CONTAINER_ARGUMENTS_([A-Z]+),\s*((?:"[^"]*"\s*)+)\}/g)) {
+    const options = entry[3].replace(/"\s*"/g, "").replace(/"/g, "").split("|").filter(Boolean).sort();
+    nativeGrammar.set(entry[1], `${entry[2].toLowerCase()} ${options.join(",")}`);
+  }
+
+  const shell = buildComposeProjectRoutingShell("/tmp/compose-project-routing-network-a.tsv");
+  const kindBody = /__port_manager_container_argument_kind\(\) \{([\s\S]*?)\n\}/.exec(shell)?.[1] ?? "";
+  const optionBody = /__port_manager_container_option_takes_value\(\) \{([\s\S]*?)\n\}/.exec(shell)?.[1] ?? "";
+  const shellOptions = new Map<string, string[]>();
+  for (const pair of optionBody.matchAll(/([a-z]+):(--?[a-z-]+)/g)) {
+    shellOptions.set(pair[1], [...(shellOptions.get(pair[1]) ?? []), pair[2]]);
+  }
+  const shellGrammar = new Map<string, string>();
+  for (const entry of kindBody.matchAll(/^\s*([a-z|]+)\) printf '([a-z]+)\\n'/gm)) {
+    for (const command of entry[1].split("|")) {
+      shellGrammar.set(command, `${entry[2]} ${(shellOptions.get(command) ?? []).sort().join(",")}`);
+    }
+  }
+
+  assert.ok(nativeGrammar.size >= 20, "the native grammar table must parse");
+  assert.deepEqual(
+    Object.fromEntries([...shellGrammar].sort()),
+    Object.fromEntries([...nativeGrammar].sort()),
+    "a container command must name the same arguments in both implementations",
+  );
+});
+
+test(
+  "native container mapper matches id prefixes only between container ids",
+  { skip: canRunNativeContainerMap() ? false : "native container mapper is not runnable on this platform" },
+  context => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "portmanager-native-container-map-ids-"));
+    context.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+    const hashRows = path.join(tempDir, "hash-routes.tsv");
+    const nameRows = path.join(tempDir, "name-routes.tsv");
+    fs.writeFileSync(hashRows, createContainerRoutingRows(tempDir), "utf8");
+    fs.writeFileSync(nameRows, createNameIdContainerRoutingRows(tempDir), "utf8");
+
+    function lookup(routingFile: string, token: string): string | undefined {
+      try {
+        return execFileSync(getNativeContainerMapPath(), [routingFile, "network-a", "docker", token], { encoding: "utf8" }).trim();
+      } catch {
+        return undefined;
+      }
+    }
+
+    assert.equal(lookup(hashRows, "abc123"), "network-a-app-postgres-1", "short container hashes keep mapping");
+    assert.equal(lookup(hashRows, "abc1234567890000ffff"), "network-a-app-postgres-1");
+    assert.equal(lookup(nameRows, "postgres"), "network-a-app-postgres-1");
+    assert.equal(lookup(nameRows, "postgresql"), undefined);
+    assert.equal(lookup(nameRows, "network-a-app-postgres-10"), undefined);
+  },
+);
+
+function getNativeContainerMapPath(): string {
+  return path.join(process.cwd(), "media", "native", "portmanager_container_map");
+}
+
+function canRunNativeContainerMap(): boolean {
+  try {
+    fs.accessSync(getNativeContainerMapPath(), fs.constants.X_OK);
+    execFileSync(getNativeContainerMapPath(), [], { stdio: "pipe" });
+    return false;
+  } catch (error) {
+    return (error as { status?: number }).status === 1;
+  }
+}
+
 function createContainerRoutingRows(projectDir: string): string {
   return serializeComposeProjectRoutingRows([
     {
