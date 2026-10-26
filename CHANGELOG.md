@@ -4,6 +4,8 @@ All notable changes to Port Manager are documented in this file.
 
 ## Unreleased
 
+## 0.0.8271
+
 - Keep servers started by a hardened `uv` (the official installer build, which drops `DYLD_INSERT_LIBRARIES`) on the logical network. For `uv run <command>`, `uv run -m <module>` and `uv run <script>.py` the uv shim runs the command through the native hook's `sh -c` preload repair, so Django/Celery/uvicorn bind the network loopback again instead of the real `127.0.0.1`. Other forms (PEP 723 scripts, `--script`, unknown options) keep uv's handling and print a one-line notice; `uvx`/`uv tool run` are unchanged.
 - Fix Docker/Podman container routing rewriting arguments that do not name containers. `docker exec -u rabbitmq <id> rabbitmqctl …` no longer turns the user and the in-container command into the clone container name: the native shim and the shell wrapper map only container positions per command (first positional for `exec`/`logs`/…, every positional for `rm`/`stop`/…, `CONTAINER:PATH` for `cp`) and skip option values. Short-hash prefix matching now requires both sides to be container ids, so names stored in id columns no longer match longer words (`rabbitmqctl`). The native shim also skips every stamped Port Manager shim directory when resolving the real runtime instead of running another extension generation's shim.
 
