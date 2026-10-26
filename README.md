@@ -165,6 +165,8 @@ Stopped processes stay visible for restart or removal, but their routed URL is c
 
 Important limitation: the agent does not transparently create isolated per-process networks. Automatic pre-launch rerouting works only for supported managed or hooked process paths. Running two ordinary host processes that both bind `127.0.0.1:3004` still requires true network isolation, runtime injection, or a proxy/runtime adapter.
 
+macOS removes `DYLD_INSERT_LIBRARIES` from launchers signed with the hardened runtime unless they carry the `com.apple.security.cs.allow-dyld-environment-variables` entitlement. The official `uv` installer build is such a launcher. For `uv run <command>`, `uv run -m <module>` and `uv run <script>.py`, the uv shim restores the hook on the command uv runs. A `uv run` form it cannot rewrite safely (PEP 723 inline-metadata scripts, `--script`, unknown options) prints a notice and runs outside the logical network, as do `uvx` and `uv tool run`.
+
 ## Settings
 
 - `portManager.enabled`: enable managed process routing.

@@ -30,6 +30,7 @@ import {
 import { normalizeBrowserDnsHostname } from "../platform/network/browser-dns-server";
 import { preparePersistentNativeHookLibrary } from "../platform/process/native-executable";
 import { ensureNetworkNamespaceScaffold, type NamespaceNetworkIdentity } from "../platform/process/network-file-scaffold";
+import { buildUvRunPreloadRepairFunctions, buildUvRunPreloadRepairShell } from "./uv-run-preload-repair";
 
 /**
  * Keeps new VS Code terminals on the pre-bind routing path.
@@ -1468,6 +1469,8 @@ __pm_text_looks_like_dev_server() {
   return 1
 }
 
+${buildUvRunPreloadRepairFunctions()}
+
 __pm_target="$(__pm_find_next_command)" || {
   printf '%s\\n' "Port Manager: could not find command after shim: \${__pm_name}" >&2
   exit 127
@@ -1481,6 +1484,7 @@ if [ -n "\${PORT_MANAGER_GUARDED_SESSION_ID:-}" ] || __pm_package_manager_comman
   export PORT_MANAGER_PRELOAD_REPAIR=1
   if __pm_package_manager_requires_preload_parent; then
     if __pm_package_manager_is_native_binary; then
+      ${buildUvRunPreloadRepairShell()}
       ${buildPreloadedPackageManagerEntrypointShell()}
     fi
     ${buildHookedPackageManagerEntrypointShell()}

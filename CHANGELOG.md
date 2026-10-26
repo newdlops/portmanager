@@ -4,6 +4,8 @@ All notable changes to Port Manager are documented in this file.
 
 ## Unreleased
 
+- Keep servers started by a hardened `uv` (the official installer build, which drops `DYLD_INSERT_LIBRARIES`) on the logical network. For `uv run <command>`, `uv run -m <module>` and `uv run <script>.py` the uv shim runs the command through the native hook's `sh -c` preload repair, so Django/Celery/uvicorn bind the network loopback again instead of the real `127.0.0.1`. Other forms (PEP 723 scripts, `--script`, unknown options) keep uv's handling and print a one-line notice; `uvx`/`uv tool run` are unchanged.
+
 ## 0.0.8270
 
 - Restore cooperative native daemon recovery for host-shell servers so existing listeners regain their network routes and browser HTTPS entrypoints after daemon replacement.
