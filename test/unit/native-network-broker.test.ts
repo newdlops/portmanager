@@ -226,7 +226,10 @@ test("broker bounds malformed requests, cancellation and slow clients without re
 
   const slow = net.createConnection(socketPath); clients.push(slow);
   slow.on("error", () => {});
-  const slowClosed = once(slow, "close");
+  // A final trickle can race the broker's absolute deadline and emit EPIPE
+  // before close. This probe expects that disconnect; events.once(close)
+  // would reject on the expected error instead of observing the close below.
+  const slowClosed = new Promise<void>(resolve => slow.once("close", () => resolve()));
   await once(slow, "connect");
   const started = Date.now();
   slow.write(Buffer.from([0x42]));
