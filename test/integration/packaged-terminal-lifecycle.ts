@@ -15,7 +15,7 @@ import { fixtureWitnessWriterSource, publishFixtureWitness } from "./fixture-wit
 export async function preparePackagedTerminalLifecycle(service: PortManagerNetworkService, moduleRoot: string, reportPath: string) {
   const load = (relative: string) => require(path.join(moduleRoot, "out/src", relative));
   const { loopbackAddressForNetwork } = load("core/networks/loopback-address") as typeof import("../../src/core/networks/loopback-address");
-  const { networkNamespacePaths } = load("platform/process/network-file-scaffold") as typeof import("../../src/platform/process/network-file-scaffold");
+  const { ensureNetworkNamespaceScaffold, networkNamespacePaths } = load("platform/process/network-file-scaffold") as typeof import("../../src/platform/process/network-file-scaffold");
   const { NativeProcessLookupProvider } = load("platform/process/native-process-lookup") as typeof import("../../src/platform/process/native-process-lookup");
   const { defaultProxyNetworkResources: resources } = load("platform/ports/proxy-network-resources") as { defaultProxyNetworkResources: ProxyNetworkResources };
   const registry = (service as unknown as { registry: LogicalNetworkRegistry }).registry;
@@ -50,6 +50,7 @@ export async function preparePackagedTerminalLifecycle(service: PortManagerNetwo
   for (let index = 0; index < selected.length; index++) assert.equal(await exchange(selected[index].host, ports[index], "outside"), `${index === 0 ? "A" : "B"}:outside`);
   const bindings = selected.map((row, index) => service.createHostAccessBinding({ networkId: row.id,
     logicalPort: 4567, hostAddress: row.host, hostPort: ports[index] }));
+  for (const network of selected) ensureNetworkNamespaceScaffold(workspace, network.id, network.id);
   const foreignFile = path.join(networkNamespacePaths(workspace, selected[1].id).filesDirectory, "kernel-fixture.dat");
   fs.mkdirSync(path.dirname(foreignFile), { recursive: true, mode: 0o700 });
   fs.writeFileSync(foreignFile, "synthetic fixture", { mode: 0o600 });

@@ -9,7 +9,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import { ensureAgentControllerToken } from "../../src/agent/agent-authorization";
 import { buildMacosNetworkSandboxProfile } from "../../src/platform/process/macos-network-sandbox";
-import { networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
+import { ensureNetworkNamespaceScaffold, networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
 
 const run = promisify(execFile);
 interface Identity { pid: number; birth: number }
@@ -59,6 +59,7 @@ test("private ownership and completion records recover abrupt supervisor death w
   assert.equal((await run(launcher, ["--lifecycle-version"], { env: environment })).stdout.trim(), "1");
   const prepare = async (networkId: string) => {
     const endpoint = path.join(security, `sockets/${networkId}.sock`), policy = path.join(security, `profiles/${networkId}.sb`);
+    ensureNetworkNamespaceScaffold(root, networkId, networkId);
     const own = networkNamespacePaths(root, networkId); fs.mkdirSync(own.filesDirectory, { recursive: true, mode: 0o700 });
     fs.writeFileSync(policy, buildMacosNetworkSandboxProfile({ networkId, namespaceDirectories: [own.directory], sharedWorkspaceDirectories: [root], agentSocketPath: endpoint }), { mode: 0o600 });
     const helper = spawn(broker, ["--socket", endpoint, "--network-id", networkId, "--loopback-host", "127.0.0.1"], { env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(helper);

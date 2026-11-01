@@ -4,6 +4,8 @@ All notable changes to Port Manager are documented in this file.
 
 ## Unreleased
 
+- Store local network settings in readable network-name folders such as `.portmanager/namespaces/rtcc/` and `.portmanager/namespaces/알파 개발/`, with numeric suffixes for duplicate names. Move existing opaque ID folders on the next attach without replacing saved settings, and preserve ownership across network renames. Native readers and guarded terminal policies use the same named folders. Restart existing workloads after migration to rebuild cached paths.
+
 ## 0.0.8271
 
 - Keep servers started by a hardened `uv` (the official installer build, which drops `DYLD_INSERT_LIBRARIES`) on the logical network. For `uv run <command>`, `uv run -m <module>` and `uv run <script>.py` the uv shim runs the command through the native hook's `sh -c` preload repair, so Django/Celery/uvicorn bind the network loopback again instead of the real `127.0.0.1`. Other forms (PEP 723 scripts, `--script`, unknown options) keep uv's handling and print a one-line notice; `uvx`/`uv tool run` are unchanged.

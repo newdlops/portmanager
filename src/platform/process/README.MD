@@ -19,7 +19,7 @@
 - hook 라이브러리를 `~/.portmanager/runtime/<OS>-<CPU>/media/native/`의 고정 경로에 원자적으로 복사하여 확장 업데이트 뒤에도 기존 launcher의 preload 경로 유지
 - 변경 없는 hook 재게시 확인은 source/target의 inode·size·mtime·ctime으로 전체 binary 재읽기를 생략한다. 최대 8개 metadata만 보관하며 손상·교체·symlink는 byte 검증과 원자적 복사로 복구한다.
 - 설치된 shell script를 `sh -n`으로 검사하고 실제 source 후 `pm` 함수 및 profile marker 유지 검증
-- ID 기반 네트워크 파일 scaffold와 소유자가 명확한 legacy 설정의 비파괴 마이그레이션
+- 네트워크 이름 기반 파일 scaffold, 중복 이름의 숫자 접미사, ID 폴더의 이동 마이그레이션과 private 소유자 표식 검증
 - UI가 터미널 창/세션으로 그룹화할 수 있는 tty, process group, console 식별자 제공
 
 ## 주요 진입점

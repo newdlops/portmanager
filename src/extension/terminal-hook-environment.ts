@@ -461,7 +461,7 @@ function applyLoopbackRoutingHosts(
 /**
  * Scaffolds `<workspaceFolder>/.portmanager/` so both per-network mechanisms
  * are ready the moment anything attaches to the network — window bindings AND
- * per-terminal attach scripts. Stable ids own `namespaces/<id-key>/` with an
+ * per-terminal attach scripts. Readable network names select `namespaces/<name>/`, with an
  * `environment.env` overlay and exclusive `files/` mirror. Unambiguous legacy
  * name-based settings are copied without replacing their originals. The app
  * `.env` starts as a private independent copy. `.portmanager/` is

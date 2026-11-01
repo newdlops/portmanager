@@ -4,9 +4,10 @@ import { Buffer } from "node:buffer";
 export const MAX_NETWORK_ID_BYTES = 124;
 
 /**
- * Storage belongs to the stable id, never the display name. Encoding UTF-8
+ * Internal credential keys belong to the stable id, never the display name. Encoding UTF-8
  * bytes is injective even on case-insensitive/Unicode-normalizing filesystems;
- * slashes, dot segments and long display names cannot change the directory.
+ * slashes and dot segments cannot redirect a key. User-editable local settings
+ * use readable network-name folders in the filesystem adapter instead.
  */
 export function networkStorageKey(networkId: string): string {
   const bytes = Buffer.from(networkId, "utf8");

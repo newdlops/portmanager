@@ -6,7 +6,7 @@ import * as path from "node:path";
 import test from "node:test";
 import { GuardedRoutePolicyCache } from "../../src/core/networks/logical-route-selection";
 import { buildMacosNetworkSandboxProfile } from "../../src/platform/process/macos-network-sandbox";
-import { networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
+import { ensureNetworkNamespaceScaffold, networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
 import type { NetworkRuntimeScope, NetworkShellLaunch } from "../../src/platform/process/macos-network-runtime";
 
 const handlers = new Map<string, (...args: unknown[]) => Promise<void>>();
@@ -83,6 +83,7 @@ test("guarded package and runtime resolution skips protected inherited PM shims"
   const { prepareRuntimeShimLauncherDirectory, buildRuntimeShimPath } = loadExtension<typeof import("../../src/extension/terminal-hook-environment")>("terminal-hook-environment");
   const root = fs.realpathSync(fs.mkdtempSync(path.join("/private/tmp", "pm-shim-scope-")));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  ensureNetworkNamespaceScaffold(root, "shim-network", "shim-network");
   const own = networkNamespacePaths(root, "shim-network");
   fs.mkdirSync(own.directory, { recursive: true });
   const inherited = path.join(root, ".portmanager", "runtime-shims");

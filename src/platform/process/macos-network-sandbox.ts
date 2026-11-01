@@ -1,5 +1,6 @@
 import * as path from "node:path";
-import { networkStorageKey } from "../../core/networks/network-identity";
+import * as fs from "node:fs";
+import { networkNamespacePaths } from "./network-file-scaffold";
 
 export interface MacosNetworkSandboxScope {
   readonly networkId: string;
@@ -19,12 +20,20 @@ export interface MacosNetworkSandboxScope {
  * a scoped broker and terminal replacement lifecycle enforce it end-to-end.
  */
 export function buildMacosNetworkSandboxProfile(scope: MacosNetworkSandboxScope): string {
-  const key = networkStorageKey(scope.networkId);
   const directories = scope.namespaceDirectories.map(directory => {
-    if (!path.isAbsolute(directory) || path.basename(directory) !== key ||
+    if (!path.isAbsolute(directory) ||
         path.basename(path.dirname(directory)) !== "namespaces" ||
         path.basename(path.dirname(path.dirname(directory))) !== ".portmanager" ||
-        path.normalize(directory) !== directory) throw new Error("Sandbox writes require a canonical namespace owned by its network id.");
+        path.normalize(directory) !== directory ||
+        networkNamespacePaths(path.dirname(path.dirname(path.dirname(directory))), scope.networkId).directory !== directory) {
+      throw new Error("Sandbox writes require a canonical namespace owned by its network id.");
+    }
+    const marker = fs.openSync(path.join(directory, ".network-id"), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    try {
+      const stats = fs.fstatSync(marker);
+      if (!stats.isFile() || (process.getuid !== undefined && stats.uid !== process.getuid()) ||
+          fs.readFileSync(marker, "utf8") !== scope.networkId) throw new Error("Sandbox namespace ownership does not match the network.");
+    } finally { fs.closeSync(marker); }
     return directory;
   });
   if (directories.length === 0) throw new Error("Sandbox execution requires a network namespace.");
@@ -52,7 +61,11 @@ export function buildMacosNetworkSandboxProfile(scope: MacosNetworkSandboxScope)
     "(allow file-read-metadata (subpath \"/\"))",
     "(allow file-read* file-map-executable (require-all (regex #\"/[.]portmanager/runtime/\") (require-not (regex #\"/[.]portmanager/namespaces/\"))))",
     ...sharedDirectories.map(directory => `(allow file-write* (require-all (subpath ${profileString(directory)}) (require-not (regex #\"/[.]portmanager(/|$)\"))))`),
-    ...directories.map(directory => `(allow file-read* file-write* file-map-executable (subpath ${profileString(directory)}))`),
+    ...directories.map(directory => `(allow file-read* file-map-executable (subpath ${profileString(directory)}))`),
+    // Workloads may edit their settings and state, but cannot transfer their
+    // folder's identity or forge a controller move receipt via replacement,
+    // unlink, hardlink aliases or namespace-root mutation.
+    ...directories.map(directory => `(allow file-write* (require-all (subpath ${profileString(directory)}) (require-not (literal ${[directory, ...[".network-id", ".network-name", ".previous-directory"].map(name => path.join(directory, name))].map(profileString).join(" ")}))))`),
     ...namespaceParents.map(directory => `(allow file-read-data (require-all (vnode-type DIRECTORY) (literal ${profileString(directory)})))`),
     "(allow file-read-data file-write-data (literal \"/dev/null\"))",
     "(allow mach-lookup (global-name \"com.apple.logd\") (global-name \"com.apple.system.logger\") (global-name \"com.apple.system.opendirectoryd.libinfo\"))",

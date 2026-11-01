@@ -9,7 +9,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 
 import { buildMacosNetworkSandboxProfile } from "../../src/platform/process/macos-network-sandbox";
-import { networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
+import { ensureNetworkNamespaceScaffold, networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
 import { ensureAgentControllerToken, ensureAgentNetworkToken, getAgentNetworkTokenPath, readAgentControllerToken } from "../../src/agent/agent-authorization";
 
 const run = promisify(execFile);
@@ -20,6 +20,7 @@ test("macOS kernel policy rejects raw cross-network access with the hook disable
   // Unix sun_path is only 104 bytes on macOS; keep the protected broker path short.
   const root = fs.realpathSync(fs.mkdtempSync(path.join("/private/tmp", "pm-sbx-")));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const id of ["network-a", "network-b"]) ensureNetworkNamespaceScaffold(root, id, id);
   const own = networkNamespacePaths(root, "network-a");
   const other = networkNamespacePaths(root, "network-b");
   fs.mkdirSync(own.filesDirectory, { recursive: true, mode: 0o700 });
@@ -79,6 +80,19 @@ test("macOS kernel policy rejects raw cross-network access with the hook disable
   await probe(true, "read", sharedSource);
   await probe(true, "read", own.envFilePath);
   await probe(true, "write", path.join(own.filesDirectory, "state.pid"));
+  await probe(true, "write", own.envFilePath);
+  await probe(true, "mkdir", path.join(own.directory, "cache"));
+  await probe(false, "write", path.join(own.directory, ".network-id"));
+  await probe(false, "write", path.join(own.directory, ".network-name"));
+  await probe(false, "write", path.join(own.directory, ".previous-directory"));
+  await probe(false, "unlink", path.join(own.directory, ".network-id"));
+  await probe(false, "link", path.join(own.directory, ".network-id"), path.join(own.filesDirectory, "owner-alias"));
+  const replacement = path.join(own.filesDirectory, "replacement");
+  fs.writeFileSync(replacement, "network-b");
+  await probe(false, "rename", replacement, path.join(own.directory, ".network-id"));
+  await probe(false, "rename", own.directory, path.join(path.dirname(own.directory), "replaced"));
+  await probe(false, "chmod", own.directory);
+  assert.equal(fs.readFileSync(path.join(own.directory, ".network-id"), "utf8"), "network-a");
   await probe(true, "brokered-tcp", ownSocket);
   await probe(true, "unix", "/var/run/mDNSResponder");
   await probe(true, "socket-only");

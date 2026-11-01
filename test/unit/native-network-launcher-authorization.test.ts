@@ -9,7 +9,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import { ensureAgentControllerToken, ensureAgentNetworkToken } from "../../src/agent/agent-authorization";
 import { buildMacosNetworkSandboxProfile } from "../../src/platform/process/macos-network-sandbox";
-import { networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
+import { ensureNetworkNamespaceScaffold, networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
 
 const run = promisify(execFile);
 interface Scope { pid: number; birth: number; networkId: string }
@@ -121,6 +121,7 @@ test("guarded exec waits for controller PID/birth registration and never widens 
   assert.equal(((await request("daemonStatus", {}, token, undefined, legacySocket)).payload as { authenticatesProcessScopes?: boolean }).authenticatesProcessScopes, false);
   assert.equal((await request("registerProcessScope", { ...inspect(process.pid), networkId: "network-a" }, token, undefined, legacySocket)).ok, false,
     "an agent using mutable project PATH must never approve guarded execution");
+  ensureNetworkNamespaceScaffold(root, "network-a", "network-a");
   const own = networkNamespacePaths(root, "network-a"); fs.mkdirSync(own.filesDirectory, { recursive: true, mode: 0o700 });
   const profilePath = path.join(security, "profiles/a.sb");
   fs.writeFileSync(profilePath, buildMacosNetworkSandboxProfile({ networkId: "network-a", namespaceDirectories: [own.directory], sharedWorkspaceDirectories: [root], agentSocketPath: brokerSocket }), { mode: 0o600 });

@@ -37,6 +37,19 @@ The previous managed-process routing, native hook, and rerun-on-failure implemen
 - Reopen persisted active exposures when the extension starts.
 - Show runtime capabilities so unsupported same-port isolation and terminal attach are explicit.
 
+## Local Network Settings
+
+Network settings live in readable local folders. After attaching `rtcc`, edit
+`.portmanager/namespaces/rtcc/environment.env` for environment overrides or
+`.portmanager/namespaces/rtcc/files/.env` for the replacement dotenv file.
+Korean and spaces are preserved; duplicate names use suffixes such as `rtcc (2)`.
+Existing opaque ID folders move to their network name on the next attach,
+preserving their settings. Restart existing workloads after migration.
+Old `.portmanager/env/<name>.env` and `.portmanager/files/<name>/` files are
+one-time import sources; edit the `namespaces/` folder afterwards.
+See [per-network environment](docs/per-network-env.md) and
+[file substitution](docs/per-network-files.md).
+
 ## Current Compatibility Code
 
 - Start a managed process from the command palette or sidebar.

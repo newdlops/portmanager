@@ -87,6 +87,7 @@ test("native env and file readers use stable identities even when display names 
   for (const network of networks) {
     ensureNetworkNamespaceScaffold(directory, network.id, network.name, networks);
     const paths = networkNamespacePaths(fs.realpathSync(directory), network.id);
+    assert.equal(path.basename(paths.directory), network.id === "network-a" ? "same" : "same (2)");
     fs.writeFileSync(paths.envFilePath, `PM_AUDIT_VALUE=${network.id}\nPORT_MANAGER_NETWORK_ID=must-not-overwrite\n`);
     fs.writeFileSync(path.join(paths.filesDirectory, ".env"), `APP=${network.id}\n`);
     assert.equal(run("context", network.id).trim(), paths.filesDirectory);

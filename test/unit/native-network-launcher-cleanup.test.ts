@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { promisify } from "node:util";
 import { buildMacosNetworkSandboxProfile } from "../../src/platform/process/macos-network-sandbox";
-import { networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
+import { ensureNetworkNamespaceScaffold, networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
 
 const run = promisify(execFile);
 interface Identity { pid: number; birth: number; ppid?: number; sid?: number }
@@ -45,6 +45,7 @@ test("supervisor reclaims escaped and churning descendants before returning or r
   assert.equal((await run(fixture, ["generation"], { env: environment, timeout: 3000 })).stdout.trim(), "generation-ok");
   const prepare = async (id: string) => {
     const endpoint = path.join(sockets, `${id}.sock`), policy = path.join(profiles, `${id}.sb`);
+    ensureNetworkNamespaceScaffold(root, id, id);
     const own = networkNamespacePaths(root, id); fs.mkdirSync(own.filesDirectory, { recursive: true, mode: 0o700 });
     fs.writeFileSync(policy, buildMacosNetworkSandboxProfile({ networkId: id, namespaceDirectories: [own.directory], sharedWorkspaceDirectories: [root], agentSocketPath: endpoint }), { mode: 0o600 });
     const helper = spawn(broker, ["--socket", endpoint, "--network-id", id, "--loopback-host", "127.0.0.1"], { env: environment, stdio: ["ignore", "pipe", "pipe"] }); children.push(helper);

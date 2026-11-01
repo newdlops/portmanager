@@ -9,7 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { promisify } from "node:util";
 import { buildMacosNetworkSandboxProfile } from "../../src/platform/process/macos-network-sandbox";
-import { networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
+import { ensureNetworkNamespaceScaffold, networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
 
 const run = promisify(execFile);
 
@@ -64,6 +64,7 @@ test("fixed broker uses complete private route snapshots for Host Access and Com
   const brokerArgs = (endpoint = socketPath) => ["--socket", endpoint, "--network-id", "network-a", "--loopback-host", "127.0.0.1", "--routes", policy];
   const broker = spawn(brokerPath, brokerArgs(), { stdio: ["ignore", "pipe", "pipe"] }); children.push(broker);
   assert.match((await once(broker.stdout!, "data"))[0].toString(), /ready/);
+  ensureNetworkNamespaceScaffold(root, "network-a", "network-a");
   const own = networkNamespacePaths(root, "network-a"); fs.mkdirSync(own.filesDirectory, { recursive: true, mode: 0o700 });
   const profile = buildMacosNetworkSandboxProfile({ networkId: "network-a", namespaceDirectories: [own.directory], sharedWorkspaceDirectories: [root], agentSocketPath: socketPath });
   const environment: NodeJS.ProcessEnv = { ...process.env, PORT_MANAGER_HOOK_DISABLED: "1", PORT_MANAGER_NETWORK_ID: "network-b" };

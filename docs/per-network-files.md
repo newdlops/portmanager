@@ -1,4 +1,4 @@
-# Per-network file substitution (`.portmanager/namespaces/<id-key>/files/…`)
+# Per-network file substitution (`.portmanager/namespaces/<network-name>/files/…`)
 
 > **The rule.** When a per-network counterpart of a file exists under
 > `.portmanager`, a hooked process talks **only** to that counterpart — the
@@ -9,30 +9,35 @@
 
 ## Layout
 
-The substitute mirrors the original path, keyed by stable network ID. `<id-key>`
-is `id-` plus lowercase UTF-8 hex, shared by TypeScript and the native hook.
-Display names never choose a file namespace, so duplicate, renamed, slash,
-dot-segment and long names cannot merge storage.
+The substitute mirrors the original path in a folder named for the network.
+Korean and spaces stay readable. Duplicate or filesystem-equivalent names get
+numeric suffixes (`rtcc (2)`); path-unsafe characters are escaped. Private
+ownership markers let the native hook distinguish networks with the same name.
 
 ```
 <root>/config.json                                # original
-<root>/.portmanager/namespaces/<id-key>/files/config.json
+<root>/.portmanager/namespaces/rtcc/files/config.json
 <root>/.env                                       # original
-<root>/.portmanager/namespaces/<id-key>/files/.env
+<root>/.portmanager/namespaces/rtcc/files/.env
 ```
 
 `<root>` is the nearest ancestor of the process working directory that
 contains a `.portmanager` directory (resolved once at process start). The
-`namespaces/<id-key>/files/` directory is scaffolded automatically whenever anything
+`namespaces/<network-name>/files/` directory is scaffolded automatically whenever anything
 attaches to the network — a window binding or a per-terminal attach script —
 and the app's root `.env` (when present) is **auto-split**: a copy is seeded as
-`namespaces/<id-key>/files/.env`, identical at copy time, so each network starts on its
+`namespaces/<network-name>/files/.env`, identical at copy time, so each network starts on its
 own independent file.
 
 The [environment-file migration](per-network-env.md) also imports unambiguous
 legacy `files/<name>/` trees without overwriting or deleting their originals.
 Automatic migration rejects symlinks and special files. Namespace directories
 are private (`0700`); seeded/copied configuration files are private (`0600`).
+Opaque `namespaces/id-<hex>/` folders move to the readable name on the next
+attach; settings are preserved. Renames move the same folder, including its
+files. Restart existing workloads after a move to refresh cached paths and
+guarded shell policies. The old legacy `files/<name>/` tree is not the active
+mirror after migration; edit `namespaces/<network-name>/files/` instead.
 
 ## Semantics
 
@@ -85,8 +90,8 @@ are private (`0700`); seeded/copied configuration files are private (`0600`).
 
 ## Relation to the per-network env file
 
-[`namespaces/<id-key>/environment.env`](per-network-env.md) is the **overlay** tool:
-injected values win, everything else stays. `namespaces/<id-key>/files/…` is the
+[`namespaces/<network-name>/environment.env`](per-network-env.md) is the **overlay** tool:
+injected values win, everything else stays. `namespaces/<network-name>/files/…` is the
 **replacement** tool: the whole file is swapped. Use the env file for a few
 per-network values; use a substitute when the process must not see the
 original at all.

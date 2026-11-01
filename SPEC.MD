@@ -371,6 +371,14 @@ runtime resolver는 가상환경의 실행 파일 symlink 경로를 유지하고
 라우팅에서 제외하지 않는다. UI 명령은 유효한 control owner lease를 확보하면 필요한
 작업을 바로 수행하며, 관계없는 Docker·Compose 초기화 완료를 기다리지 않는다.
 
+로컬 네트워크 설정은 `.portmanager/namespaces/<네트워크 이름>/`에 저장한다.
+한글·공백을 유지하고 경로 예약 문자만 escape하며, 중복·파일시스템 동치 이름은
+`이름 (2)` 같은 숫자 접미사로 구분한다. `environment.env`와 `files/`를 같은 폴더에
+두어 사람이 폴더명으로 자기 설정을 찾을 수 있어야 한다. 기존 hex ID 폴더와 이름
+변경은 설정을 보존하며 이동한다. 내부 ID는 라우팅·인증 및 private 소유권 표식에만
+사용한다. 보호 시제품은 소유권·이름·이동 표식과 namespace 루트 변경을 workload에
+허용하지 않으며, 환경 파일·상태 파일의 정상 쓰기는 유지한다.
+
 #### 비활성 커널 보호 셸 시제품
 
 아래 kernel launcher·broker·보호 profile은 내부 시제품과 테스트에만 남아 있다.

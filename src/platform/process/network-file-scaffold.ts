@@ -9,16 +9,228 @@ export interface NamespaceNetworkIdentity {
   readonly name: string;
 }
 
-/** Stable paths are also constructed by the native hook; legacy files remain untouched. */
+/** Resolve ownership independently of the readable name, including duplicate names. */
 export function networkNamespacePaths(root: string, networkId: string): {
   directory: string; envFilePath: string; filesDirectory: string;
 } {
-  const directory = path.join(root, ".portmanager", "namespaces", networkStorageKey(networkId));
+  networkStorageKey(networkId); // Validate identity; it no longer determines the settings folder name.
+  const directory = findOwnedNamespace(root, networkId);
+  if (directory === undefined) throw new Error("Attach the network to this workspace before opening its settings folder.");
   return { directory, envFilePath: path.join(directory, "environment.env"), filesDirectory: path.join(directory, "files") };
 }
 
+/** Keep human text intact; escape only bytes unsafe in a portable path component. */
+function readableNetworkName(name: string): string {
+  let result = "";
+  const characters = [...(name || "Network")];
+  let trailing = characters.length;
+  while (trailing > 0 && /[. ]/.test(characters[trailing - 1])) trailing--;
+  for (const [index, character] of characters.entries()) {
+    const escaped = index >= trailing || /[\u0000-\u001f\u007f/\\%<>:"|?*]/.test(character)
+      ? [...Buffer.from(character)].map(byte => `%${byte.toString(16).toUpperCase().padStart(2, "0")}`).join("")
+      : character;
+    if (Buffer.byteLength(result + escaped) > 220) break;
+    result += escaped;
+  }
+  // Windows aliases and trailing dots/spaces must not select a different folder.
+  // Truncation can expose a formerly interior dot/space at the new end.
+  const suffix = result.match(/[. ]+$/)?.[0];
+  if (suffix !== undefined) {
+    result = result.slice(0, -suffix.length);
+    for (const character of suffix) {
+      const escaped = character === "." ? "%2E" : "%20";
+      if (Buffer.byteLength(result + escaped) > 220) break;
+      result += escaped;
+    }
+  }
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(result)) result = `_${result}`;
+  return result || "Network";
+}
+
+/** Only an owned regular marker can identify a network, never an env display name. */
+function findOwnedNamespace(root: string, networkId: string): string | undefined {
+  const parent = path.join(root, ".portmanager", "namespaces");
+  if (!exists(parent)) return undefined;
+  verifyOwnedDirectory(path.dirname(parent));
+  verifyOwnedDirectory(parent);
+  let found: string | undefined;
+  for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    const directory = path.join(parent, entry.name);
+    const marker = path.join(directory, ".network-id");
+    if (!exists(marker)) continue;
+    verifyOwnedDirectory(directory);
+    const descriptor = openRegularFile(marker);
+    let owner: string;
+    try { owner = fs.readFileSync(descriptor, "utf8"); }
+    finally { fs.closeSync(descriptor); }
+    if (owner !== networkId) continue;
+    if (found !== undefined) throw new Error(`Multiple settings folders belong to network ${JSON.stringify(networkId)}. Resolve ${found} and ${directory} before attaching.`);
+    found = directory;
+  }
+  return found;
+}
+
+/** A short filesystem lock serializes attaches from different VS Code windows. */
+function withNamespaceLock(root: string, action: () => void): void {
+  const lock = path.join(root, ".portmanager", ".namespace-lock");
+  const temporary = path.join(root, ".portmanager", `.pm-lock-${randomUUID()}`);
+  const deadline = Date.now() + 5_000;
+  let acquired = false;
+  try {
+    // Publish a complete PID atomically; a failed write cannot strand an
+    // ownerless lock between mkdir and owner-file creation.
+    fs.writeFileSync(temporary, String(process.pid), { mode: 0o600, flag: "wx" });
+    for (;;) {
+      try { fs.linkSync(temporary, lock); acquired = true; break; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      let descriptor: number;
+      try { descriptor = openRegularFile(lock); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      let owner: number;
+      try { owner = Number(fs.readFileSync(descriptor, "utf8")); }
+      finally { fs.closeSync(descriptor); }
+      if (Number.isSafeInteger(owner) && owner > 0) {
+        try { process.kill(owner, 0); }
+        catch (failure) {
+          if ((failure as NodeJS.ErrnoException).code === "ESRCH") {
+            // Do not remove a pathname observed earlier: it may now hold a
+            // successor's live lock. Stale locks require explicit recovery.
+            throw new Error(`A previous network settings attach was interrupted. After confirming no attach is running, remove ${lock} and retry.`);
+          }
+        }
+      }
+      if (Date.now() >= deadline) throw new Error(`Network settings are busy. Retry attach; if a previous attach was interrupted, inspect ${lock}.`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+    action();
+  } finally {
+    if (acquired) fs.unlinkSync(lock);
+    if (exists(temporary)) fs.unlinkSync(temporary);
+  }
+}
+
+/** Move rather than copy on upgrade/rename: there is exactly one editable settings folder. */
+function ensureNamedNamespace(root: string, networkId: string, name: string): void {
+  const parent = path.join(root, ".portmanager", "namespaces");
+  let previous = findOwnedNamespace(root, networkId);
+  const opaque = path.join(parent, networkStorageKey(networkId));
+  if (previous === undefined && exists(opaque)) {
+    verifyOwnedDirectory(opaque);
+    const marker = path.join(opaque, ".network-id");
+    if (exists(marker)) {
+      const descriptor = openRegularFile(marker);
+      try {
+        if (fs.readFileSync(descriptor, "utf8") !== networkId) throw new Error(`Existing settings folder belongs to another network: ${opaque}`);
+      } finally { fs.closeSync(descriptor); }
+    }
+    previous = opaque;
+  }
+  if (previous !== undefined) {
+    // Establish ownership before any move, so even an interrupted window
+    // repair leaves the original settings discoverable on the next attach.
+    publishPrivateFile(path.join(previous, ".network-id"), descriptor => fs.writeFileSync(descriptor, networkId));
+    completeNamespaceMove(root, previous);
+  }
+  if (previous !== undefined && previous !== opaque) {
+    const nameFile = path.join(previous, ".network-name");
+    if (exists(nameFile)) {
+      const descriptor = openRegularFile(nameFile);
+      try { if (fs.readFileSync(descriptor, "utf8") === name) return; }
+      finally { fs.closeSync(descriptor); }
+    }
+  }
+  const base = readableNetworkName(name);
+  // Apply the same collision rule on case-sensitive and normalizing filesystems.
+  const equivalent = (value: string) => value.normalize("NFC").toLocaleLowerCase("en-US");
+  const occupied = new Set(fs.readdirSync(parent).map(equivalent));
+  let directory: string | undefined;
+  for (let number = 1; number <= 10_000; number++) {
+    const candidate = number === 1 ? base : `${base} (${number})`;
+    if (previous !== undefined && equivalent(path.basename(previous)) === equivalent(candidate)) {
+      directory = path.join(parent, candidate);
+      if (previous !== directory) {
+        publishPrivateFile(path.join(previous, ".previous-directory"), descriptor => fs.writeFileSync(descriptor, previous!));
+        fs.renameSync(previous, directory);
+        completeNamespaceMove(root, directory);
+      }
+      break;
+    }
+    if (occupied.has(equivalent(candidate))) continue;
+    directory = path.join(parent, candidate);
+    fs.mkdirSync(directory, { mode: 0o700 });
+    if (previous !== undefined) {
+      publishPrivateFile(path.join(previous, ".previous-directory"), descriptor => fs.writeFileSync(descriptor, previous!));
+      try { fs.renameSync(previous, directory); }
+      catch (error) { fs.rmdirSync(directory); throw error; }
+      completeNamespaceMove(root, directory);
+    }
+    break;
+  }
+  if (directory === undefined) throw new Error(`Too many settings folders named ${JSON.stringify(name)}.`);
+  publishPrivateFile(path.join(directory, ".network-id"), descriptor => fs.writeFileSync(descriptor, networkId));
+  const nameFile = path.join(directory, ".network-name");
+  // Only this metadata changes on rename; user settings never get overwritten.
+  if (exists(nameFile)) {
+    const descriptor = openRegularFile(nameFile);
+    try { fs.fchmodSync(descriptor, 0o600); }
+    finally { fs.closeSync(descriptor); }
+    fs.unlinkSync(nameFile);
+  }
+  publishPrivateFile(nameFile, descriptor => fs.writeFileSync(descriptor, name));
+}
+
+/** A move receipt travels with the folder; retries finish only its exact observer windows. */
+function completeNamespaceMove(root: string, directory: string): void {
+  const receipt = path.join(directory, ".previous-directory");
+  if (!exists(receipt)) return;
+  const descriptor = openRegularFile(receipt);
+  let previous: string;
+  try { previous = fs.readFileSync(descriptor, "utf8"); }
+  finally { fs.closeSync(descriptor); }
+  if (path.dirname(previous) !== path.dirname(directory) || path.normalize(previous) !== previous) {
+    throw new Error(`Invalid network settings move receipt: ${receipt}`);
+  }
+  repairStateWindows(root, previous, directory);
+  fs.unlinkSync(receipt);
+}
+
+/** Retarget only PM's exact observer symlinks, without traversing shared directories. */
+function repairStateWindows(root: string, previous: string, directory: string): void {
+  const files = path.join(directory, "files");
+  if (!exists(files)) return;
+  const visit = (current: string, relative: string): void => {
+    verifyOwnedDirectory(current);
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const child = path.join(current, entry.name);
+      const next = path.join(relative, entry.name);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) { visit(child, next); continue; }
+      const original = path.join(root, next);
+      // A shared parent symlink is outside the state-window contract.
+      let parent = path.dirname(original);
+      let safe = true;
+      while (parent !== root) {
+        const stats = fs.lstatSync(parent, { throwIfNoEntry: false });
+        if (stats === undefined || !stats.isDirectory() || stats.isSymbolicLink()) { safe = false; break; }
+        parent = path.dirname(parent);
+      }
+      if (!safe || !fs.lstatSync(original, { throwIfNoEntry: false })?.isSymbolicLink()) continue;
+      const target = fs.readlinkSync(original);
+      const suffix = path.sep + path.join(path.relative(root, previous), "files", next);
+      if (!path.isAbsolute(target) || !target.endsWith(suffix)) continue;
+      try { if (fs.realpathSync(target.slice(0, -suffix.length) || path.sep) !== root) continue; }
+      catch { continue; }
+      const temporary = path.join(path.dirname(original), `.pm-window-${randomUUID()}`);
+      fs.symlinkSync(path.join(files, next), temporary);
+      try { fs.renameSync(temporary, original); }
+      finally { if (exists(temporary)) fs.unlinkSync(temporary); }
+    }
+  };
+  visit(files, "");
+}
+
 /**
- * Creates private, id-scoped storage and imports an unambiguous legacy name
+ * Creates private, readable name-based storage and imports an unambiguous legacy name
  * once. Publishing each file without replacement makes repeated/concurrent
  * scaffolds safe. An ambiguous legacy namespace requires explicit migration;
  * it must never be silently assigned to a second logical network.
@@ -30,10 +242,21 @@ export function ensureNetworkNamespaceScaffold(
   knownNetworks: readonly NamespaceNetworkIdentity[] = [],
 ): void {
   root = fs.realpathSync(root);
-  const paths = networkNamespacePaths(root, networkId);
+  networkStorageKey(networkId);
   const stateDirectory = path.join(root, ".portmanager");
   ensurePrivateDirectory(stateDirectory);
   ensurePrivateDirectory(path.join(stateDirectory, "namespaces"));
+  withNamespaceLock(root, () => {
+    ensureNamedNamespace(root, networkId, networkName || "Network");
+    scaffoldNamespaceContents(root, networkId, networkName, knownNetworks);
+  });
+}
+
+/** Populate only missing files after ownership and readable location are established. */
+function scaffoldNamespaceContents(root: string, networkId: string, networkName: string | undefined,
+  knownNetworks: readonly NamespaceNetworkIdentity[]): void {
+  const stateDirectory = path.join(root, ".portmanager");
+  const paths = networkNamespacePaths(root, networkId);
   ensurePrivateDirectory(paths.directory);
   ensurePrivateDirectory(paths.filesDirectory);
 

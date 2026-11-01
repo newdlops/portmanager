@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/resource.h>
 #include <sys/un.h>
 #include <sys/sysctl.h>
@@ -92,6 +93,12 @@ int main(int argc, char **argv) {
     result = unlink(argv[2]);
   } else if (argc == 4 && strcmp(argv[1], "link") == 0) {
     result = link(argv[2], argv[3]);
+  } else if (argc == 4 && strcmp(argv[1], "rename") == 0) {
+    result = rename(argv[2], argv[3]);
+  } else if (argc == 3 && strcmp(argv[1], "chmod") == 0) {
+    result = chmod(argv[2], 0777);
+  } else if (argc == 3 && strcmp(argv[1], "mkdir") == 0) {
+    result = mkdir(argv[2], 0700);
   } else if (argc == 3 && strcmp(argv[1], "process-env") == 0) {
     int mib[] = { CTL_KERN, KERN_PROCARGS2, atoi(argv[2]) };
     char buffer[256 * 1024];

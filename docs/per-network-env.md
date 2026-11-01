@@ -1,7 +1,7 @@
-# Per-network environment file (`.portmanager/namespaces/<id-key>/environment.env`)
+# Per-network environment file (`.portmanager/namespaces/<network-name>/environment.env`)
 
 > **What it does.** A hooked process attached to logical network `<name>` looks
-> for `.portmanager/namespaces/<id-key>/environment.env` from its working directory upward and
+> for its owned `.portmanager/namespaces/<network-name>/environment.env` from its working directory upward and
 > applies the KEY=VALUE lines to its own environment **before `main()` runs** —
 > ahead of every runtime's env snapshot (CPython `os.environ`, JVM, Go), and
 > with **overwrite** semantics, so the per-network file beats both inherited
@@ -26,25 +26,45 @@ in each workspace folder — open it and fill in values. `.portmanager/` is
 machine-local, so it is added to the repo-local `.git/info/exclude` (the shared
 `.gitignore` is never touched; hand-written variants of the entry are
 recognized and not duplicated).
-The file is keyed by the stable network **id**: `id-` followed by the lowercase
-hex encoding of its UTF-8 bytes. Names can repeat, contain slashes or dot
-segments, and change without selecting another network's settings.
+Folders use the **network name**, including Korean and spaces. For example,
+the `rtcc` network uses this directly editable file:
 
 ```
-repo/.portmanager/namespaces/<id-key>/environment.env
+repo/.portmanager/namespaces/rtcc/environment.env
+repo/.portmanager/namespaces/rtcc/files/.env
 ```
 
-You can also create it by hand anywhere from the app working directory upward;
-the scaffold never overwrites an existing file.
+Attach the network once to create the folder, then edit `environment.env` for
+per-network variables or `files/.env` for a complete replacement dotenv file.
+The scaffold never overwrites existing settings. Duplicate or filesystem-equivalent
+names use readable suffixes such as `rtcc (2)`. Path separators and reserved
+characters are percent-escaped, while ordinary Unicode stays readable; long
+names are shortened at a complete Unicode character. A private `.network-id`
+marker records ownership so duplicate names cannot select someone else's settings;
+`.network-name` records the current display name. Do not edit these markers.
+
+When upgrading from opaque `namespaces/id-<hex>/` folders, the next attach
+**moves** the existing folder to its readable name, keeping all saved settings.
+A later attach with a renamed network moves the same settings to the new name.
+PM's exact state-file observer symlinks are retargeted during these moves.
+Restart existing workloads after upgrading/renaming so their cached mirror paths
+and any guarded shell policy are rebuilt. There is no ID calculation to perform.
 
 Directories are private (`0700`) and newly published files are private
 (`0600`). Publication does not expose a partial file or overwrite another
-process's completed copy. IDs longer than 124 bytes are rejected rather than
-truncated into a shared filename.
+process's completed copy. Internal identities still reject IDs longer than 124 bytes.
+
+Concurrent attaches serialize through the private `.portmanager/.namespace-lock`
+file. If VS Code is killed during an attach, a later attach reports the stale
+lock rather than deleting a potentially active successor's lock. After confirming
+no attach is running, remove that lock file and retry; partially completed folder
+moves retain an ownership marker and move receipt so the retry keeps the settings
+and finishes retargeting observer symlinks.
 
 Legacy `.portmanager/env/<name>.env` and `.portmanager/files/<name>/` settings
 are copied once when the current network list identifies one owner. Originals
-remain in place. A private ownership receipt prevents a deleted name being
+remain in place and are **no longer active settings** after import: edit the
+named `namespaces/` folder, not the old `env/` or `files/` tree. A private ownership receipt prevents a deleted name being
 automatically imported by a different ID later. If names collide after slash,
 case, or Unicode normalization, attach reports the preserved legacy path's
 ambiguity. Select the intended values and initialize this ID's
@@ -76,8 +96,9 @@ virtualization involved.
   mid-tree is not stomped in its children. The shell itself is unhooked and
   marker-free, so every fresh command re-reads the file; edits apply from the
   next launch.
-- **Discovery**: nearest `.portmanager/namespaces/<id-key>/environment.env` from the process cwd
-  upward (64 levels max).
+- **Discovery**: nearest owned `.portmanager/namespaces/<network-name>/environment.env`
+  from the process cwd upward (64 levels max). The hook checks the private owner
+  marker against process identity rather than trusting a display name in env.
 - **Format**: `KEY=VALUE` per line, optional `export ` prefix, `#` comments,
   one matching quote pair stripped from the value. No interpolation, no
   multiline values. Keys must be `[A-Za-z_][A-Za-z0-9_]*`.

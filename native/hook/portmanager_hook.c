@@ -31,6 +31,7 @@
 
 #include "../shared/pm_dev_log.h"
 #include "../shared/pm_network_namespace.h"
+#include "../shared/pm_network_storage.h"
 #include "../network-broker/pm_network_broker_client.h"
 
 /*
@@ -860,11 +861,10 @@ static int pm_network_env_apply_line(char *line) {
   return setenv(key, value, 1) == 0 ? 1 : 0;
 }
 
-/* Finds the stable ID's `namespaces/<id-key>/environment.env`; 0 on success. */
+/* Find the readable folder owned by this network; env names have no authority. */
 static int pm_find_network_env_file(const char *network, char *path, size_t size) {
   char directory[PM_MAX_PATH];
-  char key[PM_NETWORK_NAMESPACE_KEY_SIZE];
-  if (pm_network_namespace_key(network, key, sizeof(key)) != 0) return -1;
+  char namespace_directory[PM_MAX_PATH];
 
   if (getcwd(directory, sizeof(directory)) == NULL) {
     return -1;
@@ -874,7 +874,8 @@ static int pm_find_network_env_file(const char *network, char *path, size_t size
     struct stat file_stat;
     char *slash;
 
-    int written = snprintf(path, size, "%s/%s/%s/environment.env", directory, PM_NETWORK_ENV_DIR_RELATIVE, key);
+    int written = pm_network_storage_directory(directory, network, namespace_directory, sizeof(namespace_directory)) == 0
+      ? snprintf(path, size, "%s/environment.env", namespace_directory) : -1;
     if (written > 0 && (size_t)written < size && lstat(path, &file_stat) == 0 &&
         S_ISREG(file_stat.st_mode) && file_stat.st_uid == geteuid()) {
       return 0;
@@ -970,7 +971,7 @@ static void pm_apply_network_env_file(void) {
  * `.portmanager`, the process talks ONLY to that counterpart — the original is
  * never read (or written). Layout mirrors the original path:
  *
- *   <root>/.portmanager/namespaces/<id-key>/files/<path relative to root>
+ *   <root>/.portmanager/namespaces/<network-name>/files/<path relative to root>
  *
  * e.g. inside network "alphac", open("<root>/.env") opens
  * that ID's `files/.env` when it exists; open modes are
@@ -1031,10 +1032,10 @@ static int pm_file_substitution_unlink_original(const char *path) {
 static int pm_file_substitution_build_context(const char *network, pm_file_substitution_context *context) {
   char directory[PM_MAX_PATH];
   char probe[PM_MAX_PATH];
-  char network_key[PM_NETWORK_NAMESPACE_KEY_SIZE];
+  char namespace_directory[PM_MAX_PATH];
 
   memset(context, 0, sizeof(*context));
-  if (pm_network_namespace_key(network, network_key, sizeof(network_key)) != 0) return -1;
+  if (network == NULL || network[0] == '\0') return -1;
   if (getcwd(directory, sizeof(directory)) == NULL) {
     return -1;
   }
@@ -1045,19 +1046,22 @@ static int pm_file_substitution_build_context(const char *network, pm_file_subst
 
     snprintf(probe, sizeof(probe), "%s/.portmanager", directory);
     if (lstat(probe, &probe_stat) == 0 && S_ISDIR(probe_stat.st_mode) && probe_stat.st_uid == geteuid()) {
+      int owned = pm_network_storage_directory(directory, network, namespace_directory, sizeof(namespace_directory)) == 0;
+      if (!owned) snprintf(namespace_directory, sizeof(namespace_directory), "%s/.portmanager/namespaces", directory);
       int written = snprintf(
         context->prefix,
         sizeof(context->prefix),
-        "%s/.portmanager/namespaces/%s/%s",
-        directory,
-        network_key,
+        "%s/%s",
+        namespace_directory,
         PM_FILE_SUBSTITUTION_DIR);
       if (written <= 0 || (size_t)written >= sizeof(context->prefix)) {
         return -1;
       }
       snprintf(context->root, sizeof(context->root), "%s", directory);
       context->root_length = strlen(context->root);
-      context->ready = 1;
+      // Missing/unsafe ownership still scopes state reads: never follow another
+      // network's observer window while an attach is incomplete or rejected.
+      context->ready = owned ? 1 : -1;
       return 0;
     }
     slash = strrchr(directory, '/');
@@ -1096,7 +1100,7 @@ static void pm_file_substitution_init(void) {
   snprintf(pm_file_substitution_root, sizeof(pm_file_substitution_root), "%s", context.root);
   pm_file_substitution_root_length = context.root_length;
   snprintf(pm_file_substitution_prefix, sizeof(pm_file_substitution_prefix), "%s", context.prefix);
-  pm_file_substitution_ready = 1;
+  pm_file_substitution_ready = context.ready;
 }
 
 /* Builds the substitute candidate for a path; 0 when inside the root. */
@@ -1389,7 +1393,7 @@ static int pm_file_substitution_original_is_virtual(const char *absolute) {
 /*
  * mkdir -p for every mirror-side parent of a candidate path, starting right
  * after the root (which exists by definition) so the hook never depends on the
- * extension having scaffolded `namespaces/<id-key>/files/` first.
+ * extension having scaffolded the mirror's nested parent directories first.
  */
 static int pm_file_substitution_make_parents(char *candidate) {
   for (char *cursor = candidate + pm_file_substitution_root_length + 1; *cursor != '\0'; cursor++) {
@@ -1414,6 +1418,7 @@ static int pm_file_substitution_make_parents(char *candidate) {
 /* Walk from the workspace descriptor without following a mirror-side parent
  * symlink. A rejected namespace must never fall back to the shared original. */
 static int pm_file_substitution_open_target(const char *target, int oflag, mode_t mode) {
+  if (pm_file_substitution_ready < 0) { errno = ENOENT; return -1; }
   char relative[PM_MAX_PATH];
   int directory;
   int result = -1;
@@ -1469,6 +1474,11 @@ static const char *pm_file_substitution_target(const char *path, int oflag, char
 
   if (pm_file_substitution_candidate(path, absolute, sizeof(absolute), buffer, size) != 0) {
     return NULL;
+  }
+  if (pm_file_substitution_ready < 0) {
+    relative = absolute + pm_file_substitution_root_length + 1;
+    return pm_file_substitution_relative_is_dotenv(relative) ||
+      (pm_file_substitution_relative_is_state(relative) && pm_file_substitution_original_is_virtual(absolute)) ? buffer : NULL;
   }
   if (stat(buffer, &substitute_stat) == 0 && S_ISREG(substitute_stat.st_mode)) {
     pm_debug("file substitute %s -> %s", absolute, buffer);
@@ -1533,6 +1543,10 @@ static int pm_file_substitution_unlink_target(const char *path, char *buffer, si
 
   if (pm_file_substitution_candidate(path, absolute, sizeof(absolute), buffer, size) != 0) {
     return -1;
+  }
+  if (pm_file_substitution_ready < 0) {
+    const char *relative = absolute + pm_file_substitution_root_length + 1;
+    return pm_file_substitution_relative_is_state(relative) && pm_file_substitution_original_is_virtual(absolute) ? 0 : -1;
   }
   if (lstat(buffer, &substitute_stat) != 0 || !S_ISREG(substitute_stat.st_mode)) {
     const char *relative = absolute + pm_file_substitution_root_length + 1;
@@ -1616,6 +1630,7 @@ static int pm_substitute_unlink_hook(const char *path) {
   const char *target = path;
 
   if (pm_file_substitution_unlink_target(path, substitute, sizeof(substitute)) == 0) {
+    if (pm_file_substitution_ready < 0) { errno = ENOENT; return -1; }
     target = substitute;
   }
 #if defined(__APPLE__)
@@ -1634,6 +1649,7 @@ static int pm_substitute_unlinkat_hook(int dirfd, const char *path, int flags) {
 
   if ((flags & AT_REMOVEDIR) == 0 && (dirfd == AT_FDCWD || (path != NULL && path[0] == '/')) &&
       pm_file_substitution_unlink_target(path, substitute, sizeof(substitute)) == 0) {
+    if (pm_file_substitution_ready < 0) { errno = ENOENT; return -1; }
     target = substitute;
   }
 #if defined(__APPLE__)
@@ -6373,7 +6389,7 @@ static int pm_file_substitution_context_for_envp(char *const envp[], pm_file_sub
     return -1;
   }
   network = pm_envp_network_id(envp);
-  return pm_file_substitution_build_context(network, context);
+  return pm_file_substitution_build_context(network, context) == 0 && context->ready > 0 ? 0 : -1;
 }
 
 /*

@@ -8,7 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { promisify } from "node:util";
 import { buildMacosNetworkSandboxProfile } from "../../src/platform/process/macos-network-sandbox";
-import { networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
+import { ensureNetworkNamespaceScaffold, networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
 
 const run = promisify(execFile);
 
@@ -51,6 +51,7 @@ test("fixed-scope broker performs TCP operations for a kernel-restricted process
     fs.rmSync(root, { recursive: true, force: true });
   });
   assert.match((await once(broker.stdout!, "data"))[0].toString(), /ready/);
+  ensureNetworkNamespaceScaffold(root, "network-a", "network-a");
   const namespace = networkNamespacePaths(root, "network-a");
   fs.mkdirSync(namespace.filesDirectory, { recursive: true, mode: 0o700 });
   const profile = buildMacosNetworkSandboxProfile({ networkId: "network-a", namespaceDirectories: [namespace.directory],

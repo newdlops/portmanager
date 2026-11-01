@@ -8,7 +8,7 @@ Logical Network, Terminal Attachment, Host Port Exposure의 순수 도메인 상
 
 - Logical Network 생성과 삭제
 - 세 loopback 주소 대역의 충돌 검사와 재시도 할당, 저장 상태 적용 전 검증
-- 표시 이름과 파일시스템 정규화에 영향을 받지 않는 ID 기반 namespace key
+- 표시 이름과 독립적인 내부 인증 ID key (사용자 설정 폴더는 platform의 자연어 네트워크 이름 사용)
 - Terminal Attachment 상태 저장
 - Host Port Exposure 상태 저장
 - Network snapshot 생성
