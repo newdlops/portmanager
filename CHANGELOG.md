@@ -4,6 +4,8 @@ All notable changes to Port Manager are documented in this file.
 
 ## Unreleased
 
+## 0.0.8272
+
 - Store local network settings in readable network-name folders such as `.portmanager/namespaces/rtcc/` and `.portmanager/namespaces/알파 개발/`, with numeric suffixes for duplicate names. Move existing opaque ID folders on the next attach without replacing saved settings, and preserve ownership across network renames. Native readers and guarded terminal policies use the same named folders. Restart existing workloads after migration to rebuild cached paths.
 
 ## 0.0.8271
