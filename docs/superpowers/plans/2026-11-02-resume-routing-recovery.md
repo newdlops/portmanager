@@ -59,3 +59,9 @@
 - [ ] Bump package/lock/changelog to `0.0.8274`, compile and build/verify native runtime for the new embedded version.
 - [ ] Push the release commit and dispatch the four native targets at that exact commit. Require successful unit/native and fresh-profile activation checks on every target.
 - [ ] Download, verify and publish those four VSIX files unchanged. Confirm Marketplace validation and fresh-profile install, and report the limits of the recovery evidence.
+
+## Release validation follow-up
+
+The first release run (`41387571125`, commit `a17c32d`) passed both Linux targets and the new recovery tests on both macOS targets. macOS ARM failed an unchanged native TCP fixture's FD count after its fixed 450ms cleanup sleep; macOS Intel failed an unchanged HTTP test's proxy-listener preparation before its timeout scenario began. Neither failure is evidence that the new recovery behavior failed.
+
+The native cleanup race was reproduced deterministically by extending the fake shared DNS operation to 700ms: the old fixture checked while its two pipe descriptors were still owned. The test now waits up to 1500ms for the actual DNS-job release fence under its mutex, asserts completion explicitly, and retains the original caller deadline and zero-FD checks. This changes only tests, not native product behavior. Focused coverage after the change: 47 passed, zero failures/skips; fresh review found no Critical/Important issues. Revalidate all four packages at the final commit before release; do not publish artifacts from the failed run.

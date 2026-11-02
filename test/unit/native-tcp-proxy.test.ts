@@ -40,19 +40,21 @@ test("native TCP preparation has one deadline across addresses/EINTR and release
     });
     const port = (probe.address() as net.AddressInfo).port;
     await new Promise<void>((resolve, reject) => probe.close(error => error ? reject(error) : resolve()));
-    for (const mode of ["timeout", "interrupt", "addresses", "refused", "dns", "shared", "late-ready", "late-immediate"]) {
+    for (const mode of ["timeout", "interrupt", "addresses", "refused", "dns", "shared", "shared-delayed", "late-ready", "late-immediate"]) {
+      const shared = mode.startsWith("shared");
       const { stdout } = await run(executable, [mode, String(port)], {
         env: { ...process.env, PORT_MANAGER_HOOK: "0", PORT_MANAGER_PROXY_CONNECT_TIMEOUT_MS: "35" },
         timeout: 2000,
       });
       const result = JSON.parse(stdout) as {
         failures: number; elapsedMs: number; polls: number; fdDelta: number;
-        dnsCalls: number; connectCalls: number; maxPollMs: number;
+        dnsCalls: number; connectCalls: number; maxPollMs: number; dnsCleanupComplete: number;
       };
-      assert.equal(result.failures, mode === "dns" ? 6 : mode === "shared" ? 8 : 4, mode);
+      assert.equal(result.failures, mode === "dns" ? 6 : shared ? 8 : 4, mode);
+      assert.equal(result.dnsCleanupComplete, 1, mode + " must finish asynchronous DNS cleanup within its bound");
       assert.equal(result.fdDelta, 0, mode);
       assert.ok(result.elapsedMs < 600, mode + " must not restart its budget for each retry/address");
-      if (mode !== "refused" && mode !== "shared") assert.ok(result.elapsedMs >= 120, mode + " must exercise an actual deadline");
+      if (mode !== "refused" && !shared) assert.ok(result.elapsedMs >= 120, mode + " must exercise an actual deadline");
       if (mode === "interrupt") {
         assert.equal(result.polls, 16, "each attempt has three interruptions and one final wait");
         assert.equal(result.elapsedMs, 140, "interruptions consume four original 35ms budgets");
@@ -69,7 +71,7 @@ test("native TCP preparation has one deadline across addresses/EINTR and release
         assert.equal(result.dnsCalls, 4, "blocked resolver jobs must stay bounded");
         assert.equal(result.connectCalls, 1, "numeric targets must bypass occupied DNS workers");
       }
-      if (mode === "shared") {
+      if (shared) {
         assert.equal(result.dnsCalls, 1, "matching in-flight names share one resolver job");
         assert.ok(result.elapsedMs < 200, "callers must time out before their resolver returns");
       }
@@ -82,4 +84,5 @@ test("native TCP preparation has one deadline across addresses/EINTR and release
     assert.equal(smaller.dnsCalls, 1, "native OS lookups must obey the capacity reserved by their parent");
     assert.equal(smaller.failures, 6);
     assert.equal(smaller.fdDelta, 0);
+    assert.equal(smaller.dnsCleanupComplete, 1);
   });

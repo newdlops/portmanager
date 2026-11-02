@@ -18,6 +18,7 @@ static int fixture_interrupt = 0;
 static int fixture_attempt_polls = 0;
 static int fixture_total_polls = 0;
 static int fixture_dns = 0;
+static long fixture_dns_delay_ns = 350000000;
 static int fixture_addresses = 0;
 static int fixture_connect_calls = 0;
 static int fixture_max_poll_ms = 0;
@@ -40,7 +41,7 @@ static int fixture_getaddrinfo(const char *host, const char *service, const stru
   if (fixture_dns && host[0] == 'p' && host[1] == 'm') {
     if (hints != NULL && (hints->ai_flags & AI_NUMERICHOST) != 0) return EAI_NONAME;
     atomic_fetch_add(&fixture_dns_calls, 1);
-    struct timespec pause = { .tv_sec = 0, .tv_nsec = 350000000 };
+    struct timespec pause = { .tv_sec = 0, .tv_nsec = fixture_dns_delay_ns };
     nanosleep(&pause, NULL);
     return EAI_NONAME;
   }
@@ -133,6 +134,25 @@ static int fixture_fd_count(void) {
   return count;
 }
 
+/**
+ * A worker may start late on a busy runner. Observe its actual release fence
+ * instead of assuming a fixed sleep outlasted the fake OS resolver. The worker
+ * removes its final reference and closes its pipe before releasing this mutex.
+ */
+static int fixture_wait_for_dns_cleanup(void) {
+  int64_t deadline = pm_monotonic_ms() + 1500;
+  for (;;) {
+    unsigned int pending;
+    pthread_mutex_lock(&pm_dns_mutex);
+    pending = pm_dns_job_count;
+    pthread_mutex_unlock(&pm_dns_mutex);
+    if (pending == 0) return 1;
+    if (pm_monotonic_ms() >= deadline) return 0;
+    struct timespec pause = { .tv_sec = 0, .tv_nsec = 5000000 };
+    nanosleep(&pause, NULL);
+  }
+}
+
 static void *fixture_shared_lookup(void *raw_port) {
   int fd = pm_tcp_proxy_connect("pm-shared", *(int *)raw_port);
   if (fd >= 0) close(fd);
@@ -140,10 +160,12 @@ static void *fixture_shared_lookup(void *raw_port) {
 }
 
 int main(int argc, char **argv) {
-  int before, failures = 0;
+  int before, failures = 0, cleanup_complete = 1;
   int64_t started, elapsed;
   if (argc != 3) return 2;
-  fixture_dns = strcmp(argv[1], "dns") == 0 || strcmp(argv[1], "shared") == 0;
+  int shared = strcmp(argv[1], "shared") == 0 || strcmp(argv[1], "shared-delayed") == 0;
+  fixture_dns = strcmp(argv[1], "dns") == 0 || shared;
+  if (strcmp(argv[1], "shared-delayed") == 0) fixture_dns_delay_ns = 700000000;
   fixture_addresses = strcmp(argv[1], "addresses") == 0;
   fixture_timeout = !fixture_dns && strcmp(argv[1], "refused") != 0;
   fixture_interrupt = strcmp(argv[1], "interrupt") == 0;
@@ -158,7 +180,7 @@ int main(int argc, char **argv) {
   }
   before = fixture_fd_count();
   started = pm_monotonic_ms();
-  if (strcmp(argv[1], "shared") == 0) {
+  if (shared) {
     pthread_t callers[8];
     int port = atoi(argv[2]);
     for (int index = 0; index < 8; index++) {
@@ -190,14 +212,13 @@ int main(int argc, char **argv) {
   }
   elapsed = pm_monotonic_ms() - started;
   if (fixture_dns) {
-    // Wait for intentionally delayed OS work to return; late results must
-    // release their pipes even after every caller has left.
-    struct timespec pause = { .tv_sec = 0, .tv_nsec = 450000000 };
-    nanosleep(&pause, NULL);
+    // Keep caller deadline measurements separate from asynchronous cleanup.
+    // A genuinely stuck worker still fails within the child's 2s budget.
+    cleanup_complete = fixture_wait_for_dns_cleanup();
   }
   printf("{\"failures\":%d,\"elapsedMs\":%lld,\"polls\":%d,\"fdDelta\":%d,"
-    "\"dnsCalls\":%d,\"connectCalls\":%d,\"maxPollMs\":%d}\n",
+    "\"dnsCalls\":%d,\"connectCalls\":%d,\"maxPollMs\":%d,\"dnsCleanupComplete\":%d}\n",
     failures, (long long)elapsed, fixture_total_polls, fixture_fd_count() - before,
-    atomic_load(&fixture_dns_calls), fixture_connect_calls, fixture_max_poll_ms);
+    atomic_load(&fixture_dns_calls), fixture_connect_calls, fixture_max_poll_ms, cleanup_complete);
   return 0;
 }
