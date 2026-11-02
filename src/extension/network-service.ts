@@ -2332,15 +2332,18 @@ export class PortManagerNetworkService implements DisposableLike {
   }
 
   /**
-   * Best current view of the daemon-owned responder. The last push response is
-   * authoritative until the daemon's own status heartbeat overtakes it.
+   * The client observes both RPC health and heartbeats in arrival order. Explicit
+   * health therefore wins over response timestamps: native heartbeats only have
+   * second precision and cannot order a later failure against a healthy RPC.
+   * Older snapshots without DNS health retain the same-incarnation RPC fallback.
    */
   private getBrowserDnsRuntimeState(): { readonly running: boolean; readonly port: number } {
     const daemon = this.getDaemonStatus();
     const daemonUpdatedAtMs = Date.parse(daemon.updatedAt);
     const lastSync = this.lastBrowserDnsSyncResult;
     const preferSyncResult =
-      lastSync !== undefined && lastSync.daemonIncarnation === this.getBrowserDnsDaemonIncarnation() &&
+      daemon.browserDnsRunning === undefined && lastSync !== undefined &&
+      lastSync.daemonIncarnation === this.getBrowserDnsDaemonIncarnation() &&
       (Number.isNaN(daemonUpdatedAtMs) || lastSync.atMs >= daemonUpdatedAtMs);
 
     const running = preferSyncResult ? lastSync.result.running : daemon.browserDnsRunning === true;

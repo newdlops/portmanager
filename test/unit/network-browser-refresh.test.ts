@@ -347,13 +347,14 @@ test("successful DNS recovery emits when a newer heartbeat had superseded the pr
   assert.equal(f.getEvents(), before + 1);
 });
 
-test("actual DNS send captures current provenance rather than queued provenance", async () => {
+test("actual DNS send captures current provenance for legacy snapshots without DNS health", async () => {
   interface Runner extends DnsRunner { initialize(): void; browserDnsSyncCoordinator: BrowserDnsSyncCoordinator; }
   const Service = extract<Runner>("network-service.ts", "PortManagerNetworkService", [
     "queueBrowserDnsDaemonSync", "recordBrowserDnsSyncResult", "getBrowserDnsRuntimeState", "getBrowserDnsDaemonIncarnation",
   ], ["browserDnsSyncSignature"], { Date, browserDnsPort: () => 53153, BrowserDnsSyncCoordinator, setTimeout, clearTimeout }, "new BrowserDnsSyncCoordinator");
   const service = Object.assign(new Service(), {
-    getDaemonStatus: () => ({ pid: 200, startedAt: "current", updatedAt: new Date(0).toISOString(), browserDnsRunning: false }),
+    // Legacy daemons omit health, so only the correctly fenced RPC can supply it.
+    getDaemonStatus: () => ({ pid: 200, startedAt: "current", updatedAt: new Date(0).toISOString() }),
     processService: { syncBrowserDns: async () => ({ running: true, port: 53154 }) },
     localChangeEvents: { emit: () => {} },
   });
@@ -399,12 +400,16 @@ function observedDnsClient() {
   return { client, requests, events, flushEvents: () => { while (events.length) events.shift()!(); } };
 }
 
-test("client and service replay a newer unchanged-down heartbeat after successful DNS sync", async () => {
+test("client and service immediately replay same-second DNS failure while timestamp-only down heartbeats stay quiet", async () => {
   const f = observedDnsClient();
+  // Native status serializes seconds; the healthy RPC finishes halfway through that second.
+  class Clock extends Date { static override now() { return Date.parse("2026-11-02T12:00:00.500Z"); } }
+  f.client.applySnapshot({ ...f.client.snapshot, daemon: { ...f.client.snapshot.daemon, updatedAt: "2026-11-02T12:00:00Z" } });
+  f.flushEvents();
   interface Runner extends DnsRunner { initialize(): void; browserDnsSyncCoordinator: BrowserDnsSyncCoordinator; }
   const Service = extract<Runner>("network-service.ts", "PortManagerNetworkService", [
     "getDaemonStatus", "queueBrowserDnsDaemonSync", "recordBrowserDnsSyncResult", "getBrowserDnsRuntimeState", "getBrowserDnsDaemonIncarnation",
-  ], ["browserDnsSyncSignature"], { Date, browserDnsPort: () => 53153, BrowserDnsSyncCoordinator, setTimeout, clearTimeout },
+  ], ["browserDnsSyncSignature"], { Date: Clock, browserDnsPort: () => 53153, BrowserDnsSyncCoordinator, setTimeout, clearTimeout },
   ["new BrowserDnsSyncCoordinator", "this.processService.onDidChange"]);
   const records = "alpha=127.120.1.2";
   const service = Object.assign(new Service(), {
@@ -418,15 +423,22 @@ test("client and service replay a newer unchanged-down heartbeat after successfu
     await service.browserDnsSyncCoordinator.waitForCurrentDrain();
     f.flushEvents();
     assert.equal(f.requests.length, 1);
-    const down = { ...f.client.snapshot, daemon: { ...f.client.snapshot.daemon, browserDnsRunning: false, browserDnsError: "socket closed", updatedAt: "9999-01-01T00:00:00.000Z" } };
+    const down = { ...f.client.snapshot, daemon: { ...f.client.snapshot.daemon, browserDnsRunning: false, browserDnsError: "socket closed", updatedAt: "2026-11-02T12:00:00Z" } };
     f.client.applySnapshot(down);
     f.flushEvents();
-    assert.equal(f.requests.length, 2, "new down observation must replay despite matching the pre-sync client snapshot");
-    f.requests[1]!({ running: true, port: 53153 });
+    assert.equal(f.requests.length, 2, "same-second down observation must replay without registry or proxy activity");
+    assert.equal(service.getBrowserDnsRuntimeState().running, false, "diagnostics must report observed failure while replay is pending");
+    f.client.applySnapshot({ ...down, daemon: { ...down.daemon, updatedAt: "2026-11-02T12:00:01Z" } });
+    assert.equal(f.events.length, 0, "next-second unchanged down heartbeat stays quiet");
+    assert.equal(f.requests.length, 2, "immediate recovery must not rely on the next heartbeat");
+    assert.equal(service.getBrowserDnsRuntimeState().running, false);
+    f.requests[1]!({ running: true, port: 53154 });
     await service.browserDnsSyncCoordinator.waitForCurrentDrain();
     f.flushEvents();
+    assert.equal(service.getBrowserDnsRuntimeState().running, true);
+    assert.equal(service.getBrowserDnsRuntimeState().port, 53154);
     const eventCount = f.events.length;
-    f.client.applySnapshot({ ...f.client.snapshot, daemon: { ...f.client.snapshot.daemon, updatedAt: "9999-02-01T00:00:00.000Z" } });
+    f.client.applySnapshot({ ...f.client.snapshot, daemon: { ...f.client.snapshot.daemon, updatedAt: "2026-11-02T12:00:02Z" } });
     assert.equal(f.events.length, eventCount, "timestamp-only healthy heartbeat stays quiet");
     assert.equal(f.requests.length, 2);
   } finally {
