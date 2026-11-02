@@ -234,6 +234,9 @@ test("non-owner windows show ownership transfer guidance while keeping actions a
     "portManager.applyBindingPreset",
     "portManager.clearNetworkCache",
     "portManager.removeLogicalNetwork",
+    "portManager.openNetworkEnvironmentFile",
+    "portManager.openNetworkDotenvSubstitute",
+    "portManager.revealNetworkFolder",
   ];
 
   assert.equal(typesSource.includes('export type ControlPlaneRole = "owner" | "worker" | "unowned";'), true);
