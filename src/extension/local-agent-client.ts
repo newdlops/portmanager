@@ -1095,11 +1095,25 @@ export class LocalAgentClient implements PortManagerProcessService {
     if (this.disposed || !this.automaticEventReconnectEnabled) {
       return { suspended: true, running: false, port: 0 };
     }
-    return this.request<AgentBrowserDnsSyncResult>("syncBrowserDns", {
+    const generation = this.connectionGeneration;
+    const { pid, startedAt } = this.snapshot.daemon;
+    const result = await this.request<AgentBrowserDnsSyncResult>("syncBrowserDns", {
       records,
       ...(revision === undefined ? {} : { revision }),
       ...(sharedStatePath === undefined ? {} : { sharedStatePath }),
     });
+    const daemon = this.snapshot.daemon;
+    if (!this.disposed && this.automaticEventReconnectEnabled && !result.suspended &&
+      generation === this.connectionGeneration && pid === daemon.pid && startedAt === daemon.startedAt) {
+      // A successful bind need not broadcast a healthy snapshot. Observe the
+      // response here so a later down heartbeat differs from the last known
+      // health and reaches DNS reconciliation, even if both heartbeats are down.
+      this.applySnapshot({
+        ...this.snapshot,
+        daemon: { ...daemon, browserDnsRunning: result.running, browserDnsPort: result.port, browserDnsError: result.error },
+      });
+    }
+    return result;
   }
 
   /** Sends one request and waits for the correlated response. */

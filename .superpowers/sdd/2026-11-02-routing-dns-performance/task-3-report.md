@@ -98,3 +98,32 @@ The first sandboxed attempt of the same scoped command could not execute the gua
 - During first connection, pre-request status can still be the disconnected incarnation; a later real daemon status event invalidates that identity and permits a conservative replay. It cannot acknowledge a different current incarnation.
 - No new poller, privileged DNS action, wire-field change, enlarged timing budget, native build, package, push or publish was performed.
 - Per parent scope, no full-suite run or new reviewer agent. Root owns fresh committed-diff review, final integration/release and any broader validation.
+
+## Fix round 1: observe sync health before the next heartbeat
+
+Review finding confirmed: `LocalAgentClient.syncBrowserDns()` previously returned a healthy result without changing its observed down snapshot. The service acknowledged that healthy result independently. If the responder failed again before a healthy snapshot arrived, a subsequent newer down heartbeat had the same client content signature as the original down snapshot. Timestamp suppression then swallowed the event needed to replay DNS.
+
+Changed the client to apply running/port/error from a completed DNS RPC through its existing snapshot/event path. The captured connection generation and PID+startedAt must still match, automatic reconnect must remain enabled, and the client must remain undisposed; otherwise the response cannot update client state. This does not depend on a daemon healthy broadcast and retains ordinary timestamp-only event suppression. The daemon heartbeat timestamp itself is preserved; only observed DNS health fields change.
+
+Added the regression with actual client `syncBrowserDns`, `applySnapshot`, `onDidChange`, `queueChangeEvent` and `getSnapshot`, the actual service constructor's process-change subscription/coordinator wiring, actual service DNS policy methods and actual coordinator. The only replacements are daemon RPC completion, timer scheduling, compatibility annotation, and unrelated OS-heavy service work. The test starts down, acknowledges a healthy sync, injects a newer otherwise-identical down heartbeat, and requires a second RPC. It also confirms that a subsequent healthy timestamp-only heartbeat emits no event/replay. Additional tests check direct health/port/error observation and that successful responses after incarnation change, connection generation change or disposal leave the newer client snapshot and pending event queue untouched.
+
+RED commands (new tests before production fix):
+
+```sh
+python3 /private/tmp/pm-clean-run.py npm run compile
+python3 /private/tmp/pm-clean-run.py node --test --test-name-pattern='client and service replay|client observes DNS sync|successful DNS completion' out/test/unit/network-browser-refresh.test.js
+```
+
+Compile exit 0. **5 tests: 3 pass, 2 fail**, exit 1. Intended failures:
+
+- `client and service replay a newer unchanged-down heartbeat after successful DNS sync`: RPC count **1**, expected **2** (`new down observation must replay despite matching the pre-sync client snapshot`).
+- `client observes DNS sync health and clears the old error without a daemon healthy broadcast`: observed running **false**, expected **true**.
+
+GREEN covering commands after fix:
+
+```sh
+python3 /private/tmp/pm-clean-run.py npm run compile
+python3 /private/tmp/pm-clean-run.py node --test out/test/unit/network-browser-refresh.test.js out/test/unit/browser-dns-sync-coordinator.test.js out/test/unit/terminal-hook-environment.test.js
+```
+
+Compile exit 0. **101 tests: 101 pass, 0 fail, 0 skipped**, exit 0, 1555ms. Includes all five new cases plus coordinator, browser-refresh, stopped-client and existing client/terminal lifecycle coverage. `git diff --check` also exited 0. No native changes, native DNS rerun, full suite, push or publish in this round, per parent scope.

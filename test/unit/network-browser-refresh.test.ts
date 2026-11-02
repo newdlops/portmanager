@@ -7,9 +7,11 @@ import test from "node:test";
 import ts from "typescript";
 import { browserNetworkProxyEndpointId } from "../../src/platform/ports/browser-network-proxy";
 import { BrowserDnsSyncCoordinator, type BrowserDnsSyncBatch } from "../../src/extension/browser-dns-sync-coordinator";
+import { SimpleEventEmitter } from "../../src/shared/events";
+import type { AgentBrowserDnsSyncResult, AgentSnapshot } from "../../src/shared/types";
 
 /** Runs current orchestration methods with counted adapters, without activating VS Code. */
-function extract<T>(file: string, className: string, names: readonly string[], helpers: readonly string[] = [], globals = {}, constructorStatement?: string): new () => T {
+function extract<T>(file: string, className: string, names: readonly string[], helpers: readonly string[] = [], globals = {}, constructorStatement?: string | readonly string[]): new () => T {
   const source = fs.readFileSync(path.resolve(__dirname, "../../../src/extension", file), "utf8");
   const ast = ts.createSourceFile(file, source, ts.ScriptTarget.ES2022, true);
   const service = ast.statements.find((node): node is ts.ClassDeclaration => ts.isClassDeclaration(node) && node.name?.text === className);
@@ -25,10 +27,12 @@ function extract<T>(file: string, className: string, names: readonly string[], h
     return helper.getText(ast);
   });
   // Isolate the actual coordinator wiring while leaving OS-heavy constructor work out.
-  const setup = constructorStatement === undefined ? undefined : service.members.find(ts.isConstructorDeclaration)?.body?.statements
-    .find((node) => node.getText(ast).includes(constructorStatement));
-  if (constructorStatement !== undefined) assert.ok(setup, constructorStatement);
-  return vm.runInNewContext(ts.transpileModule(`class Runner { ${members.join("\n")} ${setup === undefined ? "" : `initialize() { ${setup.getText(ast)} }`} }\n${functions.join("\n")}\nRunner;`, {
+  const setup = (constructorStatement === undefined ? [] : typeof constructorStatement === "string" ? [constructorStatement] : constructorStatement).map((text) => {
+    const statement = service.members.find(ts.isConstructorDeclaration)?.body?.statements.find((node) => node.getText(ast).includes(text));
+    assert.ok(statement, text);
+    return statement.getText(ast);
+  });
+  return vm.runInNewContext(ts.transpileModule(`class Runner { ${members.join("\n")} initialize() { ${setup.join("\n")} } }\n${functions.join("\n")}\nRunner;`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText, globals) as new () => T;
 }
@@ -281,6 +285,7 @@ test("background DNS cannot re-enable a deliberately stopped client; explicit st
   let requests = 0;
   const client = Object.assign(new Client(), {
     snapshot: { daemon: { pid: 0 } }, rejectAllPending: () => {}, queueChangeEvent: () => {},
+    applySnapshot: () => {},
     ensureConnected: async () => {}, loadDaemonStatusForStartup: async () => {},
     request: async () => { requests++; return { running: true, port: 53153 }; },
   });
@@ -359,3 +364,99 @@ test("actual DNS send captures current provenance rather than queued provenance"
   assert.equal(service.getBrowserDnsRuntimeState().port, 53154);
   service.browserDnsSyncCoordinator.dispose();
 });
+
+interface ObservedDnsClient {
+  snapshot: AgentSnapshot;
+  connectionGeneration: number;
+  disposed: boolean;
+  applySnapshot(snapshot: AgentSnapshot): void;
+  syncBrowserDns(records: string): Promise<AgentBrowserDnsSyncResult>;
+  getSnapshot(): AgentSnapshot;
+  onDidChange(listener: () => void): { dispose(): void };
+}
+/** Keeps real client snapshot/event policy while gating only the daemon request. */
+function observedDnsClient() {
+  const events: (() => void)[] = [];
+  const requests: ((result: AgentBrowserDnsSyncResult) => void)[] = [];
+  const Client = extract<ObservedDnsClient>("local-agent-client.ts", "LocalAgentClient", [
+    "connectionGeneration", "disposed", "automaticEventReconnectEnabled", "syncBrowserDns", "applySnapshot", "getSnapshot", "onDidChange", "queueChangeEvent",
+  ], ["buildClientSnapshotSignature", "compareSnapshotSignatureRows", "buildClientRouteSignatureRows", "normalizeClientRouteDirection"], {
+    annotateDaemonCompatibility: (value: unknown) => value, normalizeAgentSnapshot: (value: unknown) => value,
+    CLIENT_CHANGE_EVENT_DEBOUNCE_MS: 16,
+    setTimeout: (callback: () => void) => { events.push(callback); return { unref() {} }; },
+  });
+  const snapshot: AgentSnapshot = {
+    agentPid: 200, processes: [], listeners: [], routes: [], updatedAt: new Date(0).toISOString(),
+    daemon: { status: "running", pid: 200, startedAt: "first", updatedAt: new Date(0).toISOString(), listenerCount: 0, routeCount: 0,
+      monitoringAllListeners: false, browserDnsRunning: false, browserDnsPort: 53153, browserDnsError: "socket closed" },
+  };
+  const client = Object.assign(new Client(), {
+    snapshot, changeEvents: new SimpleEventEmitter<void>(), getAgentMainPath: () => "/agent",
+    request: () => new Promise<AgentBrowserDnsSyncResult>((resolve) => requests.push(resolve)),
+  });
+  client.applySnapshot(snapshot);
+  events.shift()!();
+  return { client, requests, events, flushEvents: () => { while (events.length) events.shift()!(); } };
+}
+
+test("client and service replay a newer unchanged-down heartbeat after successful DNS sync", async () => {
+  const f = observedDnsClient();
+  interface Runner extends DnsRunner { initialize(): void; browserDnsSyncCoordinator: BrowserDnsSyncCoordinator; }
+  const Service = extract<Runner>("network-service.ts", "PortManagerNetworkService", [
+    "getDaemonStatus", "queueBrowserDnsDaemonSync", "recordBrowserDnsSyncResult", "getBrowserDnsRuntimeState", "getBrowserDnsDaemonIncarnation",
+  ], ["browserDnsSyncSignature"], { Date, browserDnsPort: () => 53153, BrowserDnsSyncCoordinator, setTimeout, clearTimeout },
+  ["new BrowserDnsSyncCoordinator", "this.processService.onDidChange"]);
+  const records = "alpha=127.120.1.2";
+  const service = Object.assign(new Service(), {
+    processService: f.client, disposables: [], refreshGuardedRuntimeRoutes: () => {}, notifyRoutingActivity: () => {},
+    localChangeEvents: { emit: () => {} }, syncBrowserDnsRecords: () => service.queueBrowserDnsDaemonSync(records, "R"),
+  });
+  service.initialize();
+  try {
+    service.queueBrowserDnsDaemonSync(records, "R");
+    f.requests[0]!({ running: true, port: 53153 });
+    await service.browserDnsSyncCoordinator.waitForCurrentDrain();
+    f.flushEvents();
+    assert.equal(f.requests.length, 1);
+    const down = { ...f.client.snapshot, daemon: { ...f.client.snapshot.daemon, browserDnsRunning: false, browserDnsError: "socket closed", updatedAt: "9999-01-01T00:00:00.000Z" } };
+    f.client.applySnapshot(down);
+    f.flushEvents();
+    assert.equal(f.requests.length, 2, "new down observation must replay despite matching the pre-sync client snapshot");
+    f.requests[1]!({ running: true, port: 53153 });
+    await service.browserDnsSyncCoordinator.waitForCurrentDrain();
+    f.flushEvents();
+    const eventCount = f.events.length;
+    f.client.applySnapshot({ ...f.client.snapshot, daemon: { ...f.client.snapshot.daemon, updatedAt: "9999-02-01T00:00:00.000Z" } });
+    assert.equal(f.events.length, eventCount, "timestamp-only healthy heartbeat stays quiet");
+    assert.equal(f.requests.length, 2);
+  } finally {
+    service.browserDnsSyncCoordinator.dispose();
+  }
+});
+
+test("client observes DNS sync health and clears the old error without a daemon healthy broadcast", async () => {
+  const f = observedDnsClient();
+  const pending = f.client.syncBrowserDns("alpha=127.120.1.2");
+  f.requests[0]!({ running: true, port: 53154 });
+  await pending;
+  assert.equal(f.client.snapshot.daemon.browserDnsRunning, true);
+  assert.equal(f.client.snapshot.daemon.browserDnsPort, 53154);
+  assert.equal(f.client.snapshot.daemon.browserDnsError, undefined);
+});
+
+for (const transition of ["incarnation", "connection", "dispose"] as const) {
+  test(`successful DNS completion after ${transition} transition cannot modify newer client state`, async () => {
+    const f = observedDnsClient();
+    const pending = f.client.syncBrowserDns("alpha=127.120.1.2");
+    if (transition === "connection") f.client.connectionGeneration++;
+    if (transition === "dispose") f.client.disposed = true;
+    f.client.applySnapshot({ ...f.client.snapshot, daemon: { ...f.client.snapshot.daemon,
+      startedAt: transition === "incarnation" ? "replacement" : "first", browserDnsPort: 53155, browserDnsError: "new failure" } });
+    f.flushEvents();
+    const current = f.client.snapshot;
+    f.requests[0]!({ running: true, port: 53154 });
+    await pending;
+    assert.equal(f.client.snapshot, current);
+    assert.equal(f.events.length, 0);
+  });
+}
