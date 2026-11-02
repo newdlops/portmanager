@@ -4,6 +4,12 @@ All notable changes to Port Manager are documented in this file.
 
 ## Unreleased
 
+## 0.0.8276
+
+- Recover authoritative routing once per daemon PID and start time, including when DNS/event reconnection precedes the first route snapshot. Reject late recovery completions from an older incarnation and retry failed scans without adding warm-pass scans.
+- Bound background listener-scan deferral under continuous control traffic with a monotonic deadline while preserving asynchronous scans and the normal five-minute warm cadence. Keep existing logical/browser listeners, gateway claims and routing targets during incomplete recovery while opening newly discovered endpoints independently of DNS publication.
+- Share explicit Stop intent across extension windows and reloads. Automatic startup, DNS retries and repairs respect it; explicit Start/Restart clears only observed stops, so an older pending restart cannot erase a later Stop. Replacement shutdown does not persist a user suspension that could block retry after failure or host exit.
+
 ## 0.0.8275
 
 - Add commands and network context actions to open environment overrides, dotenv substitutes and readable settings folders. Show preserved inactive legacy paths during attach, with an active-settings action; repeat the warning after legacy edits without overwriting either copy. Retain discovery across network rename and disambiguate duplicate network/workspace names. Document and test the real hardened-uv `UV_ENV_FILE` precedence and the `environment.env` override.
