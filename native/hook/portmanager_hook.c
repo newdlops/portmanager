@@ -3054,6 +3054,16 @@ static int pm_route_cache_expired(const pm_route_file_cache_entry *entry) {
     (monotonic > 0 && entry->monotonic_deadline_ms > 0 && monotonic >= entry->monotonic_deadline_ms);
 }
 
+/* Concurrent reads of the same file identity share the earliest observed
+ * lifetime. A wall-clock rollback must not let a delayed publisher renew it. */
+static void pm_route_cache_merge_lifetime(pm_route_file_cache_entry *entry, long expires_at_ms, long monotonic_deadline_ms) {
+  if (expires_at_ms < entry->expires_at_ms) entry->expires_at_ms = expires_at_ms;
+  if (monotonic_deadline_ms > 0 &&
+      (entry->monotonic_deadline_ms <= 0 || monotonic_deadline_ms < entry->monotonic_deadline_ms)) {
+    entry->monotonic_deadline_ms = monotonic_deadline_ms;
+  }
+}
+
 static void pm_clear_route_file_cache_entry(pm_route_file_cache_entry *entry) {
   if (entry == NULL) return;
   pm_route_file_cache_payload_bytes -= entry->route_count * (sizeof(pm_cached_route) + 2 * sizeof(pm_route_port_index));
@@ -3159,6 +3169,14 @@ static void pm_store_route_file_cache(const char *path, const struct stat *value
     qsort(indexes + count, count, sizeof(*indexes), pm_route_port_index_compare);
   }
   pthread_mutex_lock(&pm_route_file_cache_mutex);
+  pm_route_file_cache_entry *existing = pm_find_route_file_cache(path, value);
+  if (existing != NULL) {
+    pm_route_cache_merge_lifetime(existing, expires_at_ms, monotonic_deadline_ms);
+    pthread_mutex_unlock(&pm_route_file_cache_mutex);
+    free(copy);
+    free(indexes);
+    return;
+  }
   pm_route_file_cache_entry *entry = NULL;
   for (size_t i = 0; i < pm_route_file_cache_count; i++) {
     if (strcmp(pm_route_file_cache[i].path, path) == 0) { entry = &pm_route_file_cache[i]; break; }
@@ -3338,6 +3356,17 @@ static int pm_load_route_file_routes(const char *path, pm_cached_route **routes_
   free(buffer);
 
   pm_store_route_file_cache(path, &stat_buffer, routes, route_count, expires_at_ms, monotonic_deadline_ms);
+  /* A concurrent cold reader may have published an earlier deadline, including
+   * an expired tombstone. Validate our owned snapshot against it before any
+   * bulk or point caller can select from the newly parsed array. */
+  snapshot.expires_at_ms = expires_at_ms;
+  snapshot.monotonic_deadline_ms = monotonic_deadline_ms;
+  pthread_mutex_lock(&pm_route_file_cache_mutex);
+  pm_route_file_cache_entry *published = pm_find_route_file_cache(path, &stat_buffer);
+  if (published != NULL) pm_route_cache_merge_lifetime(&snapshot, published->expires_at_ms, published->monotonic_deadline_ms);
+  int expired = pm_route_cache_expired(&snapshot);
+  pthread_mutex_unlock(&pm_route_file_cache_mutex);
+  if (expired) { free(routes); return -1; }
   *routes_out = routes;
   *route_count_out = route_count;
   return 0;

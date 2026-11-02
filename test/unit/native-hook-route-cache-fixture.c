@@ -12,8 +12,12 @@
 #include <unistd.h>
 #include <stdarg.h>
 static long wall_shift, monotonic_shift;
+static int include_sentinels;
 static __thread unsigned allocations, comparisons;
-static __thread int selecting, cache_lock_depth;
+static __thread int selecting, cache_lock_depth, cold_reader_id;
+static pthread_mutex_t cold_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cold_condition = PTHREAD_COND_INITIALIZER;
+static int cold_ready[3], cold_release[3];
 static int fixture_lock(pthread_mutex_t *mutex);
 static int fixture_unlock(pthread_mutex_t *mutex);
 static int fixture_stat(const char *path, struct stat *value);
@@ -89,7 +93,18 @@ static int fixture_open(const char *path, int flags, ...) {
   if (flags & O_CREAT) { va_list args; va_start(args, flags); mode = (mode_t)va_arg(args, int); va_end(args); }
   return open(path, flags, mode);
 }
-static ssize_t fixture_read(int fd, void *buffer, size_t size) { assert(!cache_lock_depth); return read(fd, buffer, size); }
+static ssize_t fixture_read(int fd, void *buffer, size_t size) {
+  assert(!cache_lock_depth);
+  if (cold_reader_id) {
+    pthread_mutex_lock(&cold_mutex);
+    cold_ready[cold_reader_id] = 1;
+    pthread_cond_broadcast(&cold_condition);
+    while (!cold_release[cold_reader_id]) pthread_cond_wait(&cold_condition, &cold_mutex);
+    pthread_mutex_unlock(&cold_mutex);
+    cold_reader_id = 0;
+  }
+  return read(fd, buffer, size);
+}
 
 /* Compiler coverage counts integer comparisons, including port-range searches.
  * Callbacks themselves are excluded from instrumentation. */
@@ -109,9 +124,16 @@ NO_COVER void __sanitizer_cov_trace_switch(uint64_t v, uint64_t *cases) { (void)
 static void table(const char *file, long expires, int actual, int count) {
   FILE *output = fopen(file, "w"); assert(output);
   fprintf(output, "{\"expiresAtMs\":%ld,\"routes\":[", expires);
+  if (include_sentinels) fputs(
+    "{\"logicalPort\":20000,\"actualPort\":49000,\"networkId\":\"foreign\",\"routeDirection\":\"listen\"},"
+    "{\"logicalPort\":20000,\"actualPort\":48000,\"networkId\":\"network-probe\",\"routeDirection\":\"send\"},"
+    "{\"logicalPort\":19000,\"actualPort\":40000,\"networkId\":\"foreign\",\"routeDirection\":\"listen\"},"
+    "{\"logicalPort\":19001,\"actualPort\":41000,\"networkId\":\"foreign\",\"routeDirection\":\"listen\"},"
+    "{\"logicalPort\":19002,\"actualPort\":40000,\"networkId\":\"network-probe\",\"routeDirection\":\"send\"},"
+    "{\"logicalPort\":19003,\"actualPort\":41000,\"networkId\":\"network-probe\",\"routeDirection\":\"send\"}", output);
   for (int i = 0; i < count; i++) fprintf(output,
     "%s{\"logicalPort\":%d,\"actualPort\":%d,\"networkId\":\"network-probe\",\"host\":\"127.0.0.1\",\"routeDirection\":\"listen\"}",
-    i ? "," : "", 20000 + i, actual + i);
+    i || include_sentinels ? "," : "", 20000 + i, actual + i);
   fputs("]}", output); assert(fclose(output) == 0);
 }
 static int lookup(const char *file, int port) {
@@ -190,15 +212,57 @@ static void pending(const char *file) {
   assert(pm_memory_actual_for_logical(20000, host, sizeof(host)) == 43000);
   pm_clear_memory_routes();
 }
+typedef struct { const char *path; int id; int result; } cold_lookup;
+static void *cold_reader(void *opaque) {
+  cold_lookup *request = opaque;
+  cold_reader_id = request->id;
+  request->result = lookup(request->path, 20000);
+  return NULL;
+}
+/* Both readers miss before publication. B resumes after A publishes and the
+ * clock rolls back; publication cannot extend A's deadline or return it late. */
+static void cold_publication(const char *file, int expired) {
+  table(file, pm_now_milliseconds() + 60000, 40000, 1);
+  cold_lookup requests[2] = {{file, 1, -1}, {file, 2, -1}};
+  pthread_t threads[2];
+  for (int i = 0; i < 2; i++) assert(pthread_create(&threads[i], NULL, cold_reader, &requests[i]) == 0);
+  pthread_mutex_lock(&cold_mutex);
+  while (!cold_ready[1] || !cold_ready[2]) pthread_cond_wait(&cold_condition, &cold_mutex);
+  cold_release[1] = 1; pthread_cond_broadcast(&cold_condition);
+  pthread_mutex_unlock(&cold_mutex);
+  pthread_join(threads[0], NULL);
+  assert(requests[0].result == 40000);
+  wall_shift = -60000; monotonic_shift = expired ? 120000 : 30000;
+  pthread_mutex_lock(&cold_mutex);
+  cold_release[2] = 1; pthread_cond_broadcast(&cold_condition);
+  pthread_mutex_unlock(&cold_mutex);
+  pthread_join(threads[1], NULL);
+  assert(requests[1].result == (expired ? 0 : 40000));
+  monotonic_shift = 120000;
+  assert(lookup(file, 20000) == 0);
+  assert(lookup(file, 20000) == 0);
+}
 static void *reader(void *opaque) {
   const char *file = opaque;
+  unsigned forward_hits = 0, send_hits = 0, reverse_hits = 0;
   for (int i = 0; i < 500; i++) {
     int port = lookup(file, 20000);
     assert(port == 0 || port == 40000 || port == 41000);
+    if (port) forward_hits++;
+    int send = pm_route_table_lookup_file(file, 20000, 0, "send", NULL, 0, NULL);
+    assert(send == 0 || send == 48000);
+    if (send) send_hits++;
+    /* A replacement between forward and reverse reads can select either valid
+     * generation. Foreign or send-only reverse sentinels are never valid. */
+    int reverse = pm_route_table_lookup_file(file, 41000, 1, "listen", NULL, 0, NULL);
+    assert(reverse == 0 || reverse == 20000 || reverse == 21000);
+    if (reverse) reverse_hits++;
   }
+  assert(forward_hits >= 250 && send_hits >= 250 && reverse_hits >= 250);
   return NULL;
 }
 static void concurrent(const char *file) {
+  include_sentinels = 1;
   long deadline = pm_now_milliseconds() + 600000;
   table(file, deadline, 40000, 2048);
   pthread_t threads[4];
@@ -208,6 +272,7 @@ static void concurrent(const char *file) {
   assert(lookup(file, 20000) == 40000);
 }
 static void eviction(const char *file) {
+  include_sentinels = 1;
   char other[PM_MAX_PATH];
   table(file, pm_now_milliseconds() + 600000, 40000, 2048);
   assert(lookup(file, 20000) == 40000);
@@ -271,7 +336,9 @@ int main(int argc, char **argv) {
   assert(argc == 3);
   setenv("PORT_MANAGER_NETWORK_ID", "network-probe", 1);
   setenv("PORT_MANAGER_NETWORK_IS_GLOBAL", "0", 1);
-  if (!strcmp(argv[1], "eviction")) eviction(argv[2]);
+  if (!strcmp(argv[1], "cold-rollback")) cold_publication(argv[2], 0);
+  else if (!strcmp(argv[1], "cold-expired")) cold_publication(argv[2], 1);
+  else if (!strcmp(argv[1], "eviction")) eviction(argv[2]);
   else if (!strcmp(argv[1], "bulk")) bulk(argv[2]);
   else if (!strcmp(argv[1], "legacy")) legacy(argv[2]);
   else if (!strcmp(argv[1], "budget")) budget(argv[2]);

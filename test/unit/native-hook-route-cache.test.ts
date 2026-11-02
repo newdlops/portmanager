@@ -22,7 +22,7 @@ test.before(() => {
   assert.equal(result.status, 0, result.stderr);
 });
 test.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
-for (const scenario of ["expiry", "rollback", "replace", "inplace", "precedence", "hot", "pending", "concurrent", "budget", "bulk", "legacy", "eviction"]) {
+for (const scenario of ["expiry", "rollback", "replace", "inplace", "precedence", "hot", "pending", "concurrent", "budget", "bulk", "legacy", "eviction", "cold-rollback", "cold-expired"]) {
   test(`native route cache ${scenario}`, () => {
     const directory = path.join(temporary, scenario);
     fs.mkdirSync(directory);
