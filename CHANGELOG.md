@@ -4,6 +4,10 @@ All notable changes to Port Manager are documented in this file.
 
 ## Unreleased
 
+## 0.0.8274
+
+- Recover routing once when a new extension host reconnects to an already-running daemon, including when an early DNS push has connected before the first route snapshot arrives. Refresh listeners and publish route files without changing stable loopback addresses; failed initial recovery retries automatically. Reuse successful transition or explicit repair work and keep subsequent background passes free of extra full scans.
+
 ## 0.0.8273
 
 - Keep native route-cache hits within the document expiry and monotonic lifetime, observe same-size/same-mtime atomic replacements, and let new listener routes supersede provisional sender reservations. Indexed warm point lookups avoid full-array copies and retained cache memory stays within 16MiB. A long-lived preloaded-client test verifies expiry, backend replacement, foreign-network rejection, and usable existing TCP/HTTP/SSE streams during DNS publication and a test-daemon restart.
