@@ -94,6 +94,14 @@ DNS 응답 worker는 registry·파일·로그에 접근하지 않고 UDP와 shut
 `test/unit/native-agent-dns-index-fixture.c`는 실제 응답 경로의 비교 수·할당 실패·예산을
 검증하며 `-DPM_DNS_BENCHMARK`로 빌드해 `--benchmark`를 주면 저장한 이전 선형
 구현과 현재 production 조회의 마이크로벤치마크를 실행한다(UDP 지연 측정 아님).
+macOS arm64의 4,096행 측정 중앙값은 uniform hit 6,107.6→109.0ns,
+miss 13,696.5→84.6ns, last hit 14,908.1→103.5ns였다. first hit는 선형의
+단일 비교가 유리해 2.3→105.5ns로 느려진다. 인덱스 payload는 32,768바이트이며
+최대 테이블의 first/middle/last/missing 조회는 각각 14/13/13/12회 비교였다.
+이는 lookup CPU 작업의 측정이며 UDP·네트워크 지연·mutex scheduling을 포함하지 않는다.
+`native-agent-dns.test.ts`는 실제 Unix RPC/UDP의 동시 table 교체·영속 replay·
+restart·bind 복구와, 실제 hooked client의 route expiry/rewrite 중 열린 TCP/HTTP/SSE
+연결 보존을 검증한다. 모든 fixture는 자신이 만든 파일·socket·process만 사용한다.
 managed child의 command/env 구성은 fork 전에 끝낸다. child는 chdir/open/dup2/close/execve/_exit만 사용해 DNS 스레드가 있는 부모에서 libc 상태를 상속한 뒤 잠기는 일을 방지한다.
 
 실행 중 route/DNS 파일 읽기·쓰기·rename은 서로 독립된 게시 worker에서 수행한다. 시작 시 이전 파일 정리와 DNS sidecar 로드는 socket loop 진입 전에 끝낸다. route worker에는 불변 route/관측 사본과 전용 파일 signature·generation 상태만 전달하며 registry는 공유하지 않는다. 첫 미수집 변경부터 최대 250ms, idle 40ms를 기준으로 다음 사본을 예약한다. 진행 중인 쓰기 뒤에는 최신 사본 하나만 병합하며, 새 변경은 별도 기한을 시작해 지속적인 입력 중에도 매 turn 전체 registry를 복사하지 않는다. 이 기한은 게시 예약을 위한 것이며 파일시스템 완료 시간을 보장하지 않는다. 기존 TTL heartbeat도 유지한다.

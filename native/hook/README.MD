@@ -40,3 +40,15 @@ uncached 스냅샷으로 처리한다. 파일 읽기·stat·cwd 조회는 선택
 
 검증: `test/unit/native-hook-route-cache.test.ts`, `native-hook-connect.test.ts`,
 `native-hook-registration.test.ts`. 모든 fixture는 상속한 PM/preload 환경을 제거한다.
+
+`native-agent-dns.test.ts`의 long-lived client 통합 사례는 실제 preload된 Node
+프로세스 하나로 warm 조회 → explicit expiry의 새 연결 거부 → 동일 크기·mtime의
+atomic 교체 → 새 backend 선택을 검증한다. 기존 TCP·HTTP chunk stream·SSE는
+각 단계와 fixture DNS daemon 재시작 뒤에도 기존 backend에서 새 바이트를 받으며,
+앞에 배치한 foreign-network sentinel은 연결을 받지 않는다. 파일·daemon·Unix/UDP/TCP
+소켓은 모두 테스트 전용이며 시스템 DNS나 실행 중 사용자 daemon을 변경하지 않는다.
+
+macOS arm64 측정에서 2,048행의 warm last-row 조회 2,000회는 5회 교대 실행의
+중앙값 146.978ms → 45.942ms(약 3.2배)였다. 별도 계측은 warm 조회의 할당 0회·
+정수 비교 56회와 16MiB retained 상한을 검증한다. 이는 metadata/cwd/clock을 포함한
+lookup 마이크로벤치마크이며 연결 지연·처리량이나 모든 workload의 속도 보장이 아니다.

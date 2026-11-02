@@ -8,6 +8,7 @@ import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { BrowserDnsSyncCoordinator, type BrowserDnsSyncBatch } from "../../src/extension/browser-dns-sync-coordinator";
 import { createTestAgentCredential, testAgentAuthorization } from "./native-agent-test-authorization";
+import { exerciseHookedRouteRefresh } from "./native-hook-refresh-fixture";
 
 /**
  * Black-box coverage for the daemon-owned browser DNS responder.
@@ -110,6 +111,48 @@ test("native agent sources wire the DNS responder into dispatch, poll loop, and 
 if (!fs.existsSync(nativeAgentPath)) {
   test("native agent answers browser DNS queries", { skip: "native agent binary is not built" }, () => undefined);
 } else {
+  test("one hooked client refreshes expired routes while streams survive DNS publication and daemon restart", { timeout: 20_000 }, async (context) => {
+    const fixture = await startDnsAgent(context);
+    if (fixture === undefined) return;
+    const port = await readDnsPort(fixture.socketPath);
+    assert.ok(port);
+    await requestOnce(fixture.socketPath, {
+      id: "refresh-initial", method: "syncBrowserDns", payload: { records: "refresh.pm=127.120.5.9" },
+    });
+    await exerciseHookedRouteRefresh(context, fixture.directory, async () => {
+      // DNS work overlaps the warmed client's route expiry/rewrite. The larger
+      // whole-table swap stress and authority fences remain in their own cases.
+      await Promise.all([
+        (async () => {
+          for (let index = 0; index < 12; index++) {
+            await requestOnce(fixture.socketPath, {
+              id: `refresh-dns-${index}`, method: "syncBrowserDns",
+              payload: { records: `refresh.pm=${index % 2 ? "127.120.5.9" : "127.120.5.10"}` },
+            });
+            await new Promise((resolve) => setTimeout(resolve, 120));
+          }
+        })(),
+        (async () => {
+          for (let index = 0; index < 50; index++) {
+            const answer = await dnsQuery(port, "refresh.pm");
+            assert.ok(answer.address === "127.120.5.9" || answer.address === "127.120.5.10");
+            await new Promise((resolve) => setTimeout(resolve, 30));
+          }
+        })(),
+      ]);
+    }, async () => {
+      await requestOnce(fixture.socketPath, { id: "refresh-shutdown", method: "shutdownDaemon" });
+      await waitForProcessExit(fixture.agent, 3_000);
+      const restarted = await startDnsAgent(context, fixture.directory);
+      assert.ok(restarted, "the test daemon must restart");
+      const restartedPort = await readDnsPort(restarted.socketPath);
+      assert.ok(restartedPort);
+      assert.deepEqual(await dnsQuery(restartedPort, "refresh.pm"), {
+        rcode: 0, answerCount: 1, address: "127.120.5.9",
+      });
+    });
+  });
+
   test("native DNS retains first normalized duplicate and the 4096-row boundary through replay and restart", async (context) => {
     const fixture = await startDnsAgent(context);
     if (fixture === undefined) return;
