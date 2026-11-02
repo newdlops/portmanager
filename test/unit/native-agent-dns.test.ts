@@ -5,7 +5,12 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import vm from "node:vm";
 import test, { type TestContext } from "node:test";
+import ts from "typescript";
+import { getRouteTablePathForNetwork } from "../../src/agent/route-table";
+import { continueWhenDaemonLifecycleReady, convergeDaemonLifecycle } from "../../src/extension/daemon-lifecycle";
+import type { AgentSnapshot } from "../../src/shared/types";
 import { BrowserDnsSyncCoordinator, type BrowserDnsSyncBatch } from "../../src/extension/browser-dns-sync-coordinator";
 import { createTestAgentCredential, testAgentAuthorization } from "./native-agent-test-authorization";
 import { exerciseHookedRouteRefresh } from "./native-hook-refresh-fixture";
@@ -111,6 +116,76 @@ test("native agent sources wire the DNS responder into dispatch, poll loop, and 
 if (!fs.existsSync(nativeAgentPath)) {
   test("native agent answers browser DNS queries", { skip: "native agent binary is not built" }, () => undefined);
 } else {
+  test("new extension owners republish expired routes after DNS connects first", { timeout: 15_000 }, async (context) => {
+    const fixture = await startDnsAgent(context, undefined, 0, undefined, { PORT_MANAGER_AGENT_DISABLE_HOOK_RECOVERY: "1" });
+    if (fixture === undefined) return;
+    const dnsPort = (await readDnsPort(fixture.socketPath))!;
+    const backend = net.createServer((socket) => socket.end("resumed-backend"));
+    context.after(() => new Promise<void>((resolve) => backend.close(() => resolve())));
+    await new Promise<void>((resolve, reject) => {
+      backend.once("error", reject);
+      backend.listen(0, "127.0.0.1", resolve);
+    });
+    const actualPort = (backend.address() as net.AddressInfo).port;
+    const networkId = "resume-network";
+    const scopedPath = getRouteTablePathForNetwork(networkId, fixture.routeTablePath);
+    await requestOnce(fixture.socketPath, { id: "resume-register", method: "registerExistingProcess", payload: {
+      pid: process.pid, name: "resumed-backend", command: "resumed-backend", cwd: fixture.directory,
+      requestedPort: 48371, actualPort, host: "127.0.0.1", networkId, source: "hooked",
+    } });
+    assert.equal((await dnsQuery(dnsPort, "resume.pm")).rcode, 3);
+    // Each closed RPC socket stands in for the absent extension connection.
+    // The singleton and backend remain alive while a fresh host loses all local state.
+    for (let activation = 0; activation < 2; activation++) {
+      const earlyDns = await requestOnce(fixture.socketPath, { id: `resume-early-${activation}`, method: "syncBrowserDns", payload: { records: "resume.pm=127.0.0.1" } });
+      assert.ok(earlyDns);
+      const daemon = await requestOnce<AgentSnapshot["daemon"]>(fixture.socketPath, { id: `resume-status-${activation}`, method: "daemonStatus" });
+      let snapshot = { daemon, routes: [] } as unknown as AgentSnapshot;
+      // Deterministic elapsed-absence fixture: only generated soft state ages.
+      fs.writeFileSync(scopedPath, JSON.stringify({ version: 1, expiresAtMs: 1, ttlMs: 15_000, routes: [] }));
+      let repairs = 0;
+      let browserChecks = 0;
+      let browserFailure: unknown;
+      const service = resumedNetworkService({
+        getSnapshot: () => snapshot, start: async () => {},
+        restartDaemon: async () => { throw new Error("A current surviving daemon must not restart"); },
+        repairRoutingState: async () => {
+          repairs++;
+          snapshot = await requestOnce<AgentSnapshot>(fixture.socketPath, { id: `resume-repair-${activation}`, method: "repairRoutingState" });
+        },
+      }, async () => {
+        try {
+          await requestOnce(fixture.socketPath, { id: `resume-dns-${activation}`, method: "syncBrowserDns", payload: { records: "resume.pm=127.0.0.1" } });
+          const answer = await dnsQuery(dnsPort, "resume.pm");
+          assert.equal(answer.address, "127.0.0.1", "DNS keeps the configured address across reactivation");
+          const published = JSON.parse(fs.readFileSync(scopedPath, "utf8")) as { expiresAtMs: number; routes: { actualPort: number; networkId: string }[] };
+          assert.ok(published.expiresAtMs > Date.now(), "startup must replace the expired shard before its continuation");
+          const route = published.routes.find((row) => row.networkId === networkId && row.actualPort === actualPort);
+          assert.ok(route, "the repaired route must identify the still-listening backend");
+          const body = await new Promise<string>((resolve, reject) => {
+            const socket = net.connect(route.actualPort, answer.address);
+            let received = "";
+            socket.setTimeout(1500, () => socket.destroy(new Error("resumed backend timed out")));
+            socket.on("data", (data) => { received += data; });
+            socket.once("error", reject);
+            socket.once("end", () => resolve(received));
+          });
+          assert.equal(body, "resumed-backend");
+          browserChecks++;
+        } catch (error) {
+          browserFailure = error;
+          throw error;
+        }
+      });
+      await service.convergeDaemonAndRoutingState();
+      assert.equal(repairs, 1, "new host must recover despite an already-running daemon and initially empty routes");
+      if (browserFailure !== undefined) throw browserFailure;
+      assert.equal(browserChecks, 1);
+      await service.convergeDaemonAndRoutingState();
+      assert.equal(repairs, 1, "warm convergence must not rescan listeners");
+    }
+  });
+
   test("one hooked client refreshes expired routes while streams survive DNS publication and daemon restart", { timeout: 20_000 }, async (context) => {
     const fixture = await startDnsAgent(context);
     if (fixture === undefined) return;
@@ -545,6 +620,41 @@ if (!fs.existsSync(nativeAgentPath)) {
       "70000",
     ], { stdio: "ignore" });
     assert.notEqual(await waitForProcessExit(invalid, 2_000), 0);
+  });
+}
+
+/** Executes the production owner policy with real IPC at its process boundary, without VS Code. */
+function resumedNetworkService(processService: {
+  getSnapshot(): AgentSnapshot;
+  start(): Promise<void>;
+  restartDaemon(): Promise<void>;
+  repairRoutingState(): Promise<void>;
+}, browserCheck: () => Promise<void>): { convergeDaemonAndRoutingState(): Promise<void> } {
+  const source = fs.readFileSync(path.join(projectRoot, "src/extension/network-service.ts"), "utf8");
+  const ast = ts.createSourceFile("network-service.ts", source, ts.ScriptTarget.ES2022, true);
+  const service = ast.statements.find((node): node is ts.ClassDeclaration => ts.isClassDeclaration(node) && node.name?.text === "PortManagerNetworkService")!;
+  const members = ["daemonConvergenceInFlight", "initialDaemonRoutingRecoveryPending", "convergeDaemonAndRoutingState", "convergeDaemonAndRoutingStateExclusive", "ensureCurrentProcessDaemon", "shouldRunLogicalPortGatewayDaemon", "ensureDaemonRouteTablesMaterialized", "rehydrateBrowserDnsAndProxies"]
+    .map((name) => service.members.find((node) => node.name?.getText(ast) === name)!.getText(ast));
+  const helpers = ["createDaemonLifecyclePort", "daemonReadyWithoutTransition", "daemonNotReady"]
+    .map((name) => ast.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === name)!.getText(ast));
+  const Runner = vm.runInNewContext(ts.transpileModule(`class Runner { ${members.join("\n")} }\n${helpers.join("\n")}\nRunner`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText, {
+    convergeDaemonLifecycle, continueWhenDaemonLifecycleReady, DAEMON_RESTART_BACKOFF_MS: 30_000,
+    readPortManagerSettings: () => ({ logicalPortGateway: true, routeTableTtlSeconds: 15 }),
+    usesLoopbackAddressOnlyRouting: () => false, shouldInjectTerminalHook: () => true,
+    isRestorableComposeAttachment: () => false, getRouteTablePathForNetwork,
+    // Per-file TTL behavior has independent coverage; the warm-pass branch is cheap.
+    routeTableFileIsFresh: async () => true,
+  });
+  return Object.assign(new Runner(), {
+    processService, daemonRestartBackoffUntilMs: 0, localChangeEvents: { emit: () => {} },
+    registry: { getSnapshot: () => ({ composeAttachments: [] }) },
+    ensureSharedNetworkStateFileMaterialized: () => {}, writeHostAccessBindingsFile: async () => {},
+    writeComposeProjectRoutingFile: async () => {}, writeTerminalNetworkSelectionFile: async () => {},
+    ensureComposeRouteProcessesForAttachments: async () => {}, syncLogicalPortRouters: async () => {},
+    flushBrowserDnsDaemonSync: async () => {}, maybeOfferBrowserDnsResolverInstall: () => {},
+    syncBrowserNetworkProxies: browserCheck,
   });
 }
 

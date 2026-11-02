@@ -8,6 +8,7 @@ import ts from "typescript";
 import { browserNetworkProxyEndpointId } from "../../src/platform/ports/browser-network-proxy";
 import { BrowserDnsSyncCoordinator, type BrowserDnsSyncBatch } from "../../src/extension/browser-dns-sync-coordinator";
 import { SimpleEventEmitter } from "../../src/shared/events";
+import { continueWhenDaemonLifecycleReady, convergeDaemonLifecycle, type DaemonLifecycleConvergenceResult } from "../../src/extension/daemon-lifecycle";
 import type { AgentBrowserDnsSyncResult, AgentSnapshot } from "../../src/shared/types";
 
 /** Runs current orchestration methods with counted adapters, without activating VS Code. */
@@ -46,6 +47,117 @@ interface ClientRunner {
 }
 const Client = extract<ClientRunner>("local-agent-client.ts", "LocalAgentClient",
   ["connectionGeneration", "disposed", "refreshInFlight", "refresh"]);
+
+/** Models a fresh extension host after DNS has already connected its client. */
+function resumedOwner(initialStatus = "running", restartRequired = false) {
+  interface ResumeRunner {
+    ensureCurrentProcessDaemon(options?: { refreshAfterRestart?: boolean }): Promise<DaemonLifecycleConvergenceResult>;
+    ensureDaemonRouteTablesMaterialized(options?: { force?: boolean }): Promise<void>;
+    convergeDaemonAndRoutingState(): Promise<void>;
+  }
+  const calls: string[] = [];
+  const snapshot = {
+    daemon: { status: initialStatus, restartRequired, pid: 2468, startedAt: "surviving-daemon" },
+    routes: [] as { networkId: string }[],
+  };
+  let failRepair = false;
+  const Service = extract<ResumeRunner>("network-service.ts", "PortManagerNetworkService", [
+    "daemonConvergenceInFlight", "initialDaemonRoutingRecoveryPending", "convergeDaemonAndRoutingState", "convergeDaemonAndRoutingStateExclusive",
+    "ensureCurrentProcessDaemon", "shouldRunLogicalPortGatewayDaemon", "ensureDaemonRouteTablesMaterialized",
+  ], ["createDaemonLifecyclePort", "daemonReadyWithoutTransition", "daemonNotReady"], {
+    convergeDaemonLifecycle, continueWhenDaemonLifecycleReady,
+    readPortManagerSettings: () => ({ logicalPortGateway: true, routeTableTtlSeconds: 15 }),
+    usesLoopbackAddressOnlyRouting: () => false, shouldInjectTerminalHook: () => true,
+    DAEMON_RESTART_BACKOFF_MS: 30_000, isRestorableComposeAttachment: () => false,
+    getRouteTablePathForNetwork: () => "/owned-fixture/routes-persisted-network.json",
+    routeTableFileIsFresh: async () => true,
+  });
+  const service = Object.assign(new Service(), {
+    daemonRestartBackoffUntilMs: 0,
+    processService: {
+      getSnapshot: () => snapshot,
+      start: async () => { calls.push("connect"); snapshot.daemon.status = "running"; },
+      restartDaemon: async () => { calls.push("restart"); snapshot.daemon.restartRequired = false; },
+      repairRoutingState: async () => {
+        calls.push("repair");
+        if (failRepair) throw new Error("listener scan unavailable");
+        snapshot.routes = [{ networkId: "persisted-network" }];
+      },
+    },
+    registry: { getSnapshot: () => ({ networks: [{ id: "persisted-network" }], composeAttachments: [] }) },
+    localChangeEvents: { emit: () => {} }, ensureSharedNetworkStateFileMaterialized: () => {},
+    writeHostAccessBindingsFile: async () => {}, writeComposeProjectRoutingFile: async () => {},
+    writeTerminalNetworkSelectionFile: async () => {}, ensureComposeRouteProcessesForAttachments: async () => {},
+    rehydrateBrowserDnsAndProxies: async () => { calls.push("dns/proxies"); },
+    syncLogicalPortRouters: async () => { calls.push("routers"); },
+  });
+  return { service, calls, snapshot, failNextRepair: (fail: boolean) => { failRepair = fail; } };
+}
+
+test("a fresh owner repairs an already DNS-connected daemon before route consumers, once per extension lifetime", async () => {
+  for (let activation = 0; activation < 2; activation++) {
+    const { service, calls, snapshot } = resumedOwner();
+    assert.equal(snapshot.routes.length, 0, "an initial metadata response is not an authoritative route snapshot");
+    await Promise.all([service.convergeDaemonAndRoutingState(), service.convergeDaemonAndRoutingState()]);
+    assert.deepEqual(calls, ["repair", "dns/proxies", "routers"]);
+    assert.equal(snapshot.daemon.pid, 2468, "recovery preserves the surviving daemon");
+    calls.length = 0;
+    await service.convergeDaemonAndRoutingState();
+    assert.deepEqual(calls, ["dns/proxies", "routers"], "warm passes must not add listener scans");
+  }
+});
+
+test("failed initial recovery retries automatically and gates the convergence continuation until publication", async () => {
+  const { service, calls, failNextRepair } = resumedOwner();
+  failNextRepair(true);
+  await service.convergeDaemonAndRoutingState();
+  assert.deepEqual(calls, ["repair"], "failed scan cannot declare startup ready");
+  calls.length = 0;
+  failNextRepair(false);
+  await service.convergeDaemonAndRoutingState();
+  assert.deepEqual(calls, ["repair", "dns/proxies", "routers"]);
+});
+
+test("a failed transition repair remains pending after the daemon becomes current", async () => {
+  const { service, calls, failNextRepair } = resumedOwner("disconnected", true);
+  failNextRepair(true);
+  await service.convergeDaemonAndRoutingState();
+  assert.deepEqual(calls, ["connect", "restart", "repair"]);
+  calls.length = 0;
+  failNextRepair(false);
+  await service.convergeDaemonAndRoutingState();
+  assert.deepEqual(calls, ["repair", "dns/proxies", "routers"]);
+});
+
+test("initial connection or stale-build replacement performs only its existing transition repair", async () => {
+  for (const restartRequired of [false, true]) {
+    const { service, calls } = resumedOwner("disconnected", restartRequired);
+    await service.convergeDaemonAndRoutingState();
+    assert.deepEqual(calls, ["connect", ...(restartRequired ? ["restart"] : []), "repair", "dns/proxies", "routers"]);
+    calls.length = 0;
+    await service.convergeDaemonAndRoutingState();
+    assert.deepEqual(calls, ["dns/proxies", "routers"]);
+  }
+});
+
+test("explicit rehydration can still defer scanning without consuming initial automatic recovery", async () => {
+  const { service, calls } = resumedOwner("disconnected");
+  await service.ensureCurrentProcessDaemon({ refreshAfterRestart: false });
+  assert.deepEqual(calls, ["connect"]);
+  calls.length = 0;
+  await service.convergeDaemonAndRoutingState();
+  assert.deepEqual(calls, ["repair", "dns/proxies", "routers"]);
+});
+
+test("a completed explicit rehydration satisfies initial recovery without another automatic scan", async () => {
+  const { service, calls } = resumedOwner("disconnected");
+  await service.ensureCurrentProcessDaemon({ refreshAfterRestart: false });
+  await service.ensureDaemonRouteTablesMaterialized({ force: true });
+  assert.deepEqual(calls, ["connect", "connect", "repair"]);
+  calls.length = 0;
+  await service.convergeDaemonAndRoutingState();
+  assert.deepEqual(calls, ["dns/proxies", "routers"]);
+});
 
 test("owner commands continue while unrelated Compose startup is still pending", async () => {
   let owner: { pid: number } | undefined;

@@ -711,6 +711,9 @@ export class PortManagerNetworkService implements DisposableLike {
   /** Guards daemon and routing-file convergence so refresh events cannot recurse. */
   private daemonConvergenceInFlight: Promise<void> | undefined;
 
+  /** A new extension host must recover once even if an early DNS push already connected the daemon. */
+  private initialDaemonRoutingRecoveryPending = true;
+
   /** Serializes explicit stale-routing repair commands in this extension host. */
   private staleRoutingRepairInFlight: Promise<StaleRoutingRepairSummary> | undefined;
 
@@ -5203,6 +5206,18 @@ export class PortManagerNetworkService implements DisposableLike {
         // retain its deferred path and avoid two full listener scans.
         repairRoutingAfterTransition: options.refreshAfterRestart !== false,
       });
+      if (result.ready && options.refreshAfterRestart !== false && this.initialDaemonRoutingRecoveryPending) {
+        // A surviving daemon's metadata can arrive before its initial route
+        // snapshot. Empty routes (or existing files) cannot prove that listeners
+        // were rediscovered after the extension was absent. Transition repair
+        // already provides this guarantee; otherwise request it once here.
+        if (!result.transitioned) {
+          await this.processService.repairRoutingState();
+        }
+        // Keep recovery pending when scanning/publication throws so the next
+        // automatic convergence retries without requiring a manual Fix command.
+        this.initialDaemonRoutingRecoveryPending = false;
+      }
       if (result.transitioned) {
         this.localChangeEvents.emit();
       }
@@ -5278,6 +5293,9 @@ export class PortManagerNetworkService implements DisposableLike {
     // normally coalesced. Missing/cleaned files require the stronger contract:
     // one fresh listener scan plus completed publication before returning.
     await this.processService.repairRoutingState();
+    // Explicit rehydration can satisfy the same startup requirement while
+    // retaining its deferred scan order and avoiding a later duplicate scan.
+    this.initialDaemonRoutingRecoveryPending = false;
   }
 
   /**

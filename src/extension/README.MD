@@ -38,6 +38,8 @@ VS Code 확장의 활성화 지점과 명령 등록을 담당한다.
 
 ## 주의사항
 
+확장 호스트가 새로 시작한 뒤 첫 daemon convergence는 현재 daemon에 이미 연결되어 있어도 listener 재탐색과 route 파일 게시를 한 번 완료한 뒤 해당 복구 패스의 후속 작업을 진행한다. 초기 DNS 전송이 먼저 연결한 경우 metadata와 빈 초기 snapshot만으로 복구 완료를 판단하지 않는다. 연결·교체 단계나 명시적 파일 복구가 이미 게시를 완료했다면 재탐색을 중복하지 않으며, 실패한 첫 복구는 다음 자동 convergence에서 다시 시도한다. 이후 정상 background 갱신에는 추가 전체 탐색을 넣지 않는다. 별도 이벤트에서 수행하는 DNS·proxy 갱신은 기존의 독립 경로를 유지한다.
+
 이 모듈은 여러 계층을 조립할 수 있지만 도메인 판단 로직을 직접 구현하지 않는다.
 macOS 기본 실행은 사용자 호스트 셸에 협조적 native hook을 주입한다. 커널 보호 셸 시제품은 기본 profile·`pm`·attach에 연결하지 않는다. 이전 버전이 지정한 `Port Manager: Logical Network` 기본 profile만 저장된 사용자 값으로 복구하며, 이후 사용자가 고른 다른 profile은 보존한다. XDG cache/data/state와 TMPDIR을 덮어쓰지 않는다.
 일반 터미널 스크립트 생성은 기존 Compose projection을 재사용하고 강제 Docker 조회를 기다리지 않는다. 실제 attach·명시적 복구와 owner 갱신은 기존 reconciliation을 유지한다. `Start Daemon`은 singleton client의 시작 직렬화를 사용하고 전체 owner startup을 기다리지 않는다. 재시작·종료의 owner 확인은 유지한다.
