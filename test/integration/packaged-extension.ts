@@ -86,7 +86,7 @@ export async function run(): Promise<void> {
   const networkModule = require(path.join(extension.extensionPath, "out", "src", "extension", "network-service")) as typeof import("../../src/extension/network-service");
   const originalStart = networkModule.PortManagerNetworkService.prototype.start;
   const restoreRuntimeTrace = tracePackagedRuntime(extension.extensionPath, process.env.PM_TEST_RESOURCE_SOAK_REPORT!);
-  if (soakSeconds > 0) networkModule.PortManagerNetworkService.prototype.start = function () {
+  networkModule.PortManagerNetworkService.prototype.start = function () {
     networkService = this;
     serviceStarted = originalStart.call(this);
     return serviceStarted;
@@ -100,7 +100,7 @@ export async function run(): Promise<void> {
   assert.ok(Array.isArray(api.listLogicalNetworks()));
   assert.equal(typeof api.getTerminalDetachScript(), "string");
   const commands = new Set(await vscode.commands.getCommands(true));
-  for (const command of ["initializeWorktree", "createLogicalNetwork", "refreshTerminals", "addHostPortExposure"]) {
+  for (const command of ["initializeWorktree", "createLogicalNetwork", "refreshTerminals", "addHostPortExposure", "openNetworkEnvironmentFile", "openNetworkDotenvSubstitute", "revealNetworkFolder"]) {
     assert.ok(commands.has(`portManager.${command}`), `Missing command: ${command}`);
   }
 
@@ -129,6 +129,9 @@ export async function run(): Promise<void> {
   assert.equal(await request<boolean>("flushRouteTables"), true);
   console.log(JSON.stringify({ extension: extension.id, version: status.version, platform: process.platform,
     arch: process.arch, browserDnsRunning: status.browserDnsRunning, agentMainPath: status.agentMainPath }));
+  assert.ok(networkService);
+  await readyWithin(serviceStarted!, "network service startup");
+  await verifyNetworkSettingsCommands(networkService, extension.extensionPath);
   if (soakSeconds > 0) {
     assert.ok(networkService, "The soak must observe this installed extension's actual network service.");
     await readyWithin(serviceStarted!, "network service startup");
@@ -160,6 +163,40 @@ export async function run(): Promise<void> {
       children.spawn = originalSpawn; children.spawnSync = originalSpawnSync; commandIsolation?.restore();
       restoreRuntimeTrace();
     }
+  }
+}
+
+/** Real registered commands open the correct private resources in the installed extension host. */
+async function verifyNetworkSettingsCommands(service: PortManagerNetworkService, extensionPath: string): Promise<void> {
+  const folder = vscode.workspace.workspaceFolders?.find(folder => folder.uri.scheme === "file");
+  assert.ok(folder);
+  const root = fs.realpathSync(folder.uri.fsPath);
+  const scaffold = require(path.join(extensionPath, "out/src/platform/process/network-file-scaffold")) as typeof import("../../src/platform/process/network-file-scaffold");
+  // Seed only model rows in this disposable profile; no Docker/network runtime
+  // is created as a side effect of an editor-command test.
+  const registry = (service as unknown as { registry: { addNetwork(network: import("../../src/shared/types").LogicalNetwork): void } }).registry;
+  const networks = ["settings-first", "settings-second"].map(id => ({ id, name: "설정 확인 Settings", runtimeKind: "nativeHelper" as const, status: "running" as const, createdAt: new Date().toISOString() }));
+  for (const network of networks) registry.addNetwork(network);
+  for (const network of networks) {
+    await vscode.commands.executeCommand("portManager.openNetworkEnvironmentFile", network);
+    const paths = scaffold.networkNamespacePaths(root, network.id);
+    assert.equal(vscode.window.activeTextEditor?.document.uri.fsPath, paths.envFilePath);
+    await vscode.commands.executeCommand("portManager.openNetworkDotenvSubstitute", network);
+    const dotenv = path.join(paths.filesDirectory, ".env");
+    assert.equal(vscode.window.activeTextEditor?.document.uri.fsPath, dotenv);
+    fs.writeFileSync(dotenv, `SETTINGS_NETWORK=${network.id}\n`);
+    await vscode.commands.executeCommand("portManager.openNetworkDotenvSubstitute", network);
+    assert.equal(fs.readFileSync(dotenv, "utf8"), `SETTINGS_NETWORK=${network.id}\n`);
+    await vscode.commands.executeCommand("portManager.revealNetworkFolder", network);
+  }
+  console.log("Verified installed network settings commands: duplicate names, Korean/spaces, private files and folder reveal.");
+  if (process.env.PM_TEST_SETTINGS_UI_REVIEW === "1") {
+    // Local visual review only. The normal CI gate never waits for UI input.
+    console.log(`SETTINGS_UI_REVIEW_READY ${root}`);
+    const finish = path.join(root, ".settings-ui-review-done");
+    const deadline = Date.now() + 90_000;
+    while (!fs.existsSync(finish) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 200));
+    assert.ok(fs.existsSync(finish), "UI review was not completed within its bound");
   }
 }
 

@@ -97,7 +97,10 @@
     "onCommand:portManager.repairLocalDns",
     "onCommand:portManager.renewBrowserTlsCertificate",
     "onCommand:portManager.openOwnerUi",
-    "onCommand:portManager.openSettings"
+    "onCommand:portManager.openSettings",
+    "onCommand:portManager.openNetworkEnvironmentFile",
+    "onCommand:portManager.openNetworkDotenvSubstitute",
+    "onCommand:portManager.revealNetworkFolder"
   ],
   "main": "./out/src/extension/activate.js",
   "bin": {
@@ -479,6 +482,24 @@
         "title": "Open Settings",
         "category": "Port Manager",
         "icon": "$(settings-gear)"
+      },
+      {
+        "command": "portManager.openNetworkEnvironmentFile",
+        "title": "Open Network Environment File",
+        "category": "Port Manager",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "portManager.openNetworkDotenvSubstitute",
+        "title": "Open Network .env Substitute",
+        "category": "Port Manager",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "portManager.revealNetworkFolder",
+        "title": "Reveal Network Folder",
+        "category": "Port Manager",
+        "icon": "$(folder-open)"
       }
     ],
     "menus": {
@@ -816,6 +837,21 @@
           "command": "portManager.removeProcess",
           "when": "view == portManager.processes && portManager.isControlPlaneOwner && (viewItem == managedProcessRunning || viewItem == managedProcessStarting || viewItem == managedProcessStopped || viewItem == managedProcessError || viewItem == detectedProcess)",
           "group": "managed@3"
+        },
+        {
+          "command": "portManager.openNetworkEnvironmentFile",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "2_settings@1"
+        },
+        {
+          "command": "portManager.openNetworkDotenvSubstitute",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "2_settings@2"
+        },
+        {
+          "command": "portManager.revealNetworkFolder",
+          "when": "view == portManager.processes && viewItem == logicalNetwork",
+          "group": "2_settings@3"
         }
       ]
     },

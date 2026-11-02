@@ -38,6 +38,7 @@
 - `native-executable.ts`: native parser probe의 순수 timeout만 같은 1초 한도로 한 번
   재확인한다. 두 번째도 실패하거나 loader·권한·exit 계약 오류가 있으면 실패로 유지한다.
 - `network-file-scaffold.ts`: 0700 디렉터리, 0600 파일, 원자적 미교체 게시 및 symlink 거부
+- scaffold는 private import receipt로 rename 전의 legacy 경로를 찾고 비활성 source/destination과 metadata 서명을 반환한다. UI 알림은 extension 책임이며 파일 값은 서명·알림에 포함하지 않는다. 명시적 dotenv 열기는 기존 파일 보존과 symlink 거부를 유지한다.
 - `network-terminal-control.ts` / `network-terminal-client.ts`: 비활성 커널 보호 셸 시제품의 private host-side terminal launch와 controller-driven replacement. 기본 `pm`·attach에서는 사용하지 않는다. key와 control FD는 guarded child에 전달하지 않는다.
   `pm` 메뉴의 번호·이름 선택과 유지보수 명령은 호스트의 입력에서 읽는다. namespace의
   고정 표식은 UI 열기만 요청하고 내용은 실행하지 않는다. 취소·잘못된 선택·준비 실패는

@@ -9,6 +9,15 @@ export interface NamespaceNetworkIdentity {
   readonly name: string;
 }
 
+/** Inactive originals are preserved; callers must show where edits now belong. */
+export interface LegacyNetworkSettingsNotice {
+  readonly sourcePath: string;
+  readonly destinationPath: string;
+  /** Metadata-only change token for notification deduplication; never contains file values. */
+  readonly signature: string;
+  readonly isDirectory: boolean;
+}
+
 /** Resolve ownership independently of the readable name, including duplicate names. */
 export function networkNamespacePaths(root: string, networkId: string): {
   directory: string; envFilePath: string; filesDirectory: string;
@@ -240,16 +249,97 @@ export function ensureNetworkNamespaceScaffold(
   networkId: string,
   networkName: string | undefined,
   knownNetworks: readonly NamespaceNetworkIdentity[] = [],
-): void {
+): readonly LegacyNetworkSettingsNotice[] {
   root = fs.realpathSync(root);
   networkStorageKey(networkId);
   const stateDirectory = path.join(root, ".portmanager");
   ensurePrivateDirectory(stateDirectory);
   ensurePrivateDirectory(path.join(stateDirectory, "namespaces"));
+  let notices: readonly LegacyNetworkSettingsNotice[] = [];
   withNamespaceLock(root, () => {
     ensureNamedNamespace(root, networkId, networkName || "Network");
     scaffoldNamespaceContents(root, networkId, networkName, knownNetworks);
+    notices = collectLegacySettingsNotices(root, networkId, networkName, knownNetworks);
   });
+  return notices;
+}
+
+/** Receipts retain the old name after rename, including imports made by earlier versions. */
+function collectLegacySettingsNotices(root: string, networkId: string, networkName: string | undefined,
+  knownNetworks: readonly NamespaceNetworkIdentity[]): readonly LegacyNetworkSettingsNotice[] {
+  const state = path.join(root, ".portmanager");
+  const receipts = path.join(state, "legacy-owners");
+  const owners = new Map<string, Set<string>>();
+  if (exists(receipts)) {
+    verifyOwnedDirectory(receipts);
+    for (const entry of fs.readdirSync(receipts)) {
+      const descriptor = openRegularFile(path.join(receipts, entry));
+      let receipt: { networkId?: unknown; legacyKey?: unknown };
+      try { receipt = JSON.parse(fs.readFileSync(descriptor, "utf8")); }
+      finally { fs.closeSync(descriptor); }
+      if (typeof receipt.networkId !== "string" || typeof receipt.legacyKey !== "string" ||
+          safeLegacyKey(receipt.legacyKey) !== receipt.legacyKey) throw new Error(`Invalid legacy settings receipt: ${entry}`);
+      const ids = owners.get(receipt.legacyKey) ?? new Set<string>();
+      ids.add(receipt.networkId);
+      owners.set(receipt.legacyKey, ids);
+    }
+  }
+  const keys = new Set([...owners].filter(([, ids]) => ids.has(networkId)).map(([key]) => key));
+  const currentKey = safeLegacyKey(networkName || networkId);
+  if (currentKey !== undefined && (!owners.has(currentKey) || owners.get(currentKey)!.has(networkId))) keys.add(currentKey);
+  const paths = networkNamespacePaths(root, networkId);
+  const notices: LegacyNetworkSettingsNotice[] = [];
+  for (const key of keys) {
+    const candidates = [
+      [path.join(state, "env", `${key}.env`), paths.envFilePath],
+      [path.join(state, "files", key), paths.filesDirectory],
+    ].filter(([source]) => exists(source));
+    if (candidates.length === 0) continue;
+    if (!owners.has(key)) {
+      const equivalent = (value: string) => value.normalize("NFC").toLocaleLowerCase("en-US");
+      const users = knownNetworks.filter(network => {
+        const candidate = safeLegacyKey(network.name || network.id);
+        return candidate !== undefined && equivalent(candidate) === equivalent(key);
+      });
+      if (users.length !== 1 || users[0].id !== networkId) {
+        throw new Error(`Legacy network files for ${JSON.stringify(networkName || networkId)} are ambiguous. Preserve them and explicitly migrate this network to ${paths.directory}.`);
+      }
+      claimLegacyNamespace(state, key, networkId);
+    } else if (owners.get(key)!.size !== 1) {
+      throw new Error(`Legacy settings have multiple owners: ${key}`);
+    }
+    for (const [sourcePath, destinationPath] of candidates) {
+      verifyOwnedDirectory(path.dirname(sourcePath));
+      const fingerprint = createHash("sha256").update(sourcePath).update(destinationPath);
+      const visit = (file: string): void => {
+        const stats = fs.lstatSync(file);
+        if (stats.isSymbolicLink() || (!stats.isDirectory() && !stats.isFile())) {
+          throw new Error(`Legacy network storage contains a symlink or special file requiring explicit migration: ${file}`);
+        }
+        fingerprint.update(JSON.stringify([file, stats.dev, stats.ino, stats.size, stats.mtimeMs, stats.ctimeMs]));
+        if (stats.isDirectory()) {
+          verifyOwnedDirectory(file);
+          for (const name of fs.readdirSync(file).sort()) visit(path.join(file, name));
+        } else {
+          const descriptor = openRegularFile(file);
+          fs.closeSync(descriptor);
+        }
+      };
+      visit(sourcePath);
+      notices.push({ sourcePath, destinationPath, signature: fingerprint.digest("hex"), isDirectory: fs.lstatSync(sourcePath).isDirectory() });
+    }
+  }
+  return notices;
+}
+
+/** Explicit editor requests may create an empty private substitute, never overwrite one. */
+export function ensureNetworkDotenvSubstitute(root: string, networkId: string): string {
+  const paths = networkNamespacePaths(fs.realpathSync(root), networkId);
+  verifyOwnedDirectory(paths.filesDirectory);
+  const dotenv = path.join(paths.filesDirectory, ".env");
+  publishPrivateFile(dotenv, descriptor => fs.writeFileSync(descriptor,
+    "# Network-specific dotenv substitute. Use environment.env for inherited overrides.\n"));
+  return dotenv;
 }
 
 /** Populate only missing files after ownership and readable location are established. */

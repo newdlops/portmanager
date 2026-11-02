@@ -30,6 +30,7 @@ import {
 import { normalizeBrowserDnsHostname } from "../platform/network/browser-dns-server";
 import { preparePersistentNativeHookLibrary } from "../platform/process/native-executable";
 import { ensureNetworkNamespaceScaffold, type NamespaceNetworkIdentity } from "../platform/process/network-file-scaffold";
+import { presentLegacySettingsNotices } from "./legacy-settings-notices";
 import { buildUvRunPreloadRepairFunctions, buildUvRunPreloadRepairShell } from "./uv-run-preload-repair";
 
 /**
@@ -481,7 +482,8 @@ export function ensureNetworkEnvFileScaffold(
     const root = folder.uri.fsPath;
     // Unsafe namespace state must surface before a terminal is attached. A
     // silent fallback would read shared or another network's credentials.
-    ensureNetworkNamespaceScaffold(root, networkId, networkName, knownNetworks);
+    const legacyNotices = ensureNetworkNamespaceScaffold(root, networkId, networkName, knownNetworks);
+    void presentLegacySettingsNotices(networkName || networkId, legacyNotices);
     ensureLocalGitExclude(root);
   }
 }

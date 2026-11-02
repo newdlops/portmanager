@@ -5,6 +5,7 @@
 .django-shell/**
 .claude/**
 .codex/**
+.superpowers/**
 .mcp.json
 .lh/**
 .tmp/**

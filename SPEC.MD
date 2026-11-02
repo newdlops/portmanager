@@ -383,6 +383,13 @@ runtime resolver는 가상환경의 실행 파일 symlink 경로를 유지하고
 사용한다. 보호 시제품은 소유권·이름·이동 표식과 namespace 루트 변경을 workload에
 허용하지 않으며, 환경 파일·상태 파일의 정상 쓰기는 유지한다.
 
+네트워크 컨텍스트 메뉴와 Command Palette에서 environment.env, files/.env,
+소유한 설정 폴더를 열 수 있어야 한다. 중복 네트워크 이름은 ID로 구별하고 복수 로컬
+워크스페이스는 사용자가 선택한다. 옛 env/files 설정은 원본을 보존하되 attach 시
+비활성 경로와 실제 편집 경로를 안내하고, 이전 알림 뒤 옛 파일이 변경되면 다시 알린다.
+옛 값을 활성 자격증명에 자동 덮어쓰지 않는다. 훅 이전 launcher가 읽는 dotenv 값은
+네트워크 environment.env 오버레이를 사용하도록 실제 우선순위와 한계를 안내한다.
+
 #### 비활성 커널 보호 셸 시제품
 
 아래 kernel launcher·broker·보호 profile은 내부 시제품과 테스트에만 남아 있다.

@@ -7,13 +7,86 @@ import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 
 import { networkStorageKey } from "../../src/core/networks/network-identity";
-import { ensureNetworkNamespaceScaffold, networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
+import { ensureNetworkNamespaceScaffold, ensureNetworkDotenvSubstitute, networkNamespacePaths } from "../../src/platform/process/network-file-scaffold";
 
 function workspace(context: TestContext): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pm-namespace-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return root;
 }
+
+test("legacy settings return actionable notices again after edits and follow ownership across rename", context => {
+  const root = fs.realpathSync(workspace(context));
+  const network = { id: "network-notice", name: "rtcc" };
+  const legacy = path.join(root, ".portmanager/files/rtcc/.env");
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, "VALUE=original\n");
+  type Notice = { sourcePath: string; destinationPath: string; signature: string };
+  const first = ensureNetworkNamespaceScaffold(root, network.id, network.name, [network]) as unknown as Notice[];
+  assert.ok(Array.isArray(first), "attach must report inactive legacy paths instead of silently ignoring them");
+  assert.equal(first.length, 1);
+  assert.equal(first[0].sourcePath, path.dirname(legacy));
+  assert.equal(first[0].destinationPath, networkNamespacePaths(root, network.id).filesDirectory);
+  const repeated = ensureNetworkNamespaceScaffold(root, network.id, network.name, [network]) as unknown as Notice[];
+  assert.equal(repeated[0].signature, first[0].signature);
+  fs.writeFileSync(legacy, "VALUE=edited legacy\n");
+  const edited = ensureNetworkNamespaceScaffold(root, network.id, network.name, [network]) as unknown as Notice[];
+  assert.notEqual(edited[0].signature, first[0].signature);
+  assert.equal(fs.readFileSync(path.join(edited[0].destinationPath, ".env"), "utf8"), "VALUE=original\n");
+  const renamed = { ...network, name: "새 이름" };
+  const afterRename = ensureNetworkNamespaceScaffold(root, network.id, renamed.name, [renamed]) as unknown as Notice[];
+  assert.equal(afterRename[0].sourcePath, path.dirname(legacy));
+  assert.equal(afterRename[0].destinationPath, networkNamespacePaths(root, network.id).filesDirectory);
+  assert.equal(fs.readFileSync(legacy, "utf8"), "VALUE=edited legacy\n");
+});
+
+test("upgraded existing namespaces also report inactive legacy settings without replacing either copy", context => {
+  const root = fs.realpathSync(workspace(context));
+  const network = { id: "network-existing", name: "existing" };
+  ensureNetworkNamespaceScaffold(root, network.id, network.name, [network]);
+  const active = networkNamespacePaths(root, network.id);
+  fs.writeFileSync(active.envFilePath, "VALUE=active\n");
+  const legacy = path.join(root, ".portmanager/env/existing.env");
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, "VALUE=inactive\n");
+  const notices = ensureNetworkNamespaceScaffold(root, network.id, network.name, [network]) as unknown as { sourcePath: string; destinationPath: string }[];
+  assert.deepEqual(notices.map(({ sourcePath, destinationPath }) => ({ sourcePath, destinationPath })), [{ sourcePath: legacy, destinationPath: active.envFilePath }]);
+  assert.equal(fs.readFileSync(active.envFilePath, "utf8"), "VALUE=active\n");
+  assert.equal(fs.readFileSync(legacy, "utf8"), "VALUE=inactive\n");
+});
+
+test("explicit dotenv opening preserves existing data and rejects a substituted symlink", context => {
+  const root = fs.realpathSync(workspace(context));
+  const network = { id: "dotenv-open", name: "dotenv" };
+  ensureNetworkNamespaceScaffold(root, network.id, network.name, [network]);
+  const dotenv = ensureNetworkDotenvSubstitute(root, network.id);
+  assert.equal(fs.statSync(dotenv).mode & 0o777, 0o600);
+  fs.writeFileSync(dotenv, "EXISTING=keep\n");
+  ensureNetworkDotenvSubstitute(root, network.id);
+  assert.equal(fs.readFileSync(dotenv, "utf8"), "EXISTING=keep\n");
+  fs.unlinkSync(dotenv);
+  const outside = path.join(root, "outside.env");
+  fs.writeFileSync(outside, "OUTSIDE=keep\n");
+  fs.symlinkSync(outside, dotenv);
+  assert.throws(() => ensureNetworkDotenvSubstitute(root, network.id));
+  assert.equal(fs.readFileSync(outside, "utf8"), "OUTSIDE=keep\n");
+});
+
+test("existing namespaces cannot claim ambiguous legacy names or another network's receipt", context => {
+  const root = fs.realpathSync(workspace(context));
+  const networks = [{ id: "receipt-first", name: "same" }, { id: "receipt-second", name: "same" }];
+  for (const network of networks) ensureNetworkNamespaceScaffold(root, network.id, network.name, networks);
+  const legacy = path.join(root, ".portmanager/env/same.env");
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, "VALUE=legacy\n");
+  assert.throws(() => ensureNetworkNamespaceScaffold(root, networks[0].id, "same", networks), /ambiguous/);
+  const firstNotices = ensureNetworkNamespaceScaffold(root, networks[0].id, "same", [networks[0]]);
+  assert.equal(firstNotices.length, 1);
+  assert.deepEqual(ensureNetworkNamespaceScaffold(root, networks[1].id, "same", networks), []);
+  fs.unlinkSync(legacy);
+  fs.symlinkSync(path.join(root, "outside"), legacy);
+  assert.throws(() => ensureNetworkNamespaceScaffold(root, networks[0].id, "same", networks));
+});
 
 test("local settings folders use readable network names including Korean and spaces", context => {
   const root = workspace(context);

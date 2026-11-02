@@ -23,6 +23,7 @@ VS Code 확장의 활성화 지점과 명령 등록을 담당한다.
 - `network-service.ts`
 - `browser-dns-sync-coordinator.ts`: DNS full-table publication, duplicate coalescing, and bounded failure retries
 - `terminal-hook-environment.ts`
+- `legacy-settings-notices.ts`: attach와 설정 명령의 비활성 legacy 경로 알림·변경 시 재알림. filesystem scaffold의 metadata 결과만 받아 원본 파일은 변경하지 않는다. 짧은 파일은 OS 어댑터와 VS Code 알림 경계를 분리하기 위한 것이다.
 - `terminal-conflict-monitor.ts`
 - `terminal-secure-browser-link-provider.ts`
 - `isolated-worktree-setup.ts`: Git worktree, Logical Network, Compose copy, 새 창 handoff를 묶는 retryable onboarding
@@ -37,6 +38,8 @@ VS Code 확장의 활성화 지점과 명령 등록을 담당한다.
 - `src/config`
 
 ## 주의사항
+
+설정 열기 명령은 owner lease나 terminal attach 없이 선택한 network ID의 폴더를 연다. 복수 workspace는 경로를 보여 주고 먼저 선택하며 취소하면 파일을 만들지 않는다. legacy 알림은 nonmodal이고 같은 source/metadata는 창 안에서 중복하지 않는다. 변경된 원본은 다음 attach에서 다시 알리며 현재 설정에 자동 병합하지 않는다.
 
 확장 호스트가 새로 시작한 뒤 첫 daemon convergence는 현재 daemon에 이미 연결되어 있어도 listener 재탐색과 route 파일 게시를 한 번 완료한 뒤 해당 복구 패스의 후속 작업을 진행한다. 초기 DNS 전송이 먼저 연결한 경우 metadata와 빈 초기 snapshot만으로 복구 완료를 판단하지 않는다. 연결·교체 단계나 명시적 파일 복구가 이미 게시를 완료했다면 재탐색을 중복하지 않으며, 실패한 첫 복구는 다음 자동 convergence에서 다시 시도한다. 이후 정상 background 갱신에는 추가 전체 탐색을 넣지 않는다. 별도 이벤트에서 수행하는 DNS·proxy 갱신은 기존의 독립 경로를 유지한다.
 

@@ -29,6 +29,8 @@ import {
 } from "../platform/process/native-executable";
 import { verifyInstalledShellIntegration } from "../platform/process/shell-integration-verifier";
 import { readPortManagerPackageVersion } from "../shared/package-version";
+import { ensureNetworkNamespaceScaffold, ensureNetworkDotenvSubstitute, networkNamespacePaths } from "../platform/process/network-file-scaffold";
+import { presentLegacySettingsNotices } from "./legacy-settings-notices";
 import type { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import {
   getComposeAttachmentFromCommandArgument,
@@ -68,6 +70,7 @@ import {
   prepareShellEnvRestoreScript,
   RUNTIME_SHIM_DIRECTORY_ENV,
   TERMINAL_RUNTIME_SHIM_READY_CHECK_NAMES,
+  ensureLocalGitExclude,
 } from "./terminal-hook-environment";
 import type {
   BrowserDnsResolverStatus,
@@ -176,6 +179,9 @@ export class PortManagerCommandController implements DisposableLike {
     this.registerCommand(context, "portManager.openNetworkTerminal", (argument) =>
       this.openNetworkTerminal(argument),
     ownerCommand);
+    this.registerCommand(context, "portManager.openNetworkEnvironmentFile", argument => this.openNetworkSettings(argument, "environment"));
+    this.registerCommand(context, "portManager.openNetworkDotenvSubstitute", argument => this.openNetworkSettings(argument, "dotenv"));
+    this.registerCommand(context, "portManager.revealNetworkFolder", argument => this.openNetworkSettings(argument, "folder"));
     this.registerCommand(context, "portManager.attachTerminalToNetwork", (argument) =>
       this.attachTerminalToNetwork(argument),
     ownerCommand);
@@ -538,6 +544,29 @@ export class PortManagerCommandController implements DisposableLike {
       terminal.dispose();
       throw new Error(`Could not open a terminal for logical network "${network.name}".`, { cause: error });
     }
+  }
+
+  /** Select the workspace before scaffolding so multi-root settings never open in a guessed project. */
+  private async openNetworkSettings(argument: unknown, kind: "environment" | "dotenv" | "folder"): Promise<void> {
+    const network = await this.resolveNetworkArgument(argument, "Open Logical Network Settings");
+    if (network === undefined) return;
+    const folders = (vscode.workspace.workspaceFolders ?? []).filter(folder => folder.uri.scheme === "file");
+    if (folders.length === 0) {
+      await vscode.window.showInformationMessage("Open a local workspace folder to edit network settings.");
+      return;
+    }
+    const folder = folders.length === 1 ? folders[0] : (await vscode.window.showQuickPick(
+      folders.map(folder => ({ label: folder.name, description: folder.uri.fsPath, folder })),
+      { title: "Network Settings Workspace", placeHolder: "Select the workspace whose settings you want to edit" },
+    ))?.folder;
+    if (folder === undefined) return;
+    const root = folder.uri.fsPath;
+    const notices = ensureNetworkNamespaceScaffold(root, network.id, network.name, this.dependencies.networkService.getSnapshot().networks);
+    ensureLocalGitExclude(root);
+    void presentLegacySettingsNotices(network.name, notices);
+    const paths = networkNamespacePaths(root, network.id);
+    const resource = kind === "folder" ? paths.directory : kind === "dotenv" ? ensureNetworkDotenvSubstitute(root, network.id) : paths.envFilePath;
+    await vscode.commands.executeCommand(kind === "folder" ? "revealInExplorer" : "vscode.open", vscode.Uri.file(resource));
   }
 
   /** Attaches a selected terminal window to a selected network when the runtime supports it. */
@@ -2211,6 +2240,7 @@ export class PortManagerCommandController implements DisposableLike {
       networks.map((item) => ({
         label: item.name,
         description: `${item.runtimeKind} ${item.status}`,
+        detail: item.id,
         network: item,
       })),
       { title, placeHolder: "Select a logical network" },

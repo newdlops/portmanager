@@ -50,6 +50,13 @@ PM's exact state-file observer symlinks are retargeted during these moves.
 Restart existing workloads after upgrading/renaming so their cached mirror paths
 and any guarded shell policy are rebuilt. There is no ID calculation to perform.
 
+Use **Port Manager: Open Network Environment File**, **Open Network .env
+Substitute**, or **Reveal Network Folder** in the Command Palette or network
+context menu. Select by name and ID, then select a local workspace if several
+are open. These commands do not attach a terminal. Opening a missing substitute
+creates a private empty `.env` only when no original dotenv was copied; existing
+files are preserved. A workspace without a local filesystem must be opened locally.
+
 Directories are private (`0700`) and newly published files are private
 (`0600`). Publication does not expose a partial file or overwrite another
 process's completed copy. Internal identities still reject IDs longer than 124 bytes.
@@ -70,6 +77,38 @@ case, or Unicode normalization, attach reports the preserved legacy path's
 ambiguity. Select the intended values and initialize this ID's
 `environment.env` and `files/` explicitly before retrying. Symlinks or special
 files also require explicit migration; automatic import never follows them.
+
+Attach shows a nonmodal warning identifying inactive legacy paths and their
+active destinations, with **Open Active Settings**. Original bytes and names
+are left untouched. Identical notices are suppressed in that extension host;
+new legacy file metadata causes another warning on the next attach. Rename
+retains the old import ownership receipt so the warning still points to the
+correct network. This is a warning policy, not automatic merging: inspect the
+old values and copy the intended changes into the active files. Deleting or
+archiving old copies after review removes the warning. Do not edit private receipts.
+
+## Values read by an unhooked launcher
+
+[`UV_ENV_FILE` and `uv run --env-file`](https://docs.astral.sh/uv/configuration/files/#environment-variable-files)
+ask uv itself to load dotenv values before starting its command. The official
+hardened macOS uv cannot load the PM hook, so that read can use the root `.env`,
+even though its repaired hooked child later opens the network's `files/.env`.
+Editing `files/.env` alone does not replace values already inherited from uv.
+
+Verified with real uv 0.13.1 and Python on macOS arm64, using synthetic values:
+
+| Configuration | Child environment value | Child's direct `.env` read |
+| --- | --- | --- |
+| Root `VALUE=root`, mirror `VALUE=mirror`, no overlay | `root` | `VALUE=mirror` |
+| Same files, `environment.env` contains `VALUE=overlay` | `overlay` | `VALUE=mirror` |
+
+For variables preloaded by uv or another unhooked launcher, put the network
+override in `environment.env` and restart the workload. Its constructor applies
+before Python snapshots `os.environ`. `files/.env` remains useful for complete
+file replacement when the hooked application itself opens the file. An app
+that explicitly overwrites environment variables later controls its own precedence.
+The opt-in `uv-env-precedence.test.ts` repeats this with local real-tool paths;
+it uses offline/no-project execution and never installs dependencies.
 
 Contents are dotenv-shaped:
 

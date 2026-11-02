@@ -47,6 +47,18 @@ Existing opaque ID folders move to their network name on the next attach,
 preserving their settings. Restart existing workloads after migration.
 Old `.portmanager/env/<name>.env` and `.portmanager/files/<name>/` files are
 one-time import sources; edit the `namespaces/` folder afterwards.
+Use **Port Manager: Open Network Environment File**, **Open Network .env
+Substitute**, or **Reveal Network Folder** from the Command Palette or a
+network's context menu. Duplicate network choices show IDs; multi-root
+workspaces prompt for the project. Opening settings does not attach a terminal.
+When inactive legacy files remain, attach warns with their old and active paths
+and an **Open Active Settings** action. Originals are preserved. Repeated
+unchanged warnings are suppressed within the window; editing a legacy file
+shows the warning again on the next attach. Copy intended changes into the
+active file yourself; PM never overwrites active credentials from an old copy.
+For `UV_ENV_FILE` / `uv run --env-file` with a hardened macOS uv, put per-network
+variable overrides in `environment.env`: uv can load the root dotenv before its
+hooked child starts. See the verified precedence example in the environment guide.
 See [per-network environment](docs/per-network-env.md) and
 [file substitution](docs/per-network-files.md).
 

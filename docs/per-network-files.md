@@ -38,6 +38,11 @@ attach; settings are preserved. Renames move the same folder, including its
 files. Restart existing workloads after a move to refresh cached paths and
 guarded shell policies. The old legacy `files/<name>/` tree is not the active
 mirror after migration; edit `namespaces/<network-name>/files/` instead.
+Use **Port Manager: Open Network .env Substitute** or **Reveal Network Folder**
+from the Command Palette or network context menu. Attach reports inactive old
+paths with an action to open the active settings; later legacy edits are never
+silently merged. For dotenv values read before a hooked child starts (including
+`UV_ENV_FILE` in hardened uv), use the [environment overlay](per-network-env.md#values-read-by-an-unhooked-launcher).
 
 ## Semantics
 
