@@ -6,6 +6,29 @@ import net from "node:net";
 import path from "node:path";
 import type { TestContext } from "node:test";
 
+/** Own the child shutdown separately so signal-exit cleanup can be exercised. */
+export async function stopRefreshClient(client: ChildProcess, timeoutMs = 2_000): Promise<void> {
+  if (client.exitCode !== null || client.signalCode !== null) return;
+  await new Promise<void>((resolve, reject) => {
+    const onExit = () => finish();
+    const onError = (error: Error) => finish(error);
+    const timer = setTimeout(() => finish(new Error("hook refresh client did not exit before the cleanup deadline")), timeoutMs);
+    function finish(error?: Error): void {
+      clearTimeout(timer);
+      client.off("exit", onExit);
+      client.off("error", onError);
+      if (error === undefined) resolve(); else reject(error);
+    }
+    client.once("exit", onExit);
+    client.once("error", onError);
+    try {
+      if (!client.kill("SIGKILL")) finish(new Error("hook refresh client could not be signalled during cleanup"));
+    } catch (error) {
+      finish(error as Error);
+    }
+  });
+}
+
 /**
  * Drive one real preloaded client across route generations. The parent owns all
  * backends, files and sockets; the client retains open streams between commands
@@ -27,13 +50,12 @@ export async function exerciseHookedRouteRefresh(
   let foreignConnections = 0;
   let client: ChildProcess | undefined;
   context.after(async () => {
-    if (client !== undefined && client.exitCode === null) {
-      const exited = new Promise<void>((resolve) => client!.once("exit", () => resolve()));
-      client.kill("SIGKILL");
-      await exited;
+    try {
+      if (client !== undefined) await stopRefreshClient(client);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
     }
-    for (const socket of sockets) socket.destroy();
-    await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
   });
 
   /** Keep sockets observable so fixture failure cannot leave close() waiting. */
@@ -81,7 +103,6 @@ export async function exerciseHookedRouteRefresh(
   await Promise.all(reservations.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
   const networkId = "refresh-client-network";
   const routesPath = path.join(directory, `newdlops-portmanager-routes-${process.getuid?.() ?? "user"}-${networkId}.json`);
-  const expiry = Date.now() + 1_200;
 
   /** Foreign rows precede matching rows to detect accidental index scope leaks. */
   function document(ports: readonly number[], expiresAtMs: number): string {
@@ -93,8 +114,9 @@ export async function exerciseHookedRouteRefresh(
     }));
     return JSON.stringify({ expiresAtMs, routes: [...foreign, ...current] }).padEnd(4096, " ");
   }
-  fs.writeFileSync(routesPath, document(oldPorts, expiry));
-  const originalStat = fs.statSync(routesPath);
+  // Startup and the three retained streams get a generous readiness lifetime.
+  // Arm the short expiry only after the client's streams have all delivered.
+  fs.writeFileSync(routesPath, document(oldPorts, Date.now() + 60_000));
   const cleanEnvironment = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
     !key.startsWith("PORT_MANAGER_") && !key.startsWith("NEWDLOPS_PM_") && !key.startsWith("DYLD_") && key !== "LD_PRELOAD"));
   client = spawn(process.execPath, ["-e", clientScript, JSON.stringify(logicalPorts)], {
@@ -145,6 +167,9 @@ export async function exerciseHookedRouteRefresh(
   }
   const pid = client.pid;
   assert.deepEqual(await command("open"), ["old\n", "old:/stream\n", "old:/events\n"]);
+  const expiry = Date.now() + 1_200;
+  fs.writeFileSync(routesPath, document(oldPorts, expiry));
+  const originalStat = fs.statSync(routesPath);
   assert.deepEqual(await command("probe"), ["old\n", "old\n", "ECONNREFUSED"]);
 
   /** New bytes prove each old stream is usable, beyond merely not being closed. */
