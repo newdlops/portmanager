@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { getAgentSocketPath, getAgentStartupLockPath, removeStaleSocketFile } from "../agent/agent-socket";
 import { ensureAgentControllerToken, getAgentControllerTokenPath, readAgentControllerToken } from "../agent/agent-authorization";
+import { DaemonStartIntentStore } from "../agent/daemon-start-intent";
 import { getDefaultRouteTablePath, ROUTE_TABLE_TTL_SECONDS_ENV } from "../agent/route-table";
 import { readPortManagerSettings } from "../config/vscode-settings";
 import { buildNodeRuntimeEnvironment } from "../platform/process/node-runtime";
@@ -158,13 +159,19 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Explicit stop/dispose operations suppress automatic event-stream resubscription. */
   private automaticEventReconnectEnabled = true;
 
+  /** Shared Stop intent survives extension reloads and is visible to other windows. */
+  private readonly daemonStartIntent = new DaemonStartIntentStore(getAgentControllerTokenPath(getAgentSocketPath()));
+
   /** Disposed clients should not reconnect after socket close. */
   private disposed = false;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
   /** Connects to the agent and loads the initial snapshot. */
-  async start(): Promise<void> {
+  async start(options: { readonly explicit?: boolean } = {}): Promise<void> {
+    if (this.disposed) throw new Error("Port Manager agent client is disposed.");
+    if (options.explicit && !this.daemonStartIntent.resume()) return;
+    if (this.isAutomaticStartSuspended()) return;
     this.enableAutomaticEventReconnect();
     await this.ensureConnected();
     await this.loadDaemonStatusForStartup();
@@ -177,9 +184,12 @@ export class LocalAgentClient implements PortManagerProcessService {
   }
 
   /** Stops the singleton local agent and resets the extension-side snapshot. */
-  async stopDaemon(): Promise<void> {
+  async stopDaemon(options: { readonly forRestart?: boolean } = {}): Promise<void> {
     this.disableAutomaticEventReconnect();
     this.connectionGeneration += 1;
+    // A replacement is not a user suspension. Persisting its transient shutdown
+    // would leave automatic recovery permanently stopped after a host crash.
+    if (!options.forRestart) this.daemonStartIntent.suspend();
     const daemonPid = this.snapshot.daemon.pid;
     const startingChild = this.childProcess;
 
@@ -221,19 +231,25 @@ export class LocalAgentClient implements PortManagerProcessService {
   }
 
   /** Restarts the singleton daemon using this extension's compiled agent. */
-  async restartDaemon(options: { readonly refreshSnapshot?: boolean } = {}): Promise<void> {
+  async restartDaemon(options: { readonly refreshSnapshot?: boolean; readonly automatic?: boolean } = {}): Promise<void> {
+    if (this.disposed) throw new Error("Port Manager agent client is disposed.");
+    if (options.automatic && this.isAutomaticStartSuspended()) throw new Error("Automatic restart is suspended by Stop.");
     const previousPid = this.snapshot.daemon.pid;
     /* stopDaemon increments synchronously before its first await. Retain that
      * generation so a later explicit Stop wins instead of this older restart
      * resuming after its shutdown grace period and resurrecting the daemon. */
     const restartGeneration = this.connectionGeneration + 1;
 
-    await this.stopDaemon();
+    const stoppedIntents = options.automatic ? [] : this.daemonStartIntent.observe();
+    await this.stopDaemon({ forRestart: true });
     this.assertConnectionGeneration(restartGeneration);
     await this.waitForPreviousDaemonExit(previousPid);
     this.assertConnectionGeneration(restartGeneration);
     await this.terminateSiblingAgentProcesses(new Set([previousPid]));
     this.assertConnectionGeneration(restartGeneration);
+    if (!this.daemonStartIntent.resume(stoppedIntents)) {
+      throw new Error("Daemon restart superseded by a later Stop.");
+    }
     this.enableAutomaticEventReconnect();
     await this.ensureConnected();
     this.assertConnectionGeneration(restartGeneration);
@@ -244,9 +260,7 @@ export class LocalAgentClient implements PortManagerProcessService {
       throw new Error("Port Manager daemon restarted, but it still does not match the active extension build.");
     }
 
-    if (options.refreshSnapshot !== false) {
-      this.refreshInBackground();
-    }
+    if (options.refreshSnapshot !== false) this.refreshInBackground();
   }
 
   /**
@@ -286,6 +300,11 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Returns the latest complete agent snapshot for status and tree sections. */
   getSnapshot(): AgentSnapshot {
     return this.snapshot;
+  }
+
+  /** Automatic refresh/DNS work cannot override a user Stop from any window. */
+  isAutomaticStartSuspended(): boolean {
+    return this.disposed || this.daemonStartIntent.isSuspended();
   }
 
   /** Returns the current process rows in agent snapshot order. */
@@ -368,7 +387,7 @@ export class LocalAgentClient implements PortManagerProcessService {
       // The repair RPC itself performs the authoritative fresh scan. Starting
       // an ordinary background refresh here would make an old-daemon upgrade
       // pay for the same listener table twice.
-      await this.restartDaemon({ refreshSnapshot: false });
+      await this.restartDaemon({ refreshSnapshot: false, automatic: true });
       const snapshot = await this.request<AgentSnapshot>("repairRoutingState");
       this.applySnapshot(snapshot);
     }
@@ -517,6 +536,7 @@ export class LocalAgentClient implements PortManagerProcessService {
     if (this.disposed) {
       throw new Error("Port Manager agent client is disposed.");
     }
+    if (this.isAutomaticStartSuspended()) throw new Error("Port Manager daemon is explicitly stopped. Use Start Daemon to resume.");
     ensureAgentControllerToken(getAgentControllerTokenPath(getAgentSocketPath()));
 
     const generation = this.connectionGeneration;
@@ -697,6 +717,7 @@ export class LocalAgentClient implements PortManagerProcessService {
   private attachConnectedSocket(socket: net.Socket, generation: number): void {
     try {
       this.assertConnectionGeneration(generation);
+      if (this.isAutomaticStartSuspended()) throw new Error("Daemon startup superseded by Stop.");
     } catch (error) {
       socket.destroy();
       throw error;
@@ -741,6 +762,7 @@ export class LocalAgentClient implements PortManagerProcessService {
    */
   private startAgentProcess(generation: number): void {
     this.assertConnectionGeneration(generation);
+    if (this.isAutomaticStartSuspended()) throw new Error("Daemon startup superseded by Stop.");
     const agentMainPath = this.getAgentMainPath();
 
     if (!fs.existsSync(agentMainPath)) {
@@ -781,6 +803,7 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Starts the previous Node daemon implementation as a compatibility fallback. */
   private startNodeAgentProcess(agentMainPath: string, socketPath: string, generation: number): void {
     this.assertConnectionGeneration(generation);
+    if (this.isAutomaticStartSuspended()) return;
     this.childProcess = spawn(process.execPath, [agentMainPath, "--socket", socketPath, "--route-table", getDefaultRouteTablePath(),
       "--controller-token-file", getAgentControllerTokenPath(socketPath)], {
       detached: true,
@@ -901,7 +924,7 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Schedules a bounded existing-socket reconnect without starting a stopped daemon. */
   private scheduleEventReconnect(): void {
     if (
-      this.disposed ||
+      this.isAutomaticStartSuspended() ||
       !this.automaticEventReconnectEnabled ||
       this.eventReconnectTimer !== undefined ||
       (this.socket !== undefined && !this.socket.destroyed)
@@ -919,7 +942,7 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Reopens only a live daemon socket and re-subscribes through daemonStatus. */
   private async reconnectEventStreamToExistingAgent(): Promise<void> {
     if (
-      this.disposed ||
+      this.isAutomaticStartSuspended() ||
       !this.automaticEventReconnectEnabled ||
       (this.socket !== undefined && !this.socket.destroyed)
     ) {
@@ -1090,9 +1113,8 @@ export class LocalAgentClient implements PortManagerProcessService {
     revision?: string,
     sharedStatePath?: string,
   ): Promise<AgentBrowserDnsSyncResult> {
-    // request() intentionally starts/re-enables the daemon for user actions.
-    // Background DNS publication must respect an explicit stop before entering it.
-    if (this.disposed || !this.automaticEventReconnectEnabled) {
+    // Return a suspended result without entering connection/retry machinery.
+    if (this.isAutomaticStartSuspended() || !this.automaticEventReconnectEnabled) {
       return { suspended: true, running: false, port: 0 };
     }
     const generation = this.connectionGeneration;
@@ -1103,7 +1125,7 @@ export class LocalAgentClient implements PortManagerProcessService {
       ...(sharedStatePath === undefined ? {} : { sharedStatePath }),
     });
     const daemon = this.snapshot.daemon;
-    if (!this.disposed && this.automaticEventReconnectEnabled && !result.suspended &&
+    if (!this.isAutomaticStartSuspended() && this.automaticEventReconnectEnabled && !result.suspended &&
       generation === this.connectionGeneration && pid === daemon.pid && startedAt === daemon.startedAt) {
       // A successful bind need not broadcast a healthy snapshot. Observe the
       // response here so a later down heartbeat differs from the last known
@@ -1122,8 +1144,10 @@ export class LocalAgentClient implements PortManagerProcessService {
       throw new Error("Port Manager agent client is disposed.");
     }
     if (method !== "shutdownDaemon") {
+      if (this.isAutomaticStartSuspended()) throw new Error("Port Manager daemon is explicitly stopped. Use Start Daemon to resume.");
       this.enableAutomaticEventReconnect();
       await this.ensureConnected();
+      if (this.isAutomaticStartSuspended()) throw new Error("Daemon request superseded by Stop.");
     }
 
     const socket = this.socket;

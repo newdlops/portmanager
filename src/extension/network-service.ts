@@ -201,6 +201,7 @@ import {
 import {
   continueWhenDaemonLifecycleReady,
   convergeDaemonLifecycle,
+  daemonIncarnationKey,
   type DaemonLifecycleConvergenceResult,
   type DaemonLifecyclePort,
 } from "./daemon-lifecycle";
@@ -709,10 +710,13 @@ export class PortManagerNetworkService implements DisposableLike {
   private routingSignalRefreshInFlight: Promise<void> | undefined;
 
   /** Guards daemon and routing-file convergence so refresh events cannot recurse. */
-  private daemonConvergenceInFlight: Promise<void> | undefined;
+  private daemonConvergenceInFlight: Promise<boolean> | undefined;
 
   /** A new extension host must recover once even if an early DNS push already connected the daemon. */
   private initialDaemonRoutingRecoveryPending = true;
+
+  /** Only a completed scan/publication for this exact daemon lifetime is authoritative. */
+  private recoveredDaemonIdentity: string | undefined;
 
   /** Serializes explicit stale-routing repair commands in this extension host. */
   private staleRoutingRepairInFlight: Promise<StaleRoutingRepairSummary> | undefined;
@@ -5136,7 +5140,7 @@ export class PortManagerNetworkService implements DisposableLike {
    * daemon route tables, and localhost logical routers eventually agree even
    * when VS Code or Docker drops an event.
    */
-  private async convergeDaemonAndRoutingState(): Promise<void> {
+  private async convergeDaemonAndRoutingState(): Promise<boolean> {
     if (this.daemonConvergenceInFlight !== undefined) {
       return this.daemonConvergenceInFlight;
     }
@@ -5148,10 +5152,10 @@ export class PortManagerNetworkService implements DisposableLike {
     return this.daemonConvergenceInFlight;
   }
 
-  private async convergeDaemonAndRoutingStateExclusive(): Promise<void> {
+  private async convergeDaemonAndRoutingStateExclusive(): Promise<boolean> {
     this.ensureSharedNetworkStateFileMaterialized();
     const daemonConvergence = await this.ensureCurrentProcessDaemon().catch(() => daemonNotReady());
-    await continueWhenDaemonLifecycleReady(daemonConvergence, async () => {
+    return continueWhenDaemonLifecycleReady(daemonConvergence, async () => {
       await this.writeHostAccessBindingsFile().catch(() => undefined);
       await this.writeComposeProjectRoutingFile().catch(() => undefined);
       await this.writeTerminalNetworkSelectionFile().catch(() => undefined);
@@ -5192,6 +5196,7 @@ export class PortManagerNetworkService implements DisposableLike {
     if (this.processService === undefined) {
       return daemonReadyWithoutTransition();
     }
+    if (this.processService.isAutomaticStartSuspended?.()) return daemonNotReady();
     const settings = readPortManagerSettings();
     if (usesLoopbackAddressOnlyRouting(settings) && !this.shouldRunLogicalPortGatewayDaemon(settings)) {
       return daemonReadyWithoutTransition();
@@ -5206,6 +5211,8 @@ export class PortManagerNetworkService implements DisposableLike {
         // retain its deferred path and avoid two full listener scans.
         repairRoutingAfterTransition: options.refreshAfterRestart !== false,
       });
+      const identity = daemonIncarnationKey(this.processService.getSnapshot().daemon);
+      if (identity !== this.recoveredDaemonIdentity) this.initialDaemonRoutingRecoveryPending = true;
       if (result.ready && options.refreshAfterRestart !== false && this.initialDaemonRoutingRecoveryPending) {
         // A surviving daemon's metadata can arrive before its initial route
         // snapshot. Empty routes (or existing files) cannot prove that listeners
@@ -5214,9 +5221,12 @@ export class PortManagerNetworkService implements DisposableLike {
         if (!result.transitioned) {
           await this.processService.repairRoutingState();
         }
+        if (identity === undefined || identity !== daemonIncarnationKey(this.processService.getSnapshot().daemon) ||
+            this.processService.isAutomaticStartSuspended?.()) return daemonNotReady();
         // Keep recovery pending when scanning/publication throws so the next
         // automatic convergence retries without requiring a manual Fix command.
         this.initialDaemonRoutingRecoveryPending = false;
+        this.recoveredDaemonIdentity = identity;
       }
       if (result.transitioned) {
         this.localChangeEvents.emit();
@@ -5227,6 +5237,16 @@ export class PortManagerNetworkService implements DisposableLike {
       // clear it inside the lifecycle helper.
       this.daemonRestartBackoffUntilMs = restartBackoff.untilMs;
     }
+  }
+
+  /** Incomplete snapshots may add listeners, but cannot prove old ones disappeared. */
+  private hasAuthoritativeDaemonRoutingState(): boolean {
+    if (this.processService === undefined) return true;
+    const settings = readPortManagerSettings();
+    if (usesLoopbackAddressOnlyRouting(settings) && !this.shouldRunLogicalPortGatewayDaemon(settings)) return true;
+    return !this.processService.isAutomaticStartSuspended?.() && !this.initialDaemonRoutingRecoveryPending &&
+      this.recoveredDaemonIdentity !== undefined &&
+      this.recoveredDaemonIdentity === daemonIncarnationKey(this.processService.getSnapshot().daemon);
   }
 
   /** Recreates the shared durable state document when globalStorage was cleaned under a live extension host. */
@@ -5289,13 +5309,17 @@ export class PortManagerNetworkService implements DisposableLike {
     }
 
     await this.processService.start();
+    const identity = daemonIncarnationKey(this.processService.getSnapshot().daemon);
     // Ordinary refreshes may reuse a listener cache and native route writes are
     // normally coalesced. Missing/cleaned files require the stronger contract:
     // one fresh listener scan plus completed publication before returning.
     await this.processService.repairRoutingState();
+    if (identity === undefined || identity !== daemonIncarnationKey(this.processService.getSnapshot().daemon) ||
+        this.processService.isAutomaticStartSuspended?.()) throw new Error("Daemon changed during route recovery; retrying is required.");
     // Explicit rehydration can satisfy the same startup requirement while
     // retaining its deferred scan order and avoiding a later duplicate scan.
     this.initialDaemonRoutingRecoveryPending = false;
+    this.recoveredDaemonIdentity = identity;
   }
 
   /**
@@ -6933,7 +6957,7 @@ export class PortManagerNetworkService implements DisposableLike {
      */
     const snapshot = this.processService?.getSnapshot();
     const settings = readPortManagerSettings();
-    const logicalPorts = collectLogicalRouterPorts(
+    const observedPorts = collectLogicalRouterPorts(
       snapshot?.routes ?? [],
       snapshot?.listeners ?? [],
       this.registry.getSnapshot().attachments,
@@ -6943,6 +6967,9 @@ export class PortManagerNetworkService implements DisposableLike {
         composeLogicalPorts: this.collectAllComposeLogicalPorts(),
       },
     );
+    const preserveExisting = !this.hasAuthoritativeDaemonRoutingState();
+    // Claims must survive the same incomplete observation as their listeners.
+    const logicalPorts = preserveExisting ? [...new Set([...observedPorts, ...this.gatewayClaimPorts])] : observedPorts;
 
     if (!tryAcquireLogicalRouterOwnerLease()) {
       await this.demoteLogicalRouterOwner();
@@ -6959,7 +6986,9 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
-    await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);
+    await this.logicalPortRouter.sync(logicalPorts, {
+      preserveExisting,
+    }).catch(() => undefined);
     if (!this.retainsLogicalRouterOwnership(ownershipGeneration)) {
       await this.demoteLogicalRouterOwner();
     }
@@ -7127,7 +7156,7 @@ export class PortManagerNetworkService implements DisposableLike {
       collectGlobalSamePortListenerPorts(snapshot?.listeners ?? []),
       collectObservedHostGatewayExposureIds(hostLocalGatewayExposures, snapshot?.listeners ?? []),
     );
-    const endpoints = mergeBrowserProxyEndpoints(
+    const observedEndpoints = mergeBrowserProxyEndpoints(
       exposureEndpointPairs.map(([exposureEndpoint]) => exposureEndpoint),
       mergeBrowserProxyEndpoints(
         processEndpoints,
@@ -7140,10 +7169,16 @@ export class PortManagerNetworkService implements DisposableLike {
         ),
       ),
     );
-    this.browserProxyGeneratedRouteTargetByEndpointId = buildBrowserProxyRouteTargetIndex(
+    const endpoints = this.hasAuthoritativeDaemonRoutingState() ? observedEndpoints : mergeBrowserProxyEndpoints(
+      observedEndpoints, this.browserNetworkProxy.getDesiredEndpoints(),
+    );
+    const generatedTargets = buildBrowserProxyRouteTargetIndex(
       routes,
       snapshot?.processes ?? [],
     );
+    this.browserProxyGeneratedRouteTargetByEndpointId = this.hasAuthoritativeDaemonRoutingState()
+      ? generatedTargets
+      : new Map([...this.browserProxyGeneratedRouteTargetByEndpointId, ...generatedTargets]);
     this.browserProxyComposeTargetByEndpointId = buildBrowserProxyComposeTargetIndex(registrySnapshot.composeAttachments);
     // The native L4 forwarder must not bind coordinates the sniffing browser
     // proxy already owns, so browser endpoints are excluded from its exposures.
@@ -7172,7 +7207,9 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
-    await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);
+    await this.browserNetworkProxy.sync(endpoints, {
+      preserveExisting: !this.hasAuthoritativeDaemonRoutingState(),
+    }).catch(() => undefined);
     if (!this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)) {
       await this.demoteBrowserNetworkProxyOwner();
       return;
@@ -7185,7 +7222,9 @@ export class PortManagerNetworkService implements DisposableLike {
       const activeCount = endpoints.filter((endpoint) => this.browserNetworkProxy.has(endpoint.id)).length;
       devLog("ts-browser-proxy", `sync routes=${routes.length} desired=${endpoints.length} active=${activeCount} prepareMs=${preparedAtMs - startedAtMs} bindMs=${Date.now() - preparedAtMs}`);
     }
-    await this.syncHostGatewayProxies(hostGatewayExposures).catch(() => undefined);
+    if (this.hasAuthoritativeDaemonRoutingState()) {
+      await this.syncHostGatewayProxies(hostGatewayExposures).catch(() => undefined);
+    }
     if (!this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)) {
       await this.demoteBrowserNetworkProxyOwner();
       return;
@@ -7194,7 +7233,9 @@ export class PortManagerNetworkService implements DisposableLike {
     // Keep privileged reconciliation inside the outer coalescer. Explicit
     // state changes that arrive while macOS authorization is open are queued
     // and replayed against the latest snapshot after the prompt completes.
-    await this.syncHostLocalGatewayRedirects(hostLocalGatewayRedirects, options);
+    if (this.hasAuthoritativeDaemonRoutingState()) {
+      await this.syncHostLocalGatewayRedirects(hostLocalGatewayRedirects, options);
+    }
     if (!this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)) {
       await this.demoteBrowserNetworkProxyOwner();
     }
@@ -10189,9 +10230,10 @@ function createDisconnectedDaemonStatus(): AgentDaemonStatus {
 /** Adapts the broad process service to the lifecycle contract used during owner convergence. */
 function createDaemonLifecyclePort(processService: PortManagerProcessService): DaemonLifecyclePort {
   return {
+    isAutomaticStartSuspended: () => processService.isAutomaticStartSuspended?.() ?? false,
     getDaemonStatus: () => processService.getSnapshot().daemon,
     start: () => processService.start(),
-    restartDaemon: (options) => processService.restartDaemon(options),
+    restartDaemon: (options) => processService.restartDaemon({ ...options, automatic: true }),
     repairRoutingState: () => processService.repairRoutingState(),
   };
 }

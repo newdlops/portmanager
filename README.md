@@ -177,6 +177,8 @@ Port Manager starts after VS Code startup and connects to a single local agent.
 
 The agent listens on a per-user local socket or named pipe. If no agent is running, the first VS Code window starts one. Additional VS Code windows connect to the same agent and receive the same port snapshot. While a VS Code client is attached, the daemon rescans the OS listening table periodically so stopped external processes disappear without a manual refresh.
 
+After a cold start or daemon replacement, routing recovery refreshes listeners once for that daemon's PID and start time; normal warm refreshes reuse the result. Continuous control traffic cannot postpone a due background scan indefinitely. During an incomplete or failed recovery, existing gateway claims and proxy listeners are retained while newly discovered endpoints can still open independently of DNS publication. `Stop Daemon` suspends automatic startup across extension windows and reloads until an explicit `Start Daemon` or `Restart Daemon`; a later Stop takes precedence over an older pending restart.
+
 The sidebar shows:
 
 - daemon status, PID, listener count, route count, and route table file

@@ -18,11 +18,13 @@ import type { AuthenticatedProcessScope, ResolveProcessScopePayload } from "../a
  */
 export interface PortManagerProcessService {
   /** Connects to the local daemon, starting it when no socket is available. */
-  start(): Promise<void>;
+  start(options?: { readonly explicit?: boolean }): Promise<void>;
+  /** Shared user intent; absent only on legacy process-service adapters. */
+  isAutomaticStartSuspended?(): boolean;
   /** Stops the local daemon without stopping already running application processes. */
   stopDaemon(): Promise<void>;
   /** Replaces the local daemon with the active extension build. */
-  restartDaemon(options?: { readonly refreshSnapshot?: boolean }): Promise<void>;
+  restartDaemon(options?: { readonly refreshSnapshot?: boolean; readonly automatic?: boolean }): Promise<void>;
   /** Returns the latest complete daemon snapshot known to the extension. */
   getSnapshot(): AgentSnapshot;
   /** Returns the latest agent snapshot rows in sidebar display order. */

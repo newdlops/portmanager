@@ -51,6 +51,22 @@ async function waitUntil(condition: () => boolean, deadlineMs = 1500): Promise<v
   }
 }
 
+test("an incomplete route view keeps an existing proxy and opens a new endpoint without DNS readiness", async () => {
+  const ports = await freePorts(2);
+  const proxy = new BrowserNetworkProxyManager({ resolve: () => ({ host: "127.0.0.1", port: 9 }) }, { retireDelayMs: 15 });
+  const first = endpoint(901, [ports[0]]), second = endpoint(902, [ports[1]]);
+  try {
+    await proxy.sync([first]);
+    await proxy.sync([second], { preserveExisting: true });
+    await new Promise(resolve => setTimeout(resolve, 40));
+    assert.equal(proxy.has(first.id), true);
+    assert.equal(proxy.has(second.id), true);
+    await proxy.sync([second]);
+    await waitUntil(() => !proxy.has(first.id));
+    assert.equal(proxy.has(second.id), true);
+  } finally { await proxy.dispose(); }
+});
+
 test("recovers a freed port automatically without a new routing event", async () => {
   const occupied = await listen();
   const upstream = await listen(http.createServer((_request, response) => response.end("recovered")));

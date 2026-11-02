@@ -10,6 +10,7 @@ import * as vscode from "vscode";
 import type { PortManagerExtensionApi } from "../../src/extension/activate";
 import type { AgentDaemonStatus } from "../../src/shared/types";
 import type { PortManagerNetworkService } from "../../src/extension/network-service";
+import type { PortManagerProcessService } from "../../src/extension/process-service";
 import { runResourceSoak } from "./proxy-resource-soak";
 import { preparePackagedTerminalLifecycle } from "./packaged-terminal-lifecycle";
 import { isolatePrivilegedCommands } from "./packaged-isolation";
@@ -132,6 +133,7 @@ export async function run(): Promise<void> {
   assert.ok(networkService);
   await readyWithin(serviceStarted!, "network service startup");
   await verifyNetworkSettingsCommands(networkService, extension.extensionPath);
+  await readyWithin(verifyDaemonRecovery(networkService, extension.extensionPath), "shared Stop and daemon replacement recovery");
   if (soakSeconds > 0) {
     assert.ok(networkService, "The soak must observe this installed extension's actual network service.");
     await readyWithin(serviceStarted!, "network service startup");
@@ -164,6 +166,50 @@ export async function run(): Promise<void> {
       restoreRuntimeTrace();
     }
   }
+}
+
+/** Real installed clients and the owner's production convergence share Stop intent. */
+async function verifyDaemonRecovery(service: PortManagerNetworkService, extensionPath: string): Promise<void> {
+  const owner = service as unknown as {
+    processService: PortManagerProcessService;
+    convergeDaemonAndRoutingState(): Promise<boolean>;
+  };
+  const { LocalAgentClient } = require(path.join(extensionPath, "out/src/extension/local-agent-client")) as typeof import("../../src/extension/local-agent-client");
+  const observer = new LocalAgentClient({ asAbsolutePath: (relative: string) => path.join(extensionPath, relative) } as vscode.ExtensionContext);
+  const client = owner.processService;
+  await owner.convergeDaemonAndRoutingState();
+  await observer.start();
+  const previousPid = observer.getSnapshot().daemon.pid;
+  assert.ok(previousPid > 0);
+  const repair = client.repairRoutingState;
+  let repairs = 0;
+  client.repairRoutingState = async () => { repairs++; await repair.call(client); };
+  try {
+    await observer.stopDaemon();
+    assert.equal(await owner.convergeDaemonAndRoutingState(), false);
+    assert.equal(client.isAutomaticStartSuspended?.(), true);
+    assert.equal((await client.syncBrowserDns("")).suspended, true);
+    await client.start();
+    assert.equal(repairs, 0);
+    // Wait for cooperative shutdown without using any auto-starting RPC.
+    const deadline = Date.now() + 5000;
+    let exited = false;
+    while (Date.now() < deadline) {
+      try { await request("daemonStatus"); }
+      catch { exited = true; break; }
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    assert.equal(exited, true, "explicit Stop must actually release the daemon socket");
+    // Metadata is connected before convergence, reproducing the path that used
+    // to miss a new incarnation after the first extension-lifetime recovery.
+    await client.start({ explicit: true });
+    assert.notEqual(client.getSnapshot().daemon.pid, previousPid);
+    assert.equal(await owner.convergeDaemonAndRoutingState(), true);
+    assert.equal(repairs, 1);
+    await owner.convergeDaemonAndRoutingState();
+    assert.equal(repairs, 1, "a warm pass cannot repeat the listener scan");
+    console.log("Verified installed daemon recovery: cross-client Stop, explicit Start, replacement scan once and warm reuse.");
+  } finally { client.repairRoutingState = repair; observer.dispose(); }
 }
 
 /** Real registered commands open the correct private resources in the installed extension host. */

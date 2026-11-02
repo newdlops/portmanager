@@ -30,6 +30,24 @@ import type { LogicalPortRoute } from "../../src/shared/types";
  * not from framework names such as Vite, Django, or wait-on.
  */
 
+test("an incomplete observation preserves routers past retirement while new ports open", async () => {
+  const closed: number[] = [], opened: number[] = [];
+  const manager = new LogicalPortRouterManager({ resolve: () => ({ host: "127.0.0.1", port: 58000 }) }, { retireDelayMs: 10 });
+  const state = manager as unknown as { listeners: Map<number, { isActive(): boolean; close(): Promise<void> }>; open(port: number): Promise<void> };
+  const add = (port: number) => state.listeners.set(port, { isActive: () => true, close: async () => { closed.push(port); } });
+  add(3000);
+  state.open = async port => { if (!state.listeners.has(port)) { opened.push(port); add(port); } };
+  try {
+    await manager.sync([3001], { preserveExisting: true });
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.deepEqual(opened, [3001]);
+    assert.deepEqual(closed, []);
+    await manager.sync([3001]);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.deepEqual(closed, [3000], "a later authoritative absence still retires the old port");
+  } finally { await manager.releaseAll(); manager.dispose(); }
+});
+
 test("resolves client PID from an established TCP tuple without process-name rules", () => {
   const output = [
     "p101",

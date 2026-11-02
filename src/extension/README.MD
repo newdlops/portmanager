@@ -1,5 +1,7 @@
 # Extension
 
+라우팅 복구 확인은 daemon PID·startedAt별로 관리한다. `hasAuthoritativeDaemonRoutingState`가 false인 동안 router/proxy sync는 기존 listener·gateway claim을 보존하면서 새 endpoint를 열 수 있다. Stop은 `daemon-start-intent.ts`의 private 표식으로 창 사이에 공유하며, 자동 시작과 DNS 재시도는 이를 해제하지 않는다.
+
 ## 역할
 
 VS Code 확장의 활성화 지점과 명령 등록을 담당한다.

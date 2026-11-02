@@ -56,8 +56,8 @@ async function channel(context: TestContext, socketPath: string) {
   await until(() => { if (failure) throw failure; return !socket.connecting; });
   return {
     socket, messages,
-    send(method: string, payload?: unknown) {
-      const id = `scan-test-${++sequence}`;
+    send(method: string, payload?: unknown, eventClient = false) {
+      const id = `${eventClient ? "extension-" : ""}scan-test-${++sequence}`;
       socket.write(`${JSON.stringify({ id, method, payload, authorization: testAgentAuthorization(socketPath) })}\n`);
       return id;
     },
@@ -114,6 +114,25 @@ async function fixture(context: TestContext, timeoutMs = 3000, script = gatedSca
 }
 
 function running(child: ChildProcess): boolean { return child.exitCode === null && child.signalCode === null; }
+
+test("continuous control traffic cannot starve the initial listener observation", async (context) => {
+  const { paths, client, pids } = await fixture(context);
+  fs.writeFileSync(paths.data, `p${process.pid}\nccold-start\nn127.0.0.1:48499\n`);
+  const started = performance.now();
+  let discovered = false;
+  while (performance.now() - started < 7000) {
+    const status = await client.reply<{ listenerCount: number }>(client.send("daemonStatus", undefined, true));
+    if (status.listenerCount > 0) { discovered = true; break; }
+    await delay(75);
+  }
+  assert.equal(discovered, true, "the first scan needs a deadline even while control I/O never becomes idle");
+  assert.equal(pids().length, 1);
+  // Deadline fairness must not turn the normal five-minute warm cadence into
+  // a fast poller after the first observation has completed.
+  await delay(3200);
+  await client.reply(client.send("daemonStatus"));
+  assert.equal(pids().length, 1);
+});
 
 test("identical and unrelated registrations let a slow repair complete on its first capture", async (context) => {
   const { paths, client, pids } = await fixture(context);

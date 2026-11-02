@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import vm from "node:vm";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import test from "node:test";
@@ -8,7 +9,9 @@ import ts from "typescript";
 import { browserNetworkProxyEndpointId } from "../../src/platform/ports/browser-network-proxy";
 import { BrowserDnsSyncCoordinator, type BrowserDnsSyncBatch } from "../../src/extension/browser-dns-sync-coordinator";
 import { SimpleEventEmitter } from "../../src/shared/events";
-import { continueWhenDaemonLifecycleReady, convergeDaemonLifecycle, type DaemonLifecycleConvergenceResult } from "../../src/extension/daemon-lifecycle";
+import { LogicalPortRouterManager } from "../../src/platform/ports/logical-port-router";
+import { DaemonStartIntentStore } from "../../src/agent/daemon-start-intent";
+import { continueWhenDaemonLifecycleReady, convergeDaemonLifecycle, daemonIncarnationKey, type DaemonLifecycleConvergenceResult } from "../../src/extension/daemon-lifecycle";
 import type { AgentBrowserDnsSyncResult, AgentSnapshot } from "../../src/shared/types";
 
 /** Runs current orchestration methods with counted adapters, without activating VS Code. */
@@ -53,7 +56,7 @@ function resumedOwner(initialStatus = "running", restartRequired = false) {
   interface ResumeRunner {
     ensureCurrentProcessDaemon(options?: { refreshAfterRestart?: boolean }): Promise<DaemonLifecycleConvergenceResult>;
     ensureDaemonRouteTablesMaterialized(options?: { force?: boolean }): Promise<void>;
-    convergeDaemonAndRoutingState(): Promise<void>;
+    convergeDaemonAndRoutingState(): Promise<boolean>;
   }
   const calls: string[] = [];
   const snapshot = {
@@ -62,10 +65,10 @@ function resumedOwner(initialStatus = "running", restartRequired = false) {
   };
   let failRepair = false;
   const Service = extract<ResumeRunner>("network-service.ts", "PortManagerNetworkService", [
-    "daemonConvergenceInFlight", "initialDaemonRoutingRecoveryPending", "convergeDaemonAndRoutingState", "convergeDaemonAndRoutingStateExclusive",
+    "daemonConvergenceInFlight", "initialDaemonRoutingRecoveryPending", "recoveredDaemonIdentity", "convergeDaemonAndRoutingState", "convergeDaemonAndRoutingStateExclusive",
     "ensureCurrentProcessDaemon", "shouldRunLogicalPortGatewayDaemon", "ensureDaemonRouteTablesMaterialized",
   ], ["createDaemonLifecyclePort", "daemonReadyWithoutTransition", "daemonNotReady"], {
-    convergeDaemonLifecycle, continueWhenDaemonLifecycleReady,
+    convergeDaemonLifecycle, continueWhenDaemonLifecycleReady, daemonIncarnationKey,
     readPortManagerSettings: () => ({ logicalPortGateway: true, routeTableTtlSeconds: 15 }),
     usesLoopbackAddressOnlyRouting: () => false, shouldInjectTerminalHook: () => true,
     DAEMON_RESTART_BACKOFF_MS: 30_000, isRestorableComposeAttachment: () => false,
@@ -116,6 +119,79 @@ test("failed initial recovery retries automatically and gates the convergence co
   failNextRepair(false);
   await service.convergeDaemonAndRoutingState();
   assert.deepEqual(calls, ["repair", "dns/proxies", "routers"]);
+});
+
+test("replacement metadata and PID reuse each require one new authoritative recovery", async () => {
+  const { service, calls, snapshot } = resumedOwner();
+  await service.convergeDaemonAndRoutingState();
+  for (const [pid, startedAt] of [[2469, "replacement"], [2469, "pid-reused"]] as const) {
+    calls.length = 0;
+    snapshot.daemon.pid = pid;
+    snapshot.daemon.startedAt = startedAt;
+    snapshot.routes = [];
+    await service.convergeDaemonAndRoutingState();
+    assert.deepEqual(calls, ["repair", "dns/proxies", "routers"]);
+    calls.length = 0;
+    await service.convergeDaemonAndRoutingState();
+    assert.deepEqual(calls, ["dns/proxies", "routers"], "warm metadata must not trigger another scan");
+  }
+});
+
+test("automatic convergence respects an explicit daemon suspension", async () => {
+  const { service, calls } = resumedOwner("disconnected");
+  Object.assign(service, { processService: {
+    getSnapshot: () => ({ daemon: { status: "disconnected", pid: 0 }, routes: [] }),
+    isAutomaticStartSuspended: () => true,
+    start: async () => { calls.push("start"); },
+  } });
+  await service.convergeDaemonAndRoutingState();
+  assert.deepEqual(calls, []);
+});
+
+test("a late repair completion cannot acknowledge a replacement incarnation", async () => {
+  const { service, calls, snapshot } = resumedOwner();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const repair = service.processService.repairRoutingState;
+  service.processService.repairRoutingState = async () => { await repair(); await gate; };
+  const pending = service.convergeDaemonAndRoutingState();
+  await nextTurn();
+  snapshot.daemon.startedAt = "replaced-during-scan";
+  snapshot.routes = [];
+  release();
+  assert.equal(await pending, false);
+  assert.deepEqual(calls, ["repair"]);
+  calls.length = 0;
+  await service.convergeDaemonAndRoutingState();
+  assert.deepEqual(calls, ["repair", "dns/proxies", "routers"]);
+});
+
+test("failed owner recovery cannot retire an existing router or erase its gateway claim", async () => {
+  const f = resumedOwner();
+  const RouterService = extract<{ syncLogicalPortRoutersExclusive(): Promise<void> }>("network-service.ts", "PortManagerNetworkService", [
+    "syncLogicalPortRoutersExclusive", "hasAuthoritativeDaemonRoutingState", "shouldRunLogicalPortGatewayDaemon",
+  ], ["collectLogicalRouterPorts", "collectHostClientAttachmentNetworkIds", "isHooklessHostClientAttachment", "collectExternallyCoveredLogicalRouterPorts"], {
+    readPortManagerSettings: () => ({ logicalPortGateway: true }), usesLoopbackAddressOnlyRouting: () => false,
+    shouldInjectTerminalHook: () => true, tryAcquireLogicalRouterOwnerLease: () => true, daemonIncarnationKey,
+  });
+  const closed: number[] = [], claims: number[][] = [];
+  const router = new LogicalPortRouterManager({ resolve: () => ({ host: "127.0.0.1", port: 9 }) }, { retireDelayMs: 10 });
+  (router as unknown as { listeners: Map<number, unknown> }).listeners.set(3000, { isActive: () => true, close: async () => { closed.push(3000); } });
+  const service = Object.assign(new RouterService(), f.service, {
+    registry: { getSnapshot: () => ({ attachments: [] }) }, logicalPortRouter: router,
+    gatewayClaimPorts: new Set([3000]), collectAllComposeLogicalPorts: () => [],
+    syncGatewayClaimFiles: async (ports: number[]) => { claims.push(Array.from(ports)); }, retainsLogicalRouterOwnership: () => true,
+  });
+  f.failNextRepair(true);
+  assert.equal(await f.service.convergeDaemonAndRoutingState(), false);
+  try {
+    // This is the same outer reconciliation that previously bypassed the
+    // lifecycle helper's inner readiness gate after a failed repair.
+    await service.syncLogicalPortRoutersExclusive();
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.deepEqual(closed, []);
+    assert.deepEqual(claims, [[3000]]);
+  } finally { await router.releaseAll(); router.dispose(); }
 });
 
 test("a failed transition repair remains pending after the daemon becomes current", async () => {
@@ -384,18 +460,20 @@ test("DNS-only heartbeat changes emit events while timestamp-only updates stay q
 test("background DNS cannot re-enable a deliberately stopped client; explicit start can publish again", async () => {
   interface Runner {
     automaticEventReconnectEnabled: boolean;
-    stopDaemon(): Promise<void>; start(): Promise<void>;
+    stopDaemon(): Promise<void>; start(options?: { explicit?: boolean }): Promise<void>;
     syncBrowserDns(records: string): Promise<{ suspended?: boolean }>;
   }
   const Client = extract<Runner>("local-agent-client.ts", "LocalAgentClient", [
     "automaticEventReconnectEnabled", "connectionGeneration", "stopDaemon", "start", "syncBrowserDns",
-    "enableAutomaticEventReconnect", "disableAutomaticEventReconnect",
+    "enableAutomaticEventReconnect", "disableAutomaticEventReconnect", "isAutomaticStartSuspended",
   ], ["buildClientSnapshotSignature", "compareSnapshotSignatureRows", "buildClientRouteSignatureRows", "normalizeClientRouteDirection"], {
     createEmptySnapshot: () => ({ daemon: { pid: 0 }, listeners: [], processes: [], routes: [] }),
     AGENT_EVENT_RECONNECT_INITIAL_DELAY_MS: 100, process: { pid: 999 }, clearTimeout,
   });
   let requests = 0;
+  let suspended = false;
   const client = Object.assign(new Client(), {
+    daemonStartIntent: { suspend: () => { suspended = true; return []; }, resume: () => { suspended = false; return true; }, isSuspended: () => suspended },
     snapshot: { daemon: { pid: 0 } }, rejectAllPending: () => {}, queueChangeEvent: () => {},
     applySnapshot: () => {},
     ensureConnected: async () => {}, loadDaemonStatusForStartup: async () => {},
@@ -409,8 +487,48 @@ test("background DNS cannot re-enable a deliberately stopped client; explicit st
   assert.equal(result.suspended, true);
   assert.equal(client.automaticEventReconnectEnabled, false);
   await client.start();
+  assert.equal(suspended, true, "background owner startup must preserve Stop");
+  await client.start({ explicit: true });
   await client.syncBrowserDns("alpha=127.120.1.2");
   assert.equal(requests, 2);
+});
+
+test("automatic client replacement remains retryable after failure and yields to another window's Stop", async context => {
+  const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pm-client-intent-")));
+  context.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const intent = new DaemonStartIntentStore(path.join(directory, "private", "controller.key"));
+  const otherWindow = new DaemonStartIntentStore(path.join(directory, "private", "controller.key"));
+  const Client = extract<{ restartDaemon(options: { automatic: boolean; refreshSnapshot: boolean }): Promise<void> }>("local-agent-client.ts", "LocalAgentClient", [
+    "automaticEventReconnectEnabled", "connectionGeneration", "stopDaemon", "restartDaemon", "isAutomaticStartSuspended",
+    "assertConnectionGeneration", "enableAutomaticEventReconnect", "disableAutomaticEventReconnect",
+  ], ["buildClientSnapshotSignature", "compareSnapshotSignatureRows", "buildClientRouteSignatureRows", "normalizeClientRouteDirection"], {
+    createEmptySnapshot: () => ({ daemon: { pid: 0 }, listeners: [], processes: [], routes: [] }),
+    AGENT_EVENT_RECONNECT_INITIAL_DELAY_MS: 100, process: { pid: 999 }, clearTimeout, Set,
+  });
+  let starts = 0;
+  const client = Object.assign(new Client(), {
+    daemonStartIntent: intent, snapshot: { daemon: { pid: 0 } }, rejectAllPending: () => {}, queueChangeEvent: () => {},
+    terminateSiblingAgentProcesses: async () => {}, ensureConnected: async () => { starts++; }, loadDaemonStatus: async () => {},
+    waitForPreviousDaemonExit: async (): Promise<void> => { throw new Error("temporary replacement failure"); },
+  });
+  await assert.rejects(client.restartDaemon({ automatic: true, refreshSnapshot: false }), /temporary replacement failure/);
+  assert.equal(intent.isSuspended(), false, "automatic failure cannot leave a permanent user Stop");
+  let release!: () => void;
+  client.waitForPreviousDaemonExit = () => new Promise<void>(resolve => { release = resolve; });
+  const restarting = client.restartDaemon({ automatic: true, refreshSnapshot: false });
+  await nextTurn();
+  otherWindow.suspend();
+  release();
+  await assert.rejects(restarting, /later Stop/);
+  assert.equal(starts, 0);
+  assert.equal(intent.isSuspended(), true);
+  await assert.rejects(client.restartDaemon({ automatic: true, refreshSnapshot: false }), /suspended/);
+  const explicitRestart = client.restartDaemon({ automatic: false, refreshSnapshot: false });
+  await nextTurn();
+  otherWindow.suspend();
+  release();
+  await assert.rejects(explicitRestart, /later Stop/);
+  assert.equal(starts, 0, "an explicit Restart must also yield to a newer Stop");
 });
 
 for (const outcome of ["success", "error"] as const) {
@@ -492,7 +610,7 @@ function observedDnsClient() {
   const events: (() => void)[] = [];
   const requests: ((result: AgentBrowserDnsSyncResult) => void)[] = [];
   const Client = extract<ObservedDnsClient>("local-agent-client.ts", "LocalAgentClient", [
-    "connectionGeneration", "disposed", "automaticEventReconnectEnabled", "syncBrowserDns", "applySnapshot", "getSnapshot", "onDidChange", "queueChangeEvent",
+    "connectionGeneration", "disposed", "automaticEventReconnectEnabled", "isAutomaticStartSuspended", "syncBrowserDns", "applySnapshot", "getSnapshot", "onDidChange", "queueChangeEvent",
   ], ["buildClientSnapshotSignature", "compareSnapshotSignatureRows", "buildClientRouteSignatureRows", "normalizeClientRouteDirection"], {
     annotateDaemonCompatibility: (value: unknown) => value, normalizeAgentSnapshot: (value: unknown) => value,
     CLIENT_CHANGE_EVENT_DEBOUNCE_MS: 16,
@@ -504,6 +622,7 @@ function observedDnsClient() {
       monitoringAllListeners: false, browserDnsRunning: false, browserDnsPort: 53153, browserDnsError: "socket closed" },
   };
   const client = Object.assign(new Client(), {
+    daemonStartIntent: { isSuspended: () => false },
     snapshot, changeEvents: new SimpleEventEmitter<void>(), getAgentMainPath: () => "/agent",
     request: () => new Promise<AgentBrowserDnsSyncResult>((resolve) => requests.push(resolve)),
   });

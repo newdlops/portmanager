@@ -39,6 +39,7 @@ static int pm_resolve_authenticated_scope(pid_t pid, char *network_id, size_t si
 #define PM_LISTEN_BACKLOG 16384
 #define PM_LISTENER_POLL_IDLE_GRACE_SECONDS 2
 #define PM_LISTENER_POLL_INTERVAL_SECONDS 300
+#define PM_LISTENER_POLL_MAX_DEFERRAL_MS 2000
 /* UI events coalesce a short mutation burst but cannot starve behind sustained hook traffic. */
 #define PM_SNAPSHOT_BROADCAST_IDLE_MS 40
 #define PM_SNAPSHOT_BROADCAST_MAX_DELAY_MS 250
@@ -1187,8 +1188,9 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
   size_t client_scan_cursor = 0;
   size_t client_output_cursor = 0;
   pm_buffer last_listener_signature;
-  time_t next_poll = time(NULL) + 3;
-  time_t last_io_at = 0;
+  long long next_poll_ms = pm_monotonic_milliseconds() + 3000;
+  /* Traffic may coalesce a due scan, but never move its original deadline. */
+  long long listener_poll_deadline_ms = next_poll_ms + PM_LISTENER_POLL_MAX_DEFERRAL_MS;
   long long last_io_at_ms = 0;
   long long snapshot_dirty_since_ms = 0;
   int snapshot_dirty = 0;
@@ -1420,7 +1422,6 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
     }
 
     if (handled_io) {
-      last_io_at = time(NULL);
       last_io_at_ms = pm_monotonic_milliseconds();
     }
 
@@ -1433,11 +1434,13 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
     }
 
     if (snapshot_dirty && state->listener_cache_updated_at[0] == '\0') {
-      time_t refresh_at = time(NULL) + 1;
+      long long refresh_at_ms = pm_monotonic_milliseconds() + 1000;
       /* A mutation-invalidated cache is omitted from the fast event. Schedule
        * the accurate listener follow-up promptly once request traffic is idle. */
-      if (next_poll > refresh_at) {
-        next_poll = refresh_at;
+      if (next_poll_ms > refresh_at_ms) {
+        next_poll_ms = refresh_at_ms;
+        long long deadline_ms = refresh_at_ms + PM_LISTENER_POLL_MAX_DEFERRAL_MS;
+        if (listener_poll_deadline_ms > deadline_ms) listener_poll_deadline_ms = deadline_ms;
       }
     }
 
@@ -1466,10 +1469,14 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
      * writes remain separate so status/control traffic cannot delay commits. */
     pm_state_schedule_route_publication(state, last_io_at_ms);
 
-    if (time(NULL) >= next_poll) {
-      time_t now = time(NULL);
-      if (handled_io || (last_io_at > 0 && now - last_io_at < PM_LISTENER_POLL_IDLE_GRACE_SECONDS) || !pm_has_event_clients(clients, client_count)) {
-        next_poll = now + 1;
+    if (pm_running && pm_monotonic_milliseconds() >= next_poll_ms) {
+      long long now_ms = pm_monotonic_milliseconds();
+      int busy = handled_io || (last_io_at_ms > 0 && now_ms - last_io_at_ms < PM_LISTENER_POLL_IDLE_GRACE_SECONDS * 1000);
+      if (!pm_has_event_clients(clients, client_count)) {
+        next_poll_ms = now_ms + 1000;
+      } else if (background_scan == NULL && busy && now_ms < listener_poll_deadline_ms) {
+        next_poll_ms = now_ms + 1000;
+        if (next_poll_ms > listener_poll_deadline_ms) next_poll_ms = listener_poll_deadline_ms;
       } else {
         pm_buffer signature;
         pm_buffer_init(&signature);
@@ -1489,11 +1496,13 @@ static void pm_event_loop(int server_fd, pm_agent_state *state) {
         }
         pm_scan_use(NULL);
         pm_buffer_free(&signature);
-        if (prepared > 0) next_poll = now;
+        /* Once started, async scan progress is independent of control traffic. */
+        if (prepared > 0) next_poll_ms = now_ms;
         else {
           pm_scan_context_free(background_scan);
           background_scan = NULL;
-          next_poll = now + (prepared < 0 ? 1 : PM_LISTENER_POLL_INTERVAL_SECONDS);
+          next_poll_ms = now_ms + (prepared < 0 ? 1000 : PM_LISTENER_POLL_INTERVAL_SECONDS * 1000);
+          listener_poll_deadline_ms = next_poll_ms + PM_LISTENER_POLL_MAX_DEFERRAL_MS;
         }
       }
     }

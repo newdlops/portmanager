@@ -815,7 +815,7 @@ test("profile shell hook lazy-loads heavy pm command implementation", () => {
 test("agent client startup and process mutations avoid blocking on full listener refresh", () => {
   const sourcePath = path.resolve(__dirname, "../../../src/extension/local-agent-client.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
-  const startBody = /async start\(\): Promise<void> \{([\s\S]*?)\n  \}/.exec(source)?.[1] ?? "";
+  const startBody = /async start\([^)]*\): Promise<void> \{([\s\S]*?)\n  \}/.exec(source)?.[1] ?? "";
   const refreshBody = /private refreshInBackground\(\): void \{([\s\S]*?)\n  \}/.exec(source)?.[1] ?? "";
   const startProcessBody = /async startManagedProcess\([\s\S]*?\): Promise<ManagedProcess> \{([\s\S]*?)\n  \}/.exec(
     source,
@@ -1218,7 +1218,7 @@ test("background routing refresh converges daemon version and generated route fi
     ),
     true,
   );
-  assert.equal(convergeBody.includes("await continueWhenDaemonLifecycleReady(daemonConvergence, async () => {"), true);
+  assert.equal(convergeBody.includes("return continueWhenDaemonLifecycleReady(daemonConvergence, async () => {"), true);
   assert.equal(convergeBody.includes("await this.writeHostAccessBindingsFile().catch(() => undefined);"), true);
   assert.equal(convergeBody.includes("await this.writeComposeProjectRoutingFile().catch(() => undefined);"), true);
   assert.equal(convergeBody.includes("restorePersistedComposeRoutesIfMissing"), false);
@@ -1413,7 +1413,7 @@ test("logical port routers use a single cross-window owner lease", () => {
   assert.equal(syncBody.includes("await this.demoteLogicalRouterOwner();"), true);
   assert.equal(syncBody.includes("this.retainsLogicalRouterOwnership(ownershipGeneration)"), true);
   assert.equal(syncBody.includes("this.ownsLogicalRouterLease = true;"), true);
-  assert.equal(syncBody.includes("await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);"), true);
+  assert.equal(syncBody.includes("await this.logicalPortRouter.sync(logicalPorts,"), true);
   assert.equal(source.includes("releaseLogicalRouterOwnerLease();"), true);
   assert.equal(source.includes("BROWSER_NETWORK_PROXY_OWNER_LEASE_MS = 120_000"), true);
   assert.equal(source.includes('function buildBrowserNetworkProxyOwnerControlPath(kind: "owner" | "lock"): string'), true);
@@ -1427,7 +1427,8 @@ test("logical port routers use a single cross-window owner lease", () => {
   assert.equal(browserSyncBody.includes("await this.demoteBrowserNetworkProxyOwner();"), true);
   assert.equal(browserSyncBody.includes("this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)"), true);
   assert.equal(browserSyncBody.includes("this.ownsBrowserNetworkProxyLease = true;"), true);
-  assert.equal(browserSyncBody.includes("await this.browserNetworkProxy.sync(endpoints).catch(() => undefined);"), true);
+  assert.equal(browserSyncBody.includes("await this.browserNetworkProxy.sync(endpoints,"), true);
+  assert.equal(browserSyncBody.includes("preserveExisting: !this.hasAuthoritativeDaemonRoutingState()"), true);
   assert.equal(browserUrlBody.includes("this.ensureBrowserNetworkProxyEndpointAsOwner(desiredEndpoint)"), true);
   assert.equal(browserUrlBody.includes("if (!tryAcquireBrowserNetworkProxyOwnerLease())"), true);
   assert.equal(browserUrlBody.includes("this.retainsBrowserNetworkProxyOwnership(ownershipGeneration)"), true);
@@ -2413,7 +2414,7 @@ test("logical routers expose host-client networks without taking unrelated netwo
   assert.equal(source.includes("function endpointHostMatches"), true);
   assert.equal(source.includes("function isGeneratedLoopbackHost"), true);
   assert.equal(
-    syncBody.includes("await this.logicalPortRouter.sync(logicalPorts).catch(() => undefined);"),
+    syncBody.includes("await this.logicalPortRouter.sync(logicalPorts,"),
     true,
     "unscoped host routes can still use a localhost TCP router fallback",
   );

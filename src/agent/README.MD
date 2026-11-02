@@ -18,6 +18,7 @@ Port Manager agent 모듈은 OS당 하나만 실행되는 로컬 프로세스의
 
 - `protocol.ts`: NDJSON 프로토콜 타입, 인코딩, 디코딩
 - `agent-authorization.ts`: private controller/network 키의 원자적 생성과 권한 검증
+- `daemon-start-intent.ts`: 여러 확장 창이 공유하는 명시적 Stop 표식. 자동 시작은 이를 존중하고 Start/Restart만 해제한다. Restart는 시작 전에 관측한 표식만 제거하므로 뒤늦은 완료가 새 Stop을 지우지 않는다. 교체를 위한 일시적 종료는 이 표식을 만들지 않는다.
 - `port-manager-agent.ts`: agent 서버와 도메인 동작 구현
 - `agent-main.ts`: socket path 인자를 받아 실제 agent 프로세스를 시작하는 CLI 진입점
 

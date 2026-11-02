@@ -160,7 +160,7 @@ test("browser DNS resolver install is UI-driven and cleans only owned resolver f
   const browserProxySyncSource = networkServiceSource.slice(browserProxySyncStart, browserProxySyncEnd);
   const browserProxyLeaseIndex = browserProxySyncSource.indexOf("this.ownsBrowserNetworkProxyLease = true;");
   const browserAliasReadyIndex = browserProxySyncSource.indexOf("ensureBrowserDnsLoopbackAliasesReady(dnsRecords)");
-  const browserProxyApplyIndex = browserProxySyncSource.indexOf("await this.browserNetworkProxy.sync(endpoints)");
+  const browserProxyApplyIndex = browserProxySyncSource.indexOf("await this.browserNetworkProxy.sync(endpoints,");
   const hostGatewaySyncIndex = browserProxySyncSource.indexOf(
     "await this.syncHostGatewayProxies(",
     browserProxyApplyIndex,

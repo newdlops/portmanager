@@ -213,19 +213,22 @@ export class BrowserNetworkProxyManager {
   }
 
   /** Reconciles active browser proxies with the latest running web processes. */
-  async sync(endpoints: Iterable<BrowserNetworkProxyEndpoint>): Promise<void> {
+  async sync(endpoints: Iterable<BrowserNetworkProxyEndpoint>, options: { readonly preserveExisting?: boolean } = {}): Promise<void> {
     const ownershipGeneration = this.ownershipGeneration;
-    return this.serialize(() => this.syncExclusive(endpoints, ownershipGeneration));
+    return this.serialize(() => this.syncExclusive(endpoints, ownershipGeneration, options.preserveExisting));
   }
 
   private async syncExclusive(
     endpoints: Iterable<BrowserNetworkProxyEndpoint>,
     ownershipGeneration: number,
+    preserveExisting = false,
   ): Promise<void> {
     if (this.disposed || ownershipGeneration !== this.ownershipGeneration) {
       return;
     }
-    const desired = new Map<string, BrowserNetworkProxyEndpoint>();
+    // Keep retryable desired endpoints too: a cold scan must not discard bind
+    // recovery or retire a listener, while new endpoints can open immediately.
+    const desired = new Map<string, BrowserNetworkProxyEndpoint>(preserveExisting ? this.desiredEndpoints : []);
     for (const endpoint of endpoints) {
       if (isTcpPort(endpoint.logicalPort) && endpoint.listenPorts.some(isTcpPort)) {
         desired.set(endpoint.id, normalizeEndpoint(endpoint));
@@ -318,6 +321,11 @@ export class BrowserNetworkProxyManager {
   /** True when this manager already owns an open listener for the endpoint id. */
   has(endpointId: string): boolean {
     return this.listeners.has(endpointId);
+  }
+
+  /** Last desired view includes endpoints still waiting for an automatic bind retry. */
+  getDesiredEndpoints(): readonly BrowserNetworkProxyEndpoint[] {
+    return [...this.desiredEndpoints.values()];
   }
 
   /** Clears bind retry throttles when an external owner handoff may have freed the socket. */

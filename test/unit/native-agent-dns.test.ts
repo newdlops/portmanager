@@ -9,7 +9,7 @@ import vm from "node:vm";
 import test, { type TestContext } from "node:test";
 import ts from "typescript";
 import { getRouteTablePathForNetwork } from "../../src/agent/route-table";
-import { continueWhenDaemonLifecycleReady, convergeDaemonLifecycle } from "../../src/extension/daemon-lifecycle";
+import { continueWhenDaemonLifecycleReady, convergeDaemonLifecycle, daemonIncarnationKey } from "../../src/extension/daemon-lifecycle";
 import type { AgentSnapshot } from "../../src/shared/types";
 import { BrowserDnsSyncCoordinator, type BrowserDnsSyncBatch } from "../../src/extension/browser-dns-sync-coordinator";
 import { createTestAgentCredential, testAgentAuthorization } from "./native-agent-test-authorization";
@@ -640,7 +640,7 @@ function resumedNetworkService(processService: {
   const Runner = vm.runInNewContext(ts.transpileModule(`class Runner { ${members.join("\n")} }\n${helpers.join("\n")}\nRunner`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText, {
-    convergeDaemonLifecycle, continueWhenDaemonLifecycleReady, DAEMON_RESTART_BACKOFF_MS: 30_000,
+    convergeDaemonLifecycle, continueWhenDaemonLifecycleReady, daemonIncarnationKey, DAEMON_RESTART_BACKOFF_MS: 30_000,
     readPortManagerSettings: () => ({ logicalPortGateway: true, routeTableTtlSeconds: 15 }),
     usesLoopbackAddressOnlyRouting: () => false, shouldInjectTerminalHook: () => true,
     isRestorableComposeAttachment: () => false, getRouteTablePathForNetwork,

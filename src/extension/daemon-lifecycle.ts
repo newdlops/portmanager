@@ -8,6 +8,8 @@ import type { AgentDaemonStatus } from "../shared/types";
  * the full process service implementation.
  */
 export interface DaemonLifecyclePort {
+  /** Explicit user suspension wins over all automatic connection/repair work. */
+  isAutomaticStartSuspended?(): boolean;
   /** Returns the latest daemon status after each lifecycle operation. */
   getDaemonStatus(): AgentDaemonStatus;
   /** Connects to an existing daemon or starts one when disconnected. */
@@ -16,6 +18,13 @@ export interface DaemonLifecyclePort {
   restartDaemon(options: { readonly refreshSnapshot: false }): Promise<void>;
   /** Scans listeners and publishes the authoritative generated route files. */
   repairRoutingState(): Promise<void>;
+}
+
+/** PID alone is reusable; startedAt separates successive singleton lifetimes. */
+export function daemonIncarnationKey(status: AgentDaemonStatus): string | undefined {
+  return status.status === "running" && status.pid > 0
+    ? JSON.stringify([status.pid, status.startedAt ?? ""])
+    : undefined;
 }
 
 /** Mutable restart gate shared with the caller so failed restarts retain their backoff. */
@@ -71,6 +80,7 @@ export async function convergeDaemonLifecycle(
   options: DaemonLifecycleConvergenceOptions,
 ): Promise<DaemonLifecycleConvergenceResult> {
   let transitioned = false;
+  if (daemon.isAutomaticStartSuspended?.()) return { transitioned, ready: false };
   let status = daemon.getDaemonStatus();
 
   if (status.status !== "running") {
@@ -108,8 +118,12 @@ export async function convergeDaemonLifecycle(
   }
 
   if (transitioned && options.repairRoutingAfterTransition) {
+    const identity = daemonIncarnationKey(status);
     await daemon.repairRoutingState();
+    // A reconnect may complete while the old scan is in flight. That response
+    // cannot acknowledge a replacement daemon's still-empty listener view.
+    if (identity !== daemonIncarnationKey(daemon.getDaemonStatus())) return { transitioned, ready: false };
   }
 
-  return { transitioned, ready: true };
+  return { transitioned, ready: !daemon.isAutomaticStartSuspended?.() };
 }

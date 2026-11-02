@@ -122,13 +122,16 @@ export class LogicalPortRouterManager implements DisposableLike {
   ) { this.resources = options.resources ?? defaultProxyNetworkResources; }
 
   /** Reconciles active localhost routers with the latest logical route table. */
-  async sync(logicalPorts: Iterable<number>): Promise<void> {
+  async sync(logicalPorts: Iterable<number>, options: { readonly preserveExisting?: boolean } = {}): Promise<void> {
     if (this.disposed) {
       return;
     }
 
     const ownershipGeneration = this.ownershipGeneration;
     const desiredPorts = new Set([...logicalPorts].filter(isTcpPort));
+    // A failed/cold daemon observation is not evidence that a backend vanished.
+    // Still open newly discovered ports without waiting for scan/DNS recovery.
+    if (options.preserveExisting) for (const port of this.listeners.keys()) desiredPorts.add(port);
 
     for (const [port, listener] of [...this.listeners]) {
       if (ownershipGeneration !== this.ownershipGeneration) {

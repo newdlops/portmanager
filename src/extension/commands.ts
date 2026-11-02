@@ -1279,7 +1279,7 @@ export class PortManagerCommandController implements DisposableLike {
 
   /** Starts or reconnects to the singleton local daemon and refreshes the view. */
   private async startDaemon(): Promise<void> {
-    await this.dependencies.processService.start();
+    await this.dependencies.processService.start({ explicit: true });
     this.dependencies.treeProvider.refresh();
 
     const daemon = this.dependencies.processService.getSnapshot().daemon;
