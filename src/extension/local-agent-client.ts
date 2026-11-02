@@ -1090,6 +1090,11 @@ export class LocalAgentClient implements PortManagerProcessService {
     revision?: string,
     sharedStatePath?: string,
   ): Promise<AgentBrowserDnsSyncResult> {
+    // request() intentionally starts/re-enables the daemon for user actions.
+    // Background DNS publication must respect an explicit stop before entering it.
+    if (this.disposed || !this.automaticEventReconnectEnabled) {
+      return { suspended: true, running: false, port: 0 };
+    }
     return this.request<AgentBrowserDnsSyncResult>("syncBrowserDns", {
       records,
       ...(revision === undefined ? {} : { revision }),
@@ -1295,6 +1300,9 @@ function buildClientSnapshotSignature(snapshot: AgentSnapshot): string {
     daemon.routeCount,
     daemon.monitoringAllListeners,
     daemon.errorMessage ?? "",
+    daemon.browserDnsRunning === true,
+    daemon.browserDnsPort ?? "",
+    daemon.browserDnsError ?? "",
   ];
   const listenerRows = snapshot.listeners
     .map((listener) => [

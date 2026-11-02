@@ -646,16 +646,16 @@ export class PortManagerNetworkService implements DisposableLike {
   /**
    * Browser DNS records live in the daemon (it outlives VS Code windows), so
    * the extension only tracks its last push outcome. The signature dedupes
-   * repeat pushes; the pid detects daemon replacement; the result feeds
+   * repeat pushes; PID+startedAt detects daemon replacement; the result feeds
    * diagnostics until the next daemon status heartbeat.
    */
-  private lastBrowserDnsSyncResult: { readonly result: AgentBrowserDnsSyncResult; readonly atMs: number } | undefined;
+  private lastBrowserDnsSyncResult: { readonly result: AgentBrowserDnsSyncResult; readonly atMs: number; readonly daemonIncarnation?: string } | undefined;
 
   /** Revision-plus-record signature of the last replacement acknowledged by the daemon. */
   private lastBrowserDnsPushSignature: string | undefined;
 
-  /** Daemon pid that accepted the last push, so a replaced daemon is re-synced. */
-  private lastBrowserDnsPushDaemonPid: number | undefined;
+  /** PID plus daemon start time that accepted the last push, including PID reuse. */
+  private lastBrowserDnsPushDaemonIncarnation: string | undefined;
 
   /** Sole latest-value queue for daemon DNS publication, independent of owner leases. */
   private readonly browserDnsSyncCoordinator: BrowserDnsSyncCoordinator | undefined;
@@ -937,10 +937,15 @@ export class PortManagerNetworkService implements DisposableLike {
   ) {
     if (this.processService !== undefined) {
       this.browserDnsSyncCoordinator = new BrowserDnsSyncCoordinator({
+        prepare: (batch) => ({ ...batch, daemonIncarnation: this.getBrowserDnsDaemonIncarnation() }),
         send: (batch) => this.processService!.syncBrowserDns(batch.records, batch.revision, batch.sharedStatePath),
         resolveRejected: (batch) => this.resolveRejectedBrowserDnsSync(batch),
         onResult: (batch, result) => this.recordBrowserDnsSyncResult(batch, result),
-        onError: () => { this.lastBrowserDnsPushSignature = undefined; },
+        onError: (batch) => {
+          if (batch.daemonIncarnation === this.getBrowserDnsDaemonIncarnation()) {
+            this.lastBrowserDnsPushSignature = undefined;
+          }
+        },
         schedule: (delay, callback) => setTimeout(callback, delay),
         cancel: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
       });
@@ -1068,6 +1073,9 @@ export class PortManagerNetworkService implements DisposableLike {
     if (this.processService !== undefined) {
       this.disposables.push(
         this.processService.onDidChange(() => {
+          // DNS health and incarnation events matter in worker windows too;
+          // proxy ownership must not gate full-table responder recovery.
+          this.syncBrowserDnsRecords();
           this.refreshGuardedRuntimeRoutes();
           this.notifyRoutingActivity();
           if (!this.suppressRoutingRepairSideEffects) {
@@ -2262,11 +2270,11 @@ export class PortManagerNetworkService implements DisposableLike {
       return;
     }
 
-    const daemonPid = this.getDaemonStatus().pid;
+    const daemonIncarnation = this.getBrowserDnsDaemonIncarnation();
     if (
       browserDnsSyncSignature(encodedRecords, revision) === this.lastBrowserDnsPushSignature &&
-      daemonPid === this.lastBrowserDnsPushDaemonPid &&
-      this.lastBrowserDnsSyncResult?.result.running === true
+      daemonIncarnation === this.lastBrowserDnsPushDaemonIncarnation &&
+      this.getBrowserDnsRuntimeState().running
     ) {
       return;
     }
@@ -2276,6 +2284,7 @@ export class PortManagerNetworkService implements DisposableLike {
       revision,
       sharedStatePath,
       signature: browserDnsSyncSignature(encodedRecords, revision),
+      daemonIncarnation,
     });
   }
 
@@ -2289,20 +2298,29 @@ export class PortManagerNetworkService implements DisposableLike {
     const signature = browserDnsSyncSignature(records, document.revision);
     if (
       signature === rejected.signature ||
-      signature === this.lastBrowserDnsPushSignature
+      (signature === this.lastBrowserDnsPushSignature &&
+        this.lastBrowserDnsPushDaemonIncarnation === this.getBrowserDnsDaemonIncarnation() &&
+        this.getBrowserDnsRuntimeState().running)
     ) {
       return signature === rejected.signature ? { kind: "retry" } : { kind: "drop" };
     }
-    return { kind: "replace", batch: { records, revision: document.revision, sharedStatePath: this.sharedNetworkStateStore.filePath, signature } };
+    return { kind: "replace", batch: { records, revision: document.revision, sharedStatePath: this.sharedNetworkStateStore.filePath, signature, daemonIncarnation: this.getBrowserDnsDaemonIncarnation() } };
+  }
+
+  /** Stable local provenance; heartbeat timestamps never change daemon identity. */
+  private getBrowserDnsDaemonIncarnation(): string {
+    const daemon = this.getDaemonStatus();
+    return `${daemon.pid}\0${daemon.startedAt ?? ""}`;
   }
 
   private recordBrowserDnsSyncResult(batch: BrowserDnsSyncBatch, result: AgentBrowserDnsSyncResult): void {
-    const previousRunning = this.lastBrowserDnsSyncResult?.result.running;
+    if (result.suspended || batch.daemonIncarnation !== this.getBrowserDnsDaemonIncarnation()) return;
+    const previousRunning = this.getBrowserDnsRuntimeState().running;
     if (result.applied !== false) {
       this.lastBrowserDnsPushSignature = batch.signature;
-      this.lastBrowserDnsPushDaemonPid = this.getDaemonStatus().pid;
+      this.lastBrowserDnsPushDaemonIncarnation = batch.daemonIncarnation;
     }
-    this.lastBrowserDnsSyncResult = { result, atMs: Date.now() };
+    this.lastBrowserDnsSyncResult = { result, atMs: Date.now(), daemonIncarnation: batch.daemonIncarnation };
     if (previousRunning !== result.running) this.localChangeEvents.emit();
   }
 
@@ -2322,7 +2340,8 @@ export class PortManagerNetworkService implements DisposableLike {
     const daemonUpdatedAtMs = Date.parse(daemon.updatedAt);
     const lastSync = this.lastBrowserDnsSyncResult;
     const preferSyncResult =
-      lastSync !== undefined && (Number.isNaN(daemonUpdatedAtMs) || lastSync.atMs >= daemonUpdatedAtMs);
+      lastSync !== undefined && lastSync.daemonIncarnation === this.getBrowserDnsDaemonIncarnation() &&
+      (Number.isNaN(daemonUpdatedAtMs) || lastSync.atMs >= daemonUpdatedAtMs);
 
     const running = preferSyncResult ? lastSync.result.running : daemon.browserDnsRunning === true;
     const port = (preferSyncResult ? lastSync.result.port : daemon.browserDnsPort) || browserDnsPort();

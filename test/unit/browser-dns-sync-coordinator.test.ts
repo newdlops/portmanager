@@ -229,3 +229,90 @@ test("coordinator applies production resolver retry, replace, and drop outcomes"
   assert.equal(f.timers.length, 1);
   f.coordinator.dispose();
 });
+
+// These cases catch redundant active sends, incarnation-blind coalescing, and late callbacks.
+test("twenty identical in-flight enqueues share one successful DNS RPC", async () => {
+  let release!: () => void;
+  const sent: string[] = [];
+  const f = fixture(async (value) => {
+    sent.push(value.signature);
+    await new Promise<void>((resolve) => { release = resolve; });
+    return { running: true, port: 1 };
+  });
+  f.coordinator.enqueue(batch("A"));
+  for (let index = 0; index < 20; index++) f.coordinator.enqueue(batch("A"));
+  release();
+  await tick();
+  assert.deepEqual(sent, ["A"]);
+  f.coordinator.dispose();
+  release();
+  await f.coordinator.waitForCurrentDrain();
+});
+
+test("an identical table for a new daemon incarnation is not coalesced", async () => {
+  let release!: () => void;
+  const sent: string[] = [];
+  const first = { ...batch("A"), daemonIncarnation: "100\0first" };
+  const second = { ...batch("A"), daemonIncarnation: "100\0replacement" };
+  const f = fixture(async (value) => {
+    sent.push((value as typeof first).daemonIncarnation);
+    if (sent.length === 1) await new Promise<void>((resolve) => { release = resolve; });
+    return { running: true, port: 1 };
+  });
+  f.coordinator.enqueue(first);
+  f.coordinator.enqueue(second);
+  release();
+  await f.coordinator.waitForCurrentDrain();
+  assert.deepEqual(sent, ["100\0first", "100\0replacement"]);
+  f.coordinator.dispose();
+});
+
+for (const outcome of ["success", "error"] as const) {
+  test(`disposing during DNS ${outcome} suppresses callbacks and retry state`, async () => {
+    let resolve!: (value: { running: boolean; port: number }) => void;
+    let reject!: (error: Error) => void;
+    const observed: string[] = [];
+    const coordinator = new BrowserDnsSyncCoordinator({
+      send: () => new Promise((a, b) => { resolve = a; reject = b; }),
+      onResult: () => { observed.push("result"); },
+      onError: () => { observed.push("error"); },
+      resolveRejected: () => { observed.push("fence"); return { kind: "retry" }; },
+      schedule: () => { observed.push("timer"); return 0; }, cancel: () => {},
+    });
+    coordinator.enqueue(batch("A"));
+    coordinator.dispose();
+    if (outcome === "success") resolve({ running: true, port: 1 });
+    else reject(new Error("socket closed"));
+    await coordinator.waitForCurrentDrain();
+    assert.deepEqual(observed, []);
+  });
+}
+
+test("a suspended stopped client drops DNS retry until a fresh enqueue", async () => {
+  let calls = 0;
+  const f = fixture(async () => {
+    calls++;
+    return { suspended: true, running: false, port: 0 };
+  });
+  f.coordinator.enqueue(batch("A"));
+  await f.coordinator.waitForCurrentDrain();
+  assert.equal(f.timers.length, 0);
+  f.coordinator.enqueue(batch("A"));
+  await f.coordinator.waitForCurrentDrain();
+  assert.equal(calls, 2);
+  f.coordinator.dispose();
+});
+
+
+test("a new incarnation bypasses the same table's failed-incarnation backoff", async () => {
+  const sent: BrowserDnsSyncBatch[] = [];
+  const f = fixture(async (value) => { sent.push(value); throw new Error("offline"); });
+  f.coordinator.enqueue({ ...batch("A"), daemonIncarnation: "200\0first" });
+  await f.coordinator.waitForCurrentDrain();
+  const retry = f.timers[0]!;
+  f.coordinator.enqueue({ ...batch("A"), daemonIncarnation: "200\0replacement" });
+  await f.coordinator.waitForCurrentDrain();
+  assert.equal(sent.length, 2);
+  assert.deepEqual(f.cancelled, [retry.callback]);
+  f.coordinator.dispose();
+});

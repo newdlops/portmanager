@@ -5,6 +5,8 @@ export interface BrowserDnsSyncBatch {
   readonly revision?: string;
   readonly sharedStatePath?: string;
   readonly signature: string;
+  /** Local attempt identity; never sent over the daemon's DNS wire protocol. */
+  readonly daemonIncarnation?: string;
 }
 
 export type RejectedResolution =
@@ -26,6 +28,9 @@ export class BrowserDnsSyncCoordinator {
   /** Current drain generation, including its atomic handoff to a follow-up drain. */
   private active: Promise<void> | undefined;
 
+  /** Actual send provenance, retained through result callbacks for reentrant enqueues. */
+  private sending: BrowserDnsSyncBatch | undefined;
+
   /** Backoff timer retained only after a transport, fence, or bind failure. */
   private retryTimer: unknown;
 
@@ -36,6 +41,7 @@ export class BrowserDnsSyncCoordinator {
 
   constructor(
     private readonly deps: {
+      prepare?(batch: BrowserDnsSyncBatch): BrowserDnsSyncBatch;
       send(batch: BrowserDnsSyncBatch): Promise<AgentBrowserDnsSyncResult>;
       resolveRejected(batch: BrowserDnsSyncBatch): RejectedResolution;
       onResult(batch: BrowserDnsSyncBatch, result: AgentBrowserDnsSyncResult): void;
@@ -50,7 +56,13 @@ export class BrowserDnsSyncCoordinator {
       return;
     }
 
-    const changed = this.queued?.signature !== batch.signature;
+    if (this.sending !== undefined && sameBatch(this.sending, batch)) {
+      // The latest desired table is already in flight. It also supersedes any
+      // different table briefly queued while this request was pending.
+      this.queued = undefined;
+      return;
+    }
+    const changed = this.queued === undefined || !sameBatch(this.queued, batch);
     this.queued = batch;
     // A new network/revision has not failed yet. Do not make it inherit an
     // older table's backoff; repeated snapshots of that table still back off.
@@ -124,11 +136,19 @@ export class BrowserDnsSyncCoordinator {
 
   private async drain(): Promise<void> {
     while (!this.disposed && this.queued !== undefined) {
-      const batch = this.queued;
+      // Capture the daemon identity at the attempt boundary, not when this
+      // table first entered a backoff queue under a potentially older daemon.
+      const batch = this.deps.prepare?.(this.queued) ?? this.queued;
       this.queued = undefined;
+      this.sending = batch;
 
       try {
         const result = await this.deps.send(batch);
+        if (this.disposed) return;
+        if (result.suspended) {
+          this.attempt = 0;
+          continue;
+        }
         this.deps.onResult(batch, result);
 
         if (result.applied === false) {
@@ -150,14 +170,17 @@ export class BrowserDnsSyncCoordinator {
           this.queued ??= batch;
         }
       } catch {
+        if (this.disposed) return;
         this.deps.onError(batch);
         this.queued ??= batch;
+      } finally {
+        this.sending = undefined;
       }
 
       // A fence refresh or an event received during the failed request may
       // already have supplied the current table. Publish it in this drain so
       // the new alias is not exposed to DNS misses while an old retry sleeps.
-      if (this.queued !== undefined && this.queued.signature !== batch.signature) {
+      if (this.queued !== undefined && !sameBatch(this.queued, batch)) {
         this.attempt = 0;
         continue;
       }
@@ -180,4 +203,9 @@ export class BrowserDnsSyncCoordinator {
       }
     });
   }
+}
+
+/** Equal records/revision are redundant only within the same daemon lifetime. */
+function sameBatch(left: BrowserDnsSyncBatch, right: BrowserDnsSyncBatch): boolean {
+  return left.signature === right.signature && left.daemonIncarnation === right.daemonIncarnation;
 }

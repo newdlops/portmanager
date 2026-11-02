@@ -847,6 +847,8 @@ export interface AgentDaemonStatus {
 }
 
 export interface AgentBrowserDnsSyncResult {
+  /** Local client deliberately stopped; background publication must not auto-start or retry it. */
+  readonly suspended?: boolean;
   /** False means the daemon rejected a stale or unverifiable full replacement. */
   readonly applied?: boolean;
   /** True when the daemon-owned browser DNS responder is bound after the sync. */
