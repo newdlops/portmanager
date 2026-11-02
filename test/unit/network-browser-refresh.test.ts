@@ -465,7 +465,7 @@ test("background DNS cannot re-enable a deliberately stopped client; explicit st
   }
   const Client = extract<Runner>("local-agent-client.ts", "LocalAgentClient", [
     "automaticEventReconnectEnabled", "connectionGeneration", "stopDaemon", "start", "syncBrowserDns",
-    "enableAutomaticEventReconnect", "disableAutomaticEventReconnect", "isAutomaticStartSuspended",
+    "enableAutomaticEventReconnect", "disableAutomaticEventReconnect", "isAutomaticStartSuspended", "assertConnectionGeneration",
   ], ["buildClientSnapshotSignature", "compareSnapshotSignatureRows", "buildClientRouteSignatureRows", "normalizeClientRouteDirection"], {
     createEmptySnapshot: () => ({ daemon: { pid: 0 }, listeners: [], processes: [], routes: [] }),
     AGENT_EVENT_RECONNECT_INITIAL_DELAY_MS: 100, process: { pid: 999 }, clearTimeout,
@@ -473,10 +473,11 @@ test("background DNS cannot re-enable a deliberately stopped client; explicit st
   let requests = 0;
   let suspended = false;
   const client = Object.assign(new Client(), {
-    daemonStartIntent: { suspend: () => { suspended = true; return []; }, resume: () => { suspended = false; return true; }, isSuspended: () => suspended },
+    daemonStartIntent: { suspend: () => { suspended = true; return []; }, observe: () => suspended ? ["stop"] : [], resume: () => { suspended = false; return true; }, isSuspended: () => suspended },
     snapshot: { daemon: { pid: 0 } }, rejectAllPending: () => {}, queueChangeEvent: () => {},
     applySnapshot: () => {},
     ensureConnected: async () => {}, loadDaemonStatusForStartup: async () => {},
+    waitForPreviousDaemonExit: async () => {},
     request: async () => { requests++; return { running: true, port: 53153 }; },
   });
   await client.syncBrowserDns("alpha=127.120.1.2");
@@ -488,7 +489,17 @@ test("background DNS cannot re-enable a deliberately stopped client; explicit st
   assert.equal(client.automaticEventReconnectEnabled, false);
   await client.start();
   assert.equal(suspended, true, "background owner startup must preserve Stop");
+  let drainingSocketDestroyed = false;
+  let waitedForPid = 0;
+  // Another window stopped the daemon, but this client has not received EOF
+  // yet. Its cached running PID and still-open socket must not survive Start.
+  Object.assign(client, { socket: { destroy() { drainingSocketDestroyed = true; } } });
+  client.snapshot.daemon.pid = 777;
+  client.waitForPreviousDaemonExit = async (pid?: number) => { waitedForPid = pid!; };
+  client.ensureConnected = async () => { assert.equal(client.snapshot.daemon.pid, 0); };
   await client.start({ explicit: true });
+  assert.equal(drainingSocketDestroyed, true);
+  assert.equal(waitedForPid, 777);
   await client.syncBrowserDns("alpha=127.120.1.2");
   assert.equal(requests, 2);
 });

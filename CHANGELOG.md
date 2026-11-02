@@ -9,6 +9,7 @@ All notable changes to Port Manager are documented in this file.
 - Recover authoritative routing once per daemon PID and start time, including when DNS/event reconnection precedes the first route snapshot. Reject late recovery completions from an older incarnation and retry failed scans without adding warm-pass scans.
 - Bound background listener-scan deferral under continuous control traffic with a monotonic deadline while preserving asynchronous scans and the normal five-minute warm cadence. Keep existing logical/browser listeners, gateway claims and routing targets during incomplete recovery while opening newly discovered endpoints independently of DNS publication.
 - Share explicit Stop intent across extension windows and reloads. Automatic startup, DNS retries and repairs respect it; explicit Start/Restart clears only observed stops, so an older pending restart cannot erase a later Stop. Replacement shutdown does not persist a user suspension that could block retry after failure or host exit.
+- Discard a draining event connection and its cached metadata before explicitly starting after another window's Stop. Wait for the previous daemon to exit before clearing the observed suspension, so Start cannot report the old PID while the accept socket has already closed.
 
 ## 0.0.8275
 

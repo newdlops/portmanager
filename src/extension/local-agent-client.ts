@@ -170,7 +170,28 @@ export class LocalAgentClient implements PortManagerProcessService {
   /** Connects to the agent and loads the initial snapshot. */
   async start(options: { readonly explicit?: boolean } = {}): Promise<void> {
     if (this.disposed) throw new Error("Port Manager agent client is disposed.");
-    if (options.explicit && !this.daemonStartIntent.resume()) return;
+    if (options.explicit) {
+      const stoppedIntents = this.daemonStartIntent.observe();
+      if (stoppedIntents.length > 0) {
+        const previousPid = this.snapshot.daemon.pid;
+        const generation = ++this.connectionGeneration;
+        // Another window can close the daemon's accept socket before our event
+        // stream receives EOF. Never reuse that draining stream or its metadata
+        // as proof that an explicit Start connected the next daemon lifetime.
+        this.disableAutomaticEventReconnect();
+        this.rejectAllPending(new Error("Daemon connection replaced after Stop."));
+        this.socket?.destroy();
+        this.socket = undefined;
+        this.childProcess = undefined;
+        this.snapshot = createEmptySnapshot();
+        this.snapshotSignature = buildClientSnapshotSignature(this.snapshot);
+        this.queueChangeEvent();
+        await this.waitForPreviousDaemonExit(previousPid);
+        this.assertConnectionGeneration(generation);
+      }
+      // Clear only the Stops seen before awaiting exit; a later Stop wins.
+      if (!this.daemonStartIntent.resume(stoppedIntents)) throw new Error("Daemon Start superseded by a later Stop.");
+    }
     if (this.isAutomaticStartSuspended()) return;
     this.enableAutomaticEventReconnect();
     await this.ensureConnected();
