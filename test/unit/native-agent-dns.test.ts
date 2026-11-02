@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import dgram from "node:dgram";
 import fs from "node:fs";
 import net from "node:net";
@@ -41,6 +41,29 @@ interface DnsFixture {
   readonly directory: string;
   readonly agent: ChildProcess;
 }
+
+test("native DNS bounds maximum-table response lookup comparisons", {
+  skip: process.platform !== "darwin" && process.platform !== "linux",
+}, (context) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pm-dns-index-"));
+  context.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const binary = path.join(directory, "index-test");
+  const sources = ["portmanager_agent_json.c", "portmanager_agent_state.c", "portmanager_agent_scan.c",
+    "portmanager_agent_output.c", "portmanager_agent_publication.c"]
+    .map((source) => path.join(projectRoot, "native", "agent", source));
+  execFileSync("cc", ["-Wall", "-Wextra", "-O2", "-pthread", "-ffunction-sections",
+    process.platform === "darwin" ? "-Wl,-dead_strip" : "-Wl,--gc-sections",
+    path.join(projectRoot, "test", "unit", "native-agent-dns-index-fixture.c"), ...sources,
+    path.join(projectRoot, "native", "shared", "pm_peer_process.c"),
+    path.join(projectRoot, "native", "shared", "pm_dev_log.c"), "-o", binary], { timeout: 30_000 });
+  const output = execFileSync(binary, [], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(output.includes("network-4095.pm comparisons="), true);
+  context.diagnostic(output.trim());
+  execFileSync(binary, ["--publication-allocation", directory], { timeout: 10_000 });
+  execFileSync(binary, ["--startup-allocation", directory], { timeout: 10_000 });
+  execFileSync(binary, ["--replay-allocation", directory], { timeout: 10_000 });
+  execFileSync(binary, ["--publication-budget"], { timeout: 10_000 });
+});
 
 test("network service pushes browser DNS records from every window, not only the owner", () => {
   const source = fs.readFileSync(path.join(projectRoot, "src", "extension", "network-service.ts"), "utf8");
@@ -87,6 +110,40 @@ test("native agent sources wire the DNS responder into dispatch, poll loop, and 
 if (!fs.existsSync(nativeAgentPath)) {
   test("native agent answers browser DNS queries", { skip: "native agent binary is not built" }, () => undefined);
 } else {
+  test("native DNS retains first normalized duplicate and the 4096-row boundary through replay and restart", async (context) => {
+    const fixture = await startDnsAgent(context);
+    if (fixture === undefined) return;
+    const authorityPath = path.join(fixture.directory, "state.json");
+    fs.writeFileSync(authorityPath, JSON.stringify({ version: 1, revision: "maximum", state: { networks: [], attachments: [], exposures: [] } }));
+    const pairs = ["Z-DUP.PM.=127.120.5.7", "z-dup.pm=127.120.5.8", ...Array.from({ length: 4094 }, (_, row) => `network-${String(row).padStart(4, "0")}.pm=127.120.5.9`), "excluded.pm=127.120.5.10"];
+    const payload = { records: pairs.join(","), revision: "maximum", sharedStatePath: authorityPath };
+    assert.equal((await requestOnce<{ applied: boolean }>(fixture.socketPath, { id: "maximum", method: "syncBrowserDns", payload })).applied, true);
+    const port = (await readDnsPort(fixture.socketPath))!;
+    for (const [name, address] of [["Z-DUP.PM", "127.120.5.7"], ["network-0000.pm", "127.120.5.9"], ["network-2048.pm", "127.120.5.9"], ["network-4093.pm", "127.120.5.9"]]) {
+      assert.deepEqual(await dnsQuery(port, name!), { rcode: 0, answerCount: 1, address });
+    }
+    assert.equal((await dnsQuery(port, "excluded.pm")).rcode, 3);
+    assert.equal((await dnsQuery(port, "missing.pm")).rcode, 3);
+    const sidecar = path.join(fixture.directory, "routes-browser-dns.tsv");
+    const persisted = fs.readFileSync(sidecar, "utf8");
+    assert.deepEqual(persisted.trimEnd().split("\n").slice(0, 4), ["#revision\tmaximum", "z-dup.pm\t127.120.5.7", "z-dup.pm\t127.120.5.8", "network-0000.pm\t127.120.5.9"]);
+    assert.equal(persisted.trimEnd().split("\n").length, 4097);
+    assert.equal((await requestOnce<{ applied: boolean }>(fixture.socketPath, { id: "maximum-replay", method: "syncBrowserDns", payload: { ...payload, records: "z-dup.pm=127.120.5.99" } })).applied, true);
+    assert.equal((await dnsQuery(port, "z-dup.pm")).address, "127.120.5.7");
+    assert.equal(fs.readFileSync(sidecar, "utf8"), persisted);
+    await requestOnce(fixture.socketPath, { id: "maximum-shutdown", method: "shutdownDaemon" });
+    await waitForProcessExit(fixture.agent, 3000);
+    const restarted = await startDnsAgent(context, fixture.directory);
+    if (restarted === undefined) return;
+    const restartedPort = (await readDnsPort(restarted.socketPath))!;
+    assert.equal((await dnsQuery(restartedPort, "z-dup.pm")).address, "127.120.5.7");
+    assert.equal((await dnsQuery(restartedPort, "network-4093.pm")).address, "127.120.5.9");
+    fs.writeFileSync(authorityPath, JSON.stringify({ version: 1, revision: "empty", state: { networks: [], attachments: [], exposures: [] } }));
+    assert.equal((await requestOnce<{ applied: boolean }>(restarted.socketPath, { id: "maximum-empty", method: "syncBrowserDns", payload: { ...payload, revision: "empty", records: "" } })).applied, true);
+    assert.equal((await dnsQuery(restartedPort, "z-dup.pm")).rcode, 3);
+    assert.equal((await dnsQuery(restartedPort, "network-4093.pm")).rcode, 3);
+  });
+
   test("managed shells inherit prepared routing env while the DNS worker is running", async (context) => {
     const fixture = await startDnsAgent(context, undefined, 0, undefined, {
       PORT: "old", PORT_MANAGER_ACTUAL_PORT: "old", PORT_MANAGER_LOGICAL_PORT: "old",
@@ -167,7 +224,7 @@ if (!fs.existsSync(nativeAgentPath)) {
       (async () => {
         for (let index = 0; index < 20; index++) {
           const address = index % 2 ? "127.120.5.9" : "127.120.5.10";
-          const records = [`atomic.pm=${address}`, ...Array.from({ length: 128 }, (_, row) => `row-${row}.pm=${address}`)].join(",");
+          const records = [`atomic.pm=${address}`, ...Array.from({ length: 4095 }, (_, row) => `row-${row}.pm=${address}`)].join(",");
           await requestOnce(fixture.socketPath, { id: `atomic-${index}`, method: "syncBrowserDns", payload: { records } });
         }
       })(),
@@ -523,6 +580,7 @@ function dnsQuery(port: number, name: string, type = 1, timeoutMs = 2_000): Prom
       clearTimeout(timer);
       socket.close();
       const answerCount = response.readUInt16BE(6);
+      if (answerCount > 0) assert.equal(response.readUInt32BE(response.length - 10), 1, "DNS answer TTL stays one second");
       resolve({
         rcode: response.readUInt16BE(2) & 0xf,
         answerCount,

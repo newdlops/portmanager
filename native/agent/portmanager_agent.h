@@ -216,6 +216,9 @@ typedef struct {
   /* Durable shared-state revision that fenced the current DNS full replace. */
   char browser_dns_revision[PM_SMALL];
   pm_browser_dns_record *browser_dns_items;
+  /* Sorted pointers into the immutable items array; swapped/freed with it.
+   * NULL for empty tables or startup-only allocation-failure fallback. */
+  const pm_browser_dns_record **browser_dns_index;
   size_t browser_dns_count;
   size_t browser_dns_capacity;
 } pm_agent_state;

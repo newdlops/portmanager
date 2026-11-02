@@ -82,7 +82,18 @@ daemon restart root 재등록과 관측 전 orphan 처리에는 추가 연결이
 socket 생성 전에 종료한다. 익명 readiness만 허용하며 요청 id prefix만으로 snapshot을
 구독할 수 없다. 이 인증은 커널 sandbox 자체가 아니다. 같은 UID의 비격리 프로세스는 파일
 권한만으로 배제할 수 없으며, 고정 scope broker·커널 정책·실제 terminal attach 연결이 남아 있다.
-DNS 응답 worker는 registry·파일·로그에 접근하지 않고 UDP와 shutdown pipe를 poll한다. DNS 게시 worker가 revision 검증과 영속화를 마친 뒤 control thread가 mutex 아래 레코드 포인터/개수만 교체하고 이전 테이블을 회수한다. packet 생성 중에만 같은 mutex를 잡으며, bind 실패는 control thread의 기존 backoff로 재시도한다. 종료·소켓 오류 시 응답 worker를 깨워 join한 후 descriptor를 닫는다. UDP와 wakeup pipe, 게시 파일은 CLOEXEC으로 managed child에 유출되지 않는다.
+DNS 응답 worker는 registry·파일·로그에 접근하지 않고 UDP와 shutdown pipe를 poll한다. DNS 게시 worker가 revision 검증과 영속화를 마친 뒤 control thread가 mutex 아래 레코드 포인터/개수와 인덱스를 교체하고 이전 테이블을 회수한다. packet 생성 중에만 같은 mutex를 잡으며, bind 실패는 control thread의 기존 backoff로 재시도한다. 종료·소켓 오류 시 응답 worker를 깨워 join한 후 descriptor를 닫는다. UDP와 wakeup pipe, 게시 파일은 CLOEXEC으로 managed child에 유출되지 않는다.
+최대 4,096개 DNS 레코드는 입력 순서로 영속화하며, 별도 불변 포인터 인덱스를
+호스트명·입력 위치 순서로 정렬해 mutex 안의 조회를 O(log n) 비교로 제한한다.
+정규화 후 이름이 겹치면 첫 입력이 우선하고 응답 TTL은 1초다. 인덱스는 레코드
+재할당이 끝난 뒤 게시 worker에서 만들며, 같은 revision 재전송은 만들기 전에
+검출한다. 64비트에서 최대 32KiB인 인덱스도 큐 진입 시 32MiB 게시 예산에 예약한다.
+인덱스와 레코드는 같은 mutex 아래 함께 교체하고 이전 쌍을 함께 회수한다.
+실행 중 인덱스 할당·영속화 실패는 기존 쌍을 유지한다. 시작 시 영속 레코드의
+인덱스 할당 실패만 선형 조회로 fallback하며, 이후 성공한 게시는 새 인덱스를 쓴다.
+`test/unit/native-agent-dns-index-fixture.c`는 실제 응답 경로의 비교 수·할당 실패·예산을
+검증하며 `-DPM_DNS_BENCHMARK`로 빌드해 `--benchmark`를 주면 저장한 이전 선형
+구현과 현재 production 조회의 마이크로벤치마크를 실행한다(UDP 지연 측정 아님).
 managed child의 command/env 구성은 fork 전에 끝낸다. child는 chdir/open/dup2/close/execve/_exit만 사용해 DNS 스레드가 있는 부모에서 libc 상태를 상속한 뒤 잠기는 일을 방지한다.
 
 실행 중 route/DNS 파일 읽기·쓰기·rename은 서로 독립된 게시 worker에서 수행한다. 시작 시 이전 파일 정리와 DNS sidecar 로드는 socket loop 진입 전에 끝낸다. route worker에는 불변 route/관측 사본과 전용 파일 signature·generation 상태만 전달하며 registry는 공유하지 않는다. 첫 미수집 변경부터 최대 250ms, idle 40ms를 기준으로 다음 사본을 예약한다. 진행 중인 쓰기 뒤에는 최신 사본 하나만 병합하며, 새 변경은 별도 기한을 시작해 지속적인 입력 중에도 매 turn 전체 registry를 복사하지 않는다. 이 기한은 게시 예약을 위한 것이며 파일시스템 완료 시간을 보장하지 않는다. 기존 TTL heartbeat도 유지한다.

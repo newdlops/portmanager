@@ -49,6 +49,7 @@ typedef struct pm_dns_worker {
   pthread_t thread;
   pthread_mutex_t records_mutex;
   const pm_browser_dns_record *items;
+  const pm_browser_dns_record *const *index;
   size_t count;
   int fd;
   int wake_pipe[2];
@@ -127,12 +128,44 @@ static int pm_dns_append_record(pm_agent_state *state, const char *hostname, con
   return 0;
 }
 
-static const unsigned char *pm_dns_lookup(const pm_browser_dns_record *items, size_t count, const char *hostname) {
-  for (size_t index = 0; index < count; index++) {
-    if (strcmp(items[index].hostname, hostname) == 0) {
-      return items[index].address;
+/* Equal normalized names retain input precedence, without reordering the
+ * durable array. Both pointers always belong to the same finalized array. */
+static int pm_dns_compare_index_records(const void *left, const void *right) {
+  const pm_browser_dns_record *a = *(const pm_browser_dns_record *const *)left;
+  const pm_browser_dns_record *b = *(const pm_browser_dns_record *const *)right;
+  int order = strcmp(a->hostname, b->hostname);
+  return order != 0 ? order : (a > b) - (a < b);
+}
+
+/* Build only after all record reallocations stop. The pointer payload is at
+ * most 4096 * sizeof(pointer), or 32KiB on a 64-bit daemon. */
+static int pm_dns_build_index(pm_agent_state *state) {
+  size_t count = state->browser_dns_count;
+  if (count == 0) return 0;
+  const pm_browser_dns_record **index = malloc(count * sizeof(*index));
+  if (index == NULL) return -1;
+  for (size_t row = 0; row < count; row++) index[row] = &state->browser_dns_items[row];
+  qsort(index, count, sizeof(*index), pm_dns_compare_index_records);
+  state->browser_dns_index = index;
+  return 0;
+}
+
+static const unsigned char *pm_dns_lookup(const pm_browser_dns_record *items,
+    const pm_browser_dns_record *const *index, size_t count, const char *hostname) {
+  if (index != NULL) {
+    size_t first = 0, last = count;
+    /* Lower bound selects the earliest input row among normalized duplicates. */
+    while (first < last) {
+      size_t middle = first + (last - first) / 2;
+      if (strcmp(index[middle]->hostname, hostname) < 0) first = middle + 1;
+      else last = middle;
     }
+    return first < count && strcmp(index[first]->hostname, hostname) == 0 ? index[first]->address : NULL;
   }
+  /* Startup alone may retain a persisted table when its index cannot allocate.
+   * Runtime publication rejects that failure before touching durable state. */
+  for (size_t row = 0; row < count; row++)
+    if (strcmp(items[row].hostname, hostname) == 0) return items[row].address;
   return NULL;
 }
 
@@ -470,6 +503,8 @@ void pm_dns_init(pm_agent_state *state, int requested_port) {
   state->browser_dns_requested_port = requested_port < 0 ? PM_DNS_DEFAULT_PORT : requested_port;
   pm_dns_build_state_path(state->route_table_path, state->browser_dns_state_path, sizeof(state->browser_dns_state_path));
   pm_dns_load_persisted_records(state);
+  if (pm_dns_build_index(state) != 0)
+    pm_dev_log("agent-dns", "startup index allocation failed; retaining linear lookup records=%zu", state->browser_dns_count);
   pm_dns_maybe_rebind(state, time(NULL));
 }
 
@@ -477,6 +512,8 @@ void pm_dns_dispose(pm_agent_state *state) {
   pm_publication_dispose(state->browser_dns_publications);
   state->browser_dns_publications = NULL;
   pm_dns_stop_worker(state);
+  free(state->browser_dns_index);
+  state->browser_dns_index = NULL;
   free(state->browser_dns_items);
   state->browser_dns_items = NULL;
   state->browser_dns_count = 0;
@@ -551,6 +588,7 @@ static size_t pm_dns_write_header(
 
 static size_t pm_dns_build_response(
   const pm_browser_dns_record *items,
+  const pm_browser_dns_record *const *index,
   size_t count,
   const unsigned char *query,
   size_t query_length,
@@ -577,7 +615,7 @@ static size_t pm_dns_build_response(
     return pm_dns_write_header(response, query, 0, 0, 1);
   }
 
-  address = pm_dns_lookup(items, count, name);
+  address = pm_dns_lookup(items, index, count, name);
   if (address == NULL || klass != PM_DNS_CLASS_IN || (type != PM_DNS_TYPE_A && type != PM_DNS_TYPE_ANY)) {
     length = pm_dns_write_header(response, query, 1, 0, address == NULL ? 3 : 0);
     memcpy(response + length, query + 12, question_end - 12);
@@ -628,7 +666,7 @@ static int pm_dns_handle_readable(pm_dns_worker *worker) {
     }
 
     pthread_mutex_lock(&worker->records_mutex);
-    response_length = pm_dns_build_response(worker->items, worker->count, query, (size_t)received, response, sizeof(response));
+    response_length = pm_dns_build_response(worker->items, worker->index, worker->count, query, (size_t)received, response, sizeof(response));
     pthread_mutex_unlock(&worker->records_mutex);
     if (response_length > 0) {
       sendto(worker->fd, response, response_length, 0, (struct sockaddr *)&remote, remote_length);
@@ -667,6 +705,7 @@ static int pm_dns_start_worker(pm_agent_state *state, int fd) {
   if (worker == NULL) return ENOMEM;
   worker->fd = fd;
   worker->items = state->browser_dns_items;
+  worker->index = state->browser_dns_index;
   worker->count = state->browser_dns_count;
   atomic_init(&worker->error, 0);
   int error = pthread_mutex_init(&worker->records_mutex, NULL);
@@ -767,6 +806,10 @@ static int pm_dns_publication_run(void *context) {
     job->applied = 2; /* Revisions are immutable, even if a retry changes rows. */
     return 0;
   }
+  if (pm_dns_build_index(&job->replacement) != 0) {
+    pm_dev_log("agent-dns", "publication index allocation failed records=%zu", job->replacement.browser_dns_count);
+    return 0;
+  }
   if (pm_dns_persist_records(&job->replacement, pm_dns_publication_validate, job) == 0) job->applied = 1;
   return 0;
 }
@@ -777,17 +820,22 @@ static int pm_dns_publication_finish(void *context, int result, char **response)
   int applied = result == 0 ? job->applied : 0;
   if (applied == 1) {
     pm_browser_dns_record *previous_items = state->browser_dns_items;
+    const pm_browser_dns_record **previous_index = state->browser_dns_index;
     pm_dns_worker *worker = state->browser_dns_worker;
     if (worker != NULL) pthread_mutex_lock(&worker->records_mutex);
     state->browser_dns_items = job->replacement.browser_dns_items;
+    state->browser_dns_index = job->replacement.browser_dns_index;
     state->browser_dns_count = job->replacement.browser_dns_count;
     state->browser_dns_capacity = job->replacement.browser_dns_capacity;
     job->replacement.browser_dns_items = NULL;
+    job->replacement.browser_dns_index = NULL;
     if (worker != NULL) {
       worker->items = state->browser_dns_items;
+      worker->index = state->browser_dns_index;
       worker->count = state->browser_dns_count;
       pthread_mutex_unlock(&worker->records_mutex);
     }
+    free(previous_index);
     free(previous_items);
     snprintf(state->browser_dns_revision, sizeof(state->browser_dns_revision), "%s",
       job->replacement.browser_dns_revision);
@@ -807,6 +855,7 @@ static int pm_dns_publication_finish(void *context, int result, char **response)
 
 static void pm_dns_publication_free(void *context) {
   pm_dns_publication *job = context;
+  free(job->replacement.browser_dns_index);
   free(job->replacement.browser_dns_items);
   free(job);
 }
@@ -840,7 +889,10 @@ int pm_dns_sync(pm_agent_state *state, const char *payload_json, pm_buffer *resp
   static const pm_publication_operations operations = {
     pm_dns_publication_prepare, pm_dns_publication_run, pm_dns_publication_finish, pm_dns_publication_free
   };
-  size_t bytes = sizeof(*job) + job->replacement.browser_dns_capacity * sizeof(pm_browser_dns_record);
+  /* Reserve the worker's future index before queueing; active and queued jobs
+   * share the same 32MiB budget even though index allocation happens later. */
+  size_t bytes = sizeof(*job) + job->replacement.browser_dns_capacity * sizeof(pm_browser_dns_record) +
+    job->replacement.browser_dns_count * sizeof(*job->replacement.browser_dns_index);
   pm_publication_receipt *receipt = pm_publication_submit(state->browser_dns_publications, job, bytes, &operations, 0);
   if (receipt == NULL) return -1;
   pm_publication_release(state->request_publication);
