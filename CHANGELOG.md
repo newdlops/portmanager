@@ -4,6 +4,8 @@ All notable changes to Port Manager are documented in this file.
 
 ## Unreleased
 
+## 0.0.8273
+
 - Keep native route-cache hits within the document expiry and monotonic lifetime, observe same-size/same-mtime atomic replacements, and let new listener routes supersede provisional sender reservations. Indexed warm point lookups avoid full-array copies and retained cache memory stays within 16MiB. A long-lived preloaded-client test verifies expiry, backend replacement, foreign-network rejection, and usable existing TCP/HTTP/SSE streams during DNS publication and a test-daemon restart.
 - Index native DNS snapshots while preserving first-duplicate precedence, input-order persistence, authority fences, the 4,096-record limit, and one-second answer TTL. Fence DNS acknowledgements by PID plus start time, coalesce identical in-flight publications, republish after responder failure or daemon replacement, and respect an explicitly stopped daemon.
 - Measured on macOS arm64: 2,000 warm lookups over 2,048 routes improved from 146.978ms to 45.942ms median across five alternating runs. At 4,096 DNS rows, uniform lookup CPU time improved from 6,107.6ns to 109.0ns; the first-row best case regressed from 2.3ns to 105.5ns. These microbenchmarks exclude network/UDP latency and do not establish a universal application speedup.
