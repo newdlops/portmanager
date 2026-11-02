@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 /* Include the actual hook so deterministic clocks and allocation accounting can
  * exercise its private cache without adding test-only production entry points. */
 #include <assert.h>
@@ -22,7 +26,9 @@ static int fixture_lock(pthread_mutex_t *mutex);
 static int fixture_unlock(pthread_mutex_t *mutex);
 static int fixture_stat(const char *path, struct stat *value);
 static int fixture_fstat(int fd, struct stat *value);
+#if defined(__APPLE__)
 static int fixture_open(const char *path, int flags, ...);
+#endif
 static ssize_t fixture_read(int fd, void *buffer, size_t size);
 static pthread_mutex_t allocation_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct { void *pointer; size_t size; } tracked[10000];
@@ -56,7 +62,11 @@ static void fixture_free(void *ptr) { track(ptr, NULL, 0); free(ptr); }
 #define pthread_mutex_unlock fixture_unlock
 #define stat(...) fixture_stat(__VA_ARGS__)
 #define fstat fixture_fstat
+/* Linux supplies a public open() definition in the included hook. Renaming
+ * that definition would collide with the separate macOS instrumentation. */
+#if defined(__APPLE__)
 #define open fixture_open
+#endif
 #define read fixture_read
 #define gettimeofday fixture_gettimeofday
 #define clock_gettime fixture_clock_gettime
@@ -87,12 +97,14 @@ static int fixture_unlock(pthread_mutex_t *mutex) {
 }
 static int fixture_stat(const char *path, struct stat *value) { assert(!cache_lock_depth); return stat(path, value); }
 static int fixture_fstat(int fd, struct stat *value) { assert(!cache_lock_depth); return fstat(fd, value); }
+#if defined(__APPLE__)
 static int fixture_open(const char *path, int flags, ...) {
   assert(!cache_lock_depth);
   mode_t mode = 0;
   if (flags & O_CREAT) { va_list args; va_start(args, flags); mode = (mode_t)va_arg(args, int); va_end(args); }
   return open(path, flags, mode);
 }
+#endif
 static ssize_t fixture_read(int fd, void *buffer, size_t size) {
   assert(!cache_lock_depth);
   if (cold_reader_id) {
