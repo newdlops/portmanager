@@ -54,6 +54,7 @@
 #define PM_MAX_ROUTE_OBJECT 8192
 #define PM_ROUTE_FILE_CACHE_INITIAL_CAPACITY 128
 #define PM_ROUTE_FILE_CACHE_MAX_CAPACITY 65535
+#define PM_ROUTE_FILE_CACHE_BUDGET (16U * 1024U * 1024U)
 #define PM_ROUTE_TABLE_TTL_SECONDS_ENV "PORT_MANAGER_ROUTE_TABLE_TTL_SECONDS"
 #define PM_DEFAULT_ROUTE_TABLE_TTL_SECONDS 15
 #define PM_DEFAULT_SCAN_RANGE 20
@@ -117,12 +118,22 @@ typedef struct {
   char network_id[PM_MAX_TEXT];
 } pm_route_mapping;
 
+/* Equal ports retain document order so duplicate precedence is unchanged. */
+typedef struct { int port; uint32_t row; } pm_route_port_index;
+
 typedef struct {
   char path[PM_MAX_PATH];
+  dev_t device;
+  ino_t inode;
+  time_t ctime_sec;
+  long ctime_nsec;
+  long expires_at_ms;
+  long monotonic_deadline_ms;
   time_t mtime_sec;
   long mtime_nsec;
   off_t size;
   struct pm_cached_route *routes;
+  pm_route_port_index *port_indexes;
   size_t route_count;
   unsigned long last_used;
 } pm_route_file_cache_entry;
@@ -181,6 +192,8 @@ static size_t pm_route_file_cache_count = 0;
 static size_t pm_route_file_cache_capacity = 0;
 static unsigned long pm_request_sequence = 1;
 static unsigned long pm_route_file_cache_tick = 1;
+/* Payload excludes the entry array; both count toward the retained budget. */
+static size_t pm_route_file_cache_payload_bytes = 0;
 static pthread_mutex_t pm_route_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t pm_route_file_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -192,6 +205,8 @@ static const char *pm_current_network_id(void);
 static int pm_network_scope_is_global(void);
 static const char *pm_network_loopback_host(void);
 static int pm_connect_route_table_lookup(int logical_port, char *target_host, size_t target_host_size, int *is_compose_route);
+static int pm_route_table_lookup(int source_port, int source_is_actual, const char *required_direction,
+  char *target_host, size_t target_host_size, int *is_compose_route);
 extern char **environ;
 
 static int pm_hook_enabled(void) {
@@ -2990,171 +3005,195 @@ static int pm_route_file_buffer_expired(const char *buffer) {
   return 1;
 }
 
-static void pm_clear_route_file_cache_entry(pm_route_file_cache_entry *entry) {
-  if (entry == NULL) {
-    return;
-  }
-
-  free(entry->routes);
-  memset(entry, 0, sizeof(*entry));
+static long pm_monotonic_milliseconds(void) {
+  struct timespec now;
+  return clock_gettime(CLOCK_MONOTONIC, &now) == 0 ? (long)now.tv_sec * 1000L + now.tv_nsec / 1000000L : 0;
 }
 
-static void pm_clear_route_file_cache(void) {
-  pthread_mutex_lock(&pm_route_file_cache_mutex);
-  for (size_t index = 0; index < pm_route_file_cache_count; index++) {
-    pm_clear_route_file_cache_entry(&pm_route_file_cache[index]);
-  }
-  free(pm_route_file_cache);
-  pm_route_file_cache = NULL;
-  pm_route_file_cache_count = 0;
-  pm_route_file_cache_capacity = 0;
-  pthread_mutex_unlock(&pm_route_file_cache_mutex);
+static time_t pm_stat_ctime_sec(const struct stat *value) {
+#if defined(__APPLE__)
+  return value->st_ctimespec.tv_sec;
+#else
+  return value->st_ctim.tv_sec;
+#endif
 }
 
+static long pm_stat_ctime_nsec(const struct stat *value) {
+#if defined(__APPLE__)
+  return value->st_ctimespec.tv_nsec;
+#else
+  return value->st_ctim.tv_nsec;
+#endif
+}
+
+/* Match the opened snapshot, including replacement and preserved-mtime writes. */
 static int pm_route_file_cache_entry_matches(
-  const pm_route_file_cache_entry *entry,
-  const char *path,
-  const struct stat *stat_buffer) {
-  return entry != NULL &&
-    entry->path[0] != '\0' &&
-    strcmp(entry->path, path) == 0 &&
+  const pm_route_file_cache_entry *entry, const char *path, const struct stat *stat_buffer) {
+  return entry != NULL && entry->path[0] != '\0' && strcmp(entry->path, path) == 0 &&
+    entry->device == stat_buffer->st_dev && entry->inode == stat_buffer->st_ino &&
+    entry->ctime_sec == pm_stat_ctime_sec(stat_buffer) && entry->ctime_nsec == pm_stat_ctime_nsec(stat_buffer) &&
     entry->size == stat_buffer->st_size &&
     entry->mtime_sec == pm_stat_mtime_sec(stat_buffer) &&
     entry->mtime_nsec == pm_stat_mtime_nsec(stat_buffer);
 }
 
-static int pm_copy_cached_routes(
-  const pm_cached_route *routes,
-  size_t route_count,
-  pm_cached_route **routes_out,
-  size_t *route_count_out) {
-  pm_cached_route *copy = NULL;
-
-  if (routes_out == NULL || route_count_out == NULL) {
-    return -1;
-  }
-
-  *routes_out = NULL;
-  *route_count_out = 0;
-  if (route_count == 0) {
-    return 0;
-  }
-
-  copy = (pm_cached_route *)malloc(route_count * sizeof(pm_cached_route));
-  if (copy == NULL) {
-    return -1;
-  }
-
-  memcpy(copy, routes, route_count * sizeof(pm_cached_route));
-  *routes_out = copy;
-  *route_count_out = route_count;
-  return 0;
-}
-
-static int pm_get_cached_route_file(
-  const char *path,
-  const struct stat *stat_buffer,
-  pm_cached_route **routes_out,
-  size_t *route_count_out) {
-  int found = 0;
-
-  pthread_mutex_lock(&pm_route_file_cache_mutex);
-  for (size_t index = 0; index < pm_route_file_cache_count; index++) {
-    pm_route_file_cache_entry *entry = &pm_route_file_cache[index];
-    if (!pm_route_file_cache_entry_matches(entry, path, stat_buffer)) {
-      continue;
-    }
-
-    entry->last_used = pm_route_file_cache_tick++;
-    found = pm_copy_cached_routes(entry->routes, entry->route_count, routes_out, route_count_out) == 0;
-    break;
-  }
-  pthread_mutex_unlock(&pm_route_file_cache_mutex);
-
-  return found ? 0 : -1;
-}
-
-static int pm_ensure_route_file_cache_capacity(size_t required) {
-  size_t next_capacity;
-  pm_route_file_cache_entry *next_cache;
-
-  if (required <= pm_route_file_cache_capacity) {
-    return 0;
-  }
-  if (required > PM_ROUTE_FILE_CACHE_MAX_CAPACITY) {
-    return -1;
-  }
-
-  next_capacity = pm_route_file_cache_capacity == 0 ? PM_ROUTE_FILE_CACHE_INITIAL_CAPACITY : pm_route_file_cache_capacity;
-  while (next_capacity < required) {
-    if (next_capacity >= PM_ROUTE_FILE_CACHE_MAX_CAPACITY) {
-      next_capacity = PM_ROUTE_FILE_CACHE_MAX_CAPACITY;
-      break;
-    }
-    if (next_capacity > PM_ROUTE_FILE_CACHE_MAX_CAPACITY / 2) {
-      next_capacity = PM_ROUTE_FILE_CACHE_MAX_CAPACITY;
-    } else {
-      next_capacity *= 2;
-    }
-  }
-
-  next_cache = (pm_route_file_cache_entry *)realloc(
-    pm_route_file_cache,
-    next_capacity * sizeof(pm_route_file_cache_entry));
-  if (next_cache == NULL) {
-    return -1;
-  }
-
-  memset(
-    next_cache + pm_route_file_cache_capacity,
-    0,
-    (next_capacity - pm_route_file_cache_capacity) * sizeof(pm_route_file_cache_entry));
-  pm_route_file_cache = next_cache;
-  pm_route_file_cache_capacity = next_capacity;
-  return 0;
-}
-
-static void pm_store_route_file_cache(
-  const char *path,
-  const struct stat *stat_buffer,
-  const pm_cached_route *routes,
-  size_t route_count) {
-  pm_route_file_cache_entry *entry = NULL;
-  pm_cached_route *copy = NULL;
-
-  if (route_count > 0) {
-    copy = (pm_cached_route *)malloc(route_count * sizeof(pm_cached_route));
-    if (copy == NULL) {
-      return;
-    }
-    memcpy(copy, routes, route_count * sizeof(pm_cached_route));
-  }
-
-  pthread_mutex_lock(&pm_route_file_cache_mutex);
-  for (size_t index = 0; index < pm_route_file_cache_count; index++) {
-    if (strcmp(pm_route_file_cache[index].path, path) == 0) {
-      entry = &pm_route_file_cache[index];
-      break;
-    }
-  }
-
-  if (entry == NULL) {
-    if (pm_ensure_route_file_cache_capacity(pm_route_file_cache_count + 1) != 0) {
-      pthread_mutex_unlock(&pm_route_file_cache_mutex);
-      free(copy);
-      return;
-    }
-    entry = &pm_route_file_cache[pm_route_file_cache_count++];
-  }
-
-  pm_clear_route_file_cache_entry(entry);
+static void pm_route_file_cache_set_metadata(pm_route_file_cache_entry *entry, const char *path, const struct stat *value) {
   snprintf(entry->path, sizeof(entry->path), "%s", path);
-  entry->mtime_sec = pm_stat_mtime_sec(stat_buffer);
-  entry->mtime_nsec = pm_stat_mtime_nsec(stat_buffer);
-  entry->size = stat_buffer->st_size;
+  entry->device = value->st_dev;
+  entry->inode = value->st_ino;
+  entry->ctime_sec = pm_stat_ctime_sec(value);
+  entry->ctime_nsec = pm_stat_ctime_nsec(value);
+  entry->mtime_sec = pm_stat_mtime_sec(value);
+  entry->mtime_nsec = pm_stat_mtime_nsec(value);
+  entry->size = value->st_size;
+}
+
+static int pm_route_cache_expired(const pm_route_file_cache_entry *entry) {
+  long wall = pm_now_milliseconds(), monotonic = pm_monotonic_milliseconds();
+  return (wall > 0 && wall >= entry->expires_at_ms) ||
+    (monotonic > 0 && entry->monotonic_deadline_ms > 0 && monotonic >= entry->monotonic_deadline_ms);
+}
+
+static void pm_clear_route_file_cache_entry(pm_route_file_cache_entry *entry) {
+  if (entry == NULL) return;
+  pm_route_file_cache_payload_bytes -= entry->route_count * (sizeof(pm_cached_route) + 2 * sizeof(pm_route_port_index));
+  free(entry->routes);
+  free(entry->port_indexes);
+  memset(entry, 0, sizeof(*entry));
+}
+
+static void pm_clear_route_file_cache(void) {
+  pthread_mutex_lock(&pm_route_file_cache_mutex);
+  for (size_t i = 0; i < pm_route_file_cache_count; i++) pm_clear_route_file_cache_entry(&pm_route_file_cache[i]);
+  free(pm_route_file_cache);
+  pm_route_file_cache = NULL;
+  pm_route_file_cache_count = pm_route_file_cache_capacity = 0;
+  pthread_mutex_unlock(&pm_route_file_cache_mutex);
+}
+
+/* Call only while locked. Expired entries remain as tombstones until eviction:
+ * rereading unchanged metadata after clock rollback must not renew its lifetime. */
+static pm_route_file_cache_entry *pm_find_route_file_cache(const char *path, const struct stat *value) {
+  for (size_t i = 0; i < pm_route_file_cache_count; i++) {
+    pm_route_file_cache_entry *entry = &pm_route_file_cache[i];
+    if (pm_route_file_cache_entry_matches(entry, path, value)) {
+      entry->last_used = pm_route_file_cache_tick++;
+      return entry;
+    }
+  }
+  return NULL;
+}
+
+static int pm_copy_cached_routes(const pm_cached_route *routes, size_t count, pm_cached_route **out, size_t *count_out) {
+  *out = NULL;
+  *count_out = 0;
+  if (count == 0) return 0;
+  pm_cached_route *copy = (pm_cached_route *)malloc(count * sizeof(*copy));
+  if (copy == NULL) return -1;
+  memcpy(copy, routes, count * sizeof(*copy));
+  *out = copy;
+  *count_out = count;
+  return 0;
+}
+
+/* Bulk readers retain their caller-owned snapshot contract. Point readers below
+ * borrow only during selection and never expose an evictable route pointer. */
+static int pm_get_cached_route_file(const char *path, const struct stat *value, pm_cached_route **out, size_t *count_out) {
+  int result = -1;
+  pthread_mutex_lock(&pm_route_file_cache_mutex);
+  pm_route_file_cache_entry *entry = pm_find_route_file_cache(path, value);
+  if (entry != NULL) result = pm_route_cache_expired(entry) ? -2 : pm_copy_cached_routes(entry->routes, entry->route_count, out, count_out);
+  pthread_mutex_unlock(&pm_route_file_cache_mutex);
+  return result;
+}
+
+static pm_route_file_cache_entry *pm_route_cache_lru(void) {
+  pm_route_file_cache_entry *oldest = NULL;
+  for (size_t i = 0; i < pm_route_file_cache_count; i++) {
+    pm_route_file_cache_entry *entry = &pm_route_file_cache[i];
+    if (entry->path[0] != '\0' && (oldest == NULL || entry->last_used < oldest->last_used)) oldest = entry;
+  }
+  return oldest;
+}
+
+/* Entry capacity itself is bounded, and vacant LRU slots are reused. */
+static int pm_ensure_route_file_cache_capacity(size_t required) {
+  if (required <= pm_route_file_cache_capacity) return 0;
+  size_t capacity = pm_route_file_cache_capacity == 0 ? PM_ROUTE_FILE_CACHE_INITIAL_CAPACITY : pm_route_file_cache_capacity * 2;
+  if (capacity > PM_ROUTE_FILE_CACHE_MAX_CAPACITY) capacity = PM_ROUTE_FILE_CACHE_MAX_CAPACITY;
+  if (capacity < required || capacity * sizeof(pm_route_file_cache_entry) > PM_ROUTE_FILE_CACHE_BUDGET) return -1;
+  while (capacity * sizeof(pm_route_file_cache_entry) + pm_route_file_cache_payload_bytes > PM_ROUTE_FILE_CACHE_BUDGET) {
+    pm_route_file_cache_entry *oldest = pm_route_cache_lru();
+    if (oldest == NULL) return -1;
+    pm_clear_route_file_cache_entry(oldest);
+  }
+  pm_route_file_cache_entry *next = realloc(pm_route_file_cache, capacity * sizeof(*next));
+  if (next == NULL) return -1;
+  memset(next + pm_route_file_cache_capacity, 0, (capacity - pm_route_file_cache_capacity) * sizeof(*next));
+  pm_route_file_cache = next;
+  pm_route_file_cache_capacity = capacity;
+  return 0;
+}
+
+static int pm_route_port_index_compare(const void *left, const void *right) {
+  const pm_route_port_index *a = left, *b = right;
+  if (a->port != b->port) return a->port < b->port ? -1 : 1;
+  return a->row < b->row ? -1 : a->row > b->row;
+}
+
+static void pm_store_route_file_cache(const char *path, const struct stat *value,
+  const pm_cached_route *routes, size_t count, long expires_at_ms, long monotonic_deadline_ms) {
+  size_t bytes = count * (sizeof(pm_cached_route) + 2 * sizeof(pm_route_port_index));
+  /* Oversized parsed snapshots still serve the current lookup uncached. */
+  if (strlen(path) >= PM_MAX_PATH || bytes + PM_ROUTE_FILE_CACHE_INITIAL_CAPACITY * sizeof(pm_route_file_cache_entry) > PM_ROUTE_FILE_CACHE_BUDGET) return;
+  pm_cached_route *copy = count ? malloc(count * sizeof(*copy)) : NULL;
+  pm_route_port_index *indexes = count ? malloc(2 * count * sizeof(*indexes)) : NULL;
+  if (count && (copy == NULL || indexes == NULL)) { free(copy); free(indexes); return; }
+  if (count) memcpy(copy, routes, count * sizeof(*copy));
+  for (size_t i = 0; i < count; i++) {
+    indexes[i] = (pm_route_port_index){routes[i].logical_port, (uint32_t)i};
+    indexes[count + i] = (pm_route_port_index){routes[i].actual_port, (uint32_t)i};
+  }
+  if (count) {
+    qsort(indexes, count, sizeof(*indexes), pm_route_port_index_compare);
+    qsort(indexes + count, count, sizeof(*indexes), pm_route_port_index_compare);
+  }
+  pthread_mutex_lock(&pm_route_file_cache_mutex);
+  pm_route_file_cache_entry *entry = NULL;
+  for (size_t i = 0; i < pm_route_file_cache_count; i++) {
+    if (strcmp(pm_route_file_cache[i].path, path) == 0) { entry = &pm_route_file_cache[i]; break; }
+    if (pm_route_file_cache[i].path[0] == '\0') entry = &pm_route_file_cache[i];
+  }
+  if (entry == NULL) {
+    int capacity_available = pm_ensure_route_file_cache_capacity(pm_route_file_cache_count + 1) == 0;
+    /* Growth may evict rows. Reuse those slots, or the least-recently-used
+     * entry if metadata capacity itself prevents further growth. */
+    for (size_t i = 0; i < pm_route_file_cache_count; i++) {
+      if (pm_route_file_cache[i].path[0] == '\0') { entry = &pm_route_file_cache[i]; break; }
+    }
+    if (entry == NULL && capacity_available) entry = &pm_route_file_cache[pm_route_file_cache_count++];
+    if (entry == NULL) entry = pm_route_cache_lru();
+  }
+  if (entry != NULL) pm_clear_route_file_cache_entry(entry);
+  while (bytes + pm_route_file_cache_payload_bytes + pm_route_file_cache_capacity * sizeof(*entry) > PM_ROUTE_FILE_CACHE_BUDGET) {
+    pm_route_file_cache_entry *oldest = pm_route_cache_lru();
+    if (oldest == NULL) break;
+    pm_clear_route_file_cache_entry(oldest);
+  }
+  if (entry == NULL || bytes + pm_route_file_cache_payload_bytes + pm_route_file_cache_capacity * sizeof(*entry) > PM_ROUTE_FILE_CACHE_BUDGET) {
+    pthread_mutex_unlock(&pm_route_file_cache_mutex);
+    free(copy);
+    free(indexes);
+    return;
+  }
+  pm_route_file_cache_set_metadata(entry, path, value);
   entry->routes = copy;
-  entry->route_count = route_count;
+  entry->port_indexes = indexes;
+  entry->route_count = count;
+  entry->expires_at_ms = expires_at_ms;
+  entry->monotonic_deadline_ms = monotonic_deadline_ms;
   entry->last_used = pm_route_file_cache_tick++;
+  pm_route_file_cache_payload_bytes += bytes;
   pthread_mutex_unlock(&pm_route_file_cache_mutex);
 }
 
@@ -3258,10 +3297,8 @@ static int pm_load_route_file_routes(const char *path, pm_cached_route **routes_
     return -1;
   }
 
-  if (!pm_route_file_stat_expired(&stat_buffer) && pm_get_cached_route_file(path, &stat_buffer, routes_out, route_count_out) == 0) {
-    close(fd);
-    return 0;
-  }
+  int cached = pm_get_cached_route_file(path, &stat_buffer, routes_out, route_count_out);
+  if (cached == 0 || cached == -2) { close(fd); return cached == 0 ? 0 : -1; }
 
   buffer = (char *)malloc((size_t)stat_buffer.st_size + 1);
   if (buffer == NULL) {
@@ -3270,8 +3307,12 @@ static int pm_load_route_file_routes(const char *path, pm_cached_route **routes_
   }
 
   read_count = read(fd, buffer, (size_t)stat_buffer.st_size);
+  struct stat after_read;
+  pm_route_file_cache_entry snapshot = {0};
+  pm_route_file_cache_set_metadata(&snapshot, path, &stat_buffer);
+  int coherent = fstat(fd, &after_read) == 0 && pm_route_file_cache_entry_matches(&snapshot, path, &after_read);
   close(fd);
-  if (read_count <= 0) {
+  if (read_count != stat_buffer.st_size || !coherent) {
     free(buffer);
     return -1;
   }
@@ -3285,13 +3326,18 @@ static int pm_load_route_file_routes(const char *path, pm_cached_route **routes_
     return -1;
   }
 
+  long expires_at_ms = pm_json_long(buffer, "expiresAtMs", 0);
+  if (expires_at_ms <= 0) expires_at_ms = (long)pm_stat_mtime_sec(&stat_buffer) * 1000L + pm_route_table_ttl_seconds() * 1000L;
+  long remaining_ms = expires_at_ms - pm_now_milliseconds();
+  long monotonic_now = pm_monotonic_milliseconds();
+  long monotonic_deadline_ms = monotonic_now > 0 ? monotonic_now + (remaining_ms > 0 ? remaining_ms : 0) : 0;
   if (pm_parse_route_file_buffer(buffer, &routes, &route_count) != 0) {
     free(buffer);
     return -1;
   }
   free(buffer);
 
-  pm_store_route_file_cache(path, &stat_buffer, routes, route_count);
+  pm_store_route_file_cache(path, &stat_buffer, routes, route_count, expires_at_ms, monotonic_deadline_ms);
   *routes_out = routes;
   *route_count_out = route_count;
   return 0;
@@ -3977,6 +4023,7 @@ static int pm_memory_actual_for_logical(int logical_port, char *target_host, siz
   const char *network_id = pm_current_network_id();
   const char *route_network_id = network_id == NULL ? "" : network_id;
   int actual_port = 0;
+  int pending_sender = 0;
   char host[128];
   long now_ms = pm_now_milliseconds();
 
@@ -3991,12 +4038,20 @@ static int pm_memory_actual_for_logical(int logical_port, char *target_host, siz
 
     if (pm_routes[index].logical_port == logical_port && strcmp(pm_routes[index].network_id, route_network_id) == 0) {
       actual_port = pm_routes[index].actual_port;
+      pending_sender = pm_routes[index].expires_at_ms > 0;
       snprintf(host, sizeof(host), "%s", pm_routes[index].host);
       break;
     }
     index++;
   }
   pthread_mutex_unlock(&pm_route_mutex);
+
+  /* A leased sender endpoint is provisional. A published listener may have
+   * moved after restart; process-owned (unleased) listeners keep priority. */
+  if (pending_sender) {
+    int listening_port = pm_route_table_lookup(logical_port, 0, "listen", host, sizeof(host), NULL);
+    if (listening_port > 0) actual_port = listening_port;
+  }
 
   if (actual_port > 0 && target_host != NULL && target_host_size > 0) {
     snprintf(target_host, target_host_size, "%s", host);
@@ -4061,34 +4116,41 @@ static int pm_memory_logical_for_actual(int actual_port) {
   return logical_port;
 }
 
-static int pm_route_table_lookup_file(
-  const char *path,
+/* Selection runs against an immutable snapshot. Sorted equal-port ranges keep
+ * original row order; unrelated ports never enter network/cwd policy checks. */
+static int pm_select_route_file_routes(
+  const pm_cached_route *routes,
+  size_t route_count,
+  const pm_route_port_index *port_index,
+  const char *current_cwd,
   int source_port,
   int source_is_actual,
   const char *required_direction,
   char *target_host,
   size_t target_host_size,
   int *is_compose_route) {
-  pm_cached_route *routes;
-  size_t route_count;
   int fallback_port = 0;
   int fallback_is_compose = 0;
   char fallback_host[128];
-  char current_cwd[PM_MAX_TEXT];
 
   if (is_compose_route != NULL) {
     *is_compose_route = 0;
   }
 
-  if (pm_load_route_file_routes(path, &routes, &route_count) != 0) {
-    return 0;
-  }
-
   fallback_host[0] = '\0';
-  pm_cwd(current_cwd, sizeof(current_cwd));
 
-  for (size_t index = 0; index < route_count; index++) {
-    const pm_cached_route *route = &routes[index];
+  size_t first = 0;
+  if (port_index != NULL) {
+    size_t upper = route_count;
+    while (first < upper) {
+      size_t middle = first + (upper - first) / 2;
+      if (port_index[middle].port < source_port) first = middle + 1;
+      else upper = middle;
+    }
+  }
+  for (size_t index = first; index < route_count; index++) {
+    if (port_index != NULL && port_index[index].port != source_port) break;
+    const pm_cached_route *route = &routes[port_index == NULL ? index : port_index[index].row];
     int match_level;
     int route_matches_cwd;
 
@@ -4120,7 +4182,6 @@ static int pm_route_table_lookup_file(
           *is_compose_route = route->is_compose;
         }
         fallback_port = route->logical_port;
-        free(routes);
         return fallback_port;
       }
 
@@ -4139,7 +4200,6 @@ static int pm_route_table_lookup_file(
           *is_compose_route = route->is_compose;
         }
         fallback_port = route->actual_port;
-        free(routes);
         return fallback_port;
       }
 
@@ -4151,7 +4211,6 @@ static int pm_route_table_lookup_file(
     }
   }
 
-  free(routes);
   if (fallback_port > 0) {
     if (!source_is_actual && target_host != NULL && target_host_size > 0) {
       snprintf(target_host, target_host_size, "%s", fallback_host[0] == '\0' ? "127.0.0.1" : fallback_host);
@@ -4163,6 +4222,43 @@ static int pm_route_table_lookup_file(
   }
 
   return 0;
+}
+
+/* File metadata and cwd are gathered before locking. A warm lookup borrows the
+ * indexed snapshot only while selecting scalars/host text; replacement/eviction
+ * cannot free it underneath a reader, and no file I/O occurs under this lock. */
+static int pm_route_table_lookup_file(
+  const char *path, int source_port, int source_is_actual, const char *required_direction,
+  char *target_host, size_t target_host_size, int *is_compose_route) {
+  struct stat value;
+  char current_cwd[PM_MAX_TEXT];
+  if (is_compose_route != NULL) *is_compose_route = 0;
+  if (stat(path, &value) != 0 || value.st_size <= 0 || value.st_size > 1024 * 1024) return 0;
+  pm_cwd(current_cwd, sizeof(current_cwd));
+  pthread_mutex_lock(&pm_route_file_cache_mutex);
+  pm_route_file_cache_entry *entry = pm_find_route_file_cache(path, &value);
+  if (entry != NULL) {
+    int result = 0;
+    if (!pm_route_cache_expired(entry)) {
+      const pm_route_port_index *index = entry->port_indexes;
+      if (source_is_actual && index != NULL) index += entry->route_count;
+      result = pm_select_route_file_routes(entry->routes, entry->route_count, index, current_cwd,
+        source_port, source_is_actual, required_direction, target_host, target_host_size, is_compose_route);
+    }
+    pthread_mutex_unlock(&pm_route_file_cache_mutex);
+    return result;
+  }
+  pthread_mutex_unlock(&pm_route_file_cache_mutex);
+
+  pm_cached_route *routes;
+  size_t count;
+  if (pm_load_route_file_routes(path, &routes, &count) != 0) return 0;
+  /* Keep the owned cold snapshot usable even when it exceeds the cache budget
+   * or another reader evicts/replaces its just-published cache entry. */
+  int result = pm_select_route_file_routes(routes, count, NULL, current_cwd,
+    source_port, source_is_actual, required_direction, target_host, target_host_size, is_compose_route);
+  free(routes);
+  return result;
 }
 
 static int pm_compose_claim_blocks_port(int port) {
