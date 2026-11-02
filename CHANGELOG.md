@@ -4,6 +4,8 @@ All notable changes to Port Manager are documented in this file.
 
 ## Unreleased
 
+## 0.0.8275
+
 - Add commands and network context actions to open environment overrides, dotenv substitutes and readable settings folders. Show preserved inactive legacy paths during attach, with an active-settings action; repeat the warning after legacy edits without overwriting either copy. Retain discovery across network rename and disambiguate duplicate network/workspace names. Document and test the real hardened-uv `UV_ENV_FILE` precedence and the `environment.env` override.
 
 ## 0.0.8274
