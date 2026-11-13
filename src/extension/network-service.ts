@@ -2654,8 +2654,42 @@ export class PortManagerNetworkService implements DisposableLike {
     const candidates = session?.listCandidates() ?? [];
 
     this.lastContainerServiceRefreshAtMs = Date.now();
+    this.registry.setBrokenContainers(session?.listBrokenContainers() ?? []);
     this.registry.setContainerServiceCandidates(candidates);
     return this.registry.getSnapshot().containerServiceCandidates;
+  }
+
+  /**
+   * Force-removes containers the latest discovery reported as unlistable.
+   *
+   * Only ids present in the current broken list are accepted, so this path can
+   * never delete a healthy container. Returns the ids that were removed and
+   * the failures, then rediscovers services.
+   */
+  async removeBrokenContainers(
+    containerIds: readonly string[],
+  ): Promise<{ readonly removed: readonly string[]; readonly failed: ReadonlyArray<{ readonly id: string; readonly message: string }> }> {
+    const known = this.registry.getSnapshot().brokenContainers ?? [];
+    const removed: string[] = [];
+    const failed: Array<{ id: string; message: string }> = [];
+
+    for (const containerId of containerIds) {
+      const target = known.find((container) => container.containerId === containerId);
+      if (target === undefined) {
+        failed.push({ id: containerId, message: "Not in the current broken container list." });
+        continue;
+      }
+
+      try {
+        await this.containerServiceDiscovery.removeContainer(target.runtime, target.containerId);
+        removed.push(containerId);
+      } catch (error) {
+        failed.push({ id: containerId, message: error instanceof Error ? error.message : String(error) });
+      }
+    }
+
+    await this.refreshContainerServices({ force: true }).catch(() => []);
+    return { removed, failed };
   }
 
   /** Shares auto/explicit runtime projections within one generation, never across runtime events. */

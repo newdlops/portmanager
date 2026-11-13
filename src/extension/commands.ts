@@ -34,6 +34,7 @@ import { presentLegacySettingsNotices } from "./legacy-settings-notices";
 import type { PortManagerTreeProvider } from "../ui/sidebar/port-manager-tree";
 import {
   getComposeAttachmentFromCommandArgument,
+  getBrokenContainersFromCommandArgument,
   getContainerServiceCandidateFromCommandArgument,
   getHostPortExposureFromCommandArgument,
   getHostAccessBindingFromCommandArgument,
@@ -176,6 +177,9 @@ export class PortManagerCommandController implements DisposableLike {
     ownerCommand);
     this.registerCommand(context, "portManager.refreshTerminals", () => this.refreshTerminals(), ownerCommand);
     this.registerCommand(context, "portManager.refreshContainerServices", () => this.refreshContainerServices(), ownerCommand);
+    this.registerCommand(context, "portManager.removeBrokenContainer", (argument) =>
+      this.removeBrokenContainer(argument),
+    ownerCommand);
     this.registerCommand(context, "portManager.openNetworkTerminal", (argument) =>
       this.openNetworkTerminal(argument),
     ownerCommand);
@@ -515,6 +519,51 @@ export class PortManagerCommandController implements DisposableLike {
     await this.dependencies.networkService.refreshNetworkRoutingState();
     this.dependencies.treeProvider.refresh();
     await vscode.window.showInformationMessage(`Discovered ${candidates.length} container services.`);
+  }
+
+  /**
+   * Removes containers whose runtime metadata is corrupt after the user confirms.
+   *
+   * With no tree argument, offers every container in the latest broken list.
+   */
+  private async removeBrokenContainer(argument: unknown): Promise<void> {
+    const fromArgument = getBrokenContainersFromCommandArgument(argument);
+    const targets =
+      fromArgument.length > 0
+        ? fromArgument
+        : (this.dependencies.networkService.getSnapshot().brokenContainers ?? []);
+
+    if (targets.length === 0) {
+      await vscode.window.showInformationMessage("No broken containers found.");
+      return;
+    }
+
+    const names = targets.map((container) => container.containerName ?? container.containerId.slice(0, 12));
+    const answer = await vscode.window.showWarningMessage(
+      `Remove ${targets.length} broken container${targets.length === 1 ? "" : "s"}?`,
+      {
+        modal: true,
+        detail: `${names.join(", ")}\n\nThe runtime reports their writable layer as lost, so they cannot be listed or started. This runs "container rm -f" and cannot be undone.`,
+      },
+      "Remove",
+    );
+    if (answer !== "Remove") {
+      return;
+    }
+
+    const result = await this.dependencies.networkService.removeBrokenContainers(
+      targets.map((container) => container.containerId),
+    );
+    this.dependencies.treeProvider.refresh();
+
+    if (result.failed.length > 0) {
+      await vscode.window.showErrorMessage(
+        `Removed ${result.removed.length}, failed ${result.failed.length}: ${result.failed.map((item) => item.message).join("; ")}`,
+      );
+      return;
+    }
+
+    await vscode.window.showInformationMessage(`Removed ${result.removed.length} broken container(s).`);
   }
 
   /**

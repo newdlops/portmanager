@@ -380,6 +380,21 @@ export interface ComposeAttachment {
  * rows are transient UI candidates; attaching one creates a ComposeAttachment
  * with durable route rows.
  */
+export interface BrokenContainer {
+  /** Stable UI id derived from runtime and container id. */
+  readonly id: string;
+  /** Container runtime that reported the failure. */
+  readonly runtime: "docker" | "podman";
+  /** Full container id taken from the runtime error message. */
+  readonly containerId: string;
+  /** Container name from `inspect`, when the runtime could still read it. */
+  readonly containerName?: string;
+  /** Container state from `inspect`, for example `exited`. */
+  readonly status?: string;
+  /** Runtime error that made the container unlistable. */
+  readonly reason: string;
+}
+
 export interface ContainerServiceCandidate {
   /** Stable UI id derived from runtime and container id. */
   readonly id: string;
@@ -426,6 +441,8 @@ export interface NetworkSnapshot {
   readonly composeAttachments: readonly ComposeAttachment[];
   /** Latest Docker/Podman published-port candidates discovered for UI attach flows. */
   readonly containerServiceCandidates: readonly ContainerServiceCandidate[];
+  /** Containers whose runtime metadata is corrupt, so `container ls -a` cannot list them. */
+  readonly brokenContainers?: readonly BrokenContainer[];
   /** Runtime adapters available on this platform/build. */
   readonly runtimes: readonly NetworkRuntimeDescriptor[];
   /** Current VS Code window's relationship to the single automatic control-plane owner. */

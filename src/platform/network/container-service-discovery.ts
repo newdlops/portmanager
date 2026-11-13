@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type {
+  BrokenContainer,
   ComposeContainerMutationMapping,
   ComposePortMutationState,
   ComposePublishedPort,
@@ -26,6 +27,9 @@ import type { ContainerCommandResult, ContainerCommandRunner } from "./container
 
 const execFileAsync = promisify(execFile);
 const LIST_TIMEOUT_MS = 5_000;
+const REMOVE_TIMEOUT_MS = 30_000;
+/** Upper bound for broken containers skipped in one listing, so a failing runtime cannot loop. */
+const MAX_BROKEN_CONTAINERS = 16;
 
 export interface ContainerServiceDiscoveryOptions {
   /** Injected command runner used by unit tests to avoid real Docker calls. */
@@ -37,7 +41,7 @@ export class ContainerServiceDiscoveryAdapter {
   private readonly runCommand: ContainerCommandRunner;
 
   /** Only overlapping reads share rows; completed reads never outlive a runtime change. */
-  private readonly rowReadsInFlight = new Map<string, Promise<readonly RuntimeContainerRow[]>>();
+  private readonly rowReadsInFlight = new Map<string, Promise<RuntimeRowRead>>();
 
   constructor(options: ContainerServiceDiscoveryOptions = {}) {
     this.runCommand = options.runCommand ?? runContainerCommand;
@@ -59,14 +63,20 @@ export class ContainerServiceDiscoveryAdapter {
   async createSession(settings: ContainerRuntimeSettings): Promise<ContainerServiceDiscoverySession | undefined> {
     for (const executable of runtimeCandidates(settings.containerRuntime)) {
       try {
-        const contextRows = await this.listRuntimeRows(executable, true);
+        const { rows: contextRows, brokenContainers } = await this.listRuntimeRows(executable, true);
         // A single all-container snapshot includes stopped source labels and
         // live endpoints without two CLI launches or a race between lists.
         // Older runtimes without recognizable state retain the explicit live query.
         const runningRows = contextRows.some((row) => runtimeRowIsRunning(row) === undefined)
-          ? await this.listRuntimeRows(executable, false)
+          ? (await this.listRuntimeRows(executable, false)).rows
           : contextRows.filter((row) => runtimeRowIsRunning(row) === true);
-        return new ContainerServiceDiscoverySession(this.runCommand, executable, runningRows, contextRows);
+        return new ContainerServiceDiscoverySession(
+          this.runCommand,
+          executable,
+          runningRows,
+          contextRows,
+          brokenContainers,
+        );
       } catch {
         // Try the next configured runtime. UI refresh should not fail just
         // because Docker/Podman is absent or not running.
@@ -96,7 +106,7 @@ export class ContainerServiceDiscoveryAdapter {
 
     for (const executable of runtimeCandidates(settings.containerRuntime)) {
       try {
-        const contextRows = await this.listRuntimeRows(executable, true);
+        const { rows: contextRows } = await this.listRuntimeRows(executable, true);
         const context = buildPortRecoveryContext(contextRows);
         return recoverPortsFromContext(context, composeFiles, ports);
       } catch {
@@ -173,7 +183,7 @@ export class ContainerServiceDiscoveryAdapter {
 
     for (const executable of runtimeCandidates(settings.containerRuntime)) {
       try {
-        const rows = await this.listRuntimeRows(executable, true);
+        const { rows } = await this.listRuntimeRows(executable, true);
         return new ContainerServiceDiscoverySession(this.runCommand, executable, rows, rows).refreshComposeContainerMappings(
           originalProjectName,
           attachedProjectName,
@@ -190,10 +200,7 @@ export class ContainerServiceDiscoveryAdapter {
   }
 
   /** Shares concurrent CLI reads without caching stale endpoints across refreshes. */
-  private listRuntimeRows(
-    executable: "docker" | "podman",
-    includeStopped: boolean,
-  ): Promise<readonly RuntimeContainerRow[]> {
+  private listRuntimeRows(executable: "docker" | "podman", includeStopped: boolean): Promise<RuntimeRowRead> {
     const key = `${executable}:${includeStopped}`;
     const existingRead = this.rowReadsInFlight.get(key);
     if (existingRead !== undefined) {
@@ -207,14 +214,42 @@ export class ContainerServiceDiscoveryAdapter {
     return read;
   }
 
-  /** Reads JSON rows from `docker container ls` or `podman container ls`. */
-  private async readRuntimeRows(
+  /**
+   * Reads JSON rows from `docker container ls` or `podman container ls`.
+   *
+   * `ls --format {{json .}}` resolves every field of every container, so one
+   * container with corrupt runtime metadata fails the whole listing. When the
+   * error names such a container, the read continues without it and reports it
+   * as broken instead of hiding every healthy service.
+   */
+  private async readRuntimeRows(executable: "docker" | "podman", includeStopped: boolean): Promise<RuntimeRowRead> {
+    try {
+      return { rows: await this.runRowsCommand(executable, includeStopped, []), brokenContainers: [] };
+    } catch (error) {
+      if (!includeStopped || parseBrokenContainerId(error) === undefined) {
+        throw error;
+      }
+
+      return this.readRuntimeRowsSkippingBrokenContainers(executable, error);
+    }
+  }
+
+  /** Runs one `container ls` and parses its JSON rows, optionally restricted to the given ids. */
+  private async runRowsCommand(
     executable: "docker" | "podman",
     includeStopped: boolean,
+    onlyIds: readonly string[],
   ): Promise<readonly RuntimeContainerRow[]> {
     const result = await this.runCommand(
       executable,
-      ["container", "ls", ...(includeStopped ? ["-a"] : []), "--format", "{{json .}}"],
+      [
+        "container",
+        "ls",
+        ...(includeStopped ? ["-a"] : []),
+        ...onlyIds.flatMap((id) => ["--filter", `id=${id}`]),
+        "--format",
+        "{{json .}}",
+      ],
       { timeoutMs: LIST_TIMEOUT_MS },
     );
 
@@ -226,6 +261,101 @@ export class ContainerServiceDiscoveryAdapter {
       .filter((row): row is RuntimeContainerRow => row !== undefined);
   }
 
+  /** Re-lists without the containers the runtime reports as unreadable, one error at a time. */
+  private async readRuntimeRowsSkippingBrokenContainers(
+    executable: "docker" | "podman",
+    firstError: unknown,
+  ): Promise<RuntimeRowRead> {
+    const listed = await this.runCommand(executable, ["container", "ls", "-a", "-q", "--no-trunc"], {
+      timeoutMs: LIST_TIMEOUT_MS,
+    });
+    const allIds = listed.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    const brokenIds = new Map<string, string>();
+    let error: unknown = firstError;
+
+    for (let attempt = 0; attempt < MAX_BROKEN_CONTAINERS; attempt += 1) {
+      const brokenId = parseBrokenContainerId(error);
+      const fullId = brokenId === undefined ? undefined : allIds.find((id) => id.startsWith(brokenId));
+      if (fullId === undefined || brokenIds.has(fullId)) {
+        throw error;
+      }
+
+      brokenIds.set(fullId, errorSummary(error));
+      const healthyIds = allIds.filter((id) => !brokenIds.has(id));
+      if (healthyIds.length === 0) {
+        return { rows: [], brokenContainers: await this.describeBrokenContainers(executable, brokenIds) };
+      }
+
+      try {
+        const rows = await this.runRowsCommand(executable, true, healthyIds);
+        return { rows, brokenContainers: await this.describeBrokenContainers(executable, brokenIds) };
+      } catch (nextError) {
+        error = nextError;
+      }
+    }
+
+    throw error;
+  }
+
+  /** `inspect` still works on these containers, so names and states come from it when available. */
+  private async describeBrokenContainers(
+    executable: "docker" | "podman",
+    brokenIds: ReadonlyMap<string, string>,
+  ): Promise<readonly BrokenContainer[]> {
+    return Promise.all(
+      [...brokenIds].map(async ([containerId, reason]): Promise<BrokenContainer> => {
+        const base = { id: `${executable}:${containerId}`, runtime: executable, containerId, reason };
+        try {
+          const result = await this.runCommand(
+            executable,
+            ["container", "inspect", "--format", "{{.Name}}\t{{.State.Status}}", containerId],
+            { timeoutMs: LIST_TIMEOUT_MS },
+          );
+          const [name, status] = result.stdout.trim().split("\t");
+          const containerName = normalizeContainerName(name);
+          return {
+            ...base,
+            ...(containerName !== undefined ? { containerName } : {}),
+            ...(status ? { status } : {}),
+          };
+        } catch {
+          return base;
+        }
+      }),
+    );
+  }
+
+  /**
+   * Force-removes one container previously reported as broken.
+   *
+   * The caller must pass an id from the latest broken list; this method does
+   * not re-check that the container is actually unreadable.
+   */
+  async removeContainer(executable: "docker" | "podman", containerId: string): Promise<void> {
+    await this.runCommand(executable, ["container", "rm", "-f", containerId], { timeoutMs: REMOVE_TIMEOUT_MS });
+  }
+}
+
+/** Rows read from the runtime plus the containers it could not list. */
+interface RuntimeRowRead {
+  readonly rows: readonly RuntimeContainerRow[];
+  readonly brokenContainers: readonly BrokenContainer[];
+}
+
+/** Docker Desktop reports a lost writable layer with this text and the full container id. */
+const BROKEN_CONTAINER_ERROR = /rw layer snapshot not found for container ([0-9a-f]{12,64})/i;
+
+function parseBrokenContainerId(error: unknown): string | undefined {
+  return BROKEN_CONTAINER_ERROR.exec(errorSummary(error))?.[1]?.toLowerCase();
+}
+
+function errorSummary(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+  const match = BROKEN_CONTAINER_ERROR.exec(text);
+  return match === null ? text : `Error response from daemon: ${match[0]}`;
 }
 
 /**
@@ -248,6 +378,7 @@ export class ContainerServiceDiscoverySession {
     private readonly executable: "docker" | "podman",
     runningRows: readonly RuntimeContainerRow[],
     private readonly contextRows: readonly RuntimeContainerRow[],
+    private readonly brokenContainers: readonly BrokenContainer[] = [],
   ) {
     this.candidates = parseContainerRows(executable, buildAttachCandidateRows(runningRows, contextRows), contextRows);
     const runningIds = new Set(runningRows.map((row) => readFirstString(row.ID, row.Id)).filter(isDefinedString));
@@ -256,6 +387,11 @@ export class ContainerServiceDiscoverySession {
 
   listCandidates(): readonly ContainerServiceCandidate[] {
     return this.candidates;
+  }
+
+  /** Containers the runtime could not list in this snapshot. */
+  listBrokenContainers(): readonly BrokenContainer[] {
+    return this.brokenContainers;
   }
 
   /** Allows an auto-selected snapshot to serve subsequent explicit lookups in the same pass. */

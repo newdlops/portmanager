@@ -186,6 +186,12 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "portManager.removeBrokenContainer",
+        "title": "Remove Broken Container",
+        "category": "Port Manager",
+        "icon": "$(trash)"
+      },
+      {
         "command": "portManager.openNetworkTerminal",
         "title": "Open Terminal in Logical Network",
         "category": "Port Manager",
@@ -677,6 +683,16 @@
           "command": "portManager.refreshContainerServices",
           "when": "view == portManager.processes && viewItem == section.containers",
           "group": "container@1"
+        },
+        {
+          "command": "portManager.removeBrokenContainer",
+          "when": "view == portManager.processes && viewItem == brokenContainer",
+          "group": "inline@1"
+        },
+        {
+          "command": "portManager.removeBrokenContainer",
+          "when": "view == portManager.processes && viewItem == brokenContainer",
+          "group": "container@4"
         },
         {
           "command": "portManager.attachContainerToNetwork",

@@ -3,6 +3,7 @@ import { assertNetworkAddressesAreUnique } from "./loopback-address";
 import { networkStorageKey } from "./network-identity";
 import type {
   ComposeAttachment,
+  BrokenContainer,
   ContainerServiceCandidate,
   DisposableLike,
   HostAccessBinding,
@@ -46,6 +47,7 @@ export class LogicalNetworkRegistry implements DisposableLike {
 
   /** Latest transient Docker/Podman published-port candidates. */
   private containerServiceCandidates: readonly ContainerServiceCandidate[] = [];
+  private brokenContainers: readonly BrokenContainer[] = [];
 
   /** Runtime descriptors available to the current extension session. */
   private runtimes: readonly NetworkRuntimeDescriptor[];
@@ -106,6 +108,7 @@ export class LogicalNetworkRegistry implements DisposableLike {
       hostAccessBindings: [...this.hostAccessBindings.values()],
       composeAttachments: [...this.composeAttachments.values()],
       containerServiceCandidates: this.containerServiceCandidates,
+      brokenContainers: this.brokenContainers,
       runtimes: this.runtimes,
       updatedAt: new Date().toISOString(),
     };
@@ -199,6 +202,16 @@ export class LogicalNetworkRegistry implements DisposableLike {
     }
 
     this.containerServiceCandidates = nextCandidates;
+    this.emitChange();
+  }
+
+  /** Replaces the transient list of unlistable containers shown in the Services section. */
+  setBrokenContainers(containers: readonly BrokenContainer[]): void {
+    if (sameJsonList(this.brokenContainers, containers)) {
+      return;
+    }
+
+    this.brokenContainers = [...containers];
     this.emitChange();
   }
 

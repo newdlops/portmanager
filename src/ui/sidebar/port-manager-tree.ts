@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { formatSidebarCounts, formatSidebarSummary, summarizeSidebarIssues } from "./sidebar-presentation";
 import type {
+  BrokenContainer,
   AgentDaemonStatus,
   AgentSnapshot,
   BrowserDnsResolverStatus,
@@ -143,6 +144,7 @@ type PortManagerTreeItem =
   | TerminalCandidateTreeItem
   | ComposeProjectCandidateTreeItem
   | ContainerServiceCandidateTreeItem
+  | BrokenContainerTreeItem
   | ContainerPublishedPortTreeItem
   | ServiceDetailTreeItem
   | ServiceDetailGroupTreeItem
@@ -379,7 +381,7 @@ export class PortManagerTreeProvider
         new TreeSectionItem(
           "services",
           "Services",
-          formatContainerSectionDescription(snapshot.containerServiceCandidates),
+          formatContainerSectionDescription(snapshot.containerServiceCandidates, snapshot.brokenContainers ?? []),
           "server-environment",
         ),
         new TreeSectionItem(
@@ -442,10 +444,15 @@ export class PortManagerTreeProvider
     }
 
     switch (element.kind) {
-      case "services":
-        return snapshot.containerServiceCandidates.length > 0
-          ? buildContainerServiceTreeItems(snapshot.containerServiceCandidates, ownerAction)
-          : [new EmptyTreeItem("No published services", "Start compose services")];
+      case "services": {
+        const brokenContainers = snapshot.brokenContainers ?? [];
+        const brokenRows = buildBrokenContainerTreeItems(brokenContainers, ownerAction);
+        const serviceRows =
+          snapshot.containerServiceCandidates.length > 0
+            ? buildContainerServiceTreeItems(snapshot.containerServiceCandidates, ownerAction)
+            : [new EmptyTreeItem("No published services", "Start compose services")];
+        return [...brokenRows, ...serviceRows];
+      }
       case "system": {
         const browserDns = this.getBrowserDnsStatus(generation);
         return buildSystemGroupItems(daemon, snapshot, agentSnapshot, browserDns, ownerAction);
@@ -747,6 +754,70 @@ export class ContainerServiceCandidateTreeItem extends vscode.TreeItem {
       arguments: [{ containerService: candidate }],
     };
   }
+}
+
+/**
+ * A container whose runtime metadata is corrupt, so `container ls -a` cannot
+ * list it. Its presence hides every other service until it is removed.
+ */
+export class BrokenContainerTreeItem extends vscode.TreeItem {
+  readonly contextValue: string;
+
+  constructor(readonly container: BrokenContainer, availability: ActionAvailability = { enabled: true }) {
+    super(container.containerName ?? container.containerId.slice(0, 12), vscode.TreeItemCollapsibleState.None);
+    this.id = `broken:${container.id}`;
+    this.contextValue = availability.enabled ? "brokenContainer" : "brokenContainer.disabled";
+    this.description = [container.status, "broken: runtime cannot list it"].filter(Boolean).join(" · ");
+    this.iconPath = new vscode.ThemeIcon("error", new vscode.ThemeColor("problemsErrorIcon.foreground"));
+    const tooltip = new vscode.MarkdownString(undefined, true);
+    tooltip.isTrusted = false;
+    tooltip.appendMarkdown(`**${escapeMarkdown(this.label as string)}**\n\n`);
+    tooltip.appendMarkdown(`- Runtime: \`${container.runtime}\`\n`);
+    tooltip.appendMarkdown(`- ID: \`${escapeMarkdown(container.containerId)}\`\n`);
+    tooltip.appendMarkdown(`- Error: ${escapeMarkdown(container.reason)}\n\n`);
+    tooltip.appendMarkdown("`container ls -a` fails while this container exists, which hides all services. Remove it to restore discovery.");
+    this.tooltip = tooltip;
+  }
+}
+
+/** Broken containers first, with a remove-all action when more than one exists. */
+function buildBrokenContainerTreeItems(
+  containers: readonly BrokenContainer[],
+  availability: ActionAvailability,
+): PortManagerTreeItem[] {
+  if (containers.length === 0) {
+    return [];
+  }
+
+  return [
+    ...containers.map((container) => new BrokenContainerTreeItem(container, availability)),
+    ...(containers.length > 1
+      ? [
+          new ActionTreeItem(
+            "Remove All Broken Containers",
+            "portManager.removeBrokenContainer",
+            "trash",
+            `${containers.length} containers`,
+            { brokenContainers: containers },
+            availability,
+          ),
+        ]
+      : []),
+  ];
+}
+
+/** Extracts broken containers from a tree item or a command argument; empty when none apply. */
+export function getBrokenContainersFromCommandArgument(argument: unknown): readonly BrokenContainer[] {
+  if (argument instanceof BrokenContainerTreeItem) {
+    return [argument.container];
+  }
+
+  if (typeof argument === "object" && argument !== null && "brokenContainers" in argument) {
+    const value = (argument as { brokenContainers: unknown }).brokenContainers;
+    return Array.isArray(value) ? (value as BrokenContainer[]) : [];
+  }
+
+  return [];
 }
 
 /** One host-published container port under a discovered container candidate. */
@@ -2765,7 +2836,10 @@ function mergePortManagerCloneMetadata(
   };
 }
 
-function formatContainerSectionDescription(candidates: readonly ContainerServiceCandidate[]): string {
+function formatContainerSectionDescription(
+  candidates: readonly ContainerServiceCandidate[],
+  brokenContainers: readonly BrokenContainer[] = [],
+): string {
   const composeProjectCount = new Set(
     candidates
       .filter((candidate) => candidate.composeProject !== undefined)
@@ -2779,10 +2853,13 @@ function formatContainerSectionDescription(candidates: readonly ContainerService
       ),
   ).size;
   const rawContainerCount = candidates.filter((candidate) => candidate.composeProject === undefined).length;
-  return candidates.length === 0 ? "No services" : formatSidebarCounts([
+  const serviceDescription = candidates.length === 0 ? "No services" : formatSidebarCounts([
     { count: composeProjectCount, singular: "compose project" },
     { count: rawContainerCount, singular: "container" },
   ]);
+  return brokenContainers.length === 0
+    ? serviceDescription
+    : `${serviceDescription}, ${brokenContainers.length} broken`;
 }
 
 /** Builds tooltip details for one runtime adapter. */

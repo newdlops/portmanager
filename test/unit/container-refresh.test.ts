@@ -101,6 +101,7 @@ function setup() {
     registry: {
       getSnapshot: () => snapshot,
       setContainerServiceCandidates: (candidates: readonly ContainerServiceCandidate[]) => { snapshot.containerServiceCandidates = candidates; },
+      setBrokenContainers: () => undefined,
     },
     containerEventsWatcher: { getRuntime: () => state.healthyRuntime },
     containerRuntime: { getDescriptor: () => ({ id: state.namespaceRuntime }) },

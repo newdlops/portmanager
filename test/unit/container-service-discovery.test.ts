@@ -229,3 +229,76 @@ for (const failure of ["unavailable", "missing rows"] as const) {
     assert.equal(refreshed[0].attachedContainerName, "network-workspace-db-1");
   });
 }
+
+const BROKEN_ID = "4fabc7f270b74707fa33d4125e8fd5aec536c29b0f783a4691e0189bd91a411e";
+const SECOND_BROKEN_ID = "2df8094cb2570b2ac3427a307d2c3c3a468a2bc7e9d6b83ab51b23afa644ddaf";
+const HEALTHY_ID = "5926f6160861aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const healthy: RuntimeContainerRow = {
+  ID: "5926f6160861",
+  Names: "fundservice-app-1",
+  State: "running",
+  Status: "Up 1 minute",
+  Ports: "127.0.0.1:8775->8000/tcp",
+  Labels: "com.docker.compose.project=fundservice,com.docker.compose.service=app",
+};
+
+/** Mimics Docker: `ls -a --format json` fails on a corrupt container unless it is excluded via id filters. */
+function brokenAwareRunner(brokenIds: readonly string[], calls: string[][] = []) {
+  const allIds = [HEALTHY_ID, ...brokenIds];
+  return async (_executable: string, args: readonly string[]): Promise<ContainerCommandResult> => {
+    calls.push([...args]);
+    if (args[1] === "inspect") {
+      return { stdout: `/claude-${args[4].slice(0, 4)}\texited\n`, stderr: "" };
+    }
+    if (args.includes("-q")) {
+      return { stdout: allIds.join("\n"), stderr: "" };
+    }
+    const filtered = args.filter((arg) => arg.startsWith("id=")).map((arg) => arg.slice(3));
+    const scanned = filtered.length > 0 ? filtered : allIds;
+    const firstBroken = scanned.find((id) => brokenIds.includes(id));
+    if (firstBroken !== undefined) {
+      throw new Error(`docker ls failed: Error response from daemon: rw layer snapshot not found for container ${firstBroken}`);
+    }
+    return output(healthy);
+  };
+}
+
+test("corrupt containers are reported as broken while healthy services stay discoverable", async () => {
+  const calls: string[][] = [];
+  const adapter = new ContainerServiceDiscoveryAdapter({ runCommand: brokenAwareRunner([BROKEN_ID, SECOND_BROKEN_ID], calls) });
+  const session = await adapter.createSession(settings);
+  assert.ok(session);
+
+  assert.deepEqual(session.listCandidates().map((candidate) => candidate.containerName), ["fundservice-app-1"]);
+  const broken = session.listBrokenContainers();
+  assert.deepEqual(broken.map((container) => container.containerId).sort(), [SECOND_BROKEN_ID, BROKEN_ID].sort());
+  assert.equal(broken[0].status, "exited");
+  assert.match(broken[0].reason, /rw layer snapshot not found for container/);
+  const retry = calls.find((args) => args.includes("--filter"));
+  assert.ok(retry?.includes(`id=${HEALTHY_ID}`));
+  assert.ok(!retry?.includes(`id=${BROKEN_ID}`));
+});
+
+test("listing errors unrelated to corrupt containers still fall through to the next runtime", async () => {
+  const adapter = new ContainerServiceDiscoveryAdapter({
+    runCommand: async () => { throw new Error("Cannot connect to the Docker daemon"); },
+  });
+  assert.equal(await adapter.createSession(settings), undefined);
+});
+
+test("a healthy runtime reports no broken containers", async () => {
+  const adapter = new ContainerServiceDiscoveryAdapter({ runCommand: brokenAwareRunner([]) });
+  const session = await adapter.createSession(settings);
+  assert.ok(session);
+  assert.deepEqual(session.listBrokenContainers(), []);
+  assert.equal(session.listCandidates().length, 1);
+});
+
+test("removeContainer force-removes exactly the given container id", async () => {
+  const calls: string[][] = [];
+  const adapter = new ContainerServiceDiscoveryAdapter({
+    runCommand: async (_executable, args) => { calls.push([...args]); return { stdout: "", stderr: "" }; },
+  });
+  await adapter.removeContainer("docker", BROKEN_ID);
+  assert.deepEqual(calls, [["container", "rm", "-f", BROKEN_ID]]);
+});
