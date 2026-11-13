@@ -4,6 +4,11 @@ All notable changes to Port Manager are documented in this file.
 
 ## Unreleased
 
+## 0.0.8277
+
+- Keep Compose services discoverable when the runtime has a container with lost metadata. Docker Desktop fails `container ls -a --format '{{json .}}'` for the whole listing when one container reports `rw layer snapshot not found`, which left the Services section empty. Discovery now re-lists without such containers and reports them separately.
+- Show those broken containers at the top of the Services section with an error icon and a `N broken` count, and add `Remove Broken Container` (inline, context menu and palette) plus `Remove All Broken Containers`. Removal asks for confirmation, runs `container rm -f`, and only accepts ids from the latest broken list so a healthy container cannot be removed through this path.
+
 ## 0.0.8276
 
 - Recover authoritative routing once per daemon PID and start time, including when DNS/event reconnection precedes the first route snapshot. Reject late recovery completions from an older incarnation and retry failed scans without adding warm-pass scans.
